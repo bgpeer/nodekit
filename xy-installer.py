@@ -119,7 +119,16 @@ def ensure_acme():
         sh(f"{acme} --register-account -m {G['email'] or 'a@a.com'} "
            f"--server letsencrypt", check=False)
         sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
-        sh(f"{acme} --issue -d {G['domain']} --standalone --keylength ec-256")
+        # acme.sh 在证书仍有效时会以退出码 2 “跳过续期”，这不是错误；
+        # 只要最终能 install-cert 导出证书就算成功，否则才把真实报错抛出来。
+        r = subprocess.run(
+            f"{acme} --issue -d {G['domain']} --standalone --keylength ec-256",
+            shell=True, text=True, capture_output=True)
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        skipped = any(s in out for s in
+                      ("Domains not changed", "Skipping", "Next renewal time", "Cert success"))
+        if r.returncode and not skipped:
+            raise RuntimeError("acme 签发失败(检查域名解析是否指向本机、80 端口是否可达):\n" + out)
         os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
         sh(f"{acme} --install-cert -d {G['domain']} --ecc "
            f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}")
@@ -465,10 +474,21 @@ def run(sb_names, xr_names):
                   open(cfg, "w"), indent=2)
         write_service("xray", XRAY_BIN, cfg)
 
+    # 落盘保存，避免终端刷屏后找不到；同时打印到屏幕
+    out_file = "/root/xy-nodes.txt"
+    try:
+        with open(out_file, "w") as f:
+            f.write("\n".join(all_links) + "\n")
+    except OSError:
+        out_file = None
+
     print("\n" + "=" * 60)
     print("分享链接（直接喂给 Mihomo-fx 的 LINKS 解析）:")
     print("=" * 60)
     print("\n".join(all_links))
+    if out_file:
+        print("=" * 60)
+        print(f"已保存到 {out_file}（cat {out_file} 可再次查看）")
 
 # ============================================================================ 交互菜单
 def _ask(prompt=""):
