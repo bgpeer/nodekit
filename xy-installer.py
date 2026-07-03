@@ -424,8 +424,73 @@ def run(sb_names, xr_names):
     print("=" * 60)
     print("\n".join(all_links))
 
+# ============================================================================ 交互菜单
+def _ask(prompt=""):
+    """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。"""
+    try:
+        with open("/dev/tty", "r") as t:
+            print(prompt, end="", flush=True)
+            line = t.readline()
+            if line == "":
+                raise EOFError
+            return line.rstrip("\n").strip()
+    except (OSError, EOFError):
+        return input(prompt).strip()
+
+def _pick(title, options):
+    """列出带编号的协议，返回选中的 key 列表；回车/0/all = 全选。"""
+    print("\n" + title)
+    for i, name in enumerate(options, 1):
+        print(f"  {i:>2}. {name}")
+    print("   0. 全部")
+    raw = _ask("选择(逗号分隔编号, 回车=全部): ")
+    if raw == "" or raw == "0" or raw.lower() == "all":
+        return list(options)
+    picked = []
+    for tok in raw.replace("，", ",").split(","):
+        tok = tok.strip()
+        if tok.isdigit() and 1 <= int(tok) <= len(options):
+            picked.append(options[int(tok) - 1])
+        elif tok:
+            print(f"  ⚠ 忽略无效项: {tok}")
+    return picked
+
+def menu():
+    print("=" * 60)
+    print("  sing-box + xray 交互安装")
+    print("=" * 60)
+    print("选择核心:  1. sing-box   2. xray   3. 两个都装")
+    core = _ask("输入 [1/2/3] (回车=1): ") or "1"
+
+    sb_names, xr_names = [], []
+    if core in ("1", "3"):
+        sb_names = _pick("【sing-box 协议】", list(SB))
+    if core in ("2", "3"):
+        xr_names = _pick("【xray 协议】", list(XRAY))
+    if not sb_names and not xr_names:
+        print("没选任何协议，退出。"); return
+
+    domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
+    email = _ask("acme 注册邮箱(回车=默认): ") if domain else ""
+    sni = _ask("reality 借用目标站 SNI (回车=www.microsoft.com): ") or "www.microsoft.com"
+    G["domain"], G["email"], G["sni"] = domain, email, sni
+
+    print("\n" + "-" * 60)
+    if sb_names: print("  sing-box:", ", ".join(sb_names))
+    if xr_names: print("  xray:    ", ", ".join(xr_names))
+    print("  证书:    ", f"acme真证书({domain})" if domain else "自签")
+    print("  SNI:     ", sni)
+    print("-" * 60)
+    if (_ask("确认开始? [Y/n]: ") or "y").lower() in ("n", "no"):
+        print("已取消。"); return
+    run(sb_names, xr_names)
+
 # ============================================================================ CLI
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) == 1:          # 不带参数 → 交互菜单
+        menu()
+        sys.exit(0)
     ap = argparse.ArgumentParser(
         description="sing-box + xray 双核心多协议安装器",
         epilog=("示例:\n"
