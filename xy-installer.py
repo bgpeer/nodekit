@@ -14,7 +14,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request
+import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, shutil, socket
 
 SB_VER   = "1.11.15"
 XRAY_VER = "25.3.6"
@@ -30,8 +30,41 @@ G = {"host": "", "domain": "", "email": "", "sni": "www.microsoft.com", "_port":
 def sh(cmd, check=True):
     r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     if check and r.returncode:
-        raise RuntimeError(f"cmd failed: {cmd}\n{r.stderr}")
+        # acme.sh 等工具的报错常写到 stdout，两个都带上才看得到真正原因
+        msg = (r.stderr or "").strip() or (r.stdout or "").strip()
+        raise RuntimeError(f"cmd failed: {cmd}\n{msg}")
     return r.stdout.strip()
+
+def have(binary):
+    return shutil.which(binary) is not None
+
+def ensure_deps():
+    """安装脚本依赖：acme.sh --standalone 需要 socat；xray 解压需要 unzip。
+       Debian/Ubuntu 最小系统默认不带这些，缺了会导致 --issue / 安装直接失败。"""
+    need = [pkg for pkg, binary in
+            (("curl", "curl"), ("socat", "socat"), ("unzip", "unzip"),
+             ("openssl", "openssl"), ("tar", "tar"), ("ca-certificates", None))
+            if binary is not None and not have(binary)]
+    # ca-certificates 无对应可执行文件，装 acme/真证书时保证 TLS 根证书齐全
+    if not have("update-ca-certificates"):
+        need.append("ca-certificates")
+    if not need:
+        return
+    print("安装依赖:", ", ".join(need))
+    sh("apt-get update -y", check=False)
+    sh("DEBIAN_FRONTEND=noninteractive apt-get install -y " + " ".join(need))
+
+def port_free(port):
+    """standalone 验证要独占 80 端口，先探测避免 acme 无谓失败。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 def next_port():
     G["_port"] += 1
@@ -71,8 +104,20 @@ def ensure_acme():
         ensure_self_signed()
         return CERT, KEY, True                      # (crt, key, insecure)
     if not os.path.exists(ACME_CRT):
-        sh("curl -s https://get.acme.sh | sh -s email=" + (G["email"] or "a@a.com"))
-        acme = "~/.acme.sh/acme.sh"
+        # standalone 用 socat 起临时 HTTP 服务占 80 端口做验证，缺 socat 必挂
+        if not have("socat"):
+            ensure_deps()
+        acme = os.path.expanduser("~/.acme.sh/acme.sh")
+        if not os.path.exists(acme):
+            sh("curl -s https://get.acme.sh | sh -s email=" + (G["email"] or "a@a.com"))
+        if not os.path.exists(acme):
+            raise RuntimeError("acme.sh 安装失败，检查网络/curl 是否可访问 get.acme.sh")
+        if not port_free(80):
+            raise RuntimeError(
+                "80 端口被占用，acme.sh --standalone 无法验证。"
+                "先停掉占用 80 的服务(nginx/caddy 等)，或改用自签(回车跳过域名)。")
+        sh(f"{acme} --register-account -m {G['email'] or 'a@a.com'} "
+           f"--server letsencrypt", check=False)
         sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
         sh(f"{acme} --issue -d {G['domain']} --standalone --keylength ec-256")
         os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
@@ -397,6 +442,7 @@ def build(table, names):
     return inbounds, links
 
 def run(sb_names, xr_names):
+    ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
     G["host"] = public_ip()
     all_links = []
 
