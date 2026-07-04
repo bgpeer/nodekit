@@ -26,7 +26,8 @@ CERT, KEY = "/etc/ssl/sb/self.crt", "/etc/ssl/sb/self.key"     # 自签
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"  # acme 签发
 
 # 全局状态：域名/邮箱/SNI 由 CLI 注入；端口自增分配
-G = {"host": "", "domain": "", "email": "", "sni": "www.microsoft.com", "_port": 20000}
+G = {"host": "", "domain": "", "email": "", "sni": "s0.awsstatic.com", "_port": 20000}
+HY2_PORTS = "30000-31000"      # hy2 端口跳跃范围（对齐 mack-a）；iptables 把这段 UDP 转发到真实端口
 
 # ---------------------------------------------------------------------------- 基础工具
 def sh(cmd, check=True):
@@ -238,14 +239,31 @@ def sb_reality_grpc(port, tag):
           f"&serviceName={svc}&mode=gun#{tag}")
     return ib, lk
 
+def setup_port_hopping(target_port, rng):
+    """把 rng(如 30000-31000)这段 UDP 用 iptables DNAT 转发到真实端口，实现端口跳跃。
+       与 mack-a 同法。带 comment 便于去重/清理；尽量持久化。"""
+    lo, hi = rng.split("-")
+    tagc = "xy_hy2_portHopping"
+    # 先清掉本脚本旧的同类规则，避免重跑叠加
+    for line in sh("iptables -t nat -S PREROUTING", check=False).splitlines():
+        if tagc in line and line.startswith("-A"):
+            sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
+    sh(f"iptables -t nat -A PREROUTING -p udp --dport {lo}:{hi} "
+       f"-m comment --comment {tagc} -j DNAT --to-destination :{target_port}", check=False)
+    # 尽量持久化（重启后仍生效）；没有 netfilter-persistent 就装一下
+    if not have("netfilter-persistent"):
+        sh("DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent", check=False)
+    sh("netfilter-persistent save", check=False)
+
 def sb_hysteria2(port, tag):
     pw = new_pw(); crt, key, insec = ensure_acme()
     ib = {"type": "hysteria2", "tag": tag, "listen": "::", "listen_port": port,
           "users": [{"password": pw}],
           "tls": {"enabled": True, "alpn": ["h3"],
                   "certificate_path": crt, "key_path": key}}
+    setup_port_hopping(port, HY2_PORTS)                  # 端口跳跃：UDP 段 DNAT 到本端口
     lk = (f"hysteria2://{pw}@{G['host']}:{port}?sni={tls_host()}"
-          f"&insecure={1 if insec else 0}#{tag}")
+          f"&mport={HY2_PORTS}&insecure={1 if insec else 0}#{tag}")
     return ib, lk
 
 def sb_tuic(port, tag):
@@ -537,9 +555,10 @@ def takeover_cleanup():
     for p in dirs:
         print(f"  - 目录 {p}（疑似 mack-a / v2ray-agent）")
     if not G.get("force"):
-        ans = _ask("卸载它们、由本脚本接管？此操作不可逆 [y/N]: ")
+        ans = _ask("卸载它们、由本脚本接管？删除后不可恢复。同意删除并继续安装[y]，放弃则不安装[N]: ")
         if ans.lower() not in ("y", "yes"):
-            raise RuntimeError("已取消：未清理现有安装。换台干净机器，或加 --yes 确认接管。")
+            print("已放弃：保留现有安装，未做任何改动，退出。")
+            raise SystemExit(0)
     for u, _ in units:
         sh(f"systemctl disable --now {u}", check=False)
         sh(f"rm -f /etc/systemd/system/{u}.service", check=False)
@@ -638,7 +657,7 @@ def menu():
 
     domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
     email = _ask("acme 注册邮箱(回车=默认): ") if domain else ""
-    sni = _ask("reality 借用目标站 SNI (回车=www.microsoft.com): ") or "www.microsoft.com"
+    sni = _ask("reality 借用目标站 SNI (回车=s0.awsstatic.com): ") or "s0.awsstatic.com"
     G["domain"], G["email"], G["sni"] = domain, email, sni
 
     print("\n" + "-" * 60)
@@ -670,7 +689,7 @@ if __name__ == "__main__":
     ap.add_argument("--xray", default="", help="xray 协议，逗号分隔，或 all")
     ap.add_argument("--domain", default="", help="有域名则走 acme 真证书")
     ap.add_argument("--email", default="", help="acme 注册邮箱")
-    ap.add_argument("--sni", default="www.microsoft.com", help="reality 借用的目标站")
+    ap.add_argument("--sni", default="s0.awsstatic.com", help="reality 借用的目标站")
     ap.add_argument("--yes", action="store_true",
                     help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
