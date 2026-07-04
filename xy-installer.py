@@ -34,8 +34,12 @@ def hy2_range():
     r = (G.get("hy2_ports") or HY2_PORTS).strip()
     return r if re.match(r"^\d+-\d+$", r) else HY2_PORTS
 
-# 订阅：把生成的节点注入一份完整 Mihomo 模板，起 HTTP 服务托管，产出一条订阅链接
-SUB_DIR      = "/etc/sing-box/sub"
+# 订阅：把节点注入 Mihomo 模板写成【可编辑配置文件】，HTTP 服务托管，产出订阅链接。
+# 换订阅链接只换 token（软链名），不动配置；用户可直接编辑 CFG_FILE 改参数。
+BGP_DIR      = "/etc/bgpeer"
+CFG_FILE     = BGP_DIR + "/mihomo.yaml"      # 可编辑的成品配置（订阅内容就是它）
+SUB_DIR      = BGP_DIR + "/sub"              # HTTP 托管目录（内含 <token>.yaml 软链 → CFG_FILE）
+HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
 SUB_PORT     = 20080
 TEMPLATE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/sub-template.yaml"
 
@@ -649,8 +653,38 @@ def fetch_template():
     req = urllib.request.Request(TEMPLATE_URL, headers={"User-Agent": "xy-installer"})
     return urllib.request.urlopen(req, timeout=15).read().decode()
 
+def sub_url(token):
+    host = open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else public_ip()
+    return f"http://{host}:{SUB_PORT}/{token}.yaml"
+
+def current_token():
+    try:
+        for f in os.listdir(SUB_DIR):
+            if f.endswith(".yaml"):
+                return f[:-5]
+    except OSError:
+        pass
+    return None
+
+def serve_sub(token):
+    """在 SUB_DIR 放一个 <token>.yaml 软链指向可编辑的 CFG_FILE，并起/重启 http 服务。
+       换 token 只改软链名，CFG_FILE（订阅内容）原样不动。"""
+    os.makedirs(SUB_DIR, exist_ok=True)
+    for f in os.listdir(SUB_DIR):                       # 清旧 token 软链/文件
+        if f.endswith(".yaml"):
+            os.remove(os.path.join(SUB_DIR, f))
+    os.symlink(CFG_FILE, f"{SUB_DIR}/{token}.yaml")     # 软链 → 编辑 CFG_FILE 即时生效
+    open(f"{SUB_DIR}/index.html", "w").write("")        # 有 index 就不列目录，token 不外泄
+    svc = (f"[Unit]\nAfter=network.target\n[Service]\n"
+           f"ExecStart=/usr/bin/python3 -m http.server {SUB_PORT} --directory {SUB_DIR} --bind 0.0.0.0\n"
+           f"Restart=on-failure\nRestartSec=3\n[Install]\nWantedBy=multi-user.target\n")
+    open("/etc/systemd/system/xy-sub.service", "w").write(svc)
+    sh("systemctl daemon-reload")
+    sh("systemctl enable xy-sub", check=False)
+    sh("systemctl restart xy-sub")
+
 def build_subscription(all_links):
-    """把节点注入模板，写到 SUB_DIR，起 http 服务托管，返回订阅 URL。"""
+    """节点注入模板 → 写成可编辑配置 CFG_FILE，记住 host，起服务托管，返回订阅 URL。"""
     lines = []
     for u in all_links:
         try:
@@ -661,20 +695,12 @@ def build_subscription(all_links):
     if not lines:
         return None
     cfg = fetch_template().replace("__XY_PROXIES__", "\n".join(lines))
-    os.makedirs(SUB_DIR, exist_ok=True)
-    for f in os.listdir(SUB_DIR):                       # 清旧订阅，换新 token
-        if f.endswith(".yaml"): os.remove(os.path.join(SUB_DIR, f))
+    os.makedirs(BGP_DIR, exist_ok=True)
+    open(CFG_FILE, "w").write(cfg)                      # 可编辑的成品配置
+    open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先），换 token 不丢
     token = secrets.token_urlsafe(12)
-    open(f"{SUB_DIR}/{token}.yaml", "w").write(cfg)
-    open(f"{SUB_DIR}/index.html", "w").write("")       # 有 index 就不会列目录，token 不外泄
-    svc = (f"[Unit]\nAfter=network.target\n[Service]\n"
-           f"ExecStart=/usr/bin/python3 -m http.server {SUB_PORT} --directory {SUB_DIR} --bind 0.0.0.0\n"
-           f"Restart=on-failure\nRestartSec=3\n[Install]\nWantedBy=multi-user.target\n")
-    open("/etc/systemd/system/xy-sub.service", "w").write(svc)
-    sh("systemctl daemon-reload")
-    sh("systemctl enable xy-sub", check=False)
-    sh("systemctl restart xy-sub")
-    return f"http://{G['host']}:{SUB_PORT}/{token}.yaml"
+    serve_sub(token)
+    return sub_url(token)
 
 def detect_existing():
     """扫 systemd，找出跑 sing-box/xray 但不是本脚本装的服务（典型：mack-a/v2ray-agent）。
@@ -821,24 +847,37 @@ def show_links():
         print("\n还没有节点，请先『1.安装』。"); return
     print("\n" + "=" * 60 + "\n分享链接:\n" + "=" * 60)
     print("\n".join(links))
-    try:
-        txt = open("/root/xy-nodes.txt").read()
-        if "http" in txt.split("订阅链接")[-1]:
-            print("=" * 60 + "\n订阅链接:" + txt.split("订阅链接:")[-1].rstrip())
-    except Exception:
-        pass
+    tok = current_token()
+    if tok:
+        print("=" * 60 + "\n订阅链接:\n" + sub_url(tok))
 
-def update_mihomo_sub():
-    """用最新模板 + 已保存节点重新生成订阅（改了模板/规则后刷新用）。"""
-    links = read_saved_links()
-    if not links:
-        print("\n还没有节点，请先『1.安装』。"); return
-    G["host"] = public_ip()
-    try:
-        sub = build_subscription(links)
-        print("\n已用最新模板重新生成订阅：\n" + (sub or "(无节点)"))
-    except Exception as e:
-        print("\n生成失败:", e)
+def mihomo_config_menu():
+    """mihomo 配置：配置存成可编辑文件，用户改参数；换订阅只换 token、host 不变。"""
+    if not os.path.exists(CFG_FILE):
+        print("\n还没有订阅配置，请先『1.安装』。"); return
+    tok = current_token()
+    print("\n" + "=" * 60 + "\nmihomo 配置\n" + "=" * 60)
+    print(f"  配置文件: {CFG_FILE}")
+    print( "           用 nano/vi 直接改参数，保存后客户端重新拉取即生效（订阅链接不用换）")
+    if tok:
+        print(f"  当前订阅: {sub_url(tok)}")
+    print("-" * 60)
+    print("  1. 只换订阅链接 token（配置原样不动，怀疑外泄/被墙时用）")
+    print("  2. 用最新模板重建配置（会覆盖你在配置文件里的手动修改，谨慎）")
+    print("  0. 返回")
+    c = _ask("选择: ").strip()
+    if c == "1":
+        serve_sub(secrets.token_urlsafe(12))
+        print("\n新订阅链接（配置未改动）:\n" + sub_url(current_token()))
+    elif c == "2":
+        links = read_saved_links()
+        if not links:
+            print("没有已保存节点，无法重建。"); return
+        G["host"] = open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else public_ip()
+        try:
+            print("\n已用最新模板重建配置：\n" + (build_subscription(links) or "(无节点)"))
+        except Exception as e:
+            print("重建失败:", e)
 
 def update_cores():
     print("\n更新核心:  1. sing-box   2. xray   3. 两个   0. 返回")
@@ -884,15 +923,16 @@ def main_menu():
         print("  0. 退出")
         print("-" * 60)
         c = _ask("请选择: ").strip()
+        if c == "0" or c == "":
+            print("再见。"); return
         if c == "1":   install_flow()
         elif c == "2": show_links()
-        elif c == "3": update_mihomo_sub()
+        elif c == "3": mihomo_config_menu()
         elif c == "4": update_cores()
         elif c == "5": uninstall_all()
-        elif c == "0" or c == "":
-            print("再见。"); return
         else:
-            print("无效选择。")
+            print("无效选择。"); continue
+        _ask("\n按回车返回主菜单...")            # 停一下，别让菜单立刻盖住上面的输出
 
 # ============================================================================ 交互菜单
 def _ask(prompt=""):
