@@ -158,6 +158,31 @@ def ensure_acme():
 def tls_host():                                     # ws/trojan 的 SNI/Host
     return G["domain"] or G["sni"]
 
+def check_domain_or_die():
+    """有域名就先校验它解析到本机公网 IP；不匹配/80 被占 → 爆红并停止，
+       且在『任何破坏性动作(接管卸载)之前』执行——绝不在错误域名下删旧装新。
+       无域名则整段跳过（自签+IP 安装，无此校验）。"""
+    if not G["domain"]:
+        return
+    R, N = "\033[1;31m", "\033[0m"                   # 红色加粗
+    dom = G["domain"]
+    try:
+        resolved = sorted({info[4][0] for info in socket.getaddrinfo(dom, None)})
+    except Exception:
+        raise SystemExit(f"{R}\n❌ 域名 {dom} 解析不到（DNS 查询失败）。检查域名拼写/解析是否生效，"
+                         f"或重跑时域名留空用『自签证书+IP』安装。{N}")
+    myip = public_ip()
+    if myip not in resolved:
+        raise SystemExit(
+            f"{R}\n❌ 域名与服务器 IP 不匹配，无法签发证书，已停止（未改动本机任何配置）：\n"
+            f"   域名 {dom} 解析到 → {', '.join(resolved)}\n"
+            f"   本机公网 IP    → {myip}\n"
+            f"   请把 {dom} 的 A 记录改指向 {myip}，等 DNS 生效后再装；\n"
+            f"   或重跑时域名留空，用『自签证书 + IP』安装（无需域名，最省事）。{N}")
+    if not port_free(80):
+        raise SystemExit(f"{R}\n❌ 80 端口被占用，acme standalone 无法验证。先停掉占用 80 的服务"
+                         f"（nginx/caddy 等）再装，或域名留空用自签。{N}")
+
 # ---------------------------------------------------------------------------- 核心安装
 def arch_tag():
     return {"x86_64": "amd64", "aarch64": "arm64"}[os.uname().machine]
@@ -703,6 +728,7 @@ def takeover_cleanup():
 
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
+    check_domain_or_die()       # 域名不匹配就此停止——必须在 takeover 卸载别人之前
     takeover_cleanup()          # 有别人装的(mack-a 等)先踢掉再接管
     # 节点地址：有域名用域名，否则用公网 IP（域名需直连 A 记录指向本机）
     G["host"] = G["domain"] or public_ip()
