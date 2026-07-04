@@ -16,7 +16,9 @@
 # ============================================================================
 import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, shutil, socket
 
-SB_VER   = "1.11.15"
+# 版本：安装时优先取 GitHub 最新正式版；下面是取不到时的兜底。
+# ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
+SB_VER   = "1.12.0"
 XRAY_VER = "25.3.6"
 SB_BIN, XRAY_BIN = "/usr/local/bin/sing-box", "/usr/local/bin/xray"
 SB_DIR,  XRAY_DIR = "/etc/sing-box", "/usr/local/etc/xray"
@@ -141,23 +143,37 @@ def tls_host():                                     # ws/trojan 的 SNI/Host
 def arch_tag():
     return {"x86_64": "amd64", "aarch64": "arm64"}[os.uname().machine]
 
+def latest_gh_release(repo, fallback):
+    """取 GitHub 最新正式版 tag（去掉前导 v）。取不到就用 fallback。
+       和 mack-a 一样跟随 latest —— 否则钉死旧版会缺协议（如 anytls 需 1.12）。"""
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases/latest",
+            headers={"User-Agent": "xy-installer", "Accept": "application/vnd.github+json"})
+        tag = json.loads(urllib.request.urlopen(req, timeout=15).read())["tag_name"]
+        return tag.lstrip("v") or fallback
+    except Exception:
+        return fallback
+
 def install_singbox():
-    if os.path.exists(SB_BIN):
-        return
+    ver = latest_gh_release("SagerNet/sing-box", SB_VER)
+    if os.path.exists(SB_BIN) and ver in sh(f"{SB_BIN} version", check=False):
+        return                                          # 已是目标版本，跳过
     a = arch_tag()
     url = (f"https://github.com/SagerNet/sing-box/releases/download/"
-           f"v{SB_VER}/sing-box-{SB_VER}-linux-{a}.tar.gz")
+           f"v{ver}/sing-box-{ver}-linux-{a}.tar.gz")
     sh(f"curl -Lo /tmp/sb.tgz {url} && tar -xzf /tmp/sb.tgz -C /tmp")
-    sh(f"install -m755 /tmp/sing-box-{SB_VER}-linux-{a}/sing-box {SB_BIN}")
+    sh(f"install -m755 /tmp/sing-box-{ver}-linux-{a}/sing-box {SB_BIN}")
     os.makedirs(SB_DIR, exist_ok=True)
 
 def install_xray():
-    if os.path.exists(XRAY_BIN):
+    ver = latest_gh_release("XTLS/Xray-core", XRAY_VER)
+    if os.path.exists(XRAY_BIN) and ver in sh(f"{XRAY_BIN} version", check=False):
         return
     a = arch_tag()
     zmap = {"amd64": "64", "arm64": "arm64-v8a"}
     url = (f"https://github.com/XTLS/Xray-core/releases/download/"
-           f"v{XRAY_VER}/Xray-linux-{zmap[a]}.zip")
+           f"v{ver}/Xray-linux-{zmap[a]}.zip")
     sh(f"curl -Lo /tmp/xray.zip {url} && unzip -o /tmp/xray.zip -d /tmp/xray")
     sh(f"install -m755 /tmp/xray/xray {XRAY_BIN}")
     os.makedirs(XRAY_DIR, exist_ok=True)
@@ -170,13 +186,26 @@ def reality_keys(binpath, cmd):
     return priv, pub
 
 def write_service(name, binpath, cfg):
+    # 先校验配置，schema 错就当场报出来（避免像之前 anytls 那样静默起不来）
+    r = subprocess.run(f"{binpath} check -c {cfg}", shell=True, text=True, capture_output=True)
+    if r.returncode:
+        raise RuntimeError(f"{name} 配置校验失败（多半是内核版本太旧不认某协议）:\n"
+                           f"{(r.stderr or r.stdout).strip()}")
+    unit_path = f"/etc/systemd/system/{name}.service"
+    # 不覆盖指向别的程序的同名服务（典型：机器上已装 mack-a 的 sing-box.service）
+    if os.path.exists(unit_path) and binpath not in open(unit_path).read():
+        raise RuntimeError(
+            f"{unit_path} 已存在且指向别的程序（可能是 mack-a 等现有安装）。"
+            f"本脚本不覆盖它以免破坏现有服务。请在干净的机器上运行，"
+            f"或先卸载现有 {name}（systemctl disable --now {name} 并删除该 unit）。")
     unit = (f"[Unit]\nAfter=network.target nss-lookup.target\n"
             f"[Service]\nExecStart={binpath} run -c {cfg}\n"
             f"Restart=on-failure\nRestartSec=3\nLimitNOFILE=1000000\n"
             f"[Install]\nWantedBy=multi-user.target\n")
-    open(f"/etc/systemd/system/{name}.service", "w").write(unit)
+    open(unit_path, "w").write(unit)
     sh("systemctl daemon-reload")
-    sh(f"systemctl enable --now {name}")
+    sh(f"systemctl enable {name}", check=False)
+    sh(f"systemctl restart {name}")                     # restart 而非 enable --now：重跑能加载新配置
 
 # ============================================================================
 # sing-box 协议表 —— 每个 builder 返回 (inbound_dict, share_link)
