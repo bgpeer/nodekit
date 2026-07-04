@@ -14,7 +14,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, shutil, socket
+import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, shutil, socket, re
 
 # 版本：安装时优先取 GitHub 最新正式版；下面是取不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -504,8 +504,54 @@ def build(table, names):
         inbounds.append(ib); links.append(lk)
     return inbounds, links
 
+def detect_existing():
+    """扫 systemd，找出跑 sing-box/xray 但不是本脚本装的服务（典型：mack-a/v2ray-agent）。
+       返回 [(unit名, ExecStart路径)]。只认『别人家』的——本脚本自己的(指向 SB_BIN/XRAY_BIN)不算。"""
+    found, d = [], "/etc/systemd/system"
+    if not os.path.isdir(d):
+        return found
+    for f in os.listdir(d):
+        if not f.endswith(".service"):
+            continue
+        try:
+            txt = open(os.path.join(d, f)).read()
+        except OSError:
+            continue
+        m = re.search(r"ExecStart=(\S+)", txt)
+        if not m or not re.search(r"sing-box|xray", txt):
+            continue
+        if SB_BIN in txt or XRAY_BIN in txt:            # 本脚本自己的，跳过
+            continue
+        found.append((f[:-8], m.group(1)))
+    return found
+
+def takeover_cleanup():
+    """检测到别人装的节点就卸掉、由本脚本接管。破坏性操作，需确认（--yes 免交互）。"""
+    units = detect_existing()
+    dirs  = [p for p in ("/etc/v2ray-agent",) if os.path.isdir(p)]   # mack-a 目录
+    if not units and not dirs:
+        return
+    print("\n检测到本机已有『别人搭建』的代理安装：")
+    for u, path in units:
+        print(f"  - 服务 {u}.service  →  {path}")
+    for p in dirs:
+        print(f"  - 目录 {p}（疑似 mack-a / v2ray-agent）")
+    if not G.get("force"):
+        ans = _ask("卸载它们、由本脚本接管？此操作不可逆 [y/N]: ")
+        if ans.lower() not in ("y", "yes"):
+            raise RuntimeError("已取消：未清理现有安装。换台干净机器，或加 --yes 确认接管。")
+    for u, _ in units:
+        sh(f"systemctl disable --now {u}", check=False)
+        sh(f"rm -f /etc/systemd/system/{u}.service", check=False)
+    sh("systemctl daemon-reload", check=False)
+    for p in dirs:
+        sh(f"rm -rf {p}", check=False)
+    sh("rm -f /usr/bin/vasma /usr/bin/v2ray-agent", check=False)     # mack-a 管理命令软链
+    print("已清理，端口与服务名已腾出。\n")
+
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
+    takeover_cleanup()          # 有别人装的(mack-a 等)先踢掉再接管
     G["host"] = public_ip()
     all_links = []
 
@@ -625,9 +671,11 @@ if __name__ == "__main__":
     ap.add_argument("--domain", default="", help="有域名则走 acme 真证书")
     ap.add_argument("--email", default="", help="acme 注册邮箱")
     ap.add_argument("--sni", default="www.microsoft.com", help="reality 借用的目标站")
+    ap.add_argument("--yes", action="store_true",
+                    help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
 
-    G["domain"], G["email"], G["sni"] = a.domain, a.email, a.sni
+    G["domain"], G["email"], G["sni"], G["force"] = a.domain, a.email, a.sni, a.yes
     sb = list(SB) if a.sb == "all" else [x for x in a.sb.split(",") if x]
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
     if not sb and not xr:
