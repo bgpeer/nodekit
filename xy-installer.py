@@ -361,14 +361,39 @@ def sb_shadowtls(port, tag):
            f"plugin-opts: {{host: {G['sni']}, password: {pw}, version: 3}}}}")
     return [st_ib, ss_ib], yml
 
-SB = {"reality-vision": sb_reality_vision, "reality-grpc": sb_reality_grpc,
-      "hy2": sb_hysteria2, "tuic": sb_tuic, "anytls": sb_anytls, "ss2022": sb_ss2022,
-      "vless-ws": make_sb_vless("ws"), "vless-h2": make_sb_vless("h2"),
-      "vless-httpupgrade": make_sb_vless("httpupgrade"),
-      "vmess-ws": make_sb_vmess("ws"), "vmess-h2": make_sb_vmess("h2"),
+def sb_vless_vision(port, tag):
+    # VLESS + TCP + 真 TLS + XTLS-Vision（对应 mack-a 的 VLESS_TCP/TLS_Vision）
+    # 与 reality-vision 区别：这条用服务器自己的证书（给域名走 acme，否则自签+insecure）
+    uid = new_uuid(); crt, key, insec = ensure_acme()
+    ib = {"type": "vless", "tag": tag, "listen": "::", "listen_port": port,
+          "users": [{"uuid": uid, "flow": "xtls-rprx-vision"}],
+          "tls": {"enabled": True, "server_name": tls_host(),
+                  "certificate_path": crt, "key_path": key}}
+    lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&flow=xtls-rprx-vision"
+          f"&security=tls&sni={tls_host()}&fp=chrome&type=tcp"
+          f"&allowInsecure={1 if insec else 0}#{tag}")
+    return ib, lk
+
+# 当前只装这 10 个协议（对齐 mack-a 的输出，顺序也一致）。
+# 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
+SB = {"vless-vision": sb_vless_vision,
+      "vless-ws": make_sb_vless("ws"),
+      "vmess-ws": make_sb_vmess("ws"),
+      "trojan": sb_trojan,
+      "hy2": sb_hysteria2,
+      "reality-vision": sb_reality_vision,
+      "reality-grpc": sb_reality_grpc,
+      "tuic": sb_tuic,
       "vmess-httpupgrade": make_sb_vmess("httpupgrade"),
-      "trojan": sb_trojan, "socks5": sb_socks5, "naive": sb_naive,
-      "shadowtls": sb_shadowtls}
+      "anytls": sb_anytls}
+# 备用（以后想加回，取消注释挪进上面的 SB）：
+#   "ss2022": sb_ss2022,
+#   "vless-h2": make_sb_vless("h2"),
+#   "vless-httpupgrade": make_sb_vless("httpupgrade"),
+#   "vmess-h2": make_sb_vmess("h2"),
+#   "socks5": sb_socks5,
+#   "naive": sb_naive,
+#   "shadowtls": sb_shadowtls,
 
 # ============================================================================
 # xray 协议表 —— builder 返回 (inbound_dict, share_link)
