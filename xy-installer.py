@@ -26,7 +26,7 @@ CERT, KEY = "/etc/ssl/sb/self.crt", "/etc/ssl/sb/self.key"     # 自签
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"  # acme 签发
 
 # 全局状态：域名/邮箱/SNI 由 CLI 注入；端口自增分配
-G = {"host": "", "domain": "", "email": "", "sni": "s0.awsstatic.com", "_port": 20000}
+G = {"host": "", "domain": "", "email": "", "sni": "s0.awsstatic.com", "prefix": "", "_port": 20000}
 HY2_PORTS = "30000-31000"      # hy2 端口跳跃范围（对齐 mack-a）；iptables 把这段 UDP 转发到真实端口
 
 # 订阅：把生成的节点注入一份完整 Mihomo 模板，起 HTTP 服务托管，产出一条订阅链接
@@ -106,12 +106,20 @@ def ensure_self_signed():
     sh(f"openssl ecparam -genkey -name prime256v1 -out {KEY}")
     sh(f'openssl req -new -x509 -days 3650 -key {KEY} -out {CERT} -subj "/CN={G["sni"]}"')
 
+def cert_covers(path, domain):
+    """现有证书是否就是给这个域名签的（换域名重装时避免复用旧域名的证书）。"""
+    if not domain or not os.path.exists(path):
+        return False
+    return domain in sh(f"openssl x509 -in {path} -noout -text 2>/dev/null", check=False)
+
 def ensure_acme():
     """给了 --domain 就用 acme.sh standalone 签真证书；否则回落自签。"""
     if not G["domain"]:
         ensure_self_signed()
         return CERT, KEY, True                      # (crt, key, insecure)
-    if not os.path.exists(ACME_CRT):
+    # 只有『证书缺失』或『证书不是当前域名的』才重新签——换域名重装必须重签，
+    # 否则会拿着旧域名证书导致 8 个走域名证书的节点全部握手失败。
+    if not cert_covers(ACME_CRT, G["domain"]):
         # standalone 用 socat 起临时 HTTP 服务占 80 端口做验证，缺 socat 必挂
         if not have("socat"):
             ensure_deps()
@@ -526,7 +534,8 @@ XRAY = {"vless-reality-vision": xr_reality_vision,
 def build(table, names):
     inbounds, links = [], []
     for n in names:
-        ib, lk = table[n](next_port(), f"{n}-{G['host']}")
+        # 名称 = 用户前缀 + 协议名（默认无前缀，别人部署 US/SG 时自己填 🇺🇸/🇸🇬 等）
+        ib, lk = table[n](next_port(), G.get("prefix", "") + n)
         inbounds.append(ib); links.append(lk)
     return inbounds, links
 
@@ -542,8 +551,8 @@ def link_to_proxy(u):
     sch, host, port = P.scheme, P.hostname, P.port
     uq = urllib.parse.unquote
     def nm(default):
-        f = uq(P.fragment) if P.fragment else default
-        return '"🎌' + re.sub(r"-\d+\.\d+\.\d+\.\d+$", "", f) + '"'
+        # 名称直接用链接里的 #备注（已含用户前缀+协议）；不再硬编码国旗
+        return '"' + (uq(P.fragment) if P.fragment else default) + '"'
     insec = qs.get("insecure") == "1" or qs.get("allowInsecure") == "1" or qs.get("allow_insecure") == "1"
     if sch == "vless":
         net = qs.get("type", "tcp"); sec = qs.get("security", "none")
@@ -590,7 +599,7 @@ def link_to_proxy(u):
         return d
     if sch == "vmess":
         b = u[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
-        name = '"🎌' + re.sub(r"-\d+\.\d+\.\d+\.\d+$", "", j.get("ps", "vmess")) + '"'
+        name = '"' + j.get("ps", "vmess") + '"'
         d = {"name": name, "type": "vmess", "server": j["add"], "port": int(j["port"]), "uuid": j["id"],
              "alterId": int(j.get("aid", 0)), "cipher": j.get("scy", "auto"), "udp": "true"}
         if j.get("tls") == "tls": d["tls"] = "true"; d["servername"] = j.get("sni") or j.get("host")
@@ -689,7 +698,8 @@ def takeover_cleanup():
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
     takeover_cleanup()          # 有别人装的(mack-a 等)先踢掉再接管
-    G["host"] = public_ip()
+    # 节点地址：有域名用域名，否则用公网 IP（域名需直连 A 记录指向本机）
+    G["host"] = G["domain"] or public_ip()
     all_links = []
 
     if sb_names:
@@ -791,12 +801,15 @@ def menu():
     domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
     email = _ask("acme 注册邮箱(回车=默认): ") if domain else ""
     sni = _ask("reality 借用目标站 SNI (回车=s0.awsstatic.com): ") or "s0.awsstatic.com"
-    G["domain"], G["email"], G["sni"] = domain, email, sni
+    prefix = _ask("节点名称前缀(如 🇺🇸/🇯🇵/家宽，回车=无前缀): ")
+    G["domain"], G["email"], G["sni"], G["prefix"] = domain, email, sni, prefix
 
     print("\n" + "-" * 60)
     if sb_names: print("  sing-box:", ", ".join(sb_names))
     if xr_names: print("  xray:    ", ", ".join(xr_names))
     print("  证书:    ", f"acme真证书({domain})" if domain else "自签")
+    print("  节点地址:", domain if domain else "公网IP")
+    print("  名称前缀:", prefix or "(无)")
     print("  SNI:     ", sni)
     print("-" * 60)
     if (_ask("确认开始? [Y/n]: ") or "y").lower() in ("n", "no"):
@@ -823,11 +836,12 @@ if __name__ == "__main__":
     ap.add_argument("--domain", default="", help="有域名则走 acme 真证书")
     ap.add_argument("--email", default="", help="acme 注册邮箱")
     ap.add_argument("--sni", default="s0.awsstatic.com", help="reality 借用的目标站")
+    ap.add_argument("--prefix", default="", help="节点名称前缀(如 🇺🇸/🇯🇵)，默认无")
     ap.add_argument("--yes", action="store_true",
                     help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
 
-    G["domain"], G["email"], G["sni"], G["force"] = a.domain, a.email, a.sni, a.yes
+    G["domain"], G["email"], G["sni"], G["prefix"], G["force"] = a.domain, a.email, a.sni, a.prefix, a.yes
     sb = list(SB) if a.sb == "all" else [x for x in a.sb.split(",") if x]
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
     if not sb and not xr:
