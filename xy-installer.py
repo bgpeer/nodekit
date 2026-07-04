@@ -784,6 +784,116 @@ def run(sb_names, xr_names):
         print("=" * 60)
         print(f"※ 明文 HTTP + 随机 token，请勿外传；改端口/关闭见 xy-sub.service（端口 {SUB_PORT}）")
 
+    install_shortcut()
+    print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
+
+# ============================================================================ 管理面板 / 快捷命令
+def install_shortcut():
+    """安装 bgpeer 快捷命令：本地存一份脚本，wrapper 每次尽量拉最新再运行。"""
+    try:
+        os.makedirs("/etc/bgpeer", exist_ok=True)
+        open("/etc/bgpeer/xy-installer.py", "w").write(open(__file__).read())
+        wrapper = ("#!/usr/bin/env bash\n"
+                   'u="https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py"\n'
+                   'curl -fsSL "$u" -o /etc/bgpeer/xy-installer.py 2>/dev/null || true\n'
+                   'exec python3 /etc/bgpeer/xy-installer.py "$@"\n')
+        open("/usr/local/bin/bgpeer", "w").write(wrapper)
+        os.chmod("/usr/local/bin/bgpeer", 0o755)
+    except Exception:
+        pass
+
+def read_saved_links():
+    out = []
+    try:
+        for l in open("/root/xy-nodes.txt"):
+            s = l.strip()
+            if s.startswith("#"):          # 到「# 订阅链接:」注释就停，别把订阅 URL 当节点
+                break
+            if "://" in s:
+                out.append(s)
+    except OSError:
+        pass
+    return out
+
+def show_links():
+    links = read_saved_links()
+    if not links:
+        print("\n还没有节点，请先『1.安装』。"); return
+    print("\n" + "=" * 60 + "\n分享链接:\n" + "=" * 60)
+    print("\n".join(links))
+    try:
+        txt = open("/root/xy-nodes.txt").read()
+        if "http" in txt.split("订阅链接")[-1]:
+            print("=" * 60 + "\n订阅链接:" + txt.split("订阅链接:")[-1].rstrip())
+    except Exception:
+        pass
+
+def update_mihomo_sub():
+    """用最新模板 + 已保存节点重新生成订阅（改了模板/规则后刷新用）。"""
+    links = read_saved_links()
+    if not links:
+        print("\n还没有节点，请先『1.安装』。"); return
+    G["host"] = public_ip()
+    try:
+        sub = build_subscription(links)
+        print("\n已用最新模板重新生成订阅：\n" + (sub or "(无节点)"))
+    except Exception as e:
+        print("\n生成失败:", e)
+
+def update_cores():
+    print("\n更新核心:  1. sing-box   2. xray   3. 两个   0. 返回")
+    c = _ask("选择: ")
+    if c == "0" or not c:
+        return
+    ensure_deps()
+    if c in ("1", "3") and os.path.exists(SB_BIN):
+        install_singbox(); sh("systemctl restart sing-box", check=False)
+        print("sing-box 现版本:", sh(f"{SB_BIN} version", check=False).splitlines()[0] if sh(f"{SB_BIN} version", check=False) else "?")
+    if c in ("2", "3") and os.path.exists(XRAY_BIN):
+        install_xray(); sh("systemctl restart xray", check=False)
+        print("xray 已更新")
+    print("更新完成。")
+
+def uninstall_all():
+    print("\n将卸载本脚本安装的：sing-box/xray/订阅服务、配置、证书、端口跳跃规则、bgpeer 命令。")
+    if (_ask("确认卸载? [y/N]: ") or "n").lower() not in ("y", "yes"):
+        print("已取消。"); return
+    for svc in ("sing-box", "xray", "xy-sub"):
+        sh(f"systemctl disable --now {svc}", check=False)
+        sh(f"rm -f /etc/systemd/system/{svc}.service", check=False)
+    sh("systemctl daemon-reload", check=False)
+    for line in sh("iptables -t nat -S PREROUTING", check=False).splitlines():
+        if line.startswith("-A") and "xy_hy2_portHopping" in line:
+            sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
+    sh("netfilter-persistent save", check=False)
+    for p in (SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, "/etc/ssl/sb", SUB_DIR,
+              "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer"):
+        sh(f"rm -rf {p}", check=False)
+    print("已卸载完毕。")
+
+def main_menu():
+    while True:
+        print("\n" + "=" * 60)
+        print("  bgpeer 一键脚本  （sing-box + xray 多协议 / 订阅）")
+        print("=" * 60)
+        print("  1. 安装")
+        print("  2. 节点链接")
+        print("  3. mihomo 配置（修改 / 更新订阅）")
+        print("  4. 更新核心（sing-box / xray）")
+        print("  5. 卸载")
+        print("  0. 退出")
+        print("-" * 60)
+        c = _ask("请选择: ").strip()
+        if c == "1":   install_flow()
+        elif c == "2": show_links()
+        elif c == "3": update_mihomo_sub()
+        elif c == "4": update_cores()
+        elif c == "5": uninstall_all()
+        elif c == "0" or c == "":
+            print("再见。"); return
+        else:
+            print("无效选择。")
+
 # ============================================================================ 交互菜单
 def _ask(prompt=""):
     """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。"""
@@ -815,7 +925,7 @@ def _pick(title, options):
             print(f"  ⚠ 忽略无效项: {tok}")
     return picked
 
-def menu():
+def install_flow():
     print("=" * 60)
     print("  sing-box + xray 交互安装")
     print("=" * 60)
@@ -856,8 +966,8 @@ def menu():
 # ============================================================================ CLI
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) == 1:          # 不带参数 → 交互菜单
-        menu()
+    if len(sys.argv) == 1:          # 不带参数 → 管理面板（bgpeer 也走这里）
+        main_menu()
         sys.exit(0)
     ap = argparse.ArgumentParser(
         description="sing-box + xray 双核心多协议安装器",
