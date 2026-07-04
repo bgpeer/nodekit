@@ -244,9 +244,12 @@ def setup_port_hopping(target_port, rng):
        与 mack-a 同法。带 comment 便于去重/清理；尽量持久化。"""
     lo, hi = rng.split("-")
     tagc = "xy_hy2_portHopping"
-    # 先清掉本脚本旧的同类规则，避免重跑叠加
+    # 先清掉这段 UDP 上所有旧 DNAT 规则——不只本脚本的，还包括 mack-a 等残留的
+    # “强制固定”规则（它们指向已死的旧端口，且可能排在前面先匹配，导致 hy2 不通）。
     for line in sh("iptables -t nat -S PREROUTING", check=False).splitlines():
-        if tagc in line and line.startswith("-A"):
+        if not line.startswith("-A"):
+            continue
+        if "portHopping" in line or f"--dport {lo}:{hi}" in line:
             sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
     sh(f"iptables -t nat -A PREROUTING -p udp --dport {lo}:{hi} "
        f"-m comment --comment {tagc} -j DNAT --to-destination :{target_port}", check=False)
@@ -566,7 +569,11 @@ def takeover_cleanup():
     for p in dirs:
         sh(f"rm -rf {p}", check=False)
     sh("rm -f /usr/bin/vasma /usr/bin/v2ray-agent", check=False)     # mack-a 管理命令软链
-    print("已清理，端口与服务名已腾出。\n")
+    # 清掉别人残留的端口跳跃 iptables 规则（mack-a 的“强制固定”DNAT，指向已死端口会顶掉 hy2）
+    for line in sh("iptables -t nat -S PREROUTING", check=False).splitlines():
+        if line.startswith("-A") and "portHopping" in line:
+            sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
+    print("已清理，端口/服务名/端口跳跃规则已腾出。\n")
 
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
