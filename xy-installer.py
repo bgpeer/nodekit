@@ -171,10 +171,29 @@ def ensure_acme():
     return ACME_CRT, ACME_KEY, False
 
 # ---------------------------------------------------------------------------- nginx 前置
+def clean_stale_nginx():
+    """删掉引用了已不存在证书/目录（如 mack-a 残留 /etc/v2ray-agent）的 nginx 配置文件，
+       否则别人的坏块会让 nginx -t 全局失败、我们的 stub 也写不进去。不动 nginx.conf 主文件。"""
+    for d in ("/etc/nginx/conf.d", "/etc/nginx/sites-enabled", "/etc/nginx/sites-available"):
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            fp = os.path.join(d, f)
+            if os.path.abspath(fp) == os.path.abspath(NGINX_CONF):
+                continue
+            try:
+                txt = open(fp).read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if "/etc/v2ray-agent" in txt:                # mack-a 残留、引用已删证书
+                print(f"移除残留 nginx 配置(引用已删证书): {fp}")
+                sh(f"rm -f {fp}", check=False)
+
 def ensure_nginx():
     if not have("nginx"):
         sh("apt-get update -y", check=False)
         sh("DEBIAN_FRONTEND=noninteractive apt-get install -y nginx", check=False)
+    clean_stale_nginx()                                  # 先清掉别人残留的坏块，保证 nginx -t 能过
     os.makedirs(WEBROOT, exist_ok=True)
     if not os.path.exists(WEBROOT + "/index.html"):     # 伪装站首页
         open(WEBROOT + "/index.html", "w").write(
@@ -798,11 +817,14 @@ def detect_existing():
         except OSError:
             continue
         m = re.search(r"ExecStart=(\S+)", txt)
-        if not m or not re.search(r"sing-box|xray", txt):
+        if not m:
             continue
-        if SB_BIN in txt or XRAY_BIN in txt:            # 本脚本自己的，跳过
+        exe = m.group(1)                                 # 只认『可执行文件本身是 sing-box/xray』的
+        if not re.search(r"(sing-box|xray)$", exe):      # 避免把 xy-sub(python http.server) 误判
             continue
-        found.append((f[:-8], m.group(1)))
+        if exe in (SB_BIN, XRAY_BIN):                    # 本脚本自己的核心，跳过
+            continue
+        found.append((f[:-8], exe))
     return found
 
 def takeover_cleanup():
