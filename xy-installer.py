@@ -42,6 +42,7 @@ SBOX_FILE    = BGP_DIR + "/singbox.json"     # sing-box 客户端可编辑成品
 SR_FILE      = BGP_DIR + "/shadowrocket.conf" # Shadowrocket 可编辑成品配置
 SUB_DIR      = BGP_DIR + "/sub"              # HTTP 托管目录（<token>.yaml/.json/.conf 软链）
 HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
+STATE_FILE   = BGP_DIR + "/state.json"       # 记住上次安装（域名/前缀/协议等），重装默认保持节点不变
 SUB_PORT     = 20080
 _RAW         = "https://raw.githubusercontent.com/bgpeer/nodekit/main/"
 TEMPLATE_URL = _RAW + "sub-template.yaml"           # mihomo 模板
@@ -1025,7 +1026,7 @@ def build_subscription(all_links):
     build_singbox_sub(nodes)
     build_shadowrocket_sub(nodes)
     open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先），换 token 不丢
-    token = secrets.token_urlsafe(12)
+    token = current_token() or secrets.token_urlsafe(12)   # 复用已有 token，重建不改订阅 URL
     serve_sub(token)
     return token
 
@@ -1148,6 +1149,15 @@ def run(sb_names, xr_names):
         print(urls)
         print("=" * 60)
         print(f"※ 明文 HTTP + 随机 token，请勿外传；改端口/关闭见 xy-sub.service（端口 {SUB_PORT}）")
+
+    # 记住这次安装（节点不再随重装丢失：下次进安装默认「保持节点、只更新配置」）
+    try:
+        json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"],
+                   "prefix": G.get("prefix", ""), "hy2_ports": G.get("hy2_ports", ""),
+                   "nginx": G.get("nginx", ""), "sb": sb_names, "xray": xr_names},
+                  open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
     install_shortcut()
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
@@ -1310,7 +1320,36 @@ def _pick(title, options):
             print(f"  ⚠ 忽略无效项: {tok}")
     return picked
 
+def refresh_keep():
+    """保持节点不变：复用上次的 host/域名与已存节点链接，只用最新模板重生成三格式配置。"""
+    try:
+        st = json.load(open(STATE_FILE))
+    except Exception:
+        st = {}
+    for k in ("host", "domain", "sni", "prefix", "hy2_ports", "nginx"):
+        G[k] = st.get(k, "")
+    links = read_saved_links()
+    if not links:
+        print("没找到已存节点，无法保持。请选重新生成。"); return
+    ensure_deps()
+    token = None
+    try:
+        token = build_subscription(links)               # 节点不动，只重生成客户端配置
+    except Exception as e:
+        print("配置更新失败:", e); return
+    install_shortcut()
+    print("\n" + "=" * 60)
+    print("节点保持不变，已用最新模板更新配置。订阅链接（URL 未变）:")
+    print("=" * 60)
+    print(sub_urls_text(token) if token else "(无)")
+
 def install_flow():
+    # 已装过就默认「保持节点、只更新配置」，不再每次重装换节点（对齐 mack-a）
+    if os.path.exists(STATE_FILE) and read_saved_links():
+        ans = _ask("检测到已安装。回车=保持节点不变、只用最新模板更新配置；输 new=重新生成全部节点: ")
+        if ans.strip().lower() != "new":
+            refresh_keep(); return
+        G["regen"] = "1"
     print("=" * 60)
     print("  sing-box + xray 交互安装")
     print("=" * 60)
