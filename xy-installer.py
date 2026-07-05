@@ -907,10 +907,11 @@ def build_singbox_sub(nodes):
         return ", ".join(json.dumps(t, ensure_ascii=False) for t in sel) or '"DIRECT"'
     txt = re.sub(r'"__PATTERN__:([^"]*)"', expand, txt)
     try:
-        json.loads(txt)                                  # 落盘前校验合法
+        obj = json.loads(txt)                            # 校验合法
     except Exception as e:
         print("sing-box 配置生成后 JSON 不合法，跳过:", e); return
-    open(SBOX_FILE, "w").write(txt)
+    # 模板是压缩的；服务器上这份重新展开成缩进格式，方便用户编辑
+    open(SBOX_FILE, "w").write(json.dumps(obj, ensure_ascii=False, indent=2))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
 def shadowrocket_line(name, d):
