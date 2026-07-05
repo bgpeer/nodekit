@@ -882,10 +882,36 @@ def mihomo_to_sb_outbound(key, d):
                         "alpn": ["h2", "http/1.1"], "utls": utls}}
     return None
 
+def _sb_has_container(d):
+    """dict 里有嵌套 dict、或有『含 dict 的数组』→ 该展开；否则整体压一行。"""
+    for v in d.values():
+        if isinstance(v, dict):
+            return True
+        if isinstance(v, list) and any(isinstance(e, dict) for e in v):
+            return True
+    return False
+
+def sb_dumps(v, ind=0):
+    """sing-box 手写风格：容器(root/dns/route 等)展开缩进；数组每个元素各占一行、
+       且元素对象整体压成一行（节点/规则/策略组一行一个）。"""
+    pad, pad1 = "  " * ind, "  " * (ind + 1)
+    if isinstance(v, dict):
+        if not _sb_has_container(v):
+            return json.dumps(v, ensure_ascii=False)                 # 叶子对象一行
+        parts = [f'{pad1}{json.dumps(k, ensure_ascii=False)}: {sb_dumps(val, ind + 1)}'
+                 for k, val in v.items()]
+        return "{\n" + ",\n".join(parts) + "\n" + pad + "}"
+    if isinstance(v, list):
+        if not any(isinstance(e, (dict, list)) for e in v):
+            return json.dumps(v, ensure_ascii=False)                 # 纯标量数组内联
+        parts = [f'{pad1}{json.dumps(e, ensure_ascii=False)}' for e in v]  # 每元素一行
+        return "[\n" + ",\n".join(parts) + "\n" + pad + "]"
+    return json.dumps(v, ensure_ascii=False)
+
 def build_singbox_sub(nodes):
-    """服务器端生成节点对象填 __PROXY__ 锚点、展开名称填 __PATTERN__ 锚点。模板不带任何连接参数。"""
+    """对象级替换两锚点(__PROXY__ 换节点对象、__PATTERN__ 展开节点名)，再按手写风格序列化。"""
     try:
-        txt = fetch_url(SBOX_TPL_URL)
+        cfg = json.loads(fetch_url(SBOX_TPL_URL))
     except Exception as e:
         print("sing-box 模板拉取失败，跳过:", e); return
     objs = []
@@ -898,20 +924,27 @@ def build_singbox_sub(nodes):
     if not objs:
         return
     tags = [o["tag"] for o in objs]
-    # 节点锚点：占位串换成真实节点对象
-    txt = txt.replace('"__PROXY__"', ",\n    ".join(json.dumps(o, ensure_ascii=False) for o in objs))
-    # 名称锚点：每个 "__PATTERN__:正则" 换成命中该正则的节点名列表
-    def expand(m):
-        rx = m.group(1)
-        sel = [t for t in tags if re.search(rx, t)]
-        return ", ".join(json.dumps(t, ensure_ascii=False) for t in sel) or '"DIRECT"'
-    txt = re.sub(r'"__PATTERN__:([^"]*)"', expand, txt)
-    try:
-        obj = json.loads(txt)                            # 校验合法
-    except Exception as e:
-        print("sing-box 配置生成后 JSON 不合法，跳过:", e); return
-    # 模板是压缩的；服务器上这份重新展开成缩进格式，方便用户编辑
-    open(SBOX_FILE, "w").write(json.dumps(obj, ensure_ascii=False, indent=2))
+    def expand_list(lst):
+        out = []
+        for x in lst:
+            if x == "__PROXY__":
+                out += objs                                          # 节点锚点 → 节点对象
+            elif isinstance(x, str) and x.startswith("__PATTERN__:"):
+                sel = [t for t in tags if re.search(x[len("__PATTERN__:"):], t)]
+                out += sel or ["DIRECT"]                             # 名称锚点 → 命中的节点名
+            else:
+                out.append(x)
+        return out
+    new_ob = []
+    for x in cfg.get("outbounds", []):
+        if x == "__PROXY__":
+            new_ob += objs
+        elif isinstance(x, dict) and isinstance(x.get("outbounds"), list):
+            x["outbounds"] = expand_list(x["outbounds"]); new_ob.append(x)
+        else:
+            new_ob.append(x)
+    cfg["outbounds"] = new_ob
+    open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
 def shadowrocket_line(name, d):
