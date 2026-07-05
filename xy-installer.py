@@ -706,12 +706,14 @@ def link_to_proxy(u):
         if sec == "reality":
             d["reality-opts"] = {"public-key": qs.get("pbk", ""), "short-id": qs.get("sid", "")}
             if net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
+            elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}  # xray 专属
             else: d["network"] = "tcp"
         else:
             if insec: d["skip-cert-verify"] = "true"
             if net == "ws": d["network"] = "ws"; d["ws-opts"] = {"path": qs.get("path", "/"), "headers": {"Host": qs.get("host", host)}}
             elif net == "httpupgrade": d["network"] = "ws"; d["ws-opts"] = {"path": qs.get("path", "/"), "headers": {"Host": qs.get("host", host)}, "v2ray-http-upgrade": "true"}
             elif net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
+            elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}
             else: d["network"] = "tcp"
         return d
     if sch in ("hysteria2", "hy2"):
@@ -807,6 +809,8 @@ def proto_key(d):
     if t == "vmess":
         return "vmess-httpupgrade" if d.get("ws-opts", {}).get("v2ray-http-upgrade") else "vmess-ws"
     if t == "vless":
+        if d.get("network") == "xhttp":
+            return "vless-xhttp"                          # xray 专属，sing-box 不支持 → 不映射
         if d.get("reality-opts"):
             return "reality-grpc" if d.get("network") == "grpc" else "reality-vision"
         if d.get("flow"):
@@ -822,48 +826,91 @@ PROTO_TO_SBTAG = {
     "tuic": "🇺🇲 singbox_tuic", "anytls": "🇺🇲 AnyTLS", "vmess-httpupgrade": "🇺🇲 VMess_HTTPUpgrade_TLS",
 }
 
-def fill_singbox_outbound(ob, d):
-    """把 mihomo 节点 dict 的真实连接参数写进 sing-box 模板节点对象（保留其结构/utls/alpn 等）。"""
-    ob["server"] = d["server"]
-    if d.get("type") == "hysteria2":
-        ob["password"] = d["password"]
+def mihomo_to_sb_outbound(key, d):
+    """mihomo 节点 dict → 完整的 sing-box 出站对象（服务器端现生成，不依赖模板里的固定参数）。
+       不支持的类型(如 xhttp)返回 None，由调用方跳过。"""
+    tag = PROTO_TO_SBTAG.get(key)
+    if not tag:
+        return None                                      # xhttp 等 → 不写进 sing-box
+    srv = d["server"]; sni = d.get("servername") or d.get("sni") or srv
+    insec = bool(d.get("skip-cert-verify"))
+    utls = {"enabled": True, "fingerprint": "chrome"}
+    t = d.get("type")
+    if t == "vless":
+        ob = {"tag": tag, "type": "vless", "server": srv, "server_port": int(d["port"]),
+              "uuid": d["uuid"], "packet_encoding": "xudp",
+              "tls": {"enabled": True, "server_name": sni, "insecure": insec, "utls": utls}}
+        if d.get("flow"): ob["flow"] = d["flow"]
+        if d.get("reality-opts"):
+            ob["tls"]["reality"] = {"enabled": True,
+                                    "public_key": d["reality-opts"].get("public-key", ""),
+                                    "short_id": d["reality-opts"].get("short-id", "")}
+        if d.get("network") == "ws":
+            ob["transport"] = {"type": "ws", "path": d["ws-opts"].get("path", "/"),
+                               "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}
+        elif d.get("network") == "grpc":
+            ob["transport"] = {"type": "grpc", "service_name": d.get("grpc-opts", {}).get("grpc-service-name", "")}
+        return ob
+    if t == "vmess":
+        net = "httpupgrade" if key == "vmess-httpupgrade" else "ws"
+        return {"tag": tag, "type": "vmess", "server": srv, "server_port": int(d["port"]),
+                "uuid": d["uuid"], "security": "none", "alter_id": 0,
+                "tls": {"enabled": True, "server_name": sni, "insecure": insec, "utls": utls},
+                "transport": {"type": net, "path": d["ws-opts"].get("path", "/"),
+                              "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}}
+    if t == "trojan":
+        return {"tag": tag, "type": "trojan", "server": srv, "server_port": int(d["port"]),
+                "password": d["password"],
+                "tls": {"enabled": True, "server_name": sni, "insecure": insec,
+                        "alpn": ["http/1.1"], "utls": utls}}
+    if t == "hysteria2":
+        ob = {"tag": tag, "type": "hysteria2", "server": srv, "password": d["password"],
+              "tls": {"enabled": True, "server_name": sni, "insecure": insec, "alpn": ["h3"]}}
         if d.get("ports"):
-            ob["server_ports"] = [d["ports"].replace("-", ":")]; ob.pop("server_port", None)
+            ob["server_ports"] = [d["ports"].replace("-", ":")]; ob["hop_interval"] = "30s"
         else:
             ob["server_port"] = int(d["port"])
-    else:
-        ob["server_port"] = int(d["port"])
-    if d.get("uuid"):
-        ob["uuid"] = d["uuid"]
-    if d.get("password") and d.get("type") in ("trojan", "tuic", "anytls"):
-        ob["password"] = d["password"]
-    sn = d.get("servername") or d.get("sni")
-    if sn and isinstance(ob.get("tls"), dict):
-        ob["tls"]["server_name"] = sn
-    if d.get("reality-opts") and isinstance(ob.get("tls"), dict):
-        rob = ob["tls"].setdefault("reality", {"enabled": True})
-        rob["public_key"] = d["reality-opts"].get("public-key", "")
-        rob["short_id"] = d["reality-opts"].get("short-id", "")
-    if d.get("ws-opts") and isinstance(ob.get("transport"), dict):
-        ob["transport"]["path"] = d["ws-opts"].get("path", "/")
-        h = d["ws-opts"].get("headers", {}).get("Host")
-        if h:
-            ob["transport"].setdefault("headers", {})["Host"] = h
-    if d.get("grpc-opts") and isinstance(ob.get("transport"), dict):
-        ob["transport"]["service_name"] = d["grpc-opts"].get("grpc-service-name", "")
+        return ob
+    if t == "tuic":
+        return {"tag": tag, "type": "tuic", "server": srv, "server_port": int(d["port"]),
+                "uuid": d["uuid"], "password": d["password"], "congestion_control": "bbr",
+                "tls": {"enabled": True, "server_name": sni, "insecure": insec, "alpn": ["h3"]}}
+    if t == "anytls":
+        return {"tag": tag, "type": "anytls", "server": srv, "server_port": int(d["port"]),
+                "password": d["password"],
+                "tls": {"enabled": True, "server_name": sni, "insecure": insec,
+                        "alpn": ["h2", "http/1.1"], "utls": utls}}
+    return None
 
 def build_singbox_sub(nodes):
-    """nodes: [(proto_key, mihomo_dict)]。按 tag 把参数填进 sing-box 模板，写 SBOX_FILE。"""
+    """服务器端生成节点对象填 __PROXY__ 锚点、展开名称填 __PATTERN__ 锚点。模板不带任何连接参数。"""
     try:
-        cfg = json.loads(fetch_url(SBOX_TPL_URL))
+        txt = fetch_url(SBOX_TPL_URL)
     except Exception as e:
         print("sing-box 模板拉取失败，跳过:", e); return
-    by_tag = {ob.get("tag"): ob for ob in cfg.get("outbounds", [])}
+    objs = []
     for key, d in nodes:
-        tag = PROTO_TO_SBTAG.get(key)
-        if tag and tag in by_tag:
-            fill_singbox_outbound(by_tag[tag], d)
-    open(SBOX_FILE, "w").write(json.dumps(cfg, ensure_ascii=False, indent=2))
+        try:
+            ob = mihomo_to_sb_outbound(key, d)
+            if ob: objs.append(ob)
+        except Exception:
+            pass
+    if not objs:
+        return
+    tags = [o["tag"] for o in objs]
+    # 节点锚点：占位串换成真实节点对象
+    txt = txt.replace('"__PROXY__"', ",\n    ".join(json.dumps(o, ensure_ascii=False) for o in objs))
+    # 名称锚点：每个 "__PATTERN__:正则" 换成命中该正则的节点名列表
+    def expand(m):
+        rx = m.group(1)
+        sel = [t for t in tags if re.search(rx, t)]
+        return ", ".join(json.dumps(t, ensure_ascii=False) for t in sel) or '"DIRECT"'
+    txt = re.sub(r'"__PATTERN__:([^"]*)"', expand, txt)
+    try:
+        json.loads(txt)                                  # 落盘前校验合法
+    except Exception as e:
+        print("sing-box 配置生成后 JSON 不合法，跳过:", e); return
+    open(SBOX_FILE, "w").write(txt)
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
 def shadowrocket_line(name, d):
