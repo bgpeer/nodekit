@@ -37,11 +37,18 @@ def hy2_range():
 # 订阅：把节点注入 Mihomo 模板写成【可编辑配置文件】，HTTP 服务托管，产出订阅链接。
 # 换订阅链接只换 token（软链名），不动配置；用户可直接编辑 CFG_FILE 改参数。
 BGP_DIR      = "/etc/bgpeer"
-CFG_FILE     = BGP_DIR + "/mihomo.yaml"      # 可编辑的成品配置（订阅内容就是它）
-SUB_DIR      = BGP_DIR + "/sub"              # HTTP 托管目录（内含 <token>.yaml 软链 → CFG_FILE）
+CFG_FILE     = BGP_DIR + "/mihomo.yaml"      # mihomo 可编辑成品配置
+SBOX_FILE    = BGP_DIR + "/singbox.json"     # sing-box 客户端可编辑成品配置
+SR_FILE      = BGP_DIR + "/shadowrocket.conf" # Shadowrocket 可编辑成品配置
+SUB_DIR      = BGP_DIR + "/sub"              # HTTP 托管目录（<token>.yaml/.json/.conf 软链）
 HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
 SUB_PORT     = 20080
-TEMPLATE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/sub-template.yaml"
+_RAW         = "https://raw.githubusercontent.com/bgpeer/nodekit/main/"
+TEMPLATE_URL = _RAW + "sub-template.yaml"           # mihomo 模板
+SBOX_TPL_URL = _RAW + "subbox-template.json"        # sing-box 模板
+SR_TPL_URL   = _RAW + "shadowrocket-template.conf"  # Shadowrocket 模板
+# 订阅三格式：扩展名 → 客户端
+SUB_EXTS = {"yaml": "mihomo/clash", "json": "sing-box", "conf": "Shadowrocket"}
 
 # nginx 前置（可选，需域名）：nginx 在 443 终结 TLS + 伪装站 + 按 path 反代 ws 家族；
 # webroot 签证书。Vision/anytls/trojan/reality/hy2/tuic 因协议性质仍走各自端口。
@@ -750,13 +757,19 @@ def link_to_proxy(u):
         return {"name": nm("ss"), "type": "ss", "server": host, "port": port, "cipher": method, "password": pw, "udp": "true"}
     return None
 
-def fetch_template():
-    req = urllib.request.Request(TEMPLATE_URL, headers={"User-Agent": "xy-installer"})
+def fetch_url(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
     return urllib.request.urlopen(req, timeout=15).read().decode()
 
-def sub_url(token):
-    host = open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else public_ip()
-    return f"http://{host}:{SUB_PORT}/{token}.yaml"
+def _host():
+    return open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else (G.get("host") or public_ip())
+
+def sub_url(token, ext="yaml"):
+    return f"http://{_host()}:{SUB_PORT}/{token}.{ext}"
+
+def sub_urls_text(token):
+    have = {"yaml": os.path.exists(CFG_FILE), "json": os.path.exists(SBOX_FILE), "conf": os.path.exists(SR_FILE)}
+    return "\n".join(f"  {SUB_EXTS[e]:<12} {sub_url(token, e)}" for e in ("yaml", "json", "conf") if have[e])
 
 def current_token():
     try:
@@ -768,13 +781,15 @@ def current_token():
     return None
 
 def serve_sub(token):
-    """在 SUB_DIR 放一个 <token>.yaml 软链指向可编辑的 CFG_FILE，并起/重启 http 服务。
-       换 token 只改软链名，CFG_FILE（订阅内容）原样不动。"""
+    """SUB_DIR 放 <token>.yaml/.json/.conf 软链分别指向三份可编辑配置，起/重启 http 服务。
+       换 token 只改软链名，配置文件原样不动。"""
     os.makedirs(SUB_DIR, exist_ok=True)
-    for f in os.listdir(SUB_DIR):                       # 清旧 token 软链/文件
-        if f.endswith(".yaml"):
+    for f in os.listdir(SUB_DIR):                       # 清旧 token 软链
+        if f.rsplit(".", 1)[-1] in SUB_EXTS:
             os.remove(os.path.join(SUB_DIR, f))
-    os.symlink(CFG_FILE, f"{SUB_DIR}/{token}.yaml")     # 软链 → 编辑 CFG_FILE 即时生效
+    for ext, target in (("yaml", CFG_FILE), ("json", SBOX_FILE), ("conf", SR_FILE)):
+        if os.path.exists(target):
+            os.symlink(target, f"{SUB_DIR}/{token}.{ext}")
     open(f"{SUB_DIR}/index.html", "w").write("")        # 有 index 就不列目录，token 不外泄
     svc = (f"[Unit]\nAfter=network.target\n[Service]\n"
            f"ExecStart=/usr/bin/python3 -m http.server {SUB_PORT} --directory {SUB_DIR} --bind 0.0.0.0\n"
@@ -784,24 +799,154 @@ def serve_sub(token):
     sh("systemctl enable xy-sub", check=False)
     sh("systemctl restart xy-sub")
 
-def build_subscription(all_links):
-    """节点注入模板 → 写成可编辑配置 CFG_FILE，记住 host，起服务托管，返回订阅 URL。"""
+# --- 协议归类：mihomo 节点 dict → 统一协议键（三格式共用）---
+def proto_key(d):
+    t = d.get("type")
+    if t in ("hysteria2", "tuic", "anytls", "trojan"):
+        return t if t != "hysteria2" else "hy2"
+    if t == "vmess":
+        return "vmess-httpupgrade" if d.get("ws-opts", {}).get("v2ray-http-upgrade") else "vmess-ws"
+    if t == "vless":
+        if d.get("reality-opts"):
+            return "reality-grpc" if d.get("network") == "grpc" else "reality-vision"
+        if d.get("flow"):
+            return "vless-vision"
+        return "vless-ws"
+    return None
+
+# 协议键 → sing-box 模板里的节点 tag（模板节点名固定，只换连接参数）
+PROTO_TO_SBTAG = {
+    "vless-vision": "🇺🇲 VLESS_TCP/TLS_Vision", "vless-ws": "🇺🇲 VLESS_WS",
+    "vmess-ws": "🇺🇲 VMess_WS", "trojan": "🇺🇲 Trojan_TCP", "hy2": "🇺🇲 Hysteria2_TLS",
+    "reality-vision": "🇺🇲 VLESS_Reality_Vision", "reality-grpc": "🇺🇲 VLESS_Reality_gPRC",
+    "tuic": "🇺🇲 singbox_tuic", "anytls": "🇺🇲 AnyTLS", "vmess-httpupgrade": "🇺🇲 VMess_HTTPUpgrade_TLS",
+}
+
+def fill_singbox_outbound(ob, d):
+    """把 mihomo 节点 dict 的真实连接参数写进 sing-box 模板节点对象（保留其结构/utls/alpn 等）。"""
+    ob["server"] = d["server"]
+    if d.get("type") == "hysteria2":
+        ob["password"] = d["password"]
+        if d.get("ports"):
+            ob["server_ports"] = [d["ports"].replace("-", ":")]; ob.pop("server_port", None)
+        else:
+            ob["server_port"] = int(d["port"])
+    else:
+        ob["server_port"] = int(d["port"])
+    if d.get("uuid"):
+        ob["uuid"] = d["uuid"]
+    if d.get("password") and d.get("type") in ("trojan", "tuic", "anytls"):
+        ob["password"] = d["password"]
+    sn = d.get("servername") or d.get("sni")
+    if sn and isinstance(ob.get("tls"), dict):
+        ob["tls"]["server_name"] = sn
+    if d.get("reality-opts") and isinstance(ob.get("tls"), dict):
+        rob = ob["tls"].setdefault("reality", {"enabled": True})
+        rob["public_key"] = d["reality-opts"].get("public-key", "")
+        rob["short_id"] = d["reality-opts"].get("short-id", "")
+    if d.get("ws-opts") and isinstance(ob.get("transport"), dict):
+        ob["transport"]["path"] = d["ws-opts"].get("path", "/")
+        h = d["ws-opts"].get("headers", {}).get("Host")
+        if h:
+            ob["transport"].setdefault("headers", {})["Host"] = h
+    if d.get("grpc-opts") and isinstance(ob.get("transport"), dict):
+        ob["transport"]["service_name"] = d["grpc-opts"].get("grpc-service-name", "")
+
+def build_singbox_sub(nodes):
+    """nodes: [(proto_key, mihomo_dict)]。按 tag 把参数填进 sing-box 模板，写 SBOX_FILE。"""
+    try:
+        cfg = json.loads(fetch_url(SBOX_TPL_URL))
+    except Exception as e:
+        print("sing-box 模板拉取失败，跳过:", e); return
+    by_tag = {ob.get("tag"): ob for ob in cfg.get("outbounds", [])}
+    for key, d in nodes:
+        tag = PROTO_TO_SBTAG.get(key)
+        if tag and tag in by_tag:
+            fill_singbox_outbound(by_tag[tag], d)
+    open(SBOX_FILE, "w").write(json.dumps(cfg, ensure_ascii=False, indent=2))
+
+# --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
+def shadowrocket_line(name, d):
+    t = d.get("type"); srv = d["server"]; port = d.get("port")
+    sni = d.get("servername") or d.get("sni") or srv
+    scv = "1" if d.get("skip-cert-verify") else "0"
+    if t == "vless":
+        p = [f"{name} = vless", srv, str(port), f"username={d['uuid']}", "tls=1", f"sni={sni}",
+             f"skip-cert-verify={scv}", "tfo=1"]
+        if d.get("flow"): p.append(f"flow={d['flow']}")
+        if d.get("reality-opts"):
+            p += [f"public-key={d['reality-opts'].get('public-key','')}",
+                  f"short-id={d['reality-opts'].get('short-id','')}", "fp=chrome"]
+        if d.get("network") == "ws":
+            p += ["obfs=websocket", f"obfs-uri={d['ws-opts'].get('path','/')}",
+                  f"obfs-host={d['ws-opts'].get('headers',{}).get('Host',sni)}"]
+        elif d.get("network") == "grpc":
+            p += ["transport=grpc", f"grpc-service-name={d.get('grpc-opts',{}).get('grpc-service-name','')}"]
+        return ",".join(p)
+    if t == "vmess":
+        p = [f"{name} = vmess", srv, str(port), f"username={d['uuid']}", "tls=1", f"sni={sni}",
+             "alterId=0", f"skip-cert-verify={scv}", "tfo=1",
+             "obfs=websocket", f"obfs-uri={d.get('ws-opts',{}).get('path','/')}",
+             f"obfs-host={d.get('ws-opts',{}).get('headers',{}).get('Host',sni)}"]
+        return ",".join(p)
+    if t == "trojan":
+        return ",".join([f"{name} = trojan", srv, str(port), f"password={d['password']}",
+                         "tls=1", f"sni={sni}", f"skip-cert-verify={scv}", "tfo=1"])
+    if t == "hysteria2":
+        pt = port or (d["ports"].split("-")[0] if d.get("ports") else "")   # 跳跃时用起点端口
+        p = [f"{name} = hysteria2", srv, str(pt), f"password={d['password']}", f"sni={sni}",
+             f"skip-cert-verify={scv}"]
+        if d.get("ports"): p.append(f"ports={d['ports']}")
+        return ",".join(p)
+    if t == "tuic":
+        return ",".join([f"{name} = tuic", srv, str(port), f"uuid={d['uuid']}",
+                         f"password={d['password']}", f"sni={sni}", "alpn=h3", f"skip-cert-verify={scv}"])
+    if t == "anytls":
+        return ",".join([f"{name} = anytls", srv, str(port), f"password={d['password']}",
+                         "tls=1", f"sni={sni}", f"skip-cert-verify={scv}"])
+    return None
+
+def build_shadowrocket_sub(nodes):
     lines = []
-    for u in all_links:
+    for key, d in nodes:
+        name = "🇯🇵" + key            # 带国旗前缀，让 Shadowrocket 分组的地区正则能命中
         try:
-            d = link_to_proxy(u)
-            if d: lines.append("  - {" + ", ".join(f"{k}: {_yfmt(v)}" for k, v in d.items()) + "}")
+            s = shadowrocket_line(name, d)
+            if s: lines.append(s)
         except Exception:
             pass
     if not lines:
+        return
+    try:
+        tpl = fetch_url(SR_TPL_URL)
+    except Exception as e:
+        print("Shadowrocket 模板拉取失败，跳过:", e); return
+    open(SR_FILE, "w").write(tpl.replace("# __XY_PROXY__", "\n".join(lines)))
+
+def build_subscription(all_links):
+    """三格式各生成一份可编辑配置(mihomo/sing-box/Shadowrocket)，记住 host，托管，返回 token。"""
+    nodes, ylines = [], []
+    for u in all_links:
+        try:
+            d = link_to_proxy(u)
+        except Exception:
+            d = None
+        if not d:
+            continue
+        ylines.append("  - {" + ", ".join(f"{k}: {_yfmt(v)}" for k, v in d.items()) + "}")
+        k = proto_key(d)
+        if k:
+            nodes.append((k, d))
+    if not ylines:
         return None
-    cfg = fetch_template().replace("__XY_PROXIES__", "\n".join(lines))
     os.makedirs(BGP_DIR, exist_ok=True)
-    open(CFG_FILE, "w").write(cfg)                      # 可编辑的成品配置
+    open(CFG_FILE, "w").write(fetch_url(TEMPLATE_URL).replace("__XY_PROXIES__", "\n".join(ylines)))
+    build_singbox_sub(nodes)
+    build_shadowrocket_sub(nodes)
     open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先），换 token 不丢
     token = secrets.token_urlsafe(12)
     serve_sub(token)
-    return sub_url(token)
+    return token
 
 def detect_existing():
     """扫 systemd，找出跑 sing-box/xray 但不是本脚本装的服务（典型：mack-a/v2ray-agent）。
@@ -906,19 +1051,20 @@ def run(sb_names, xr_names):
     if out_file:
         print(f"（已保存到 {out_file}）")
 
-    # 生成一条完整订阅链接：节点注入模板 → 起 http 服务托管
-    sub = None
+    # 生成三格式订阅（mihomo / sing-box / Shadowrocket），各自一条链接
+    token = None
     try:
-        sub = build_subscription(all_links)
+        token = build_subscription(all_links)
     except Exception as e:
         print("\n订阅生成跳过（不影响节点使用）:", e)
-    if sub:
+    if token:
+        urls = sub_urls_text(token)
         if out_file:
-            open(out_file, "a").write("\n# 订阅链接:\n" + sub + "\n")
+            open(out_file, "a").write("\n# 订阅链接:\n" + urls + "\n")
         print("\n" + "=" * 60)
-        print("一键订阅链接（导入客户端即用，含全部节点+分流规则）:")
+        print("一键订阅链接（按你的客户端选对应一条，含全部节点+分流规则）:")
         print("=" * 60)
-        print(sub)
+        print(urls)
         print("=" * 60)
         print(f"※ 明文 HTTP + 随机 token，请勿外传；改端口/关闭见 xy-sub.service（端口 {SUB_PORT}）")
 
@@ -961,33 +1107,36 @@ def show_links():
     print("\n".join(links))
     tok = current_token()
     if tok:
-        print("=" * 60 + "\n订阅链接:\n" + sub_url(tok))
+        print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + sub_urls_text(tok))
 
 def mihomo_config_menu():
-    """mihomo 配置：配置存成可编辑文件，用户改参数；换订阅只换 token、host 不变。"""
+    """订阅配置：三格式存成可编辑文件，用户改参数；换订阅只换 token、host 不变。"""
     if not os.path.exists(CFG_FILE):
         print("\n还没有订阅配置，请先『1.安装』。"); return
     tok = current_token()
-    print("\n" + "=" * 60 + "\nmihomo 配置\n" + "=" * 60)
-    print(f"  配置文件: {CFG_FILE}")
-    print( "           用 nano/vi 直接改参数，保存后客户端重新拉取即生效（订阅链接不用换）")
+    print("\n" + "=" * 60 + "\n订阅 / 配置（mihomo · sing-box · Shadowrocket）\n" + "=" * 60)
+    print(f"  mihomo:       {CFG_FILE}")
+    print(f"  sing-box:     {SBOX_FILE}")
+    print(f"  Shadowrocket: {SR_FILE}")
+    print( "  ↑ 用 nano/vi 直接改参数，保存后客户端重拉即生效（订阅链接不用换）")
     if tok:
-        print(f"  当前订阅: {sub_url(tok)}")
+        print("-" * 60 + "\n  当前订阅链接:\n" + sub_urls_text(tok))
     print("-" * 60)
     print("  1. 只换订阅链接 token（配置原样不动，怀疑外泄/被墙时用）")
-    print("  2. 用最新模板重建配置（会覆盖你在配置文件里的手动修改，谨慎）")
+    print("  2. 用最新模板重建全部配置（会覆盖你的手动修改，谨慎）")
     print("  0. 返回")
     c = _ask("选择: ").strip()
     if c == "1":
         serve_sub(secrets.token_urlsafe(12))
-        print("\n新订阅链接（配置未改动）:\n" + sub_url(current_token()))
+        print("\n新订阅链接（配置未改动）:\n" + sub_urls_text(current_token()))
     elif c == "2":
         links = read_saved_links()
         if not links:
             print("没有已保存节点，无法重建。"); return
         G["host"] = open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else public_ip()
         try:
-            print("\n已用最新模板重建配置：\n" + (build_subscription(links) or "(无节点)"))
+            t = build_subscription(links)
+            print("\n已用最新模板重建全部配置：\n" + (sub_urls_text(t) if t else "(无节点)"))
         except Exception as e:
             print("重建失败:", e)
 
