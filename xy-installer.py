@@ -622,9 +622,10 @@ def xr_reality_xhttp(port, tag):
     priv, pub = reality_keys(XRAY_BIN, "x25519")
     st = _xr_reality_stream(priv, sid, "xhttp",
                             {"xhttpSettings": {"path": path}})
+    # xhttp 传输不支持 xtls-rprx-vision flow（那是 raw/tcp 专属），客户端也没带 flow，
+    # 服务端这里若强设 vision flow 会导致握手对不上 → 连不上，所以留空。
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
-          "settings": {"clients": [{"id": uid, "flow": "xtls-rprx-vision"}],
-                       "decryption": "none"},
+          "settings": {"clients": [{"id": uid}], "decryption": "none"},
           "streamSettings": st}
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=reality"
           f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp&path={path}#{tag}")
