@@ -830,9 +830,9 @@ PROTO_TO_SBTAG = {
 def mihomo_to_sb_outbound(key, d):
     """mihomo 节点 dict → 完整的 sing-box 出站对象（服务器端现生成，不依赖模板里的固定参数）。
        不支持的类型(如 xhttp)返回 None，由调用方跳过。"""
-    tag = PROTO_TO_SBTAG.get(key)
-    if not tag:
+    if key not in PROTO_TO_SBTAG:
         return None                                      # xhttp 等 → 不写进 sing-box
+    tag = d.get("name", "").strip('"') or key            # 统一用节点池名称（含服务器端前缀）
     srv = d["server"]; sni = d.get("servername") or d.get("sni") or srv
     insec = bool(d.get("skip-cert-verify"))
     utls = {"enabled": True, "fingerprint": "chrome"}
@@ -991,7 +991,7 @@ def shadowrocket_line(name, d):
 def build_shadowrocket_sub(nodes):
     lines = []
     for key, d in nodes:
-        name = "🇯🇵" + key            # 带国旗前缀，让 Shadowrocket 分组的地区正则能命中
+        name = d.get("name", "").strip('"') or key       # 统一用节点池名称（含服务器端前缀）
         try:
             s = shadowrocket_line(name, d)
             if s: lines.append(s)
@@ -1005,8 +1005,9 @@ def build_shadowrocket_sub(nodes):
         print("Shadowrocket 模板拉取失败，跳过:", e); return
     open(SR_FILE, "w").write(tpl.replace("# __XY_PROXY__", "\n".join(lines)))
 
-def build_subscription(all_links):
-    """三格式各生成一份可编辑配置(mihomo/sing-box/Shadowrocket)，记住 host，托管，返回 token。"""
+def build_subscription(all_links, new_token=False):
+    """三格式各生成一份可编辑配置(mihomo/sing-box/Shadowrocket)，记住 host，托管，返回 token。
+       new_token=True（重装换节点/换域名时）强制换 token 刷新订阅；否则复用旧 token（更新配置/脚本不改 URL）。"""
     nodes, ylines = [], []
     for u in all_links:
         try:
@@ -1026,7 +1027,7 @@ def build_subscription(all_links):
     build_singbox_sub(nodes)
     build_shadowrocket_sub(nodes)
     open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先），换 token 不丢
-    token = current_token() or secrets.token_urlsafe(12)   # 复用已有 token，重建不改订阅 URL
+    token = secrets.token_urlsafe(12) if new_token else (current_token() or secrets.token_urlsafe(12))
     serve_sub(token)
     return token
 
@@ -1136,7 +1137,7 @@ def run(sb_names, xr_names):
     # 生成三格式订阅（mihomo / sing-box / Shadowrocket），各自一条链接
     token = None
     try:
-        token = build_subscription(all_links)
+        token = build_subscription(all_links, new_token=True)   # 重装换了节点/域名 → 换 token 刷新订阅
     except Exception as e:
         print("\n订阅生成跳过（不影响节点使用）:", e)
     if token:
@@ -1200,36 +1201,47 @@ def show_links():
     if tok:
         print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + sub_urls_text(tok))
 
-def mihomo_config_menu():
-    """订阅配置：三格式存成可编辑文件，用户改参数；换订阅只换 token、host 不变。"""
-    if not os.path.exists(CFG_FILE):
-        print("\n还没有订阅配置，请先『1.安装』。"); return
+def show_config(label, path, ext):
+    """展示某格式的配置文件路径 + 该客户端的订阅链接 + 编辑提示。"""
+    if not os.path.exists(path):
+        print(f"\n还没有 {label} 配置，请先『1.安装』。"); return
     tok = current_token()
-    print("\n" + "=" * 60 + "\n订阅 / 配置（mihomo · sing-box · Shadowrocket）\n" + "=" * 60)
-    print(f"  mihomo:       {CFG_FILE}")
-    print(f"  sing-box:     {SBOX_FILE}")
-    print(f"  Shadowrocket: {SR_FILE}")
+    print("\n" + "=" * 60 + f"\n{label} 配置\n" + "=" * 60)
+    print(f"  配置文件: {path}")
     print( "  ↑ 用 nano/vi 直接改参数，保存后客户端重拉即生效（订阅链接不用换）")
     if tok:
-        print("-" * 60 + "\n  当前订阅链接:\n" + sub_urls_text(tok))
-    print("-" * 60)
-    print("  1. 只换订阅链接 token（配置原样不动，怀疑外泄/被墙时用）")
-    print("  2. 用最新模板重建全部配置（会覆盖你的手动修改，谨慎）")
-    print("  0. 返回")
-    c = _ask("选择: ").strip()
-    if c == "1":
-        serve_sub(secrets.token_urlsafe(12))
-        print("\n新订阅链接（配置未改动）:\n" + sub_urls_text(current_token()))
-    elif c == "2":
-        links = read_saved_links()
-        if not links:
-            print("没有已保存节点，无法重建。"); return
-        G["host"] = open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else public_ip()
-        try:
-            t = build_subscription(links)
-            print("\n已用最新模板重建全部配置：\n" + (sub_urls_text(t) if t else "(无节点)"))
-        except Exception as e:
-            print("重建失败:", e)
+        print(f"  订阅链接: http://{_host()}:{SUB_PORT}/{tok}.{ext}")
+
+def update_configs():
+    """用最新模板重刷三格式配置——不动节点、不换 token（URL 不变）。"""
+    links = read_saved_links()
+    if not links:
+        print("\n没有已保存节点，请先『1.安装』。"); return
+    G["host"] = _host()
+    ensure_deps()
+    try:
+        t = build_subscription(links, new_token=False)   # 保留 token，URL 不变
+        print("\n已用最新模板刷新三格式配置（节点与订阅链接均未变）:\n" + (sub_urls_text(t) if t else "(无)"))
+    except Exception as e:
+        print("刷新失败:", e)
+
+def rotate_token():
+    """只换订阅 token（配置不动，怀疑外泄/被墙时用）。"""
+    if not current_token():
+        print("\n还没有订阅，请先『1.安装』。"); return
+    serve_sub(secrets.token_urlsafe(12))
+    print("\n新订阅链接（配置未改动）:\n" + sub_urls_text(current_token()))
+
+def update_script():
+    """只更新脚本本体到最新，不动节点、不改配置。"""
+    try:
+        latest = fetch_url("https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py")
+        os.makedirs(BGP_DIR, exist_ok=True)
+        open(BGP_DIR + "/xy-installer.py", "w").write(latest)
+        install_shortcut()
+        print("\n脚本已更新到最新（节点/配置均未改动）。重新输入 bgpeer 生效。")
+    except Exception as e:
+        print("\n更新脚本失败:", e)
 
 def update_cores():
     print("\n更新核心:  1. sing-box   2. xray   3. 两个   0. 返回")
@@ -1270,21 +1282,31 @@ def main_menu():
         print("\n" + "=" * 60)
         print("  bgpeer 一键脚本  （sing-box + xray 多协议 / 订阅）")
         print("=" * 60)
-        print("  1. 安装")
-        print("  2. 节点链接")
-        print("  3. mihomo 配置（修改 / 更新订阅）")
-        print("  4. 更新核心（sing-box / xray）")
-        print("  5. 卸载")
+        print("  1. 安装（已装则默认保持节点，输 new 才换节点）")
+        print("  2. 节点链接 / 订阅")
+        print("  3. mihomo 配置")
+        print("  4. sing-box 配置")
+        print("  5. 小火箭配置")
+        print("  6. 更新配置（最新模板重刷三格式，不动节点、URL 不变）")
+        print("  7. 换订阅 token（配置不动，防外泄）")
+        print("  8. 更新脚本（不影响节点）")
+        print("  9. 更新核心（sing-box / xray）")
+        print(" 10. 卸载")
         print("  0. 退出")
         print("-" * 60)
         c = _ask("请选择: ").strip()
         if c == "0" or c == "":
             print("再见。"); return
-        if c == "1":   install_flow()
-        elif c == "2": show_links()
-        elif c == "3": mihomo_config_menu()
-        elif c == "4": update_cores()
-        elif c == "5": uninstall_all()
+        if c == "1":    install_flow()
+        elif c == "2":  show_links()
+        elif c == "3":  show_config("mihomo", CFG_FILE, "yaml")
+        elif c == "4":  show_config("sing-box", SBOX_FILE, "json")
+        elif c == "5":  show_config("小火箭 Shadowrocket", SR_FILE, "conf")
+        elif c == "6":  update_configs()
+        elif c == "7":  rotate_token()
+        elif c == "8":  update_script()
+        elif c == "9":  update_cores()
+        elif c == "10": uninstall_all()
         else:
             print("无效选择。"); continue
         _ask("\n按回车返回主菜单...")            # 停一下，别让菜单立刻盖住上面的输出
