@@ -326,10 +326,16 @@ def reality_keys(binpath, cmd):
 
 def write_service(name, binpath, cfg):
     # 先校验配置，schema 错就当场报出来（避免像之前 anytls 那样静默起不来）
-    r = subprocess.run(f"{binpath} check -c {cfg}", shell=True, text=True, capture_output=True)
-    if r.returncode:
-        raise RuntimeError(f"{name} 配置校验失败（多半是内核版本太旧不认某协议）:\n"
-                           f"{(r.stderr or r.stdout).strip()}")
+    # 两个内核校验命令不一样：sing-box 用 `check -c`，xray 用 `run -test -c`（xray 没有 check 子命令）
+    check_cmd = (f"{binpath} run -test -c {cfg}" if "xray" in os.path.basename(binpath)
+                 else f"{binpath} check -c {cfg}")
+    r = subprocess.run(check_cmd, shell=True, text=True, capture_output=True)
+    msg = (r.stderr or r.stdout).strip()
+    # 万一某内核不认这个校验子命令，跳过校验而不是让整个安装崩掉
+    if r.returncode and re.search(r"unknown command|unknown flag|Run '.*help'", msg):
+        pass
+    elif r.returncode:
+        raise RuntimeError(f"{name} 配置校验失败（多半是内核版本太旧不认某协议）:\n{msg}")
     unit_path = f"/etc/systemd/system/{name}.service"
     # 不覆盖指向别的程序的同名服务（典型：机器上已装 mack-a 的 sing-box.service）
     if os.path.exists(unit_path) and binpath not in open(unit_path).read():
