@@ -1353,7 +1353,7 @@ def main_menu():
         print("\n" + "=" * 60)
         print("  bgpeer 一键脚本  （sing-box + xray 多协议 / 订阅）")
         print("=" * 60)
-        print("  1. 安装（已装则默认保持节点，输 new 才换节点）")
+        print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
         print("  3. mihomo 配置")
         print("  4. sing-box 配置")
@@ -1410,34 +1410,12 @@ def _pick(title, options):
             print(f"  ⚠ 忽略无效项: {tok}")
     return picked
 
-def refresh_keep():
-    """保持节点不变：复用上次的 host/域名与已存节点链接，只用最新模板重生成三格式配置。"""
-    try:
-        st = json.load(open(STATE_FILE))
-    except Exception:
-        st = {}
-    for k in ("host", "domain", "sni", "prefix", "hy2_ports", "nginx"):
-        G[k] = st.get(k, "")
-    links = read_saved_links()
-    if not links:
-        print("没找到已存节点，无法保持。请选重新生成。"); return
-    ensure_deps()
-    try:
-        build_subscription(links)                       # 节点不动，只重生成客户端配置（保持 token）
-    except Exception as e:
-        print("配置更新失败:", e); return
-    install_shortcut()
-    print("\n" + "=" * 60)
-    print("节点保持不变，已用最新模板更新配置。订阅链接（URL 未变）:")
-    print("=" * 60)
-    print(sub_urls_text() or "(无)")
-
 def install_flow():
-    # 已装过就默认「保持节点、只更新配置」，不再每次重装换节点（对齐 mack-a）
+    # 已装过就问是否重装节点；不重装就直接返回（更新配置在各配置菜单里做，这里不掺和）
     if os.path.exists(STATE_FILE) and read_saved_links():
-        ans = _ask("检测到已安装。回车=保持节点不变、只用最新模板更新配置；输 new=重新生成全部节点: ")
-        if ans.strip().lower() != "new":
-            refresh_keep(); return
+        ans = _ask("检测到已安装 bgpeer 节点。重新安装节点? [y/N]: ")
+        if ans.strip().lower() not in ("y", "yes"):
+            print("已取消，返回主菜单。（更新配置请进对应配置菜单）"); return
         G["regen"] = "1"
     print("=" * 60)
     print("  sing-box + xray 交互安装")
