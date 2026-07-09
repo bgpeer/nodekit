@@ -25,9 +25,11 @@ SB_DIR,  XRAY_DIR = "/etc/sing-box", "/usr/local/etc/xray"
 CERT, KEY = "/etc/ssl/sb/self.crt", "/etc/ssl/sb/self.key"     # 自签
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"  # acme 签发
 
-# 全局状态：域名/邮箱/SNI 由 CLI 注入；端口自增分配
-G = {"host": "", "domain": "", "email": "", "sni": "s0.awsstatic.com", "prefix": "", "_port": 20000}
+# 全局状态：域名/邮箱/SNI 由 CLI 注入；端口每次安装在大区间内随机分配
+G = {"host": "", "domain": "", "email": "", "sni": "s0.awsstatic.com", "prefix": ""}
 HY2_PORTS = "30000-31000"      # hy2 端口跳跃范围默认值；用户可自定义（--hy2-ports / 菜单）
+# 端口随机分配区间：每个协议每次重装都从这里随机挑不同的端口，避免连续端口被批量扫描识别
+PORT_LO, PORT_HI = 15000, 45000
 
 def hy2_range():
     """取 hy2 端口跳跃范围：用户自定义优先，格式须 起-止（如 30000-31000），否则回落默认。"""
@@ -104,9 +106,26 @@ def port_free(port):
     finally:
         s.close()
 
+_USED_PORTS = set()            # 本次安装已分配的端口，防止随机撞车
+
 def next_port():
-    G["_port"] += 1
-    return G["_port"]
+    """每次安装为每个协议随机挑一个可用端口（PORT_LO~PORT_HI），非连续：
+       - 避开 hy2 跳跃段（整段 UDP 被 DNAT 给 hy2，别的协议落进去会被劫走）
+       - 避开订阅端口、本次已分配端口、系统已被占用的端口
+       连续端口(20001,20002…)一扫一整排是明显的代理指纹，随机分散能显著削弱。"""
+    lo, hi = hy2_range().split("-")
+    hop_lo, hop_hi = int(lo), int(hi)
+    for _ in range(500):
+        p = secrets.randbelow(PORT_HI - PORT_LO + 1) + PORT_LO
+        if p in _USED_PORTS or p == SUB_PORT:
+            continue
+        if hop_lo <= p <= hop_hi:               # hy2 跳跃段，留给 hy2
+            continue
+        if not port_free(p):                    # 系统层面已被别的进程占用
+            continue
+        _USED_PORTS.add(p)
+        return p
+    raise RuntimeError(f"在 {PORT_LO}-{PORT_HI} 内找不到可用端口，请检查端口占用。")
 
 def public_ip():
     try:
@@ -1248,6 +1267,7 @@ def run(sb_names, xr_names):
     precheck_sni(sb_names, xr_names)     # reality 借用目标合格性预检（只警告不阻断）
     warn_selfsigned(sb_names, xr_names)  # 无域名自签的伪装弱点引导
     NGINX_WS.clear()
+    _USED_PORTS.clear()                  # 本次安装重新随机分配端口
     if G.get("nginx"):
         if not G["domain"]:
             print("nginx 前置需要域名，已忽略、改用自签+IP。"); G["nginx"] = ""
