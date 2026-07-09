@@ -179,8 +179,13 @@ def ensure_acme():
         if r.returncode and not skipped:
             raise RuntimeError("acme 签发失败(检查域名解析是否指向本机、80 端口是否可达):\n" + out)
         os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
-        # 装证书后让 acme 自动 reload nginx（续期时也会）
-        reload_hook = f" --reloadcmd 'systemctl reload nginx'" if G.get("nginx") else ""
+        # reloadcmd 会被 acme.sh 记住，续期时自动执行。sing-box/xray 是启动时把证书读进
+        # 内存的、不会自动重载证书文件，所以续期后必须重启它们，否则磁盘证书更新了、进程还用
+        # 旧证书，约 90 天后客户端撞上过期证书。有 nginx 顺带 reload；服务不存在则静默跳过。
+        reload_hook = (" --reloadcmd '"
+                       "systemctl reload nginx 2>/dev/null; "
+                       "systemctl restart sing-box 2>/dev/null; "
+                       "systemctl restart xray 2>/dev/null; true'")
         sh(f"{acme} --install-cert -d {G['domain']} --ecc "
            f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
     return ACME_CRT, ACME_KEY, False

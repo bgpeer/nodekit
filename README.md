@@ -29,6 +29,8 @@ sudo python3 /tmp/xy.py
 - root 权限
 - Python 3
 - 有域名走 acme 真证书更稳；无域名则自签证书 + 公网 IP 直连（域名需 A 记录直连指向本机）
+- **证书自动续签**：走域名真证书时用 acme.sh 签发，acme.sh 会装每日 cron 自动续期（约 60 天一次），
+  续期后自动重启 sing-box / xray（有 nginx 顺带 reload）使新证书生效，无需手动干预
 
 ---
 
