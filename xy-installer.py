@@ -300,6 +300,20 @@ def write_nginx_conf():
     open(NGINX_CONF, "w").write(conf)
     nginx_reload()
 
+def free_443_for_reality():
+    """reality 要独占 443/TCP：清掉本脚本的 nginx 前置块并 reload，让 nginx 释放 443；
+       若 443 仍被别的服务占着，明确警告（否则 sing-box 会绑不上 443、服务起不来）。"""
+    if os.path.exists(NGINX_CONF):
+        sh(f"rm -f {NGINX_CONF}", check=False)
+        sh("nginx -t && systemctl reload nginx", check=False)   # 无 443 server 后 nginx 会释放 443
+    if not port_free(443):
+        time.sleep(1)
+    if not port_free(443):
+        Y, N = "\033[1;33m", "\033[0m"
+        holder = sh("ss -tlpnH | grep ':443' || true", check=False)
+        print(f"{Y}  ⚠ 443 仍被占用，reality 可能绑不上、服务起不来。占用者：\n    {holder}\n"
+              f"    先停掉占 443 的服务（nginx/caddy 等）再重装。{N}")
+
 def tls_host():                                     # ws/trojan 的 SNI/Host
     return G["domain"] or G["sni"]
 
@@ -569,10 +583,15 @@ def _sb_transport(transport, path, host):
 _LINK_NET = {"ws": "ws", "h2": "http", "httpupgrade": "httpupgrade"}      # vless URI
 _VMESS_NET = {"ws": "ws", "h2": "h2", "httpupgrade": "httpupgrade"}       # vmess json
 
+def _nginx_front():
+    """ws 家族是否走 nginx 443 前置：reality 绑 443 时 443 归 reality，
+       此时 nginx 只留 :80 续期、不再前置 ws，ws 改走自己端口的真证书。"""
+    return bool(G.get("nginx")) and not G.get("reality443")
+
 def make_sb_vless(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
-        if G.get("nginx") and transport in ("ws", "httpupgrade"):
+        if _nginx_front() and transport in ("ws", "httpupgrade"):
             # nginx 前置：本地明文口，TLS 由 nginx 在 443 终结、按 path 反代进来
             ib = {"type": "vless", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
                   "users": [{"uuid": uid}],
@@ -597,7 +616,7 @@ def make_sb_vless(transport):
 def make_sb_vmess(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
-        if G.get("nginx") and transport in ("ws", "httpupgrade"):
+        if _nginx_front() and transport in ("ws", "httpupgrade"):
             ib = {"type": "vmess", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
                   "users": [{"uuid": uid, "alterId": 0}],
                   "transport": _sb_transport(transport, path, tls_host())}
@@ -803,11 +822,27 @@ XRAY = {"vless-reality-vision": xr_reality_vision,
         "trojan": xr_trojan, "ss2022": xr_ss2022}
 
 # ============================================================================ 组装
-def build(table, names):
+# reality 绑 443 的优先级：优先 sing-box reality-vision（Vision flow 最稳），依次往下。
+# 只能有一个 reality 上 443（443/TCP 独占），其余 reality 留在随机端口。
+REALITY_443_PRIORITY = ["reality-vision", "reality-grpc",
+                        "vless-reality-vision", "vless-reality-xhttp", "vless-reality-grpc"]
+
+def pick_reality_443(sb_names, xr_names):
+    """选出要绑到 443 的那个 reality 协议名；没有 reality 被选则返回 ''。"""
+    selected = set(sb_names) | set(xr_names)
+    for n in REALITY_443_PRIORITY:
+        if n in selected:
+            return n
+    return ""
+
+def build(table, names, pinned=None):
+    """pinned: {协议名: 固定端口}，用于把某个 reality 协议钉在 443；其余走随机端口。"""
+    pinned = pinned or {}
     inbounds, links = [], []
     for n in names:
         # 名称 = 用户前缀 + 协议名（默认无前缀，别人部署 US/SG 时自己填 🇺🇸/🇸🇬 等）
-        ib, lk = table[n](next_port(), G.get("prefix", "") + n)
+        port = pinned.get(n) or next_port()
+        ib, lk = table[n](port, G.get("prefix", "") + n)
         inbounds.append(ib); links.append(lk)
     return inbounds, links
 
@@ -1268,6 +1303,19 @@ def run(sb_names, xr_names):
     warn_selfsigned(sb_names, xr_names)  # 无域名自签的伪装弱点引导
     NGINX_WS.clear()
     _USED_PORTS.clear()                  # 本次安装重新随机分配端口
+
+    # reality 绑 443：把主力 reality 协议钉在 443，主动探测回落到借用的真站，
+    # 消掉「reality 在非 443 易被 GFW 封 IP」的风险。443/TCP 独占，与 nginx 前置互斥。
+    pin = {}
+    r443 = pick_reality_443(sb_names, xr_names) if G.get("reality443") else ""
+    if r443:
+        pin[r443] = 443
+        if G.get("nginx"):
+            # 保留 nginx 在 :80（acme webroot 续期照常），把 :443 让给 reality；
+            # ws 类不再藏 443，改走自己端口的真证书。这样证书续期不会因为撤掉 nginx 而断。
+            print(f"  {r443} → 443（抗封锁）；nginx 仅保留 :80 供证书续期，ws 类改走自己端口。")
+        free_443_for_reality()                          # 让出 443（清掉旧 nginx 前置的 443 块）
+
     if G.get("nginx"):
         if not G["domain"]:
             print("nginx 前置需要域名，已忽略、改用自签+IP。"); G["nginx"] = ""
@@ -1277,9 +1325,10 @@ def run(sb_names, xr_names):
 
     if sb_names:
         install_singbox()
-        ins, lks = build(SB, sb_names); all_links += lks
-        if G.get("nginx") and NGINX_WS:
+        ins, lks = build(SB, sb_names, pin); all_links += lks
+        if _nginx_front() and NGINX_WS:
             write_nginx_conf()                          # 收集完 ws 家族，写 443 伪装站+反代
+        # reality 绑 443 时 nginx 只留 :80 acme stub（续期用），不写 443 块，443 归 reality
         cfg = f"{SB_DIR}/config.json"
         json.dump({"log": {"level": "info"}, "inbounds": ins,
                    "outbounds": [{"type": "direct"}]},
@@ -1288,7 +1337,7 @@ def run(sb_names, xr_names):
 
     if xr_names:
         install_xray()
-        ins, lks = build(XRAY, xr_names); all_links += lks
+        ins, lks = build(XRAY, xr_names, pin); all_links += lks
         cfg = f"{XRAY_DIR}/config.json"
         json.dump({"log": {"loglevel": "warning"}, "inbounds": ins,
                    "outbounds": [{"protocol": "freedom", "tag": "direct"},
@@ -1339,7 +1388,8 @@ def run(sb_names, xr_names):
     try:
         json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"],
                    "prefix": G.get("prefix", ""), "hy2_ports": G.get("hy2_ports", ""),
-                   "nginx": G.get("nginx", ""), "sb": sb_names, "xray": xr_names},
+                   "nginx": G.get("nginx", ""), "reality443": G.get("reality443", ""),
+                   "sb": sb_names, "xray": xr_names},
                   open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
         pass
@@ -1629,15 +1679,24 @@ def install_flow():
     hy2p = ""
     if "hy2" in sb_names:
         hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000): ")
-    G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"] = \
-        domain, email, sni, prefix, hy2p, nginx
+    # 选了 reality 才问：把主力 reality 绑 443（抗 GFW 封端口）。默认开，会关掉 nginx 前置。
+    r443 = ""
+    if pick_reality_443(sb_names, xr_names):
+        ans = _ask("把主力 reality 绑到 443 抗封锁?(推荐；会关闭 nginx 前置) [Y/n]: ")
+        r443 = "" if ans.lower() in ("n", "no") else "1"
+    G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["reality443"] = \
+        domain, email, sni, prefix, hy2p, nginx, r443
 
+    reality443_proto = pick_reality_443(sb_names, xr_names) if r443 else ""
     print("\n" + "-" * 60)
     if sb_names: print("  sing-box:", ", ".join(sb_names))
     if xr_names: print("  xray:    ", ", ".join(xr_names))
     print("  证书:    ", f"acme真证书({domain})" if domain else "自签")
     print("  节点地址:", domain if domain else "公网IP")
-    print("  nginx前置:", "是（443伪装站+webroot，ws类走443）" if nginx else "否")
+    if reality443_proto:
+        print("  reality绑443:", f"是（{reality443_proto} → 443，抗封锁；nginx前置关闭）")
+    print("  nginx前置:", "是（443伪装站+webroot，ws类走443）"
+          if nginx and not reality443_proto else "否")
     print("  名称前缀:", prefix or "(无)")
     print("  SNI:     ", sni)
     if "hy2" in sb_names:
@@ -1671,12 +1730,15 @@ if __name__ == "__main__":
     ap.add_argument("--hy2-ports", default="", help="hy2 端口跳跃范围 起-止，默认 30000-31000")
     ap.add_argument("--nginx", action="store_true",
                     help="用 nginx 前置(443伪装站+webroot证书, ws类藏443)，需域名")
+    ap.add_argument("--no-reality-443", action="store_true",
+                    help="不把主力 reality 绑到 443（默认会绑，抗 GFW 封端口；会关闭 nginx 前置）")
     ap.add_argument("--yes", action="store_true",
                     help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
 
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["force"] = \
         a.domain, a.email, a.sni, a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes
+    G["reality443"] = "" if a.no_reality_443 else "1"   # 默认把 reality 绑 443（抗封端口）
     sb = list(SB) if a.sb == "all" else [x for x in a.sb.split(",") if x]
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
     if not sb and not xr:

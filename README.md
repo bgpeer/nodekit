@@ -129,7 +129,9 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 
 常用参数：`--sb` / `--xray`（协议，逗号分隔或 `all`）、`--domain`、`--email`、
 `--sni`（reality 借用目标站，默认 `s0.awsstatic.com`）、`--prefix`（节点名前缀）、
-`--hy2-ports`（hy2 端口跳跃范围，默认 `30000-31000`）、`--nginx`、`--yes`（检测到 mack-a 等现有安装直接接管）。
+`--hy2-ports`（hy2 端口跳跃范围，默认 `30000-31000`）、`--nginx`、
+`--no-reality-443`（默认会把主力 reality 绑 443 抗封端口，加此参数则不绑）、
+`--yes`（检测到 mack-a 等现有安装直接接管）。
 
 ---
 
@@ -151,8 +153,24 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 （默认是一个「维护中」通用静态页，不是一眼假的 Apache 默认页）。你可以直接覆盖它换成自己的
 真站内容，伪装效果更好。
 
-> 说明：本脚本各协议默认分布在各自端口（非 443 单端口复用）。若要对抗较强的主动探测，
-> 建议主力用 **reality**（自带握手回落到真站），reality 的抗探测能力不依赖端口复用。
+### reality 绑 443（抗 GFW 封端口，默认开启）
+
+xray 内核会警告 `REALITY: Listening on non-443 ports may get your IP blocked by the GFW`——
+reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为此脚本**默认把主力 reality
+协议绑到 443**（优先 sing-box `reality-vision`）：
+
+- 主动探测打你的 443 → sing-box 把握手转发到**借用的真站**（如 awsstatic），
+  看到的是真站证书，和真访问该站无法区分——比任何本地伪装站都强。
+- 端口随机化削弱"一排代理端口"的扫描指纹；reality 上 443 再消掉"非 443 易被封"的风险，两者互补。
+
+与 nginx 前置的关系：reality 独占 443/TCP 时，**nginx 只保留 :80 用于 acme 证书续期**
+（续期不会因此中断），ws 家族不再藏 443、改走各自端口的真证书；443 的"网站伪装"
+由 reality 借用的真站接管。其余协议（trojan/tuic/anytls/vless-vision 等）留在随机端口作备用。
+
+加 `--no-reality-443` 可关闭此行为（reality 回到随机端口、保留 nginx 443 前置）。
+
+> 想更进一步做到"网站 + 多协议全部回 443"（nginx `stream` + `ssl_preread` 按 SNI 分流），
+> 属于更大的架构改动，可作为后续。当前 reality-443 已能解决最主要的封端口风险。
 
 ---
 
