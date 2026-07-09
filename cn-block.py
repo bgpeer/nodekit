@@ -78,19 +78,25 @@ def cnblock_save(d):
     os.makedirs(BGP_DIR, exist_ok=True)
     json.dump(d, open(CNBLOCK_FILE, "w"), ensure_ascii=False, indent=2)
 
-def _srs_ok(url):
-    """预检规则集能否下载（200 才注入，避免死链导致 sing-box 起不来）。"""
-    code = sh(f'curl -s -o /dev/null -w "%{{http_code}}" --max-time 15 {url}', check=False)
-    return code.strip() == "200"
+def _http_code(url):
+    return sh(f'curl -s -o /dev/null -w "%{{http_code}}" --max-time 15 {url}', check=False).strip()
 
 def _rule_url(rel):
-    """返回可用的规则集 URL：优先 jsDelivr（不受 GitHub 429 限流），回退 raw；都不通返回 ''。
-       rel 形如 'geosite/geolocation-cn.srs'、'geoip/cn.srs'。"""
+    """选规则集 URL（rel 形如 'geosite/geolocation-cn.srs'）：
+       - 优先 jsDelivr、回退 raw，确认能拿到 200 就用它；
+       - 只是临时拉不到（429/超时/5xx 等）时，仍返回 jsDelivr 地址「先注入着」，
+         sing-box 会在 24h 自动更新时重新拉——不因一时限流拖累其它能用的规则集；
+       - 只有两个源都明确 404（压根不存在，如 wildrift）才返回 '' 跳过。"""
+    codes = []
     for base in (RULES_CDN, RULES_RAW):
         u = f"{base}/{rel}"
-        if _srs_ok(u):
+        c = _http_code(u)
+        if c == "200":
             return u
-    return ""
+        codes.append(c)
+    if all(c == "404" for c in codes):                   # 确认不存在 → 跳过
+        return ""
+    return f"{RULES_CDN}/{rel}"                           # 临时拉不到 → 先注入，交给自动更新重拉
 
 def _is_cnblk_rule(r):
     """判断一条 route.rule 是不是本脚本注入的（引用了 cnblk- 开头的规则集）。"""
@@ -162,11 +168,11 @@ def apply_cn_block(cfg=None):
                           "download_detour": direct_tag, "update_interval": "24h"})
             wl_refs.append(tag)
         else:
-            print(f"    跳过 {t}（raw 与 jsDelivr 都拉不到）")
+            print(f"    跳过 {t}（该规则集不存在）")
     cn_site = _rule_url("geosite/geolocation-cn.srs")   # 全部 CN 域名
     cn_ip   = _rule_url("geoip/cn.srs")                 # 全部 CN IP
-    if not cn_site or not cn_ip:
-        print("CN 规则集拉不到（raw 与 jsDelivr 都失败），可能是临时限流，稍后再试。未改动配置。")
+    if not cn_site or not cn_ip:                         # 只有确认 404 才会走到这（正常不会）
+        print("CN 核心规则集不存在，无法屏蔽。未改动配置。")
         return False
     rsets.append({"type": "remote", "tag": "cnblk-cn-site", "format": "binary", "url": cn_site,
                   "download_detour": direct_tag, "update_interval": "24h"})
@@ -195,8 +201,21 @@ def apply_cn_block(cfg=None):
         json.dump(backup, open(sb_cfg, "w"), ensure_ascii=False, indent=2)   # 回滚
         print("注入后配置校验失败，已回滚未生效：\n" + (r.stderr or r.stdout).strip()); return False
     sh("systemctl restart sing-box", check=False)
+    # 确认真的起来了；万一注入后起不来（比如规则集这会儿全拉不到），回滚到屏蔽前配置，
+    # 绝不影响原本能用的节点
+    active = False
+    for _ in range(10):
+        time.sleep(1)
+        if sh("systemctl is-active sing-box", check=False) == "active":
+            active = True; break
+    if not active:
+        json.dump(backup, open(sb_cfg, "w"), ensure_ascii=False, indent=2)
+        sh("systemctl restart sing-box", check=False)
+        print("注入后 sing-box 未能启动，已回滚到屏蔽前配置（节点照常可用）。可能是规则集暂时全拉不到，稍后再试。")
+        return False
     cfg["enabled"] = True; cnblock_save(cfg)
     print(f"\n✓ 已开启屏蔽中国域名/IP：放行白名单 {len(wl_refs)} 组，其余 CN 域名+IP 一律拦截。")
+    print("  （临时拉不到的规则集已先注入，sing-box 会在 24h 自动更新时补齐，不影响其它已生效的。）")
     return True
 
 def remove_cn_block(silent=False):
