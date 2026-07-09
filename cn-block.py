@@ -18,8 +18,17 @@ RULES_RAW    = "https://raw.githubusercontent.com/bgpeer/rules/main/geo"
 CN_SITE_URL  = RULES_RAW + "/geosite/geolocation-cn.srs"   # 全部 CN 域名
 CN_IP_URL    = RULES_RAW + "/geoip/cn.srs"                 # 全部 CN IP
 # 作者放行白名单：这些 CN 服务照常直连，其余 CN 一律拦
-CN_WHITELIST = ["bytedance", "tiktok", "wildrift", "bilibili",
-                "xiaohongshu", "alibaba", "tencent", "kuaishou", "geolocation-!cn"]
+CN_WHITELIST = [
+  "bytedance", 
+  "tiktok", 
+  "wildrift", 
+  "bilibili",
+  "xiaohongshu", 
+  "alibaba", 
+  "tencent", 
+  "kuaishou", 
+  "geolocation-!cn"
+]
 
 def sh(cmd, check=True):
     r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
