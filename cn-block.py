@@ -21,7 +21,7 @@ RULES_RAW    = "https://raw.githubusercontent.com/bgpeer/rules/main/geo"
 CN_WHITELIST = [
   "bytedance", 
   "tiktok", 
-  "wildrift", 
+  "category-games-!cn", 
   "bilibili",
   "xiaohongshu", 
   "alibaba", 
