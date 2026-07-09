@@ -169,8 +169,22 @@ reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为
 
 加 `--no-reality-443` 可关闭此行为（reality 回到随机端口、保留 nginx 443 前置）。
 
-> 想更进一步做到"网站 + 多协议全部回 443"（nginx `stream` + `ssl_preread` 按 SNI 分流），
-> 属于更大的架构改动，可作为后续。当前 reality-443 已能解决最主要的封端口风险。
+### SNI 分流（`--sni-split`，最强抗封锁，需域名 + reality-vision）
+
+比 reality 直绑 443 更进一步：用 nginx `stream` + `ssl_preread` 在 443 **按 SNI 不解密分流**，
+让 **reality + 网站 + ws 全部只用 443**，对外就是一个 HTTPS 网站：
+
+- SNI = reality 借用域名（如 `s0.awsstatic.com`）→ 转发给本地 reality 端口；
+- SNI = 你的真域名 / 默认 → 转发给本地 https（伪装站 + ws 反代）；
+- hy2 仍走自己的 UDP 端口 + 跳跃（QUIC 与 nginx 的 443/TCP 不冲突）；
+- 证书续期继续走 nginx `:80` webroot，不受影响。
+
+安全兜底：改 `nginx.conf` **前先做 preflight**（装 `libnginx-mod-stream`，用测试配置跑 `nginx -t`），
+探测不过就**自动退回 reality-443 直连**；正式写入若 `nginx -t` 不过则**整体回滚**并还原
+`nginx.conf`，绝不把现有能用的 443 改坏。交互安装选了域名 + reality-vision 时会询问是否启用。
+
+> v1 只把 sing-box `reality-vision` 放到 443 SNI 分流后面；其余 reality（xray xhttp 等）仍在随机端口。
+> 这是较大的架构改动，务必在你自己的机器上实测（`openssl s_client` 打 443 分别用两个 SNI 验证走向 + 客户端逐协议连通）。
 
 ---
 
