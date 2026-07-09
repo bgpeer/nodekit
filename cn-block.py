@@ -14,9 +14,9 @@ SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
 BGP_DIR = "/etc/bgpeer"
 CNBLOCK_FILE = BGP_DIR + "/cnblock.json"        # 记住是否开启 + 白名单来源
+# 规则集优先走 jsDelivr 镜像（不受 GitHub raw 的 429 限流），回退 raw。
+RULES_CDN    = "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo"
 RULES_RAW    = "https://raw.githubusercontent.com/bgpeer/rules/main/geo"
-CN_SITE_URL  = RULES_RAW + "/geosite/geolocation-cn.srs"   # 全部 CN 域名
-CN_IP_URL    = RULES_RAW + "/geoip/cn.srs"                 # 全部 CN IP
 # 作者放行白名单：这些 CN 服务照常直连，其余 CN 一律拦
 CN_WHITELIST = [
   "bytedance", 
@@ -83,6 +83,15 @@ def _srs_ok(url):
     code = sh(f'curl -s -o /dev/null -w "%{{http_code}}" --max-time 15 {url}', check=False)
     return code.strip() == "200"
 
+def _rule_url(rel):
+    """返回可用的规则集 URL：优先 jsDelivr（不受 GitHub 429 限流），回退 raw；都不通返回 ''。
+       rel 形如 'geosite/geolocation-cn.srs'、'geoip/cn.srs'。"""
+    for base in (RULES_CDN, RULES_RAW):
+        u = f"{base}/{rel}"
+        if _srs_ok(u):
+            return u
+    return ""
+
 def _is_cnblk_rule(r):
     """判断一条 route.rule 是不是本脚本注入的（引用了 cnblk- 开头的规则集）。"""
     rs = r.get("rule_set")
@@ -146,17 +155,22 @@ def apply_cn_block(cfg=None):
     wl_refs = []
     print("  预检白名单规则集…")
     for t in _whitelist_tags(cfg):
-        url = f"{RULES_RAW}/geosite/{t}.srs"
-        if _srs_ok(url):
+        url = _rule_url(f"geosite/{t}.srs")
+        if url:
             tag = "cnblk-wl-" + t
             rsets.append({"type": "remote", "tag": tag, "format": "binary", "url": url,
                           "download_detour": direct_tag, "update_interval": "24h"})
             wl_refs.append(tag)
         else:
-            print(f"    跳过 {t}（拉不到）")
-    rsets.append({"type": "remote", "tag": "cnblk-cn-site", "format": "binary", "url": CN_SITE_URL,
+            print(f"    跳过 {t}（raw 与 jsDelivr 都拉不到）")
+    cn_site = _rule_url("geosite/geolocation-cn.srs")   # 全部 CN 域名
+    cn_ip   = _rule_url("geoip/cn.srs")                 # 全部 CN IP
+    if not cn_site or not cn_ip:
+        print("CN 规则集拉不到（raw 与 jsDelivr 都失败），可能是临时限流，稍后再试。未改动配置。")
+        return False
+    rsets.append({"type": "remote", "tag": "cnblk-cn-site", "format": "binary", "url": cn_site,
                   "download_detour": direct_tag, "update_interval": "24h"})
-    rsets.append({"type": "remote", "tag": "cnblk-cn-ip", "format": "binary", "url": CN_IP_URL,
+    rsets.append({"type": "remote", "tag": "cnblk-cn-ip", "format": "binary", "url": cn_ip,
                   "download_detour": direct_tag, "update_interval": "24h"})
 
     # 规则顺序：白名单放行（在前，命中即直连不被拦）→ CN 域名拦 → CN IP 拦 → 原有其它规则
