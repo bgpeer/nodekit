@@ -9,7 +9,7 @@
 # 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
-import os, re, sys, json, time, subprocess, urllib.request
+import os, re, sys, json, time, subprocess, urllib.request, urllib.error
 
 SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
@@ -78,12 +78,28 @@ def fetch_url(url):
 def cnblock_load():
     try: return json.load(open(CNBLOCK_FILE))
     except Exception: return {}
+
+def _write_json(path, obj):
+    """原子写：先写临时文件再 replace，进程中途被杀也不会留下写了一半的配置。"""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 def cnblock_save(d):
     os.makedirs(BGP_DIR, exist_ok=True)
-    json.dump(d, open(CNBLOCK_FILE, "w"), ensure_ascii=False, indent=2)
+    _write_json(CNBLOCK_FILE, d)
 
 def _http_code(url):
-    return sh(f'curl -s -o /dev/null -w "%{{http_code}}" --max-time 15 {url}', check=False).strip()
+    """HEAD 探测 HTTP 状态码。不走 shell（url 可能含外部内容，避免注入）。"""
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xy-installer"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return str(r.status)
+    except urllib.error.HTTPError as e:
+        return str(e.code)
+    except Exception:
+        return "000"
 
 def _rule_url(rel):
     """选规则集 URL（rel 形如 'geosite/geolocation-cn.srs'）：
@@ -130,8 +146,14 @@ def _whitelist_tags(cfg):
         tags = []                                        # 否则按纯文本：每行一个 tag
         for ln in txt.splitlines():
             ln = ln.strip()
-            if ln and not ln.startswith("#"):
-                tags.append(ln.split()[0])
+            if not ln or ln.startswith("#"):
+                continue
+            t = ln.split()[0]
+            # 远端内容只当 tag 用，字符集收紧到规则集名允许的范围，防止混入奇怪内容
+            if re.fullmatch(r"[A-Za-z0-9!_.\-]+", t):
+                tags.append(t)
+            else:
+                print(f"  跳过非法 tag: {t!r}")
         return tags
     return list(CN_WHITELIST)
 
@@ -198,11 +220,19 @@ def apply_cn_block(cfg=None):
     cf = exp.get("cache_file") or {}
     cf["enabled"] = True; cf.setdefault("path", f"{SB_DIR}/cache.db")
     exp["cache_file"] = cf; conf["experimental"] = exp
-    json.dump(conf, open(sb_cfg, "w"), ensure_ascii=False, indent=2)
+    _write_json(sb_cfg, conf)
+
+    def _rollback():
+        """回滚到注入前配置，并把 enabled 状态对齐回滚后的实际情况——
+           重装后配置里已无 cnblk 规则时，不再让菜单显示『已开启』误导用户。"""
+        _write_json(sb_cfg, backup)
+        cfg["enabled"] = any(str(r.get("tag", "")).startswith("cnblk-")
+                             for r in (backup.get("route") or {}).get("rule_set", []))
+        cnblock_save(cfg)
 
     r = subprocess.run(f"{SB_BIN} check -c {sb_cfg}", shell=True, text=True, capture_output=True)
     if r.returncode:
-        json.dump(backup, open(sb_cfg, "w"), ensure_ascii=False, indent=2)   # 回滚
+        _rollback()
         print("注入后配置校验失败，已回滚未生效：\n" + (r.stderr or r.stdout).strip()); return False
     sh("systemctl restart sing-box", check=False)
     # 确认真的起来了；万一注入后起不来（比如规则集这会儿全拉不到），回滚到屏蔽前配置，
@@ -213,7 +243,7 @@ def apply_cn_block(cfg=None):
         if sh("systemctl is-active sing-box", check=False) == "active":
             active = True; break
     if not active:
-        json.dump(backup, open(sb_cfg, "w"), ensure_ascii=False, indent=2)
+        _rollback()
         sh("systemctl restart sing-box", check=False)
         print("注入后 sing-box 未能启动，已回滚到屏蔽前配置（节点照常可用）。可能是规则集暂时全拉不到，稍后再试。")
         return False
@@ -232,11 +262,14 @@ def remove_cn_block(silent=False):
             route = conf.get("route") or {}
             route["rule_set"] = [r for r in route.get("rule_set", []) if not str(r.get("tag", "")).startswith("cnblk-")]
             route["rules"] = [r for r in route.get("rules", []) if not _is_cnblk_rule(r)]
-            if not route.get("rule_set") and not route.get("rules"):
-                conf.pop("route", None)
-            else:
+            for k in ("rule_set", "rules"):                 # 清空的键不留着
+                if not route.get(k):
+                    route.pop(k, None)
+            if route:                                       # route 里还有 final 等其它键 → 保留
                 conf["route"] = route
-            json.dump(conf, open(sb_cfg, "w"), ensure_ascii=False, indent=2)
+            else:
+                conf.pop("route", None)
+            _write_json(sb_cfg, conf)
             sh("systemctl restart sing-box", check=False)
         except Exception as e:
             print("处理配置失败:", e)
@@ -254,16 +287,20 @@ def _cache_path():
         return f"{SB_DIR}/cache.db"
 
 def setup_cron():
-    """装每日定点刷新的 cron：北京时间 03:00 = UTC 19:00。"""
+    """装每日定点刷新的 cron：北京时间 03:00 = UTC 19:00。
+       Debian/Ubuntu 默认 cron 不支持 CRON_TZ（那是 cronie 的特性），
+       所以按服务器当前时区把 UTC 19:00 换算成本地时刻写入。"""
     try:
         if os.path.abspath(__file__) != SELF_PATH:      # 确保 cron 调的本地副本存在
             os.makedirs(BGP_DIR, exist_ok=True)
             import shutil; shutil.copy(os.path.abspath(__file__), SELF_PATH)
-        txt = ("# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = UTC 19:00）\n"
+        import datetime
+        local = (datetime.datetime.now(datetime.timezone.utc)
+                 .replace(hour=19, minute=0, second=0, microsecond=0).astimezone())
+        txt = (f"# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = UTC 19:00 = 本机 {local:%H:%M}）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               "CRON_TZ=UTC\n"
-               f"0 19 * * * root python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1\n")
+               f"{local.minute} {local.hour} * * * root python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1\n")
         open(CRON_FILE, "w").write(txt); os.chmod(CRON_FILE, 0o644)
     except OSError as e:
         print("  安装定时任务失败（不影响屏蔽，仅少了每日刷新）:", e)
@@ -289,10 +326,14 @@ def refresh():
         time.sleep(1)
         if sh("systemctl is-active sing-box", check=False) == "active":
             active = True; break
-    if not active and bak:                              # 起不来 → 回滚旧缓存
-        os.replace(bak, cache)
-        sh("systemctl restart sing-box", check=False)
-        print(time.strftime("%F %T"), "刷新后 sing-box 未启动，已回滚缓存"); return
+    if not active:                                      # 起不来 → 有旧缓存就回滚，无论如何要报出来
+        if bak:
+            os.replace(bak, cache)
+            sh("systemctl restart sing-box", check=False)
+            print(time.strftime("%F %T"), "刷新后 sing-box 未启动，已回滚缓存")
+        else:
+            print(time.strftime("%F %T"), "刷新后 sing-box 未启动（无缓存可回滚），请检查 systemctl status sing-box")
+        return
     if bak and os.path.exists(bak):
         try: os.remove(bak)
         except OSError: pass
