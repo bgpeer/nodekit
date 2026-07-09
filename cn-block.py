@@ -3,9 +3,10 @@
 # 独立文件，方便单独维护；nodekit 主脚本(xy-installer.py)通过子进程调用：
 #   python3 cn-block.py            交互菜单
 #   python3 cn-block.py apply      按已存状态重新注入（未开启则直接跳过）——重装后自动调用
+#   python3 cn-block.py refresh    刷新规则集缓存并重启（cron 每天北京 03:00 调用）
 #   python3 cn-block.py remove     卸载屏蔽规则
 #
-# 规则集用 sing-box 远程 srs（每 24h 自更新）：
+# 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
 import os, re, sys, json, time, subprocess, urllib.request
@@ -14,6 +15,9 @@ SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
 BGP_DIR = "/etc/bgpeer"
 CNBLOCK_FILE = BGP_DIR + "/cnblock.json"        # 记住是否开启 + 白名单来源
+SELF_PATH    = BGP_DIR + "/cn-block.py"          # cron 调用的本地副本
+CRON_FILE    = "/etc/cron.d/bgpeer-cnblock"      # 每日定点刷新规则集
+CRON_LOG     = "/var/log/bgpeer-cnblock.log"
 # 规则集优先走 jsDelivr 镜像（不受 GitHub raw 的 429 限流），回退 raw。
 RULES_CDN    = "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo"
 RULES_RAW    = "https://raw.githubusercontent.com/bgpeer/rules/main/geo"
@@ -214,8 +218,9 @@ def apply_cn_block(cfg=None):
         print("注入后 sing-box 未能启动，已回滚到屏蔽前配置（节点照常可用）。可能是规则集暂时全拉不到，稍后再试。")
         return False
     cfg["enabled"] = True; cnblock_save(cfg)
+    setup_cron()                                        # 每天北京 03:00 定点刷新规则集
     print(f"\n✓ 已开启屏蔽中国域名/IP：放行白名单 {len(wl_refs)} 组，其余 CN 域名+IP 一律拦截。")
-    print("  （临时拉不到的规则集已先注入，sing-box 会在 24h 自动更新时补齐，不影响其它已生效的。）")
+    print("  规则集每天北京时间 03:00 自动刷新（cron）；临时拉不到的会在下次刷新补齐，不影响已生效的。")
     return True
 
 def remove_cn_block(silent=False):
@@ -235,10 +240,63 @@ def remove_cn_block(silent=False):
             sh("systemctl restart sing-box", check=False)
         except Exception as e:
             print("处理配置失败:", e)
+    remove_cron()                                         # 一并撤掉每日刷新的定时任务
     try: os.remove(CNBLOCK_FILE)                          # 卸载即清状态，之后重装不会再自动注入
     except OSError: pass
     if not silent:
         print("已卸载屏蔽，恢复为不拦截 CN。")
+
+def _cache_path():
+    try:
+        conf = json.load(open(f"{SB_DIR}/config.json"))
+        return conf.get("experimental", {}).get("cache_file", {}).get("path") or f"{SB_DIR}/cache.db"
+    except Exception:
+        return f"{SB_DIR}/cache.db"
+
+def setup_cron():
+    """装每日定点刷新的 cron：北京时间 03:00 = UTC 19:00。"""
+    try:
+        if os.path.abspath(__file__) != SELF_PATH:      # 确保 cron 调的本地副本存在
+            os.makedirs(BGP_DIR, exist_ok=True)
+            import shutil; shutil.copy(os.path.abspath(__file__), SELF_PATH)
+        txt = ("# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = UTC 19:00）\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               "CRON_TZ=UTC\n"
+               f"0 19 * * * root python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1\n")
+        open(CRON_FILE, "w").write(txt); os.chmod(CRON_FILE, 0o644)
+    except OSError as e:
+        print("  安装定时任务失败（不影响屏蔽，仅少了每日刷新）:", e)
+
+def remove_cron():
+    try: os.remove(CRON_FILE)
+    except OSError: pass
+
+def refresh():
+    """定点刷新：清 sing-box 规则集缓存后重启，强制重新拉取远程 srs；
+       起不来就回滚缓存，绝不因刷新把节点搞挂。cron 调用。"""
+    if not cnblock_load().get("enabled"):
+        return
+    cache = _cache_path(); bak = cache + ".bak"
+    if os.path.exists(cache):
+        try: os.replace(cache, bak)
+        except OSError: bak = None
+    else:
+        bak = None
+    sh("systemctl restart sing-box", check=False)
+    active = False
+    for _ in range(15):
+        time.sleep(1)
+        if sh("systemctl is-active sing-box", check=False) == "active":
+            active = True; break
+    if not active and bak:                              # 起不来 → 回滚旧缓存
+        os.replace(bak, cache)
+        sh("systemctl restart sing-box", check=False)
+        print(time.strftime("%F %T"), "刷新后 sing-box 未启动，已回滚缓存"); return
+    if bak and os.path.exists(bak):
+        try: os.remove(bak)
+        except OSError: pass
+    print(time.strftime("%F %T"), "规则集已刷新")
 
 def menu():
     while True:
@@ -286,6 +344,8 @@ def main():
     if act == "apply":                                   # 主脚本重装后调用：仅在已开启时重注入
         if cnblock_load().get("enabled"):
             apply_cn_block()
+    elif act == "refresh":                               # cron 每日定点调用：刷新规则集
+        refresh()
     elif act == "remove":
         remove_cn_block()
     else:
