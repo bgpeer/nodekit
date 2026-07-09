@@ -103,6 +103,8 @@ sudo python3 /tmp/xy.py
 - 注入后会确认 sing-box 正常启动，**万一起不来自动回滚**，绝不影响原本能用的节点。
 - 自定义白名单：可填纯文本 tag 列表，也可**直接指向一个 `whitelist-inject.sh` 脚本链接**，
   自动抽取其中的 `WHITELIST_TAGS=(...)` 数组。
+- 白名单按**域名**（geosite）放行：客户端需走远程 DNS 解析（本项目生成的订阅配置默认即是）；
+  若客户端本地解析后以裸 IP 出站，仍会被 CN IP 规则拦截。
 
 规则集来自 [`bgpeer/rules`](https://github.com/bgpeer/rules)，
 配套的 mack-a 白名单注入脚本见 [`bgpeer/vps-net`](https://github.com/bgpeer/vps-net)。

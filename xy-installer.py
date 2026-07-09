@@ -290,7 +290,11 @@ def check_domain_or_die():
 
 # ---------------------------------------------------------------------------- 核心安装
 def arch_tag():
-    return {"x86_64": "amd64", "aarch64": "arm64"}[os.uname().machine]
+    m = os.uname().machine
+    t = {"x86_64": "amd64", "aarch64": "arm64"}.get(m)
+    if not t:
+        raise SystemExit(f"不支持的 CPU 架构: {m}（sing-box/xray 预编译包仅支持 x86_64 / aarch64）")
+    return t
 
 def latest_gh_release(repo, fallback):
     """取 GitHub 最新正式版 tag（去掉前导 v）。取不到就用 fallback。
@@ -400,13 +404,17 @@ def setup_port_hopping(target_port, rng):
     tagc = "xy_hy2_portHopping"
     # 先清掉这段 UDP 上所有旧 DNAT 规则——不只本脚本的，还包括 mack-a 等残留的
     # “强制固定”规则（它们指向已死的旧端口，且可能排在前面先匹配，导致 hy2 不通）。
-    for line in sh("iptables -t nat -S PREROUTING", check=False).splitlines():
-        if not line.startswith("-A"):
+    # inbound 监听 :: 双栈，跳跃段 v4/v6 都要转发，否则 IPv6 客户端走 mport 全挂。
+    for ipt in ("iptables", "ip6tables"):
+        if not have(ipt):
             continue
-        if "portHopping" in line or f"--dport {lo}:{hi}" in line:
-            sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
-    sh(f"iptables -t nat -A PREROUTING -p udp --dport {lo}:{hi} "
-       f"-m comment --comment {tagc} -j DNAT --to-destination :{target_port}", check=False)
+        for line in sh(f"{ipt} -t nat -S PREROUTING", check=False).splitlines():
+            if not line.startswith("-A"):
+                continue
+            if "portHopping" in line or f"--dport {lo}:{hi}" in line:
+                sh(f"{ipt} -t nat " + line.replace("-A", "-D", 1), check=False)
+        sh(f"{ipt} -t nat -A PREROUTING -p udp --dport {lo}:{hi} "
+           f"-m comment --comment {tagc} -j DNAT --to-destination :{target_port}", check=False)
     # 尽量持久化（重启后仍生效）；没有 netfilter-persistent 就装一下
     if not have("netfilter-persistent"):
         sh("DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent", check=False)
@@ -1246,8 +1254,9 @@ def install_shortcut():
         wrapper = ("#!/usr/bin/env bash\n"
                    'u="https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py"\n'
                    'j="https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py"\n'
-                   'curl -fsSL "$u" -o /tmp/xy.new 2>/dev/null || curl -fsSL "$j" -o /tmp/xy.new 2>/dev/null || true\n'
-                   '[ -s /tmp/xy.new ] && mv /tmp/xy.new /etc/bgpeer/xy-installer.py; rm -f /tmp/xy.new\n'
+                   't="$(mktemp)"\n'                     # 随机临时文件，避免固定路径被抢注
+                   'curl -fsSL "$u" -o "$t" 2>/dev/null || curl -fsSL "$j" -o "$t" 2>/dev/null || true\n'
+                   '[ -s "$t" ] && mv "$t" /etc/bgpeer/xy-installer.py; rm -f "$t"\n'
                    'exec python3 /etc/bgpeer/xy-installer.py "$@"\n')
         open("/usr/local/bin/bgpeer", "w").write(wrapper)
         os.chmod("/usr/local/bin/bgpeer", 0o755)
@@ -1363,7 +1372,8 @@ def update_cores():
     ensure_deps()
     if c in ("1", "3") and os.path.exists(SB_BIN):
         install_singbox(); sh("systemctl restart sing-box", check=False)
-        print("sing-box 现版本:", sh(f"{SB_BIN} version", check=False).splitlines()[0] if sh(f"{SB_BIN} version", check=False) else "?")
+        v = sh(f"{SB_BIN} version", check=False)
+        print("sing-box 现版本:", v.splitlines()[0] if v else "?")
     if c in ("2", "3") and os.path.exists(XRAY_BIN):
         install_xray(); sh("systemctl restart xray", check=False)
         print("xray 已更新")
@@ -1377,15 +1387,18 @@ def uninstall_all():
         sh(f"systemctl disable --now {svc}", check=False)
         sh(f"rm -f /etc/systemd/system/{svc}.service", check=False)
     sh("systemctl daemon-reload", check=False)
-    for line in sh("iptables -t nat -S PREROUTING", check=False).splitlines():
-        if line.startswith("-A") and "xy_hy2_portHopping" in line:
-            sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
+    for ipt in ("iptables", "ip6tables"):
+        for line in sh(f"{ipt} -t nat -S PREROUTING", check=False).splitlines():
+            if line.startswith("-A") and "xy_hy2_portHopping" in line:
+                sh(f"{ipt} -t nat " + line.replace("-A", "-D", 1), check=False)
     sh("netfilter-persistent save", check=False)
     if os.path.exists(NGINX_CONF):                      # 移除本脚本的 nginx 前置块（不动用户其它站点）
         sh(f"rm -f {NGINX_CONF}", check=False)
         sh("nginx -t && systemctl reload nginx", check=False)
     for p in (SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, "/etc/ssl/sb", SUB_DIR,
-              "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer", WEBROOT):
+              "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer", WEBROOT,
+              # cn-block 的每日刷新 cron 及日志：不清掉的话 cron 会每天调已删除的脚本报错
+              "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log"):
         sh(f"rm -rf {p}", check=False)
     print("已卸载完毕。")
 
@@ -1510,7 +1523,7 @@ def install_flow():
     sni = _ask("reality 借用目标站 SNI (回车=s0.awsstatic.com): ") or "s0.awsstatic.com"
     prefix = _ask("节点名称前缀(如 🇺🇸/🇯🇵/家宽，回车=无前缀): ")
     hy2p = ""
-    if not sb_names or "hy2" in sb_names:
+    if "hy2" in sb_names:
         hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000): ")
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"] = \
         domain, email, sni, prefix, hy2p, nginx
@@ -1523,7 +1536,7 @@ def install_flow():
     print("  nginx前置:", "是（443伪装站+webroot，ws类走443）" if nginx else "否")
     print("  名称前缀:", prefix or "(无)")
     print("  SNI:     ", sni)
-    if not sb_names or "hy2" in sb_names:
+    if "hy2" in sb_names:
         print("  hy2跳跃: ", hy2_range())
     print("-" * 60)
     if (_ask("确认开始? [Y/n]: ") or "y").lower() in ("n", "no"):
