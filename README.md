@@ -133,6 +133,29 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 
 ---
 
+## 伪装 / 加密建议
+
+装机时脚本会自动做两项检查，帮你把伪装做扎实（都只提示、不阻断安装）：
+
+- **Reality SNI 预检**：选了 reality 系列协议时，装前会探测你借用的 SNI 目标是否
+  **可达 + 支持 TLS1.3 + HTTP/2**。不合格会给黄色警告并建议换站
+  （推荐 `www.microsoft.com` / `addons.mozilla.org` / `s0.awsstatic.com` / `dl.google.com`
+  这类大流量、支持 h2、不套 CDN、不在国内的站）。借用不合格的站会让 reality 握手特征更容易被识别。
+- **无域名自签提示**：不给域名时，依赖证书的 TLS 协议（vless-vision / trojan / ws 家族 / anytls）
+  只能走**自签证书 + 客户端 `allowInsecure`**——内容仍加密（各协议有自己的密码/UUID），
+  但失去证书校验、且自签本身是明显特征。**想要更强伪装：优先用 `reality-*` 系列**
+  （借真站证书，无需域名、无 insecure），或补一个域名走 acme 真证书。
+  hy2 / tuic 用自签是行业常规，无需担心。
+
+**伪装站可自替换**：`--nginx` 模式下 443 的伪装首页在 `/var/www/bgpeer/index.html`
+（默认是一个「维护中」通用静态页，不是一眼假的 Apache 默认页）。你可以直接覆盖它换成自己的
+真站内容，伪装效果更好。
+
+> 说明：本脚本各协议默认分布在各自端口（非 443 单端口复用）。若要对抗较强的主动探测，
+> 建议主力用 **reality**（自带握手回落到真站），reality 的抗探测能力不依赖端口复用。
+
+---
+
 ## 卸载
 
 管理面板选 **9. 卸载**，会移除本脚本安装的 sing-box / xray / 订阅服务、配置、证书、

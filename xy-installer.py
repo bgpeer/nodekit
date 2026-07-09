@@ -216,9 +216,31 @@ def ensure_nginx():
     clean_stale_nginx()                                  # 先清掉别人残留的坏块，保证 nginx -t 能过
     os.makedirs(WEBROOT, exist_ok=True)
     if not os.path.exists(WEBROOT + "/index.html"):     # 伪装站首页
+        # 别用 Apache/nginx 默认页(一眼假)；放一个像样的通用静态站。
+        # 用户可直接覆盖 WEBROOT/index.html 换成自己的真站内容以增强伪装。
+        host = G.get("domain") or "this site"
         open(WEBROOT + "/index.html", "w").write(
-            "<!doctype html><html><head><meta charset='utf-8'><title>Welcome</title></head>"
-            "<body><h1>It works!</h1><p>The server is running.</p></body></html>\n")
+            "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            f"<title>{host}</title>\n"
+            "<style>\n"
+            "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2933;background:#f5f7fa;"
+            "display:flex;min-height:100vh;align-items:center;justify-content:center}\n"
+            ".card{max-width:560px;margin:24px;padding:48px 40px;background:#fff;border-radius:14px;"
+            "box-shadow:0 8px 30px rgba(0,0,0,.06);text-align:center}\n"
+            "h1{margin:0 0 12px;font-size:1.6rem;font-weight:600}\n"
+            "p{margin:8px 0;line-height:1.6;color:#616e7c}\n"
+            ".dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#3ba55d;"
+            "margin-right:8px;vertical-align:middle}\n"
+            "footer{margin-top:28px;font-size:.82rem;color:#9aa5b1}\n"
+            "</style>\n</head>\n<body>\n<div class=\"card\">\n"
+            "<h1><span class=\"dot\"></span>We'll be back soon</h1>\n"
+            "<p>This site is currently undergoing scheduled maintenance.</p>\n"
+            "<p>Thank you for your patience — please check back a little later.</p>\n"
+            "<footer>&copy; 2026 &middot; All rights reserved.</footer>\n"
+            "</div>\n</body>\n</html>\n")
 
 def nginx_reload():
     chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
@@ -287,6 +309,66 @@ def check_domain_or_die():
     if not G.get("nginx") and not port_free(80):
         raise SystemExit(f"{R}\n❌ 80 端口被占用，acme standalone 无法验证。先停掉占用 80 的服务"
                          f"（nginx/caddy 等）再装，或域名留空用自签，或用 nginx 前置模式。{N}")
+
+# 建议的 reality 借用目标：都是大流量、支持 TLS1.3+h2、不在国内、不套 CDN 的站
+SNI_SUGGESTIONS = "www.microsoft.com / addons.mozilla.org / s0.awsstatic.com / dl.google.com"
+
+def _reality_sni_ok(sni):
+    """探测 reality 借用目标站是否支持 TLS1.3 + HTTP/2。返回 (ok, 说明)。
+       reality 要求目标必须 TLS1.3，且最好支持 h2（否则握手特征与真站不符、易被识别）。
+       探测本身失败(网络不通等)按『未知』放行，不阻断安装。"""
+    if not re.match(r"^[A-Za-z0-9.\-]+$", sni or ""):
+        return True, "非常规主机名，跳过校验"
+    if not have("openssl"):
+        return True, "无 openssl，跳过校验"
+    try:
+        r = subprocess.run(
+            ["openssl", "s_client", "-connect", f"{sni}:443", "-servername", sni,
+             "-alpn", "h2", "-tls1_3"],
+            input="", text=True, capture_output=True, timeout=15)
+        out = r.stdout + r.stderr
+    except Exception as e:
+        return True, f"探测失败，跳过校验（{e}）"
+    if "CONNECTED" not in out:                        # TCP 都没连上：DNS 挂/不可达/被墙
+        return False, "从本机连不上该目标:443（reality 握手也需能到达它），换一个可达的大站"
+    tls13 = "TLSv1.3" in out and "Cipher is" in out
+    h2 = "ALPN protocol: h2" in out
+    if tls13 and h2:
+        return True, "TLS1.3 + h2 ✓"
+    if not tls13:
+        return False, "目标不支持 TLS1.3（reality 强制要求），必须换"
+    return False, "目标不支持 HTTP/2(h2)，reality 握手特征易露，建议换"
+
+def precheck_sni(sb_names, xr_names):
+    """选了 reality 类协议时，装前探测借用的 SNI 目标是否合格；不合格只警告不阻断。"""
+    reality_sel = (any(n in ("reality-vision", "reality-grpc") for n in sb_names)
+                   or any(n.startswith("vless-reality") for n in xr_names))
+    if not reality_sel:
+        return
+    ok, detail = _reality_sni_ok(G["sni"])
+    if ok:
+        print(f"  reality 借用目标 {G['sni']}: {detail}")
+    else:
+        Y, N = "\033[1;33m", "\033[0m"                # 黄色警告（不阻断）
+        print(f"{Y}  ⚠ reality 借用目标 {G['sni']} 可能不理想：{detail}\n"
+              f"    建议换成支持 TLS1.3+h2 的大站：{SNI_SUGGESTIONS}\n"
+              f"    （可 --sni 指定或在交互菜单里改；现按你填的继续装）{N}")
+
+def warn_selfsigned(sb_names, xr_names):
+    """无域名时，依赖证书的 TLS 协议只能自签+insecure，是伪装/加密弱点。
+       给出明确引导：优先 reality，或补一个域名走真证书。hy2/tuic 自签是常规，不在此列。"""
+    if G["domain"]:
+        return
+    cert_tls = ([n for n in sb_names if n in
+                 ("vless-vision", "trojan", "anytls", "vless-ws", "vmess-ws", "vmess-httpupgrade")]
+                + [n for n in xr_names if n in ("vless-ws", "vmess-ws", "trojan")])
+    if not cert_tls:
+        return
+    Y, N = "\033[1;33m", "\033[0m"
+    print(f"{Y}  ⚠ 无域名：{', '.join(cert_tls)} 将用自签证书 + 客户端 allowInsecure。\n"
+          f"    这些协议内容仍加密(有各自密码/UUID)，但失去证书校验、且自签是明显特征。\n"
+          f"    更稳的伪装：优先选 reality-* 系列（借真站证书，无需域名、无 insecure），\n"
+          f"    或补一个域名走 acme 真证书。hy2/tuic 用自签属常规、无需担心。{N}")
 
 # ---------------------------------------------------------------------------- 核心安装
 def arch_tag():
@@ -1163,6 +1245,8 @@ def run(sb_names, xr_names):
     takeover_cleanup()          # 有别人装的(mack-a 等)先踢掉再接管
     # 节点地址：有域名用域名，否则用公网 IP（域名需直连 A 记录指向本机）
     G["host"] = G["domain"] or public_ip()
+    precheck_sni(sb_names, xr_names)     # reality 借用目标合格性预检（只警告不阻断）
+    warn_selfsigned(sb_names, xr_names)  # 无域名自签的伪装弱点引导
     NGINX_WS.clear()
     if G.get("nginx"):
         if not G["domain"]:
