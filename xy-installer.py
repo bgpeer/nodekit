@@ -14,7 +14,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, shutil, socket, re
+import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, shutil, socket, re, time
 
 # 版本：安装时优先取 GitHub 最新正式版；下面是取不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -774,9 +774,28 @@ def link_to_proxy(u):
         return {"name": nm("ss"), "type": "ss", "server": host, "port": port, "cipher": method, "password": pw, "udp": "true"}
     return None
 
+def _mirrors(url):
+    """raw.githubusercontent 常被限流(429)，补上 jsDelivr 镜像作兜底。"""
+    urls = [url]
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)", url)
+    if m:
+        o, repo, br, path = m.groups()
+        urls.append(f"https://cdn.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+        urls.append(f"https://fastly.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+    return urls
+
 def fetch_url(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
-    return urllib.request.urlopen(req, timeout=15).read().decode()
+    """带重试 + 镜像兜底的拉取，缓解 GitHub 429 限流。"""
+    last = None
+    for rd in range(2):                                 # 两轮，轮间退避
+        for u in _mirrors(url):
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "xy-installer"})
+                return urllib.request.urlopen(req, timeout=15).read().decode()
+            except Exception as e:
+                last = e
+        time.sleep(2 * (rd + 1))
+    raise last
 
 def _host():
     return open(HOST_FILE).read().strip() if os.path.exists(HOST_FILE) else (G.get("host") or public_ip())
@@ -1217,9 +1236,13 @@ def install_shortcut():
     try:
         os.makedirs("/etc/bgpeer", exist_ok=True)
         open("/etc/bgpeer/xy-installer.py", "w").write(open(__file__).read())
+        # raw.githubusercontent 常被 GitHub 限流(429)，加 jsDelivr 镜像兜底；
+        # 只有真的下到非空内容才覆盖本地，拉不到就继续用本地缓存（不会退回旧版失败）。
         wrapper = ("#!/usr/bin/env bash\n"
                    'u="https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py"\n'
-                   'curl -fsSL "$u" -o /etc/bgpeer/xy-installer.py 2>/dev/null || true\n'
+                   'j="https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py"\n'
+                   'curl -fsSL "$u" -o /tmp/xy.new 2>/dev/null || curl -fsSL "$j" -o /tmp/xy.new 2>/dev/null || true\n'
+                   '[ -s /tmp/xy.new ] && mv /tmp/xy.new /etc/bgpeer/xy-installer.py; rm -f /tmp/xy.new\n'
                    'exec python3 /etc/bgpeer/xy-installer.py "$@"\n')
         open("/usr/local/bin/bgpeer", "w").write(wrapper)
         os.chmod("/usr/local/bin/bgpeer", 0o755)
