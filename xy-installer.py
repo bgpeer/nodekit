@@ -60,6 +60,14 @@ SUB_EXTS = {"yaml": "mihomo/clash", "json": "sing-box", "conf": "Shadowrocket"}
 NGINX_CONF = "/etc/nginx/conf.d/bgpeer.conf"
 WEBROOT    = "/var/www/bgpeer"
 NGINX_WS   = []                 # 运行期收集：ws 家族的 {path, port}，供 nginx location 反代
+# SNI 分流模式（--sni-split）：nginx stream + ssl_preread 在 443 按 SNI 不解密分流——
+# reality 借用域名的 SNI → 本地 reality 端口；你的真域名/默认 → 本地 https(网站+ws)。
+# 对外只有 443，reality 真正上 443，且探测回落到借用真站。hy2 仍走自己的 UDP 端口。
+NGINX_MAIN        = "/etc/nginx/nginx.conf"
+NGINX_MAIN_BAK    = "/etc/nginx/nginx.conf.bgpeer-bak"
+NGINX_STREAM_CONF = "/etc/nginx/bgpeer-stream.conf"   # stream(ssl_preread) 分流配置
+NGINX_STREAM      = []          # 运行期收集：reality 后端 [{sni, port}]（监听 127.0.0.1）
+SNI_HTTPS_PORT    = 8443        # 本地 https(网站+ws)端口，藏在 stream 443 后面
 
 # 屏蔽中国域名/IP 功能拆到独立文件 cn-block.py，方便单独维护；主脚本只负责拉取+调用。
 CNBLOCK_FILE   = BGP_DIR + "/cnblock.json"       # cn-block.py 存的状态（这里只读它判断是否已开启）
@@ -276,8 +284,8 @@ def write_nginx_acme_stub():
     open(NGINX_CONF, "w").write(conf)
     nginx_reload()
 
-def write_nginx_conf():
-    """签好证书、收集完 ws 家族后，写完整 conf：80 跳转 + 443 伪装站 + ws 按 path 反代。"""
+def _nginx_ws_locations():
+    """ws 家族的 location 反代块（供 443 或本地 https server 复用）。"""
     locs = ""
     for w in NGINX_WS:
         locs += (f"  location = {w['path']} {{\n"
@@ -287,18 +295,146 @@ def write_nginx_conf():
                  f"    proxy_set_header Connection \"upgrade\";\n"
                  f"    proxy_set_header Host $host;\n"
                  f"    proxy_set_header X-Real-IP $remote_addr;\n  }}\n")
-    conf = (
-        f"server {{\n  listen 80;\n  listen [::]:80;\n  server_name {G['domain']};\n"
-        f"  location /.well-known/acme-challenge/ {{ root {WEBROOT}; }}\n"
-        f"  location / {{ return 301 https://$host$request_uri; }}\n}}\n"
-        f"server {{\n  listen 443 ssl http2;\n  listen [::]:443 ssl http2;\n"
-        f"  server_name {G['domain']};\n"
-        f"  ssl_certificate {ACME_CRT};\n  ssl_certificate_key {ACME_KEY};\n"
-        f"  ssl_protocols TLSv1.2 TLSv1.3;\n"
-        f"{locs}"
-        f"  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
-    open(NGINX_CONF, "w").write(conf)
+    return locs
+
+def _nginx_80_server():
+    """:80——acme webroot 验证 + 跳转到 https。"""
+    return (f"server {{\n  listen 80;\n  listen [::]:80;\n  server_name {G['domain']};\n"
+            f"  location /.well-known/acme-challenge/ {{ root {WEBROOT}; }}\n"
+            f"  location / {{ return 301 https://$host$request_uri; }}\n}}\n")
+
+def _nginx_https_server(listen):
+    """https 伪装站 + ws 反代；listen 为监听指令（公网 443 或本地 127.0.0.1:8443）。"""
+    return (f"server {{\n{listen}"
+            f"  server_name {G['domain']};\n"
+            f"  ssl_certificate {ACME_CRT};\n  ssl_certificate_key {ACME_KEY};\n"
+            f"  ssl_protocols TLSv1.2 TLSv1.3;\n"
+            f"{_nginx_ws_locations()}"
+            f"  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
+
+def write_nginx_conf():
+    """签好证书、收集完 ws 家族后，写完整 conf：80 跳转 + 443 伪装站 + ws 按 path 反代。"""
+    listen = "  listen 443 ssl http2;\n  listen [::]:443 ssl http2;\n"
+    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
     nginx_reload()
+
+# ---- SNI 分流（--sni-split）：nginx stream + ssl_preread，reality 真正上 443 ----
+def ensure_stream_module():
+    """确保 nginx 的 stream + ssl_preread 模块可用（Ubuntu/Debian 在 libnginx-mod-stream）。
+       是否真能用最终由 preflight 的 nginx -t 判定，这里只尽量把模块装上。"""
+    v = subprocess.run("nginx -V", shell=True, text=True, capture_output=True)
+    if "with-stream" in (v.stdout + v.stderr):          # 内建 stream（nginx -V 输出在 stderr）
+        return True
+    if subprocess.run("dpkg -s libnginx-mod-stream", shell=True,
+                      capture_output=True).returncode == 0:
+        return True                                     # 已装动态模块
+    sh("apt-get update -y", check=False)
+    sh("DEBIAN_FRONTEND=noninteractive apt-get install -y libnginx-mod-stream", check=False)
+    return True
+
+def _nginxconf_has_stream():
+    """nginx.conf 顶层是否已有 stream 块（有的话不敢贸然再加，交给用户/我们的标记块）。"""
+    try:
+        txt = open(NGINX_MAIN).read()
+    except OSError:
+        return False
+    return "BGPEER-STREAM-BEGIN" in txt or re.search(r"(?m)^\s*stream\s*\{", txt) is not None
+
+def _nginxconf_add_stream():
+    """在 nginx.conf 顶层追加我们的 stream include（带标记，便于卸载时移除）；幂等。"""
+    txt = open(NGINX_MAIN).read()
+    if "BGPEER-STREAM-BEGIN" in txt:
+        return
+    block = ("\n# BGPEER-STREAM-BEGIN\n"
+             f"stream {{\n    include {NGINX_STREAM_CONF};\n}}\n"
+             "# BGPEER-STREAM-END\n")
+    open(NGINX_MAIN, "a").write(block)
+
+def _nginxconf_remove_stream():
+    """卸载时移除我们加进 nginx.conf 的 stream 标记块，不动用户其它内容。"""
+    try:
+        txt = open(NGINX_MAIN).read()
+    except OSError:
+        return
+    new = re.sub(r"\n?# BGPEER-STREAM-BEGIN\n.*?# BGPEER-STREAM-END\n",
+                 "\n", txt, flags=re.S)
+    if new != txt:
+        open(NGINX_MAIN, "w").write(new)
+
+def _stream_conf_text():
+    """stream 配置：按 SNI 不解密分流。reality 借用域名 → 本地 reality 端口；
+       真域名/默认 → 本地 https(网站+ws)。"""
+    m = "map $ssl_preread_server_name $bgpeer_upstream {\n"
+    for b in NGINX_STREAM:                              # reality 后端（借用 SNI → 本地端口）
+        m += f"    {b['sni']}  127.0.0.1:{b['port']};\n"
+    m += f"    {G['domain']}  127.0.0.1:{SNI_HTTPS_PORT};\n"
+    m += f"    default  127.0.0.1:{SNI_HTTPS_PORT};\n}}\n"
+    srv = ("server {\n  listen 443 reuseport;\n  listen [::]:443 reuseport;\n"
+           "  ssl_preread on;\n  proxy_pass $bgpeer_upstream;\n}\n")
+    return m + srv
+
+def sni_split_preflight():
+    """真正改动前先探测：装 stream 模块，用一份『结构等价』的测试 stream 配置跑 nginx -t。
+       通过才敢走 sni-split；不通过返回 False，让调用方退回 reality-443 直连模式。
+       全过程可回滚，绝不把用户能用的 nginx 改坏。"""
+    if not have("nginx"):
+        sh("apt-get update -y", check=False)
+        sh("DEBIAN_FRONTEND=noninteractive apt-get install -y nginx", check=False)
+    if not have("nginx"):
+        print("  sni-split 预检：nginx 装不上，退回 reality-443 直连。"); return False
+    ensure_stream_module()
+    try:
+        txt = open(NGINX_MAIN).read()
+    except OSError:
+        print("  sni-split 预检：读不到 nginx.conf，退回 reality-443 直连。"); return False
+    has_ours = "BGPEER-STREAM-BEGIN" in txt
+    if not has_ours and re.search(r"(?m)^\s*stream\s*\{", txt):   # 用户自己已有 stream 块
+        print("  sni-split 预检：nginx.conf 已有你自己的 stream 块，不便共存，退回 reality-443 直连。")
+        return False
+    if not os.path.exists(NGINX_MAIN_BAK):               # 首次备份 nginx.conf，供回滚
+        sh(f"cp -a {NGINX_MAIN} {NGINX_MAIN_BAK}", check=False)
+    test_conf = os.path.join(os.path.dirname(NGINX_MAIN), "bgpeer-stream-test.conf")
+    open(test_conf, "w").write(
+        "server {\n  listen 65533 reuseport;\n  ssl_preread on;\n"
+        "  proxy_pass 127.0.0.1:65534;\n}\n")
+    added = not has_ours                                 # 已有我们的正式块就不重复加测试块
+    try:
+        if added:
+            open(NGINX_MAIN, "a").write(
+                f"\n# BGPEER-STREAM-TEST\nstream {{\n    include {test_conf};\n}}\n")
+        r = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+        ok = r.returncode == 0
+    finally:                                             # 无论如何撤掉测试块和测试文件
+        if added:
+            t = open(NGINX_MAIN).read()
+            t = re.sub(r"\n?# BGPEER-STREAM-TEST\nstream \{\n.*?\n\}\n", "\n", t, flags=re.S)
+            open(NGINX_MAIN, "w").write(t)
+        sh(f"rm -f {test_conf}", check=False)
+    if not ok:
+        print("  sni-split 预检：nginx stream/ssl_preread 不可用，退回 reality-443 直连。\n   " +
+              (r.stderr or r.stdout).strip().replace("\n", "\n   "))
+    return ok
+
+def write_nginx_sni_split():
+    """写 sni-split 的 http(本地 https 网站+ws) + stream(443 SNI 分流)配置并生效；
+       nginx -t 不过则整体回滚（还原 nginx.conf、删 stream 配置），返回 False。"""
+    listen = f"  listen 127.0.0.1:{SNI_HTTPS_PORT} ssl http2;\n"
+    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
+    open(NGINX_STREAM_CONF, "w").write(_stream_conf_text())
+    _nginxconf_add_stream()
+    chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+    if chk.returncode:                                  # 回滚，绝不留下坏配置
+        _nginxconf_remove_stream()
+        sh(f"rm -f {NGINX_STREAM_CONF}", check=False)
+        if os.path.exists(NGINX_MAIN_BAK):
+            sh(f"cp -a {NGINX_MAIN_BAK} {NGINX_MAIN}", check=False)
+        sh("nginx -t && systemctl reload nginx", check=False)
+        print("  sni-split 写入后校验失败，已回滚：\n   " +
+              (chk.stderr or chk.stdout).strip().replace("\n", "\n   "))
+        return False
+    sh("systemctl enable --now nginx", check=False)
+    sh("systemctl reload nginx", check=False)
+    return True
 
 def free_443_for_reality():
     """reality 要独占 443/TCP：清掉本脚本的 nginx 前置块并 reload，让 nginx 释放 443；
@@ -487,13 +623,20 @@ def write_service(name, binpath, cfg):
 def sb_reality_vision(port, tag):
     uid = new_uuid(); sid = short_id()
     priv, pub = reality_keys(SB_BIN, "generate reality-keypair")
-    ib = {"type": "vless", "tag": tag, "listen": "::", "listen_port": port,
+    # sni-split：reality 监听 127.0.0.1，由 nginx stream 按 SNI 转发进来，链接对外报 443；
+    # 否则常规监听公网端口。
+    split = bool(G.get("sni_split"))
+    listen = "127.0.0.1" if split else "::"
+    ib = {"type": "vless", "tag": tag, "listen": listen, "listen_port": port,
           "users": [{"uuid": uid, "flow": "xtls-rprx-vision"}],
           "tls": {"enabled": True, "server_name": G["sni"],
                   "reality": {"enabled": True,
                               "handshake": {"server": G["sni"], "server_port": 443},
                               "private_key": priv, "short_id": [sid]}}}
-    lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&flow=xtls-rprx-vision"
+    link_port = 443 if split else port
+    if split:
+        NGINX_STREAM.append({"sni": G["sni"], "port": port})   # SNI → 本地 reality 端口
+    lk = (f"vless://{uid}@{G['host']}:{link_port}?encryption=none&flow=xtls-rprx-vision"
           f"&security=reality&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=tcp#{tag}")
     return ib, lk
 
@@ -1295,6 +1438,8 @@ def takeover_cleanup():
 
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
+    if G.get("sni_split") and G["domain"]:
+        G["nginx"] = "1"        # sni-split 自带 nginx(:80 webroot + stream 443)，提前置位让域名校验按 webroot 放宽
     check_domain_or_die()       # 域名不匹配就此停止——必须在 takeover 卸载别人之前
     takeover_cleanup()          # 有别人装的(mack-a 等)先踢掉再接管
     # 节点地址：有域名用域名，否则用公网 IP（域名需直连 A 记录指向本机）
@@ -1302,10 +1447,25 @@ def run(sb_names, xr_names):
     precheck_sni(sb_names, xr_names)     # reality 借用目标合格性预检（只警告不阻断）
     warn_selfsigned(sb_names, xr_names)  # 无域名自签的伪装弱点引导
     NGINX_WS.clear()
+    NGINX_STREAM.clear()
     _USED_PORTS.clear()                  # 本次安装重新随机分配端口
 
-    # reality 绑 443：把主力 reality 协议钉在 443，主动探测回落到借用的真站，
-    # 消掉「reality 在非 443 易被 GFW 封 IP」的风险。443/TCP 独占，与 nginx 前置互斥。
+    # --- SNI 分流（--sni-split）：nginx stream+ssl_preread 让 reality 真正上 443，
+    #     网站/ws 同在 443（按 SNI 不解密分流）。改 nginx 前先 preflight，
+    #     探测不过就退回 reality-443 直连模式，绝不把现有能用的 443 改坏。
+    if G.get("sni_split"):
+        if not G["domain"]:
+            print("  sni-split 需要域名，已忽略。"); G["sni_split"] = ""
+        elif "reality-vision" not in sb_names:
+            print("  sni-split 需选 sing-box reality-vision（放到 443 后面），已忽略。")
+            G["sni_split"] = ""
+        elif not sni_split_preflight():
+            G["sni_split"] = ""; G["reality443"] = "1"    # 退回 reality-443 直连
+        else:
+            G["reality443"] = ""                          # sni-split 下 reality 走本地口，不直绑 443
+
+    # reality 绑 443（直连模式，与 sni-split 互斥）：把主力 reality 协议钉在 443，
+    # 主动探测回落到借用的真站，消掉「reality 在非 443 易被 GFW 封 IP」的风险。
     pin = {}
     r443 = pick_reality_443(sb_names, xr_names) if G.get("reality443") else ""
     if r443:
@@ -1326,7 +1486,12 @@ def run(sb_names, xr_names):
     if sb_names:
         install_singbox()
         ins, lks = build(SB, sb_names, pin); all_links += lks
-        if _nginx_front() and NGINX_WS:
+        if G.get("sni_split"):
+            ensure_acme()                               # 确保证书就绪（本地 https server 要用）
+            if not write_nginx_sni_split():             # 写 http(本地https)+stream(443分流)，失败已回滚
+                print("  ⚠ sni-split 生效失败（nginx 已回滚到安全状态）。此时 reality 监听在本地、"
+                      "暂不可达；请用 --no-sni-split 重装，或改用 reality-443 直连模式。")
+        elif _nginx_front() and NGINX_WS:
             write_nginx_conf()                          # 收集完 ws 家族，写 443 伪装站+反代
         # reality 绑 443 时 nginx 只留 :80 acme stub（续期用），不写 443 块，443 归 reality
         cfg = f"{SB_DIR}/config.json"
@@ -1389,6 +1554,7 @@ def run(sb_names, xr_names):
         json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"],
                    "prefix": G.get("prefix", ""), "hy2_ports": G.get("hy2_ports", ""),
                    "nginx": G.get("nginx", ""), "reality443": G.get("reality443", ""),
+                   "sni_split": G.get("sni_split", ""),
                    "sb": sb_names, "xray": xr_names},
                   open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
@@ -1548,6 +1714,9 @@ def uninstall_all():
     sh("netfilter-persistent save", check=False)
     if os.path.exists(NGINX_CONF):                      # 移除本脚本的 nginx 前置块（不动用户其它站点）
         sh(f"rm -f {NGINX_CONF}", check=False)
+    _nginxconf_remove_stream()                          # 撤掉 sni-split 加进 nginx.conf 的 stream 块
+    sh(f"rm -f {NGINX_STREAM_CONF}", check=False)
+    if have("nginx"):
         sh("nginx -t && systemctl reload nginx", check=False)
     for p in (SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, "/etc/ssl/sb", SUB_DIR,
               "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer", WEBROOT,
@@ -1679,13 +1848,18 @@ def install_flow():
     hy2p = ""
     if "hy2" in sb_names:
         hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000): ")
-    # 选了 reality 才问：把主力 reality 绑 443（抗 GFW 封端口）。默认开，会关掉 nginx 前置。
-    r443 = ""
-    if pick_reality_443(sb_names, xr_names):
+    # 抗 GFW 封端口，两档（都让 reality 上 443）：
+    #  sni-split（最强，需域名+reality-vision）：nginx SNI 分流，reality+网站/ws 全在 443；
+    #  reality-443 直连（次之）：主力 reality 独占 443，nginx 仅留 :80 续期。
+    r443 = ""; split = ""
+    if domain and "reality-vision" in sb_names:
+        ans = _ask("用 nginx SNI 分流把 reality+网站全放到 443?(最强抗封锁, 会装 stream 模块) [Y/n]: ")
+        split = "" if ans.lower() in ("n", "no") else "1"
+    if not split and pick_reality_443(sb_names, xr_names):
         ans = _ask("把主力 reality 绑到 443 抗封锁?(推荐；会关闭 nginx 前置) [Y/n]: ")
         r443 = "" if ans.lower() in ("n", "no") else "1"
-    G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["reality443"] = \
-        domain, email, sni, prefix, hy2p, nginx, r443
+    G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"] = domain, email, sni, prefix, hy2p
+    G["nginx"], G["reality443"], G["sni_split"] = nginx, r443, split
 
     reality443_proto = pick_reality_443(sb_names, xr_names) if r443 else ""
     print("\n" + "-" * 60)
@@ -1693,10 +1867,12 @@ def install_flow():
     if xr_names: print("  xray:    ", ", ".join(xr_names))
     print("  证书:    ", f"acme真证书({domain})" if domain else "自签")
     print("  节点地址:", domain if domain else "公网IP")
-    if reality443_proto:
-        print("  reality绑443:", f"是（{reality443_proto} → 443，抗封锁；nginx前置关闭）")
-    print("  nginx前置:", "是（443伪装站+webroot，ws类走443）"
-          if nginx and not reality443_proto else "否")
+    if split:
+        print("  443方案: ", "SNI分流（reality+网站/ws 全在 443，nginx stream 分流；最强抗封锁）")
+    elif reality443_proto:
+        print("  443方案: ", f"reality直绑443（{reality443_proto}；nginx 仅 :80 续期）")
+    else:
+        print("  nginx前置:", "是（443伪装站+webroot，ws类走443）" if nginx else "否")
     print("  名称前缀:", prefix or "(无)")
     print("  SNI:     ", sni)
     if "hy2" in sb_names:
@@ -1732,6 +1908,8 @@ if __name__ == "__main__":
                     help="用 nginx 前置(443伪装站+webroot证书, ws类藏443)，需域名")
     ap.add_argument("--no-reality-443", action="store_true",
                     help="不把主力 reality 绑到 443（默认会绑，抗 GFW 封端口；会关闭 nginx 前置）")
+    ap.add_argument("--sni-split", action="store_true",
+                    help="最强抗封锁：nginx stream+ssl_preread 按 SNI 分流，reality+网站/ws 全在 443（需域名+reality-vision）")
     ap.add_argument("--yes", action="store_true",
                     help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
@@ -1739,6 +1917,7 @@ if __name__ == "__main__":
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["force"] = \
         a.domain, a.email, a.sni, a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes
     G["reality443"] = "" if a.no_reality_443 else "1"   # 默认把 reality 绑 443（抗封端口）
+    G["sni_split"] = "1" if a.sni_split else ""         # 最强：nginx SNI 分流，全上 443
     sb = list(SB) if a.sb == "all" else [x for x in a.sb.split(",") if x]
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
     if not sb and not xr:
