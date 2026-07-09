@@ -8,7 +8,7 @@
 # 规则集用 sing-box 远程 srs（每 24h 自更新）：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
-import os, re, sys, json, subprocess, urllib.request
+import os, re, sys, json, time, subprocess, urllib.request
 
 SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
@@ -48,9 +48,28 @@ def _ask(prompt=""):
     except (OSError, EOFError):
         return input(prompt).strip()
 
+def _mirrors(url):
+    """raw.githubusercontent 常被限流(429)，补上 jsDelivr 镜像作兜底。"""
+    urls = [url]
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)", url)
+    if m:
+        o, repo, br, path = m.groups()
+        urls.append(f"https://cdn.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+        urls.append(f"https://fastly.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+    return urls
+
 def fetch_url(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
-    return urllib.request.urlopen(req, timeout=15).read().decode()
+    """带重试 + 镜像兜底的拉取，缓解 GitHub 429 限流。"""
+    last = None
+    for rd in range(2):
+        for u in _mirrors(url):
+            try:
+                req = urllib.request.Request(u, headers={"User-Agent": "xy-installer"})
+                return urllib.request.urlopen(req, timeout=15).read().decode()
+            except Exception as e:
+                last = e
+        time.sleep(2 * (rd + 1))
+    raise last
 
 def cnblock_load():
     try: return json.load(open(CNBLOCK_FILE))
