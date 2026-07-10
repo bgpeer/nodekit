@@ -1258,6 +1258,9 @@ def sb_dumps(v, ind=0):
 # 三格式共用同一套检测；各格式生成器按自己语法在 __XY_GROUPS__ / __XY_GROUP_NAMES__ 锚点渲染。
 COUNTRY_THRESHOLD = 2               # 某国节点数 < 该值则不建该组（1=有就建, 2=至少2个）
 OTHER_GROUP = "🎲其他随机"          # 未归入任何国家组的漏网节点收进这里（有漏网才建）
+# sing-box 出站里"是节点"的类型（用来从模板抽用户手写的静态节点，排除 selector/urltest/direct 等分组）
+_SB_NODE_TYPES = {"vless", "vmess", "trojan", "hysteria2", "hysteria", "tuic", "anytls",
+                  "shadowsocks", "shadowtls", "socks", "http", "naive", "ssh", "wireguard"}
 COUNTRY_GROUPS = [                  # [组名, 匹配正则]，顺序即面板展示顺序
     ("🇭🇰香港随机",   r"🇭🇰|\bHK\b|Hong|hong|香港|深港|沪港|京港"),
     ("🇹🇼台湾随机",   r"🇹🇼|\bTW\b|\bTWN\b|Taiwan|Taipei|台湾|台灣|台北"),
@@ -1338,7 +1341,10 @@ def build_singbox_sub(nodes, tpl_url):
             pass
     if not objs:
         return
-    tags = [o["tag"] for o in objs]
+    # 国家检测/成员池 = 注入的订阅节点 + 用户手写进模板的静态节点（同为出站节点，按类型识别）
+    static_tags = [o["tag"] for o in cfg.get("outbounds", [])
+                   if isinstance(o, dict) and o.get("type") in _SB_NODE_TYPES and o.get("tag")]
+    tags = [o["tag"] for o in objs] + static_tags
     country_objs, country_names = _sb_country_groups(tags)
     def expand_list(lst):
         out = []
@@ -1410,6 +1416,18 @@ def shadowrocket_line(name, d):
                          "tls=1", f"sni={sni}", f"skip-cert-verify={scv}"])
     return None
 
+def _sr_static_names(tpl):
+    """抽取 shadowrocket 模板 [Proxy] 段里用户手写的静态节点名（"名 = 协议,..." 行）。"""
+    m = re.search(r"(?ms)^\[Proxy\]\s*\n(.*?)(?=^\[|\Z)", tpl)
+    if not m:
+        return []
+    out = []
+    for ln in m.group(1).splitlines():
+        ln = ln.strip()
+        if ln and "=" in ln and not ln.startswith("#") and "__XY" not in ln:
+            out.append(ln.split("=", 1)[0].strip())
+    return out
+
 def _sr_country_groups(names_list):
     """shadowrocket 国家随机组：显式列成员（不依赖 shadowrocket 正则引擎，稳）。
        返回 (组定义行文本, 拼进服务组的组名片段[前导逗号, 裸名])。"""
@@ -1442,8 +1460,11 @@ def build_shadowrocket_sub(nodes, tpl_url):
             pass
     if not lines:
         return
-    groups_txt, names_frag = _sr_country_groups(names_list)
-    out = fetch_url(tpl_url)
+    tpl = fetch_url(tpl_url)
+    # 国家检测/成员池 = 注入节点 + 用户手写进模板 [Proxy] 段的静态节点（"名 = 协议,..." 行）
+    static = _sr_static_names(tpl)
+    groups_txt, names_frag = _sr_country_groups(names_list + static)
+    out = tpl
     out = _fill_block(out, "__XY_NODES__", "\n".join(lines))    # 块锚点整行替换，缩进容错
     out = _fill_block(out, "__XY_GROUPS__", groups_txt)
     out = out.replace("__XY_NAMES__", names_frag)               # 行内锚点
@@ -1476,8 +1497,11 @@ def _fill_block(tpl, anchor, block):
     return re.sub(r"(?m)^[ \t]*" + re.escape(anchor) + r"[ \t]*$", lambda m: block, tpl)
 
 def gen_mihomo(ylines, nodes, tpl_url):
-    groups_yaml, names_frag = _mihomo_country(_node_names(nodes))
     tpl = fetch_url(tpl_url)
+    # 国家检测要看"全部节点"：注入的订阅节点 + 用户手写进模板的静态节点。
+    # 静态节点名取 proxy-groups 段之前的 name:（策略组名在 proxy-groups 里，且不含国旗，不会误检）。
+    static = re.findall(r'name:\s*"([^"]*)"', tpl.split("proxy-groups:")[0])
+    groups_yaml, names_frag = _mihomo_country(_node_names(nodes) + static)
     # 块锚点(独占一行)整行替换，缩进容错：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组
     tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
