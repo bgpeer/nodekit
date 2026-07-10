@@ -1481,13 +1481,15 @@ def _mihomo_country(names):
     present = detect_countries(names)
     if not present:
         return "", ""
+    # hidden: true 让国家组不占面板卡片位（仍可在🌍全球加速里选到）；显式写在组上，
+    # 覆盖 <<: *COUNTRY_COMMON，自定义模板不改锚点也生效。
     lines, gnames = [], []
     for gname, pat, _ in present:
-        lines.append(f"  - {{name: \"{gname}\", <<: *COUNTRY_COMMON, filter: '{pat}'}}")
+        lines.append(f"  - {{name: \"{gname}\", <<: *COUNTRY_COMMON, filter: '{pat}', hidden: true}}")
         gnames.append(gname)
     if OTHER_GROUP and other_members(names, present):          # 有漏网节点才建"其他随机"
         allpat = "|".join(p for _, p, _ in present)
-        lines.append(f"  - {{name: \"{OTHER_GROUP}\", <<: *COUNTRY_COMMON, exclude-filter: '{allpat}'}}")
+        lines.append(f"  - {{name: \"{OTHER_GROUP}\", <<: *COUNTRY_COMMON, exclude-filter: '{allpat}', hidden: true}}")
         gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f', "{g}"' for g in gnames)
 
