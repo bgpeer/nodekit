@@ -31,6 +31,8 @@ sudo python3 /tmp/xy.py
 - 有域名走 acme 真证书更稳；无域名则自签证书 + 公网 IP 直连（域名需 A 记录直连指向本机）
 - **证书自动续签**：走域名真证书时用 acme.sh 签发，acme.sh 会装每日 cron 自动续期（约 60 天一次），
   续期后自动重启 sing-box / xray（有 nginx 顺带 reload）使新证书生效，无需手动干预
+- **内核自动更新**：安装后自动挂 cron，**每月北京时间 2 号凌晨 04:00** 把 sing-box / xray 更新到最新并重启一次
+  （无新版则跳过）；也可随时进管理面板 **8 更新核心** 手动立即更新。日志在 `/var/log/bgpeer-coreupdate.log`
 
 ---
 
