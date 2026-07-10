@@ -132,12 +132,12 @@ pg-anchor:
   - &URLTEST_COMMON {type: url-test, lazy: true, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/bypass.png, include-all: true, exclude-type: direct, url: "https://www.gstatic.com/generate_204", interval: 120, tolerance: 30, timeout: 5000, hidden: true}
   # 国家随机组用它(同 URLTEST_COMMON 但不隐藏，面板可见)；节点由 include-all + 各组 filter 客户端自动收拢
   - &COUNTRY_COMMON {type: url-test, lazy: true, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/bypass.png, include-all: true, exclude-type: direct, url: "https://www.gstatic.com/generate_204", interval: 120, tolerance: 30, timeout: 5000}
-  - &GLOBAL_PROXIES ["🌍全球加速","♻️全部随机","🎯直连"]
-  - &GLOBAL_WITH_DIRECT ["🎯直连","🌍全球加速","♻️全部随机"]
+  - &GLOBAL_PROXIES ["🌍全球加速","♻️全部随机","🎯直连"__XY_GROUP__]
+  - &GLOBAL_WITH_DIRECT ["🎯直连","🌍全球加速","♻️全部随机"__XY_GROUP__]
   - &AUTO_COMMON {include-all: true, exclude-type: direct, filter: ".*"}
   
 proxy-groups:
-  - {name: "🌍全球加速", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/global_1.png, proxies: ["♻️全部随机"__XY_GROUP_NAMES__], <<: *AUTO_COMMON, url: "https://www.gstatic.com/generate_204", interval: 120, timeout: 5000}
+  - {name: "🌍全球加速", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/global_1.png, proxies: ["♻️全部随机"__XY_GROUP__], <<: *AUTO_COMMON, url: "https://www.gstatic.com/generate_204", interval: 120, timeout: 5000}
   - {name: "🎷抖音", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/douyin_1.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}
   - {name: "🎬TikTok", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/tiktok_1.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}
   - {name: "🎮国际游戏", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/game_2.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}

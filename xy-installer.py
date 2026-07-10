@@ -1308,6 +1308,8 @@ def _sb_country_groups(tags):
     """sing-box 国家随机组：无 filter，按正则算好每国成员显式列入 urltest。
        返回 (国家组对象列表, 组名列表)。tag 用原始名（保留 🇺🇲 等，匹配用归一名）。"""
     present = detect_countries(tags)
+    if not present:                                      # 没有任何国家 → 不建组（含"其他随机"），与 mihomo 一致
+        return [], []
     objs, names = [], []
     mk = lambda tag, members: {"tag": tag, "type": "urltest", "outbounds": members,
                                "url": "https://www.gstatic.com/generate_204",
@@ -1341,11 +1343,14 @@ def build_singbox_sub(nodes, tpl_url):
     def expand_list(lst):
         out = []
         for x in lst:
-            if x == "__XY_GROUP_NAMES__":
-                out += country_names                                 # 国家组名锚点 → 各国家组名
+            if x == "__XY_GROUP__":
+                out += country_names                                 # 裸锚点 → 只国家组名
+            elif isinstance(x, str) and x.startswith("__XY_GROUP__:"):
+                out += country_names                                 # 带:正则 → 国家组名 + 命中节点名
+                out += [t for t in tags if re.search(x[len("__XY_GROUP__:"):], t)]
             elif isinstance(x, str) and x.startswith("__PATTERN__:"):
                 sel = [t for t in tags if re.search(x[len("__PATTERN__:"):], t)]
-                out += sel or ["DIRECT"]                             # 名称锚点 → 命中的节点名
+                out += sel or ["DIRECT"]                             # 节点名锚点 → 命中的节点名
             else:
                 out.append(x)
         return out
@@ -1409,6 +1414,8 @@ def _sr_country_groups(names_list):
     """shadowrocket 国家随机组：显式列成员（不依赖 shadowrocket 正则引擎，稳）。
        返回 (组定义行文本, 拼进服务组的组名片段[前导逗号, 裸名])。"""
     present = detect_countries(names_list)
+    if not present:                                      # 没有任何国家 → 不建组（含"其他随机"），与 mihomo 一致
+        return "", ""
     U = "url=http://www.gstatic.com/generate_204,interval=120,tolerance=30,timeout=5"
     lines, gnames = [], []
     for gname, pat, _ in present:
@@ -1438,7 +1445,7 @@ def build_shadowrocket_sub(nodes, tpl_url):
     groups_txt, names_frag = _sr_country_groups(names_list)
     out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(lines))
                              .replace("__XY_GROUPS__", groups_txt)
-                             .replace("__XY_GROUP_NAMES__", names_frag))
+                             .replace("__XY_GROUP__", names_frag))
     open(SR_FILE, "w").write(out)
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
@@ -1464,9 +1471,10 @@ def _mihomo_country(names):
 
 def gen_mihomo(ylines, nodes, tpl_url):
     groups_yaml, names_frag = _mihomo_country(_node_names(nodes))
+    # 先 __XY_GROUPS__(组定义) 再 __XY_GROUP__(组名引用)：前者更长，不会被后者误伤
     out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(ylines))
                              .replace("__XY_GROUPS__", groups_yaml)
-                             .replace("__XY_GROUP_NAMES__", names_frag))
+                             .replace("__XY_GROUP__", names_frag))
     open(CFG_FILE, "w").write(out)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)
