@@ -35,7 +35,7 @@
   ],
   "outbounds": [
     {"tag": "DIRECT", "type": "direct"},
-    {"tag": "🌍代理", "type": "selector", "default": "♻️随机", "outbounds": ["♻️随机", "__PATTERN__:.*"]},
+    {"tag": "🌍代理", "type": "selector", "default": "♻️随机", "outbounds": ["♻️随机", "__XY_GROUP_NAMES__", "__PATTERN__:.*"]},
     {"tag": "🎷抖音", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__PATTERN__:.*"]},
     {"tag": "🎬TikTok", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__PATTERN__:.*"]},
     {"tag": "🎮国际游戏", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__PATTERN__:.*"]},
@@ -57,7 +57,8 @@
     {"tag": "🎯直连", "type": "selector", "outbounds": ["DIRECT", "🌍代理"]},
     {"tag": "🤡漏网之鱼", "type": "selector", "outbounds": ["🌍代理", "🎯直连"]},
     {"tag": "♻️随机", "type": "urltest", "outbounds": ["__PATTERN__:.*"], "url": "https://www.gstatic.com/generate_204", "interval": "120s", "tolerance": 30},
-    "__PROXY__"
+    "__XY_GROUPS__",
+    "__XY_NODES__"
   ],
   "route": {
     "auto_detect_interface": true,

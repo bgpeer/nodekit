@@ -1253,8 +1253,79 @@ def sb_dumps(v, ind=0):
         return "[\n" + ",\n".join(parts) + "\n" + pad + "]"
     return json.dumps(v, ensure_ascii=False)
 
+# ============================================================================ 国家随机分组
+# 扫模板注入的节点名，按国家自动建 url-test 随机组（命中≥阈值才建）；搬自 Mihomo-fx 复写脚本。
+# 三格式共用同一套检测；各格式生成器按自己语法在 __XY_GROUPS__ / __XY_GROUP_NAMES__ 锚点渲染。
+COUNTRY_THRESHOLD = 2               # 某国节点数 < 该值则不建该组（1=有就建, 2=至少2个）
+OTHER_GROUP = "🎲其他随机"          # 未归入任何国家组的漏网节点收进这里（有漏网才建）
+COUNTRY_GROUPS = [                  # [组名, 匹配正则]，顺序即面板展示顺序
+    ("🇭🇰香港随机",   r"🇭🇰|\bHK\b|Hong|hong|香港|深港|沪港|京港"),
+    ("🇹🇼台湾随机",   r"🇹🇼|\bTW\b|\bTWN\b|Taiwan|Taipei|台湾|台灣|台北"),
+    ("🇯🇵日本随机",   r"🇯🇵|\bJP\b|Japan|japan|Tokyo|东京|大阪|日本"),
+    ("🇸🇬新加坡随机", r"🇸🇬|\bSG\b|Singapore|singapore|新加坡|狮城"),
+    ("🇰🇷韩国随机",   r"🇰🇷|\bKR\b|Korea|korea|韩国|首尔"),
+    ("🇺🇸美国随机",   r"🇺🇸|\bUS\b|\bUSA\b|America|美国|洛杉矶|纽约|西雅图|圣何塞|硅谷"),
+    ("🇬🇧英国随机",   r"🇬🇧|\bUK\b|\bGB\b|England|Britain|London|英国|伦敦"),
+    ("🇩🇪德国随机",   r"🇩🇪|\bDE\b|Germany|German|Frankfurt|德国|法兰克福"),
+    ("🇳🇱荷兰随机",   r"🇳🇱|\bNL\b|Netherlands|Holland|Amsterdam|荷兰|阿姆斯特丹"),
+    ("🇫🇷法国随机",   r"🇫🇷|\bFR\b|France|Paris|法国|巴黎"),
+    ("🇨🇦加拿大随机",  r"🇨🇦|\bCA\b|Canada|加拿大|多伦多"),
+    ("🇦🇺澳洲随机",    r"🇦🇺|\bAU\b|Australia|Sydney|澳大利亚|悉尼"),
+    ("🇷🇺俄罗斯随机",  r"🇷🇺|\bRU\b|Russia|Moscow|俄罗斯|莫斯科"),
+    ("🇮🇳印度随机",    r"🇮🇳|India|india|Mumbai|Delhi|Bangalore|Bengaluru|Chennai|印度|孟买|新德里|班加罗尔"),
+    ("🇻🇳越南随机",    r"🇻🇳|Vietnam|vietnam|Hanoi|Saigon|越南|河内|胡志明|西贡"),
+    ("🇲🇾马来西亚随机", r"🇲🇾|Malaysia|malaysia|Kuala|马来|吉隆坡"),
+    ("🇹🇭泰国随机",    r"🇹🇭|\bTH\b|Thailand|thailand|Bangkok|泰国|曼谷"),
+    ("🇮🇩印尼随机",    r"🇮🇩|Indonesia|indonesia|Jakarta|印尼|印度尼西亚|雅加达"),
+    ("🇵🇭菲律宾随机",  r"🇵🇭|\bPH\b|Philippines|philippines|Manila|菲律宾|马尼拉"),
+    ("🇹🇷土耳其随机",  r"🇹🇷|Turkey|turkey|Türkiye|Istanbul|土耳其|伊斯坦布尔"),
+    ("🇦🇪阿联酋随机",  r"🇦🇪|\bUAE\b|Emirates|Dubai|阿联酋|迪拜|阿布扎比"),
+    ("🇧🇷巴西随机",    r"🇧🇷|\bBR\b|Brazil|brazil|Brasil|巴西|圣保罗"),
+    ("🇦🇷阿根廷随机",  r"🇦🇷|\bAR\b|Argentina|argentina|阿根廷|布宜诺斯艾利斯"),
+]
+
+def _norm_us_flag(s):
+    return (s or "").replace("\U0001F1FA\U0001F1F2", "\U0001F1FA\U0001F1F8")   # 🇺🇲→🇺🇸
+
+def detect_countries(names):
+    """names: 节点名列表。返回 [(组名, 正则, [命中节点名])]，仅含命中数≥阈值的国家（按表序）。"""
+    norm = [_norm_us_flag(n) for n in names]
+    out = []
+    for gname, pat in COUNTRY_GROUPS:
+        rx = re.compile(pat)
+        members = [n for n in norm if rx.search(n)]
+        if len(members) >= COUNTRY_THRESHOLD:
+            out.append((gname, pat, members))
+    return out
+
+def other_members(names, present):
+    """不属于任何已建国家组的漏网节点名（present 为 detect_countries 的返回）。"""
+    norm = [_norm_us_flag(n) for n in names]
+    rxs = [re.compile(p) for _, p, _ in present]
+    return [n for n in norm if not any(rx.search(n) for rx in rxs)]
+
+def _sb_country_groups(tags):
+    """sing-box 国家随机组：无 filter，按正则算好每国成员显式列入 urltest。
+       返回 (国家组对象列表, 组名列表)。tag 用原始名（保留 🇺🇲 等，匹配用归一名）。"""
+    present = detect_countries(tags)
+    objs, names = [], []
+    mk = lambda tag, members: {"tag": tag, "type": "urltest", "outbounds": members,
+                               "url": "https://www.gstatic.com/generate_204",
+                               "interval": "120s", "tolerance": 30}
+    for gname, pat, _ in present:
+        rx = re.compile(pat)
+        members = [t for t in tags if rx.search(_norm_us_flag(t))]
+        objs.append(mk(gname, members)); names.append(gname)
+    if OTHER_GROUP:
+        rxs = [re.compile(p) for _, p, _ in present]
+        omembers = [t for t in tags if not any(r.search(_norm_us_flag(t)) for r in rxs)]
+        if omembers:
+            objs.append(mk(OTHER_GROUP, omembers)); names.append(OTHER_GROUP)
+    return objs, names
+
 def build_singbox_sub(nodes, tpl_url):
-    """对象级替换两锚点(__PROXY__ 换节点对象、__PATTERN__ 展开节点名)，再按手写风格序列化。"""
+    """对象级替换锚点：__XY_NODES__ 换节点对象、__XY_GROUPS__ 换国家组、
+       __XY_GROUP_NAMES__ 展开国家组名、__PATTERN__:正则 展开命中节点名，再按手写风格序列化。"""
     cfg = json.loads(fetch_url(tpl_url))
     objs = []
     for key, d in nodes:
@@ -1266,11 +1337,12 @@ def build_singbox_sub(nodes, tpl_url):
     if not objs:
         return
     tags = [o["tag"] for o in objs]
+    country_objs, country_names = _sb_country_groups(tags)
     def expand_list(lst):
         out = []
         for x in lst:
-            if x == "__PROXY__":
-                out += objs                                          # 节点锚点 → 节点对象
+            if x == "__XY_GROUP_NAMES__":
+                out += country_names                                 # 国家组名锚点 → 各国家组名
             elif isinstance(x, str) and x.startswith("__PATTERN__:"):
                 sel = [t for t in tags if re.search(x[len("__PATTERN__:"):], t)]
                 out += sel or ["DIRECT"]                             # 名称锚点 → 命中的节点名
@@ -1279,8 +1351,10 @@ def build_singbox_sub(nodes, tpl_url):
         return out
     new_ob = []
     for x in cfg.get("outbounds", []):
-        if x == "__PROXY__":
-            new_ob += objs
+        if x == "__XY_NODES__":
+            new_ob += objs                                           # 节点锚点 → 节点对象
+        elif x == "__XY_GROUPS__":
+            new_ob += country_objs                                   # 分组锚点 → 国家 urltest 组
         elif isinstance(x, dict) and isinstance(x.get("outbounds"), list):
             x["outbounds"] = expand_list(x["outbounds"]); new_ob.append(x)
         else:
@@ -1331,22 +1405,69 @@ def shadowrocket_line(name, d):
                          "tls=1", f"sni={sni}", f"skip-cert-verify={scv}"])
     return None
 
+def _sr_country_groups(names_list):
+    """shadowrocket 国家随机组：显式列成员（不依赖 shadowrocket 正则引擎，稳）。
+       返回 (组定义行文本, 拼进服务组的组名片段[前导逗号, 裸名])。"""
+    present = detect_countries(names_list)
+    U = "url=http://www.gstatic.com/generate_204,interval=120,tolerance=30,timeout=5"
+    lines, gnames = [], []
+    for gname, pat, _ in present:
+        rx = re.compile(pat)
+        members = [t for t in names_list if rx.search(_norm_us_flag(t))]
+        lines.append(f"{gname} = url-test,{','.join(members)},{U}")
+        gnames.append(gname)
+    if OTHER_GROUP:
+        rxs = [re.compile(p) for _, p, _ in present]
+        omembers = [t for t in names_list if not any(r.search(_norm_us_flag(t)) for r in rxs)]
+        if omembers:
+            lines.append(f"{OTHER_GROUP} = url-test,{','.join(omembers)},{U}")
+            gnames.append(OTHER_GROUP)
+    return "\n".join(lines), "".join(f",{g}" for g in gnames)
+
 def build_shadowrocket_sub(nodes, tpl_url):
-    lines = []
+    lines, names_list = [], []
     for key, d in nodes:
         name = d.get("name", "").strip('"') or key       # 统一用节点池名称（含服务器端前缀）
         try:
             s = shadowrocket_line(name, d)
-            if s: lines.append(s)
+            if s: lines.append(s); names_list.append(name)
         except Exception:
             pass
     if not lines:
         return
-    open(SR_FILE, "w").write(fetch_url(tpl_url).replace("# __XY_PROXY__", "\n".join(lines)))
+    groups_txt, names_frag = _sr_country_groups(names_list)
+    out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(lines))
+                             .replace("__XY_GROUPS__", groups_txt)
+                             .replace("__XY_GROUP_NAMES__", names_frag))
+    open(SR_FILE, "w").write(out)
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
+def _node_names(nodes):
+    """从解析后的节点取名字列表（去引号），供国家检测用。"""
+    return [d.get("name", "").strip('"') or k for k, d in nodes]
+
+def _mihomo_country(names):
+    """mihomo 国家随机组：返回 (组定义 yaml 行, 拼进🌍全球加速的组名片段)。无国家则空串。
+       用 filter+include-all，客户端按正则自动收拢；filter 用单引号 YAML 串避免 \\b 被转义。"""
+    present = detect_countries(names)
+    if not present:
+        return "", ""
+    lines, gnames = [], []
+    for gname, pat, _ in present:
+        lines.append(f"  - {{name: \"{gname}\", <<: *COUNTRY_COMMON, filter: '{pat}'}}")
+        gnames.append(gname)
+    if OTHER_GROUP and other_members(names, present):          # 有漏网节点才建"其他随机"
+        allpat = "|".join(p for _, p, _ in present)
+        lines.append(f"  - {{name: \"{OTHER_GROUP}\", <<: *COUNTRY_COMMON, exclude-filter: '{allpat}'}}")
+        gnames.append(OTHER_GROUP)
+    return "\n".join(lines), "".join(f', "{g}"' for g in gnames)
+
 def gen_mihomo(ylines, nodes, tpl_url):
-    open(CFG_FILE, "w").write(fetch_url(tpl_url).replace("__XY_PROXIES__", "\n".join(ylines)))
+    groups_yaml, names_frag = _mihomo_country(_node_names(nodes))
+    out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(ylines))
+                             .replace("__XY_GROUPS__", groups_yaml)
+                             .replace("__XY_GROUP_NAMES__", names_frag))
+    open(CFG_FILE, "w").write(out)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)
 def gen_shadow(ylines, nodes, tpl_url):
