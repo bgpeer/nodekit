@@ -57,7 +57,7 @@
     {"tag": "🎯直连", "type": "selector", "outbounds": ["DIRECT", "🌍代理"]},
     {"tag": "🤡漏网之鱼", "type": "selector", "outbounds": ["🌍代理", "🎯直连"]},
     {"tag": "♻️随机", "type": "urltest", "outbounds": ["__PATTERN__:.*"], "url": "https://www.gstatic.com/generate_204", "interval": "120s", "tolerance": 30},
-    "__XY_GROUPS__",
+    
     "__XY_NODES__"
   ],
   "route": {
