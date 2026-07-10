@@ -370,6 +370,11 @@ def menu():
             print("    已设为", "作者名单" if cfg["wl_mode"] == "author" else "自定义名单")
             if cfg.get("enabled"): apply_cn_block(cfg)    # 已开启则立即用新名单重注入
         elif c == "3":
+            cur = (cfg.get("wl_url") or "").strip()
+            if cur:                                      # 加过了：先显示当前链接，问要不要换
+                print(f"  已添加过自定义放行名单链接：{cur}")
+                if _ask("  是否更换? [y/N]: ").lower() not in ("y", "yes"):
+                    continue                             # n 返回菜单，不动原链接
             url = _ask("  自定义放行名单链接(纯文本 tag 列表，或直接指向 whitelist-inject.sh): ").strip()
             if url:
                 cfg["wl_url"] = url; cfg["wl_mode"] = "custom"; cnblock_save(cfg)

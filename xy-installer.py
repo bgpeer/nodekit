@@ -1678,6 +1678,11 @@ def config_menu(ext):
         elif c == "3":
             update_one_config(ext)
         elif c == "4":
+            cur = load_custpl().get(ext)
+            if cur:                                     # 加过了：先显示当前链接，问要不要换
+                print(f"  已添加过自定义模板链接：{cur}")
+                if _ask("  是否更换? [y/N]: ").lower() not in ("y", "yes"):
+                    continue                            # n 返回菜单，不动原链接
             url = _ask("  自定义模板链接(gist/GitHub raw，占位符须与作者模板一致): ").strip()
             if url:
                 set_custpl(ext, url); print("  已保存。之后『3→2 自定义模板』即用它。")
