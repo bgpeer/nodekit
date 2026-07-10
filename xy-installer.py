@@ -1343,11 +1343,11 @@ def build_singbox_sub(nodes, tpl_url):
     def expand_list(lst):
         out = []
         for x in lst:
-            if x == "__XY_GROUP__":
+            if x == "__XY_NAMES__":
                 out += country_names                                 # 裸锚点 → 只国家组名
-            elif isinstance(x, str) and x.startswith("__XY_GROUP__:"):
+            elif isinstance(x, str) and x.startswith("__XY_NAMES__:"):
                 out += country_names                                 # 带:正则 → 国家组名 + 命中节点名
-                out += [t for t in tags if re.search(x[len("__XY_GROUP__:"):], t)]
+                out += [t for t in tags if re.search(x[len("__XY_NAMES__:"):], t)]
             elif isinstance(x, str) and x.startswith("__PATTERN__:"):
                 sel = [t for t in tags if re.search(x[len("__PATTERN__:"):], t)]
                 out += sel or ["DIRECT"]                             # 节点名锚点 → 命中的节点名
@@ -1445,7 +1445,7 @@ def build_shadowrocket_sub(nodes, tpl_url):
     groups_txt, names_frag = _sr_country_groups(names_list)
     out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(lines))
                              .replace("__XY_GROUPS__", groups_txt)
-                             .replace("__XY_GROUP__", names_frag))
+                             .replace("__XY_NAMES__", names_frag))
     open(SR_FILE, "w").write(out)
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
@@ -1471,10 +1471,10 @@ def _mihomo_country(names):
 
 def gen_mihomo(ylines, nodes, tpl_url):
     groups_yaml, names_frag = _mihomo_country(_node_names(nodes))
-    # 先 __XY_GROUPS__(组定义) 再 __XY_GROUP__(组名引用)：前者更长，不会被后者误伤
+    # 三锚点各不为对方子串，替换顺序无所谓：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组 / __XY_NAMES__ 引用组名
     out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(ylines))
                              .replace("__XY_GROUPS__", groups_yaml)
-                             .replace("__XY_GROUP__", names_frag))
+                             .replace("__XY_NAMES__", names_frag))
     open(CFG_FILE, "w").write(out)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)
