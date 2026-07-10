@@ -1443,9 +1443,10 @@ def build_shadowrocket_sub(nodes, tpl_url):
     if not lines:
         return
     groups_txt, names_frag = _sr_country_groups(names_list)
-    out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(lines))
-                             .replace("__XY_GROUPS__", groups_txt)
-                             .replace("__XY_NAMES__", names_frag))
+    out = fetch_url(tpl_url)
+    out = _fill_block(out, "__XY_NODES__", "\n".join(lines))    # 块锚点整行替换，缩进容错
+    out = _fill_block(out, "__XY_GROUPS__", groups_txt)
+    out = out.replace("__XY_NAMES__", names_frag)               # 行内锚点
     open(SR_FILE, "w").write(out)
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
@@ -1469,13 +1470,19 @@ def _mihomo_country(names):
         gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f', "{g}"' for g in gnames)
 
+def _fill_block(tpl, anchor, block):
+    """按整行替换独占一行的块锚点：连同该行的前导缩进一起换成 block（block 自带缩进）。
+       这样锚点顶格或缩进都行——避免用户给 __XY_NODES__/__XY_GROUPS__ 缩两格导致 YAML 缩进错乱。"""
+    return re.sub(r"(?m)^[ \t]*" + re.escape(anchor) + r"[ \t]*$", lambda m: block, tpl)
+
 def gen_mihomo(ylines, nodes, tpl_url):
     groups_yaml, names_frag = _mihomo_country(_node_names(nodes))
-    # 三锚点各不为对方子串，替换顺序无所谓：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组 / __XY_NAMES__ 引用组名
-    out = (fetch_url(tpl_url).replace("__XY_NODES__", "\n".join(ylines))
-                             .replace("__XY_GROUPS__", groups_yaml)
-                             .replace("__XY_NAMES__", names_frag))
-    open(CFG_FILE, "w").write(out)
+    tpl = fetch_url(tpl_url)
+    # 块锚点(独占一行)整行替换，缩进容错：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组
+    tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
+    tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
+    tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
+    open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)
 def gen_shadow(ylines, nodes, tpl_url):
