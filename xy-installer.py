@@ -1350,7 +1350,7 @@ def build_singbox_sub(nodes, tpl_url):
                 out += [t for t in tags if re.search(x[len("__XY_NAMES__:"):], t)]
             elif isinstance(x, str) and x.startswith("__PATTERN__:"):
                 sel = [t for t in tags if re.search(x[len("__PATTERN__:"):], t)]
-                out += sel or ["DIRECT"]                             # 节点名锚点 → 命中的节点名
+                out += sel or ["DIRECT"]                             # 旧锚点(向后兼容)：只命中的节点名
             else:
                 out.append(x)
         return out
