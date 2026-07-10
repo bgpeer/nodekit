@@ -680,13 +680,18 @@ def setup_port_hopping(target_port, rng):
 
 def sb_hysteria2(port, tag):
     pw = new_pw(); crt, key, insec = ensure_acme()
+    obfs_pw = new_pw()                                   # salamander 混淆：把 QUIC 包头也扰乱，
+    #   让流量不再"长得像 QUIC/hysteria"，抗 DPI 识别、也可能绕过针对 QUIC 的运营商 QoS。
+    #   开销极小（每包一次 XOR）；服务端/客户端密码由脚本两端自动对齐。
     ib = {"type": "hysteria2", "tag": tag, "listen": "::", "listen_port": port,
           "users": [{"password": pw}],
+          "obfs": {"type": "salamander", "password": obfs_pw},
           "tls": {"enabled": True, "alpn": ["h3"],
                   "certificate_path": crt, "key_path": key}}
     rng = hy2_range()                                    # 用户自定义跳跃范围，默认 30000-31000
     setup_port_hopping(port, rng)                        # 端口跳跃：UDP 段 DNAT 到本端口
     lk = (f"hysteria2://{pw}@{G['host']}:{port}?sni={tls_host()}"
+          f"&obfs=salamander&obfs-password={obfs_pw}"
           f"&mport={rng}&insecure={1 if insec else 0}#{tag}")
     return ib, lk
 
@@ -1028,6 +1033,8 @@ def link_to_proxy(u):
         if qs.get("sni"): d["sni"] = qs["sni"]
         if insec: d["skip-cert-verify"] = "true"
         d["alpn"] = ["h3"]
+        if qs.get("obfs") == "salamander" and qs.get("obfs-password"):   # salamander 混淆
+            d["obfs"] = "salamander"; d["obfs-password"] = qs["obfs-password"]
         if qs.get("mport"): d["ports"] = qs["mport"]; d.pop("port")   # 端口跳跃：只留跳跃段，不写固定端口
         return d
     if sch == "tuic":
@@ -1197,6 +1204,8 @@ def mihomo_to_sb_outbound(key, d):
     if t == "hysteria2":
         ob = {"tag": tag, "type": "hysteria2", "server": srv, "password": d["password"],
               "tls": {"enabled": True, "server_name": sni, "insecure": insec, "alpn": ["h3"]}}
+        if d.get("obfs") == "salamander" and d.get("obfs-password"):
+            ob["obfs"] = {"type": "salamander", "password": d["obfs-password"]}
         if d.get("ports"):
             ob["server_ports"] = [d["ports"].replace("-", ":")]; ob["hop_interval"] = "30s"
         else:
@@ -1305,6 +1314,8 @@ def shadowrocket_line(name, d):
         pt = port or (d["ports"].split("-")[0] if d.get("ports") else "")   # 跳跃时用起点端口
         p = [f"{name} = hysteria2", srv, str(pt), f"password={d['password']}", f"sni={sni}",
              f"skip-cert-verify={scv}"]
+        if d.get("obfs") == "salamander" and d.get("obfs-password"):
+            p += ["obfs=salamander", f"obfs-password={d['obfs-password']}"]
         if d.get("ports"): p.append(f"ports={d['ports']}")
         return ",".join(p)
     if t == "tuic":

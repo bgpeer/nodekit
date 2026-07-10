@@ -38,7 +38,7 @@ sudo python3 /tmp/xy.py
 
 | 核心 | 协议 |
 |------|------|
-| **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃)、reality-vision、reality-grpc、tuic、vmess-httpupgrade、anytls |
+| **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、reality-grpc、tuic、vmess-httpupgrade、anytls |
 | **xray** | vless-reality-xhttp（sing-box 不支持 xhttp，由 xray 承载） |
 
 可以只装 sing-box、只装 xray，或两个一起装（端口/服务互不冲突）。
