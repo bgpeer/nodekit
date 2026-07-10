@@ -74,20 +74,8 @@ sudo python3 /tmp/xy.py
 | sing-box | `.json` |
 | Shadowrocket（小火箭）| `.conf` |
 
-每种格式的配置模板都在本仓库里（`sub-template.yaml` / `subbox-template.json` / `shadowrocket-template.conf`），
-节点参数由服务端实时注入到模板锚点，重装换节点也会自动更新。
-
-**统一锚点（三格式一致，便于维护）**，国家分组这套是 3 个：
-- `__XY_NODES__` — **建节点**：注入真实节点（三格式同名，各按自己语法渲染）;
-- `__XY_GROUPS__` — **建国家策略组**：扫描节点名，按国家(旗子/关键词)建 url-test 随机组的**定义**，
-  某国 ≥2 个才建，剩下没归类的进「🎲其他随机」；无任何国家则不建组;
-- `__XY_NAMES__` — **引用国家组名**：把建好的国家组名接进主选择组 / 服务组（可放多处）。
-  必须先有 `__XY_GROUPS__` 造出组，`__XY_NAMES__` 才有东西可引用。
-
-> sing-box 里 `__XY_NAMES__` 可带正则：`__XY_NAMES__:.*` = 国家组名 **+** 全部节点名；裸 `__XY_NAMES__` = 只国家组名。
-> 模板已统一只用 `__XY_NAMES__`（含 `♻️随机`）。老锚点 `__PATTERN__:.*`（只全部节点名）生成器仍支持，供自定义模板向后兼容。
-
-机制：**检测到锚点才展开，漏写不报错、只是不生成**。自定义模板放上这几个锚点即可白嫖国家随机分组。
+每种格式的配置模板都在本仓库里，节点参数由服务端实时注入到模板锚点，重装换节点也会自动更新。
+详见下面的 [自定义模板 & 锚点](#自定义模板--锚点)。
 
 ### 每个配置菜单（3 / 4 / 5）里可以
 
@@ -122,6 +110,62 @@ sudo python3 /tmp/xy.py
 
 规则集来自 [`bgpeer/rules`](https://github.com/bgpeer/rules)，
 配套的 mack-a 白名单注入脚本见 [`bgpeer/vps-net`](https://github.com/bgpeer/vps-net)。
+
+---
+
+## 自定义模板 & 锚点
+
+你可以把**自己的配置模板**放到 gist / GitHub raw，脚本按锚点把节点和国家随机组注入进去。
+好处：**既能在模板里手写自己的静态节点，又能把成品配置直接托管到服务器保存**；
+本仓库的作者模板既是参考，也是首次搭建的人开箱即用的配置。
+
+**三个作者模板（点开直接看）**：
+
+| 客户端 | 模板文件 |
+|--------|----------|
+| mihomo / Clash | [`sub-template.yaml`](https://github.com/bgpeer/nodekit/blob/main/sub-template.yaml) |
+| sing-box | [`subbox-template.json`](https://github.com/bgpeer/nodekit/blob/main/subbox-template.json) |
+| Shadowrocket（小火箭）| [`shadowrocket-template.conf`](https://github.com/bgpeer/nodekit/blob/main/shadowrocket-template.conf) |
+
+### 三个锚点（三格式同名，各按自己语法渲染）
+
+| 锚点 | 作用 | 展开成 | 放哪 |
+|------|------|--------|------|
+| `__XY_NODES__` | **建节点** | 你 VPS 的真实节点 | 独占一行（mihomo `proxies:` 段 / sing-box `outbounds` / 小火箭 `[Proxy]` 段） |
+| `__XY_GROUPS__` | **建国家策略组** | 各国 url-test 随机组的**定义** | 独占一行（mihomo `proxy-groups:` 段 / sing-box `outbounds` / 小火箭 `[Proxy Group]` 段） |
+| `__XY_NAMES__` | **引用国家组名** | 建好的国家组**名字清单** | **写在列表行内**（主选择组 / 服务组的 proxies·outbounds 里，可放多处） |
+
+> 顺序依赖：必须先有 `__XY_GROUPS__` 把组**造出来**，`__XY_NAMES__` 才有组名可引用；
+> 只写 `__XY_NAMES__` 不写 `__XY_GROUPS__` → 引用了不存在的组 → 客户端报错/起不来。
+
+### 国家随机分组是怎么来的
+
+- 脚本扫描**全部节点名**（`__XY_NODES__` 注入的订阅节点 **＋** 你手写进模板的静态节点），
+  按**旗子 / 关键词**（如 `🇯🇵`、`JP`、`日本`、`Tokyo`）归国；
+- 某国**≥2 个**节点才建该国随机组（`1` 个不建）；剩下没归入任何国家的进「🎲其他随机」；
+  `🇺🇲` 自动归一到 `🇺🇸`；一个国家都没有则整段不建。
+- **mihomo** 用 `filter`+`include-all`：客户端按正则**自动收拢**匹配节点（连你机场订阅合并进来的同国节点也会进组）；
+- **sing-box / 小火箭** 没有 filter：由脚本**算好每国成员显式列进去**。
+
+### 放置规则（照着作者模板抄最稳）
+
+- **块锚点**（`__XY_NODES__` / `__XY_GROUPS__`）：**各占一行**。顶格或缩进都行（生成器会整行替换、自带缩进，缩进不会把 YAML 弄乱）。
+- **行内锚点**（`__XY_NAMES__`）：写在 `[...]` 列表里。例：
+  - mihomo：`proxies: ["♻️全部随机"__XY_NAMES__]` → `["♻️全部随机","🇯🇵日本随机","🇺🇸美国随机"]`
+  - sing-box：`"outbounds": ["♻️随机", "__XY_NAMES__:.*"]`
+- **只 sing-box** 的 `__XY_NAMES__` 可带正则后缀：
+  - `__XY_NAMES__:.*` = 国家组名 **＋** 全部节点名；
+  - 裸 `__XY_NAMES__` = **只**国家组名。
+  - 老锚点 `__PATTERN__:.*`（只全部节点名）生成器仍兼容，但作者模板已统一用 `__XY_NAMES__`。
+
+> 机制核心：**检测到锚点才展开，漏写不报错、只是不生成**。就算忘了写 `__XY_NODES__`，也只是不注入节点、模板原样拉上来，不会报错。
+
+### 怎么用自定义模板
+
+1. 进对应配置菜单（**3** mihomo / **4** sing-box / **5** 小火箭）→ **添加自定义模板链接**（填你 gist / GitHub raw 地址）；
+2. 再选 **更新配置 → 自定义模板** 重新生成（不动节点、不换订阅 token）。
+
+> 更新配置每次都**实时重新拉取**你模板的最新版；GitHub raw 有约 5 分钟 CDN 缓存，改完模板等一两分钟再点更新。
 
 ---
 
