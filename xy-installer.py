@@ -1937,10 +1937,25 @@ def read_saved_links():
         pass
     return out
 
+def _sub_service_synced():
+    """正在跑的 xy-sub.service 的 HTTP/HTTPS 状态是否与应有的一致。
+       不一致多见于：升级脚本后订阅 URL 变成 https，但托管服务还是旧的明文 HTTP。"""
+    try:
+        svc = open("/etc/systemd/system/xy-sub.service").read()
+    except OSError:
+        return True                       # 还没有该服务（没装），不强制
+    return (ACME_CRT in svc) == _sub_https()
+
 def show_links():
     links = read_saved_links()
     if not links:
         print("\n还没有节点，请先『1.安装』。"); return
+    if not _sub_service_synced():         # HTTP/HTTPS 漂移 → 自动把托管服务同步到当前应有状态
+        try:
+            serve_sub()                   # 不换 token，仅切换 HTTP/HTTPS 并重启 xy-sub
+            print("（已把订阅托管服务同步到 " + ("HTTPS" if _sub_https() else "HTTP") + "，URL 不变）")
+        except Exception as e:
+            print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
     print("\n" + "=" * 60 + "\n分享链接:\n" + "=" * 60)
     print("\n".join(links))
     urls = sub_urls_text()
