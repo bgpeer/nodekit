@@ -1015,6 +1015,31 @@ def _yfmt(v):
     if isinstance(v, list): return "[" + ", ".join(_yfmt(x) for x in v) + "]"
     return str(v)
 
+# X25519MLKEM768 后量子 KEX 需要新核心：sing-box>=1.12.0、xray>=25.5.16。
+# 客户端主动发起该握手，若服务端核心太旧会直接握手失败，故装机核心太旧时不下发此字段。
+_MLKEM_MIN = {SB_BIN: (1, 12, 0), XRAY_BIN: (25, 5, 16)}
+_MLKEM_CACHE = None
+
+def _core_ver(binpath):
+    """读核心版本号 → (a,b,c) 元组；读不到返回 None。"""
+    out = sh(f"{binpath} version", check=False)
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out)
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+def mlkem_ok():
+    """已装核心是否都够新以支持 X25519MLKEM768（保守：装了但版本读不出/太旧 → False）。"""
+    global _MLKEM_CACHE
+    if _MLKEM_CACHE is not None:
+        return _MLKEM_CACHE
+    ok = True
+    for binpath, floor in _MLKEM_MIN.items():
+        if os.path.exists(binpath):
+            v = _core_ver(binpath)
+            if v is None or v < floor:
+                ok = False
+    _MLKEM_CACHE = ok
+    return ok
+
 # ws 家族 smux 多路复用（mihomo 客户端；服务端 sing-box 同步开 multiplex）
 _SMUX = {"enabled": "true", "protocol": "h2mux",
          "max-connections": 4, "min-streams": 4, "padding": "true"}
@@ -1038,9 +1063,10 @@ def link_to_proxy(u):
         d["tls"] = "true"; d["client-fingerprint"] = qs.get("fp", "chrome")
         if qs.get("sni"): d["servername"] = qs["sni"]
         if sec == "reality":
-            # X25519MLKEM768 后量子密钥交换：mihomo 客户端字段，服务端 reality 默认已支持
-            d["reality-opts"] = {"public-key": qs.get("pbk", ""), "short-id": qs.get("sid", ""),
-                                 "support-x25519mlkem768": "true"}
+            d["reality-opts"] = {"public-key": qs.get("pbk", ""), "short-id": qs.get("sid", "")}
+            # X25519MLKEM768 后量子 KEX：仅当本机核心够新才下发，避免旧核心握手失败
+            if mlkem_ok():
+                d["reality-opts"]["support-x25519mlkem768"] = "true"
             if net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
             elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}  # xray 专属
             else: d["network"] = "tcp"
