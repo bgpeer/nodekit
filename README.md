@@ -32,7 +32,7 @@ sudo python3 /tmp/xy.py
 - **证书自动续签**：走域名真证书时用 acme.sh 签发，acme.sh 会装每日 cron 自动续期（约 60 天一次），
   续期后自动重启 sing-box / xray（有 nginx 顺带 reload）使新证书生效，无需手动干预
 - **内核自动更新**：安装后自动挂 cron，**每月北京时间 2 号凌晨 04:00** 把 sing-box / xray 更新到最新并重启一次
-  （无新版则跳过）；也可随时进管理面板 **9 更新核心** 手动立即更新。日志在 `/var/log/bgpeer-coreupdate.log`
+  （无新版则跳过）；也可随时进管理面板 **10 更新核心** 手动立即更新。日志在 `/var/log/bgpeer-coreupdate.log`
 
 ---
 
@@ -63,11 +63,22 @@ sudo python3 /tmp/xy.py
   5. sing-box 配置
   6. 小火箭配置
   7. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）
-  8. 更新脚本（不影响节点）
-  9. 更新核心（sing-box / xray）
-  10. 卸载
+  8. BT/PT 下载屏蔽（防 VPS 被投诉封机）
+  9. 更新脚本（不影响节点）
+  10. 更新核心（sing-box / xray）
+  11. 卸载
   0. 退出
 ```
+
+### BT/PT 下载屏蔽（菜单 8）
+
+装好后随时开/关,不用重装、不动节点。菜单里 `1` 循环切换。开启后服务端识别到 BT/PT
+流量即 **reject**,防止有人用你的 VPS 挂 BT 下载、招来机房投诉封机:
+
+- **sing-box**:路由加 `sniff` + `protocol: bittorrent → reject`,和「屏蔽中国域名/IP」的规则**互不覆盖**(各自只增删自己那几条)。
+- **xray**:入站开安全嗅探(`routeOnly`)+ 路由 `bittorrent → block`;**vision 流入站自动跳过**(在它上面开嗅探会干扰,故不动)。
+- best-effort:大部分 BT 会被拦,但 vision 流可能漏一小部分——这是协议特性,mack-a 同款限制。
+- 开关状态记在 `bt.json`,重装节点会自动重新注入,不用再点一次。
 
 ### 多路复用开关 smux（菜单 3）
 
@@ -281,7 +292,7 @@ reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为
 
 ## 卸载
 
-管理面板选 **10. 卸载**，会移除本脚本安装的 sing-box / xray / 订阅服务、配置、证书、
+管理面板选 **11. 卸载**，会移除本脚本安装的 sing-box / xray / 订阅服务、配置、证书、
 hy2 端口跳跃规则、nginx 前置块与 `bgpeer` 命令。
 
 ---
