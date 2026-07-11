@@ -45,7 +45,9 @@ sudo python3 /tmp/xy.py
 
 可以只装 sing-box、只装 xray，或两个一起装。**端口/服务/配置都互不冲突**（两核心是独立进程、各绑各的随机端口、各写各的 config）。
 
-> 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`）。两个一起装时，为避免客户端订阅里节点**重名报错**，xray 那份会自动加 `-xray` 后缀区分（如 `trojan-xray`）。不过这几个 sing-box 已能做且做得一样，xray 独有价值的只有 `vless-reality-xhttp`——想精简可只在 xray 勾它。
+> 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`），sing-box 已能做且做得一样，xray 独有价值的只有 `vless-reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `vless-reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
+>
+> 万一你让两核心装了同名协议，为避免客户端订阅**重名报错**，xray 那份会自动加 `-xray` 后缀区分（如 `trojan-xray`）。端口/服务/配置本来就互不冲突。
 
 ---
 

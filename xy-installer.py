@@ -2088,14 +2088,21 @@ def _ask(prompt=""):
     except (OSError, EOFError):
         return input(prompt).strip()
 
-def _pick(title, options):
-    """列出带编号的协议，返回选中的 key 列表；回车/0/all = 全选。"""
+def _pick(title, options, default=None):
+    """列出带编号的协议，返回选中的 key 列表。
+       回车 = default（缺省=全选）；0/all 永远=全选；也可逗号分隔编号自选。"""
     print("\n" + title)
     for i, name in enumerate(options, 1):
         print(f"  {i:>2}. {name}")
     print("   0. 全部")
-    raw = _ask("选择(逗号分隔编号, 回车=全部): ")
-    if raw == "" or raw == "0" or raw.lower() == "all":
+    if default is None:
+        hint = "回车=全部"
+    else:
+        hint = "回车=" + "、".join(default) + "，0/all=全部"
+    raw = _ask(f"选择(逗号分隔编号, {hint}): ")
+    if raw == "":
+        return list(default) if default is not None else list(options)
+    if raw == "0" or raw.lower() == "all":
         return list(options)
     picked = []
     for tok in raw.replace("，", ",").split(","):
@@ -2123,7 +2130,10 @@ def install_flow():
     if core in ("1", "3"):
         sb_names = _pick("【sing-box 协议】", list(SB))
     if core in ("2", "3"):
-        xr_names = _pick("【xray 协议】", list(XRAY))
+        # 两个都装时，xray 默认只装它独有的 vless-reality-xhttp（其余协议 sing-box 已有，避免重复）；
+        # 只装 xray(core=2) 时回车仍全装。想全装 xray 就输 0/all 或点编号。
+        xr_default = ["vless-reality-xhttp"] if core == "3" else None
+        xr_names = _pick("【xray 协议】", list(XRAY), default=xr_default)
     if not sb_names and not xr_names:
         print("没选任何协议，退出。"); return
 
