@@ -234,6 +234,7 @@ def apply_cn_block(cfg=None):
     if r.returncode:
         _rollback()
         print("注入后配置校验失败，已回滚未生效：\n" + (r.stderr or r.stdout).strip()); return False
+    cfg["enabled"] = True; cnblock_save(cfg)             # 校验已过，状态先落盘：即便重启掐断 SSH，状态也已正确
     sh("systemctl restart sing-box", check=False)
     # 确认真的起来了；万一注入后起不来（比如规则集这会儿全拉不到），回滚到屏蔽前配置，
     # 绝不影响原本能用的节点

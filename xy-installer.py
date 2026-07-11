@@ -597,17 +597,22 @@ def reality_keys(binpath, cmd):
     pub  = out[1].split(":")[-1].strip()
     return priv, pub
 
-def write_service(name, binpath, cfg):
-    # 先校验配置，schema 错就当场报出来（避免像之前 anytls 那样静默起不来）
-    # 两个内核校验命令不一样：sing-box 用 `check -c`，xray 用 `run -test -c`（xray 没有 check 子命令）
+def core_check(binpath, cfg):
+    """校验核心配置文件。返回 (ok, msg)。
+       sing-box 用 `check -c`，xray 用 `run -test -c`（xray 无 check 子命令）；
+       内核太旧不认校验命令时按『通过』处理（ok=True），避免误伤。"""
     check_cmd = (f"{binpath} run -test -c {cfg}" if "xray" in os.path.basename(binpath)
                  else f"{binpath} check -c {cfg}")
     r = subprocess.run(check_cmd, shell=True, text=True, capture_output=True)
     msg = (r.stderr or r.stdout).strip()
-    # 万一某内核不认这个校验子命令，跳过校验而不是让整个安装崩掉
     if r.returncode and re.search(r"unknown command|unknown flag|Run '.*help'", msg):
-        pass
-    elif r.returncode:
+        return True, ""
+    return (r.returncode == 0), msg
+
+def write_service(name, binpath, cfg):
+    # 先校验配置，schema 错就当场报出来（避免像之前 anytls 那样静默起不来）
+    ok, msg = core_check(binpath, cfg)
+    if not ok:
         raise RuntimeError(f"{name} 配置校验失败（多半是内核版本太旧不认某协议）:\n{msg}")
     unit_path = f"/etc/systemd/system/{name}.service"
     # 不覆盖指向别的程序的同名服务（典型：机器上已装 mack-a 的 sing-box.service）
@@ -2161,8 +2166,16 @@ def smux_apply(on):
         tags.add(ib.get("tag"))
         if on: ib["multiplex"] = {"enabled": True}
         else:  ib.pop("multiplex", None)
-    json.dump(data, open(cfg, "w"), indent=2)         # 写回 sing-box 配置
-    _toggle_saved_links_smux(on, tags)                # 同步分享链接标记
+    # 安全阀：改完先备份、校验；不过就回滚、绝不重启（单台 VPS 也不会被坏配置锁死）
+    old = open(cfg).read() if os.path.exists(cfg) else None
+    json.dump(data, open(cfg, "w"), indent=2)
+    if os.path.exists(SB_BIN):
+        ok, msg = core_check(SB_BIN, cfg)
+        if not ok:
+            if old is not None: open(cfg, "w").write(old)   # 回滚，核心继续按原配置运行
+            print("  ✗ sing-box 配置校验未通过，已回滚、未重启（节点照常）:")
+            print("   ", msg.splitlines()[-1] if msg else "校验失败"); return
+    _toggle_saved_links_smux(on, tags)                # 校验通过后才动链接/订阅
     G["host"] = _host()
     try:
         build_subscription(read_saved_links(), new_token=False)   # 保持 token，刷新三格式订阅
@@ -2256,21 +2269,37 @@ def _bt_apply_xray(on):
     return True
 
 def bt_apply(on):
-    """开/关 BT 屏蔽：先改两核心 config + 落盘状态，最后后台重启。
-       顺序很重要——状态先写，即便随后 SSH 断（重启掐了本机代理隧道）状态也已正确。"""
-    did = []
-    if os.path.exists(f"{SB_DIR}/config.json") and _bt_apply_singbox(on):
-        did.append("sing-box")
-    if os.path.exists(f"{XRAY_DIR}/config.json") and _bt_apply_xray(on):
-        did.append("xray")
-    bt_set(on)                     # 状态先落盘
-    restart_services(*did)         # 再后台异步重启
-    return did
+    """开/关 BT 屏蔽（两核心 all-or-nothing）：改 config → 各自校验 → 全过才落盘状态 + 后台重启；
+       任一不过则两核心全回滚、不重启（单台 VPS 也不会被坏配置锁死）。
+       返回 (成功的核心列表, [(核心, 错误信息)])。"""
+    items = []   # (cfg, binpath, svc, old_text)
+    sbcfg, xrcfg = f"{SB_DIR}/config.json", f"{XRAY_DIR}/config.json"
+    if os.path.exists(sbcfg):
+        old = open(sbcfg).read(); _bt_apply_singbox(on)
+        items.append((sbcfg, SB_BIN, "sing-box", old))
+    if os.path.exists(xrcfg):
+        old = open(xrcfg).read(); _bt_apply_xray(on)
+        items.append((xrcfg, XRAY_BIN, "xray", old))
+    errors = []
+    for cfg, binp, svc, _ in items:
+        if os.path.exists(binp):
+            ok, msg = core_check(binp, cfg)
+            if not ok: errors.append((svc, msg))
+    if errors:
+        for cfg, binp, svc, old in items:       # 任一不过 → 全回滚，核心继续按原配置运行
+            open(cfg, "w").write(old)
+        return [], errors
+    bt_set(on)                                  # 全过：状态先落盘（即便随后 SSH 断，状态也已正确）
+    restart_services(*[svc for _, _, svc, _ in items])
+    return [svc for _, _, svc, _ in items], []
 
 def bt_reapply():
     """重装重写 config 后，若之前开过 BT 屏蔽就重新注入（在 cn-block 之后调，二者互不覆盖）。"""
     if bt_enabled():
-        bt_apply(True)
+        _, errors = bt_apply(True)
+        if errors:
+            print("BT 屏蔽重注入校验未过、已跳过（不影响节点）:",
+                  (errors[0][1].splitlines()[-1] if errors[0][1] else ""))
 
 def bt_menu():
     while True:
@@ -2289,9 +2318,14 @@ def bt_menu():
         if c == "1":
             ans = _ask(f"  确认{'关闭' if on else '开启'} BT 屏蔽? y 确认 / n 返回: ").strip().lower()
             if ans in ("y", "yes"):
-                did = bt_apply(not on)
-                print(f"  ✓ 已{'关闭' if on else '开启'} BT 屏蔽（状态已保存，{('、'.join(did)) or '无核心'} 正在后台重启）。")
-                print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常——设置已生效。")
+                did, errors = bt_apply(not on)
+                if errors:
+                    print("  ✗ 配置校验未通过，已回滚、未重启（核心仍按原配置运行，未被锁死）:")
+                    for svc, msg in errors:
+                        print(f"    {svc}: {msg.splitlines()[-1] if msg else '校验失败'}")
+                else:
+                    print(f"  ✓ 已{'关闭' if on else '开启'} BT 屏蔽（状态已保存，{('、'.join(did)) or '无核心'} 正在后台重启）。")
+                    print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常——设置已生效。")
         elif c in ("0", ""):
             return
 
