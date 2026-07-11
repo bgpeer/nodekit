@@ -2043,6 +2043,110 @@ def cnblock_load():
     except Exception: return {}
 
 
+# ============================================================================ smux 多路复用开关
+def _load_sb_cfg():
+    cfg = f"{SB_DIR}/config.json"
+    try:
+        return json.load(open(cfg)), cfg
+    except Exception:
+        return None, cfg
+
+def _sb_ws_inbounds(data):
+    """sing-box 配置里可开 smux 的入站：ws/httpupgrade 的 vless/vmess。"""
+    return [ib for ib in data.get("inbounds", [])
+            if ib.get("type") in ("vless", "vmess")
+            and ib.get("transport", {}).get("type") in ("ws", "httpupgrade")]
+
+def _link_set_smux(link, on, tags):
+    """按节点名(tags)给 ws 家族链接加/去 smux 标记；名字不在 tags 里的原样返回（如 xray 的 ws）。"""
+    if link.startswith("vmess://"):
+        try:
+            b = link[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        except Exception:
+            return link
+        if j.get("ps") not in tags:
+            return link
+        if on: j["smux"] = "1"
+        else:  j.pop("smux", None)
+        return vmess_link(j)
+    if link.startswith("vless://"):
+        head, _, frag = link.partition("#")
+        if urllib.parse.unquote(frag) not in tags:
+            return link
+        head = head.replace("&smux=1", "")           # 先去旧标记，避免重复
+        if on: head += "&smux=1"
+        return head + ("#" + frag if frag else "")
+    return link
+
+def _toggle_saved_links_smux(on, tags, path="/root/xy-nodes.txt"):
+    """改写保存的分享链接标记；『# 订阅链接:』尾部原样保留。"""
+    try:
+        lines = open(path).read().split("\n")
+    except OSError:
+        return
+    out, tail = [], False
+    for ln in lines:
+        if ln.strip().startswith("#"):
+            tail = True
+        out.append(ln if (tail or "://" not in ln) else _link_set_smux(ln, on, tags))
+    open(path, "w").write("\n".join(out))
+
+def smux_current_state():
+    """当前是否开启：sing-box ws 入站带 multiplex 即视为开；无 ws 节点返回 None（不适用）。"""
+    data, _ = _load_sb_cfg()
+    if not data:
+        return None
+    ws = _sb_ws_inbounds(data)
+    if not ws:
+        return None
+    return any(ib.get("multiplex") for ib in ws)
+
+def smux_apply(on):
+    """开/关 smux：改 sing-box 入站 multiplex + 同步链接标记 + 重启 + 刷新三格式订阅（保持 token）。"""
+    data, cfg = _load_sb_cfg()
+    if not data:
+        print("  找不到 sing-box 配置，无法切换。"); return
+    ws = _sb_ws_inbounds(data)
+    if not ws:
+        print("  没有 ws/httpupgrade 类节点，smux 不适用。"); return
+    tags = set()
+    for ib in ws:
+        tags.add(ib.get("tag"))
+        if on: ib["multiplex"] = {"enabled": True}
+        else:  ib.pop("multiplex", None)
+    json.dump(data, open(cfg, "w"), indent=2)         # 写回 sing-box 配置
+    _toggle_saved_links_smux(on, tags)                # 同步分享链接标记
+    sh("systemctl restart sing-box", check=False)     # 重启使入站生效
+    G["host"] = _host()
+    try:
+        build_subscription(read_saved_links(), new_token=False)   # 保持 token，刷新三格式订阅
+    except Exception as e:
+        print("  订阅刷新跳过（不影响节点）:", e)
+    print(f"\n  ✓ 已{'开启' if on else '关闭'} smux；sing-box 已重启，三格式订阅已同步（URL 不变）。")
+    print("  客户端重新拉取订阅、或到各配置菜单点『3 更新配置』即可生效。")
+
+def smux_menu():
+    while True:
+        st = smux_current_state()
+        print("\n" + "=" * 60)
+        print("  多路复用开关 smux（只对 ws / httpupgrade 类协议有效）")
+        print("=" * 60)
+        if st is None:
+            print("  本机没有 ws / httpupgrade 类 sing-box 节点，smux 不适用。")
+            return
+        print(f"  当前状态: {'已开启 ✓' if st else '已关闭'}")
+        print("  提示: 开启后网页/小请求更顺，大文件下载/丢包线路可能变慢。")
+        print("-" * 60)
+        print(f"  1 smux 开关（循环检测，当前{'开' if st else '关'}，选此项切换）")
+        print("  0 返回")
+        c = _ask("选择: ").strip()
+        if c == "1":
+            ans = _ask(f"  确认{'关闭' if st else '开启'} smux? y 确认 / n 返回: ").strip().lower()
+            if ans in ("y", "yes"):
+                smux_apply(not st)
+        elif c in ("0", ""):
+            return
+
 def main_menu():
     while True:
         print("\n" + "=" * 60)
@@ -2051,26 +2155,28 @@ def main_menu():
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
         print("  3. mihomo 配置")
-        print("  4. sing-box 配置")
-        print("  5. 小火箭配置")
-        print("  6. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）")
-        print("  7. 更新脚本（不影响节点）")
-        print("  8. 更新核心（sing-box / xray）")
-        print("  9. 卸载")
+        print("  4. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
+        print("  5. sing-box 配置")
+        print("  6. 小火箭配置")
+        print("  7. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）")
+        print("  8. 更新脚本（不影响节点）")
+        print("  9. 更新核心（sing-box / xray）")
+        print("  10. 卸载")
         print("  0. 退出")
         print("-" * 60)
         c = _ask("请选择: ").strip()
         if c == "0" or c == "":
             print("再见。"); return
-        if c == "1":    install_flow()
-        elif c == "2":  show_links()
-        elif c == "3":  config_menu("yaml")
-        elif c == "4":  config_menu("json")
-        elif c == "5":  config_menu("conf")
-        elif c == "6":  cn_block_menu()
-        elif c == "7":  update_script()
-        elif c == "8":  update_cores()
-        elif c == "9":  uninstall_all()
+        if c == "1":     install_flow()
+        elif c == "2":   show_links()
+        elif c == "3":   config_menu("yaml")
+        elif c == "4":   smux_menu()
+        elif c == "5":   config_menu("json")
+        elif c == "6":   config_menu("conf")
+        elif c == "7":   cn_block_menu()
+        elif c == "8":   update_script()
+        elif c == "9":   update_cores()
+        elif c == "10":  uninstall_all()
         else:
             print("无效选择。"); continue
         _ask("\n按回车返回主菜单...")            # 停一下，别让菜单立刻盖住上面的输出
