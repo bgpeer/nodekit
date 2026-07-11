@@ -1464,6 +1464,7 @@ def build_singbox_sub(nodes, tpl_url):
         else:
             new_ob.append(x)
     cfg["outbounds"] = new_ob
+    _sb_direct_ip(cfg)                                        # 本机 IP 直连（走紧凑序列化，不破坏格式）
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
@@ -1614,27 +1615,25 @@ def _mihomo_direct_ip(tpl):
         return tpl
     return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n  - " + line, tpl, count=1)
 
-def _sb_direct_ip(path):
-    """sing-box：把本机 IP 直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）。"""
+def _sb_direct_ip(cfg):
+    """sing-box：把本机 IP 直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
+       就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。"""
     ip = _self_ip()
     if not ip:
         return
-    try: conf = json.load(open(path))
-    except Exception: return
-    route = conf.get("route") or {}
+    route = cfg.get("route")
+    if not isinstance(route, dict):
+        return
     rules = route.get("rules")
     if not isinstance(rules, list):
         return
-    tags = {o.get("tag") for o in conf.get("outbounds", []) if isinstance(o, dict)}
+    tags = {o.get("tag") for o in cfg.get("outbounds", []) if isinstance(o, dict)}
     direct = "🎯直连" if "🎯直连" in tags else next((t for t in tags if t and "直连" in str(t)), "")
     if not direct:
         return
     rule = {"ip_cidr": [f"{ip}/32"], "outbound": direct}
-    if rule in rules:
-        return
-    route["rules"] = [rule] + rules
-    conf["route"] = route
-    json.dump(conf, open(path, "w"), ensure_ascii=False, indent=2)
+    if rule not in rules:
+        route["rules"] = [rule] + rules
 
 def _sr_direct_ip(path):
     """Shadowrocket：在 [Rule] 段顶部插一条本机 IP 直连。"""
@@ -1661,8 +1660,7 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _mihomo_direct_ip(tpl)                           # 本机 IP 直连（防管理时 SSH 走代理）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
-    build_singbox_sub(nodes, tpl_url)
-    _sb_direct_ip(SBOX_FILE)
+    build_singbox_sub(nodes, tpl_url)                        # 直连规则已在内部注入并紧凑序列化
 def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
     _sr_direct_ip(SR_FILE)
@@ -1971,6 +1969,43 @@ def edit_file(path):
     except Exception as e:
         print("打开编辑器失败:", e, "—— 手动改:", path)
 
+def _validate_generated(ext, path):
+    """校验刚生成的订阅配置，返回 (ok, 错误信息)。主要抓自定义模板改坏导致的语法错误。"""
+    try:
+        text = open(path).read()
+    except OSError as e:
+        return False, f"读取失败: {e}"
+    if not text.strip():
+        return False, "生成内容为空（模板损坏或锚点未命中）"
+    if ext == "json":                                           # sing-box：JSON 语法 + 内核 check
+        try:
+            json.loads(text)
+        except Exception as e:
+            return False, f"JSON 语法错误: {e}"
+        if os.path.exists(SB_BIN):
+            ok, msg = core_check(SB_BIN, path)
+            if not ok:
+                return False, msg or "sing-box check 未通过"
+        return True, ""
+    if ext == "yaml":                                           # mihomo：关键段必查 + 有 PyYAML 再验语法
+        for sec in ("proxies:", "proxy-groups:", "rules:"):
+            if sec not in text:
+                return False, f"缺少 {sec} 段（模板损坏）"
+        try:
+            import yaml
+            yaml.safe_load(text)
+        except ImportError:
+            pass
+        except Exception as e:
+            return False, f"YAML 语法错误: {e}"
+        return True, ""
+    if ext == "conf":                                           # Shadowrocket：查关键段
+        for sec in ("[Proxy]", "[Proxy Group]", "[Rule]"):
+            if sec not in text:
+                return False, f"缺少 {sec} 段（模板损坏）"
+        return True, ""
+    return True, ""
+
 def update_one_config(ext):
     """更新单个格式的配置：可选作者模板 / 自定义模板；不动节点、不换 token。"""
     print("\n  1 作者模板   2 自定义模板   0 返回")
@@ -1989,12 +2024,22 @@ def update_one_config(ext):
         print("  没有已保存节点。"); return
     G["host"] = _host(); ensure_deps()
     ylines, nodes = parse_nodes(links)
+    target = FMT[ext]["file"]
+    backup = open(target).read() if os.path.exists(target) else None
     try:
         FMT[ext]["gen"](ylines, nodes, url)
-        serve_sub()                                     # 保持 token，URL 不变
-        print(f"\n  已用【{which}模板】更新 {FMT[ext]['label']} 配置（节点/URL 未变）:\n  {sub_url(ext)}")
     except Exception as e:
-        print("  更新失败:", e)
+        if backup is not None: open(target, "w").write(backup)      # 回滚，保留原能用配置
+        print(f"\n  ❌ 更新失败（生成出错，已保留原配置）：{e}"); return
+    ok, err = _validate_generated(ext, target)
+    if not ok:
+        if backup is not None: open(target, "w").write(backup)      # 语法/校验不过 → 回滚
+        print(f"\n  ❌ 更新失败（{FMT[ext]['label']} 语法/校验错误，已保留原配置）：")
+        for ln in str(err).splitlines()[:6]:
+            print("     " + ln)
+        return
+    serve_sub()                                                     # 保持 token，URL 不变
+    print(f"\n  ✅ 更新成功（{which}模板，节点/URL 未变）：\n  {sub_url(ext)}")
 
 def config_menu(ext):
     """单个格式的配置子菜单：改配置 / 改订阅(换token) / 更新配置(作者·自定义) / 加自定义模板链接。"""
