@@ -1591,6 +1591,63 @@ def _fill_block(tpl, anchor, block):
        这样锚点顶格或缩进都行——避免用户给 __XY_NODES__/__XY_GROUPS__ 缩两格导致 YAML 缩进错乱。"""
     return re.sub(r"(?m)^[ \t]*" + re.escape(anchor) + r"[ \t]*$", lambda m: block, tpl)
 
+_SELF_IP_CACHE = None
+def _self_ip():
+    """本机对外 IPv4：host 是 v4 就用它，否则(域名)取 public_ip()。用于「本机 IP 直连」规则。"""
+    global _SELF_IP_CACHE
+    if _SELF_IP_CACHE is None:
+        h = _host()
+        ip = h if re.match(r"^\d+\.\d+\.\d+\.\d+$", h or "") else ""
+        if not ip:
+            try: ip = public_ip()
+            except Exception: ip = ""
+        _SELF_IP_CACHE = ip or ""
+    return _SELF_IP_CACHE
+
+def _mihomo_direct_ip(tpl):
+    """mihomo：在 rules: 段顶部插一条本机 IP 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
+    ip = _self_ip()
+    if not ip or "rules:" not in tpl:
+        return tpl
+    line = f"IP-CIDR,{ip}/32,DIRECT,no-resolve"
+    if line in tpl:
+        return tpl
+    return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n  - " + line, tpl, count=1)
+
+def _sb_direct_ip(path):
+    """sing-box：把本机 IP 直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）。"""
+    ip = _self_ip()
+    if not ip:
+        return
+    try: conf = json.load(open(path))
+    except Exception: return
+    route = conf.get("route") or {}
+    rules = route.get("rules")
+    if not isinstance(rules, list):
+        return
+    tags = {o.get("tag") for o in conf.get("outbounds", []) if isinstance(o, dict)}
+    direct = "🎯直连" if "🎯直连" in tags else next((t for t in tags if t and "直连" in str(t)), "")
+    if not direct:
+        return
+    rule = {"ip_cidr": [f"{ip}/32"], "outbound": direct}
+    if rule in rules:
+        return
+    route["rules"] = [rule] + rules
+    conf["route"] = route
+    json.dump(conf, open(path, "w"), ensure_ascii=False, indent=2)
+
+def _sr_direct_ip(path):
+    """Shadowrocket：在 [Rule] 段顶部插一条本机 IP 直连。"""
+    ip = _self_ip()
+    if not ip:
+        return
+    try: tpl = open(path).read()
+    except OSError: return
+    line = f"IP-CIDR,{ip}/32,DIRECT,no-resolve"
+    if "[Rule]" not in tpl or line in tpl:
+        return
+    open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + line, 1))
+
 def gen_mihomo(ylines, nodes, tpl_url):
     tpl = fetch_url(tpl_url)
     # 国家检测要看"全部节点"：注入的订阅节点 + 用户手写进模板的静态节点。
@@ -1601,11 +1658,14 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
     tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
+    tpl = _mihomo_direct_ip(tpl)                           # 本机 IP 直连（防管理时 SSH 走代理）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)
+    _sb_direct_ip(SBOX_FILE)
 def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
+    _sr_direct_ip(SR_FILE)
 
 FMT = {
     "yaml": {"label": "mihomo",              "file": CFG_FILE,  "author": TEMPLATE_URL, "gen": gen_mihomo},
