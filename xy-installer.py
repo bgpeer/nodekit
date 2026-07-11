@@ -42,7 +42,8 @@ BGP_DIR      = "/etc/bgpeer"
 CFG_FILE     = BGP_DIR + "/mihomo.yaml"      # mihomo 可编辑成品配置
 SBOX_FILE    = BGP_DIR + "/singbox.json"     # sing-box 客户端可编辑成品配置
 SR_FILE      = BGP_DIR + "/shadowrocket.conf" # Shadowrocket 可编辑成品配置
-SUB_DIR      = BGP_DIR + "/sub"              # HTTP 托管目录（<token>.yaml/.json/.conf 软链）
+SUB_DIR      = BGP_DIR + "/sub"              # 托管目录（<token>.yaml/.json/.conf 软链）
+SUB_SERVER   = BGP_DIR + "/xy-sub-server.py" # 订阅托管小服务（支持可选 TLS）
 HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
 STATE_FILE   = BGP_DIR + "/state.json"       # 记住上次安装（域名/前缀/协议等），重装默认保持节点不变
 TOKENS_FILE  = BGP_DIR + "/tokens.json"      # 每格式独立订阅 token
@@ -217,7 +218,8 @@ def ensure_acme():
         reload_hook = (" --reloadcmd '"
                        "systemctl reload nginx 2>/dev/null; "
                        "systemctl restart sing-box 2>/dev/null; "
-                       "systemctl restart xray 2>/dev/null; true'")
+                       "systemctl restart xray 2>/dev/null; "
+                       "systemctl restart xy-sub 2>/dev/null; true'")   # 订阅 HTTPS 证书同步刷新
         sh(f"{acme} --install-cert -d {G['domain']} --ecc "
            f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
     return ACME_CRT, ACME_KEY, False
@@ -1162,9 +1164,20 @@ def load_tokens():
 def save_tokens(t):
     os.makedirs(BGP_DIR, exist_ok=True); json.dump(t, open(TOKENS_FILE, "w"))
 
+def _is_ip(h):
+    return bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", h)) or ":" in h   # v4 或 v6 都当 IP
+
+def _sub_https():
+    """订阅能否走 HTTPS：host 是域名（非 IP）且 acme 真证书就绪。自签/IP 仍用 HTTP。"""
+    h = _host()
+    return (not _is_ip(h)) and os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY)
+
 def sub_url(ext):
     t = load_tokens().get(ext)
-    return f"http://{_host()}:{SUB_PORT}/{t}.{ext}" if t else "(未生成)"
+    if not t:
+        return "(未生成)"
+    scheme = "https" if _sub_https() else "http"
+    return f"{scheme}://{_host()}:{SUB_PORT}/{t}.{ext}"
 
 def sub_urls_text():
     ff = {"yaml": CFG_FILE, "json": SBOX_FILE, "conf": SR_FILE}; toks = load_tokens()
@@ -1173,6 +1186,21 @@ def sub_urls_text():
 
 def rotate_token_ext(ext):
     t = load_tokens(); t[ext] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
+
+# 订阅托管小服务：有 cert/key 参数就起 HTTPS，否则明文 HTTP（用法：port dir [cert key]）
+_SUB_SERVER_PY = (
+    "import http.server, functools, ssl, sys\n"
+    "port = int(sys.argv[1]); directory = sys.argv[2]\n"
+    "cert = sys.argv[3] if len(sys.argv) > 3 else ''\n"
+    "key  = sys.argv[4] if len(sys.argv) > 4 else ''\n"
+    "H = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)\n"
+    "httpd = http.server.ThreadingHTTPServer(('0.0.0.0', port), H)\n"
+    "if cert and key:\n"
+    "    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n"
+    "    ctx.load_cert_chain(cert, key)\n"
+    "    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)\n"
+    "httpd.serve_forever()\n"
+)
 
 def serve_sub(reset=False):
     """SUB_DIR 放 <token>.<ext> 软链指向各格式配置文件；每格式独立 token（存 TOKENS_FILE）。
@@ -1188,8 +1216,12 @@ def serve_sub(reset=False):
             os.symlink(target, f"{SUB_DIR}/{toks[ext]}.{ext}")
     save_tokens(toks)
     open(f"{SUB_DIR}/index.html", "w").write("")        # 有 index 就不列目录，token 不外泄
+    # 托管小服务：有域名+真证书就用 TLS（https 订阅），否则明文（自签 host 用 https 客户端会拒）
+    open(SUB_SERVER, "w").write(_SUB_SERVER_PY)
+    https = _sub_https()
+    args = f"{SUB_PORT} {SUB_DIR}" + (f" {ACME_CRT} {ACME_KEY}" if https else "")
     svc = (f"[Unit]\nAfter=network.target\n[Service]\n"
-           f"ExecStart=/usr/bin/python3 -m http.server {SUB_PORT} --directory {SUB_DIR} --bind 0.0.0.0\n"
+           f"ExecStart=/usr/bin/python3 {SUB_SERVER} {args}\n"
            f"Restart=on-failure\nRestartSec=3\n[Install]\nWantedBy=multi-user.target\n")
     open("/etc/systemd/system/xy-sub.service", "w").write(svc)
     sh("systemctl daemon-reload")
@@ -1781,7 +1813,8 @@ def run(sb_names, xr_names):
         print("=" * 60)
         print(urls)
         print("=" * 60)
-        print(f"※ 明文 HTTP + 随机 token，请勿外传；改端口/关闭见 xy-sub.service（端口 {SUB_PORT}）")
+        proto = "HTTPS(真证书) + 随机 token" if _sub_https() else "明文 HTTP + 随机 token（无域名/自签，客户端拒绝自签 TLS）"
+        print(f"※ {proto}，请勿外传；改端口/关闭见 xy-sub.service（端口 {SUB_PORT}）")
 
     # 记住这次安装（节点不再随重装丢失：下次进安装默认「保持节点、只更新配置」）
     try:
