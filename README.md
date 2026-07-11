@@ -207,6 +207,16 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
   （借真站证书，无需域名、无 insecure），或补一个域名走 acme 真证书。
   hy2 / tuic 用自签是行业常规，无需担心。
 
+订阅里还默认开了两项客户端增强（服务端已同步支持，均自动生成、无需手动配置）：
+
+- **X25519MLKEM768 后量子密钥交换**：所有 `reality-*` 节点在 mihomo 订阅里带
+  `reality-opts.support-x25519mlkem768: true`，握手改用抗量子的混合 KEX，也能进一步
+  打散 reality 的 ClientHello 指纹。服务端 xray/sing-box 新核心默认支持（本脚本每月自动更新核心）。
+- **smux 多路复用**：仅 **ws / httpupgrade** 家族两头开 `h2mux`（mihomo `smux`、
+  sing-box `multiplex`），多条请求复用一条底层连接、少握手更省延迟。
+  vision / reality / grpc / QUIC(hy2、tuic) / anytls **一律不开**（它们要么自带更优复用、
+  要么与 xray `mux.cool` 不兼容），xray 承载的 ws 也不带该标记，避免两端复用协议不一致。
+
 **伪装站可自替换**：`--nginx` 模式下 443 的伪装首页在 `/var/www/bgpeer/index.html`
 （默认是一个「维护中」通用静态页，不是一眼假的 Apache 默认页）。你可以直接覆盖它换成自己的
 真站内容，伪装效果更好。

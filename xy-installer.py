@@ -744,15 +744,18 @@ def _nginx_front():
 def make_sb_vless(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
+        mux = transport in ("ws", "httpupgrade")  # 仅 ws 家族两头开 smux
+        smk = "&smux=1" if mux else ""
         if _nginx_front() and transport in ("ws", "httpupgrade"):
             # nginx 前置：本地明文口，TLS 由 nginx 在 443 终结、按 path 反代进来
             ib = {"type": "vless", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
                   "users": [{"uuid": uid}],
+                  "multiplex": {"enabled": True},
                   "transport": _sb_transport(transport, path, tls_host())}
             NGINX_WS.append({"path": path, "port": port})
             lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls"
                   f"&sni={tls_host()}&type={_LINK_NET[transport]}&host={tls_host()}"
-                  f"&path={path}#{tag}")
+                  f"&path={path}{smk}#{tag}")
             return ib, lk
         crt, key, insec = ensure_acme()
         ib = {"type": "vless", "tag": tag, "listen": "::", "listen_port": port,
@@ -760,24 +763,29 @@ def make_sb_vless(transport):
               "tls": {"enabled": True, "server_name": tls_host(),
                       "certificate_path": crt, "key_path": key},
               "transport": _sb_transport(transport, path, tls_host())}
+        if mux:
+            ib["multiplex"] = {"enabled": True}
         lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=tls"
               f"&sni={tls_host()}&type={_LINK_NET[transport]}&host={tls_host()}"
-              f"&path={path}&allowInsecure={1 if insec else 0}#{tag}")
+              f"&path={path}&allowInsecure={1 if insec else 0}{smk}#{tag}")
         return ib, lk
     return b
 
 def make_sb_vmess(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
+        mux = transport in ("ws", "httpupgrade")  # 仅 ws 家族两头开 smux
+        smk = {"smux": "1"} if mux else {}
         if _nginx_front() and transport in ("ws", "httpupgrade"):
             ib = {"type": "vmess", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
                   "users": [{"uuid": uid, "alterId": 0}],
+                  "multiplex": {"enabled": True},
                   "transport": _sb_transport(transport, path, tls_host())}
             NGINX_WS.append({"path": path, "port": port})
             lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": "443",
                              "id": uid, "aid": "0", "net": _VMESS_NET[transport],
                              "type": "none", "host": tls_host(), "path": path,
-                             "tls": "tls", "sni": tls_host()})
+                             "tls": "tls", "sni": tls_host(), **smk})
             return ib, lk
         crt, key, insec = ensure_acme()
         ib = {"type": "vmess", "tag": tag, "listen": "::", "listen_port": port,
@@ -785,10 +793,12 @@ def make_sb_vmess(transport):
               "tls": {"enabled": True, "server_name": tls_host(),
                       "certificate_path": crt, "key_path": key},
               "transport": _sb_transport(transport, path, tls_host())}
+        if mux:
+            ib["multiplex"] = {"enabled": True}
         lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": str(port),
                          "id": uid, "aid": "0", "net": _VMESS_NET[transport],
                          "type": "none", "host": tls_host(), "path": path,
-                         "tls": "tls", "sni": tls_host()})
+                         "tls": "tls", "sni": tls_host(), **smk})
         return ib, lk
     return b
 
@@ -1005,6 +1015,13 @@ def _yfmt(v):
     if isinstance(v, list): return "[" + ", ".join(_yfmt(x) for x in v) + "]"
     return str(v)
 
+# ws 家族 smux 多路复用（mihomo 客户端；服务端 sing-box 同步开 multiplex）
+_SMUX = {"enabled": "true", "protocol": "h2mux",
+         "max-connections": 4, "min-streams": 4, "padding": "true"}
+# sing-box 客户端出站的等价多路复用配置
+_SB_MUX = {"enabled": True, "protocol": "h2mux",
+           "max_connections": 4, "min_streams": 4, "padding": True}
+
 def link_to_proxy(u):
     """分享链接 → Mihomo proxy dict（客户端节点）。解析不了返回 None。"""
     P = urllib.parse.urlparse(u); qs = {k: v[0] for k, v in urllib.parse.parse_qs(P.query).items()}
@@ -1021,7 +1038,9 @@ def link_to_proxy(u):
         d["tls"] = "true"; d["client-fingerprint"] = qs.get("fp", "chrome")
         if qs.get("sni"): d["servername"] = qs["sni"]
         if sec == "reality":
-            d["reality-opts"] = {"public-key": qs.get("pbk", ""), "short-id": qs.get("sid", "")}
+            # X25519MLKEM768 后量子密钥交换：mihomo 客户端字段，服务端 reality 默认已支持
+            d["reality-opts"] = {"public-key": qs.get("pbk", ""), "short-id": qs.get("sid", ""),
+                                 "support-x25519mlkem768": "true"}
             if net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
             elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}  # xray 专属
             else: d["network"] = "tcp"
@@ -1032,6 +1051,7 @@ def link_to_proxy(u):
             elif net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
             elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}
             else: d["network"] = "tcp"
+            if qs.get("smux") == "1" and d.get("network") == "ws": d["smux"] = _SMUX
         return d
     if sch in ("hysteria2", "hy2"):
         d = {"name": nm("hy2"), "type": "hysteria2", "server": host, "port": port, "password": P.username, "udp": "true"}
@@ -1070,6 +1090,7 @@ def link_to_proxy(u):
         net = j.get("net", "tcp")
         if net == "ws": d["network"] = "ws"; d["ws-opts"] = {"path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}}
         elif net == "httpupgrade": d["network"] = "ws"; d["ws-opts"] = {"path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}, "v2ray-http-upgrade": "true"}
+        if str(j.get("smux")) == "1" and d.get("network") == "ws": d["smux"] = _SMUX
         return d
     if sch == "ss":
         ui = P.username or ""
@@ -1191,16 +1212,19 @@ def mihomo_to_sb_outbound(key, d):
         if d.get("network") == "ws":
             ob["transport"] = {"type": "ws", "path": d["ws-opts"].get("path", "/"),
                                "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}
+            if d.get("smux"): ob["multiplex"] = dict(_SB_MUX)
         elif d.get("network") == "grpc":
             ob["transport"] = {"type": "grpc", "service_name": d.get("grpc-opts", {}).get("grpc-service-name", "")}
         return ob
     if t == "vmess":
         net = "httpupgrade" if key == "vmess-httpupgrade" else "ws"
-        return {"tag": tag, "type": "vmess", "server": srv, "server_port": int(d["port"]),
-                "uuid": d["uuid"], "security": "none", "alter_id": 0,
-                "tls": {"enabled": True, "server_name": sni, "insecure": insec, "utls": utls},
-                "transport": {"type": net, "path": d["ws-opts"].get("path", "/"),
-                              "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}}
+        ob = {"tag": tag, "type": "vmess", "server": srv, "server_port": int(d["port"]),
+              "uuid": d["uuid"], "security": "none", "alter_id": 0,
+              "tls": {"enabled": True, "server_name": sni, "insecure": insec, "utls": utls},
+              "transport": {"type": net, "path": d["ws-opts"].get("path", "/"),
+                            "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}}
+        if d.get("smux"): ob["multiplex"] = dict(_SB_MUX)
+        return ob
     if t == "trojan":
         return {"tag": tag, "type": "trojan", "server": srv, "server_port": int(d["port"]),
                 "password": d["password"],
