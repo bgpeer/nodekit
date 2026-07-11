@@ -41,9 +41,11 @@ sudo python3 /tmp/xy.py
 | 核心 | 协议 |
 |------|------|
 | **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、reality-grpc、tuic、vmess-httpupgrade、anytls |
-| **xray** | vless-reality-xhttp（sing-box 不支持 xhttp，由 xray 承载） |
+| **xray** | vless-reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、vless-reality-vision、vless-reality-grpc、vless-ws、vmess-ws、trojan |
 
-可以只装 sing-box、只装 xray，或两个一起装（端口/服务互不冲突）。
+可以只装 sing-box、只装 xray，或两个一起装。**端口/服务/配置都互不冲突**（两核心是独立进程、各绑各的随机端口、各写各的 config）。
+
+> 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`）。两个一起装时，为避免客户端订阅里节点**重名报错**，xray 那份会自动加 `-xray` 后缀区分（如 `trojan-xray`）。不过这几个 sing-box 已能做且做得一样，xray 独有价值的只有 `vless-reality-xhttp`——想精简可只在 xray 勾它。
 
 ---
 
