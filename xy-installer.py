@@ -973,18 +973,12 @@ def xr_trojan(port, tag):
           f"&type=tcp&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
-def xr_ss2022(port, tag):
-    method = "2022-blake3-aes-128-gcm"; key = ss2022_key(method)
-    ib = {"listen": "0.0.0.0", "port": port, "protocol": "shadowsocks", "tag": tag,
-          "settings": {"method": method, "password": key, "network": "tcp,udp"}}
-    lk = f"ss://{ss_userinfo(method, key)}@{G['host']}:{port}#{tag}"
-    return ib, lk
-
 XRAY = {"vless-reality-vision": xr_reality_vision,
         "vless-reality-grpc": xr_reality_grpc,
         "vless-reality-xhttp": xr_reality_xhttp,
         "vless-ws": xr_vless_ws, "vmess-ws": xr_vmess_ws,
-        "trojan": xr_trojan, "ss2022": xr_ss2022}
+        "trojan": xr_trojan}
+# 已移除 ss2022：纯全加密无伪装，易被 GFW 全加密流量探测识别；有 reality 完全无需它。
 
 # ============================================================================ 组装
 # reality 绑 443 的优先级：优先 sing-box reality-vision（Vision flow 最稳），依次往下。
@@ -1000,14 +994,21 @@ def pick_reality_443(sb_names, xr_names):
             return n
     return ""
 
-def build(table, names, pinned=None):
-    """pinned: {协议名: 固定端口}，用于把某个 reality 协议钉在 443；其余走随机端口。"""
+_USED_TAGS = set()   # 跨核心节点名去重：sb 先建、xray 后建，两核心同名协议(vless-ws/vmess-ws/trojan)给 xray 加后缀
+
+def build(table, names, pinned=None, core=""):
+    """pinned: {协议名: 固定端口}，用于把某个 reality 协议钉在 443；其余走随机端口。
+       core: 核心标识('sb'/'xray')，仅用于同名协议撞名时给节点名加后缀区分。"""
     pinned = pinned or {}
     inbounds, links = [], []
     for n in names:
         # 名称 = 用户前缀 + 协议名（默认无前缀，别人部署 US/SG 时自己填 🇺🇸/🇸🇬 等）
         port = pinned.get(n) or next_port()
-        ib, lk = table[n](port, G.get("prefix", "") + n)
+        tag = G.get("prefix", "") + n
+        if tag in _USED_TAGS:                    # sb 与 xray 都有该协议 → 客户端订阅会重名报错，加核心后缀区分
+            tag = f"{tag}-{core}" if core else tag + "-2"
+        _USED_TAGS.add(tag)
+        ib, lk = table[n](port, tag)
         inbounds.append(ib); links.append(lk)
     return inbounds, links
 
@@ -1681,6 +1682,7 @@ def run(sb_names, xr_names):
     NGINX_WS.clear()
     NGINX_STREAM.clear()
     _USED_PORTS.clear()                  # 本次安装重新随机分配端口
+    _USED_TAGS.clear()                   # 本次安装重新去重节点名
 
     # --- SNI 分流（--sni-split）：nginx stream+ssl_preread 让 reality 真正上 443，
     #     网站/ws 同在 443（按 SNI 不解密分流）。改 nginx 前先 preflight，
@@ -1717,7 +1719,7 @@ def run(sb_names, xr_names):
 
     if sb_names:
         install_singbox()
-        ins, lks = build(SB, sb_names, pin); all_links += lks
+        ins, lks = build(SB, sb_names, pin, core="sb"); all_links += lks
         if G.get("sni_split"):
             ensure_acme()                               # 确保证书就绪（本地 https server 要用）
             if not write_nginx_sni_split():             # 写 http(本地https)+stream(443分流)，失败已回滚
@@ -1734,7 +1736,7 @@ def run(sb_names, xr_names):
 
     if xr_names:
         install_xray()
-        ins, lks = build(XRAY, xr_names, pin); all_links += lks
+        ins, lks = build(XRAY, xr_names, pin, core="xray"); all_links += lks
         cfg = f"{XRAY_DIR}/config.json"
         json.dump({"log": {"loglevel": "warning"}, "inbounds": ins,
                    "outbounds": [{"protocol": "freedom", "tag": "direct"},
