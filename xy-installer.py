@@ -744,14 +744,15 @@ def _nginx_front():
 def make_sb_vless(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
-        mux = transport in ("ws", "httpupgrade")  # 仅 ws 家族两头开 smux
+        mux = bool(G.get("smux")) and transport in ("ws", "httpupgrade")  # 仅 ws 家族、且用户选了才开 smux
         smk = "&smux=1" if mux else ""
         if _nginx_front() and transport in ("ws", "httpupgrade"):
             # nginx 前置：本地明文口，TLS 由 nginx 在 443 终结、按 path 反代进来
             ib = {"type": "vless", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
                   "users": [{"uuid": uid}],
-                  "multiplex": {"enabled": True},
                   "transport": _sb_transport(transport, path, tls_host())}
+            if mux:
+                ib["multiplex"] = {"enabled": True}
             NGINX_WS.append({"path": path, "port": port})
             lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls"
                   f"&sni={tls_host()}&type={_LINK_NET[transport]}&host={tls_host()}"
@@ -774,13 +775,14 @@ def make_sb_vless(transport):
 def make_sb_vmess(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
-        mux = transport in ("ws", "httpupgrade")  # 仅 ws 家族两头开 smux
+        mux = bool(G.get("smux")) and transport in ("ws", "httpupgrade")  # 仅 ws 家族、且用户选了才开 smux
         smk = {"smux": "1"} if mux else {}
         if _nginx_front() and transport in ("ws", "httpupgrade"):
             ib = {"type": "vmess", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
                   "users": [{"uuid": uid, "alterId": 0}],
-                  "multiplex": {"enabled": True},
                   "transport": _sb_transport(transport, path, tls_host())}
+            if mux:
+                ib["multiplex"] = {"enabled": True}
             NGINX_WS.append({"path": path, "port": port})
             lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": "443",
                              "id": uid, "aid": "0", "net": _VMESS_NET[transport],
@@ -1041,6 +1043,8 @@ def mlkem_ok():
     return ok
 
 # ws 家族 smux 多路复用（mihomo 客户端；服务端 sing-box 同步开 multiplex）
+# 是否开启由 G["smux"] 决定（安装时询问，默认关：多路复用可能拖慢大文件下载）
+_WS_FAMILY = {"vless-ws", "vmess-ws", "vmess-httpupgrade"}   # 可开 smux 的 sing-box 节点键
 _SMUX = {"enabled": "true", "protocol": "h2mux",
          "max-connections": 4, "min-streams": 4, "padding": "true"}
 # sing-box 客户端出站的等价多路复用配置
@@ -2132,6 +2136,10 @@ def install_flow():
     hy2p = ""
     if "hy2" in sb_names:
         hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000): ")
+    smux = ""
+    if _WS_FAMILY & set(sb_names):     # 只有选了 ws/httpupgrade 节点才问
+        ans = _ask("ws 类开启 smux 多路复用?(网页/小请求更快，大文件下载可能变慢) y开启/n不开(回车=不开): ")
+        smux = "1" if ans.lower() in ("y", "yes") else ""
     # 抗 GFW 封端口，两档（都让 reality 上 443）：
     #  sni-split（最强，需域名+reality-vision）：nginx SNI 分流，reality+网站/ws 全在 443；
     #  reality-443 直连（次之）：主力 reality 独占 443，nginx 仅留 :80 续期。
@@ -2143,7 +2151,7 @@ def install_flow():
         ans = _ask("把主力 reality 绑到 443 抗封锁?(推荐；会关闭 nginx 前置) [Y/n]: ")
         r443 = "" if ans.lower() in ("n", "no") else "1"
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"] = domain, email, sni, prefix, hy2p
-    G["nginx"], G["reality443"], G["sni_split"] = nginx, r443, split
+    G["nginx"], G["reality443"], G["sni_split"], G["smux"] = nginx, r443, split, smux
 
     reality443_proto = pick_reality_443(sb_names, xr_names) if r443 else ""
     print("\n" + "-" * 60)
@@ -2158,6 +2166,8 @@ def install_flow():
     else:
         print("  nginx前置:", "是（443伪装站+webroot，ws类走443）" if nginx else "否")
     print("  名称前缀:", prefix or "(无)")
+    if _WS_FAMILY & set(sb_names):
+        print("  ws多路复用:", "开启 smux" if smux else "不开(默认)")
     print("  SNI:     ", sni)
     if "hy2" in sb_names:
         print("  hy2跳跃: ", hy2_range())
@@ -2197,6 +2207,8 @@ if __name__ == "__main__":
                     help="不把主力 reality 绑到 443（默认会绑，抗 GFW 封端口；会关闭 nginx 前置）")
     ap.add_argument("--sni-split", action="store_true",
                     help="最强抗封锁：nginx stream+ssl_preread 按 SNI 分流，reality+网站/ws 全在 443（需域名+reality-vision）")
+    ap.add_argument("--smux", action="store_true",
+                    help="ws 类开启 smux 多路复用（网页/小请求更快，大文件下载可能变慢；默认关）")
     ap.add_argument("--yes", action="store_true",
                     help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
@@ -2205,6 +2217,7 @@ if __name__ == "__main__":
         a.domain, a.email, a.sni, a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes
     G["reality443"] = "" if a.no_reality_443 else "1"   # 默认把 reality 绑 443（抗封端口）
     G["sni_split"] = "1" if a.sni_split else ""         # 最强：nginx SNI 分流，全上 443
+    G["smux"] = "1" if a.smux else ""                   # ws 类多路复用，默认关
     sb = list(SB) if a.sb == "all" else [x for x in a.sb.split(",") if x]
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
     if not sb and not xr:

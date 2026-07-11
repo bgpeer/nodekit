@@ -207,16 +207,19 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
   （借真站证书，无需域名、无 insecure），或补一个域名走 acme 真证书。
   hy2 / tuic 用自签是行业常规，无需担心。
 
-订阅里还默认开了两项客户端增强（服务端已同步支持，均自动生成、无需手动配置）：
+订阅还带两项客户端增强（服务端已同步支持，均自动生成、无需手动配置）：
 
-- **X25519MLKEM768 后量子密钥交换**：`reality-*` 节点在 mihomo 订阅里带
+- **X25519MLKEM768 后量子密钥交换**（默认开）：`reality-*` 节点在 mihomo 订阅里带
   `reality-opts.support-x25519mlkem768: true`，握手改用抗量子的混合 KEX，也能进一步
   打散 reality 的 ClientHello 指纹。此字段由客户端主动发起，**旧核心会握手失败**，
   故脚本会**先检测本机核心版本**（sing-box ≥ 1.12.0、xray ≥ 25.5.16 才下发；
   版本读不出或过旧则自动省略，保连通性优先）。本脚本每月自动更新核心，正常无需担心。
-- **smux 多路复用**：仅 **ws / httpupgrade** 家族两头开 `h2mux`（mihomo `smux`、
-  sing-box `multiplex`），多条请求复用一条底层连接、少握手更省延迟。
-  vision / reality / grpc / QUIC(hy2、tuic) / anytls **一律不开**（它们要么自带更优复用、
+- **smux 多路复用**（**默认关，安装时询问**）：仅 **ws / httpupgrade** 家族可两头开
+  `h2mux`（mihomo `smux`、sing-box `multiplex`）。多条请求复用一条底层连接，
+  **网页/小请求延迟更低、连接数更少更隐蔽**；但同一条 TCP 上的**队头阻塞**会让
+  **大文件下载 / 测速 / 丢包重的跨境线**变慢，所以默认关——选了 ws 类节点时装机会问一句
+  `y开启/n不开(回车=不开)`，命令行用 `--smux` 开启。
+  vision / reality / grpc / QUIC(hy2、tuic) / anytls **一律不参与**（它们要么自带更优复用、
   要么与 xray `mux.cool` 不兼容），xray 承载的 ws 也不带该标记，避免两端复用协议不一致。
 
 **伪装站可自替换**：`--nginx` 模式下 443 的伪装首页在 `/var/www/bgpeer/index.html`
