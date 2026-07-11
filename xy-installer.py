@@ -2140,8 +2140,16 @@ def smux_current_state():
         return None
     return any(ib.get("multiplex") for ib in ws)
 
+def restart_services(*names):
+    """后台异步重启核心：--no-block 交给 systemd 执行，本进程不阻塞、立即返回。
+       这样即便你挂着本机代理来管理、重启会掐断 SSH，操作也已在服务端完成
+       （所有配置/状态必须在调用本函数之前就落盘）。"""
+    svc = " ".join(n for n in names if n)
+    if svc:
+        sh(f"systemctl restart --no-block {svc}", check=False)
+
 def smux_apply(on):
-    """开/关 smux：改 sing-box 入站 multiplex + 同步链接标记 + 重启 + 刷新三格式订阅（保持 token）。"""
+    """开/关 smux：改 sing-box 入站 multiplex + 同步链接标记 + 刷新订阅，最后后台重启。"""
     data, cfg = _load_sb_cfg()
     if not data:
         print("  找不到 sing-box 配置，无法切换。"); return
@@ -2155,13 +2163,14 @@ def smux_apply(on):
         else:  ib.pop("multiplex", None)
     json.dump(data, open(cfg, "w"), indent=2)         # 写回 sing-box 配置
     _toggle_saved_links_smux(on, tags)                # 同步分享链接标记
-    sh("systemctl restart sing-box", check=False)     # 重启使入站生效
     G["host"] = _host()
     try:
         build_subscription(read_saved_links(), new_token=False)   # 保持 token，刷新三格式订阅
     except Exception as e:
         print("  订阅刷新跳过（不影响节点）:", e)
-    print(f"\n  ✓ 已{'开启' if on else '关闭'} smux；sing-box 已重启，三格式订阅已同步（URL 不变）。")
+    restart_services("sing-box")                      # 全部落盘后再后台重启，避免中途掐 SSH 导致没跑完
+    print(f"\n  ✓ 已{'开启' if on else '关闭'} smux；订阅已同步，sing-box 正在后台重启（URL 不变）。")
+    print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常——操作已在服务端完成。")
     print("  客户端重新拉取订阅、或到各配置菜单点『3 更新配置』即可生效。")
 
 def smux_menu():
@@ -2247,13 +2256,15 @@ def _bt_apply_xray(on):
     return True
 
 def bt_apply(on):
-    """开/关 BT 屏蔽：改两核心 config + 重启；记住状态。返回改动的核心列表。"""
+    """开/关 BT 屏蔽：先改两核心 config + 落盘状态，最后后台重启。
+       顺序很重要——状态先写，即便随后 SSH 断（重启掐了本机代理隧道）状态也已正确。"""
     did = []
     if os.path.exists(f"{SB_DIR}/config.json") and _bt_apply_singbox(on):
-        sh("systemctl restart sing-box", check=False); did.append("sing-box")
+        did.append("sing-box")
     if os.path.exists(f"{XRAY_DIR}/config.json") and _bt_apply_xray(on):
-        sh("systemctl restart xray", check=False); did.append("xray")
-    bt_set(on)
+        did.append("xray")
+    bt_set(on)                     # 状态先落盘
+    restart_services(*did)         # 再后台异步重启
     return did
 
 def bt_reapply():
@@ -2279,7 +2290,8 @@ def bt_menu():
             ans = _ask(f"  确认{'关闭' if on else '开启'} BT 屏蔽? y 确认 / n 返回: ").strip().lower()
             if ans in ("y", "yes"):
                 did = bt_apply(not on)
-                print(f"  ✓ 已{'关闭' if on else '开启'} BT 屏蔽（{('、'.join(did)) or '无核心'} 已重启）。")
+                print(f"  ✓ 已{'关闭' if on else '开启'} BT 屏蔽（状态已保存，{('、'.join(did)) or '无核心'} 正在后台重启）。")
+                print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常——设置已生效。")
         elif c in ("0", ""):
             return
 
