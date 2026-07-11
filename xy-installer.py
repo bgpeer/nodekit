@@ -1977,15 +1977,14 @@ def _validate_generated(ext, path):
         return False, f"读取失败: {e}"
     if not text.strip():
         return False, "生成内容为空（模板损坏或锚点未命中）"
-    if ext == "json":                                           # sing-box：JSON 语法 + 内核 check
+    if ext == "json":                                           # sing-box：只验 JSON 语法
+        # 注意：这是给客户端用的订阅配置，不能用服务器的 sing-box check 做语义校验——
+        # 客户端内核版本常与服务器不同，模板里 dns.optimistic 等字段在客户端合法、
+        # 却可能不被服务器内核识别，硬校验会误杀（用户模板没动却报失败）。
         try:
             json.loads(text)
         except Exception as e:
             return False, f"JSON 语法错误: {e}"
-        if os.path.exists(SB_BIN):
-            ok, msg = core_check(SB_BIN, path)
-            if not ok:
-                return False, msg or "sing-box check 未通过"
         return True, ""
     if ext == "yaml":                                           # mihomo：关键段必查 + 有 PyYAML 再验语法
         for sec in ("proxies:", "proxy-groups:", "rules:"):
