@@ -14,7 +14,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, shutil, socket, re, time
+import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time
 
 # 版本：安装时优先取 GitHub 最新正式版；下面是取不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -47,6 +47,8 @@ SUB_SERVER   = BGP_DIR + "/xy-sub-server.py" # 订阅托管小服务（支持可
 HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
 STATE_FILE   = BGP_DIR + "/state.json"       # 记住上次安装（域名/前缀/协议等），重装默认保持节点不变
 TOKENS_FILE  = BGP_DIR + "/tokens.json"      # 每格式独立订阅 token
+LINKS_FILE   = BGP_DIR + "/nodes.links"      # 本机节点链接（供多机聚合拉取的 .links 端点）
+PEERS_FILE   = BGP_DIR + "/peers.json"       # 聚合的成员机 .links 地址列表
 CUSTPL_FILE  = BGP_DIR + "/custom_tpl.json"  # 每格式自定义模板链接（gist/GitHub）
 BT_STATE     = BGP_DIR + "/bt.json"          # BT/PT 下载屏蔽开关状态
 SUB_PORT     = 20080
@@ -1190,6 +1192,14 @@ def sub_urls_text():
     return "\n".join(f"  {SUB_EXTS[e]:<12} {sub_url(e)}"
                      for e in ("yaml", "json", "conf") if os.path.exists(ff[e]) and toks.get(e))
 
+def links_url():
+    """本机节点链接（.links）地址：粘到别的机器「聚合节点链接」里做多机汇总。"""
+    t = load_tokens().get("links")
+    if not t:
+        return ""
+    scheme = "https" if _sub_https() else "http"
+    return f"{scheme}://{_host()}:{SUB_PORT}/{t}.links"
+
 def rotate_token_ext(ext):
     t = load_tokens(); t[ext] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
 
@@ -1213,13 +1223,21 @@ def serve_sub(reset=False):
        reset=True 换全部 token；否则复用已有、只给新出现的格式补 token。"""
     os.makedirs(SUB_DIR, exist_ok=True)
     toks = {} if reset else load_tokens()
-    for f in os.listdir(SUB_DIR):                       # 清旧软链
-        if f.rsplit(".", 1)[-1] in SUB_EXTS:
+    for f in os.listdir(SUB_DIR):                       # 清旧软链（含 .links）
+        if f.rsplit(".", 1)[-1] in SUB_EXTS or f.endswith(".links"):
             os.remove(os.path.join(SUB_DIR, f))
     for ext, target in (("yaml", CFG_FILE), ("json", SBOX_FILE), ("conf", SR_FILE)):
         if os.path.exists(target):
             toks.setdefault(ext, secrets.token_urlsafe(12))
             os.symlink(target, f"{SUB_DIR}/{toks[ext]}.{ext}")
+    # 节点链接端点（.links）：纯本机分享链接，供别的机器聚合拉取；token 保护。
+    # .links token 跨重装保持稳定——成员机重装后地址不变，主机端不用重新添加。
+    local = read_saved_links()
+    if local:
+        open(LINKS_FILE, "w").write("\n".join(local) + "\n")
+        lt = toks.get("links") or load_tokens().get("links") or secrets.token_urlsafe(12)
+        toks["links"] = lt
+        os.symlink(LINKS_FILE, f"{SUB_DIR}/{lt}.links")
     save_tokens(toks)
     open(f"{SUB_DIR}/index.html", "w").write("")        # 有 index 就不列目录，token 不外泄
     # 托管小服务：有域名+真证书就用 TLS（https 订阅），否则明文（自签 host 用 https 客户端会拒）
@@ -1464,7 +1482,7 @@ def build_singbox_sub(nodes, tpl_url):
         else:
             new_ob.append(x)
     cfg["outbounds"] = new_ob
-    _sb_direct_ip(cfg)                                        # 本机 IP 直连（走紧凑序列化，不破坏格式）
+    _sb_direct_ip(cfg, _direct_ips(nodes))                    # 各 VPS IP 直连（走紧凑序列化，不破坏格式）
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
@@ -1605,21 +1623,33 @@ def _self_ip():
         _SELF_IP_CACHE = ip or ""
     return _SELF_IP_CACHE
 
-def _mihomo_direct_ip(tpl):
-    """mihomo：在 rules: 段顶部插一条本机 IP 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
-    ip = _self_ip()
-    if not ip or "rules:" not in tpl:
-        return tpl
-    line = f"IP-CIDR,{ip}/32,DIRECT,no-resolve"
-    if line in tpl:
-        return tpl
-    return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n  - " + line, tpl, count=1)
+def _direct_ips(nodes):
+    """要直连的 IP：本机 IP + 所有节点服务器里的 IP 字面量（多机聚合后自动覆盖各成员机 IP，
+       这样挂着聚合代理管理任意一台，SSH 都走直连、不被重启核心掐断）。"""
+    ips, seen = [], set()
+    si = _self_ip()
+    if si:
+        ips.append(si); seen.add(si)
+    for _, d in nodes:
+        s = str(d.get("server", "")).strip()
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", s) and s not in seen:
+            seen.add(s); ips.append(s)
+    return ips
 
-def _sb_direct_ip(cfg):
-    """sing-box：把本机 IP 直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
+def _mihomo_direct_ip(tpl, ips):
+    """mihomo：在 rules: 段顶部插各 VPS IP 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
+    if not ips or "rules:" not in tpl:
+        return tpl
+    new = [f"  - IP-CIDR,{ip}/32,DIRECT,no-resolve" for ip in ips
+           if f"IP-CIDR,{ip}/32,DIRECT,no-resolve" not in tpl]
+    if not new:
+        return tpl
+    return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n" + "\n".join(new), tpl, count=1)
+
+def _sb_direct_ip(cfg, ips):
+    """sing-box：把各 VPS IP 直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
        就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。"""
-    ip = _self_ip()
-    if not ip:
+    if not ips:
         return
     route = cfg.get("route")
     if not isinstance(route, dict):
@@ -1631,21 +1661,26 @@ def _sb_direct_ip(cfg):
     direct = "🎯直连" if "🎯直连" in tags else next((t for t in tags if t and "直连" in str(t)), "")
     if not direct:
         return
-    rule = {"ip_cidr": [f"{ip}/32"], "outbound": direct}
-    if rule not in rules:
-        route["rules"] = [rule] + rules
+    add = []
+    for ip in ips:
+        rule = {"ip_cidr": [f"{ip}/32"], "outbound": direct}
+        if rule not in rules and rule not in add:
+            add.append(rule)
+    if add:
+        route["rules"] = add + rules
 
-def _sr_direct_ip(path):
-    """Shadowrocket：在 [Rule] 段顶部插一条本机 IP 直连。"""
-    ip = _self_ip()
-    if not ip:
+def _sr_direct_ip(path, ips):
+    """Shadowrocket：在 [Rule] 段顶部插各 VPS IP 直连。"""
+    if not ips:
         return
     try: tpl = open(path).read()
     except OSError: return
-    line = f"IP-CIDR,{ip}/32,DIRECT,no-resolve"
-    if "[Rule]" not in tpl or line in tpl:
+    if "[Rule]" not in tpl:
         return
-    open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + line, 1))
+    new = [f"IP-CIDR,{ip}/32,DIRECT,no-resolve" for ip in ips
+           if f"IP-CIDR,{ip}/32,DIRECT,no-resolve" not in tpl]
+    if new:
+        open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + "\n".join(new), 1))
 
 def gen_mihomo(ylines, nodes, tpl_url):
     tpl = fetch_url(tpl_url)
@@ -1657,13 +1692,13 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
     tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
-    tpl = _mihomo_direct_ip(tpl)                           # 本机 IP 直连（防管理时 SSH 走代理）
+    tpl = _mihomo_direct_ip(tpl, _direct_ips(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)                        # 直连规则已在内部注入并紧凑序列化
 def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
-    _sr_direct_ip(SR_FILE)
+    _sr_direct_ip(SR_FILE, _direct_ips(nodes))
 
 FMT = {
     "yaml": {"label": "mihomo",              "file": CFG_FILE,  "author": TEMPLATE_URL, "gen": gen_mihomo},
@@ -1680,6 +1715,49 @@ def set_custpl(ext, url):
     os.makedirs(BGP_DIR, exist_ok=True); json.dump(d, open(CUSTPL_FILE, "w"), ensure_ascii=False, indent=2)
 def tpl_url_for(ext, custom=False):
     return (load_custpl().get(ext) if custom else "") or FMT[ext]["author"]
+
+# ============================================================================ 多机聚合
+def load_peers():
+    try: return [u for u in json.load(open(PEERS_FILE)) if u]
+    except Exception: return []
+
+def save_peers(peers):
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump(peers, open(PEERS_FILE, "w"), ensure_ascii=False, indent=2)
+
+def _fetch_text(url, timeout=15):
+    """普通拉取任意 URL 文本（成员机 .links 端点用；不走 github 镜像逻辑）。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
+    return urllib.request.urlopen(req, timeout=timeout).read().decode(errors="ignore")
+
+def peer_status(url):
+    """探测成员链接可达性，返回 HTTP 状态码字符串；不通返回 '000'。供菜单显示 ✓/红码。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
+        return str(urllib.request.urlopen(req, timeout=8).status)
+    except urllib.error.HTTPError as e:
+        return str(e.code)
+    except Exception:
+        return "000"
+
+_NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://",
+                 "hysteria2://", "hy2://", "tuic://", "anytls://")
+
+def aggregated_links(local=None):
+    """本机链接 + 各成员机 .links（去重；拉不到的成员直接跳过）。
+       只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。"""
+    links = list(local if local is not None else read_saved_links())
+    seen = set(links)
+    for u in load_peers():
+        try:
+            text = _fetch_text(u)
+        except Exception:
+            continue                                    # 不通就忽略这台
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith(_NODE_SCHEMES) and s not in seen:
+                seen.add(s); links.append(s)
+    return links
 
 def parse_nodes(all_links):
     ylines, nodes = [], []
@@ -1699,6 +1777,7 @@ def parse_nodes(all_links):
 def build_subscription(all_links, new_token=False):
     """三格式各生成可编辑配置（有自定义模板就用自定义，否则作者模板），记住 host，托管。
        new_token=True（重装换节点/换域名）换全部 token 刷新订阅；否则保持各格式 token。"""
+    all_links = aggregated_links(all_links)               # 合并成员机节点（多机聚合）
     ylines, nodes = parse_nodes(all_links)
     if not ylines:
         return False
@@ -1959,6 +2038,51 @@ def show_links():
     urls = sub_urls_text()
     if urls:
         print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + urls)
+    lu = links_url()
+    if lu:
+        print("=" * 60 + "\n本机节点链接地址（多机聚合用：复制它，粘到主机的『聚合节点链接』里）:\n  " + lu)
+
+def peers_menu():
+    """聚合节点链接：加/删成员机 .links 地址，列表带连通性 ✓/红码。改完到配置菜单点『更新配置』生效。"""
+    while True:
+        peers = load_peers()
+        print("\n" + "=" * 60)
+        print("  聚合节点链接（多机汇总）")
+        print("=" * 60)
+        if peers:
+            print("  已添加的成员链接（生成时不通的自动忽略）：")
+            for i, u in enumerate(peers, 1):
+                code = peer_status(u)
+                mark = "\033[1;32m✓\033[0m" if code == "200" else \
+                       ("\033[1;31m不通\033[0m" if code == "000" else f"\033[1;31m{code}\033[0m")
+                print(f"    {i}. {u}   {mark}")
+        else:
+            print("  还没添加成员链接。成员机进『2 节点/订阅』复制它的 .links 地址，粘进来即可。")
+        print("-" * 60)
+        print("  1 添加链接    2 删除链接    0 返回")
+        print("  （加/删后回主菜单进配置菜单点『更新配置』重新汇总生成）")
+        c = _ask("选择: ").strip()
+        if c == "1":
+            u = _ask("  粘贴成员机 .links 地址: ").strip()
+            if not u:
+                continue
+            if not re.match(r"^https?://", u):
+                print("  ✗ 不是合法的 http(s) 地址，已忽略。"); continue
+            if u in peers:
+                print("  该链接已存在。"); continue
+            peers.append(u); save_peers(peers)
+            code = peer_status(u)
+            print("  ✓ 已添加。" + ("连通 ✓" if code == "200" else f"（当前不通 {code}，之后通了会自动纳入）"))
+        elif c == "2":
+            if not peers:
+                continue
+            n = _ask("  删除哪个编号: ").strip()
+            if n.isdigit() and 1 <= int(n) <= len(peers):
+                print("  已删除:", peers.pop(int(n) - 1)); save_peers(peers)
+            else:
+                print("  编号无效。")
+        elif c in ("0", ""):
+            return
 
 def edit_file(path):
     ed = shutil.which("nano") or shutil.which("vi") or shutil.which("vim")
@@ -2018,10 +2142,10 @@ def update_one_config(ext):
         which = "自定义"
     else:
         return
-    links = read_saved_links()
-    if not links:
+    if not read_saved_links():
         print("  没有已保存节点。"); return
     G["host"] = _host(); ensure_deps()
+    links = aggregated_links()                                  # 本机 + 成员机节点（多机聚合）
     ylines, nodes = parse_nodes(links)
     target = FMT[ext]["file"]
     backup = open(target).read() if os.path.exists(target) else None
@@ -2455,15 +2579,16 @@ def main_menu():
         print("=" * 60)
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
-        print("  3. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
-        print("  4. mihomo 配置")
-        print("  5. sing-box 配置")
-        print("  6. 小火箭配置")
-        print("  7. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）")
-        print("  8. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
-        print("  9. 更新脚本（不影响节点）")
-        print("  10. 更新核心（sing-box / xray）")
-        print("  11. 卸载")
+        print("  3. 聚合节点链接（多机汇总：把别的 VPS 节点并进来）")
+        print("  4. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
+        print("  5. mihomo 配置")
+        print("  6. sing-box 配置")
+        print("  7. 小火箭配置")
+        print("  8. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）")
+        print("  9. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
+        print("  10. 更新脚本（不影响节点）")
+        print("  11. 更新核心（sing-box / xray）")
+        print("  12. 卸载")
         print("  0. 退出")
         print("-" * 60)
         c = _ask("请选择: ").strip()
@@ -2471,15 +2596,16 @@ def main_menu():
             print("再见。"); return
         if c == "1":     install_flow()
         elif c == "2":   show_links()
-        elif c == "3":   smux_menu()
-        elif c == "4":   config_menu("yaml")
-        elif c == "5":   config_menu("json")
-        elif c == "6":   config_menu("conf")
-        elif c == "7":   cn_block_menu()
-        elif c == "8":   bt_menu()
-        elif c == "9":   update_script()
-        elif c == "10":  update_cores()
-        elif c == "11":  uninstall_all()
+        elif c == "3":   peers_menu()
+        elif c == "4":   smux_menu()
+        elif c == "5":   config_menu("yaml")
+        elif c == "6":   config_menu("json")
+        elif c == "7":   config_menu("conf")
+        elif c == "8":   cn_block_menu()
+        elif c == "9":   bt_menu()
+        elif c == "10":  update_script()
+        elif c == "11":  update_cores()
+        elif c == "12":  uninstall_all()
         else:
             print("无效选择。"); continue
         _ask("\n按回车返回主菜单...")            # 停一下，别让菜单立刻盖住上面的输出
