@@ -2066,12 +2066,10 @@ def show_links():
     links = read_saved_links()
     if not links:
         print("\n还没有节点，请先『1.安装』。"); return
-    # HTTP/HTTPS 漂移，或老安装升级上来还没 .links 端点 → 自动补一次 serve_sub
-    if not _sub_service_synced() or not links_url():
+    if not _sub_service_synced():         # HTTP/HTTPS 漂移 → 自动把托管服务同步到当前应有状态
         try:
-            serve_sub()                   # 不换 token，仅补 .links / 切换 HTTP-HTTPS 并重启 xy-sub
-            print("（订阅托管服务已同步：" + ("HTTPS" if _sub_https() else "HTTP") +
-                  "，并已生成本机 .links 地址，URL 不变）")
+            serve_sub()                   # 不换 token，仅切换 HTTP/HTTPS 并重启 xy-sub
+            print("（已把订阅托管服务同步到 " + ("HTTPS" if _sub_https() else "HTTP") + "，URL 不变）")
         except Exception as e:
             print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
     print("\n" + "=" * 60 + "\n分享链接:\n" + "=" * 60)
@@ -2079,17 +2077,23 @@ def show_links():
     urls = sub_urls_text()
     if urls:
         print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + urls)
-    lu = links_url()
-    if lu:
-        print("=" * 60 + "\n本机节点链接地址（多机聚合用：复制它，粘到主机的『聚合节点链接』里）:\n  " + lu)
 
 def peers_menu():
-    """聚合节点链接：加/删成员机 .links 地址，列表带连通性 ✓/红码。改完到配置菜单点『更新配置』生效。"""
+    """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
+       改完到配置菜单点『更新配置』生效。"""
+    # 老安装升级上来还没 .links 端点 → 进来补生成一次，保证本机地址能显示
+    if read_saved_links() and not links_url():
+        try: serve_sub()
+        except Exception: pass
     while True:
         peers = load_peers()
         print("\n" + "=" * 60)
         print("  聚合节点链接（多机汇总）")
         print("=" * 60)
+        lu = links_url()
+        print("  ▸ 本机节点链接地址（要被别的主机聚合时，复制这条给它）:")
+        print("    " + (lu if lu else "（本机还没节点，先『1.安装』）"))
+        print("-" * 60)
         if peers:
             print("  已添加的成员链接（生成时不通的自动忽略）：")
             for i, u in enumerate(peers, 1):
@@ -2098,7 +2102,7 @@ def peers_menu():
                        ("\033[1;31m不通\033[0m" if code == "000" else f"\033[1;31m{code}\033[0m")
                 print(f"    {i}. {u}   {mark}")
         else:
-            print("  还没添加成员链接。成员机进『2 节点/订阅』复制它的 .links 地址，粘进来即可。")
+            print("  还没添加成员链接。到别的机器进本菜单，复制它顶部那条 .links 地址，粘进来即可。")
         print("-" * 60)
         print("  1 添加链接    2 删除链接    0 返回")
         print("  （加/删后回主菜单进配置菜单点『更新配置』重新汇总生成）")
