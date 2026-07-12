@@ -138,7 +138,7 @@ pg-anchor:
   
 proxy-groups:
   - {name: "🌍全球加速", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/global_1.png, proxies: ["♻️全部随机"__XY_NAMES__], <<: *AUTO_COMMON, url: "https://www.gstatic.com/generate_204", interval: 120, timeout: 5000}
-  - {name: "🎷抖音", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/douyin_1.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}
+  - {name: "🎷抖音", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/douyin_1.png, proxies: *GLOBAL_WITH_DIRECT, <<: *AUTO_COMMON}
   - {name: "🎬TikTok", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/tiktok_1.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}
   - {name: "🎮国际游戏", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/game_2.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}
   - {name: "💻Telegram", type: select, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/telegram.png, proxies: *GLOBAL_PROXIES, <<: *AUTO_COMMON}
