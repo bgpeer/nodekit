@@ -1743,9 +1743,48 @@ def peer_status(url):
 _NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://",
                  "hysteria2://", "hy2://", "tuic://", "anytls://")
 
+_SUP = {"0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+        "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹"}
+def _sup(n):
+    return "".join(_SUP.get(c, c) for c in str(n))
+
+def _link_name(link):
+    """取分享链接的节点名（vmess 在 base64 JSON 的 ps，其余在 #fragment）。"""
+    if link.startswith("vmess://"):
+        try:
+            b = link[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+            return j.get("ps", "")
+        except Exception:
+            return ""
+    return urllib.parse.unquote(link.split("#", 1)[1]) if "#" in link else ""
+
+def _link_rename(link, newname):
+    if link.startswith("vmess://"):
+        try:
+            b = link[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        except Exception:
+            return link
+        j["ps"] = newname
+        return vmess_link(j)
+    return link.split("#", 1)[0] + "#" + newname
+
+def _dedup_names(links):
+    """多机聚合后可能有同名节点（两台同前缀+同协议）→ mihomo/sing-box 不许重名。
+       只给『撞名』的加小上标前缀区分（¹²³…），没撞的保持原样、干净。"""
+    names = [_link_name(u) for u in links]
+    dup = {n for n in names if n and names.count(n) > 1}
+    idx, out = {}, []
+    for u, nm in zip(links, names):
+        if nm in dup:
+            idx[nm] = idx.get(nm, 0) + 1
+            out.append(_link_rename(u, _sup(idx[nm]) + nm))       # ¹🇯🇵… ²🇯🇵…（旗子仍在，国家分组照常命中）
+        else:
+            out.append(u)
+    return out
+
 def aggregated_links(local=None):
     """本机链接 + 各成员机 .links（去重；拉不到的成员直接跳过）。
-       只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。"""
+       只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。撞名的自动加 ¹²³ 区分。"""
     links = list(local if local is not None else read_saved_links())
     seen = set(links)
     for u in load_peers():
@@ -1757,7 +1796,7 @@ def aggregated_links(local=None):
             s = line.strip()
             if s.startswith(_NODE_SCHEMES) and s not in seen:
                 seen.add(s); links.append(s)
-    return links
+    return _dedup_names(links)
 
 def parse_nodes(all_links):
     ylines, nodes = [], []
