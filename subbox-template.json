@@ -50,7 +50,7 @@
   "outbounds": [
     {"tag": "DIRECT", "type": "direct"},
     {"tag": "🌍代理", "type": "selector", "default": "♻️随机", "outbounds": ["♻️随机", "__XY_NAMES__:.*"]},
-    {"tag": "🎷抖音", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__XY_NAMES__:.*"]},
+    {"tag": "🎷抖音", "type": "selector", "outbounds": ["🎯直连", "♻️随机", "🌍代理", "__XY_NAMES__:.*"]},
     {"tag": "🎬TikTok", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__XY_NAMES__:.*"]},
     {"tag": "🎮国际游戏", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__XY_NAMES__:.*"]},
     {"tag": "💻Telegram", "type": "selector", "outbounds": ["🌍代理", "♻️随机", "🎯直连", "__XY_NAMES__:.*"]},
