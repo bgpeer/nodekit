@@ -1203,6 +1203,10 @@ def links_url():
 def rotate_token_ext(ext):
     t = load_tokens(); t[ext] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
 
+def rotate_links_token():
+    """换 .links token：旧地址立即失效（防泄露）。聚合了本机的主机需重新复制新地址。"""
+    t = load_tokens(); t["links"] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
+
 # 订阅托管小服务：有 cert/key 参数就起 HTTPS，否则明文 HTTP（用法：port dir [cert key]）
 _SUB_SERVER_PY = (
     "import http.server, functools, ssl, sys\n"
@@ -1231,11 +1235,14 @@ def serve_sub(reset=False):
             toks.setdefault(ext, secrets.token_urlsafe(12))
             os.symlink(target, f"{SUB_DIR}/{toks[ext]}.{ext}")
     # 节点链接端点（.links）：纯本机分享链接，供别的机器聚合拉取；token 保护。
-    # .links token 跨重装保持稳定——成员机重装后地址不变，主机端不用重新添加。
+    # 重装换节点(reset)时和订阅一样换 .links token，旧地址失效（防泄露）；平时保持不变。
     local = read_saved_links()
     if local:
         open(LINKS_FILE, "w").write("\n".join(local) + "\n")
-        lt = toks.get("links") or load_tokens().get("links") or secrets.token_urlsafe(12)
+        if reset:
+            lt = secrets.token_urlsafe(12)
+        else:
+            lt = toks.get("links") or load_tokens().get("links") or secrets.token_urlsafe(12)
         toks["links"] = lt
         os.symlink(LINKS_FILE, f"{SUB_DIR}/{lt}.links")
     save_tokens(toks)
@@ -2091,7 +2098,7 @@ def peers_menu():
         print("  聚合节点链接（多机汇总）")
         print("=" * 60)
         lu = links_url()
-        print("  ▸ 本机节点链接地址（要被别的主机聚合时，复制这条给它）:")
+        print("  ▸ 本机 links 链接地址（要被别的主机聚合时，复制这条给它）:")
         print("    " + (lu if lu else "（本机还没节点，先『1.安装』）"))
         print("-" * 60)
         if peers:
@@ -2102,12 +2109,21 @@ def peers_menu():
                        ("\033[1;31m不通\033[0m" if code == "000" else f"\033[1;31m{code}\033[0m")
                 print(f"    {i}. {u}   {mark}")
         else:
-            print("  还没添加成员链接。到别的机器进本菜单，复制它顶部那条 .links 地址，粘进来即可。")
+            print("  还没添加成员链接。到别的机器进本菜单，复制它顶部那条 links 链接，粘进来即可。")
         print("-" * 60)
-        print("  1 添加链接    2 删除链接    0 返回")
+        print("  1 添加链接    2 删除链接    3 刷新本机 links 链接（换 token）    0 返回")
         print("  （加/删后回主菜单进配置菜单点『更新配置』重新汇总生成）")
         c = _ask("选择: ").strip()
-        if c == "1":
+        if c == "3":
+            if not links_url():
+                print("  本机还没节点/links 链接，先『1.安装』。"); continue
+            if _ask("  换 token 后旧地址立即失效，聚合了本机的主机要重新复制新地址。确认? y/n: ").strip().lower() in ("y", "yes"):
+                try:
+                    rotate_links_token()
+                    print("  ✓ 已换新地址：\n    " + links_url())
+                except Exception as e:
+                    print("  刷新失败:", e)
+        elif c == "1":
             u = _ask("  粘贴成员机 .links 地址: ").strip()
             if not u:
                 continue
