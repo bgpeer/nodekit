@@ -251,7 +251,7 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 
 常用参数：`--sb` / `--xray`（协议，逗号分隔或 `all`）、`--domain`、`--email`、
 `--sni`（reality 借用目标站，默认 `s0.awsstatic.com`）、`--prefix`（节点名前缀）、
-`--hy2-ports`（hy2 端口跳跃范围，默认 `30000-31000`）、`--nginx`、
+`--hy2-ports`（hy2 端口跳跃范围，默认 `30000-31000`；填 `off` 关闭跳跃、走单端口）、`--nginx`、
 `--no-reality-443`（默认会把主力 reality 绑 443 抗封端口，加此参数则不绑）、
 `--yes`（检测到 mack-a 等现有安装直接接管）。
 
