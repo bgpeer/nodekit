@@ -47,7 +47,7 @@ sudo python3 /tmp/xy.py
 
 > 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`），sing-box 已能做且做得一样，xray 独有价值的只有 `vless-reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `vless-reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
 >
-> 万一你让两核心装了同名协议，为避免客户端订阅**重名报错**，xray 那份会自动加 `-xray` 后缀区分（如 `trojan-xray`）。端口/服务/配置本来就互不冲突。
+> 万一你让两核心装了同名协议（`vless-ws`/`vmess-ws`/`trojan`），为避免客户端订阅**重名报错**，会给它们**尾部各加一个小上标区分**：sing-box 那份加 `¹`、xray 那份加 `²`（如 `trojan¹` / `trojan²`）。只标撞名的这几个，其余不动；上标短，手机上也显示得下。端口/服务/配置本来就互不冲突。
 
 ---
 
