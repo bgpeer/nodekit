@@ -2049,11 +2049,12 @@ def run(sb_names, xr_names):
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
 
 # ============================================================================ 管理面板 / 快捷命令
-def install_shortcut():
-    """安装 bgpeer 快捷命令：本地存一份脚本，wrapper 每次尽量拉最新再运行。"""
+def install_shortcut(content=None):
+    """安装 bgpeer 快捷命令：本地存一份脚本，wrapper 每次尽量拉最新再运行。
+       content 给了就存它（更新脚本时传刚下载的新版，避免又被当前运行的旧版覆盖）。"""
     try:
-        os.makedirs("/etc/bgpeer", exist_ok=True)
-        open("/etc/bgpeer/xy-installer.py", "w").write(open(__file__).read())
+        os.makedirs(BGP_DIR, exist_ok=True)
+        open(SELF_LOCAL, "w").write(content if content is not None else open(__file__).read())
         # raw.githubusercontent 常被 GitHub 限流(429)，加 jsDelivr 镜像兜底；
         # 只有真的下到非空内容才覆盖本地，拉不到就继续用本地缓存（不会退回旧版失败）。
         wrapper = ("#!/usr/bin/env bash\n"
@@ -2285,15 +2286,21 @@ def config_menu(ext):
             return
 
 def update_script():
-    """只更新脚本本体到最新，不动节点、不改配置。"""
+    """只更新脚本本体到最新，不动节点、不改配置；有新版则自动重载新版面板。"""
     try:
-        latest = fetch_url("https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py")
-        os.makedirs(BGP_DIR, exist_ok=True)
-        open(BGP_DIR + "/xy-installer.py", "w").write(latest)
-        install_shortcut()
-        print("\n脚本已更新到最新（节点/配置均未改动）。重新输入 bgpeer 生效。")
+        latest = fetch_url(_RAW + "xy-installer.py")
     except Exception as e:
-        print("\n更新脚本失败:", e)
+        print("\n更新脚本失败:", e); return
+    try:    cur = open(SELF_LOCAL).read()
+    except OSError: cur = ""
+    if latest == cur:
+        # 镜像(jsDelivr)对 main 分支有最长 ~12 小时缓存；刚发布的新版可能要等缓存刷新
+        print("\n已是最新版本。（若刚发布过新版还没看到，多半是 GitHub/镜像缓存未刷新，稍后再试）")
+        return
+    install_shortcut(latest)
+    print("\n脚本已更新（节点/配置均未改动），正在重新载入新版面板…")
+    import sys
+    os.execv(sys.executable, [sys.executable, SELF_LOCAL])
 
 def setup_core_update_cron():
     """装每月定点更新内核的 cron：北京时间每月 2 号 04:00。
