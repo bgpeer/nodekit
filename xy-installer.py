@@ -2712,11 +2712,79 @@ def bt_menu():
         elif c in ("0", ""):
             return
 
+# ---------------------------------------------------------------------------- 流量统计（主菜单顶部展示）
+def _fmt_traffic(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if n < 1024 or u == "PB":
+            return f"{int(n)} B" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+def _main_iface():
+    out = sh("ip -4 route get 1.1.1.1 2>/dev/null || ip route show default", check=False)
+    m = re.search(r"\bdev\s+(\S+)", out)
+    return m.group(1) if m else ""
+
+def _vnstat_stats(iface):
+    """vnstat 2.x：返回 (月rx, 月tx, 日rx, 日tx) 字节；不可用/没数据返回 None。"""
+    if not have("vnstat"):
+        return None
+    sel = f"-i {iface} " if iface else ""
+    try:
+        mo = json.loads(sh(f"vnstat {sel}--json m 1", check=False))
+        mo = mo["interfaces"][0]["traffic"]["month"][-1]
+        dy = json.loads(sh(f"vnstat {sel}--json d 1", check=False))
+        dy = dy["interfaces"][0]["traffic"]["day"][-1]
+        return mo["rx"], mo["tx"], dy["rx"], dy["tx"]
+    except Exception:
+        return None
+
+def _vnstat_bg_install():
+    """后台静默装 vnstat（只试一次），装好后主菜单显示 本月/今日 流量。"""
+    marker = BGP_DIR + "/.vnstat_tried"
+    if have("vnstat") or os.path.exists(marker) or not have("apt-get"):
+        return
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        open(marker, "w").write("")
+        subprocess.Popen(
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y vnstat >/dev/null 2>&1 && "
+            "systemctl enable --now vnstat >/dev/null 2>&1",
+            shell=True, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def traffic_line():
+    """主菜单顶部的流量一行字：优先 vnstat（本月/今日，跨重启准确），
+       没装则先显示内核计数（开机以来）并后台装 vnstat。任何失败返回 ''，不影响面板。"""
+    try:
+        iface = _main_iface()
+        v = _vnstat_stats(iface)
+        if v:
+            mrx, mtx, drx, dtx = v
+            return (f"  📊 本月流量: ↑{_fmt_traffic(mtx)} ↓{_fmt_traffic(mrx)}"
+                    f"   今日: ↑{_fmt_traffic(dtx)} ↓{_fmt_traffic(drx)}（{iface}）")
+        if not iface:
+            return ""
+        rx = int(open(f"/sys/class/net/{iface}/statistics/rx_bytes").read())
+        tx = int(open(f"/sys/class/net/{iface}/statistics/tx_bytes").read())
+        tried = os.path.exists(BGP_DIR + "/.vnstat_tried")   # 已试过装 → 不再重复宣称"安装中"
+        _vnstat_bg_install()
+        hint = "" if tried else "；vnstat 正在后台安装，装好后按 本月/今日 统计"
+        return (f"  📊 流量(开机以来): ↑{_fmt_traffic(tx)} ↓{_fmt_traffic(rx)}（{iface}{hint}）")
+    except Exception:
+        return ""
+
 def main_menu():
     while True:
         print("\n" + "=" * 60)
         print("  bgpeer 一键脚本  （sing-box + xray 多协议 / 订阅）")
         print("=" * 60)
+        t = traffic_line()
+        if t:
+            print(t)
+            print("-" * 60)
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
         print("  3. 聚合节点链接（多机汇总：把别的 VPS 节点并进来）")
