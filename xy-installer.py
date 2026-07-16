@@ -2724,6 +2724,7 @@ def main_menu():
         print("  13. 卸载")
         print("  0. 退出")
         print("-" * 60)
+        print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
         c = _ask("请选择: ").strip()
         if c == "0" or c == "":
             print("再见。"); return
