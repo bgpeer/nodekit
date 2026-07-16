@@ -2356,7 +2356,8 @@ def update_cores():
         print("sing-box 现版本:", v.splitlines()[0] if v else "?")
     if c in ("2", "3") and os.path.exists(XRAY_BIN):
         install_xray(); sh("systemctl restart xray", check=False)
-        print("xray 已更新")
+        v = sh(f"{XRAY_BIN} version", check=False)
+        print("xray 现版本:", v.splitlines()[0] if v else "?")
     setup_core_update_cron()                             # 顺手确保每月自动更新的 cron 在
     print("更新完成。")
 
