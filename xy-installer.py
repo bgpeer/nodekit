@@ -2344,7 +2344,14 @@ def update_cores_auto():
             print(f"{ts} {name} 更新失败:", e)
 
 def update_cores():
-    print("\n更新核心:  1. sing-box   2. xray   3. 两个   0. 返回")
+    print("\n当前版本:")
+    for name, binpath in (("sing-box", SB_BIN), ("xray", XRAY_BIN)):
+        if os.path.exists(binpath):
+            v = sh(f"{binpath} version", check=False)
+            print(f"  {name}: {v.splitlines()[0] if v else '版本读取失败'}")
+        else:
+            print(f"  {name}: 未安装")
+    print("更新核心:  1. sing-box   2. xray   3. 两个   0. 返回")
     print(f"  （每月自动更新已开启：{_core_update_schedule_str()}）")
     c = _ask("选择: ")
     if c == "0" or not c:
