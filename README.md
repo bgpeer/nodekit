@@ -65,7 +65,7 @@ sudo python3 /tmp/xy.py
   7. 小火箭配置
   8. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）
   9. BT/PT 下载屏蔽（防 VPS 被投诉封机）
-  10. 网络优化（BBR/QoS 内核调优，来自 vps-net 仓库）
+  10. 网络优化（BBR/QoS 内核调优）
   11. 更新脚本（不影响节点）
   12. 更新核心（sing-box / xray）
   13. 卸载
@@ -113,17 +113,17 @@ sudo python3 /tmp/xy.py
 
 ### 网络优化（菜单 10）
 
-一键调用 [vps-net](https://github.com/bgpeer/vps-net) 仓库的 `net-optimize-ultimate.sh`
-（BBR / QoS / 缓冲区等内核调优），不用再手动复制命令。三种模式：
+一键调用本仓库的 `net-optimize.py`（BBR / QoS / 缓冲区等内核调优，Python 重构版，
+所需依赖工具会自动安装），不用再手动复制命令。三种模式：
 
 1. **自适应智能算法+抢占带宽**（流量达 10MB/s 激活）——适合内存 <1G 的机器；
 2. **自适应智能算法+抢占带宽**（默认 20MB/s 激活，**阈值可自定义**）——适合内存 2G 左右的机器；
 3. **固定 cake 纯智能算法**（不切换）——适合高性能机器。
 
-> ❗ 优化前请先装 **VPS 适用工具**（菜单里选 `4`，即 vps-net 的 `setup-tools.sh`），
-> 否则网络优化可能安装不成功。优化脚本自带 SHA256 校验的自动更新，每次执行都是最新版。
+优化完（或任何时候）可选 `4` **网络优化状况**，一键检测当前优化状态（`net-optimize.py --check`）。
 
-优化完（或任何时候）可选 `5` **网络优化状况**，一键检测当前优化状态（`net-optimize-check.sh`）。
+> 优化脚本自带 SHA256 校验的自动更新（对照仓库里的 `SHA256SUMS`），每次执行都是最新版。
+> 也可单独运行：`python3 <(curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py)`
 
 ### 多路复用开关 smux（菜单 4）
 

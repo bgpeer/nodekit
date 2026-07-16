@@ -24,8 +24,9 @@
 #   4) 自动更新仅在默认完整优化模式触发（--boot/--daemon 不自更新，更安全）
 #
 # 用法：
-#   python3 <(curl -fsSL https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize.py)
+#   python3 <(curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py)
 #   或落盘后: python3 /usr/local/sbin/net-optimize.py
+#   （也可从 bgpeer 管理面板「10 网络优化」一键调用）
 # ==============================================================================
 
 import argparse
@@ -50,8 +51,8 @@ from datetime import datetime, timezone
 VERSION = "4.1.0"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
-REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/vps-net/main/net-optimize.py"
-REMOTE_SHA256SUMS_URL = "https://raw.githubusercontent.com/bgpeer/vps-net/main/SHA256SUMS"
+REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
+REMOTE_SHA256SUMS_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/SHA256SUMS"
 
 CONFIG_DIR = "/etc/net-optimize"
 CONFIG_FILE = f"{CONFIG_DIR}/config"
@@ -64,7 +65,7 @@ CONNTRACK_MODULES_CONF = "/etc/modules-load.d/conntrack.conf"
 BOOT_SERVICE = "net-optimize"
 ADAPTIVE_QOS_SERVICE = "net-optimize-adaptive-qos"
 NGINX_LOG = "/var/log/nginx-auto-upgrade.log"
-PYTHON_BIN = "/usr/bin/python3"
+PYTHON_BIN = shutil.which("python3") or "/usr/bin/python3"
 
 SYSCTL_KEYS = [
     "net.core.default_qdisc",
@@ -316,7 +317,7 @@ def ipt_count(cmd, pattern, table="mangle", chain="POSTROUTING"):
 
 
 def ipt_add(cmd, args, iface=None, table="mangle", chain="POSTROUTING"):
-    base = [cmd, "-t", table, "-A", chain]
+    base = [cmd, "-w", "2", "-t", table, "-A", chain]
     if iface and iface != "unknown":
         base += ["-o", iface]
     return run(base + args, timeout=5).returncode == 0
@@ -398,12 +399,26 @@ def strip_route_params(route):
 
 
 # === 自动更新（SHA256SUMS 校验，仅默认完整模式触发）===
+def _mirror_urls(url):
+    """raw.githubusercontent 常被限流(429)，补 jsDelivr 镜像兜底（raw 优先，最新鲜）。"""
+    urls = [url]
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)", url)
+    if m:
+        o, repo, br, path = m.groups()
+        urls.append(f"https://cdn.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+        urls.append(f"https://fastly.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+    return urls
+
+
 def fetch_url(url, timeout=10):
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.read()
-    except Exception:  # noqa
-        return None
+    for u in _mirror_urls(url):
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "net-optimize"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception:  # noqa
+            continue
+    return None
 
 
 def auto_update(argv):
@@ -413,7 +428,11 @@ def auto_update(argv):
     remote_hash = hashlib.sha256(data).hexdigest()
     local_hash = ""
     if os.path.isfile(SCRIPT_PATH):
-        local_hash = hashlib.sha256(read_text(SCRIPT_PATH).encode()).hexdigest()
+        try:
+            with open(SCRIPT_PATH, "rb") as f:
+                local_hash = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            pass
     if remote_hash == local_hash:
         return
 
@@ -430,7 +449,7 @@ def auto_update(argv):
         echo("⚠️ SHA256SUMS 中未找到脚本条目，跳过自动更新")
         return
     if remote_hash != expected:
-        echo("❌ 远程脚本 SHA256 校验失败！可能被篡改，拒绝更新")
+        echo("❌ 远程脚本 SHA256 校验失败（可能被篡改，或镜像缓存未同步），拒绝更新")
         echo(f"  期望: {expected}")
         echo(f"  实际: {remote_hash}")
         return
