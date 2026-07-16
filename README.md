@@ -121,6 +121,8 @@ sudo python3 /tmp/xy.py
 3. **固定 cake 纯智能算法**（不切换）——适合高性能机器。
 
 优化完（或任何时候）可选 `4` **网络优化状况**，一键检测当前优化状态（`net-optimize.py --check`）。
+不想优化了选 `5` **卸载网络优化**（`--reset`）：清除全部优化配置（服务/内核参数/防火墙标记/
+持久化规则），恢复系统默认，节点本身不受影响；建议卸载后重启一次。
 
 > 优化脚本自带 SHA256 校验的自动更新（对照仓库里的 `SHA256SUMS`），每次执行都是最新版。
 > 也可单独运行：`python3 <(curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py)`
