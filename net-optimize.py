@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v4.1.0 (Python 重构版)
+# 🚀 Net-Optimize-Ultimate v4.2.0 (Python 重构版)
 # 功能对齐 bash v3.8.0，所有功能 1:1 保留：
 #   自动更新(SHA256SUMS 校验) / 低内存临时 swap / dpkg 自愈 / ulimit /
 #   BBRv3→BBRv2→bbrplus→BBR 拥塞算法 / fq_pie 队列 / RAM 自适应缓冲区 /
@@ -13,6 +13,12 @@
 #   激进模式 / 游戏 QoS(cake diffserv4→prio+fq_codel) / 自适应 QoS 守护 /
 #   Nginx 官方源+Pin+月度自动升级 / 开机恢复(flock 幂等) /
 #   networkd-dispatcher DHCP 续约恢复 initcwnd / netfilter-persistent 兼容
+#
+# v4.2.0 新增：
+#   --reset=完整卸载(原 net-optimize-reset.sh 移植)：清服务/tc/iptables/sysctl/
+#   ulimit/conntrack/持久化/initcwnd/cron/脚本本体，恢复被禁用的冲突 sysctl 文件；
+#   并修老版 reset 的遗漏——同步剥掉 netfilter-persistent 保存的 mangle 段再
+#   save，否则重启后 TCPMSS/DSCP 会被它恢复回来（nat 端口跳跃不受影响）
 #
 # v4.0.0 重构变化（行为不变，结构变化）：
 #   1) 单文件多入口：默认=完整优化；--boot=开机恢复(原 net-optimize-apply)；
@@ -48,7 +54,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -2222,6 +2228,144 @@ def print_status():
     echo("")
 
 
+# === 完整卸载/重置（--reset，原 net-optimize-reset.sh 移植）===
+def _rm(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_reset():
+    echo("🧹 开始清除所有 Net-Optimize 配置...")
+    echo("=" * 60)
+
+    # [1] systemd 服务
+    echo("🔧 [1] 清理 systemd 服务...")
+    for svc in (f"{BOOT_SERVICE}.service", f"{ADAPTIVE_QOS_SERVICE}.service"):
+        run(["systemctl", "stop", svc], timeout=15)
+        run(["systemctl", "disable", svc], timeout=15)
+        _rm(f"/etc/systemd/system/{svc}")
+        echo(f"  ✅ 已移除 {svc}")
+    run(["systemctl", "daemon-reload"], timeout=30)
+
+    # [2] 网卡 tc qdisc
+    echo("🔧 [2] 重置网卡 tc qdisc...")
+    iface = detect_outbound_iface()
+    if iface and have_cmd("tc"):
+        run(["tc", "qdisc", "del", "dev", iface, "root"], timeout=5)
+        echo(f"  ✅ 已重置 {iface} qdisc（恢复内核默认）")
+    else:
+        echo("  ℹ️ 无法检测出口网卡，跳过 qdisc 重置")
+
+    # [3] iptables 规则（TCPMSS + DSCP + INVALID DROP，所有后端）
+    echo("🔧 [3] 清理 iptables 规则（TCPMSS + DSCP + INVALID DROP）...")
+    ipt_clear(V4_CMDS + V6_CMDS, r"TCPMSS|DSCP")
+    for cmd in V4_CMDS:
+        if not have_cmd(cmd):
+            continue
+        for chain in ("INPUT", "OUTPUT"):
+            run([cmd, "-w", "2", "-t", "filter", "-D", chain, "-m", "conntrack",
+                 "--ctstate", "INVALID", "-j", "DROP"], timeout=5)
+    echo("  ✅ 已清理所有后端的 TCPMSS/DSCP/INVALID DROP 规则")
+    # 同步剥掉 netfilter-persistent 保存文件里的 mangle 段并重新保存，
+    # 否则下次开机会把 TCPMSS/DSCP 又恢复回来（nat 表端口跳跃规则不受影响）
+    for pf in strip_persistent_mangle():
+        echo(f"  ✅ 已从 {pf} 移除 mangle 段")
+    if have_cmd("netfilter-persistent"):
+        run(["netfilter-persistent", "save"], timeout=60)
+
+    # [4] sysctl 配置（删除本脚本文件 + 恢复被禁用的冲突文件）
+    echo("🔧 [4] 清理 sysctl 配置...")
+    for f in (SYSCTL_AUTH_FILE, SYSCTL_OVERRIDE_FILE,
+              "/etc/sysctl.d/98-net-optimize-mptcp.conf"):
+        _rm(f)
+    echo("  ✅ 已删除 sysctl 配置文件")
+    for f in sorted(glob.glob("/etc/sysctl.d/*.disabled-by-net-optimize-*")):
+        orig = re.sub(r"\.disabled-by-net-optimize-.*$", "", f)
+        if not os.path.isfile(orig):
+            os.rename(f, orig)
+            echo(f"  ✅ 已恢复: {orig}")
+        else:
+            _rm(f)
+            echo(f"  🗑 已删除残留: {f}")
+    if os.path.isfile("/etc/sysctl.conf"):
+        content = read_text("/etc/sysctl.conf")
+        restored = content.replace("# net-optimize disabled: ", "")
+        if restored != content:
+            write_text("/etc/sysctl.conf", restored)
+            echo("  ✅ 已恢复 /etc/sysctl.conf 中被注释的行")
+    run(["sysctl", "--system"], timeout=60)
+    echo("  ✅ sysctl 已重新加载")
+
+    # [5] ulimit
+    echo("🔧 [5] 清理 ulimit 配置...")
+    _rm("/etc/security/limits.d/99-net-optimize.conf")
+    sysconf = read_text("/etc/systemd/system.conf")
+    restored = re.sub(r"^DefaultLimitNOFILE.*\n?", "", sysconf, flags=re.M)
+    if restored != sysconf:
+        write_text("/etc/systemd/system.conf", restored)
+    run(["systemctl", "daemon-reload"], timeout=30)
+    echo("  ✅ 已清理 ulimit 配置")
+
+    # [6] conntrack
+    echo("🔧 [6] 清理 conntrack 配置...")
+    _rm(CONNTRACK_MODULES_CONF)
+    _rm("/etc/modprobe.d/net-optimize-conntrack.conf")
+    echo("  ✅ 已删除 conntrack 开机加载 / hashsize 配置")
+
+    # [7] NIC offload / RPS/RFS / CPU 调频 / initcwnd 钩子持久化
+    echo("🔧 [7] 清理网卡/CPU 持久化配置...")
+    for f in ("/etc/udev/rules.d/99-net-optimize-offload.rules",
+              "/etc/tmpfiles.d/net-optimize-rps.conf",
+              "/etc/tmpfiles.d/net-optimize-cpufreq.conf",
+              "/etc/networkd-dispatcher/routable.d/50-initcwnd"):
+        _rm(f)
+    echo("  ✅ 已删除 offload/RPS/RFS/cpufreq/initcwnd-hook 持久化规则")
+
+    # [8] initcwnd 路由参数
+    echo("🔧 [8] 清理 initcwnd 路由参数...")
+    for fam, args in (("IPv4", ["ip", "-4"]), ("IPv6", ["ip", "-6"])):
+        gw = run(args + ["route", "show", "default"], timeout=5).stdout
+        line = gw.splitlines()[0] if gw.strip() else ""
+        if line and "initcwnd" in line:
+            parts = shlex.split(strip_route_params(line))
+            run(args + ["route", "change"] + parts, timeout=5)
+            echo(f"  ✅ 已清除 {fam} initcwnd")
+
+    # [9] Nginx 自动更新 cron（nginx 本体与源保留，不影响正在用的网站/证书）
+    echo("🔧 [9] 清理 Nginx 自动更新 cron...")
+    _rm(NGINX_CRON)
+    echo("  ✅ 已删除 Nginx 自动更新 cron")
+
+    # [10] 配置目录 + 脚本本体（含旧版 bash 遗留文件）
+    echo("🔧 [10] 删除脚本和配置...")
+    shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+    shutil.rmtree("/etc/net-optimize-backup", ignore_errors=True)
+    for f in (SCRIPT_PATH,
+              "/usr/local/sbin/net-optimize-ultimate.sh",
+              "/usr/local/sbin/net-optimize-apply",
+              "/usr/local/sbin/net-optimize-adaptive-qos",
+              "/usr/local/sbin/net-optimize-nginx-upgrade"):
+        _rm(f)
+    echo("  ✅ 已删除 /etc/net-optimize 与脚本本体（含旧版 bash 遗留）")
+
+    # [11] 临时 swap 残留（正常运行结束会自动清，异常中断可能留下）
+    swap_file = "/tmp/.net-optimize-swap"
+    if os.path.exists(swap_file):
+        run(["swapoff", swap_file], timeout=30)
+        _rm(swap_file)
+        echo("  ✅ 已清理临时 swap 残留")
+
+    echo("")
+    echo("=" * 60)
+    echo("🎉 所有 Net-Optimize 配置已清除，系统已恢复默认状态")
+    echo("📌 建议重启一次，让内核参数完全回到系统默认：reboot")
+    echo("📌 重启后可验证：sysctl net.ipv4.tcp_congestion_control / "
+         "iptables -t mangle -L -n -v")
+
+
 # === 主流程 ===
 def main_optimize(argv):
     require_root()
@@ -2941,6 +3085,9 @@ def main():
                    help="重新应用 initcwnd（由 networkd-dispatcher 钩子调用）")
     g.add_argument("--check", action="store_true",
                    help="完整状态检测（原 net-optimize-check.sh，带彩色判定）")
+    g.add_argument("--reset", action="store_true",
+                   help="卸载网络优化：清除全部优化配置，恢复系统默认"
+                        "（原 net-optimize-reset.sh）")
     g.add_argument("--status", action="store_true", help="仅打印优化状态报告")
     g.add_argument("--version", action="store_true", help="打印版本号")
     args, argv = parser.parse_known_args()
@@ -2961,6 +3108,9 @@ def main():
         cmd_reapply_initcwnd()
     elif args.check:
         cmd_check()
+    elif args.reset:
+        require_root()
+        cmd_reset()
     elif args.status:
         print_status()
     else:
