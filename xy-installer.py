@@ -2437,6 +2437,7 @@ def net_optimize_menu():
         print("  2 自适应智能算法+抢占带宽（默认 20MB/s 激活、阈值可调，适合内存 2G 左右机器）")
         print("  3 固定 cake 纯智能算法（不切换，适合高性能机器）")
         print("  4 网络优化状况（一键检测当前优化状态）")
+        print("  5 卸载网络优化（清除全部优化配置，恢复系统默认）")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
@@ -2452,6 +2453,11 @@ def net_optimize_menu():
             _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_cake"})
         elif c == "4":
             _run_net_optimize("--check")
+        elif c == "5":
+            ans = _ask("  确认卸载网络优化？优化写入的内核参数/服务/防火墙标记将全部清除，\n"
+                       "  节点本身不受影响（建议卸载后重启一次）。y 确认 / n 返回: ").strip().lower()
+            if ans in ("y", "yes"):
+                _run_net_optimize("--reset")
         elif c in ("0", ""):
             return
 
