@@ -2755,18 +2755,91 @@ def _vnstat_bg_install():
     except Exception:
         pass
 
+TRAFFIC_FILE = BGP_DIR + "/traffic.json"   # 流量套餐设置：重置日/配额/计费方式/校准
+
+def _traffic_cfg():
+    try: return json.load(open(TRAFFIC_FILE))
+    except Exception: return {}
+
+def _cycle_start(reset_day, today):
+    """机房账单周期的起点（重置日超出当月天数时取月末，如 31 号遇 2 月）。"""
+    import calendar, datetime
+    d = min(reset_day, calendar.monthrange(today.year, today.month)[1])
+    if today.day >= d:
+        return datetime.date(today.year, today.month, d)
+    y, m = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
+    return datetime.date(y, m, min(reset_day, calendar.monthrange(y, m)[1]))
+
+def _vnstat_cycle_usage(iface, start, mode):
+    """从 vnstat 日表累加账单周期用量（字节）。mode: sum=双向相加 / max=单向取大。"""
+    import datetime
+    sel = f"-i {iface} " if iface else ""
+    j = json.loads(sh(f"vnstat {sel}--json d 62", check=False))
+    rx = tx = 0
+    for e in j["interfaces"][0]["traffic"]["day"]:
+        dt = datetime.date(e["date"]["year"], e["date"]["month"], e["date"]["day"])
+        if dt >= start:
+            rx += e["rx"]; tx += e["tx"]
+    return (rx + tx) if mode == "sum" else max(rx, tx)
+
+def traffic_setup():
+    """设置流量套餐：机房重置日 / 月配额 / 计费方式 / 一次性校准到机房当前读数。"""
+    cfg = _traffic_cfg()
+    print("\n  按机房账单口径显示流量（都可回车跳过）：")
+    d = _ask(f"  每月流量重置日 1-31（回车={cfg.get('reset_day', 1)}）: ").strip()
+    try: reset_day = min(max(int(d), 1), 31) if d else int(cfg.get("reset_day", 1))
+    except ValueError: reset_day = int(cfg.get("reset_day", 1))
+    q = _ask(f"  月流量配额 GB（回车={cfg.get('quota_gb') or '不设，只显示用量'}）: ").strip()
+    try: quota = float(q) if q else cfg.get("quota_gb")
+    except ValueError: quota = cfg.get("quota_gb")
+    m = _ask(f"  计费方式 1 双向相加 / 2 单向取大（回车={'2' if cfg.get('mode') == 'max' else '1'}）: ").strip()
+    mode = "max" if m == "2" or (not m and cfg.get("mode") == "max") else "sum"
+    cfg.update({"reset_day": reset_day, "quota_gb": quota, "mode": mode})
+
+    # 校准：vnstat 只统计装机之后的量，本周期装机前的用量抄一次机房面板即可对齐；
+    # 差值只在本周期内生效，下个重置日起 vnstat 数据完整、自动归零。
+    c = _ask("  校准：机房面板当前显示的已用量 GB（回车不校准）: ").strip()
+    if c:
+        try:
+            import datetime
+            start = _cycle_start(reset_day, datetime.date.today())
+            now_used = _vnstat_cycle_usage(_main_iface(), start, mode)
+            cfg["calib_bytes"] = int(float(c) * 1024 ** 3) - now_used
+            cfg["calib_cycle"] = start.isoformat()
+            print("  ✓ 已校准到机房读数（下个重置日起自动改用本机完整统计）。")
+        except Exception:
+            print("  ✗ 校准失败（vnstat 可能还没就绪），套餐设置已保存，可稍后再校准。")
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump(cfg, open(TRAFFIC_FILE, "w"))
+    print("  ✓ 已保存。面板顶部将按「周期已用/配额 + 重置日」显示。")
+
 def traffic_line():
-    """主菜单顶部的流量一行字：优先 vnstat（本月/今日，跨重启准确），
-       没装则先显示内核计数（开机以来）并后台装 vnstat。任何失败返回 ''，不影响面板。"""
+    """主菜单顶部的流量行。设置过套餐（重置日/配额）→ 按机房账单周期显示；
+       否则 vnstat 本月/今日；vnstat 没装 → 内核计数兜底。失败返回 ''，不影响面板。"""
     try:
         iface = _main_iface()
+        if not iface:
+            return ""
+        cfg = _traffic_cfg()
+        if have("vnstat") and cfg.get("reset_day"):
+            import datetime
+            start = _cycle_start(int(cfg["reset_day"]), datetime.date.today())
+            used = _vnstat_cycle_usage(iface, start, cfg.get("mode", "sum"))
+            if cfg.get("calib_cycle") == start.isoformat():   # 校准只在本周期生效
+                used = max(used + int(cfg.get("calib_bytes", 0)), 0)
+            tag = "双向" if cfg.get("mode", "sum") == "sum" else "单向"
+            quota = cfg.get("quota_gb")
+            if quota:
+                left = max(quota * 1024 ** 3 - used, 0)
+                return (f"  📊 本周期已用: {_fmt_traffic(used)} / {quota:g} GB"
+                        f"（剩 {_fmt_traffic(left)}，每月 {cfg['reset_day']} 号重置，{tag}计）")
+            return (f"  📊 本周期已用: {_fmt_traffic(used)}"
+                    f"（每月 {cfg['reset_day']} 号重置，{tag}计，{iface}）")
         v = _vnstat_stats(iface)
         if v:
             mrx, mtx, drx, dtx = v
             return (f"  📊 本月流量: ↑{_fmt_traffic(mtx)} ↓{_fmt_traffic(mrx)}"
-                    f"   今日: ↑{_fmt_traffic(dtx)} ↓{_fmt_traffic(drx)}（{iface}）")
-        if not iface:
-            return ""
+                    f"   今日: ↑{_fmt_traffic(dtx)} ↓{_fmt_traffic(drx)}（输 t 按机房周期显示）")
         rx = int(open(f"/sys/class/net/{iface}/statistics/rx_bytes").read())
         tx = int(open(f"/sys/class/net/{iface}/statistics/tx_bytes").read())
         tried = os.path.exists(BGP_DIR + "/.vnstat_tried")   # 已试过装 → 不再重复宣称"安装中"
@@ -2817,6 +2890,7 @@ def main_menu():
         elif c == "11":  update_script()
         elif c == "12":  update_cores()
         elif c == "13":  uninstall_all()
+        elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
         _ask("\n按回车返回主菜单...")            # 停一下，别让菜单立刻盖住上面的输出
