@@ -3178,8 +3178,8 @@ def cdn_remove():
     for i, n in enumerate(nodes, 1):
         print(f"   {i}. {n['domain']}:{n['cf_port']} [{n['proto']}/{n['core']}]"
               f"{'（已写入订阅）' if n.get('in_sub') else ''}")
-    print("   a 全部")
-    sel = _ask("  选择(编号；可多选，逗号分隔如 1,3；a 全部；回车取消): ").strip().lower()
+    print("   all 全部")
+    sel = _ask("  选择(编号；可多选，逗号分隔如 1,3；all=全部；回车取消): ").strip().lower()
     if not sel:
         return
     if sel in ("a", "all", "0"):
