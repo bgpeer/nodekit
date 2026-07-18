@@ -2066,7 +2066,7 @@ def run(sb_names, xr_names):
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
     if sched:
-        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 12 手动立即更新。')
+        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 13 手动立即更新。')
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
 
 # ============================================================================ 管理面板 / 快捷命令
@@ -2397,7 +2397,8 @@ def uninstall_all():
     print("\n将卸载本脚本安装的：sing-box/xray/订阅服务、配置、证书、端口跳跃规则、bgpeer 命令。")
     if (_ask("确认卸载? [y/N]: ") or "n").lower() not in ("y", "yes"):
         print("已取消。"); return
-    for svc in ("sing-box", "xray", "xy-sub", CDN_SVC):
+    cdn_svcs = [n["svc"] for n in _cdn_load() if n.get("svc")]   # 全部 CDN 套用节点服务
+    for svc in ["sing-box", "xray", "xy-sub", CDN_SVC] + cdn_svcs:
         sh(f"systemctl disable --now {svc}", check=False)
         sh(f"rm -f /etc/systemd/system/{svc}.service", check=False)
     sh("systemctl daemon-reload", check=False)
@@ -2874,24 +2875,47 @@ def traffic_line():
     except Exception:
         return ""
 
-# ---------------------------------------------------------------------------- CDN 灾备节点（防 IP 被墙）
+# ---------------------------------------------------------------------------- CDN 套用（防 IP 被墙）
+# 支持多条：state 是节点列表，每条一套独立自签证书 + 配置 + systemd 服务（xy-cdn-<id>）。
 def _cdn_load():
-    try: return json.load(open(CDN_STATE))
-    except Exception: return {}
+    """返回 CDN 节点列表。兼容旧单节点 dict 格式（迁移为列表，服务名沿用旧 xy-cdn）。"""
+    try:
+        data = json.load(open(CDN_STATE))
+    except Exception:
+        return []
+    if isinstance(data, dict):                            # 旧格式：单节点 → 包成列表
+        data.setdefault("id", 1)
+        data.setdefault("svc", CDN_SVC)
+        data.setdefault("crt", CDN_CRT); data.setdefault("key", CDN_KEY)
+        data.setdefault("conf", CDN_CONF)
+        return [data]
+    return data
 
-def _cdn_selfsigned(domain):
+def _cdn_save(nodes):
+    os.makedirs(CDN_DIR, exist_ok=True)
+    json.dump(nodes, open(CDN_STATE, "w"), ensure_ascii=False)
+
+def _cdn_next_id(nodes):
+    return max([n.get("id", 0) for n in nodes], default=0) + 1
+
+def _cdn_node_paths(nid):
+    return (f"{CDN_DIR}/{nid}.crt", f"{CDN_DIR}/{nid}.key",
+            f"{CDN_DIR}/{nid}.json", f"xy-cdn-{nid}")
+
+def _cdn_selfsigned(domain, crt, key):
     """源站自签证书即可：CF 走 Full 模式不校验源站证书，客户端看到的是 CF 的有效证书。"""
     os.makedirs(CDN_DIR, exist_ok=True)
-    sh(f"openssl ecparam -genkey -name prime256v1 -out {CDN_KEY}")
-    sh(f'openssl req -new -x509 -days 3650 -key {CDN_KEY} -out {CDN_CRT} -subj "/CN={domain}"')
+    sh(f"openssl ecparam -genkey -name prime256v1 -out {key}")
+    sh(f'openssl req -new -x509 -days 3650 -key {key} -out {crt} -subj "/CN={domain}"')
 
-def _cdn_pick_port():
+def _cdn_pick_port(used):
+    """从 CF 可代理端口里挑一个未占用的；用尽（>5 条）返回 0。"""
     for p in CDN_PORTS:
-        if port_free(p):
+        if p not in used and port_free(p):
             return p
-    return CDN_PORTS[0]
+    return 0
 
-# CDN 可选协议 → (显示名, 能写进哪些订阅格式)。xhttp 只有 mihomo 认，sing-box/小火箭自动跳过。
+# CDN 可选协议 → 能写进哪些订阅格式。xhttp 只有 mihomo 认，sing-box/小火箭自动跳过。
 CDN_PROTOS = {"1": "vless-ws", "2": "vless-xhttp", "3": "vmess-ws", "4": "trojan-ws"}
 CDN_PROTO_SUB = {
     "vless-ws":    "mihomo / sing-box / 小火箭（全支持）",
@@ -2901,7 +2925,6 @@ CDN_PROTO_SUB = {
 }
 
 def _cdn_link(st):
-    # 向后兼容旧 state（只有 uuid、无 proto/cred 的老版本 CDN 节点）
     proto = st.get("proto", "vless-ws")
     cred = st.get("cred") or st.get("uuid", "")
     dom, port, path, tag = st["domain"], st["cf_port"], st["path"], st["tag"]
@@ -2918,26 +2941,26 @@ def _cdn_link(st):
     return (f"vless://{cred}@{dom}:{port}?encryption=none&security=tls&sni={dom}"
             f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
 
-def _cdn_checklist(st):
+def _cdn_checklist(nodes):
+    """Cloudflare 侧照做清单（多条时各自的域名都要配一遍，端口列出全部）。"""
     ip = public_ip()
-    print("\n  ── Cloudflare 侧设置（照做一次，脚本代替不了点鼠标）──")
-    print(f"  1. 把域名 {st['domain']} 加进 Cloudflare（免费版即可），改用 CF 的 DNS。")
-    print(f"  2. 加一条 A 记录：{st['domain']} → {ip}（本机 IP），")
-    print(f"     代理状态开【橙色云 Proxied】——必须橙云，灰云不生效。")
-    print(f"  3. SSL/TLS 加密模式选【Full 完全】（不要 Full strict，源站是自签证书）。")
-    print(f"  4. VPS 安全组/防火墙放行入站 TCP {st['cf_port']}（CF 从这个口回源到本机）。")
-    print(f"  客户端连的是 CF 的 IP（{st['domain']}:{st['cf_port']}），本机真 IP 不暴露；")
-    print(f"  哪天真 IP 被墙，这条 CDN 节点仍可用。")
+    ports = "/".join(str(n["cf_port"]) for n in nodes)
+    print("\n  ── Cloudflare 侧设置（下面每个域名各照做一次，脚本代替不了点鼠标）──")
+    print("  1. 域名加进 Cloudflare（免费版即可），改用 CF 的 DNS。")
+    print(f"  2. 每个域名加 A 记录 → {ip}（本机 IP），代理开【橙色云 Proxied】（必须橙云，灰云不生效）。")
+    print("  3. SSL/TLS 加密模式选【Full 完全】（不要 Full strict，源站是自签证书）。")
+    print(f"  4. VPS 安全组/防火墙放行入站 TCP：{ports}（CF 从这些口回源到本机）。")
+    print("  客户端连的是 CF 的 IP，本机真 IP 不暴露；真 IP 被墙这些 CDN 节点仍可用。")
 
 def _state_prefix():
     """读安装时用的名称前缀（state.json），CDN 节点默认沿用它。"""
     try: return json.load(open(STATE_FILE)).get("prefix", "")
     except Exception: return ""
 
-def _cdn_config(proto, core, cred, path, port, domain):
+def _cdn_config(proto, core, cred, path, port, domain, crt, key):
     """按协议+核心生成 CDN 节点的 (config_dict, binpath)。cred=uuid(vless/vmess)或password(trojan)。"""
     if core == "xray":
-        xr_tls = {"certificates": [{"certificateFile": CDN_CRT, "keyFile": CDN_KEY}]}
+        xr_tls = {"certificates": [{"certificateFile": crt, "keyFile": key}]}
         if proto == "vless-xhttp":
             stream = {"network": "xhttp", "security": "tls",
                       "xhttpSettings": {"path": path}, "tlsSettings": xr_tls}
@@ -2958,7 +2981,7 @@ def _cdn_config(proto, core, cred, path, port, domain):
                  "outbounds": [{"protocol": "freedom"}]}, XRAY_BIN)
     # sing-box（不支持 xhttp 入站，xhttp 已在上层强制走 xray）
     sb_tls = {"enabled": True, "server_name": domain,
-              "certificate_path": CDN_CRT, "key_path": CDN_KEY}
+              "certificate_path": crt, "key_path": key}
     tr = {"type": "ws", "path": path}
     if proto.startswith("vless"):
         ib = {"type": "vless", "tag": "cdn-in", "listen": "::", "listen_port": port,
@@ -2972,30 +2995,31 @@ def _cdn_config(proto, core, cred, path, port, domain):
     return ({"log": {"level": "info"}, "inbounds": [ib],
              "outbounds": [{"type": "direct"}]}, SB_BIN)
 
-def cdn_setup():
+def cdn_add():
+    """新增一条 CDN 套用节点（可反复加多条，各自独立服务/证书/端口）。"""
     print("\n" + "=" * 60)
-    print("  CDN 灾备节点（域名 + Cloudflare 中转，防 IP 被墙时续命）")
+    print("  新增 CDN 套用节点（域名 + Cloudflare 中转，防 IP 被墙时续命）")
     print("=" * 60)
     print("  原理：客户端连 Cloudflare 的 IP、不是你 VPS 的 IP；VPS 真 IP 被墙也能用。")
     print("  前提：一个域名，且能挂到 Cloudflare（免费版就行）。")
     print("-" * 60)
+    nodes = _cdn_load()
+    used = {n["cf_port"] for n in nodes}
+    port = _cdn_pick_port(used)
+    if not port:
+        print("  CF 可代理端口已用尽（最多 5 条 CDN 节点）。先卸载一条再加。"); return
     domain = _ask("  输入用于 CDN 的域名（如 node.example.com，回车取消）: ").strip().lower()
     if not domain:
         print("  已取消。"); return
     if "." not in domain or "/" in domain or " " in domain:
         print("  域名格式不对，已取消。"); return
 
-    # 选协议（都能过 CF；写入订阅时按各格式支持度自动筛选，单条链接始终照常给）
     print("  选协议: 1 VLESS+WS(默认·最稳) / 2 VLESS+XHTTP(最快) / 3 VMess+WS / 4 Trojan+WS")
     proto = CDN_PROTOS.get(_ask("  选择(回车=1): ").strip(), "vless-ws")
-
-    # 选核心：xhttp 仅 xray 支持入站，强制 xray；其余两核心可选
     if proto == "vless-xhttp":
-        core = "xray"
-        print("  （XHTTP 入站仅 xray 支持，已自动用 xray）")
+        core = "xray"; print("  （XHTTP 入站仅 xray 支持，已自动用 xray）")
     else:
-        ans = _ask("  用哪个核心跑? 1 sing-box(默认) / 2 xray: ").strip()
-        core = "xray" if ans == "2" else "sing-box"
+        core = "xray" if _ask("  用哪个核心跑? 1 sing-box(默认) / 2 xray: ").strip() == "2" else "sing-box"
     binpath = XRAY_BIN if core == "xray" else SB_BIN
     installer = install_xray if core == "xray" else install_singbox
     if not os.path.exists(binpath):
@@ -3004,43 +3028,37 @@ def cdn_setup():
         except Exception as e:
             print(f"  ✗ {core} 下载失败：", e); return
 
-    # 名称前缀：默认沿用安装前缀；没有则可自定义；都没有则用 CDN·协议
     ipfx = _state_prefix()
     if ipfx:
-        p = _ask(f"  节点名称前缀（回车=沿用安装前缀「{ipfx}」，或输入自定义）: ").strip()
-        prefix = p or ipfx
+        prefix = _ask(f"  节点名称前缀（回车=沿用安装前缀「{ipfx}」，或输入自定义）: ").strip() or ipfx
     else:
         prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
     tag = f"{prefix}CDN·{proto}"
 
-    port = _cdn_pick_port()
-    _cdn_selfsigned(domain)
+    nid = _cdn_next_id(nodes)
+    crt, key, conf, svc = _cdn_node_paths(nid)
+    _cdn_selfsigned(domain, crt, key)
     cred = new_pw() if proto == "trojan-ws" else new_uuid()
     path = "/" + secrets.token_hex(4)
-    cfg_dict, binpath = _cdn_config(proto, core, cred, path, port, domain)
+    cfg_dict, binpath = _cdn_config(proto, core, cred, path, port, domain, crt, key)
     os.makedirs(CDN_DIR, exist_ok=True)
-    json.dump(cfg_dict, open(CDN_CONF, "w"), indent=2)
-    # 换核心重建：先拆掉旧 xy-cdn 单元（可能指向另一核心），避免 write_service 的“指向别的程序”拦截
-    old = _cdn_load()
-    sh(f"systemctl disable --now {CDN_SVC}", check=False)
-    sh(f"rm -f /etc/systemd/system/{CDN_SVC}.service", check=False)
+    json.dump(cfg_dict, open(conf, "w"), indent=2)
+    sh(f"systemctl disable --now {svc}", check=False)
+    sh(f"rm -f /etc/systemd/system/{svc}.service", check=False)
     sh("systemctl daemon-reload", check=False)
     try:
-        write_service(CDN_SVC, binpath, CDN_CONF)
+        write_service(svc, binpath, conf)
     except RuntimeError as e:
         print("  ✗ CDN 节点服务启动失败：", e); return
-    st = {"proto": proto, "core": core, "domain": domain, "cred": cred, "path": path,
-          "cf_port": port, "tag": tag, "in_sub": old.get("in_sub", False)}
-    json.dump(st, open(CDN_STATE, "w"))
-    print(f"\n  ✓ CDN 灾备节点已就绪（{proto} / {core}，本机监听 {port}，独立服务 {CDN_SVC}，与主节点互不影响）。")
+    node = {"id": nid, "proto": proto, "core": core, "domain": domain, "cred": cred,
+            "path": path, "cf_port": port, "tag": tag, "svc": svc,
+            "crt": crt, "key": key, "conf": conf, "in_sub": False}
+    nodes.append(node); _cdn_save(nodes)
+    print(f"\n  ✓ 新增成功（第 {len(nodes)} 条：{proto} / {core}，监听 {port}，服务 {svc}，与主节点及其它 CDN 节点互不影响）。")
     print(f"  可写入的订阅：{CDN_PROTO_SUB[proto]}")
-    # 若之前已写进订阅，重建后同步刷新（旧链接换成新链接）
-    if old.get("in_sub"):
-        _cdn_sub_apply(_cdn_link(old), _cdn_link(st))
-        print("  ↻ 已同步刷新订阅里的这条 CDN 节点（URL 不变）。")
-    _cdn_checklist(st)
-    print("\n  ▼ 备用节点链接（CF 配好后导入客户端；平时留着不用即可）:")
-    print("    " + _cdn_link(st))
+    _cdn_checklist([node])
+    print("\n  ▼ 本条备用链接（CF 配好后导入客户端；平时留着不用即可）:")
+    print("    " + _cdn_link(node))
 
 # --- 把 CDN 节点写入/移出订阅（改 /root/xy-nodes.txt 节点段 + 刷新三格式）---
 def _node_file_parts():
@@ -3057,17 +3075,16 @@ def _node_file_parts():
             links.append(l.strip())
     return links, tail
 
-def _cdn_sub_apply(old_link, new_link):
-    """从节点文件移除 old_link（含旧 uuid 的行），有 new_link 则加进去，然后刷新订阅。"""
+def _cdn_sub_apply(remove_links=(), add_links=()):
+    """从节点文件移除 remove_links、加入 add_links（全整条匹配，去重），再刷新订阅。
+       没有主节点也能生成——此时订阅仅含 CDN 节点。"""
     links, tail = _node_file_parts()
-    old_uuid = re.search(r"vless://([^@]+)@", old_link or "")
-    keep = []
-    for l in links:
-        if old_link and (l == old_link or (old_uuid and old_uuid.group(1) in l)):
-            continue
-        keep.append(l)
-    if new_link and new_link not in keep:
-        keep.append(new_link)
+    remove_set = set(l for l in remove_links if l)
+    keep = [l for l in links if l not in remove_set]
+    for al in add_links:
+        if al and al not in keep:
+            keep.append(al)
+    os.makedirs(os.path.dirname(NODE_FILE) or ".", exist_ok=True)
     with open(NODE_FILE, "w") as f:
         f.write("\n".join(keep) + ("\n" if keep else ""))
         if tail:
@@ -3076,77 +3093,112 @@ def _cdn_sub_apply(old_link, new_link):
     build_subscription(read_saved_links(), new_token=False)   # 保持 token，刷新三格式
 
 def cdn_write_sub():
-    st = _cdn_load()
-    if not st:
-        print("  还没配置 CDN 灾备节点，先选 1 生成。"); return
-    if not read_saved_links():
-        print("  本机还没有主节点（先『1.安装』），无法写入订阅。"); return
-    on = st.get("in_sub", False)
-    proto = st.get("proto", "vless-ws")
-    print(f"\n  节点写入订阅配置（当前：{'已写入 ✓' if on else '未写入'}）")
-    print(f"  本节点协议 {proto}，可写入：{CDN_PROTO_SUB[proto]}")
-    print("  写入后客户端拉一次订阅即见（不支持该协议的格式会自动跳过）；")
-    print("  移出则从订阅撤掉（备用链接始终在本菜单可查，不受影响）。")
-    ans = _ask(f"  {'移出订阅' if on else '写入订阅'}? y 确认 / n 返回: ").strip().lower()
+    nodes = _cdn_load()
+    if not nodes:
+        print("  还没配置 CDN 节点，先选 1 新增。"); return
+    total = len(nodes); already = sum(1 for n in nodes if n.get("in_sub"))
+    writing = already < total                            # 未全部写入 → 写入全部；否则移出全部
+    has_main = bool(read_saved_links() and
+                    any(l for l in read_saved_links() if not any(l == _cdn_link(n) for n in nodes)))
+    print(f"\n  全部 CDN 节点写入订阅（当前 {already}/{total} 条已写入）")
+    for n in nodes:
+        print(f"    · {n['domain']}:{n['cf_port']} [{n['proto']}] → {CDN_PROTO_SUB[n['proto']]}")
+    print("  写入后客户端拉一次订阅即见（不支持某协议的格式自动跳过）；单条备用链接不受影响。")
+    if writing and not has_main:
+        print("  注意：本机还没装主节点，订阅将只含这些 CDN 节点；且订阅地址走本机 IP，")
+        print("       若本机 IP 被墙则订阅地址也拉不到（节点本身经 CF 仍可用，改用单链接导入）。")
+    ans = _ask(f"  {'写入全部' if writing else '移出全部'}? y 确认 / n 返回: ").strip().lower()
     if ans not in ("y", "yes"):
         return
+    cdn_links = [_cdn_link(n) for n in nodes]
     try:
-        if on:
-            _cdn_sub_apply(_cdn_link(st), None)
-        else:
-            _cdn_sub_apply(None, _cdn_link(st))
+        _cdn_sub_apply(remove_links=cdn_links, add_links=(cdn_links if writing else []))
     except Exception as e:
         print("  ✗ 刷新订阅失败：", e); return
-    st["in_sub"] = not on
-    json.dump(st, open(CDN_STATE, "w"))
-    print(f"  ✓ 已{'移出' if on else '写入'}订阅并刷新三格式（URL 不变）。客户端重新拉订阅即可生效。")
+    for n in nodes:
+        n["in_sub"] = writing
+    _cdn_save(nodes)
+    print(f"  ✓ 已{'写入' if writing else '移出'}全部 CDN 节点并刷新三格式订阅。客户端重新拉订阅即可生效。")
+
+def _cdn_drop(node):
+    """停服务、删单元、删该条的证书/配置。"""
+    sh(f"systemctl disable --now {node['svc']}", check=False)
+    sh(f"rm -f /etc/systemd/system/{node['svc']}.service", check=False)
+    for p in (node.get("crt"), node.get("key"), node.get("conf")):
+        if p:
+            try: os.remove(p)
+            except OSError: pass
 
 def cdn_remove():
-    st = _cdn_load()
-    if not st:
-        print("  还没配置 CDN 灾备节点。"); return
-    if (_ask("  确认卸载 CDN 灾备节点? y 确认 / n 返回: ") or "n").lower() not in ("y", "yes"):
+    nodes = _cdn_load()
+    if not nodes:
+        print("  还没配置 CDN 节点。"); return
+    print("\n  卸载哪条 CDN 节点：")
+    for i, n in enumerate(nodes, 1):
+        print(f"   {i}. {n['domain']}:{n['cf_port']} [{n['proto']}/{n['core']}]"
+              f"{'（已写入订阅）' if n.get('in_sub') else ''}")
+    print("   a 全部")
+    sel = _ask("  选择(编号/a，回车取消): ").strip().lower()
+    if not sel:
         return
-    if st.get("in_sub"):                                  # 先从订阅撤掉，别留死节点
-        try: _cdn_sub_apply(_cdn_link(st), None)
+    if sel == "a":
+        targets = list(nodes)
+    else:
+        try: idx = int(sel)
+        except ValueError: print("  无效选择。"); return
+        if not (1 <= idx <= len(nodes)): print("  编号超范围。"); return
+        targets = [nodes[idx - 1]]
+    if (_ask(f"  确认卸载 {len(targets)} 条? y 确认 / n 返回: ") or "n").lower() not in ("y", "yes"):
+        return
+    # 已写入订阅的先从订阅撤掉，别留死节点
+    in_sub = [n for n in targets if n.get("in_sub")]
+    if in_sub:
+        try: _cdn_sub_apply(remove_links=[_cdn_link(n) for n in in_sub])
         except Exception: pass
-    sh(f"systemctl disable --now {CDN_SVC}", check=False)
-    sh(f"rm -f /etc/systemd/system/{CDN_SVC}.service", check=False)
+    for n in targets:
+        _cdn_drop(n)
     sh("systemctl daemon-reload", check=False)
-    shutil.rmtree(CDN_DIR, ignore_errors=True)
-    try: os.remove(CDN_STATE)
-    except OSError: pass
-    print("  ✓ 已卸载 CDN 灾备节点（Cloudflare 那边的 DNS 记录请自行删除）。")
+    remaining = [n for n in nodes if n not in targets]
+    if remaining:
+        _cdn_save(remaining)
+    else:
+        shutil.rmtree(CDN_DIR, ignore_errors=True)
+        try: os.remove(CDN_STATE)
+        except OSError: pass
+    print(f"  ✓ 已卸载 {len(targets)} 条 CDN 节点（Cloudflare 那边的 DNS 记录请自行删除）。")
 
 def cdn_menu():
     while True:
-        st = _cdn_load()
-        active = bool(st) and sh(f"systemctl is-active {CDN_SVC}", check=False) == "active"
+        nodes = _cdn_load()
         print("\n" + "=" * 60)
-        print("  CDN 灾备节点（防 IP 被墙：靠 Cloudflare 中转续命）")
+        print("  CDN 套用（防 IP 被墙：靠 Cloudflare 中转续命）")
         print("=" * 60)
-        if st:
-            insub = "已写入订阅" if st.get("in_sub") else "仅备用链接"
-            print(f"  当前: {st['domain']}:{st['cf_port']}"
-                  f"（{st.get('proto', 'vless-ws')} / {st.get('core', 'sing-box')}）"
-                  f"  服务: {'运行中 ✓' if active else '未运行 ✗'}  {insub}")
+        if nodes:
+            print(f"  已配置 {len(nodes)} 条：")
+            for i, n in enumerate(nodes, 1):
+                act = sh(f"systemctl is-active {n['svc']}", check=False) == "active"
+                insub = "已写入订阅" if n.get("in_sub") else "仅备用链接"
+                print(f"   {i}. {n['domain']}:{n['cf_port']}（{n.get('proto','vless-ws')}/"
+                      f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}")
         else:
-            print("  当前: 未配置（平时不用，建议先配好备着，被墙那天直接导入）")
+            print("  未配置（平时不用，建议先配好备着，被墙那天直接导入）")
         print("-" * 60)
-        print("  1 生成 / 重建 CDN 灾备节点")
-        print("  2 查看备用链接 + Cloudflare 设置清单")
-        print("  3 节点写入订阅配置（循环开关，执行后订阅自动刷新）")
-        print("  4 卸载 CDN 灾备节点")
+        print("  1 新增 CDN 节点（可加多条）")
+        print("  2 查看全部备用链接 + Cloudflare 设置清单")
+        print("  3 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
+        print("  4 卸载 CDN 节点（可选某条 / 全部）")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
-            cdn_setup()
+            cdn_add()
         elif c == "2":
-            if not st:
-                print("  还没配置，先选 1 生成。"); continue
-            _cdn_checklist(st)
-            print("\n  ▼ 备用节点链接:")
-            print("    " + _cdn_link(st))
+            if not nodes:
+                print("  还没配置，先选 1 新增。"); continue
+            print("\n  ▼ 全部 CDN 备用节点链接:")
+            for i, n in enumerate(nodes, 1):
+                print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
+                print(f"     {_cdn_link(n)}")
+            _cdn_checklist(nodes)
         elif c == "3":
             cdn_write_sub()
         elif c == "4":
@@ -3170,13 +3222,13 @@ def main_menu():
         print("  5. mihomo 配置")
         print("  6. sing-box 配置")
         print("  7. 小火箭配置")
-        print("  8. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）")
-        print("  9. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
-        print("  10. 网络优化（BBR/QoS 内核调优）")
-        print("  11. 更新脚本（不影响节点）")
-        print("  12. 更新核心（sing-box / xray）")
-        print("  13. 卸载")
-        print("  14. CDN 灾备节点（域名+Cloudflare 中转，防 IP 被墙 · 备用）")
+        print("  8. CDN套用（域名+Cloudflare 中转，防 IP 被墙 · 备用）")
+        print("  9. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）")
+        print("  10. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
+        print("  11. 网络优化（BBR/QoS 内核调优）")
+        print("  12. 更新脚本（不影响节点）")
+        print("  13. 更新核心（sing-box / xray）")
+        print("  14. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -3190,13 +3242,13 @@ def main_menu():
         elif c == "5":   config_menu("yaml")
         elif c == "6":   config_menu("json")
         elif c == "7":   config_menu("conf")
-        elif c == "8":   cn_block_menu()
-        elif c == "9":   bt_menu()
-        elif c == "10":  net_optimize_menu()
-        elif c == "11":  update_script()
-        elif c == "12":  update_cores()
-        elif c == "13":  uninstall_all()
-        elif c == "14":  cdn_menu()
+        elif c == "8":   cdn_menu()
+        elif c == "9":   cn_block_menu()
+        elif c == "10":  bt_menu()
+        elif c == "11":  net_optimize_menu()
+        elif c == "12":  update_script()
+        elif c == "13":  update_cores()
+        elif c == "14":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
