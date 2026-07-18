@@ -36,7 +36,7 @@
       "type": "tun",
       "interface_name": "singbox",
       "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
-      "mtu": 9000,
+      "mtu": 1500,
       "stack": "mixed",
       "auto_route": true,
       "strict_route": true,
