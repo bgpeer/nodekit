@@ -2941,20 +2941,12 @@ def _cdn_link(st):
     return (f"vless://{cred}@{dom}:{port}?encryption=none&security=tls&sni={dom}"
             f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
 
-def _cdn_checklist(nodes):
-    """Cloudflare 侧照做清单：按域名分组（同域名的多条只需配一次，端口合起来放行）。"""
-    ip = public_ip()
-    by_dom = {}
-    for n in nodes:                                       # 保序去重，同域名归并端口
-        by_dom.setdefault(n["domain"], []).append(str(n["cf_port"]))
-    all_ports = "、".join(str(n["cf_port"]) for n in nodes)
-    print("\n  ── Cloudflare 侧设置（每个域名照做一次，脚本代替不了点鼠标）──")
-    for dom, ports in by_dom.items():
-        print(f"  · 域名 {dom}：在 Cloudflare 加 A 记录 → {ip}，代理开【橙色云 Proxied】"
-              f"（必须橙云）；要放行的端口：{'、'.join(ports)}")
-    print("  · SSL/TLS 加密模式选【Full 完全】（不要 Full strict，源站是自签证书）。")
-    print(f"  · VPS 安全组/防火墙放行入站 TCP：{all_ports}（CF 从这些口回源到本机）。")
-    print("  客户端连的是 CF 的 IP，本机真 IP 不暴露；真 IP 被墙这些 CDN 节点仍可用。")
+def _cdn_intro():
+    """进 CDN 菜单顶部的简短说明（原理 + 执行前三步）。"""
+    print("  防 IP 被墙：域名套 Cloudflare 中转，客户端连的是 CF 的 IP，本机真 IP 被墙也能用。")
+    print("  执行前：① 域名解析绑到本机 IP、开【橙色云】代理（必须橙云）；"
+          "② VPS 放行端口 2053/2083/2087/2096/8443（商用 VPS 一般全开放）；"
+          "③ CF 的 SSL/TLS 模式选【Full 完全】。")
 
 def _state_prefix():
     """读安装时用的名称前缀（state.json），CDN 节点默认沿用它。"""
@@ -3100,12 +3092,11 @@ def cdn_add():
     if not created:
         print("  ✗ 没有成功新增的节点。"); return
     _cdn_save(nodes)
-    print(f"\n  ✓ 新增成功 {len(created)} 条（共 {len(nodes)} 条 CDN 节点，各自独立服务、与主节点互不影响）:")
-    for n in created:
-        print(f"    · {n['proto']} / {n['core']}  监听 {n['cf_port']}  服务 {n['svc']}"
-              f"  → 可写入订阅：{CDN_PROTO_SUB[n['proto']]}")
-    _cdn_checklist(created)
-    print("\n  ▼ 本次新增的备用链接（CF 配好后导入客户端；平时留着不用即可）:")
+    ports = "、".join(str(n["cf_port"]) for n in created)
+    print(f"\n  ✓ 新增成功 {len(created)} 条（共 {len(nodes)} 条，各自独立服务、与主节点互不影响）。")
+    print(f"  记得在 CF 把域名 {created[0]['domain']} 绑到本机 IP、开橙云，VPS 放行端口：{ports}")
+    print("  （详细步骤见本菜单顶部说明）。")
+    print("\n  ▼ 本次新增的备用链接（导入客户端用；平时留着不用即可）:")
     for i, n in enumerate(created, 1):
         print(f"  {i}. {_cdn_link(n)}")
 
@@ -3237,6 +3228,8 @@ def cdn_menu():
         print("\n" + "=" * 60)
         print("  CDN 套用（防 IP 被墙：靠 Cloudflare 中转续命）")
         print("=" * 60)
+        _cdn_intro()
+        print("-" * 60)
         if nodes:
             print(f"  已配置 {len(nodes)} 条：")
             for i, n in enumerate(nodes, 1):
@@ -3248,7 +3241,7 @@ def cdn_menu():
             print("  未配置（平时不用，建议先配好备着，被墙那天直接导入）")
         print("-" * 60)
         print("  1 新增 CDN 节点（可加多条）")
-        print("  2 查看全部备用链接 + Cloudflare 设置清单")
+        print("  2 查看全部备用链接")
         print("  3 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
         print("  4 卸载 CDN 节点（可选某条 / 全部）")
         print("  0 返回")
@@ -3258,11 +3251,10 @@ def cdn_menu():
         elif c == "2":
             if not nodes:
                 print("  还没配置，先选 1 新增。"); continue
-            print("\n  ▼ 全部 CDN 备用节点链接:")
+            print("\n  ▼ 全部 CDN 备用节点链接（导入客户端用；平时留着不用即可）:")
             for i, n in enumerate(nodes, 1):
                 print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
                 print(f"     {_cdn_link(n)}")
-            _cdn_checklist(nodes)
         elif c == "3":
             cdn_write_sub()
         elif c == "4":
