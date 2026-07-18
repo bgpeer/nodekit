@@ -2995,46 +2995,25 @@ def _cdn_config(proto, core, cred, path, port, domain, crt, key):
     return ({"log": {"level": "info"}, "inbounds": [ib],
              "outbounds": [{"type": "direct"}]}, SB_BIN)
 
-def cdn_add():
-    """新增一条 CDN 套用节点（可反复加多条，各自独立服务/证书/端口）。"""
-    print("\n" + "=" * 60)
-    print("  新增 CDN 套用节点（域名 + Cloudflare 中转，防 IP 被墙时续命）")
-    print("=" * 60)
-    print("  原理：客户端连 Cloudflare 的 IP、不是你 VPS 的 IP；VPS 真 IP 被墙也能用。")
-    print("  前提：一个域名，且能挂到 Cloudflare（免费版就行）。")
-    print("-" * 60)
-    nodes = _cdn_load()
-    used = {n["cf_port"] for n in nodes}
-    port = _cdn_pick_port(used)
+def _parse_cdn_protos(raw):
+    """协议多选解析：回车=vless-ws；0/all=全部 4 种；否则按逗号分隔编号取，去重保序。"""
+    raw = raw.strip().replace("，", ",")
+    if raw == "":
+        return ["vless-ws"]
+    if raw.lower() in ("0", "all", "a"):
+        return list(CDN_PROTOS.values())
+    out = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if tok in CDN_PROTOS and CDN_PROTOS[tok] not in out:
+            out.append(CDN_PROTOS[tok])
+    return out
+
+def _cdn_build_one(nodes, proto, core, domain, prefix):
+    """建一条 CDN 节点（独立证书/配置/服务/端口），成功返回 node、失败返回 None。"""
+    port = _cdn_pick_port({n["cf_port"] for n in nodes})
     if not port:
-        print("  CF 可代理端口已用尽（最多 5 条 CDN 节点）。先卸载一条再加。"); return
-    domain = _ask("  输入用于 CDN 的域名（如 node.example.com，回车取消）: ").strip().lower()
-    if not domain:
-        print("  已取消。"); return
-    if "." not in domain or "/" in domain or " " in domain:
-        print("  域名格式不对，已取消。"); return
-
-    print("  选协议: 1 VLESS+WS(默认·最稳) / 2 VLESS+XHTTP(最快) / 3 VMess+WS / 4 Trojan+WS")
-    proto = CDN_PROTOS.get(_ask("  选择(回车=1): ").strip(), "vless-ws")
-    if proto == "vless-xhttp":
-        core = "xray"; print("  （XHTTP 入站仅 xray 支持，已自动用 xray）")
-    else:
-        core = "xray" if _ask("  用哪个核心跑? 1 sing-box(默认) / 2 xray: ").strip() == "2" else "sing-box"
-    binpath = XRAY_BIN if core == "xray" else SB_BIN
-    installer = install_xray if core == "xray" else install_singbox
-    if not os.path.exists(binpath):
-        print(f"  正在下载 {core} 内核（CDN 备用节点用）...")
-        try: installer()
-        except Exception as e:
-            print(f"  ✗ {core} 下载失败：", e); return
-
-    ipfx = _state_prefix()
-    if ipfx:
-        prefix = _ask(f"  节点名称前缀（回车=沿用安装前缀「{ipfx}」，或输入自定义）: ").strip() or ipfx
-    else:
-        prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
-    tag = f"{prefix}CDN·{proto}"
-
+        return None
     nid = _cdn_next_id(nodes)
     crt, key, conf, svc = _cdn_node_paths(nid)
     _cdn_selfsigned(domain, crt, key)
@@ -3049,16 +3028,78 @@ def cdn_add():
     try:
         write_service(svc, binpath, conf)
     except RuntimeError as e:
-        print("  ✗ CDN 节点服务启动失败：", e); return
+        print(f"  ✗ {proto} 服务启动失败（跳过）：", e); return None
     node = {"id": nid, "proto": proto, "core": core, "domain": domain, "cred": cred,
-            "path": path, "cf_port": port, "tag": tag, "svc": svc,
+            "path": path, "cf_port": port, "tag": f"{prefix}CDN·{proto}", "svc": svc,
             "crt": crt, "key": key, "conf": conf, "in_sub": False}
-    nodes.append(node); _cdn_save(nodes)
-    print(f"\n  ✓ 新增成功（第 {len(nodes)} 条：{proto} / {core}，监听 {port}，服务 {svc}，与主节点及其它 CDN 节点互不影响）。")
-    print(f"  可写入的订阅：{CDN_PROTO_SUB[proto]}")
-    _cdn_checklist([node])
-    print("\n  ▼ 本条备用链接（CF 配好后导入客户端；平时留着不用即可）:")
-    print("    " + _cdn_link(node))
+    nodes.append(node)                                    # 立即并入，供下一条挑端口/id 避重
+    return node
+
+def cdn_add():
+    """新增 CDN 套用节点：协议可多选，一次装多条（各自独立服务/证书/端口，共用同一域名）。"""
+    print("\n" + "=" * 60)
+    print("  新增 CDN 套用节点（域名 + Cloudflare 中转，防 IP 被墙时续命）")
+    print("=" * 60)
+    print("  原理：客户端连 Cloudflare 的 IP、不是你 VPS 的 IP；VPS 真 IP 被墙也能用。")
+    print("  前提：一个域名，且能挂到 Cloudflare（免费版就行）。")
+    print("-" * 60)
+    nodes = _cdn_load()
+    free = len(CDN_PORTS) - len(nodes)
+    if free <= 0:
+        print("  CF 可代理端口已用尽（最多 5 条 CDN 节点）。先卸载一条再加。"); return
+    domain = _ask("  输入用于 CDN 的域名（如 node.example.com，回车取消）: ").strip().lower()
+    if not domain:
+        print("  已取消。"); return
+    if "." not in domain or "/" in domain or " " in domain:
+        print("  域名格式不对，已取消。"); return
+
+    print("  选协议: 1 VLESS+WS(默认·最稳) / 2 VLESS+XHTTP(最快) / 3 VMess+WS / 4 Trojan+WS")
+    protos = _parse_cdn_protos(_ask("  选择(回车=1；可多选，逗号分隔如 1,3,4；all=全部): "))
+    if not protos:
+        print("  没选到有效协议，已取消。"); return
+    if len(protos) > free:
+        print(f"  当前只剩 {free} 个可用端口，只装前 {free} 个：{protos[:free]}")
+        protos = protos[:free]
+
+    # 核心：只对非 xhttp 的协议问一次（xhttp 强制 xray）；多选里混了 xhttp 会自动分别用对的核心
+    core_choice = "sing-box"
+    if any(p != "vless-xhttp" for p in protos):
+        core_choice = "xray" if _ask("  非 XHTTP 的用哪个核心? 1 sing-box(默认) / 2 xray: ").strip() == "2" else "sing-box"
+    if "vless-xhttp" in protos:
+        print("  （XHTTP 入站仅 xray 支持，那条自动用 xray）")
+
+    ipfx = _state_prefix()
+    if ipfx:
+        prefix = _ask(f"  节点名称前缀（回车=沿用安装前缀「{ipfx}」，或输入自定义）: ").strip() or ipfx
+    else:
+        prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
+
+    # 需要的核心先各下载一次（避免循环里重复打印下载）
+    for cr in {("xray" if p == "vless-xhttp" else core_choice) for p in protos}:
+        binp = XRAY_BIN if cr == "xray" else SB_BIN
+        if not os.path.exists(binp):
+            print(f"  正在下载 {cr} 内核（CDN 备用节点用）...")
+            try: (install_xray if cr == "xray" else install_singbox)()
+            except Exception as e:
+                print(f"  ✗ {cr} 下载失败：", e); return
+
+    created = []
+    for proto in protos:
+        core = "xray" if proto == "vless-xhttp" else core_choice
+        node = _cdn_build_one(nodes, proto, core, domain, prefix)
+        if node:
+            created.append(node)
+    if not created:
+        print("  ✗ 没有成功新增的节点。"); return
+    _cdn_save(nodes)
+    print(f"\n  ✓ 新增成功 {len(created)} 条（共 {len(nodes)} 条 CDN 节点，各自独立服务、与主节点互不影响）:")
+    for n in created:
+        print(f"    · {n['proto']} / {n['core']}  监听 {n['cf_port']}  服务 {n['svc']}"
+              f"  → 可写入订阅：{CDN_PROTO_SUB[n['proto']]}")
+    _cdn_checklist(created)
+    print("\n  ▼ 本次新增的备用链接（CF 配好后导入客户端；平时留着不用即可）:")
+    for i, n in enumerate(created, 1):
+        print(f"  {i}. {_cdn_link(n)}")
 
 # --- 把 CDN 节点写入/移出订阅（改 /root/xy-nodes.txt 节点段 + 刷新三格式）---
 def _node_file_parts():
