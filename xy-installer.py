@@ -3035,15 +3035,37 @@ def _cdn_build_one(nodes, proto, core, domain, prefix):
     nodes.append(node)                                    # 立即并入，供下一条挑端口/id 避重
     return node
 
+def _cdn_wipe_all(nodes):
+    """清空全部 CDN 节点（先撤订阅、停服务删单元、清目录/状态）。"""
+    for n in nodes:
+        if n.get("in_sub"):
+            try: _cdn_sub_apply(remove_links=[_cdn_link(n)])
+            except Exception: pass
+        _cdn_drop(n)
+    sh("systemctl daemon-reload", check=False)
+    shutil.rmtree(CDN_DIR, ignore_errors=True)
+    try: os.remove(CDN_STATE)
+    except OSError: pass
+
 def cdn_add():
-    """新增 CDN 套用节点：协议可多选，一次装多条（各自独立服务/证书/端口，共用同一域名）。"""
+    """CDN 节点安装：协议可多选、一次装多条；已装则问清空重装 / 追加 / 返回。"""
     print("\n" + "=" * 60)
-    print("  新增 CDN 套用节点（域名 + Cloudflare 中转，防 IP 被墙时续命）")
+    print("  CDN 节点安装（域名 + Cloudflare 中转，防 IP 被墙时续命）")
     print("=" * 60)
     print("  原理：客户端连 Cloudflare 的 IP、不是你 VPS 的 IP；VPS 真 IP 被墙也能用。")
     print("  前提：一个域名，且能挂到 Cloudflare（免费版就行）。")
     print("-" * 60)
     nodes = _cdn_load()
+    if nodes:                                             # 已安装 → 问怎么处理
+        print(f"  检测到已安装 {len(nodes)} 条 CDN 节点。")
+        ans = _ask("  y 清空重装（先删现有再装新的）/ a 追加新增 / 回车返回: ").strip().lower()
+        if ans in ("y", "yes"):
+            _cdn_wipe_all(nodes); nodes = []
+            print("  ✓ 已清空旧 CDN 节点，开始全新安装。")
+        elif ans in ("a", "add"):
+            pass                                          # 追加，保留现有
+        else:
+            print("  已返回。"); return
     free = len(CDN_PORTS) - len(nodes)
     if free <= 0:
         print("  CF 可代理端口已用尽（最多 5 条 CDN 节点）。先卸载一条再加。"); return
@@ -3230,17 +3252,7 @@ def cdn_menu():
         print("=" * 60)
         _cdn_intro()
         print("-" * 60)
-        if nodes:
-            print(f"  已配置 {len(nodes)} 条：")
-            for i, n in enumerate(nodes, 1):
-                act = sh(f"systemctl is-active {n['svc']}", check=False) == "active"
-                insub = "已写入订阅" if n.get("in_sub") else "仅备用链接"
-                print(f"   {i}. {n['domain']}:{n['cf_port']}（{n.get('proto','vless-ws')}/"
-                      f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}")
-        else:
-            print("  未配置（平时不用，建议先配好备着，被墙那天直接导入）")
-        print("-" * 60)
-        print("  1 新增 CDN 节点（可加多条）")
+        print(f"  1 CDN节点安装{('（已配置 %d 条）' % len(nodes)) if nodes else ''}")
         print("  2 查看全部备用链接")
         print("  3 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
         print("  4 卸载 CDN 节点（可选某条 / 全部）")
@@ -3250,7 +3262,14 @@ def cdn_menu():
             cdn_add()
         elif c == "2":
             if not nodes:
-                print("  还没配置，先选 1 新增。"); continue
+                print("  还没配置，先选 1 CDN节点安装。"); continue
+            # 上方：已配置节点列表；下方：全部备用链接
+            print("\n  已配置 %d 条：" % len(nodes))
+            for i, n in enumerate(nodes, 1):
+                act = sh(f"systemctl is-active {n['svc']}", check=False) == "active"
+                insub = "已写入订阅" if n.get("in_sub") else "仅备用链接"
+                print(f"   {i}. {n['domain']}:{n['cf_port']}（{n.get('proto','vless-ws')}/"
+                      f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}")
             print("\n  ▼ 全部 CDN 备用节点链接（导入客户端用；平时留着不用即可）:")
             for i, n in enumerate(nodes, 1):
                 print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
