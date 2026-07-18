@@ -2942,14 +2942,18 @@ def _cdn_link(st):
             f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
 
 def _cdn_checklist(nodes):
-    """Cloudflare 侧照做清单（多条时各自的域名都要配一遍，端口列出全部）。"""
+    """Cloudflare 侧照做清单：按域名分组（同域名的多条只需配一次，端口合起来放行）。"""
     ip = public_ip()
-    ports = "/".join(str(n["cf_port"]) for n in nodes)
-    print("\n  ── Cloudflare 侧设置（下面每个域名各照做一次，脚本代替不了点鼠标）──")
-    print("  1. 域名加进 Cloudflare（免费版即可），改用 CF 的 DNS。")
-    print(f"  2. 每个域名加 A 记录 → {ip}（本机 IP），代理开【橙色云 Proxied】（必须橙云，灰云不生效）。")
-    print("  3. SSL/TLS 加密模式选【Full 完全】（不要 Full strict，源站是自签证书）。")
-    print(f"  4. VPS 安全组/防火墙放行入站 TCP：{ports}（CF 从这些口回源到本机）。")
+    by_dom = {}
+    for n in nodes:                                       # 保序去重，同域名归并端口
+        by_dom.setdefault(n["domain"], []).append(str(n["cf_port"]))
+    all_ports = "、".join(str(n["cf_port"]) for n in nodes)
+    print("\n  ── Cloudflare 侧设置（每个域名照做一次，脚本代替不了点鼠标）──")
+    for dom, ports in by_dom.items():
+        print(f"  · 域名 {dom}：在 Cloudflare 加 A 记录 → {ip}，代理开【橙色云 Proxied】"
+              f"（必须橙云）；要放行的端口：{'、'.join(ports)}")
+    print("  · SSL/TLS 加密模式选【Full 完全】（不要 Full strict，源站是自签证书）。")
+    print(f"  · VPS 安全组/防火墙放行入站 TCP：{all_ports}（CF 从这些口回源到本机）。")
     print("  客户端连的是 CF 的 IP，本机真 IP 不暴露；真 IP 被墙这些 CDN 节点仍可用。")
 
 def _state_prefix():
@@ -3028,7 +3032,11 @@ def _cdn_build_one(nodes, proto, core, domain, prefix):
     try:
         write_service(svc, binpath, conf)
     except RuntimeError as e:
-        print(f"  ✗ {proto} 服务启动失败（跳过）：", e); return None
+        print(f"  ✗ {proto} 服务启动失败（跳过）：", e)
+        for p in (crt, key, conf):                        # 起不来就把这条的残留文件清掉
+            try: os.remove(p)
+            except OSError: pass
+        return None
     node = {"id": nid, "proto": proto, "core": core, "domain": domain, "cred": cred,
             "path": path, "cf_port": port, "tag": f"{prefix}CDN·{proto}", "svc": svc,
             "crt": crt, "key": key, "conf": conf, "in_sub": False}
@@ -3160,6 +3168,9 @@ def cdn_write_sub():
         n["in_sub"] = writing
     _cdn_save(nodes)
     print(f"  ✓ 已{'写入' if writing else '移出'}全部 CDN 节点并刷新三格式订阅。客户端重新拉订阅即可生效。")
+    if not writing and not read_saved_links():
+        # 移出后订阅里一个节点都不剩：build_subscription 对空列表不再刷新，托管的旧订阅内容不会自动清空
+        print("  ℹ️ 订阅里已无任何节点，之前托管的订阅内容不会再更新；如需彻底清空可到菜单 2「节点/订阅」重置。")
 
 def _cdn_drop(node):
     """停服务、删单元、删该条的证书/配置。"""
