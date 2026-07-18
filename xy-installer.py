@@ -3054,7 +3054,7 @@ def cdn_add():
         print("  域名格式不对，已取消。"); return
 
     print("  选协议: 1 VLESS+WS(默认·最稳) / 2 VLESS+XHTTP(最快) / 3 VMess+WS / 4 Trojan+WS")
-    protos = _parse_cdn_protos(_ask("  选择(回车=1；可多选，逗号分隔如 1,3,4；all=全部): "))
+    protos = _parse_cdn_protos(_ask("  选择(回车=1；可多选，逗号分隔如 1,3,4；a=全部): "))
     if not protos:
         print("  没选到有效协议，已取消。"); return
     if len(protos) > free:
@@ -3178,8 +3178,8 @@ def cdn_remove():
     for i, n in enumerate(nodes, 1):
         print(f"   {i}. {n['domain']}:{n['cf_port']} [{n['proto']}/{n['core']}]"
               f"{'（已写入订阅）' if n.get('in_sub') else ''}")
-    print("   all 全部")
-    sel = _ask("  选择(编号；可多选，逗号分隔如 1,3；all=全部；回车取消): ").strip().lower()
+    print("   a 全部")
+    sel = _ask("  选择(编号；可多选，逗号分隔如 1,3；a=全部；回车取消): ").strip().lower()
     if not sel:
         return
     if sel in ("a", "all", "0"):
