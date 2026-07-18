@@ -3179,16 +3179,28 @@ def cdn_remove():
         print(f"   {i}. {n['domain']}:{n['cf_port']} [{n['proto']}/{n['core']}]"
               f"{'（已写入订阅）' if n.get('in_sub') else ''}")
     print("   a 全部")
-    sel = _ask("  选择(编号/a，回车取消): ").strip().lower()
+    sel = _ask("  选择(编号；可多选，逗号分隔如 1,3；a 全部；回车取消): ").strip().lower()
     if not sel:
         return
-    if sel == "a":
+    if sel in ("a", "all", "0"):
         targets = list(nodes)
     else:
-        try: idx = int(sel)
-        except ValueError: print("  无效选择。"); return
-        if not (1 <= idx <= len(nodes)): print("  编号超范围。"); return
-        targets = [nodes[idx - 1]]
+        idxs, bad = [], False
+        for tok in sel.replace("，", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try: i = int(tok)
+            except ValueError: bad = True; continue
+            if 1 <= i <= len(nodes):
+                if i not in idxs: idxs.append(i)
+            else:
+                bad = True
+        if bad:
+            print("  含无效/超范围编号，已忽略这些。" if idxs else "  无效选择。")
+        if not idxs:
+            return
+        targets = [nodes[i - 1] for i in idxs]
     if (_ask(f"  确认卸载 {len(targets)} 条? y 确认 / n 返回: ") or "n").lower() not in ("y", "yes"):
         return
     # 已写入订阅的先从订阅撤掉，别留死节点
