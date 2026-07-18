@@ -1148,6 +1148,9 @@ def link_to_proxy(u):
         if qs.get("sni"): d["sni"] = qs["sni"]
         if insec: d["skip-cert-verify"] = "true"
         d["client-fingerprint"] = qs.get("fp", "chrome")
+        if qs.get("type") == "ws":                    # trojan+ws（CDN 套 Cloudflare 用）
+            d["network"] = "ws"
+            d["ws-opts"] = {"path": qs.get("path", "/"), "headers": {"Host": qs.get("host", host)}}
         return d
     if sch == "vmess":
         b = u[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
@@ -1347,10 +1350,14 @@ def mihomo_to_sb_outbound(key, d):
         if d.get("smux"): ob["multiplex"] = dict(_SB_MUX)
         return ob
     if t == "trojan":
-        return {"tag": tag, "type": "trojan", "server": srv, "server_port": int(d["port"]),
-                "password": d["password"],
-                "tls": {"enabled": True, "server_name": sni, "insecure": insec,
-                        "alpn": ["http/1.1"], "utls": utls}}
+        ob = {"tag": tag, "type": "trojan", "server": srv, "server_port": int(d["port"]),
+              "password": d["password"],
+              "tls": {"enabled": True, "server_name": sni, "insecure": insec,
+                      "alpn": ["http/1.1"], "utls": utls}}
+        if d.get("network") == "ws":                  # trojan+ws（CDN）：补 ws 传输
+            ob["transport"] = {"type": "ws", "path": d["ws-opts"].get("path", "/"),
+                               "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}
+        return ob
     if t == "hysteria2":
         ob = {"tag": tag, "type": "hysteria2", "server": srv, "password": d["password"],
               "tls": {"enabled": True, "server_name": sni, "insecure": insec, "alpn": ["h3"]}}
@@ -1524,6 +1531,8 @@ def shadowrocket_line(name, d):
     t = d.get("type"); srv = d["server"]; port = d.get("port")
     sni = d.get("servername") or d.get("sni") or srv
     scv = "1" if d.get("skip-cert-verify") else "0"
+    if d.get("network") == "xhttp":
+        return None                                   # 小火箭不支持 xhttp → 跳过（不写进小火箭订阅，单链接仍在）
     if t == "vless":
         p = [f"{name} = vless", srv, str(port), f"username={d['uuid']}", "tls=1", f"sni={sni}",
              f"skip-cert-verify={scv}", "tfo=1"]
@@ -1544,8 +1553,12 @@ def shadowrocket_line(name, d):
              f"obfs-host={d.get('ws-opts',{}).get('headers',{}).get('Host',sni)}"]
         return ",".join(p)
     if t == "trojan":
-        return ",".join([f"{name} = trojan", srv, str(port), f"password={d['password']}",
-                         "tls=1", f"sni={sni}", f"skip-cert-verify={scv}", "tfo=1"])
+        p = [f"{name} = trojan", srv, str(port), f"password={d['password']}",
+             "tls=1", f"sni={sni}", f"skip-cert-verify={scv}", "tfo=1"]
+        if d.get("network") == "ws":                  # trojan+ws（CDN）
+            p += ["obfs=websocket", f"obfs-uri={d.get('ws-opts',{}).get('path','/')}",
+                  f"obfs-host={d.get('ws-opts',{}).get('headers',{}).get('Host',sni)}"]
+        return ",".join(p)
     if t == "hysteria2":
         pt = port or (d["ports"].split("-")[0] if d.get("ports") else "")   # 跳跃时用起点端口
         p = [f"{name} = hysteria2", srv, str(pt), f"password={d['password']}", f"sni={sni}",
@@ -2878,10 +2891,32 @@ def _cdn_pick_port():
             return p
     return CDN_PORTS[0]
 
+# CDN 可选协议 → (显示名, 能写进哪些订阅格式)。xhttp 只有 mihomo 认，sing-box/小火箭自动跳过。
+CDN_PROTOS = {"1": "vless-ws", "2": "vless-xhttp", "3": "vmess-ws", "4": "trojan-ws"}
+CDN_PROTO_SUB = {
+    "vless-ws":    "mihomo / sing-box / 小火箭（全支持）",
+    "vmess-ws":    "mihomo / sing-box / 小火箭（全支持）",
+    "trojan-ws":   "mihomo / sing-box / 小火箭（全支持）",
+    "vless-xhttp": "仅 mihomo（sing-box/小火箭不支持 xhttp，写入时自动跳过）",
+}
+
 def _cdn_link(st):
-    return (f"vless://{st['uuid']}@{st['domain']}:{st['cf_port']}?encryption=none"
-            f"&security=tls&sni={st['domain']}&type=ws&host={st['domain']}"
-            f"&path={st['path']}&fp=chrome#{st['tag']}")
+    # 向后兼容旧 state（只有 uuid、无 proto/cred 的老版本 CDN 节点）
+    proto = st.get("proto", "vless-ws")
+    cred = st.get("cred") or st.get("uuid", "")
+    dom, port, path, tag = st["domain"], st["cf_port"], st["path"], st["tag"]
+    if proto == "vless-xhttp":
+        return (f"vless://{cred}@{dom}:{port}?encryption=none&security=tls&sni={dom}"
+                f"&host={dom}&type=xhttp&path={path}&fp=chrome#{tag}")
+    if proto == "vmess-ws":
+        return vmess_link({"v": "2", "ps": tag, "add": dom, "port": str(port), "id": cred,
+                           "aid": "0", "net": "ws", "type": "none", "host": dom,
+                           "path": path, "tls": "tls", "sni": dom})
+    if proto == "trojan-ws":
+        return (f"trojan://{cred}@{dom}:{port}?security=tls&sni={dom}"
+                f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
+    return (f"vless://{cred}@{dom}:{port}?encryption=none&security=tls&sni={dom}"
+            f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
 
 def _cdn_checklist(st):
     ip = public_ip()
@@ -2899,22 +2934,41 @@ def _state_prefix():
     try: return json.load(open(STATE_FILE)).get("prefix", "")
     except Exception: return ""
 
-def _cdn_config(core, uid, path, port, domain):
-    """按核心生成 CDN 节点的 (config_dict, binpath)。两核心都是 VLESS+WS+TLS。"""
+def _cdn_config(proto, core, cred, path, port, domain):
+    """按协议+核心生成 CDN 节点的 (config_dict, binpath)。cred=uuid(vless/vmess)或password(trojan)。"""
     if core == "xray":
-        ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": "cdn-in",
-              "settings": {"clients": [{"id": uid}], "decryption": "none"},
-              "streamSettings": {"network": "ws", "security": "tls",
-                                 "wsSettings": {"path": path},
-                                 "tlsSettings": {"certificates":
-                                     [{"certificateFile": CDN_CRT, "keyFile": CDN_KEY}]}}}
+        xr_tls = {"certificates": [{"certificateFile": CDN_CRT, "keyFile": CDN_KEY}]}
+        if proto == "vless-xhttp":
+            stream = {"network": "xhttp", "security": "tls",
+                      "xhttpSettings": {"path": path}, "tlsSettings": xr_tls}
+        else:
+            stream = {"network": "ws", "security": "tls",
+                      "wsSettings": {"path": path}, "tlsSettings": xr_tls}
+        if proto.startswith("vless"):
+            ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": "cdn-in",
+                  "settings": {"clients": [{"id": cred}], "decryption": "none"},
+                  "streamSettings": stream}
+        elif proto == "vmess-ws":
+            ib = {"listen": "0.0.0.0", "port": port, "protocol": "vmess", "tag": "cdn-in",
+                  "settings": {"clients": [{"id": cred}]}, "streamSettings": stream}
+        else:  # trojan-ws
+            ib = {"listen": "0.0.0.0", "port": port, "protocol": "trojan", "tag": "cdn-in",
+                  "settings": {"clients": [{"password": cred}]}, "streamSettings": stream}
         return ({"log": {"loglevel": "warning"}, "inbounds": [ib],
                  "outbounds": [{"protocol": "freedom"}]}, XRAY_BIN)
-    ib = {"type": "vless", "tag": "cdn-in", "listen": "::", "listen_port": port,
-          "users": [{"uuid": uid}],
-          "tls": {"enabled": True, "server_name": domain,
-                  "certificate_path": CDN_CRT, "key_path": CDN_KEY},
-          "transport": {"type": "ws", "path": path}}
+    # sing-box（不支持 xhttp 入站，xhttp 已在上层强制走 xray）
+    sb_tls = {"enabled": True, "server_name": domain,
+              "certificate_path": CDN_CRT, "key_path": CDN_KEY}
+    tr = {"type": "ws", "path": path}
+    if proto.startswith("vless"):
+        ib = {"type": "vless", "tag": "cdn-in", "listen": "::", "listen_port": port,
+              "users": [{"uuid": cred}], "tls": sb_tls, "transport": tr}
+    elif proto == "vmess-ws":
+        ib = {"type": "vmess", "tag": "cdn-in", "listen": "::", "listen_port": port,
+              "users": [{"uuid": cred, "alterId": 0}], "tls": sb_tls, "transport": tr}
+    else:  # trojan-ws
+        ib = {"type": "trojan", "tag": "cdn-in", "listen": "::", "listen_port": port,
+              "users": [{"password": cred}], "tls": sb_tls, "transport": tr}
     return ({"log": {"level": "info"}, "inbounds": [ib],
              "outbounds": [{"type": "direct"}]}, SB_BIN)
 
@@ -2923,7 +2977,6 @@ def cdn_setup():
     print("  CDN 灾备节点（域名 + Cloudflare 中转，防 IP 被墙时续命）")
     print("=" * 60)
     print("  原理：客户端连 Cloudflare 的 IP、不是你 VPS 的 IP；VPS 真 IP 被墙也能用。")
-    print("  协议：VLESS + WebSocket + TLS（CDN 场景最通用、客户端全支持）。")
     print("  前提：一个域名，且能挂到 Cloudflare（免费版就行）。")
     print("-" * 60)
     domain = _ask("  输入用于 CDN 的域名（如 node.example.com，回车取消）: ").strip().lower()
@@ -2932,9 +2985,17 @@ def cdn_setup():
     if "." not in domain or "/" in domain or " " in domain:
         print("  域名格式不对，已取消。"); return
 
-    # 选核心（VLESS+WS+TLS 两核心都能跑；灾备是单入口，选一个即可，无需两个一起）
-    ans = _ask("  用哪个核心跑? 1 sing-box(默认) / 2 xray: ").strip()
-    core = "xray" if ans == "2" else "sing-box"
+    # 选协议（都能过 CF；写入订阅时按各格式支持度自动筛选，单条链接始终照常给）
+    print("  选协议: 1 VLESS+WS(默认·最稳) / 2 VLESS+XHTTP(最快) / 3 VMess+WS / 4 Trojan+WS")
+    proto = CDN_PROTOS.get(_ask("  选择(回车=1): ").strip(), "vless-ws")
+
+    # 选核心：xhttp 仅 xray 支持入站，强制 xray；其余两核心可选
+    if proto == "vless-xhttp":
+        core = "xray"
+        print("  （XHTTP 入站仅 xray 支持，已自动用 xray）")
+    else:
+        ans = _ask("  用哪个核心跑? 1 sing-box(默认) / 2 xray: ").strip()
+        core = "xray" if ans == "2" else "sing-box"
     binpath = XRAY_BIN if core == "xray" else SB_BIN
     installer = install_xray if core == "xray" else install_singbox
     if not os.path.exists(binpath):
@@ -2950,12 +3011,13 @@ def cdn_setup():
         prefix = p or ipfx
     else:
         prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
-    tag = f"{prefix}CDN·vless-ws"
+    tag = f"{prefix}CDN·{proto}"
 
     port = _cdn_pick_port()
     _cdn_selfsigned(domain)
-    uid = new_uuid(); path = "/" + secrets.token_hex(4)
-    cfg_dict, binpath = _cdn_config(core, uid, path, port, domain)
+    cred = new_pw() if proto == "trojan-ws" else new_uuid()
+    path = "/" + secrets.token_hex(4)
+    cfg_dict, binpath = _cdn_config(proto, core, cred, path, port, domain)
     os.makedirs(CDN_DIR, exist_ok=True)
     json.dump(cfg_dict, open(CDN_CONF, "w"), indent=2)
     # 换核心重建：先拆掉旧 xy-cdn 单元（可能指向另一核心），避免 write_service 的“指向别的程序”拦截
@@ -2967,10 +3029,11 @@ def cdn_setup():
         write_service(CDN_SVC, binpath, CDN_CONF)
     except RuntimeError as e:
         print("  ✗ CDN 节点服务启动失败：", e); return
-    st = {"core": core, "domain": domain, "uuid": uid, "path": path,
+    st = {"proto": proto, "core": core, "domain": domain, "cred": cred, "path": path,
           "cf_port": port, "tag": tag, "in_sub": old.get("in_sub", False)}
     json.dump(st, open(CDN_STATE, "w"))
-    print(f"\n  ✓ CDN 灾备节点已就绪（{core}，本机监听 {port}，独立服务 {CDN_SVC}，与主节点互不影响）。")
+    print(f"\n  ✓ CDN 灾备节点已就绪（{proto} / {core}，本机监听 {port}，独立服务 {CDN_SVC}，与主节点互不影响）。")
+    print(f"  可写入的订阅：{CDN_PROTO_SUB[proto]}")
     # 若之前已写进订阅，重建后同步刷新（旧链接换成新链接）
     if old.get("in_sub"):
         _cdn_sub_apply(_cdn_link(old), _cdn_link(st))
@@ -3019,8 +3082,10 @@ def cdn_write_sub():
     if not read_saved_links():
         print("  本机还没有主节点（先『1.安装』），无法写入订阅。"); return
     on = st.get("in_sub", False)
+    proto = st.get("proto", "vless-ws")
     print(f"\n  节点写入订阅配置（当前：{'已写入 ✓' if on else '未写入'}）")
-    print("  写入后这条 CDN 节点会并进 mihomo/sing-box/小火箭三条订阅，客户端拉一次即可见；")
+    print(f"  本节点协议 {proto}，可写入：{CDN_PROTO_SUB[proto]}")
+    print("  写入后客户端拉一次订阅即见（不支持该协议的格式会自动跳过）；")
     print("  移出则从订阅撤掉（备用链接始终在本菜单可查，不受影响）。")
     ans = _ask(f"  {'移出订阅' if on else '写入订阅'}? y 确认 / n 返回: ").strip().lower()
     if ans not in ("y", "yes"):
@@ -3062,7 +3127,8 @@ def cdn_menu():
         print("=" * 60)
         if st:
             insub = "已写入订阅" if st.get("in_sub") else "仅备用链接"
-            print(f"  当前: {st['domain']}:{st['cf_port']}（{st.get('core', 'sing-box')}）"
+            print(f"  当前: {st['domain']}:{st['cf_port']}"
+                  f"（{st.get('proto', 'vless-ws')} / {st.get('core', 'sing-box')}）"
                   f"  服务: {'运行中 ✓' if active else '未运行 ✗'}  {insub}")
         else:
             print("  当前: 未配置（平时不用，建议先配好备着，被墙那天直接导入）")
