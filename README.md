@@ -225,7 +225,7 @@ xray 承载的 ws、reality/vision/QUIC 等一概不动。
   若客户端本地解析后以裸 IP 出站，仍会被 CN IP 规则拦截。
 
 规则集来自 [`bgpeer/rules`](https://github.com/bgpeer/rules)，
-配套的 mack-a 白名单注入脚本见 [`bgpeer/vps-net`](https://github.com/bgpeer/vps-net)。
+配套的白名单注入脚本见 [`nodekit/cn-block.py`](https://github.com/bgpeer/nodekit/blob/main/cn-block.py)。
 
 ---
 
@@ -387,7 +387,6 @@ hy2 端口跳跃规则、nginx 前置块与 `bgpeer` 命令。
 ## 相关仓库
 
 - [`bgpeer/rules`](https://github.com/bgpeer/rules) — geosite / geoip 规则集（srs）
-- [`白名单样板`](https://github.com/bgpeer/nodekit/blob/main/cn-block.py) — 白名单注入脚本样板 `cn-block.py`
 
 ---
 
