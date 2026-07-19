@@ -179,7 +179,8 @@ def sub_port():
        固定端口所有机器一样，会成为按端口批量扫描识别的指纹；随机后与协议端口混在一起。
        老安装（升级上来的）从正在用的 xy-sub.service 里抠出原端口沿用并落盘，
        已发给客户端的订阅链接一个字不变。挑好后写 SUBPORT_FILE，之后换 token、
-       更新脚本、更新配置都用同一个端口，订阅 URL 永远稳定。"""
+       更新脚本、更新配置都用同一个端口，订阅 URL 稳定；只有重装换节点时
+       才随 token 一起换新端口（见 renew_sub_port）。"""
     global _SUB_PORT
     if _SUB_PORT:
         return _SUB_PORT
@@ -195,7 +196,12 @@ def sub_port():
             _SUB_PORT = int(m.group(1)); _save_sub_port(_SUB_PORT); return _SUB_PORT
     except OSError:
         pass
-    rng = hy2_range()                           # 新安装：随机挑（避开 hy2 跳跃段/已分配/被占端口）
+    _SUB_PORT = _pick_sub_port(); _save_sub_port(_SUB_PORT)   # 新安装：随机挑
+    return _SUB_PORT
+
+def _pick_sub_port():
+    """从协议同一大区间随机挑订阅端口（避开 hy2 跳跃段/已分配/被占端口）。"""
+    rng = hy2_range()
     hop = tuple(map(int, rng.split("-"))) if rng else None
     for _ in range(500):
         p = secrets.randbelow(PORT_HI - PORT_LO + 1) + PORT_LO
@@ -203,8 +209,16 @@ def sub_port():
             continue
         if p in _USED_PORTS or not port_free(p):
             continue
-        _SUB_PORT = p; _save_sub_port(p); return p
+        return p
     raise RuntimeError(f"在 {PORT_LO}-{PORT_HI} 内找不到可用的订阅端口，请检查端口占用。")
+
+def renew_sub_port():
+    """重装节点时随 token 一起换新端口（旧链接反正已失效，顺带换端口零成本；
+       平时换 token/更新配置绝不走这里，端口保持稳定）。直接挑新的落盘，
+       绕过「从旧服务文件沿用」的老安装兜底。"""
+    global _SUB_PORT
+    _SUB_PORT = _pick_sub_port(); _save_sub_port(_SUB_PORT)
+    return _SUB_PORT
 
 def _save_sub_port(p):
     try:
@@ -1299,8 +1313,10 @@ _SUB_SERVER_PY = (
 
 def serve_sub(reset=False):
     """SUB_DIR 放 <token>.<ext> 软链指向各格式配置文件；每格式独立 token（存 TOKENS_FILE）。
-       reset=True 换全部 token；否则复用已有、只给新出现的格式补 token。"""
+       reset=True 换全部 token + 换新随机端口；否则复用已有、只给新格式补 token、端口不动。"""
     os.makedirs(SUB_DIR, exist_ok=True)
+    if reset:
+        renew_sub_port()                        # 重装换节点：端口随 token 一起换新
     toks = {} if reset else load_tokens()
     for f in os.listdir(SUB_DIR):                       # 清旧软链（含 .links）
         if f.rsplit(".", 1)[-1] in SUB_EXTS or f.endswith(".links"):
