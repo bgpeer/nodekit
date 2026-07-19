@@ -1,7 +1,7 @@
 # nodekit · bgpeer 一键脚本
 
 sing-box + xray 双核心、多协议一键部署，自动生成 **mihomo / sing-box / Shadowrocket** 三种订阅，
-并可一键屏蔽中国域名/IP（白名单放行）。参考 [mack-a/v2ray-agent](https://github.com/mack-a/v2ray-agent) 的协议组合用 Python 重写，装完直接给客户端一条订阅链接即可。
+并可一键屏蔽中国域名/IP（白名单放行）。参考 mack-a/v2ray-agent 的协议组合用 Python 重写，装完直接给客户端一条订阅链接即可。
 
 > ⚠️ 仅供个人学习与合法用途，使用前请阅读文末[免责声明](#免责声明)。
 
