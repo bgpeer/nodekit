@@ -16,6 +16,10 @@
 # ============================================================================
 import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time
 
+# 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
+# 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
+SCRIPT_VERSION = "1.0.0"
+
 # 版本：安装时优先取 GitHub 最新正式版；下面是取不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
 SB_VER   = "1.12.0"
@@ -2306,6 +2310,11 @@ def config_menu(ext):
         elif c == "0" or c == "":
             return
 
+def _script_ver(text):
+    """从脚本源码里抠 SCRIPT_VERSION；老版本没有这行则返回 '?'。"""
+    m = re.search(r'^SCRIPT_VERSION\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else "?"
+
 def update_script():
     """只更新脚本本体到最新，不动节点、不改配置；有新版则自动重载新版面板。"""
     try:
@@ -2316,10 +2325,10 @@ def update_script():
     except OSError: cur = ""
     if latest == cur:
         # 镜像(jsDelivr)对 main 分支有最长 ~12 小时缓存；刚发布的新版可能要等缓存刷新
-        print("\n已是最新版本。（若刚发布过新版还没看到，多半是 GitHub/镜像缓存未刷新，稍后再试）")
+        print(f"\n已是最新版本 v{SCRIPT_VERSION}。（若刚发布过新版还没看到，多半是 GitHub/镜像缓存未刷新，稍后再试）")
         return
     install_shortcut(latest)
-    print("\n脚本已更新（节点/配置均未改动），正在重新载入新版面板…")
+    print(f"\n脚本已更新 v{SCRIPT_VERSION} → v{_script_ver(latest)}（节点/配置均未改动），正在重新载入新版面板…")
     import sys
     os.execv(sys.executable, [sys.executable, SELF_LOCAL])
 
@@ -3284,7 +3293,7 @@ def cdn_menu():
 def main_menu():
     while True:
         print("\n" + "=" * 60)
-        print("  bgpeer 一键脚本  （sing-box + xray 多协议 / 订阅）")
+        print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
         print("=" * 60)
         t = traffic_line()
         if t:

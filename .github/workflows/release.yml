@@ -1,0 +1,101 @@
+name: Auto Release
+
+# 发布流程（全自动，合并进 main 即发布）：
+#   1. main 上脚本/模板有改动 → 自动把 xy-installer.py 里的 SCRIPT_VERSION 补丁位 +1 并回写提交
+#   2. 打 vX.Y.Z 标签 → 创建 GitHub Release（自动生成更新说明）
+#   想升大/中版本：合并前手动把 SCRIPT_VERSION 改成更高的号（如 2.0.0），CI 检测到比已发布的高
+#   就直接用它发布，不再自动 +1。
+# 注意：CI 的回写提交用 GITHUB_TOKEN push，GitHub 不会再触发工作流，不存在死循环。
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'xy-installer.py'
+      - 'net-optimize.py'
+      - 'cn-block.py'
+      - 'sub-template.yaml'
+      - 'subbox-template.json'
+      - 'shadowrocket-template.conf'
+  workflow_dispatch: {}
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 需要完整历史和全部 tag 来算最新已发布版本
+
+      - name: Compute version (auto-bump patch, honor manual bump)
+        id: ver
+        run: |
+          set -euo pipefail
+          file_ver=$(grep -Po '^SCRIPT_VERSION\s*=\s*"\K[^"]+' xy-installer.py)
+          latest_tag=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+          latest_ver=${latest_tag#v}
+          echo "file=$file_ver latest_tag=${latest_tag:-none}"
+          if [ -z "$latest_tag" ]; then
+            # 第一次发布：直接用文件里的版本号
+            new_ver="$file_ver"; bump=false
+          elif [ "$file_ver" != "$latest_ver" ] && \
+               [ "$(printf '%s\n' "$latest_ver" "$file_ver" | sort -V | tail -1)" = "$file_ver" ]; then
+            # 人工把版本号改得比已发布的高 → 尊重人工版本，直接发布
+            new_ver="$file_ver"; bump=false
+          else
+            # 常规情况：补丁位 +1 并回写文件
+            IFS=. read -r a b c <<< "$latest_ver"
+            new_ver="$a.$b.$((c+1))"; bump=true
+          fi
+          if git rev-parse -q --verify "refs/tags/v$new_ver" >/dev/null; then
+            echo "Tag v$new_ver already exists, nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "skip=false"        >> "$GITHUB_OUTPUT"
+          echo "new_ver=$new_ver"  >> "$GITHUB_OUTPUT"
+          echo "bump=$bump"        >> "$GITHUB_OUTPUT"
+          echo "file_ver=$file_ver" >> "$GITHUB_OUTPUT"
+
+      - name: Bump SCRIPT_VERSION & push
+        if: steps.ver.outputs.skip == 'false' && steps.ver.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          new_ver='${{ steps.ver.outputs.new_ver }}'
+          file_ver='${{ steps.ver.outputs.file_ver }}'
+          sed -i "s/^SCRIPT_VERSION = \"$file_ver\"/SCRIPT_VERSION = \"$new_ver\"/" xy-installer.py
+          grep -q "^SCRIPT_VERSION = \"$new_ver\"" xy-installer.py
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add xy-installer.py
+          git commit -m "chore(release): v$new_ver"
+          # 和 SHA256SUMS 工作流可能同时往 main push，带 rebase 重试
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort || true; echo "Rebase failed."; exit 1; }
+            if git push origin HEAD:main; then
+              echo "Push success."; exit 0
+            fi
+            echo "Push rejected (race). retry=${i}"; sleep $((i*2))
+          done
+          echo "Failed to push after retries."; exit 1
+
+      - name: Tag & create GitHub Release
+        if: steps.ver.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          new_ver='${{ steps.ver.outputs.new_ver }}'
+          # 若上一步回写了版本号，要把 tag 打在回写后的那个提交上
+          git fetch origin main
+          gh release create "v$new_ver" \
+            --target "$(git rev-parse origin/main)" \
+            --title "v$new_ver" \
+            --generate-notes
