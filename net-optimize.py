@@ -123,8 +123,8 @@ class Cfg:
     ENABLE_DSCP = _flag("ENABLE_DSCP")
     ENABLE_INITCWND = _flag("ENABLE_INITCWND")
     TCP_NOTSENT_LOWAT = _env("TCP_NOTSENT_LOWAT", "4096")
-    # 代理节点监听口从临时端口池保留（nodekit: 15000-45000 + 20080 + 30000-31000）
-    RESERVED_PORTS = _env("RESERVED_PORTS", "15000-45000,20080,30000-31000")
+    # 代理节点监听口从临时端口池保留（nodekit 的协议/订阅/hy2跳跃端口都在这一个区间里）
+    RESERVED_PORTS = _env("RESERVED_PORTS", "15000-45000")
     AGGRESSIVE_MODE = _flag("AGGRESSIVE_MODE", "0")
     ENABLE_GAME_QOS = _flag("ENABLE_GAME_QOS")
     ADAPTIVE_QOS = _flag("ADAPTIVE_QOS")

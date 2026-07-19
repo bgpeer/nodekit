@@ -62,7 +62,7 @@ LINKS_FILE   = BGP_DIR + "/nodes.links"      # 本机节点链接（供多机聚
 PEERS_FILE   = BGP_DIR + "/peers.json"       # 聚合的成员机 .links 地址列表
 CUSTPL_FILE  = BGP_DIR + "/custom_tpl.json"  # 每格式自定义模板链接（gist/GitHub）
 BT_STATE     = BGP_DIR + "/bt.json"          # BT/PT 下载屏蔽开关状态
-SUB_PORT     = 20080
+SUBPORT_FILE = BGP_DIR + "/sub.port"         # 订阅托管端口（首装随机挑一次永久沿用，每台机器不同）
 _RAW         = "https://raw.githubusercontent.com/bgpeer/nodekit/main/"
 TEMPLATE_URL = _RAW + "sub-template.yaml"           # mihomo 模板
 SBOX_TPL_URL = _RAW + "subbox-template.json"        # sing-box 模板
@@ -162,7 +162,7 @@ def next_port():
     hop = tuple(map(int, rng.split("-"))) if rng else None
     for _ in range(500):
         p = secrets.randbelow(PORT_HI - PORT_LO + 1) + PORT_LO
-        if p in _USED_PORTS or p == SUB_PORT:
+        if p in _USED_PORTS or p == sub_port():
             continue
         if hop and hop[0] <= p <= hop[1]:       # hy2 跳跃段，留给 hy2
             continue
@@ -171,6 +171,47 @@ def next_port():
         _USED_PORTS.add(p)
         return p
     raise RuntimeError(f"在 {PORT_LO}-{PORT_HI} 内找不到可用端口，请检查端口占用。")
+
+_SUB_PORT = None               # 进程内缓存，避免反复读文件
+
+def sub_port():
+    """订阅/聚合链接托管端口：首装从协议同一大区间随机挑一个并永久记住——
+       固定端口所有机器一样，会成为按端口批量扫描识别的指纹；随机后与协议端口混在一起。
+       老安装（升级上来的）从正在用的 xy-sub.service 里抠出原端口沿用并落盘，
+       已发给客户端的订阅链接一个字不变。挑好后写 SUBPORT_FILE，之后换 token、
+       更新脚本、更新配置都用同一个端口，订阅 URL 永远稳定。"""
+    global _SUB_PORT
+    if _SUB_PORT:
+        return _SUB_PORT
+    try:
+        p = int(open(SUBPORT_FILE).read().strip())
+        if 1024 <= p <= 65535:
+            _SUB_PORT = p; return p
+    except (OSError, ValueError):
+        pass
+    try:                                        # 老安装：沿用服务里正在用的端口
+        m = re.search(r"xy-sub-server\.py (\d+)", open("/etc/systemd/system/xy-sub.service").read())
+        if m:
+            _SUB_PORT = int(m.group(1)); _save_sub_port(_SUB_PORT); return _SUB_PORT
+    except OSError:
+        pass
+    rng = hy2_range()                           # 新安装：随机挑（避开 hy2 跳跃段/已分配/被占端口）
+    hop = tuple(map(int, rng.split("-"))) if rng else None
+    for _ in range(500):
+        p = secrets.randbelow(PORT_HI - PORT_LO + 1) + PORT_LO
+        if hop and hop[0] <= p <= hop[1]:
+            continue
+        if p in _USED_PORTS or not port_free(p):
+            continue
+        _SUB_PORT = p; _save_sub_port(p); return p
+    raise RuntimeError(f"在 {PORT_LO}-{PORT_HI} 内找不到可用的订阅端口，请检查端口占用。")
+
+def _save_sub_port(p):
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        open(SUBPORT_FILE, "w").write(str(p))
+    except OSError:
+        pass                                    # 写不进（非 root 只读操作等）就靠服务文件兜底
 
 def public_ip():
     try:
@@ -1219,7 +1260,7 @@ def sub_url(ext):
     if not t:
         return "(未生成)"
     scheme = "https" if _sub_https() else "http"
-    return f"{scheme}://{_host()}:{SUB_PORT}/{t}.{ext}"
+    return f"{scheme}://{_host()}:{sub_port()}/{t}.{ext}"
 
 def sub_urls_text():
     ff = {"yaml": CFG_FILE, "json": SBOX_FILE, "conf": SR_FILE}; toks = load_tokens()
@@ -1232,7 +1273,7 @@ def links_url():
     if not t:
         return ""
     scheme = "https" if _sub_https() else "http"
-    return f"{scheme}://{_host()}:{SUB_PORT}/{t}.links"
+    return f"{scheme}://{_host()}:{sub_port()}/{t}.links"
 
 def rotate_token_ext(ext):
     t = load_tokens(); t[ext] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
@@ -1284,7 +1325,7 @@ def serve_sub(reset=False):
     # 托管小服务：有域名+真证书就用 TLS（https 订阅），否则明文（自签 host 用 https 客户端会拒）
     open(SUB_SERVER, "w").write(_SUB_SERVER_PY)
     https = _sub_https()
-    args = f"{SUB_PORT} {SUB_DIR}" + (f" {ACME_CRT} {ACME_KEY}" if https else "")
+    args = f"{sub_port()} {SUB_DIR}" + (f" {ACME_CRT} {ACME_KEY}" if https else "")
     svc = (f"[Unit]\nAfter=network.target\n[Service]\n"
            f"ExecStart=/usr/bin/python3 {SUB_SERVER} {args}\n"
            f"Restart=on-failure\nRestartSec=3\n[Install]\nWantedBy=multi-user.target\n")
@@ -2054,7 +2095,7 @@ def run(sb_names, xr_names):
         print(urls)
         print("=" * 60)
         proto = "HTTPS(真证书) + 随机 token" if _sub_https() else "明文 HTTP + 随机 token（无域名/自签，客户端拒绝自签 TLS）"
-        print(f"※ {proto}，请勿外传；改端口/关闭见 xy-sub.service（端口 {SUB_PORT}）")
+        print(f"※ {proto}，请勿外传；改端口/关闭见 xy-sub.service（端口 {sub_port()}）")
 
     # 记住这次安装（节点不再随重装丢失：下次进安装默认「保持节点、只更新配置」）
     try:
