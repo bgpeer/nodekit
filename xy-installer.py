@@ -3292,7 +3292,7 @@ def main_menu():
             print("-" * 60)
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
-        print("  3. 聚合节点链接（连机VPS合并节点）")
+        print("  3. 聚合节点链接（连机VPS合并多台VPS节点）")
         print("  4. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
         print("  5. mihomo 配置")
         print("  6. sing-box 配置")
