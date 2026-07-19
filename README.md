@@ -58,12 +58,12 @@ sudo python3 /tmp/xy.py
 ```
   1. 安装（已装则问是否重装节点，y 重装 / n 返回）
   2. 节点链接 / 订阅
-  3. 聚合节点链接（多机汇总：把别的 VPS 节点并进来）
+  3. 聚合节点链接（连机VPS合并多台VPS节点）
   4. 多路复用开关 smux（只针对 ws / httpupgrade 协议）
   5. mihomo 配置
   6. sing-box 配置
   7. 小火箭配置
-  8. CDN套用（域名+Cloudflare 中转，防 IP 被墙 · 备用）
+  8. CDN套用（域名+CF中转 · 备用）
   9. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）
   10. BT/PT 下载屏蔽（防 VPS 被投诉封机）
   11. 网络优化（BBR/QoS 内核调优）
