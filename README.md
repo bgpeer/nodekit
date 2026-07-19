@@ -387,7 +387,7 @@ hy2 端口跳跃规则、nginx 前置块与 `bgpeer` 命令。
 ## 相关仓库
 
 - [`bgpeer/rules`](https://github.com/bgpeer/rules) — geosite / geoip 规则集（srs）
-- [`bgpeer/vps-net`](https://github.com/bgpeer/vps-net) — mack-a 白名单注入脚本 `whitelist-inject.sh`
+- [`白名单样板`](https://github.com/bgpeer/nodekit/blob/main/cn-block.py) — 白名单注入脚本样板 `cn-block.py`
 
 ---
 
