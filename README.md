@@ -7,7 +7,7 @@ sing-box + xray 双核心、多协议一键部署，自动生成 **mihomo / sing
 
 ---
 
-## 一键安装
+## 一键安装代码
 
 ```bash
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py -o /tmp/xy.py
