@@ -63,7 +63,7 @@ sudo python3 /tmp/xy.py
   5. mihomo 配置
   6. sing-box 配置
   7. 小火箭配置
-  8. CDN套用（域名+CF中转 · 备用）
+  8. CDN套用（域名+CF中转，延时较高，只能作备用）
   9. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）
   10. BT/PT 下载屏蔽（防 VPS 被投诉封机）
   11. 网络优化（BBR/QoS 内核调优）
