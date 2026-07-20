@@ -2241,11 +2241,18 @@ def peers_menu():
         elif c == "2":
             if not peers:
                 continue
-            n = _ask("  删除哪个编号: ").strip()
-            if n.isdigit() and 1 <= int(n) <= len(peers):
-                print("  已删除:", peers.pop(int(n) - 1)); save_peers(peers)
-            else:
-                print("  编号无效。")
+            n = _ask("  删除哪些编号（逗号分隔如 1,3；a=全部）: ").strip().lower()
+            if n in ("a", "all"):
+                save_peers([]); print(f"  已全部删除（{len(peers)} 条）。"); continue
+            try:                                # 手机输入法常打出中文逗号，一并兼容
+                idxs = sorted({int(x) for x in n.replace("，", ",").split(",") if x.strip()}, reverse=True)
+            except ValueError:
+                idxs = []
+            if not idxs or not all(1 <= i <= len(peers) for i in idxs):
+                print("  编号无效。"); continue
+            for i in idxs:                      # 从大到小删，编号不会因前面先删而错位
+                print("  已删除:", peers.pop(i - 1))
+            save_peers(peers)
         elif c in ("0", ""):
             return
 
