@@ -95,7 +95,18 @@ jobs:
           new_ver='${{ steps.ver.outputs.new_ver }}'
           # 若上一步回写了版本号，要把 tag 打在回写后的那个提交上
           git fetch origin main
-          gh release create "v$new_ver" \
-            --target "$(git rev-parse origin/main)" \
-            --title "v$new_ver" \
-            --generate-notes
+          target="$(git rev-parse origin/main)"
+          prev_tag="$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)"
+          # 更新说明：直接从提交主题生成——这样不管是 PR 合并（squash 后主题即 PR 标题）
+          # 还是直接在网页改文件提交，都能列出来，不再出现空说明。过滤掉发版/校验和这类
+          # 自动提交。取不到上一个 tag（首发）则退回 GitHub 自动生成。
+          if [ -n "$prev_tag" ]; then
+            notes="$(git log --no-merges --pretty='- %s' "$prev_tag..$target" \
+                     | grep -vE '^- (chore\(release\):|chore: auto-update SHA256SUMS)' || true)"
+            [ -z "$notes" ] && notes="- 维护性更新"
+            body="$(printf '## 更新内容\n\n%s\n\n**Full Changelog**: https://github.com/bgpeer/nodekit/compare/%s...v%s\n' \
+                    "$notes" "$prev_tag" "$new_ver")"
+            gh release create "v$new_ver" --target "$target" --title "v$new_ver" --notes "$body"
+          else
+            gh release create "v$new_ver" --target "$target" --title "v$new_ver" --generate-notes
+          fi
