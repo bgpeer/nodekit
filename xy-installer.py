@@ -4,8 +4,9 @@
 # ----------------------------------------------------------------------------
 # 设计原则（对应“逻辑和加密要做好”）：
 #   1. 密钥一律调用核心自带生成器，绝不在 Python 里手搓 x25519 / UUID
-#   2. 版本钉死：sing-box 1.11.x（避开 1.12 inbound sniff 迁移的破坏性改动）
-#                xray 25.x（reality 传输用 raw；ws 已 deprecated 但仍可用）
+#   2. 内核版本跟随 GitHub latest（和 mack-a 一致）：sing-box 下限 1.12
+#                （anytls inbound 是 1.12 才加的），xray reality 传输用 raw；
+#                拉不到 latest 时回落到 SB_VER / XRAY_VER 兜底常量
 #   3. 证书三态：reality 借目标站证书(无需域名) / hy2·tuic·anytls 自签 /
 #                ws·trojan 给域名走 acme.sh，不给则自签 + 链接带 insecure
 #   4. 加协议 = 往 SB / XRAY 表里加一个 builder，返回 (inbound, share_link)
@@ -1097,6 +1098,7 @@ def build(table, names, pinned=None, dup=None, mark=""):
                  手机上也显示得下。"""
     pinned = pinned or {}
     dup = dup or set()
+    names = list(dict.fromkeys(names))           # 去重保序：--sb hy2,hy2 不至于生成两个同 tag inbound
     inbounds, links = [], []
     for n in names:
         # 名称 = 用户前缀 + 协议名（默认无前缀，别人部署 US/SG 时自己填 🇺🇸/🇸🇬 等）
@@ -3561,4 +3563,11 @@ if __name__ == "__main__":
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
     if not sb and not xr:
         ap.error("至少用 --sb 或 --xray 指定要装的协议")
+    # 协议名校验：拼错的名字必须在这里挡下——run() 会先卸载别人的安装(takeover)再 build，
+    # 放到 build() 里撞 KeyError 就成了「先把机器上的节点卸了、再崩 traceback」。
+    bad_sb = [n for n in sb if n not in SB]
+    bad_xr = [n for n in xr if n not in XRAY]
+    if bad_sb or bad_xr:
+        if bad_sb: ap.error(f"未知的 sing-box 协议: {','.join(bad_sb)}\n  可选: {','.join(SB)}")
+        ap.error(f"未知的 xray 协议: {','.join(bad_xr)}\n  可选: {','.join(XRAY)}")
     run(sb, xr)
