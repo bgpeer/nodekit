@@ -1586,7 +1586,7 @@ def build_singbox_sub(nodes, tpl_url):
         else:
             new_ob.append(x)
     cfg["outbounds"] = new_ob
-    _sb_direct_ip(cfg, _direct_ips(nodes))                    # 各 VPS IP 直连（走紧凑序列化，不破坏格式）
+    _sb_direct_ip(cfg, _direct_targets(nodes))                    # 各 VPS IP 直连（走紧凑序列化，不破坏格式）
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
@@ -1733,33 +1733,48 @@ def _self_ip():
         _SELF_IP_CACHE = ip or ""
     return _SELF_IP_CACHE
 
-def _direct_ips(nodes):
-    """要直连的 IP：本机 IP + 所有节点服务器里的 IP 字面量（多机聚合后自动覆盖各成员机 IP，
-       这样挂着聚合代理管理任意一台，SSH 都走直连、不被重启核心掐断）。"""
-    ips, seen = [], set()
-    si = _self_ip()
-    if si:
-        ips.append(si); seen.add(si)
-    for _, d in nodes:
+def _direct_targets(nodes):
+    """要直连的目标：本机 + 各节点服务器字面量。**有域名就用域名，没域名才落地 IP**——
+       用域名时配置里不出现裸 IP（分享配置也不暴露真实 IP）；多机聚合后自动覆盖各成员机
+       地址，挂着聚合代理管理任意一台，SSH/管理流量都走直连、不被重启核心掐断。
+       返回 [(kind, val)]，kind 为 'ip' 或 'domain'。"""
+    out, seen = [], set()
+    def add(kind, val):
+        val = (val or "").strip()
+        if val and val not in seen:
+            seen.add(val); out.append((kind, val))
+    h = (_host() or "").strip()                              # 本机：sub.host 存的是域名或 IP
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", h):
+        add("ip", h)
+    elif re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", h):
+        add("domain", h)
+    else:
+        add("ip", _self_ip())                               # 兜底：拿不到合法域名/IP 就用探测的公网 IP
+    for _, d in nodes:                                       # 各节点服务器：域名或 IP 字面量都收
         s = str(d.get("server", "")).strip()
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", s) and s not in seen:
-            seen.add(s); ips.append(s)
-    return ips
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", s):
+            add("ip", s)
+        elif re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", s):
+            add("domain", s)
+    return out
 
-def _mihomo_direct_ip(tpl, ips):
-    """mihomo：在 rules: 段顶部插各 VPS IP 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
-    if not ips or "rules:" not in tpl:
+def _direct_rule_text(kind, val):
+    """mihomo / 小火箭通用规则文本：IP 走 IP-CIDR(+no-resolve)，域名走 DOMAIN。"""
+    return f"IP-CIDR,{val}/32,DIRECT,no-resolve" if kind == "ip" else f"DOMAIN,{val},DIRECT"
+
+def _mihomo_direct_ip(tpl, targets):
+    """mihomo：在 rules: 段顶部插本机/各 VPS 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
+    if not targets or "rules:" not in tpl:
         return tpl
-    new = [f"  - IP-CIDR,{ip}/32,DIRECT,no-resolve" for ip in ips
-           if f"IP-CIDR,{ip}/32,DIRECT,no-resolve" not in tpl]
+    new = [f"  - {r}" for r in (_direct_rule_text(k, v) for k, v in targets) if r not in tpl]
     if not new:
         return tpl
     return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n" + "\n".join(new), tpl, count=1)
 
-def _sb_direct_ip(cfg, ips):
-    """sing-box：把各 VPS IP 直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
+def _sb_direct_ip(cfg, targets):
+    """sing-box：把直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
        就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。"""
-    if not ips:
+    if not targets:
         return
     route = cfg.get("route")
     if not isinstance(route, dict):
@@ -1772,23 +1787,23 @@ def _sb_direct_ip(cfg, ips):
     if not direct:
         return
     add = []
-    for ip in ips:
-        rule = {"ip_cidr": [f"{ip}/32"], "outbound": direct}
+    for kind, val in targets:
+        rule = {"ip_cidr": [f"{val}/32"], "outbound": direct} if kind == "ip" \
+               else {"domain": [val], "outbound": direct}
         if rule not in rules and rule not in add:
             add.append(rule)
     if add:
         route["rules"] = add + rules
 
-def _sr_direct_ip(path, ips):
-    """Shadowrocket：在 [Rule] 段顶部插各 VPS IP 直连。"""
-    if not ips:
+def _sr_direct_ip(path, targets):
+    """Shadowrocket：在 [Rule] 段顶部插本机/各 VPS 直连。"""
+    if not targets:
         return
     try: tpl = open(path).read()
     except OSError: return
     if "[Rule]" not in tpl:
         return
-    new = [f"IP-CIDR,{ip}/32,DIRECT,no-resolve" for ip in ips
-           if f"IP-CIDR,{ip}/32,DIRECT,no-resolve" not in tpl]
+    new = [r for r in (_direct_rule_text(k, v) for k, v in targets) if r not in tpl]
     if new:
         open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + "\n".join(new), 1))
 
@@ -1802,13 +1817,13 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
     tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
-    tpl = _mihomo_direct_ip(tpl, _direct_ips(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
+    tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)                        # 直连规则已在内部注入并紧凑序列化
 def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
-    _sr_direct_ip(SR_FILE, _direct_ips(nodes))
+    _sr_direct_ip(SR_FILE, _direct_targets(nodes))
 
 FMT = {
     "yaml": {"label": "mihomo",              "file": CFG_FILE,  "author": TEMPLATE_URL, "gen": gen_mihomo},
