@@ -340,6 +340,34 @@ def refresh():
         except OSError: pass
     print(time.strftime("%F %T"), "规则集已刷新")
 
+def update_now():
+    """立即更新：重新拉取最新放行名单 + 规则集并即时生效，不必等每天 03:00 的定时刷新。
+       覆盖两种改动——① 改了放行名单(作者名单随最新 cn-block.py、自定义名单从链接实时拉)
+       → 重新注入；② 改了 rules 仓库里的规则集数据(.srs) → 清 sing-box 缓存强制重拉。
+       沿用 apply 的校验/回滚：失败则退回原本能用的状态，绝不把节点搞挂。"""
+    cfg = cnblock_load()
+    if not cfg.get("enabled"):
+        print("  屏蔽还没开启——先选 1 开启，开启时本来就是按最新名单注入的。")
+        return
+    # 备份并清掉规则集缓存，逼 sing-box 重启时重新拉最新 srs（拉不到可回滚，不影响节点）
+    cache = _cache_path(); baks = []
+    for p in (cache, cache + "-wal", cache + "-shm"):
+        if os.path.exists(p):
+            try: os.replace(p, p + ".bak"); baks.append(p)
+            except OSError: pass
+    print("  重新拉取最新放行名单 + 规则集…")
+    ok = apply_cn_block(cfg)                              # 重读名单 + 重注入 + 重启（自带校验/回滚）
+    for p in baks:                                        # 成功→丢弃旧缓存备份；失败→还原，保住原本能用的缓存
+        try:
+            if ok: os.remove(p + ".bak")
+            else:  os.replace(p + ".bak", p)
+        except OSError:
+            pass
+    if ok:
+        print("  ✓ 已按最新放行名单 + 规则集刷新生效。")
+    else:
+        print("  更新未生效（多半规则集临时拉不到），已保持原状，稍后再试。")
+
 def menu():
     while True:
         cfg = cnblock_load()
@@ -352,7 +380,8 @@ def menu():
         print("  1 屏蔽中国域名和IP" + ("（已开，再选可关闭）" if on else ""))
         print("  2 放行白名单（作者名单 / 自定义名单）")
         print("  3 自定义放行名单脚本链接")
-        print("  4 卸载（不想屏蔽了，直接清掉规则）")
+        print("  4 立即更新（拉取最新放行名单/规则集并生效，不用等每天定时刷新）")
+        print("  5 卸载（不想屏蔽了，直接清掉规则）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":
@@ -382,8 +411,10 @@ def menu():
                 print("  已保存，并切到自定义名单。")
                 if cfg.get("enabled"): apply_cn_block(cfg)
         elif c == "4":
+            update_now()
+        elif c == "5":
             remove_cn_block()
-        elif c in ("5", "0", ""):
+        elif c in ("0", ""):
             return
 
 def main():
