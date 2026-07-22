@@ -98,10 +98,14 @@ def install():
         print("    没有真证书 DoT 客户端会拒连。可继续装，但建议先给节点配好域名真证书。")
         if _ask("  仍然继续? [y/N]: ").lower() not in ("y", "yes"):
             return
+    # 53 常被 systemd-resolved 占用，会让向导里 DNS 端口报红过不去——装前先帮忙腾好
     b53 = _port_busy(53)
-    if b53:
-        print(f"  ⚠ 53 端口被 {b53} 占用（常见是 systemd-resolved）。加密 DoT(853) 不受影响、照常能用；")
-        print("    但『给设备填本机IP走明文53』这条要先腾出 53——装完在『3 查看』里有一键腾53的说明。")
+    if b53 and ("systemd-resolve" in b53 or "systemd" in b53):
+        print(f"\n  ⚠ 53 端口被 {b53} 占用——不腾的话向导里 DNS 端口(53)会报红过不去。")
+        if _ask("  现在就腾出 53（关 systemd-resolved 的 53 桩监听，本机解析改公共 DNS，可逆）? [Y/n]: ").lower() not in ("n", "no"):
+            _do_free53()
+    elif b53:
+        print(f"\n  ⚠ 53 端口被 {b53} 占用（不是 systemd-resolved）——请自行确认能否停它，否则向导 DNS 端口会报红。")
 
     print("\n  正在安装 AdGuard Home（官方安装脚本，装到 /opt/AdGuardHome）…")
     r = subprocess.run(f'curl -sSL "{AGH_INSTALL}" | sh -s -- -v', shell=True)
@@ -122,8 +126,10 @@ def _first_setup():
     print("\n  === 下一步：打开网页后台完成初始化（2 分钟）===")
     print(f"  1) 浏览器打开：\033[1;32mhttp://{ip}:{WEB_PORT}\033[0m")
     print("     （先在 VPS 服务商防火墙放行 3000/TCP；设完可改回只放行 DNS 端口）")
-    print("  2) 按向导设管理员账号密码 → 监听接口/端口保持默认（DNS 用 53）→ 完成。")
-    print("     广告过滤（AdGuard DNS filter）默认就是开的，无需额外操作。")
+    print("  2) 向导里两个端口按这样填（\033[1;33m别用默认的 80\033[0m）：")
+    print(f"     · 网页管理界面 端口 → 改成 \033[1;32m{WEB_PORT}\033[0m（默认 80 被证书续期/nginx 占，会报红）")
+    print("     · DNS 服务器 端口 → 保持 \033[1;32m53\033[0m（装前已帮你腾好；仍报红就回菜单选 4 腾53）")
+    print("  3) 设管理员账号密码 → 完成。广告过滤（AdGuard DNS filter）默认就是开的。")
     _usage()
 
 def _usage():
@@ -141,18 +147,9 @@ def _usage():
     print("  ▸ 防火墙放行：53(UDP/TCP) 给明文；853(TCP) 给 DoT；3000(TCP) 仅设置时开、设完可关。")
     print("  ▸ 想看拦了多少 / 加过滤名单 / 放行误杀域名：都在网页后台点。")
 
-def free_port53():
-    """腾出 53 端口：关掉 systemd-resolved 的 DNS 桩监听（保留它做本机解析）。
-       改动可逆——把 /etc/resolv.conf 指到公共 DNS，避免关桩后本机自身解析失效。"""
-    if os.geteuid() != 0:
-        print("  需要 root。"); return
-    who = _port_busy(53)
-    if not who:
-        print("  53 端口现在是空闲的，无需腾。"); return
-    if "systemd-resolve" not in who and "systemd" not in who:
-        print(f"  53 被 {who} 占用，不是 systemd-resolved——请自行确认那个服务能否停。未改动。"); return
-    if _ask("  关闭 systemd-resolved 的 53 桩监听（本机解析改用公共 DNS，可逆）? [y/N]: ").lower() not in ("y", "yes"):
-        return
+def _do_free53():
+    """真正腾 53：关掉 systemd-resolved 的桩监听 + 把 resolv.conf 指到公共 DNS（可逆）。
+       不含确认/占用者判断，供安装流程与菜单复用。"""
     try:
         d = "/etc/systemd/resolved.conf.d"
         os.makedirs(d, exist_ok=True)
@@ -162,15 +159,29 @@ def free_port53():
         except OSError: pass
         open("/etc/resolv.conf", "w").write("nameserver 1.1.1.1\nnameserver 223.5.5.5\n")
         sh("systemctl restart systemd-resolved")
-        sh("systemctl restart AdGuardHome")
         time.sleep(2)
-        if _port_busy(53) and "AdGuardHome" not in _port_busy(53):
-            print("  53 仍被占，请手动检查 `ss -lntup sport = :53`。")
+        left = _port_busy(53)
+        if left and "AdGuardHome" not in left:
+            print(f"  53 仍被 {left} 占，请手动检查 `ss -lntup 'sport = :53'`。")
         else:
-            print("  ✓ 已腾出 53，AdGuard Home 现在能收明文 DNS 了。")
+            print("  ✓ 已腾出 53。")
         print("  （撤销：删 /etc/systemd/resolved.conf.d/adguard.conf 后 systemctl restart systemd-resolved）")
     except OSError as e:
         print("  腾 53 失败:", e)
+
+def free_port53():
+    """菜单入口：腾出 53 端口（关 systemd-resolved 桩监听，可逆）。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    who = _port_busy(53)
+    if not who:
+        print("  53 端口现在是空闲的，无需腾。"); return
+    if "systemd-resolve" not in who and "systemd" not in who:
+        print(f"  53 被 {who} 占用，不是 systemd-resolved——请自行确认那个服务能否停。未改动。"); return
+    if _ask("  关闭 systemd-resolved 的 53 桩监听（本机解析改用公共 DNS，可逆）? [y/N]: ").lower() not in ("y", "yes"):
+        return
+    _do_free53()
+    sh("systemctl restart AdGuardHome")           # 已装则让 AGH 立刻接管 53
 
 def status():
     print("\n  === AdGuard Home 状态 ===")
