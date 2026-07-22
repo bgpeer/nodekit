@@ -119,17 +119,17 @@ def install():
         print("\n  ✓ AdGuard Home 已安装并启动。")
     else:
         print("\n  已安装，但服务暂未在运行——稍等或看 `systemctl status AdGuardHome`。")
-    _first_setup()
+    _first_setup(_pick_web_port(0) or WEB_PORT)          # 装时就随机挑一个 2000-5000 的后台端口（固定不跳）
 
-def _first_setup():
+def _first_setup(sug):
     ip = _public_ip()
     print("\n  === 下一步：打开网页后台完成初始化（2 分钟）===")
-    print(f"  1) 浏览器打开：\033[1;32mhttp://{ip}:{WEB_PORT}\033[0m")
-    print("     （先在 VPS 服务商防火墙放行 3000/TCP；设完可改回只放行 DNS 端口）")
+    print(f"  1) 浏览器打开安装向导：\033[1;32mhttp://{ip}:{WEB_PORT}\033[0m（先在防火墙放行 {WEB_PORT}/TCP）")
     print("  2) 向导里两个端口按这样填（\033[1;33m别用默认的 80\033[0m）：")
-    print(f"     · 网页管理界面 端口 → 改成 \033[1;32m{WEB_PORT}\033[0m（默认 80 被证书续期/nginx 占，会报红）")
+    print(f"     · 网页管理界面 端口 → 填 \033[1;32m{sug}\033[0m（我随机生成的·防扫描，固定用它不会跳；想省事填 {WEB_PORT} 也行，之后可用菜单 5 改）")
     print("     · DNS 服务器 端口 → 保持 \033[1;32m53\033[0m（装前已帮你腾好；仍报红就回菜单选 4 腾53）")
     print("  3) 设管理员账号密码 → 完成。广告过滤（AdGuard DNS filter）默认就是开的。")
+    print(f"  4) 完成后后台地址变成 \033[1;32mhttp://{ip}:{sug}\033[0m（防火墙放行 {sug}、可关掉 {WEB_PORT}）")
     _usage()
 
 def _usage():
