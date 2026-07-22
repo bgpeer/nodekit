@@ -10,7 +10,7 @@
 #   - 加密走 DoT(853，复用 acme 证书)：安卓「专用 DNS」填域名即可全系统去广告；
 #     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
 #   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
-import os, re, sys, time, socket, shutil, subprocess, urllib.request
+import os, re, sys, time, socket, shutil, secrets, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
@@ -183,6 +183,77 @@ def free_port53():
     _do_free53()
     sh("systemctl restart AdGuardHome")           # 已装则让 AGH 立刻接管 53
 
+def _agh_yaml():
+    return AGH_DIR + "/AdGuardHome.yaml"
+
+_ADDR_RE = re.compile(r'(?m)^(\s*address:\s+\S+:)(\d+)(\s*)$')   # AdGuardHome.yaml 里 http.address 行
+
+def _current_web_port():
+    """从 AdGuardHome.yaml 读当前后台端口；读不到返回 None。"""
+    try: txt = open(_agh_yaml()).read()
+    except OSError: return None
+    m = _ADDR_RE.findall(txt)
+    return int(m[0][1]) if len(m) == 1 else None
+
+def _pick_web_port(avoid):
+    """在 2000-5000 随机挑一个空闲端口（避开当前端口/被占端口）。"""
+    for _ in range(300):
+        p = secrets.randbelow(5000 - 2000 + 1) + 2000
+        if p == avoid or _port_busy(p):
+            continue
+        return p
+    return None
+
+def change_web_port():
+    """改 AdGuard 网页后台端口（随机 2000-5000 / 自定义）：改 yaml + 重启 + 校验，
+       改完连不上就回滚，绝不把你锁在后台外面。DNS 端口(53/853)是协议固定的，不动。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return
+    yaml_path = _agh_yaml()
+    try: txt = open(yaml_path).read()
+    except OSError:
+        print("  读不到 AdGuard 配置文件。"); return
+    hits = _ADDR_RE.findall(txt)
+    if len(hits) != 1:                                   # 没能唯一定位就别乱改
+        print(f"  配置里没能唯一定位后台端口行（找到 {len(hits)} 处），保险起见不自动改。"); return
+    cur = int(hits[0][1])
+    print(f"\n  当前后台端口: {cur}")
+    print("  1 随机(2000-5000)   2 自定义   0 取消")
+    c = _ask("  选择: ").strip()
+    if c == "1":
+        new = _pick_web_port(cur)
+        if not new:
+            print("  2000-5000 内没挑到空闲端口，稍后再试。"); return
+    elif c == "2":
+        s = _ask("  输入端口(1024-65535): ").strip()
+        if not s.isdigit() or not (1024 <= int(s) <= 65535):
+            print("  端口无效。"); return
+        new = int(s)
+        if new != cur and _port_busy(new):
+            print(f"  {new} 已被占用，换一个。"); return
+    else:
+        return
+    if new == cur:
+        print("  端口没变，未改动。"); return
+    # 改端口（内存留原文以便回滚）→ 重启 → 校验 AGH 在新端口起来了
+    open(yaml_path, "w").write(_ADDR_RE.sub(lambda m: f"{m.group(1)}{new}{m.group(3)}", txt, count=1))
+    sh("systemctl restart AdGuardHome")
+    ok = False
+    for _ in range(12):
+        time.sleep(1)
+        if _running() and "AdGuardHome" in _port_busy(new):
+            ok = True; break
+    if ok:
+        ip = _public_ip()
+        print(f"\n  ✓ 后台端口已改为 {new}。新后台地址：\033[1;32mhttp://{ip}:{new}\033[0m")
+        print(f"  ▸ 防火墙：放行 \033[1;32m{new}/TCP\033[0m，关掉旧的 {cur}/TCP。")
+    else:
+        open(yaml_path, "w").write(txt)                  # 回滚原配置
+        sh("systemctl restart AdGuardHome")
+        print(f"\n  ❌ 改到 {new} 后 AGH 没在新端口正常起来，已回滚回 {cur}（后台仍可用）。稍后再试或换个端口。")
+
 def status():
     print("\n  === AdGuard Home 状态 ===")
     if not _installed():
@@ -218,12 +289,14 @@ def menu():
         print("  2 卸载（彻底移除，不动节点）")
         print("  3 查看状态 / 设备怎么设置")
         print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
+        print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":   install()
         elif c == "2": uninstall()
         elif c == "3": status()
         elif c == "4": free_port53()
+        elif c == "5": change_web_port()
         elif c in ("0", ""):
             return
 
