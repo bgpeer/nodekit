@@ -67,7 +67,7 @@ sudo python3 /tmp/xy.py
   9. 屏蔽中国域名和IP（CN 域名+IP 拦截 / 白名单放行）
   10. BT/PT 下载屏蔽（防 VPS 被投诉封机）
   11. 网络优化（BBR/QoS 内核调优）
-  12. 去广告DNS（AdGuard Home·全设备DNS层去广告）
+  12. 自建DNS（AdGuard Home·全设备DNS层去广告）
   13. 更新脚本（不影响节点）
   14. 更新核心（sing-box / xray）
   15. 卸载
