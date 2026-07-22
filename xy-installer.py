@@ -89,6 +89,8 @@ SNI_HTTPS_PORT    = 8443        # 本地 https(网站+ws)端口，藏在 stream 
 CNBLOCK_FILE   = BGP_DIR + "/cnblock.json"       # cn-block.py 存的状态（这里只读它判断是否已开启）
 CN_BLOCK_LOCAL = BGP_DIR + "/cn-block.py"        # 本地缓存的 cn-block.py
 CN_BLOCK_URL   = _RAW + "cn-block.py"            # 仓库里的 cn-block.py（每次尽量拉最新）
+ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.py
+ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（去广告 DNS·AdGuard Home）
 
 # 网络优化脚本已并入本仓库（net-optimize.py，BBR/QoS 等内核调优，依赖工具自动安装）；
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
@@ -2503,6 +2505,10 @@ def uninstall_all():
     sh(f"rm -f {NGINX_STREAM_CONF}", check=False)
     if have("nginx"):
         sh("nginx -t && systemctl reload nginx", check=False)
+    if os.path.exists("/opt/AdGuardHome/AdGuardHome"):   # 去广告 DNS（AdGuard Home）一并撤掉——它的 DoT 靠 /etc/ssl/sb 证书，证书这里会删
+        sh("/opt/AdGuardHome/AdGuardHome -s uninstall", check=False)
+        sh("systemctl stop AdGuardHome", check=False)
+        sh("rm -rf /opt/AdGuardHome", check=False)
     for p in (SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, "/etc/ssl/sb", SUB_DIR,
               "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer", WEBROOT,
               # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
@@ -2529,6 +2535,12 @@ def cn_block_menu():
     if not ensure_cn_block():
         print("拉取 cn-block.py 失败，且本地无缓存。请检查网络。"); return
     subprocess.run(f"python3 {CN_BLOCK_LOCAL}", shell=True)
+
+def adguard_menu():
+    """打开独立的 adguard-dns.py 交互菜单（去广告 DNS · AdGuard Home）。"""
+    if not ensure_remote_script(ADGUARD_URL, ADGUARD_LOCAL):
+        print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
+    subprocess.run(f"python3 {ADGUARD_LOCAL}", shell=True)
 
 def cn_block_reapply():
     """重装后调用：若之前开启过屏蔽，用 cn-block.py 重新注入（未开启则内部直接跳过）。"""
@@ -3391,9 +3403,10 @@ def main_menu():
         print("  9. 屏蔽中国域名和IP（可做白名单放行）")
         print("  10. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
         print("  11. 网络优化（BBR/QoS 内核调优）")
-        print("  12. 更新脚本（不影响节点）")
-        print("  13. 更新核心（sing-box / xray）")
-        print("  14. 卸载")
+        print("  12. 去广告DNS（AdGuard Home·全设备DNS层去广告）")
+        print("  13. 更新脚本（不影响节点）")
+        print("  14. 更新核心（sing-box / xray）")
+        print("  15. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -3411,9 +3424,10 @@ def main_menu():
         elif c == "9":   cn_block_menu()
         elif c == "10":  bt_menu()
         elif c == "11":  net_optimize_menu()
-        elif c == "12":  update_script()
-        elif c == "13":  update_cores()
-        elif c == "14":  uninstall_all()
+        elif c == "12":  adguard_menu()
+        elif c == "13":  update_script()
+        elif c == "14":  update_cores()
+        elif c == "15":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue

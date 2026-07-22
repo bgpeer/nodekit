@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+# adguard-dns.py —— 一键架设 AdGuard Home 去广告 DNS（全设备 DNS 层去广告）
+# 独立文件，nodekit 主脚本(xy-installer.py)通过子进程调用：
+#   python3 adguard-dns.py            交互菜单（安装 / 卸载 / 查看）
+#
+# 定位：给「装不了代理的设备」(电视/盒子/IoT/路由器) 和「安卓专用DNS(全系统)」做 DNS 层去广告。
+#   - 挂代理的设备本来就靠订阅里的 reject 规则集拦广告，这个是补「没挂代理」的场景。
+#   - AdGuard Home 是网页后台管理的软件：这里做「一键装好起服务 + 一键干净卸载」，
+#     设管理密码、微调过滤名单在它的网页后台点几下完成（广告过滤默认即开）。
+#   - 加密走 DoT(853，复用 acme 证书)：安卓「专用 DNS」填域名即可全系统去广告；
+#     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
+#   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
+import os, re, sys, time, socket, shutil, subprocess, urllib.request
+
+BGP_DIR = "/etc/bgpeer"
+HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
+ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"   # 主脚本 acme 证书
+AGH_DIR = "/opt/AdGuardHome"
+AGH_BIN = AGH_DIR + "/AdGuardHome"
+AGH_INSTALL = "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh"
+WEB_PORT = 3000
+
+def sh(cmd, check=False):
+    r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+    if check and r.returncode:
+        raise RuntimeError((r.stderr or r.stdout).strip())
+    return r.stdout.strip()
+
+def _ask(prompt=""):
+    """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。"""
+    try:
+        with open("/dev/tty", "r") as t:
+            print(prompt, end="", flush=True)
+            line = t.readline()
+            if line == "":
+                raise EOFError
+            return line.rstrip("\n").strip()
+    except (OSError, EOFError):
+        return input(prompt).strip()
+
+def _host():
+    try: return open(HOST_FILE).read().strip()
+    except OSError: return ""
+
+def _domain():
+    """有域名才返回域名（DoT 需要证书 + 域名）；没域名返回 ''。"""
+    h = _host()
+    return h if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", h or "") else ""
+
+def _public_ip():
+    for u in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            return urllib.request.urlopen(u, timeout=8).read().decode().strip()
+        except Exception:
+            pass
+    out = sh("hostname -I")
+    return out.split()[0] if out else "本机IP"
+
+def _installed():
+    return os.path.exists(AGH_BIN)
+
+def _running():
+    return sh("systemctl is-active AdGuardHome") == "active"
+
+def _port_busy(port):
+    """端口是否被占（TCP bind 探测）。占用返回占用者的粗略名字，空闲返回 ''。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return ""                                    # 绑得上 → 空闲
+    except OSError:
+        who = sh(f"ss -lntup 'sport = :{port}' 2>/dev/null | tail -n +2")
+        m = re.search(r'users:\(\("([^"]+)"', who)
+        return m.group(1) if m else "未知进程"
+    finally:
+        s.close()
+
+def _cert_ready():
+    return os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY)
+
+def install():
+    if os.geteuid() != 0:
+        print("  需要 root 运行。"); return
+    if _installed():
+        print("  AdGuard Home 已经装过了。要重装请先『2 卸载』再装。")
+        _usage(); return
+    dom = _domain()
+    print("\n  === 安装前检查 ===")
+    print(f"  域名: {dom or '（未用域名，装脚本时没填域名）'}")
+    if not dom:
+        print("  ⚠ 没有域名：安卓「专用 DNS」(加密 DoT) 用不了，只能给设备填本机 IP 走明文 53。")
+        print("    想要安卓全系统加密去广告，得先用域名重装主节点。")
+        if _ask("  仍然继续安装（只用明文 53）? [y/N]: ").lower() not in ("y", "yes"):
+            return
+    elif not _cert_ready():
+        print(f"  ⚠ 有域名但没找到 acme 证书（{ACME_CRT}）：多半是装节点时用的是自签。")
+        print("    没有真证书 DoT 客户端会拒连。可继续装，但建议先给节点配好域名真证书。")
+        if _ask("  仍然继续? [y/N]: ").lower() not in ("y", "yes"):
+            return
+    b53 = _port_busy(53)
+    if b53:
+        print(f"  ⚠ 53 端口被 {b53} 占用（常见是 systemd-resolved）。加密 DoT(853) 不受影响、照常能用；")
+        print("    但『给设备填本机IP走明文53』这条要先腾出 53——装完在『3 查看』里有一键腾53的说明。")
+
+    print("\n  正在安装 AdGuard Home（官方安装脚本，装到 /opt/AdGuardHome）…")
+    r = subprocess.run(f'curl -sSL "{AGH_INSTALL}" | sh -s -- -v', shell=True)
+    if r.returncode or not _installed():
+        print("\n  ❌ 安装失败（多半是网络/GitHub 限流）。稍后重试。"); return
+    ok = False
+    for _ in range(12):
+        time.sleep(1)
+        if _running(): ok = True; break
+    if ok:
+        print("\n  ✓ AdGuard Home 已安装并启动。")
+    else:
+        print("\n  已安装，但服务暂未在运行——稍等或看 `systemctl status AdGuardHome`。")
+    _first_setup()
+
+def _first_setup():
+    ip = _public_ip()
+    print("\n  === 下一步：打开网页后台完成初始化（2 分钟）===")
+    print(f"  1) 浏览器打开：\033[1;32mhttp://{ip}:{WEB_PORT}\033[0m")
+    print("     （先在 VPS 服务商防火墙放行 3000/TCP；设完可改回只放行 DNS 端口）")
+    print("  2) 按向导设管理员账号密码 → 监听接口/端口保持默认（DNS 用 53）→ 完成。")
+    print("     广告过滤（AdGuard DNS filter）默认就是开的，无需额外操作。")
+    _usage()
+
+def _usage():
+    ip = _public_ip(); dom = _domain()
+    print("\n  === 设备怎么用它去广告 ===")
+    print("  ▸ 电视/盒子/IoT/路由器（装不了代理）: 把 DNS 填成 \033[1;32m" + ip + "\033[0m（明文，需放行 53/UDP+TCP）")
+    if dom:
+        print("  ▸ 安卓手机「专用 DNS」(全系统加密去广告，推荐):")
+        print("     ① 网页后台 → 设置 → 加密设置(Encryption)：启用；")
+        print(f"        服务器名称填 \033[1;32m{dom}\033[0m；证书路径 {ACME_CRT}；私钥路径 {ACME_KEY}；")
+        print("        DNS-over-TLS 端口 853、DNS-over-HTTPS 端口留 0（不占 443）。")
+        print(f"     ② 手机 设置→网络→专用DNS→ 填 \033[1;32m{dom}\033[0m 。全系统 App 即走去广告 DNS。")
+    else:
+        print("  ▸ 安卓「专用 DNS」需要域名+真证书，当前没有——用域名重装节点后可开。")
+    print("  ▸ 防火墙放行：53(UDP/TCP) 给明文；853(TCP) 给 DoT；3000(TCP) 仅设置时开、设完可关。")
+    print("  ▸ 想看拦了多少 / 加过滤名单 / 放行误杀域名：都在网页后台点。")
+
+def free_port53():
+    """腾出 53 端口：关掉 systemd-resolved 的 DNS 桩监听（保留它做本机解析）。
+       改动可逆——把 /etc/resolv.conf 指到公共 DNS，避免关桩后本机自身解析失效。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    who = _port_busy(53)
+    if not who:
+        print("  53 端口现在是空闲的，无需腾。"); return
+    if "systemd-resolve" not in who and "systemd" not in who:
+        print(f"  53 被 {who} 占用，不是 systemd-resolved——请自行确认那个服务能否停。未改动。"); return
+    if _ask("  关闭 systemd-resolved 的 53 桩监听（本机解析改用公共 DNS，可逆）? [y/N]: ").lower() not in ("y", "yes"):
+        return
+    try:
+        d = "/etc/systemd/resolved.conf.d"
+        os.makedirs(d, exist_ok=True)
+        open(d + "/adguard.conf", "w").write("[Resolve]\nDNSStubListener=no\n")
+        # resolv.conf 常是指向 stub(127.0.0.53) 的软链；关桩后要换成真能用的解析
+        try: os.remove("/etc/resolv.conf")
+        except OSError: pass
+        open("/etc/resolv.conf", "w").write("nameserver 1.1.1.1\nnameserver 223.5.5.5\n")
+        sh("systemctl restart systemd-resolved")
+        sh("systemctl restart AdGuardHome")
+        time.sleep(2)
+        if _port_busy(53) and "AdGuardHome" not in _port_busy(53):
+            print("  53 仍被占，请手动检查 `ss -lntup sport = :53`。")
+        else:
+            print("  ✓ 已腾出 53，AdGuard Home 现在能收明文 DNS 了。")
+        print("  （撤销：删 /etc/systemd/resolved.conf.d/adguard.conf 后 systemctl restart systemd-resolved）")
+    except OSError as e:
+        print("  腾 53 失败:", e)
+
+def status():
+    print("\n  === AdGuard Home 状态 ===")
+    if not _installed():
+        print("  未安装。选『1 安装』先装上。"); return
+    print("  已安装:", AGH_BIN)
+    print("  运行中 ✓" if _running() else "  未运行 ✗（systemctl status AdGuardHome 看原因）")
+    b53 = _port_busy(53)
+    print("  53 端口:", "空闲" if not b53 else f"被 {b53} 占用")
+    _usage()
+    print("\n  （53 被 systemd-resolved 占用、想走明文 DNS 的话，回菜单选『4 腾出53端口』）")
+
+def uninstall():
+    if not _installed():
+        print("  没检测到 AdGuard Home，无需卸载。"); return
+    if _ask("  确认卸载 AdGuard Home（去广告 DNS）? [y/N]: ").lower() not in ("y", "yes"):
+        return
+    if os.path.exists(AGH_BIN):
+        sh(f"{AGH_BIN} -s uninstall")                # 官方卸载（停服务 + 注销 systemd）
+    sh("systemctl stop AdGuardHome")
+    sh("systemctl disable AdGuardHome")
+    try: shutil.rmtree(AGH_DIR)
+    except OSError: pass
+    print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）。")
+    print("  记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
+
+def menu():
+    while True:
+        print("\n" + "=" * 60 + "\n去广告 DNS · AdGuard Home（全设备 DNS 层去广告）\n" + "=" * 60)
+        st = "已安装 " + ("运行中 ✓" if _running() else "未运行 ✗") if _installed() else "未安装"
+        print("  当前状态:", st)
+        print("-" * 60)
+        print("  1 安装（装 AdGuard Home + 起服务，之后网页后台点几下完成设置）")
+        print("  2 卸载（彻底移除，不动节点）")
+        print("  3 查看状态 / 设备怎么设置")
+        print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
+        print("  0 退出")
+        c = _ask("选择: ").strip()
+        if c == "1":   install()
+        elif c == "2": uninstall()
+        elif c == "3": status()
+        elif c == "4": free_port53()
+        elif c in ("0", ""):
+            return
+
+def main():
+    act = sys.argv[1] if len(sys.argv) > 1 else ""
+    if act == "remove":                              # 主脚本整体卸载时可调用
+        uninstall()
+    else:
+        menu()
+
+if __name__ == "__main__":
+    main()
