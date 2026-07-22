@@ -91,6 +91,7 @@ CN_BLOCK_LOCAL = BGP_DIR + "/cn-block.py"        # 本地缓存的 cn-block.py
 CN_BLOCK_URL   = _RAW + "cn-block.py"            # 仓库里的 cn-block.py（每次尽量拉最新）
 ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.py
 ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（去广告 DNS·AdGuard Home）
+SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
 
 # 网络优化脚本已并入本仓库（net-optimize.py，BBR/QoS 等内核调优，依赖工具自动安装）；
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
@@ -1764,6 +1765,44 @@ def _direct_rule_text(kind, val):
     """mihomo / 小火箭通用规则文本：IP 走 IP-CIDR(+no-resolve)，域名走 DOMAIN。"""
     return f"IP-CIDR,{val}/32,DIRECT,no-resolve" if kind == "ip" else f"DOMAIN,{val},DIRECT"
 
+def _selfdns_doh():
+    """开关开启且本机是域名时，返回本机 AdGuard 的 DoH 地址 https://域名:端口/dns-query，
+       否则返回 ''。DoH 端口从 AdGuardHome.yaml 的 port_https 读，读不到默认 10443。"""
+    if not os.path.exists(SELFDNS_FLAG):
+        return ""
+    dom = _host()
+    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or ""):
+        return ""
+    port = 10443
+    try:
+        m = re.search(r'(?m)^\s*port_https:\s*(\d+)', open("/opt/AdGuardHome/AdGuardHome.yaml").read())
+        if m and int(m.group(1)) > 0:
+            port = int(m.group(1))
+    except OSError:
+        pass
+    return f"https://{dom}:{port}/dns-query"
+
+def _mihomo_selfdns(tpl, url):
+    """mihomo：把自建 DoH 加到 nameserver 列表最前（当主用，原有留兜底：DoH 没通自动回落）。"""
+    if not url:
+        return tpl
+    q = f'"{url}"'
+    if q in tpl:                                            # 已写入，别重复
+        return tpl
+    return re.sub(r'(?m)^(\s*nameserver:\s*\[)', lambda m: m.group(1) + q + ", ", tpl, count=1)
+
+def _sr_selfdns(path, url):
+    """Shadowrocket：把自建 DoH 加到 dns-server 最前（原有留兜底）。"""
+    if not url:
+        return
+    try: tpl = open(path).read()
+    except OSError: return
+    if url in tpl:
+        return
+    new = re.sub(r'(?m)^(dns-server\s*=\s*)', lambda m: m.group(1) + url + ",", tpl, count=1)
+    if new != tpl:
+        open(path, "w").write(new)
+
 def _mihomo_direct_ip(tpl, targets):
     """mihomo：在 rules: 段顶部插本机/各 VPS 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
     if not targets or "rules:" not in tpl:
@@ -1820,12 +1859,14 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
     tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
+    tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)                        # 直连规则已在内部注入并紧凑序列化
 def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
     _sr_direct_ip(SR_FILE, _direct_targets(nodes))
+    _sr_selfdns(SR_FILE, _selfdns_doh())                       # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
 
 FMT = {
     "yaml": {"label": "mihomo",              "file": CFG_FILE,  "author": TEMPLATE_URL, "gen": gen_mihomo},
@@ -2541,6 +2582,39 @@ def adguard_menu():
     if not ensure_remote_script(ADGUARD_URL, ADGUARD_LOCAL):
         print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
     subprocess.run(f"python3 {ADGUARD_LOCAL}", shell=True)
+
+def selfdns_toggle():
+    """开关：把本机自建 DNS(AdGuard DoH) 写进订阅配置的 DNS，循环切换、写/删后自动刷新订阅。
+       只写 mihomo / 小火箭（列表型 DNS，把自建 DoH 放最前当主用、原有留兜底，没通自动回落）；
+       sing-box 的 DNS 无列表回落机制，强改易断解析，故不写入。adguard 菜单调用（selfdns-toggle）。"""
+    dom = _host()
+    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or ""):
+        print("  需要域名（DoH 走域名+证书）。当前节点不是域名，无法写入自建 DNS。"); return
+    if not read_saved_links():
+        print("  还没有节点，先『1.安装』。"); return
+    on = os.path.exists(SELFDNS_FLAG)
+    if on:
+        if _ask("  自建 DNS 已写入订阅。移除它? [y/N]: ").strip().lower() not in ("y", "yes"):
+            return
+        try: os.remove(SELFDNS_FLAG)
+        except OSError: pass
+        act = "已移除"
+    else:
+        if not os.path.exists("/opt/AdGuardHome/AdGuardHome"):
+            print("  还没装 AdGuard Home——先装并在后台开好加密(DoH 10443)，否则写进去也用不了。")
+            if _ask("  仍然写入? [y/N]: ").strip().lower() not in ("y", "yes"):
+                return
+        open(SELFDNS_FLAG, "w").write("1")
+        act = "已写入"
+    G["host"] = dom; ensure_deps()
+    if build_subscription(read_saved_links()):               # 重新生成三格式并托管（不换 token）
+        print(f"\n  ✓ {act}自建 DNS，订阅已刷新（写入 mihomo / 小火箭；sing-box 未动，避免断解析）。")
+        if act == "已写入":
+            print(f"  写入的 DoH：{_selfdns_doh()}")
+            print("  ⚠ 确保 AdGuard 已开加密、防火墙放行 DoH 端口；没通也不影响——会自动回落到原 DNS。")
+        print("  客户端重新拉一次订阅即生效。")
+    else:
+        print("  刷新配置失败（没有可用节点？）。")
 
 def cn_block_reapply():
     """重装后调用：若之前开启过屏蔽，用 cn-block.py 重新注入（未开启则内部直接跳过）。"""
@@ -3403,7 +3477,7 @@ def main_menu():
         print("  9. 屏蔽中国域名和IP（可做白名单放行）")
         print("  10. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
         print("  11. 网络优化（BBR/QoS 内核调优）")
-        print("  12. 去广告DNS（AdGuard Home·全设备DNS层去广告）")
+        print("  12. 自建DNS（AdGuard Home·全设备去广告）")
         print("  13. 更新脚本（不影响节点）")
         print("  14. 更新核心（sing-box / xray）")
         print("  15. 卸载")
@@ -3554,6 +3628,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新内核调这个
         update_cores_auto()
+        sys.exit(0)
+    if sys.argv[1] == "selfdns-toggle":  # adguard 菜单调用：开关"自建DNS写入订阅"
+        selfdns_toggle()
         sys.exit(0)
     ap = argparse.ArgumentParser(
         description="sing-box + xray 双核心多协议安装器",

@@ -154,6 +154,7 @@ def _usage(port=None):
         print(f"      · 私钥（选『文件路径』）填：{G}{ACME_KEY}{N}")
         print(f"      · HTTPS 端口         填：{G}10443{N}   （不要填 0，也别填 443）")
         print(f"      · DNS-over-TLS 端口  填：{G}853{N}")
+        print(f"      · 「HTTPS 自动重定向」{Y}不要勾{N}（勾了进后台会强制跳 HTTPS，用 IP 访问会证书报错、进不去）")
         print(f"      · 点『保存』（若提示 {Y}no IP addresses{N} 的黄字，无害，忽略）")
     else:
         print(f"    {Y}你装节点时没用域名 → 加密(DoT/DoH)用不了，只能用下面①明文 DNS。{N}")
@@ -314,9 +315,16 @@ def uninstall():
     print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）。")
     print("  记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
 
+def _selfdns_toggle():
+    """把"自建DNS写入订阅"的开关交给主脚本处理（订阅生成/刷新都在主脚本里）。"""
+    xy = BGP_DIR + "/xy-installer.py"
+    if not os.path.exists(xy):
+        print("  没找到主脚本(xy-installer.py)，请从主面板进入本菜单。"); return
+    subprocess.run(f"python3 {xy} selfdns-toggle", shell=True)
+
 def menu():
     while True:
-        print("\n" + "=" * 60 + "\n去广告 DNS · AdGuard Home（全设备 DNS 层去广告）\n" + "=" * 60)
+        print("\n" + "=" * 60 + "\n自建DNS · AdGuard Home（全设备去广告）\n" + "=" * 60)
         st = "已安装 " + ("运行中 ✓" if _running() else "未运行 ✗") if _installed() else "未安装"
         print("  当前状态:", st)
         print("-" * 60)
@@ -325,6 +333,7 @@ def menu():
         print("  3 查看状态 / 设备怎么设置")
         print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
         print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
+        print("  6 把自建DNS写入订阅配置（开/关：第一次写入·再点移除，自动刷新）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -332,6 +341,7 @@ def menu():
         elif c == "3": status()
         elif c == "4": free_port53()
         elif c == "5": change_web_port()
+        elif c == "6": _selfdns_toggle()
         elif c in ("0", ""):
             return
 
