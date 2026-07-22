@@ -130,22 +130,55 @@ def _first_setup(sug):
     print("     · DNS 服务器 端口 → 保持 \033[1;32m53\033[0m（装前已帮你腾好；仍报红就回菜单选 4 腾53）")
     print("  3) 设管理员账号密码 → 完成。广告过滤（AdGuard DNS filter）默认就是开的。")
     print(f"  4) 完成后后台地址变成 \033[1;32mhttp://{ip}:{sug}\033[0m（防火墙放行 {sug}、可关掉 {WEB_PORT}）")
-    _usage()
+    _usage(sug)
 
-def _usage():
+def _usage(port=None):
+    """一步步的使用说明：登录后台 → 开加密 → 设备指过来。写给不懂的人看。"""
     ip = _public_ip(); dom = _domain()
-    print("\n  === 设备怎么用它去广告 ===")
-    print("  ▸ 电视/盒子/IoT/路由器（装不了代理）: 把 DNS 填成 \033[1;32m" + ip + "\033[0m（明文，需放行 53/UDP+TCP）")
+    port = port or _current_web_port() or WEB_PORT
+    G = "\033[1;32m"; Y = "\033[1;33m"; N = "\033[0m"     # 绿=要填的值，黄=提示
+    print("\n" + "  " + "=" * 56)
+    print("  怎么用它去广告 —— 照着下面三步做")
+    print("  " + "=" * 56)
+
+    print("\n  【第一步 · 登录网页后台】")
+    print(f"    浏览器打开：  {G}http://{ip}:{port}{N}")
+    print("    ↑ 这就是你的管理后台，首次打开设个账号密码；以后看拦截统计、加名单都进这里。")
+
+    print("\n  【第二步 · 开加密】（给手机全系统去广告用；没域名可跳过，只用第三步①明文）")
     if dom:
-        print("  ▸ 安卓手机「专用 DNS」(全系统加密去广告，推荐):")
-        print("     ① 网页后台 → 设置 → 加密设置(Encryption)：启用；")
-        print(f"        服务器名称填 \033[1;32m{dom}\033[0m；证书路径 {ACME_CRT}；私钥路径 {ACME_KEY}；")
-        print("        DNS-over-TLS 端口 853、DNS-over-HTTPS 端口留 0（不占 443）。")
-        print(f"     ② 手机 设置→网络→专用DNS→ 填 \033[1;32m{dom}\033[0m 。全系统 App 即走去广告 DNS。")
+        print("    后台里点：设置 → 加密设置(Encryption)，然后：")
+        print(f"      · 勾选「启用加密」")
+        print(f"      · 服务器名称        填：{G}{dom}{N}")
+        print(f"      · 证书（选『文件路径』）填：{G}{ACME_CRT}{N}")
+        print(f"      · 私钥（选『文件路径』）填：{G}{ACME_KEY}{N}")
+        print(f"      · HTTPS 端口         填：{G}10443{N}   （不要填 0，也别填 443）")
+        print(f"      · DNS-over-TLS 端口  填：{G}853{N}")
+        print(f"      · 点『保存』（若提示 {Y}no IP addresses{N} 的黄字，无害，忽略）")
     else:
-        print("  ▸ 安卓「专用 DNS」需要域名+真证书，当前没有——用域名重装节点后可开。")
-    print("  ▸ 防火墙放行：53(UDP/TCP) 给明文；853(TCP) 给 DoT；3000(TCP) 仅设置时开、设完可关。")
-    print("  ▸ 想看拦了多少 / 加过滤名单 / 放行误杀域名：都在网页后台点。")
+        print(f"    {Y}你装节点时没用域名 → 加密(DoT/DoH)用不了，只能用下面①明文 DNS。{N}")
+        print("    想要手机全系统加密去广告，得先用域名重装节点。")
+
+    print("\n  【第三步 · 把设备的 DNS 指到这台服务器】下面三种，按设备挑一种：")
+    print(f"    ① 明文 DNS —— 电视/盒子/IoT/路由器/电脑，最通用")
+    print(f"        把设备的 DNS 填成：  {G}{ip}{N}")
+    print(f"        需要：VPS 防火墙放行 {G}53{N}(UDP+TCP)；若 53 被占，回菜单选『4 腾出53端口』")
+    if dom:
+        print(f"    ② DoT 加密 —— 安卓手机「专用DNS」，全系统生效，{Y}最推荐{N}")
+        print(f"        手机：设置 → 网络 → 专用DNS → 选『私人DNS提供商主机名』→ 填：{G}{dom}{N}")
+        print(f"        需要：先做完第二步开加密；VPS 防火墙放行 {G}853{N}(TCP)")
+        print(f"    ③ DoH 加密 —— 电脑浏览器 / 支持 DoH 的 App")
+        print(f"        DoH 地址：  {G}https://{dom}:10443/dns-query{N}")
+        print(f"        需要：VPS 防火墙放行 {G}10443{N}(TCP)")
+
+    print("\n  " + "-" * 56)
+    print("  三种 DNS 怎么选（一句话）：")
+    print(f"    · 明文 53     简单通用、不加密 —— 电视/IoT/内网设备")
+    print(f"    · DoT 853     加密、安卓系统原生支持、一次设置全系统去广告 {Y}【首选】{N}")
+    print(f"    · DoH 10443   加密、浏览器/App 用；因本机 443 被节点占，所以带端口")
+    print("\n  想拦更多广告：")
+    print("    · 后台 → 过滤器 → DNS 拦截列表 → 添加名单（推荐 anti-AD：https://anti-ad.net/easylist.txt）")
+    print("    · 后台 → 查询日志 → 找到广告域名 → 点『屏蔽』")
 
 def _do_free53():
     """真正腾 53：关掉 systemd-resolved 的桩监听 + 把 resolv.conf 指到公共 DNS（可逆）。
@@ -260,10 +293,12 @@ def status():
         print("  未安装。选『1 安装』先装上。"); return
     print("  已安装:", AGH_BIN)
     print("  运行中 ✓" if _running() else "  未运行 ✗（systemctl status AdGuardHome 看原因）")
+    port = _current_web_port()
+    if port:
+        print(f"  后台端口: {port}    （登录地址见下方第一步）")
     b53 = _port_busy(53)
     print("  53 端口:", "空闲" if not b53 else f"被 {b53} 占用")
-    _usage()
-    print("\n  （53 被 systemd-resolved 占用、想走明文 DNS 的话，回菜单选『4 腾出53端口』）")
+    _usage(port)
 
 def uninstall():
     if not _installed():
