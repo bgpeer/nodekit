@@ -223,7 +223,7 @@ rule-providers:
   OpenAI-zj: {<<: *class-yaml, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/openai.yaml"}
   Facebook-zj: {<<: *mrs-domain, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/meta.mrs"}
   Netflix: {<<: *class-yaml, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/netflix.yaml"}
-  Google-zj: {<<: *mrs-domain, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/google.mrs"}
+  Google-zj: {<<: *class-yaml, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/google.yaml"}
   GitHub-zj: {<<: *mrs-domain, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/github.mrs"}
   Claude-zj: {<<: *class-yaml, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/anthropic.yaml"}
   PayPal: {<<: *mrs-domain, url: "https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/rules/main/geo/geosite/paypal.mrs"}
