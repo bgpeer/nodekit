@@ -15,9 +15,6 @@ on:
       - 'net-optimize.py'
       - 'cn-block.py'
       - 'adguard-dns.py'
-      - 'sub-template.yaml'
-      - 'subbox-template.json'
-      - 'shadowrocket-template.conf'
   workflow_dispatch: {}
 
 concurrency:
