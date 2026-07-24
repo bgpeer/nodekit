@@ -65,6 +65,7 @@ dns:
   enhanced-mode: fake-ip
   cache-algorithm: arc
   fake-ip-range: 198.18.0.0/16
+  fake-ip-range6: fc00::/18
   prefer-h3: true
   use-hosts: true
   use-system-hosts: true
