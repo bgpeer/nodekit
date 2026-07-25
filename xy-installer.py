@@ -1327,7 +1327,8 @@ port = int(sys.argv[1]); directory = sys.argv[2]
 tokenfile = sys.argv[3]
 cert = sys.argv[4] if len(sys.argv) > 4 else ''
 key  = sys.argv[5] if len(sys.argv) > 5 else ''
-ALLOW = ('raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com', 'codeload.github.com')
+ALLOW = ('raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com', 'codeload.github.com',
+         'gist.github.com', 'gist.githubusercontent.com')
 class H(http.server.SimpleHTTPRequestHandler):
     timeout = 30                     # 读请求超时：卡住的客户端不会永久占着线程
     def __init__(self, *a, **k):
@@ -1865,10 +1866,31 @@ def _ghrelay_prefix():
         return ""
     return f"https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/"
 
+# 能被【自动识别】直接改走中转的 GitHub「原始文件」主机——规则集(.mrs/.yaml)和图标都在这几个上。
+# 只认原始文件主机：github.com 的项目页、codeload 的 zip 不自动改（那些多半是说明链接/面板包，
+# 误改没意义甚至变慢）；真要转它们，在模板里显式写代理前缀即可，下面第二步会处理。
+_GH_RAW_HOSTS = ("raw.githubusercontent.com", "gist.githubusercontent.com",
+                 "objects.githubusercontent.com")
+_URL_TAIL = r'[^\s"\'<>,}\]\)]+'                     # URL 结尾：碰到引号/空白/YAML·JSON 分隔符就停
+# 匹配「可有可无的代理前缀 + GitHub 原始文件链接」。前缀那段会把 https://gh-proxy.com/、
+# https://ghproxy.net/ 这类镜像整段吃掉一起替换，避免出现「别人的镜像/自己的中转/…」套娃。
+_GH_URL_RE = re.compile(
+    r'(?:https?://' + _URL_TAIL + r'?/)?'
+    r'(https://(?:' + "|".join(h.replace(".", r"\.") for h in _GH_RAW_HOSTS) + r')/' + _URL_TAIL + r')')
+
 def _ghrelay_rewrite(text):
-    """开启时把模板里的 https://gh-proxy.com/ 全换成本机中转前缀；关闭/无域名则原样返回。"""
+    """开启时把模板里的 GitHub 链接改走本机中转；关闭/无域名则原样返回。
+       三种写法都认——因为很多人写模板不会加 gh-proxy 前缀，靠 raw 主机名识别才最可靠：
+         ① https://raw.githubusercontent.com/…            裸链接，自动识别
+         ② https://gh-proxy.com/https://raw.github…       老写法，前缀可有可无
+         ③ https://随便哪个镜像/https://raw.github…       别人的镜像也整段换掉
+       第二步再兜底处理非原始文件主机（github.com/codeload/gist.github.com）上显式写了前缀的。
+       对已经是中转链接的文本重复执行不会套娃（前缀段会把旧的中转前缀一并吃掉再补上）。"""
     p = _ghrelay_prefix()
-    return text.replace("https://gh-proxy.com/", p) if p else text
+    if not p:
+        return text
+    text = _GH_URL_RE.sub(lambda m: p + m.group(1), text)
+    return text.replace("https://gh-proxy.com/", p)
 
 def _selfdns_doh():
     """开关开启且本机是域名时，返回本机 AdGuard 的 DoH 地址 https://域名:端口/dns-query，

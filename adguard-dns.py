@@ -10,7 +10,7 @@
 #   - 加密走 DoT(853，复用 acme 证书)：安卓「专用 DNS」填域名即可全系统去广告；
 #     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
 #   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
-import os, re, sys, time, socket, shutil, secrets, subprocess, urllib.request
+import os, re, sys, time, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
@@ -315,6 +315,324 @@ def uninstall():
     print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）。")
     print("  记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
 
+# ===================== 自检 =====================
+# 为什么要有这个：安卓「私人DNS」是严格模式——填了主机名就只用这一台 DoT，没有任何回落，
+# 它一挂全机所有 App 立刻解析失败(errno=7)，且解析不了节点域名 → 连代理自救都做不到。
+# 所以要能一键查出到底哪一环断了：服务 / 监听 / 证书 / 真实解析 / 访问控制 / 防火墙。
+
+def _tls_block(txt):
+    """从 AdGuardHome.yaml 里切出顶层 tls: 段（下面 enabled 等键才不会跟别处混）。"""
+    m = re.search(r'(?m)^tls:[ \t]*$', txt)
+    if not m:
+        return ""
+    out = []
+    for line in txt[m.end():].splitlines():
+        if line and not line[0].isspace():
+            break
+        out.append(line)
+    return "\n".join(out)
+
+def _yaml_val(block, key):
+    m = re.search(rf'(?m)^\s*{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$', block)
+    return m.group(1).strip('"\'') if m else ""
+
+def _yaml_list(txt, key):
+    """读 YAML 里的一个列表；键不存在返回 None，空列表返回 []。"""
+    m = re.search(rf'(?m)^(\s*){re.escape(key)}:[ \t]*(\[[ \t]*\])?[ \t]*$', txt)
+    if not m:
+        return None
+    if m.group(2):
+        return []
+    indent, items = len(m.group(1)), []
+    for line in txt[m.end():].splitlines():
+        if not line.strip():
+            continue
+        cur, st = len(line) - len(line.lstrip()), line.strip()
+        if st.startswith("- ") and cur > indent:
+            items.append(st[2:].strip())
+        elif cur <= indent:
+            break
+    return items
+
+def _dns_packet(name):
+    pkt = struct.pack(">HHHHHH", secrets.randbelow(65536), 0x0100, 1, 0, 0, 0)
+    for part in name.split("."):
+        pkt += bytes([len(part)]) + part.encode()
+    return pkt + b"\x00" + struct.pack(">HH", 1, 1)
+
+def _dns_parse(data):
+    """返回 (rcode, [A记录IP])；解析不出来返回 (-1, [])。"""
+    try:
+        rcode = data[3] & 0x0F
+        ancount = struct.unpack(">H", data[6:8])[0]
+        i = 12
+        while data[i]:                                  # 跳过 question 的 QNAME
+            i += data[i] + 1
+        i += 5                                          # 0x00 + QTYPE + QCLASS
+        ips = []
+        for _ in range(ancount):
+            while True:                                 # 跳过 answer 的 NAME（可能是压缩指针）
+                l = data[i]
+                if l & 0xC0 == 0xC0:
+                    i += 2; break
+                i += 1
+                if l == 0:
+                    break
+                i += l
+            rtype = struct.unpack(">H", data[i:i + 2])[0]
+            rdlen = struct.unpack(">H", data[i + 8:i + 10])[0]
+            i += 10
+            if rtype == 1 and rdlen == 4:
+                ips.append(".".join(str(b) for b in data[i:i + rdlen]))
+            i += rdlen
+        return rcode, ips
+    except Exception:
+        return -1, []
+
+def _q_plain(port, name):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(6)
+    try:
+        s.sendto(_dns_packet(name), ("127.0.0.1", port))
+        return _dns_parse(s.recvfrom(4096)[0]), ""
+    except Exception as e:
+        return (-1, []), f"{type(e).__name__}: {e}"
+    finally:
+        s.close()
+
+def _tls_conn(port, sni):
+    """连本机 port，但按 sni 校验证书（校验的是证书内容，跟连 127.0.0.1 不冲突）。"""
+    raw = socket.create_connection(("127.0.0.1", port), timeout=8)
+    try:
+        return ssl.create_default_context().wrap_socket(raw, server_hostname=sni)
+    except Exception:
+        raw.close(); raise
+
+def _q_dot(port, sni, name):
+    """DoT 查询：TLS 里发 2 字节长度前缀 + DNS 报文。顺带把服务端证书带回来。"""
+    try:
+        c = _tls_conn(port, sni)
+    except Exception as e:
+        return (-1, []), None, f"{type(e).__name__}: {e}"
+    cert = c.getpeercert()          # 必须握手后立刻取：连接一关再取会抛 handshake not done
+    try:
+        q = _dns_packet(name)
+        c.sendall(struct.pack(">H", len(q)) + q)
+        head = c.recv(2)
+        if len(head) < 2:
+            return (-1, []), cert, "服务端没回数据"
+        need = struct.unpack(">H", head)[0]
+        buf = b""
+        while len(buf) < need:
+            chunk = c.recv(need - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return _dns_parse(buf), cert, ""
+    except Exception as e:
+        return (-1, []), cert, f"{type(e).__name__}: {e}"
+    finally:
+        try: c.close()
+        except Exception: pass
+
+def _q_doh(port, sni, name):
+    try:
+        c = _tls_conn(port, sni)
+    except Exception as e:
+        return -1, None, f"{type(e).__name__}: {e}"
+    cert = c.getpeercert()          # 同上：服务端 Connection: close 后就取不到了
+    try:
+        d = base64.urlsafe_b64encode(_dns_packet(name)).rstrip(b"=").decode()
+        c.sendall((f"GET /dns-query?dns={d} HTTP/1.1\r\nHost: {sni}\r\n"
+                   "Accept: application/dns-message\r\nConnection: close\r\n\r\n").encode())
+        buf = b""
+        while True:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        first = buf.split(b"\r\n", 1)[0].decode(errors="replace")
+        m = re.search(r"\s(\d{3})\s", first + " ")
+        return (int(m.group(1)) if m else -1), cert, ""
+    except Exception as e:
+        return -1, cert, f"{type(e).__name__}: {e}"
+    finally:
+        try: c.close()
+        except Exception: pass
+
+def _cert_days_left(peercert):
+    """优先用握手拿到的证书（那才是真正在服务的），拿不到就读证书文件。"""
+    exp = ""
+    if peercert and peercert.get("notAfter"):
+        exp = peercert["notAfter"]
+    elif os.path.exists(ACME_CRT):
+        out = sh(f"openssl x509 -enddate -noout -in {ACME_CRT} 2>/dev/null")
+        exp = out.split("=", 1)[1].strip() if "=" in out else ""
+    if not exp:
+        return None, ""
+    try:
+        return int((ssl.cert_time_to_seconds(exp) - time.time()) // 86400), exp
+    except Exception:
+        return None, exp
+
+def selfcheck():
+    """一键自检：服务 / 监听 / 证书 / 真实解析 / 访问控制 / 本机防火墙。只读不改任何配置。"""
+    G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    ok, warn, bad = f"{G}✓{N}", f"{Y}⚠{N}", f"{R}✗{N}"
+    print("\n" + "=" * 60 + "\n  自建DNS 自检（只读，不会改任何配置）\n" + "=" * 60)
+    if not _installed():
+        print(f"  {bad} 还没装 AdGuard Home——先回菜单选『1 安装』。"); return
+    dom, ip = _domain(), _public_ip()
+    fix = []                                     # 收集结论里要给的处置建议
+
+    # ---- 1 服务 ----
+    print("\n  【1/6 服务】")
+    if _running():
+        print(f"    {ok} AdGuardHome 运行中")
+    else:
+        print(f"    {bad} AdGuardHome {R}没在运行{N} —— 所有指到它的设备都会没 DNS")
+        print("       看原因: journalctl -u AdGuardHome -n 30 --no-pager")
+        fix.append("先把服务起来: systemctl restart AdGuardHome")
+
+    try: txt = open(_agh_yaml()).read()
+    except OSError:
+        txt = ""
+        print(f"    {warn} 读不到 {_agh_yaml()}（可能还没走完网页初始化向导）")
+    tb = _tls_block(txt)
+    enc_on = _yaml_val(tb, "enabled") == "true"
+    sname  = _yaml_val(tb, "server_name")
+    p_dot  = int(_yaml_val(tb, "port_dns_over_tls") or 0)
+    p_doh  = int(_yaml_val(tb, "port_https") or 0)
+    web    = _current_web_port()
+
+    # ---- 2 监听 ----
+    print("\n  【2/6 端口监听】")
+    b53 = _port_busy(53)
+    if "AdGuardHome" in b53:
+        print(f"    {ok} 53   明文DNS  由 AdGuardHome 监听")
+    elif b53:
+        print(f"    {bad} 53   被 {R}{b53}{N} 占着，不是 AdGuardHome —— 明文DNS用不了")
+        fix.append("腾 53：回菜单选『4 腾出 53 端口』")
+    else:
+        print(f"    {warn} 53   没人监听 —— 明文DNS用不了（AGH 可能没配 53 或没起来）")
+    if web:
+        print(f"    {ok} {web:<5}网页后台   http://{ip}:{web}")
+    if not enc_on:
+        print(f"    {warn} 加密(DoT/DoH) {Y}没开{N} —— 安卓「私人DNS」用不了，只能用明文 53")
+        if dom:
+            fix.append("要用安卓私人DNS：后台 → 设置 → 加密设置，按菜单『3 查看状态』里的第二步填")
+    else:
+        for p, label in ((p_dot, "853  DoT "), (p_doh, "10443 DoH")):
+            if not p:
+                continue
+            who = _port_busy(p)
+            tag = ok if "AdGuardHome" in who else (bad if who else warn)
+            note = "由 AdGuardHome 监听" if "AdGuardHome" in who else (f"被 {who} 占" if who else "没人监听")
+            print(f"    {tag} {label} {note}")
+
+    # ---- 3 证书 ----
+    print("\n  【3/6 证书】")
+    peer = None
+    if not dom:
+        print(f"    {warn} 装节点时没用域名 —— 加密用不了，跳过")
+    elif not enc_on:
+        print(f"    {warn} 加密没开，跳过")
+    else:
+        if sname and sname != dom:
+            print(f"    {bad} 加密设置里的「服务器名称」是 {R}{sname}{N}，和你的域名 {dom} 对不上")
+            fix.append(f"把加密设置里的服务器名称改成 {dom}")
+        else:
+            print(f"    {ok} 服务器名称 {sname or dom}")
+
+    # ---- 4 真实解析 ----
+    print("\n  【4/6 真实解析测试】(本机直连，绕开公网)")
+    probe = "www.qq.com"
+    if not ("AdGuardHome" in b53 or (enc_on and dom and (p_dot or p_doh))):
+        print(f"    {warn} 没有可测的服务（53 不在 AGH 手上，加密也没开）—— 先把上面两步弄好")
+    if "AdGuardHome" in b53:
+        (rc, ips), err = _q_plain(53, probe)
+        if rc == 0 and ips:
+            print(f"    {ok} 明文 53  解析 {probe} → {ips[0]}")
+        else:
+            print(f"    {bad} 明文 53  {R}解析失败{N} {err or f'rcode={rc}'}")
+            fix.append("53 解析不出来：看后台『设置 → DNS设置 → 上游DNS服务器』是否填了能用的上游")
+    if enc_on and dom and p_dot:
+        (rc, ips), peer, err = _q_dot(p_dot, dom, probe)
+        if rc == 0 and ips:
+            print(f"    {ok} DoT {p_dot}  握手+解析都正常 → {ips[0]}   {G}(安卓私人DNS 可用){N}")
+        else:
+            print(f"    {bad} DoT {p_dot}  {R}失败{N}: {err or f'rcode={rc}'}")
+            print(f"       {Y}这一条挂掉 = 填了私人DNS 的安卓机会整机断网{N}")
+            if "CERTIFICATE" in err.upper() or "SSLCert" in err:
+                fix.append("DoT 证书校验没过：证书过期或填的不是 acme 真证书，去加密设置重填 "
+                           f"{ACME_CRT} / {ACME_KEY}")
+            else:
+                fix.append("DoT 连不上：确认加密设置里 DoT 端口填了、服务已重启")
+    if enc_on and dom and p_doh:
+        code, pc, err = _q_doh(p_doh, dom, probe)
+        peer = peer or pc
+        if code == 200:
+            print(f"    {ok} DoH {p_doh} 正常 (HTTP 200)")
+        else:
+            print(f"    {bad} DoH {p_doh} {R}失败{N}: {err or f'HTTP {code}'}")
+    days, exp = _cert_days_left(peer)
+    if days is not None:
+        tag = ok if days > 20 else (warn if days > 7 else bad)
+        print(f"    {tag} 证书还有 {days} 天到期（{exp}）")
+        if days <= 20:
+            fix.append(f"证书 {days} 天后到期——续期后记得 systemctl restart AdGuardHome 让 AGH 重新加载")
+    # 顺手验一下广告到底拦没拦
+    if "AdGuardHome" in b53:
+        (rc, ips), _ = _q_plain(53, "doubleclick.net")
+        if rc == 3 or (ips and ips[0] in ("0.0.0.0", "127.0.0.1")) or (rc == 0 and not ips):
+            print(f"    {ok} 广告过滤生效（doubleclick.net 已被拦）")
+        elif rc == 0 and ips:
+            print(f"    {warn} doubleclick.net 没被拦 → {ips[0]}；后台『过滤器』里确认拦截名单是开的")
+
+    # ---- 5 访问控制（这次把你锁在外面的就是它）----
+    print("\n  【5/6 访问控制】")
+    allow = _yaml_list(txt, "allowed_clients")
+    deny  = _yaml_list(txt, "disallowed_clients")
+    if allow:
+        print(f"    {bad} 允许列表里只放了: {R}{', '.join(allow)}{N}")
+        print(f"       {Y}这表示除这些来源外一律拒绝。手机一从 WiFi 切到 4G，出口IP 变了就会被拒，")
+        print(f"       而私人DNS 没有回落 → 整机解析全挂。{N}")
+        fix.append("后台 → 设置 → 客户端设置 → 访问设置：把「允许的客户端」清空"
+                   "（在外面用移动网络的设备没法固定 IP）")
+    else:
+        print(f"    {ok} 没设允许列表（任何来源可查）—— 移动网络下也能用")
+        if allow == []:
+            print(f"       {Y}注意：这同时意味着它是台公开解析器，别到处外传你的域名。{N}")
+    if deny:
+        print(f"    {warn} 拒绝列表: {', '.join(deny)}")
+
+    # ---- 6 本机防火墙 ----
+    print("\n  【6/6 本机防火墙】")
+    hit = False
+    u = sh("ufw status 2>/dev/null")
+    if "Status: active" in u:
+        hit = True
+        print(f"    {warn} ufw 已启用，确认这些端口放行了：53(UDP+TCP)"
+              + (f" / {p_dot}(TCP) / {p_doh}(TCP)" if enc_on else "")
+              + (f" / {web}(TCP)" if web else ""))
+    if sh("firewall-cmd --state 2>/dev/null") == "running":
+        hit = True
+        print(f"    {warn} firewalld 正在运行，确认上述端口已放行")
+    if not hit:
+        print(f"    {ok} 本机没启用 ufw/firewalld")
+    print(f"    {Y}提醒：本机没拦 ≠ 外面能连。{N}云商（DMIT/甲骨文等）的安全组是另一层，")
+    print( "       上面 4/6 全绿但手机连不上，那就一定是安全组没放行。")
+
+    # ---- 结论 ----
+    print("\n  " + "-" * 56)
+    if fix:
+        print(f"  {Y}要处理的事：{N}")
+        for i, f in enumerate(fix, 1):
+            print(f"    {i}. {f}")
+    else:
+        print(f"  {G}全部正常。{N}")
+    print(f"\n  {Y}万一手机整机没网、又连不上代理自救：{N}")
+    print( "    设置 → 网络和互联网 → 私人DNS → 改成「关闭」或「自动」，解析立刻恢复。")
+
 def _selfdns_toggle():
     """把"自建DNS写入订阅"的开关交给主脚本处理（订阅生成/刷新都在主脚本里）。"""
     xy = BGP_DIR + "/xy-installer.py"
@@ -334,6 +652,7 @@ def menu():
         print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
         print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
         print("  6 把自建DNS写入订阅配置（开/关：第一次写入·再点移除，自动刷新）")
+        print("  7 自检（服务/端口/证书/解析/访问控制 一次查清，只读不改）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -342,6 +661,7 @@ def menu():
         elif c == "4": free_port53()
         elif c == "5": change_web_port()
         elif c == "6": _selfdns_toggle()
+        elif c == "7": selfcheck()
         elif c in ("0", ""):
             return
 
