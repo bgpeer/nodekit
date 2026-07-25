@@ -2735,20 +2735,32 @@ def ghrelay_menu():
         elif c == "3":
             if not on:
                 print("  当前用的是 gh-proxy，先『1』开启本机中转再操作。"); continue
-            print(f"\n  当前订阅端口：{sub_port()}")
-            print("  ⚠ 换端口后订阅地址会变，客户端要【重新导入订阅】；而且新端口\033[1;31m必须先在 VPS 服务商防火墙/安全组放行\033[0m，")
-            print("     否则订阅+中转+图标全部打不开（很多机房如 DMIT 默认只开你装机时的端口）！")
-            print("  建议：先去防火墙放行好一个端口，再填在这里。")
+            R, N = "\033[1;31m", "\033[0m"
             cur = sub_port()
-            s = _ask("  输入新订阅端口（1024-65535，务必已放行；直接回车=取消不改）: ").strip()
-            if not s:
+            print(f"\n  当前订阅端口：{cur}")
+            print(f"  ⚠ 换端口后订阅地址会变，客户端要【重新导入订阅】；新端口{R}须在 VPS 防火墙/安全组放行{N}，")
+            print("     否则订阅+中转+图标全部打不开（很多机房如 DMIT 默认只开装机时的端口）。")
+            newp = None
+            while True:                                       # 输错/冲突就退回重输，不用退出菜单重来
+                s = _ask("  新订阅端口（回车=随机挑一个 / 输 n 返回）: ").strip().lower()
+                if s in ("n", "no"):
+                    break
+                if not s:                                     # 回车 → 随机（自动避开已占端口/hy2 跳跃段）
+                    try:
+                        newp = _pick_sub_port()
+                    except RuntimeError as e:
+                        print(f"  {R}{e}{N}"); continue
+                    print(f"  已随机挑到：\033[1;32m{newp}\033[0m（记得防火墙放行它）")
+                    break
+                if not s.isdigit() or not (1024 <= int(s) <= 65535):
+                    print(f"  {R}端口无效{N}：请输入 1024-65535 的数字（或回车=随机 / n=返回）。"); continue
+                p = int(s)
+                if p != cur and not port_free(p):
+                    print(f"  {R}端口冲突{N}：{p} 已被本机其它服务/节点占用，请换一个。"); continue
+                newp = p; break
+            if newp is None:                                  # 输了 n
                 continue
-            if not s.isdigit() or not (1024 <= int(s) <= 65535):
-                print("  端口无效。"); continue
-            newp = int(s)
-            if newp != cur and not port_free(newp):
-                print(f"  {newp} 本机已被占用（可能是节点端口），换一个。"); continue
-            if _ask(f"  确认把订阅端口改为 {newp}（已在防火墙放行）? [y/N]: ").strip().lower() not in ("y", "yes"):
+            if _ask(f"  确认把订阅端口改为 {newp}? [y/N]: ").strip().lower() not in ("y", "yes"):
                 continue
             set_sub_port(newp)
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))
