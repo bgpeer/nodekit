@@ -78,9 +78,20 @@ sudo python3 /tmp/xy.py
 > **`13 GitHub中转`**：订阅里的**规则集/图标链接**默认用第三方 `gh-proxy.com` 中转（国内直连 GitHub 常被墙）。
 > 本项把它换成**本机自建中转**——用你自己的域名 `https://本机域名:订阅端口/<token>/gh/...`，不再依赖别人的服务。
 > **默认开**（有域名+真证书时）。子菜单：`1` **本机中转写入配置（开/关）**、`2` **刷新中转 token**（防别人蹭，旧地址立即失效 + 自动刷新订阅；订阅端口不变、客户端自动更新即可）、`3` **刷新 token + 换端口**（更狠：连订阅端口一起换随机、自动避开节点端口；⚠ 换端口后订阅地址变，需重开防火墙 + 客户端重新导入订阅）。
-> 自定义模板若没写 `gh-proxy.com`，改写找不到就原样不动——**不影响、不破坏**自定义模板（只是它享受不到本机中转）。
+> **认哪些链接**：以 **GitHub 原始文件主机名**为准（`raw.githubusercontent.com`、`gist.githubusercontent.com`、
+> `objects.githubusercontent.com`），`gh-proxy.com` 前缀**可有可无**——很多人写模板不会加前缀，靠主机名识别才可靠。
+> 三种写法都能自动改走本机中转：
+> ```
+> https://raw.githubusercontent.com/…              裸链接，自动识别
+> https://gh-proxy.com/https://raw.github…         老写法，前缀会被整段替换
+> https://随便哪个镜像/https://raw.github…          别人的镜像也整段替换（不会套娃）
+> ```
+> **不限仓库**：白名单按**主机**判定、不看是谁的仓库——别人自建中转转**他自己的**仓库同样可用。
+> 裸的 `github.com` 项目页、`codeload` 的面板 zip **不会**被自动改（多为说明链接/大文件，误改无意义）；
+> 确需中转就在模板里显式写代理前缀。改写只作用于**生成出来的订阅**，模板本身不动。
 > - **带 token 防蹭**：中转地址带一段随机 token，别人不知道就用不了；token 文件存在 `/etc/bgpeer`（不在托管目录，不会被下载）。
-> - **只白名单 GitHub**（`raw.githubusercontent.com` 等），**绝不做成开放代理**；与订阅**同端口**（客户端本就从这端口拉订阅，无需额外放行）。
+> - **只白名单 GitHub**（`raw.githubusercontent.com`、`gist.github(usercontent).com`、`github.com`、`codeload.github.com`、
+>   `objects.githubusercontent.com`），**绝不做成开放代理**；与订阅**同端口**（客户端本就从这端口拉订阅，无需额外放行）。
 > - 用本机域名动态注入、**不写死公共模板**（模板里保留 `gh-proxy.com` 作占位/兜底，生成订阅时才替换成你的中转；别人的部署用别人的域名）。
 > ⚠️ 单 IP：你 VPS 的 IP 被墙时中转会失效，但规则集客户端**有缓存、每天才更新**，不会立刻崩；无域名/自签则退回 `gh-proxy`。
 
