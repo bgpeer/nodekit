@@ -576,8 +576,17 @@ def check_domain_or_die():
         raise SystemExit(f"{R}\n❌ 80 端口被占用，acme standalone 无法验证。先停掉占用 80 的服务"
                          f"（nginx/caddy 等）再装，或域名留空用自签，或用 nginx 前置模式。{N}")
 
-# 建议的 reality 借用目标：都是大流量、支持 TLS1.3+h2、不在国内、不套 CDN 的站
-SNI_SUGGESTIONS = "www.microsoft.com / addons.mozilla.org / s0.awsstatic.com / dl.google.com"
+# reality 借用目标池：都是大厂/技术站，实测 TLS1.3+h2+X25519、国内可达、不套乱 CDN。
+# 安装时默认从这里随机挑一个（避免所有人都按回车挤在同一个 SNI 上被针对）。
+REALITY_SNI_POOL = [
+    "www.cisco.com", "www.oracle.com", "www.ibm.com", "www.vmware.com",
+    "www.python.org", "www.mysql.com", "www.mongodb.com", "redis.io", "www.swift.com",
+    "www.intel.com", "www.amd.com", "www.qualcomm.com", "www.dell.com",
+    "www.samsung.com", "academy.nvidia.com",
+    "swcdn.apple.com", "updates.cdn-apple.com", "cdn-dynmedia-1.microsoft.com",
+    "www.bing.com", "www.tesla.com", "s0.awsstatic.com",
+]
+SNI_SUGGESTIONS = " / ".join(REALITY_SNI_POOL[:6]) + " 等"
 
 def _reality_sni_ok(sni):
     """探测 reality 借用目标站是否支持 TLS1.3 + HTTP/2。返回 (ok, 说明)。
@@ -3575,7 +3584,8 @@ def install_flow():
     if domain:
         nginx = "1" if (_ask("用 nginx 前置(443伪装站+webroot证书, ws类藏443)? [y/N]: ")
                         .lower() in ("y", "yes")) else ""
-    sni = _ask("reality 借用目标站 SNI (回车=s0.awsstatic.com): ") or "s0.awsstatic.com"
+    _sni_rand = secrets.choice(REALITY_SNI_POOL)         # 回车就用这个随机挑的（不同机器各不同，不扎堆）
+    sni = _ask(f"reality 借用目标站 SNI (回车=随机挑，本次随机到 {_sni_rand}): ") or _sni_rand
     prefix = _ask("节点名称前缀(如 🇺🇸/🇯🇵/家宽，回车=无前缀): ")
     hy2p = ""
     if "hy2" in sb_names:
@@ -3645,7 +3655,7 @@ if __name__ == "__main__":
     ap.add_argument("--xray", default="", help="xray 协议，逗号分隔，或 all")
     ap.add_argument("--domain", default="", help="有域名则走 acme 真证书")
     ap.add_argument("--email", default="", help="acme 注册邮箱")
-    ap.add_argument("--sni", default="s0.awsstatic.com", help="reality 借用的目标站")
+    ap.add_argument("--sni", default="", help="reality 借用的目标站（不填=从内置大厂池随机挑一个）")
     ap.add_argument("--prefix", default="", help="节点名称前缀(如 🇺🇸/🇯🇵)，默认无")
     ap.add_argument("--hy2-ports", default="", help="hy2 端口跳跃范围 起-止，默认 30000-31000；填 off 关闭跳跃走单端口")
     ap.add_argument("--nginx", action="store_true",
@@ -3661,7 +3671,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
 
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["force"] = \
-        a.domain, a.email, a.sni, a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes
+        a.domain, a.email, (a.sni or secrets.choice(REALITY_SNI_POOL)), a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes
     G["reality443"] = "" if a.no_reality_443 else "1"   # 默认把 reality 绑 443（抗封端口）
     G["sni_split"] = "1" if a.sni_split else ""         # 最强：nginx SNI 分流，全上 443
     G["smux"] = "1" if a.smux else ""                   # ws 类多路复用，默认关
