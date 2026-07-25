@@ -361,7 +361,7 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 ```
 
 常用参数：`--sb` / `--xray`（协议，逗号分隔或 `all`）、`--domain`、`--email`、
-`--sni`（reality 借用目标站，默认 `s0.awsstatic.com`）、`--prefix`（节点名前缀）、
+`--sni`（reality 借用目标站，**不填=从内置大厂池随机挑一个**，避免所有人挤在同一个 SNI）、`--prefix`（节点名前缀）、
 `--hy2-ports`（hy2 端口跳跃范围，默认 `30000-31000`；填 `off` 关闭跳跃、走单端口）、`--nginx`、
 `--no-reality-443`（默认会把主力 reality 绑 443 抗封端口，加此参数则不绑）、
 `--yes`（检测到 mack-a 等现有安装直接接管）。
@@ -372,10 +372,12 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 
 装机时脚本会自动做两项检查，帮你把伪装做扎实（都只提示、不阻断安装）：
 
-- **Reality SNI 预检**：选了 reality 系列协议时，装前会探测你借用的 SNI 目标是否
-  **可达 + 支持 TLS1.3 + HTTP/2**。不合格会给黄色警告并建议换站
-  （推荐 `www.microsoft.com` / `addons.mozilla.org` / `s0.awsstatic.com` / `dl.google.com`
-  这类大流量、支持 h2、不套 CDN、不在国内的站）。借用不合格的站会让 reality 握手特征更容易被识别。
+- **Reality SNI 随机池 + 预检**：安装时**默认从内置的大厂/技术站池里随机挑一个**当 reality 借用目标
+  （cisco/oracle/python/intel/dell/苹果CDN/微软 等 21 个，实测 TLS1.3+h2+X25519、国内可达、不套乱 CDN）——
+  避免所有人都按回车挤在同一个 SNI 上被针对。想指定就 `--sni 域名` 或交互里输入。选了 reality 系列协议时，
+  装前还会探测借用目标是否**可达 + 支持 TLS1.3 + HTTP/2**，不合格给黄色警告并建议换站。
+  > ⚠️ 伪装目标要用**国内可达的国外大站**：别用被墙的站（google/youtube 等），更**不能用国内域名**
+  > （国外 IP 配国内 SNI = IP 与 SNI 极度不匹配，最容易被识别）。
 - **无域名自签提示**：不给域名时，依赖证书的 TLS 协议（vless-vision / trojan / ws 家族 / anytls）
   只能走**自签证书 + 客户端 `allowInsecure`**——内容仍加密（各协议有自己的密码/UUID），
   但失去证书校验、且自签本身是明显特征。**想要更强伪装：优先用 `reality-*` 系列**
