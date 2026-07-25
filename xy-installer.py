@@ -226,6 +226,12 @@ def renew_sub_port():
     _SUB_PORT = _pick_sub_port(); _save_sub_port(_SUB_PORT)
     return _SUB_PORT
 
+def set_sub_port(p):
+    """把订阅端口设为指定值并落盘（用于用户手动指定一个已在防火墙放行的端口）。"""
+    global _SUB_PORT
+    _SUB_PORT = p; _save_sub_port(p)
+    return p
+
 def _save_sub_port(p):
     try:
         os.makedirs(BGP_DIR, exist_ok=True)
@@ -2711,15 +2717,27 @@ def ghrelay_menu():
         elif c == "3":
             if not on:
                 print("  当前用的是 gh-proxy，先『1』开启本机中转再操作。"); continue
-            print("  ⚠ 换端口后【订阅地址也会变】：需在 VPS 防火墙放行新端口、且客户端要【重新导入订阅】（不是刷新）。")
-            if _ask("  确认换端口? [y/N]: ").strip().lower() not in ("y", "yes"):
+            print(f"\n  当前订阅端口：{sub_port()}")
+            print("  ⚠ 换端口后订阅地址会变，客户端要【重新导入订阅】；而且新端口\033[1;31m必须先在 VPS 服务商防火墙/安全组放行\033[0m，")
+            print("     否则订阅+中转+图标全部打不开（很多机房如 DMIT 默认只开你装机时的端口）！")
+            print("  建议：先去防火墙放行好一个端口，再填在这里。")
+            cur = sub_port()
+            s = _ask("  输入新订阅端口（1024-65535，务必已放行；直接回车=取消不改）: ").strip()
+            if not s:
                 continue
-            renew_sub_port()                                            # 换新随机端口（避开已绑节点端口/hy2段）
+            if not s.isdigit() or not (1024 <= int(s) <= 65535):
+                print("  端口无效。"); continue
+            newp = int(s)
+            if newp != cur and not port_free(newp):
+                print(f"  {newp} 本机已被占用（可能是节点端口），换一个。"); continue
+            if _ask(f"  确认把订阅端口改为 {newp}（已在防火墙放行）? [y/N]: ").strip().lower() not in ("y", "yes"):
+                continue
+            set_sub_port(newp)
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))
             print("  正在换端口 + token 并刷新订阅…")
             if _ghrelay_regen():
                 print(f"  ✓ 新订阅端口：\033[1;32m{sub_port()}\033[0m　新中转前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
-                print(f"  ▸ 记得：防火墙放行 {sub_port()}、关掉旧端口；客户端到菜单『2 节点链接/订阅』复制新订阅地址重新导入。")
+                print(f"  ▸ 客户端到菜单『2 节点链接/订阅』复制新订阅地址重新导入；确认防火墙已放行 {sub_port()}、可关掉旧端口。")
             else:
                 print("  刷新失败（没有可用节点？）。")
         elif c in ("0", ""):
