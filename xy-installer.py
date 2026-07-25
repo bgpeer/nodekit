@@ -92,6 +92,7 @@ CN_BLOCK_URL   = _RAW + "cn-block.py"            # 仓库里的 cn-block.py（�
 ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.py
 ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（去广告 DNS·AdGuard Home）
 SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
+GHRELAY_OFF    = BGP_DIR + "/ghrelay.off"        # 开关：规则/图标走本机 GitHub 中转（默认开；存在此文件=用户手动关了）
 
 # 网络优化脚本已并入本仓库（net-optimize.py，BBR/QoS 等内核调优，依赖工具自动安装）；
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
@@ -1311,19 +1312,51 @@ def rotate_links_token():
     t = load_tokens(); t["links"] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
 
 # 订阅托管小服务：有 cert/key 参数就起 HTTPS，否则明文 HTTP（用法：port dir [cert key]）
-_SUB_SERVER_PY = (
-    "import http.server, functools, ssl, sys\n"
-    "port = int(sys.argv[1]); directory = sys.argv[2]\n"
-    "cert = sys.argv[3] if len(sys.argv) > 3 else ''\n"
-    "key  = sys.argv[4] if len(sys.argv) > 4 else ''\n"
-    "H = functools.partial(http.server.SimpleHTTPRequestHandler, directory=directory)\n"
-    "httpd = http.server.ThreadingHTTPServer(('0.0.0.0', port), H)\n"
-    "if cert and key:\n"
-    "    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)\n"
-    "    ctx.load_cert_chain(cert, key)\n"
-    "    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)\n"
-    "httpd.serve_forever()\n"
-)
+# 订阅托管小服务：静态发订阅文件；另带一个 /gh/ GitHub 中转（规则/图标走本机、不依赖 gh-proxy）。
+# 中转和订阅共用同一端口（客户端本就从这端口拉订阅，无需额外放行）。多线程，中转不卡订阅。
+# 安全：中转只白名单 GitHub 几个主机——绝不做成"谁都能拿它转发任意网址"的开放代理。
+_SUB_SERVER_PY = r'''import http.server, ssl, sys, urllib.request, urllib.parse
+port = int(sys.argv[1]); directory = sys.argv[2]
+cert = sys.argv[3] if len(sys.argv) > 3 else ''
+key  = sys.argv[4] if len(sys.argv) > 4 else ''
+ALLOW = ('raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com', 'codeload.github.com')
+class H(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **k):
+        super().__init__(*a, directory=directory, **k)
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        if self.path.startswith('/gh/'):
+            self._relay(); return
+        super().do_GET()
+    def _relay(self):
+        target = self.path[4:]
+        if not target.startswith(('http://', 'https://')):
+            target = 'https://' + target.lstrip('/')
+        try:
+            host = urllib.parse.urlsplit(target).hostname or ''
+        except Exception:
+            host = ''
+        if host not in ALLOW:            # 非 GitHub 主机一律拒，杜绝开放代理滥用
+            self.send_error(403); return
+        try:
+            req = urllib.request.Request(target, headers={'User-Agent': 'xy-sub'})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = r.read(); ct = r.headers.get('Content-Type', 'application/octet-stream')
+            self.send_response(200)
+            self.send_header('Content-Type', ct)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'public, max-age=3600')
+            self.end_headers(); self.wfile.write(data)
+        except Exception:
+            self.send_error(502)
+httpd = http.server.ThreadingHTTPServer(('0.0.0.0', port), H)
+if cert and key:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+'''
 
 def serve_sub(reset=False):
     """SUB_DIR 放 <token>.<ext> 软链指向各格式配置文件；每格式独立 token（存 TOKENS_FILE）。
@@ -1558,7 +1591,7 @@ def _sb_country_groups(tags):
 def build_singbox_sub(nodes, tpl_url):
     """对象级替换锚点：__XY_NODES__ 换节点对象、__XY_GROUPS__ 换国家组、
        __XY_GROUP_NAMES__ 展开国家组名、__PATTERN__:正则 展开命中节点名，再按手写风格序列化。"""
-    cfg = json.loads(fetch_url(tpl_url))
+    cfg = json.loads(_ghrelay_rewrite(fetch_url(tpl_url)))    # 规则/图标链接：开启则改走本机 GitHub 中转
     objs = []
     for key, d in nodes:
         try:
@@ -1694,7 +1727,7 @@ def build_shadowrocket_sub(nodes, tpl_url):
             pass
     if not lines:
         return
-    tpl = fetch_url(tpl_url)
+    tpl = _ghrelay_rewrite(fetch_url(tpl_url))               # 规则/图标链接：开启则改走本机 GitHub 中转
     # 国家检测/成员池 = 注入节点 + 用户手写进模板 [Proxy] 段的静态节点（"名 = 协议,..." 行）
     static = _sr_static_names(tpl)
     groups_txt, names_frag = _sr_country_groups(names_list + static)
@@ -1773,6 +1806,22 @@ def _direct_targets(nodes):
 def _direct_rule_text(kind, val):
     """mihomo / 小火箭通用规则文本：IP 走 IP-CIDR(+no-resolve)，域名走 DOMAIN。"""
     return f"IP-CIDR,{val}/32,DIRECT,no-resolve" if kind == "ip" else f"DOMAIN,{val},DIRECT"
+
+def _ghrelay_prefix():
+    """本机 GitHub 中转前缀 https://域名:订阅端口/gh/ ——默认开（有域名+真证书且没被手动关时）。
+       返回 '' 则用模板里原本的 gh-proxy.com。中转与订阅同端口、只白名单 GitHub、不是开放代理。
+       没域名/自签时返回 ''：中转走 HTTPS 需要真证书，否则客户端拒连，只能退回 gh-proxy。"""
+    if os.path.exists(GHRELAY_OFF):
+        return ""
+    dom = _host()
+    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or "") or not _sub_https():
+        return ""
+    return f"https://{dom}:{sub_port()}/gh/"
+
+def _ghrelay_rewrite(text):
+    """开启时把模板里的 https://gh-proxy.com/ 全换成本机中转前缀；关闭/无域名则原样返回。"""
+    p = _ghrelay_prefix()
+    return text.replace("https://gh-proxy.com/", p) if p else text
 
 def _selfdns_doh():
     """开关开启且本机是域名时，返回本机 AdGuard 的 DoH 地址 https://域名:端口/dns-query，
@@ -1858,7 +1907,7 @@ def _sr_direct_ip(path, targets):
         open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + "\n".join(new), 1))
 
 def gen_mihomo(ylines, nodes, tpl_url):
-    tpl = fetch_url(tpl_url)
+    tpl = _ghrelay_rewrite(fetch_url(tpl_url))               # 规则/图标链接：开启则改走本机 GitHub 中转
     # 国家检测要看"全部节点"：注入的订阅节点 + 用户手写进模板的静态节点。
     # 静态节点名取 proxy-groups 段之前的 name:（策略组名在 proxy-groups 里，且不含国旗，不会误检）。
     static = re.findall(r'name:\s*"([^"]*)"', tpl.split("proxy-groups:")[0])
@@ -2591,6 +2640,33 @@ def adguard_menu():
     if not ensure_remote_script(ADGUARD_URL, ADGUARD_LOCAL):
         print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
     subprocess.run(f"python3 {ADGUARD_LOCAL}", shell=True)
+
+def ghrelay_toggle():
+    """开关：规则/图标链接走【本机 GitHub 中转】还是 gh-proxy.com（别人的）。默认走本机中转。
+       循环切换 + 自动刷新订阅。需域名+真证书（中转走 HTTPS）。中转只白名单 GitHub，非开放代理。"""
+    dom = _host()
+    if not (re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or "") and _sub_https()):
+        print("  需要域名 + acme 真证书才能自建中转（走 HTTPS）；当前无域名/自签，只能用 gh-proxy。"); return
+    if not read_saved_links():
+        print("  还没有节点，先『1.安装』。"); return
+    on = not os.path.exists(GHRELAY_OFF)
+    print("\n  规则/图标链接中转 —— 当前：" + ("\033[1;32m本机中转\033[0m" if on else "gh-proxy.com（别人的）"))
+    if on:
+        if _ask("  改回用 gh-proxy(别人的服务)? [y/N]: ").strip().lower() not in ("y", "yes"):
+            return
+        open(GHRELAY_OFF, "w").write("1"); act = "已改回 gh-proxy"
+    else:
+        try: os.remove(GHRELAY_OFF)
+        except OSError: pass
+        act = "已切回本机中转"
+    G["host"] = dom; ensure_deps()
+    if build_subscription(read_saved_links()):               # 重新生成三格式 + 重写托管服务（含中转）
+        print(f"\n  ✓ {act}，订阅已刷新。")
+        if not os.path.exists(GHRELAY_OFF):
+            print(f"  中转地址前缀：https://{dom}:{sub_port()}/gh/ （只转发 GitHub、与订阅同端口）")
+        print("  客户端重新拉一次订阅即生效。")
+    else:
+        print("  刷新失败（没有可用节点？）。")
 
 def selfdns_toggle():
     """开关：把本机自建 DNS(AdGuard DoH) 写进订阅配置的 DNS，循环切换、写/删后自动刷新订阅。
@@ -3487,9 +3563,10 @@ def main_menu():
         print("  10. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
         print("  11. 网络优化（BBR/QoS 内核调优）")
         print("  12. 自建DNS（AdGuard Home·全设备去广告）")
-        print("  13. 更新脚本（不影响节点）")
-        print("  14. 更新核心（sing-box / xray）")
-        print("  15. 卸载")
+        print("  13. GitHub中转（规则/图标走本机·默认开，可关）")
+        print("  14. 更新脚本（不影响节点）")
+        print("  15. 更新核心（sing-box / xray）")
+        print("  16. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -3508,9 +3585,10 @@ def main_menu():
         elif c == "10":  bt_menu()
         elif c == "11":  net_optimize_menu()
         elif c == "12":  adguard_menu()
-        elif c == "13":  update_script()
-        elif c == "14":  update_cores()
-        elif c == "15":  uninstall_all()
+        elif c == "13":  ghrelay_toggle()
+        elif c == "14":  update_script()
+        elif c == "15":  update_cores()
+        elif c == "16":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
