@@ -1329,6 +1329,7 @@ cert = sys.argv[4] if len(sys.argv) > 4 else ''
 key  = sys.argv[5] if len(sys.argv) > 5 else ''
 ALLOW = ('raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com', 'codeload.github.com')
 class H(http.server.SimpleHTTPRequestHandler):
+    timeout = 30                     # 读请求超时：卡住的客户端不会永久占着线程
     def __init__(self, *a, **k):
         super().__init__(*a, directory=directory, **k)
     def log_message(self, *a):
@@ -1366,11 +1367,28 @@ class H(http.server.SimpleHTTPRequestHandler):
             self.end_headers(); self.wfile.write(data)
         except Exception:
             self.send_error(502)
-httpd = http.server.ThreadingHTTPServer(('0.0.0.0', port), H)
+class S(http.server.ThreadingHTTPServer):
+    """TLS 握手必须在工作线程里做。若像以前那样 wrap 监听 socket，accept() 会在主循环
+       内完成握手——只要有客户端连上却不握手（mihomo 并发拉几十个规则集时很常见），
+       主循环就被堵死、后续订阅/中转全部连不上（表现为 active 但 EOF/超时、队列堆积）。"""
+    daemon_threads = True
+    request_queue_size = 128          # 默认 5 太小，并发拉规则时瞬间排满
+    ctx = None
+    def process_request_thread(self, request, client_address):
+        if self.ctx is not None:
+            try:
+                request.settimeout(20)                    # 握手不能无限等
+                request = self.ctx.wrap_socket(request, server_side=True)
+            except Exception:
+                try: self.shutdown_request(request)
+                except Exception: pass
+                return
+        super().process_request_thread(request, client_address)
+httpd = S(('0.0.0.0', port), H)
 if cert and key:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
-    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    httpd.ctx = ctx
 httpd.serve_forever()
 '''
 
