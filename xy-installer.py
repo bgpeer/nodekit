@@ -2683,11 +2683,12 @@ def ghrelay_menu():
             print(f"  中转地址前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
             print("  （只转发 GitHub、与订阅同端口、带 token 防蹭）")
         print("-" * 60)
-        print("  1 " + ("改回用 gh-proxy（别人的）" if on else "切到本机中转"))
-        print("  2 刷新中转 token（防别人蹭：旧地址立即失效 + 刷新订阅）")
+        print(f"  1 本机中转 写入配置（开/关）   [当前：{'开' if on else '关（用 gh-proxy）'}]")
+        print("  2 刷新中转 token（防别人蹭：旧地址立即失效 + 刷新订阅；订阅端口不变、客户端自动更新即可）")
+        print("  3 刷新 token + 换端口（更狠：连订阅端口一起换随机·自动避开节点端口）")
         print("  0 返回")
         c = _ask("选择: ").strip()
-        if c in ("1", "2") and not read_saved_links():
+        if c in ("1", "2", "3") and not read_saved_links():
             print("  还没有节点，先『1.安装』。"); continue
         if c == "1":
             if on:
@@ -2699,12 +2700,26 @@ def ghrelay_menu():
             print("  ✓ 已切换并刷新订阅，客户端重拉即生效。" if _ghrelay_regen() else "  刷新失败（没有可用节点？）。")
         elif c == "2":
             if not on:
-                print("  当前用的是 gh-proxy，先『1』切到本机中转再刷 token。"); continue
+                print("  当前用的是 gh-proxy，先『1』开启本机中转再刷 token。"); continue
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))   # 换新 token，旧的立即失效
             print("  正在换 token 并刷新订阅…")
             if _ghrelay_regen():
                 print(f"  ✓ 已换新 token，旧中转地址立即失效。新前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
-                print("  客户端重新拉一次订阅即用新 token。")
+                print("  客户端重新拉一次订阅即用新 token（订阅地址端口没变，自动更新即可）。")
+            else:
+                print("  刷新失败（没有可用节点？）。")
+        elif c == "3":
+            if not on:
+                print("  当前用的是 gh-proxy，先『1』开启本机中转再操作。"); continue
+            print("  ⚠ 换端口后【订阅地址也会变】：需在 VPS 防火墙放行新端口、且客户端要【重新导入订阅】（不是刷新）。")
+            if _ask("  确认换端口? [y/N]: ").strip().lower() not in ("y", "yes"):
+                continue
+            renew_sub_port()                                            # 换新随机端口（避开已绑节点端口/hy2段）
+            open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))
+            print("  正在换端口 + token 并刷新订阅…")
+            if _ghrelay_regen():
+                print(f"  ✓ 新订阅端口：\033[1;32m{sub_port()}\033[0m　新中转前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
+                print(f"  ▸ 记得：防火墙放行 {sub_port()}、关掉旧端口；客户端到菜单『2 节点链接/订阅』复制新订阅地址重新导入。")
             else:
                 print("  刷新失败（没有可用节点？）。")
         elif c in ("0", ""):
