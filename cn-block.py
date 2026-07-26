@@ -30,8 +30,24 @@ CN_WHITELIST = [
   "xiaohongshu", 
   "alibaba", 
   "tencent", 
-  "kuaishou", 
+  "kuaishou",
   "geolocation-!cn"
+]
+
+# ── 写死的单条放行（改这里 = 所有装了本脚本的机器都生效）───────────────────────
+# 和菜单「4 单条放行域名/IP」是同一套机制，两边的条目会合并、自动去重。区别：
+#   · 写在这里     → 跟着脚本走，改一次全网生效；但只能改【仓库里的】cn-block.py，
+#                    因为 VPS 上的 /etc/bgpeer/cn-block.py 每次进菜单都会被重新下载覆盖
+#   · 菜单里加     → 只对这台机器生效，存在 /etc/bgpeer/cnblock.json，更新脚本不会丢
+# 域名和 IP 分开两个列表，各自只按自己的类型校验，不做自动识别，避免把打错的 IP
+# （如 999.1.1.1）当成域名收下变成一条永不命中的死规则。
+ALLOW_DOMAINS = [
+    # "example.com",        # 后缀匹配：连同它的所有子域一起放行
+]
+ALLOW_IPS = [
+    # "1.2.3.4",            # 单个 IP，自动补成 /32
+    # "10.0.0.0/8",         # CIDR
+    # "2001:db8::/32",      # IPv6 也行
 ]
 
 def sh(cmd, check=True):
@@ -133,33 +149,87 @@ _DOM_RE = re.compile(
     r"^(?=.{1,253}$)[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
     r"(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)+$")
 
-def parse_wl_entry(s):
-    """把用户输入解析成 ('ip', CIDR) / ('domain', 域名) / (None, 原因)。
-       宽容常见写法：*.x.com、+.x.com、.x.com、结尾多余的点、大写、中文域名(转 punycode)。"""
+def _clean(s):
+    """去掉常见的前缀/大小写/结尾点等写法差异。"""
     s = (s or "").strip().lower().rstrip(".")
     for p in ("*.", "+.", "."):
         if s.startswith(p):
             s = s[len(p):]
+    return s
+
+def norm_domain(s):
+    """只按【域名】校验，返回规范化域名或 (None, 原因)。中文域名转 punycode。"""
+    s = _clean(s)
     if not s:
         return None, "不能为空"
-    try:                                   # 先试 IP/CIDR——域名正则也能匹配 1.2.3.4，顺序不能反
-        return "ip", str(ipaddress.ip_network(s, strict=False))
-    except ValueError:
-        pass
-    if ":" in s or re.fullmatch(r"[\d.]+(/\d+)?", s):     # 看着就是 IP 却没解析成功 → 打错了
-        return None, "IP/CIDR 格式不对"
-    if not s.isascii():                                   # 中文域名 → punycode
+    if ":" in s or re.fullmatch(r"[\d.]+(/\d+)?", s):
+        return None, "这看着是 IP，请写到 IP 列表里"
+    if not s.isascii():
         try:
             s = s.encode("idna").decode()
         except Exception:
             return None, "域名含无法编码的字符"
-    if _DOM_RE.match(s):
-        return "domain", s
-    return None, "既不是合法域名，也不是合法 IP/CIDR"
+    if not _DOM_RE.match(s):
+        return None, "不是合法域名"
+    return s, ""
+
+def norm_ip(s):
+    """只按【IP / CIDR】校验，返回规范化 CIDR 或 (None, 原因)。单个 IP 自动补掩码。"""
+    s = _clean(s)
+    if not s:
+        return None, "不能为空"
+    try:
+        return str(ipaddress.ip_network(s, strict=False)), ""
+    except ValueError:
+        return None, "不是合法 IP/CIDR"
+
+def parse_wl_entry(s):
+    """菜单交互用：自动判断是域名还是 IP，返回 ('ip'|'domain', 值) / (None, 原因)。
+       先试 IP——域名正则也能匹配 1.2.3.4，顺序反了会把 IP 当域名。
+       看着像 IP 却解析失败（999.1.1.1）直接报错，不默默当成永不命中的域名。"""
+    s = _clean(s)
+    if not s:
+        return None, "不能为空"
+    v, _ = norm_ip(s)
+    if v:
+        return "ip", v
+    if ":" in s or re.fullmatch(r"[\d.]+(/\d+)?", s):
+        return None, "IP/CIDR 格式不对"
+    v, why = norm_domain(s)
+    return ("domain", v) if v else (None, why)
+
+def _script_custom():
+    """脚本里写死的单条放行。域名/IP 分开校验，写错的跳过并提示，不让它污染配置。"""
+    doms, ips = [], []
+    for raw in ALLOW_DOMAINS:
+        v, why = norm_domain(raw)
+        if v:
+            doms.append(v)
+        else:
+            print(f"  跳过 ALLOW_DOMAINS 里的 {raw!r}：{why}")
+    for raw in ALLOW_IPS:
+        v, why = norm_ip(raw)
+        if v:
+            ips.append(v)
+        else:
+            print(f"  跳过 ALLOW_IPS 里的 {raw!r}：{why}")
+    return doms, ips
 
 def _wl_custom(cfg):
-    """取已保存的单条放行列表 (domains, ips)。"""
-    return list(cfg.get("wl_domains") or []), list(cfg.get("wl_ips") or [])
+    """单条放行的最终列表 = 脚本写死的 + 菜单加的，按顺序去重。
+       存量条目也过一遍规范化：手改过 cnblock.json 时 8.8.8.8 与 8.8.8.8/32
+       会被当成两条而去重失败，统一成 CIDR 形式才能真正去重。"""
+    sd, si = _script_custom()
+    doms, ips = list(sd), list(si)
+    for raw in (cfg.get("wl_domains") or []):
+        v, _ = norm_domain(raw)
+        if v:
+            doms.append(v)
+    for raw in (cfg.get("wl_ips") or []):
+        v, _ = norm_ip(raw)
+        if v:
+            ips.append(v)
+    return list(dict.fromkeys(doms)), list(dict.fromkeys(ips))
 
 def _whitelist_tags(cfg):
     """取白名单 tag 列表：作者名单 / 自定义名单。
@@ -427,11 +497,19 @@ def custom_allow_menu():
     R, G, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
     while True:
         cfg = cnblock_load()
-        doms, ips = _wl_custom(cfg)
+        sd, si = _script_custom()                        # 脚本写死的：菜单里删不掉
+        doms = list(cfg.get("wl_domains") or [])         # 本机加的：可增删
+        ips = list(cfg.get("wl_ips") or [])
         items = [("域名", d) for d in doms] + [("IP", i) for i in ips]
         print("\n" + "-" * 60)
         print("  单条放行（域名 / IP）—— 命中即直连，不被 CN 屏蔽拦下")
         print("-" * 60)
+        if sd or si:
+            print("  脚本内置（改仓库里的 cn-block.py 才能动，这里删不掉）:")
+            for v in sd: print(f"      [域名] {v}")
+            for v in si: print(f"      [IP]   {v}")
+            print()
+        print("  本机添加:")
         if items:
             for n, (kind, v) in enumerate(items, 1):
                 print(f"    {n:>2}. [{kind}] {v}")
@@ -452,6 +530,8 @@ def custom_allow_menu():
                 kind, val = parse_wl_entry(raw)
                 if not kind:
                     print(f"    {R}跳过 {raw!r}{N}：{val}"); continue
+                if val in (sd if kind == "domain" else si):
+                    print(f"    脚本内置里已有，跳过：{val}"); continue
                 key = "wl_domains" if kind == "domain" else "wl_ips"
                 lst = list(cfg.get(key) or [])
                 if val in lst:
