@@ -99,6 +99,11 @@ GHRELAY_TOKEN_FILE = BGP_DIR + "/ghrelay.token"  # 本机中转的 token（防�
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
 NETOPT_LOCAL = BGP_DIR + "/net-optimize.py"      # 本地缓存的网络优化脚本
 NETOPT_URL   = _RAW + "net-optimize.py"
+# 网络优化的落盘状态（net-optimize.py 写的，卸载时 rmtree 整个目录）：
+#   config           KEY=VAL，含 ADAPTIVE_QOS_MODE（adaptive / fixed_cake）
+#   adaptive-qos.conf JSON，含 threshold（激活阈值，单位字节）
+NETOPT_CONFIG   = "/etc/net-optimize/config"
+NETOPT_ADAPTIVE = "/etc/net-optimize/adaptive-qos.conf"
 
 # CDN 灾备节点：独立 sing-box 实例(VLESS+WS+TLS)，靠 Cloudflare 橙云中转——
 # 客户端连的是 CF 的 IP，VPS 真 IP 被墙时仍能续命。与主节点隔离，重装主节点不受影响。
@@ -2849,15 +2854,60 @@ def _run_net_optimize(args="", env_extra=None):
     subprocess.run(f"python3 {NETOPT_LOCAL} {args}".strip(), shell=True,
                    env=dict(os.environ, **(env_extra or {})))
 
+def _netopt_state():
+    """读网络优化当前档位。返回 (mode, mb)：
+       mode = None（未优化）/ 'fixed_cake' / 'adaptive'；
+       mb   = 自适应激活阈值 MB/s（fixed_cake 或读不到时为 None）。"""
+    if not os.path.exists(NETOPT_CONFIG):
+        return None, None
+    mode = "adaptive"
+    try:
+        for ln in open(NETOPT_CONFIG):
+            if ln.startswith("ADAPTIVE_QOS_MODE="):
+                mode = ln.split("=", 1)[1].strip() or "adaptive"
+    except OSError:
+        return None, None
+    if mode == "fixed_cake":
+        return "fixed_cake", None
+    mb = None
+    try:
+        thr = int(json.load(open(NETOPT_ADAPTIVE)).get("threshold", 0))
+        if thr > 0:
+            mb = thr / 1048576.0
+    except Exception:
+        pass
+    return "adaptive", mb
+
+def _fmt_mb(mb):
+    if mb is None:
+        return "?"
+    return str(int(round(mb))) if abs(mb - round(mb)) < 0.05 else f"{mb:.1f}"
+
 def net_optimize_menu():
     """网络优化（本仓库 net-optimize.py：BBR/QoS/缓冲区等内核调优，依赖工具自动安装）。"""
+    G, N, MARK = "\033[1;32m", "\033[0m", "  \033[1;32m← 当前\033[0m"
     while True:
+        mode, mb = _netopt_state()
+        is_10 = mode == "adaptive" and mb is not None and abs(mb - 10) < 0.05
+        if mode is None:
+            cur = "未优化（尚未设置任何档位）"
+        elif mode == "fixed_cake":
+            cur = "固定 cake 纯智能算法（不切换）"
+        elif mb is not None:
+            cur = f"自适应+抢带宽 · {_fmt_mb(mb)}MB/s 激活"
+        else:
+            cur = "自适应+抢带宽（阈值未知）"
+        m1 = MARK if is_10 else ""
+        m2 = MARK if (mode == "adaptive" and mb is not None and not is_10) else ""
+        m3 = MARK if mode == "fixed_cake" else ""
         print("\n" + "=" * 60)
         print("  网络优化（BBR / QoS 内核调优，依赖工具自动安装）")
         print("=" * 60)
-        print("  1 自适应智能算法+抢占带宽（流量 10MB/s 激活，适合内存 <1G 机器）")
-        print("  2 自适应智能算法+抢占带宽（默认 20MB/s 激活、阈值可调，适合内存 2G 左右机器）")
-        print("  3 固定 cake 纯智能算法（不切换，适合高性能机器）")
+        print(f"  当前档位: {G}{cur}{N}")
+        print("-" * 60)
+        print(f"  1 自适应智能算法+抢占带宽（流量 10MB/s 激活，适合内存 <1G 机器）{m1}")
+        print(f"  2 自适应智能算法+抢占带宽（默认 20MB/s 激活、阈值可调，适合内存 2G 左右机器）{m2}")
+        print(f"  3 固定 cake 纯智能算法（不切换，适合高性能机器）{m3}")
         print("  4 网络优化状况（一键检测当前优化状态）")
         print("  5 卸载网络优化（清除全部优化配置，恢复系统默认）")
         print("  0 返回")
