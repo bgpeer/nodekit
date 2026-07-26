@@ -9,7 +9,7 @@
 # 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
-import os, re, sys, json, time, ipaddress, subprocess, urllib.request, urllib.error
+import os, re, ast, sys, json, time, ipaddress, subprocess, urllib.request, urllib.error
 
 SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
@@ -215,12 +215,20 @@ def _script_custom():
             print(f"  跳过 ALLOW_IPS 里的 {raw!r}：{why}")
     return doms, ips
 
+def _link_custom(cfg):
+    """自定义链接里的单条放行（域名/IP）。只在选了「自定义名单」时才算数。"""
+    if cfg.get("wl_mode") != "custom":
+        return [], []
+    d = _link_data(cfg)
+    return (d[1], d[2]) if d else ([], [])
+
 def _wl_custom(cfg):
-    """单条放行的最终列表 = 脚本写死的 + 菜单加的，按顺序去重。
+    """单条放行的最终列表 = 脚本写死的 + 自定义链接里的 + 菜单加的，按顺序去重。
        存量条目也过一遍规范化：手改过 cnblock.json 时 8.8.8.8 与 8.8.8.8/32
        会被当成两条而去重失败，统一成 CIDR 形式才能真正去重。"""
     sd, si = _script_custom()
-    doms, ips = list(sd), list(si)
+    ld, li = _link_custom(cfg)
+    doms, ips = list(sd) + list(ld), list(si) + list(li)
     for raw in (cfg.get("wl_domains") or []):
         v, _ = norm_domain(raw)
         if v:
@@ -231,36 +239,99 @@ def _wl_custom(cfg):
             ips.append(v)
     return list(dict.fromkeys(doms)), list(dict.fromkeys(ips))
 
+_LINK_CACHE = {}                                          # url -> (tags, domains, ips)，避免一次运行里重复拉
+
+def _parse_remote_list(txt):
+    """从远端名单文件里提取 (tags, domains, ips)。
+       ⚠ 只做【解析】，绝不执行远端文件——用 ast.parse 取字面量，拿不到再退回
+         bash 数组 / 纯文本。远端内容一律当数据看待，逐条校验后才使用。
+       支持三种写法：
+         ① Python 列表（推荐，即本脚本同款样板）：
+              WHITELIST_TAGS / CN_WHITELIST = ["bilibili", ...]
+              ALLOW_DOMAINS = ["example.com", ...]
+              ALLOW_IPS     = ["1.2.3.4", ...]
+         ② bash 数组：WHITELIST_TAGS=(...)   （兼容 whitelist-inject.sh）
+         ③ 纯文本：每行一个 tag，# 开头为注释"""
+    tags, doms, ips = [], [], []
+    got = False
+    try:
+        for node in ast.parse(txt).body:                  # ast.parse 只解析不执行
+            if not isinstance(node, ast.Assign):
+                continue
+            for tgt in node.targets:
+                name = getattr(tgt, "id", "")
+                if name not in ("WHITELIST_TAGS", "CN_WHITELIST", "ALLOW_DOMAINS", "ALLOW_IPS"):
+                    continue
+                try:
+                    val = ast.literal_eval(node.value)    # 只认字面量，函数调用等一律取不到
+                except Exception:
+                    continue
+                if not isinstance(val, (list, tuple)):
+                    continue
+                got = True
+                items = [str(x) for x in val]
+                if name in ("WHITELIST_TAGS", "CN_WHITELIST"):
+                    tags += items
+                elif name == "ALLOW_DOMAINS":
+                    doms += items
+                else:
+                    ips += items
+    except (SyntaxError, ValueError):
+        pass                                              # 不是 Python 文件，往下退
+    if not got:
+        m = re.search(r"WHITELIST_TAGS=\(([^)]*)\)", txt, re.S)
+        if m:                                             # bash 数组（whitelist-inject.sh）
+            tags = re.findall(r'[A-Za-z0-9!_.\-]+', m.group(1)); got = True
+    if not got:
+        for ln in txt.splitlines():                       # 纯文本：每行一个 tag
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                tags.append(ln.split()[0])
+    return tags, doms, ips
+
+def _link_data(cfg):
+    """拉取并解析自定义链接，返回校验后的 (tags, domains, ips)。失败返回 None。"""
+    url = (cfg.get("wl_url") or "").strip()
+    if not url:
+        return None
+    if url in _LINK_CACHE:
+        return _LINK_CACHE[url]
+    try:
+        txt = fetch_url(url)
+    except Exception as e:
+        print("  拉取自定义名单失败:", e); return None
+    raw_t, raw_d, raw_i = _parse_remote_list(txt)
+    tags = []
+    for t in raw_t:
+        # 远端内容只当 tag 用，字符集收紧到规则集名允许的范围，防止混入奇怪内容
+        if re.fullmatch(r"[A-Za-z0-9!_.\-]+", t):
+            tags.append(t)
+        else:
+            print(f"  跳过非法 tag: {t!r}")
+    doms, ips = [], []
+    for r in raw_d:
+        v, why = norm_domain(r)
+        if v: doms.append(v)
+        else: print(f"  跳过链接里的域名 {r!r}：{why}")
+    for r in raw_i:
+        v, why = norm_ip(r)
+        if v: ips.append(v)
+        else: print(f"  跳过链接里的 IP {r!r}：{why}")
+    _LINK_CACHE[url] = (tags, doms, ips)
+    return _LINK_CACHE[url]
+
 def _whitelist_tags(cfg):
-    """取白名单 tag 列表：作者名单 / 自定义名单。
-       自定义链接可为纯文本（每行一个 tag，# 注释跳过），
-       也可直接指向 whitelist-inject.sh —— 自动抽取其中 WHITELIST_TAGS=(...) 数组。"""
+    """取白名单 tag 列表：作者名单 / 自定义名单（链接里的 tag 部分）。"""
     mode = cfg.get("wl_mode", "author")
     if mode == "none":
         return []
     if mode == "custom":
-        url = (cfg.get("wl_url") or "").strip()
-        if not url:
+        if not (cfg.get("wl_url") or "").strip():
             print("  未设置自定义放行名单链接，改用作者名单。"); return list(CN_WHITELIST)
-        try:
-            txt = fetch_url(url)
-        except Exception as e:
-            print("  拉取自定义名单失败，改用作者名单:", e); return list(CN_WHITELIST)
-        m = re.search(r"WHITELIST_TAGS=\(([^)]*)\)", txt, re.S)
-        if m:                                            # 直接喂 whitelist-inject.sh：抽数组
-            return re.findall(r'[A-Za-z0-9!_.\-]+', m.group(1))
-        tags = []                                        # 否则按纯文本：每行一个 tag
-        for ln in txt.splitlines():
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            t = ln.split()[0]
-            # 远端内容只当 tag 用，字符集收紧到规则集名允许的范围，防止混入奇怪内容
-            if re.fullmatch(r"[A-Za-z0-9!_.\-]+", t):
-                tags.append(t)
-            else:
-                print(f"  跳过非法 tag: {t!r}")
-        return tags
+        d = _link_data(cfg)
+        if d is None:
+            print("  改用作者名单。"); return list(CN_WHITELIST)
+        return d[0]
     return list(CN_WHITELIST)
 
 def apply_cn_block(cfg=None):
@@ -586,7 +657,7 @@ def menu():
         print("-" * 60)
         print("  1 屏蔽中国域名和IP" + ("（已开，再选可关闭）" if on else ""))
         print("  2 放行白名单（作者名单 / 自定义名单）")
-        print("  3 自定义放行名单脚本链接")
+        print("  3 自定义放行名单脚本链接（规则集 + 单条域名/IP，可抄样板改）")
         print("  4 单条放行域名/IP（自己加，按后缀匹配含子域）")
         print("  5 立即更新（拉取最新放行名单/规则集并生效，不用等每天定时刷新）")
         print("  6 卸载（不想屏蔽了，直接清掉规则）")
@@ -613,7 +684,9 @@ def menu():
                 print(f"  已添加过自定义放行名单链接：{cur}")
                 if _ask("  是否更换? [y/N]: ").lower() not in ("y", "yes"):
                     continue                             # n 返回菜单，不动原链接
-            url = _ask("  自定义放行名单链接(纯文本 tag 列表，或直接指向 whitelist-inject.sh): ").strip()
+            print("  样板可直接抄走改：https://github.com/bgpeer/nodekit/blob/main/whitelist-template.py")
+            print("  支持 WHITELIST_TAGS / ALLOW_DOMAINS / ALLOW_IPS 三个列表；也兼容纯文本 tag 列表、whitelist-inject.sh")
+            url = _ask("  自定义放行名单链接(必须是 raw 链接): ").strip()
             if url:
                 cfg["wl_url"] = url; cfg["wl_mode"] = "custom"; cnblock_save(cfg)
                 print("  已保存，并切到自定义名单。")
