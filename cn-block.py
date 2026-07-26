@@ -9,7 +9,7 @@
 # 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
-import os, re, sys, json, time, subprocess, urllib.request, urllib.error
+import os, re, sys, json, time, ipaddress, subprocess, urllib.request, urllib.error
 
 SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
@@ -125,6 +125,42 @@ def _is_cnblk_rule(r):
     if isinstance(rs, list): return any(str(x).startswith("cnblk-") for x in rs)
     return False
 
+# ── 单条放行（域名 / IP）──────────────────────────────────────────────────────
+# 规则集白名单是「整组放行」(bilibili、tencent 这种)，粒度太粗；这里补一个单条的口子，
+# 用 sing-box 的 inline rule_set 实现（tag 同样以 cnblk- 开头，复用现有的清理逻辑，
+# 不会重复注入）。域名按【后缀】匹配：填 example.com 连它的子域一起放行。
+_DOM_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+    r"(\.[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)+$")
+
+def parse_wl_entry(s):
+    """把用户输入解析成 ('ip', CIDR) / ('domain', 域名) / (None, 原因)。
+       宽容常见写法：*.x.com、+.x.com、.x.com、结尾多余的点、大写、中文域名(转 punycode)。"""
+    s = (s or "").strip().lower().rstrip(".")
+    for p in ("*.", "+.", "."):
+        if s.startswith(p):
+            s = s[len(p):]
+    if not s:
+        return None, "不能为空"
+    try:                                   # 先试 IP/CIDR——域名正则也能匹配 1.2.3.4，顺序不能反
+        return "ip", str(ipaddress.ip_network(s, strict=False))
+    except ValueError:
+        pass
+    if ":" in s or re.fullmatch(r"[\d.]+(/\d+)?", s):     # 看着就是 IP 却没解析成功 → 打错了
+        return None, "IP/CIDR 格式不对"
+    if not s.isascii():                                   # 中文域名 → punycode
+        try:
+            s = s.encode("idna").decode()
+        except Exception:
+            return None, "域名含无法编码的字符"
+    if _DOM_RE.match(s):
+        return "domain", s
+    return None, "既不是合法域名，也不是合法 IP/CIDR"
+
+def _wl_custom(cfg):
+    """取已保存的单条放行列表 (domains, ips)。"""
+    return list(cfg.get("wl_domains") or []), list(cfg.get("wl_ips") or [])
+
 def _whitelist_tags(cfg):
     """取白名单 tag 列表：作者名单 / 自定义名单。
        自定义链接可为纯文本（每行一个 tag，# 注释跳过），
@@ -205,8 +241,25 @@ def apply_cn_block(cfg=None):
     rsets.append({"type": "remote", "tag": "cnblk-cn-ip", "format": "binary", "url": cn_ip,
                   "download_detour": direct_tag, "update_interval": "24h"})
 
-    # 规则顺序：白名单放行（在前，命中即直连不被拦）→ CN 域名拦 → CN IP 拦 → 原有其它规则
+    # 单条放行（域名/IP）：inline rule_set，域名与 IP 必须拆成两条 headless 规则——
+    # 同一条规则里不同字段是 AND 关系，写一起就变成「既要域名匹配又要 IP 匹配」永不命中。
+    # 空数组会被 sing-box 判为非法配置，所以没有条目时整个跳过、不注入空壳。
+    wl_doms, wl_ips = _wl_custom(cfg)
+    custom_ref = ""
+    if wl_doms or wl_ips:
+        hr = []
+        if wl_doms:
+            hr.append({"domain_suffix": wl_doms})        # 后缀匹配：含该域名及其全部子域
+        if wl_ips:
+            hr.append({"ip_cidr": wl_ips})
+        custom_ref = "cnblk-wl-custom"
+        rsets.append({"type": "inline", "tag": custom_ref, "rules": hr})
+
+    # 规则顺序：单条放行 → 规则集白名单放行（都在前，命中即直连不被拦）
+    #           → CN 域名拦 → CN IP 拦 → 原有其它规则
     inj = []
+    if custom_ref:
+        inj.append({"rule_set": custom_ref, "outbound": direct_tag})
     if wl_refs:
         inj.append({"rule_set": wl_refs, "outbound": direct_tag})
     inj.append({"rule_set": "cnblk-cn-site", "action": "reject"})
@@ -250,7 +303,8 @@ def apply_cn_block(cfg=None):
         return False
     cfg["enabled"] = True; cnblock_save(cfg)
     setup_cron()                                        # 每天北京 03:00 定点刷新规则集
-    print(f"\n✓ 已开启屏蔽中国域名/IP：放行白名单 {len(wl_refs)} 组，其余 CN 域名+IP 一律拦截。")
+    extra = f"，单条放行 {len(wl_doms)} 域名 + {len(wl_ips)} IP" if (wl_doms or wl_ips) else ""
+    print(f"\n✓ 已开启屏蔽中国域名/IP：放行白名单 {len(wl_refs)} 组{extra}，其余 CN 域名+IP 一律拦截。")
     print("  规则集每天北京时间 03:00 自动刷新（cron）；临时拉不到的会在下次刷新补齐，不影响已生效的。")
     return True
 
@@ -368,6 +422,77 @@ def update_now():
     else:
         print("  更新未生效（多半规则集临时拉不到），已保持原状，稍后再试。")
 
+def custom_allow_menu():
+    """单条放行（域名/IP）的增删查。域名按后缀匹配，含子域；IP 支持单个或 CIDR、v4/v6。"""
+    R, G, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
+    while True:
+        cfg = cnblock_load()
+        doms, ips = _wl_custom(cfg)
+        items = [("域名", d) for d in doms] + [("IP", i) for i in ips]
+        print("\n" + "-" * 60)
+        print("  单条放行（域名 / IP）—— 命中即直连，不被 CN 屏蔽拦下")
+        print("-" * 60)
+        if items:
+            for n, (kind, v) in enumerate(items, 1):
+                print(f"    {n:>2}. [{kind}] {v}")
+        else:
+            print("    (还没添加)")
+        print(f"\n  {Y}域名按后缀匹配{N}：填 example.com，它和它的所有子域都放行")
+        print("  1 添加（可一次多个，逗号分隔）   2 删除   0 返回")
+        c = _ask("  选择: ").strip()
+        if c == "1":
+            s = _ask("  输入域名或IP(可逗号分隔，如 baidu.com,1.2.3.4,10.0.0.0/8): ").strip()
+            if not s:
+                continue
+            added = 0
+            for raw in s.replace("，", ",").split(","):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                kind, val = parse_wl_entry(raw)
+                if not kind:
+                    print(f"    {R}跳过 {raw!r}{N}：{val}"); continue
+                key = "wl_domains" if kind == "domain" else "wl_ips"
+                lst = list(cfg.get(key) or [])
+                if val in lst:
+                    print(f"    已存在，跳过：{val}"); continue
+                lst.append(val); cfg[key] = lst; added += 1
+                print(f"    {G}已添加{N} [{'域名' if kind=='domain' else 'IP'}] {val}")
+            if added:
+                cnblock_save(cfg)
+                if cfg.get("enabled"):
+                    apply_cn_block(cfg)                  # 已开启则立即生效
+                else:
+                    print("    （当前未开启屏蔽，已保存；开启时会自动带上）")
+        elif c == "2":
+            if not items:
+                continue
+            s = _ask("  删除哪几条(逗号分隔如 1,3；a=全部；回车取消): ").strip().lower()
+            if not s:
+                continue
+            if s in ("a", "all"):
+                idxs = list(range(len(items)))
+            else:
+                idxs = []
+                for p in s.replace("，", ",").split(","):
+                    p = p.strip()
+                    if p.isdigit() and 1 <= int(p) <= len(items):
+                        idxs.append(int(p) - 1)
+                    elif p:
+                        print(f"    {R}忽略无效序号 {p!r}{N}")
+                if not idxs:
+                    continue
+            gone = [items[i] for i in sorted(set(idxs))]
+            cfg["wl_domains"] = [d for d in doms if ("域名", d) not in gone]
+            cfg["wl_ips"] = [i for i in ips if ("IP", i) not in gone]
+            cnblock_save(cfg)
+            for kind, v in gone:
+                print(f"    已删除 [{kind}] {v}")
+            if cfg.get("enabled"):
+                apply_cn_block(cfg)
+        elif c in ("0", ""):
+            return
+
 def menu():
     while True:
         cfg = cnblock_load()
@@ -376,12 +501,15 @@ def menu():
         print("\n" + "=" * 60 + "\n屏蔽中国域名和IP\n" + "=" * 60)
         print(f"  当前状态: {'已开启 ✓' if on else '未开启'}    放行白名单: {wl}")
         print(f"  自定义放行名单链接: {cfg.get('wl_url') or '(未设置)'}")
+        _d, _i = _wl_custom(cfg)
+        print(f"  单条放行: {len(_d)} 个域名 + {len(_i)} 个 IP" if (_d or _i) else "  单条放行: (未添加)")
         print("-" * 60)
         print("  1 屏蔽中国域名和IP" + ("（已开，再选可关闭）" if on else ""))
         print("  2 放行白名单（作者名单 / 自定义名单）")
         print("  3 自定义放行名单脚本链接")
-        print("  4 立即更新（拉取最新放行名单/规则集并生效，不用等每天定时刷新）")
-        print("  5 卸载（不想屏蔽了，直接清掉规则）")
+        print("  4 单条放行域名/IP（自己加，按后缀匹配含子域）")
+        print("  5 立即更新（拉取最新放行名单/规则集并生效，不用等每天定时刷新）")
+        print("  6 卸载（不想屏蔽了，直接清掉规则）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":
@@ -411,8 +539,10 @@ def menu():
                 print("  已保存，并切到自定义名单。")
                 if cfg.get("enabled"): apply_cn_block(cfg)
         elif c == "4":
-            update_now()
+            custom_allow_menu()
         elif c == "5":
+            update_now()
+        elif c == "6":
             remove_cn_block()
         elif c in ("0", ""):
             return
