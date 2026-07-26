@@ -339,8 +339,26 @@ xray 承载的 ws、reality/vision/QUIC 等一概不动。
 - 优先走 **jsDelivr 镜像**、回退 raw；临时拉不到的先注入、交给自动更新重拉；
   确认不存在（404）的才跳过。
 - 注入后会确认 sing-box 正常启动，**万一起不来自动回滚**，绝不影响原本能用的节点。
-- 自定义白名单：可填纯文本 tag 列表，也可**直接指向一个 `whitelist-inject.sh` 脚本链接**，
-  自动抽取其中的 `WHITELIST_TAGS=(...)` 数组。
+- **自定义放行名单链接（菜单 3）——别人可以整套抄走改成自己的**：
+  仓库里放了一份可直接复制的样板 [`whitelist-template.py`](https://github.com/bgpeer/nodekit/blob/main/whitelist-template.py)，
+  抄到自己仓库改完，把 **raw 链接**填进菜单 3 即可。样板里三个列表都支持：
+
+  | 列表 | 作用 |
+  | --- | --- |
+  | `WHITELIST_TAGS` | 规则集整组放行（`bilibili`、`tencent` 这类 tag） |
+  | `ALLOW_DOMAINS` | 单条域名放行（后缀匹配，含子域） |
+  | `ALLOW_IPS` | 单条 IP / CIDR 放行（v4/v6） |
+
+  向下兼容老格式：纯文本 tag 列表（每行一个）、`whitelist-inject.sh` 的 `WHITELIST_TAGS=(...)` bash 数组，
+  甚至**直接指向 `cn-block.py` 本身**也能解析。
+
+  > 🔒 **远端文件只解析、绝不执行**：用 `ast.parse` + `literal_eval` 取字面量，
+  > 所以别人的名单里就算写了 `os.system(...)` 也不会被运行（已实测：恶意样本中的命令未执行、
+  > 含函数调用的条目被忽略）。每一条还会逐个校验——非法 tag、把 IP 写进域名列表、
+  > 打错的 IP 都会**跳过并提示**，不会污染配置。
+
+  三处来源（脚本写死的 `ALLOW_*` + 链接里的 + 菜单加的）**合并去重**后一起注入。
+  改完不用等每天 03:00，点菜单 `5 立即更新` 即时生效。
 - 白名单按**域名**（geosite）放行：客户端需走远程 DNS 解析（本项目生成的订阅配置默认即是）；
   若客户端本地解析后以裸 IP 出站，仍会被 CN IP 规则拦截。
 
