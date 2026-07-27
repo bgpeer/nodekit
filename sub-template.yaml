@@ -26,6 +26,17 @@ profile: {store-selected: true, store-fake-ip: true}
 ntp: {enable: true, server: time.apple.com, port: 123, interval: 30, dialer-proxy: "", write-to-system: false}
 experimental: {quic-go-disable-ecn: true}
 
+# geo 数据库：只用 mmdb（连接信息/国旗 + 万一有 GEOIP 规则）+ asn（IP-ASN 规则要它，
+# 缺了才会刷 "Unsupported ASN type: GeoLite2-Country"）。不加 dat——分流全走
+# rule-provider（本仓库 .mrs/.yaml），没有内置 GEOSITE/GEOIP 规则，mihomo 不会去下
+# geosite.dat/geoip.dat。mmdb/asn 走本机 GitHub 中转拉（关中转/无域名时回落 gh-proxy）。
+geodata-mode: false
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  mmdb: "https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb"
+  asn: "https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
+
 external-controller-cors:
   allow-origins: ["*"]
   allow-private-network: true
