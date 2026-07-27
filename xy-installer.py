@@ -1914,14 +1914,25 @@ def _selfdns_doh():
         pass
     return f"https://{dom}:{port}/dns-query"
 
+def _selfdns_prepend_list(tpl, prefix_re, item):
+    """在匹配 prefix_re（以 [ 收尾）的单行列表最前插入 item；该列表已含 item 则不动（幂等）。"""
+    def repl(m):
+        head, rest = m.group(1), m.group(2)                # head=…[，rest=[ 之后到行尾
+        return m.group(0) if item in rest else head + item + ", " + rest
+    return re.sub(prefix_re, repl, tpl, count=1)
+
 def _mihomo_selfdns(tpl, url):
-    """mihomo：把自建 DoH 加到 nameserver 列表最前（当主用，原有留兜底：DoH 没通自动回落）。"""
+    """mihomo：把自建 DoH 写进两处，都放列表最前当主用、原有留兜底（DoH 没通自动回落）：
+       ① nameserver —— 默认解析用它
+       ② global-dns 锚点 —— nameserver-policy 里所有走代理的域名组(*global-dns)共用它，
+          改锚点一行即全部生效。cn-dns 不动：国内域名该用国内解析拿就近 CDN，
+          用境外自建 DNS 解析反而慢。"""
     if not url:
         return tpl
     q = f'"{url}"'
-    if q in tpl:                                            # 已写入，别重复
-        return tpl
-    return re.sub(r'(?m)^(\s*nameserver:\s*\[)', lambda m: m.group(1) + q + ", ", tpl, count=1)
+    tpl = _selfdns_prepend_list(tpl, r'(?m)^(\s*nameserver:\s*\[)(.*)$', q)
+    tpl = _selfdns_prepend_list(tpl, r'(?m)^(\s*global-dns:\s*&global-dns\s*\[)(.*)$', q)
+    return tpl
 
 def _sr_selfdns(path, url):
     """Shadowrocket：把自建 DoH 加到 dns-server 最前（原有留兜底）。"""
