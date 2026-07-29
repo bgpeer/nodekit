@@ -2024,6 +2024,12 @@ def load_custpl():   return _load_json(CUSTPL_FILE)
 def set_custpl(ext, url):
     d = load_custpl(); d[ext] = url
     os.makedirs(BGP_DIR, exist_ok=True); json.dump(d, open(CUSTPL_FILE, "w"), ensure_ascii=False, indent=2)
+def del_custpl(ext):
+    """删掉某格式的自定义模板链接（改回作者模板）。没有则无操作。"""
+    d = load_custpl()
+    if ext in d:
+        del d[ext]
+        os.makedirs(BGP_DIR, exist_ok=True); json.dump(d, open(CUSTPL_FILE, "w"), ensure_ascii=False, indent=2)
 def tpl_url_for(ext, custom=False):
     return (load_custpl().get(ext) if custom else "") or FMT[ext]["author"]
 
@@ -2504,21 +2510,10 @@ def _validate_generated(ext, path):
         return True, ""
     return True, ""
 
-def update_one_config(ext):
-    """更新单个格式的配置：可选作者模板 / 自定义模板；不动节点、不换 token。"""
-    print("\n  1 作者模板   2 自定义模板   0 返回")
-    c = _ask("  选择: ").strip()
-    if c == "1":
-        url = FMT[ext]["author"]; which = "作者"
-    elif c == "2":
-        url = load_custpl().get(ext)
-        if not url:
-            print("  还没添加自定义模板链接（先选『4 添加自定义模板链接』）。"); return
-        which = "自定义"
-    else:
-        return
+def _regen_config(ext, url, which):
+    """用指定模板重生成单格式配置；不动节点、不换 token；失败回滚保留原配置。返回是否成功。"""
     if not read_saved_links():
-        print("  没有已保存节点。"); return
+        print("  没有已保存节点。"); return False
     G["host"] = _host(); ensure_deps()
     links = aggregated_links()                                  # 本机 + 成员机节点（多机聚合）
     ylines, nodes = parse_nodes(links)
@@ -2528,16 +2523,29 @@ def update_one_config(ext):
         FMT[ext]["gen"](ylines, nodes, url)
     except Exception as e:
         if backup is not None: open(target, "w").write(backup)      # 回滚，保留原能用配置
-        print(f"\n  ❌ 更新失败（生成出错，已保留原配置）：{e}"); return
+        print(f"\n  ❌ 更新失败（生成出错，已保留原配置）：{e}"); return False
     ok, err = _validate_generated(ext, target)
     if not ok:
         if backup is not None: open(target, "w").write(backup)      # 语法/校验不过 → 回滚
         print(f"\n  ❌ 更新失败（{FMT[ext]['label']} 语法/校验错误，已保留原配置）：")
         for ln in str(err).splitlines()[:6]:
             print("     " + ln)
-        return
+        return False
     serve_sub()                                                     # 保持 token，URL 不变
     print(f"\n  ✅ 更新成功（{which}模板，节点/URL 未变）：\n  {sub_url(ext)}")
+    return True
+
+def update_one_config(ext):
+    """更新单个格式的配置：可选作者模板 / 自定义模板；不动节点、不换 token。"""
+    print("\n  1 作者模板   2 自定义模板   0 返回")
+    c = _ask("  选择: ").strip()
+    if c == "1":
+        _regen_config(ext, FMT[ext]["author"], "作者")
+    elif c == "2":
+        url = load_custpl().get(ext)
+        if not url:
+            print("  还没添加自定义模板链接（先选『4 自定义模板链接』）。"); return
+        _regen_config(ext, url, "自定义")
 
 def config_menu(ext):
     """单个格式的配置子菜单：改配置 / 改订阅(换token) / 更新配置(作者·自定义) / 加自定义模板链接。"""
@@ -2554,7 +2562,7 @@ def config_menu(ext):
         print("  1 修改配置（编辑器打开）")
         print("  2 修改订阅（显示当前 / 换 token）")
         print("  3 更新配置（作者模板 / 自定义模板）")
-        print("  4 添加自定义模板链接")
+        print("  4 自定义模板链接（添加 / 更换 / 删除）")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
@@ -2567,13 +2575,21 @@ def config_menu(ext):
             update_one_config(ext)
         elif c == "4":
             cur = load_custpl().get(ext)
-            if cur:                                     # 加过了：先显示当前链接，问要不要换
-                print(f"  已添加过自定义模板链接：{cur}")
-                if _ask("  是否更换? [y/N]: ").lower() not in ("y", "yes"):
-                    continue                            # n 返回菜单，不动原链接
+            if cur:                                     # 已有链接：给 更换 / 删除 / 返回
+                print(f"\n  当前自定义模板链接：{cur}")
+                print("  1 更换   2 删除（改回作者模板）   0 返回")
+                s = _ask("  选择: ").strip()
+                if s == "2":
+                    del_custpl(ext)
+                    print("  ✓ 已删除自定义模板链接，之后『3 更新配置』默认用作者模板。")
+                    if _ask("  现在就用作者模板重新生成一次配置? [y/N]: ").lower() in ("y", "yes"):
+                        _regen_config(ext, FMT[ext]["author"], "作者")   # 立即生效
+                    continue
+                if s != "1":
+                    continue                            # 0/其它 → 返回，不动原链接
             url = _ask("  自定义模板链接(gist/GitHub raw，占位符须与作者模板一致): ").strip()
             if url:
-                set_custpl(ext, url); print("  已保存。之后『3→2 自定义模板』即用它。")
+                set_custpl(ext, url); print("  ✓ 已保存。之后『3→2 自定义模板』即用它。")
         elif c == "0" or c == "":
             return
 
