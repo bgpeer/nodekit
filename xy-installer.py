@@ -2910,8 +2910,8 @@ def _run_net_optimize(args="", env_extra=None):
 
 def _netopt_state():
     """读网络优化当前档位。返回 (mode, mb)：
-       mode = None（未优化）/ 'fixed_cake' / 'adaptive'；
-       mb   = 自适应激活阈值 MB/s（fixed_cake 或读不到时为 None）。"""
+       mode = None（未优化）/ 'fixed_cake' / 'fixed_burst' / 'adaptive'；
+       mb   = 自适应激活阈值 MB/s（fixed_cake / fixed_burst 或读不到时为 None）。"""
     if not os.path.exists(NETOPT_CONFIG):
         return None, None
     mode = "adaptive"
@@ -2921,8 +2921,8 @@ def _netopt_state():
                 mode = ln.split("=", 1)[1].strip() or "adaptive"
     except OSError:
         return None, None
-    if mode == "fixed_cake":
-        return "fixed_cake", None
+    if mode in ("fixed_cake", "fixed_burst"):
+        return mode, None
     mb = None
     try:
         thr = int(json.load(open(NETOPT_ADAPTIVE)).get("threshold", 0))
@@ -2947,12 +2947,15 @@ def net_optimize_menu():
             cur = "未优化（尚未设置任何档位）"
         elif mode == "fixed_cake":
             cur = "固定 cake 纯智能算法（不切换）"
+        elif mode == "fixed_burst":
+            cur = "纯暴力发包（固定抢带宽，无智能算法）"
         elif mb is not None:
             cur = f"自适应+抢带宽 · {_fmt_mb(mb)}MB/s 激活"
         else:
             cur = "自适应+抢带宽（阈值未知）"
         m1 = MARK if is_10 else ""
-        m2 = MARK if (mode == "adaptive" and mb is not None and not is_10) else ""
+        m2 = MARK if (mode == "adaptive" and mb is not None and not is_10) \
+            or mode == "fixed_burst" else ""
         m3 = MARK if mode == "fixed_cake" else ""
         print("\n" + "=" * 60)
         print("  网络优化（BBR / QoS 内核调优，依赖工具自动安装）")
@@ -2960,7 +2963,7 @@ def net_optimize_menu():
         print(f"  当前档位: {G}{cur}{N}")
         print("-" * 60)
         print(f"  1 自适应智能算法+抢占带宽（流量 10MB/s 激活，适合内存 <1G 机器）{m1}")
-        print(f"  2 自适应智能算法+抢占带宽（默认 20MB/s 激活、阈值可调，适合内存 2G 左右机器）{m2}")
+        print(f"  2 自适应智能算法+抢占带宽（默认 20MB/s 激活、阈值可调；输入 0=纯暴力发包无智能算法，适合内存 2G 左右机器）{m2}")
         print(f"  3 固定 cake 纯智能算法（不切换，适合高性能机器）{m3}")
         print("  4 网络优化状况（一键检测当前优化状态）")
         print("  5 卸载网络优化（清除全部优化配置，恢复系统默认）")
@@ -2969,12 +2972,15 @@ def net_optimize_menu():
         if c == "1":
             _run_net_optimize()
         elif c == "2":
-            t = _ask("  激活阈值 MB/s（回车=20）: ").strip() or "20"
+            t = _ask("  激活阈值 MB/s（回车=20；输入 0 = 纯暴力发包，无智能算法）: ").strip() or "20"
             try:    mb = float(t)
-            except ValueError: mb = 0
-            if mb <= 0:
-                print("  无效数字，请输入正数（如 20）。"); continue
-            _run_net_optimize(env_extra={"ADAPTIVE_QOS_THRESHOLD": str(int(mb * 1024 * 1024))})
+            except ValueError: mb = -1
+            if mb == 0:
+                _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_burst"})
+            elif mb < 0:
+                print("  无效数字，请输入 ≥0 的数字（如 20，或 0 = 纯暴力发包）。"); continue
+            else:
+                _run_net_optimize(env_extra={"ADAPTIVE_QOS_THRESHOLD": str(int(mb * 1024 * 1024))})
         elif c == "3":
             _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_cake"})
         elif c == "4":
