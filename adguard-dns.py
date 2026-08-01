@@ -142,7 +142,12 @@ def _usage(port=None):
     print("  " + "=" * 56)
 
     print("\n  【第一步 · 登录网页后台】")
-    print(f"    浏览器打开：  {G}http://{ip}:{port}{N}")
+    hp = _https_panel()
+    if hp:
+        print(f"    浏览器打开(推荐·加密)：  {G}https://{hp[0]}:{hp[1]}{N}")
+        print(f"    {Y}走域名 HTTPS，登录密码不会明文过网{N}；应急/本机可用明文 http://{ip}:{port}")
+    else:
+        print(f"    浏览器打开：  {G}http://{ip}:{port}{N}")
     print("    ↑ 这就是你的管理后台，首次打开设个账号密码；以后看拦截统计、加名单都进这里。")
 
     print("\n  【第二步 · 开加密】（给手机全系统去广告用；没域名可跳过，只用第三步①明文）")
@@ -281,8 +286,12 @@ def change_web_port():
             ok = True; break
     if ok:
         ip = _public_ip()
-        print(f"\n  ✓ 后台端口已改为 {new}。新后台地址：\033[1;32mhttp://{ip}:{new}\033[0m")
+        print(f"\n  ✓ 后台端口已改为 {new}。新后台地址(明文)：\033[1;32mhttp://{ip}:{new}\033[0m")
         print(f"  ▸ 防火墙：放行 \033[1;32m{new}/TCP\033[0m，关掉旧的 {cur}/TCP。")
+        hp = _https_panel()
+        if hp:
+            print(f"  ▸ 你开了加密：更推荐用域名 HTTPS 进后台 \033[1;32mhttps://{hp[0]}:{hp[1]}\033[0m"
+                  f"（走 {hp[1]} 口，不受本次改端口影响、密码加密）。")
     else:
         open(yaml_path, "w").write(txt)                  # 回滚原配置
         sh("systemctl restart AdGuardHome")
@@ -335,6 +344,24 @@ def _tls_block(txt):
 def _yaml_val(block, key):
     m = re.search(rf'(?m)^\s*{re.escape(key)}:[ \t]*(\S.*?)[ \t]*$', block)
     return m.group(1).strip('"\'') if m else ""
+
+def _https_panel():
+    """开了加密且有域名时，AGH 后台同时挂在 https://域名:port_https/ 上
+       （同一个 HTTPS 端口：根路径 / 是后台、/dns-query 是 DoH）。
+       返回 (域名, https端口)；没开加密 / 没域名 / 服务器名对不上 / 端口读不到时返回 None。"""
+    dom = _domain()
+    if not dom:
+        return None
+    try: txt = open(_agh_yaml()).read()
+    except OSError: return None
+    tb = _tls_block(txt)
+    if _yaml_val(tb, "enabled") != "true":
+        return None
+    sname = _yaml_val(tb, "server_name")
+    if sname and sname != dom:
+        return None
+    p = int(_yaml_val(tb, "port_https") or 0)
+    return (dom, p) if p else None
 
 def _yaml_list(txt, key):
     """读 YAML 里的一个列表；键不存在返回 None，空列表返回 []。"""
@@ -515,7 +542,9 @@ def selfcheck():
     else:
         print(f"    {warn} 53   没人监听 —— 明文DNS用不了（AGH 可能没配 53 或没起来）")
     if web:
-        print(f"    {ok} {web:<5}网页后台   http://{ip}:{web}")
+        print(f"    {ok} {web:<5}网页后台(明文) http://{ip}:{web}")
+    if enc_on and dom and p_doh and (not sname or sname == dom):
+        print(f"    {ok} {p_doh:<5}网页后台(加密) {G}https://{dom}:{p_doh}{N}  {Y}← 推荐这样进，密码不明文{N}")
     if not enc_on:
         print(f"    {warn} 加密(DoT/DoH) {Y}没开{N} —— 安卓「私人DNS」用不了，只能用明文 53")
         if dom:
