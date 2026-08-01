@@ -128,7 +128,7 @@ class Cfg:
     AGGRESSIVE_MODE = _flag("AGGRESSIVE_MODE", "0")
     ENABLE_GAME_QOS = _flag("ENABLE_GAME_QOS")
     ADAPTIVE_QOS = _flag("ADAPTIVE_QOS")
-    ADAPTIVE_QOS_MODE = _env("ADAPTIVE_QOS_MODE", "adaptive")  # adaptive / fixed_cake
+    ADAPTIVE_QOS_MODE = _env("ADAPTIVE_QOS_MODE", "adaptive")  # adaptive / fixed_cake / fixed_burst
     ADAPTIVE_QOS_THRESHOLD = int(_env("ADAPTIVE_QOS_THRESHOLD", "10485760"))
     ADAPTIVE_QOS_INTERVAL = int(_env("ADAPTIVE_QOS_INTERVAL", "2"))
     ADAPTIVE_QOS_COOLDOWN = int(_env("ADAPTIVE_QOS_COOLDOWN", "10"))
@@ -143,6 +143,11 @@ class Cfg:
 # fixed_cake 模式：强制关闭自适应守护，走 setup_game_qos 固定 cake
 if Cfg.ADAPTIVE_QOS_MODE == "fixed_cake":
     Cfg.ADAPTIVE_QOS = False
+# fixed_burst 模式：纯暴力发包——固定 pfifo_fast 抢带宽，无智能算法（不切 cake、不起守护）
+elif Cfg.ADAPTIVE_QOS_MODE == "fixed_burst":
+    Cfg.ADAPTIVE_QOS = False
+    Cfg.AGGRESSIVE_MODE = True
+    Cfg.ENABLE_GAME_QOS = False
 
 FINAL_CC = ""
 FINAL_QDISC = ""
@@ -1449,6 +1454,10 @@ def setup_aggressive_tc():
     out = run(["tc", "qdisc", "show", "dev", iface, "root"], timeout=5).stdout.split()
     echo(f"  ✅ {iface} qdisc 已设置为: {out[1] if len(out) > 1 else 'unknown'}")
     echo("  ⚡ 无流量整形，发包不受 AQM 限制")
+    if Cfg.ADAPTIVE_QOS_MODE == "fixed_burst":
+        config_set("ADAPTIVE_QOS_MODE", "fixed_burst", only_if_exists=True)
+        config_set("AGGRESSIVE_MODE", 1, only_if_exists=True)
+        echo("  ⚡ 纯暴力发包模式：固定 pfifo_fast 抢带宽，无智能算法（不切 cake）")
 
 
 # === 游戏 QoS：cake / prio 双方案（tc 部分，--boot 与守护共用）===
@@ -2176,6 +2185,8 @@ def print_status():
     aq_mode = cfg.get("ADAPTIVE_QOS_MODE", "adaptive")
     if aq_mode == "fixed_cake":
         echo("\n📌 QoS 模式：固定 cake（不自动切换，始终游戏低延迟）")
+    elif aq_mode == "fixed_burst":
+        echo("\n📌 QoS 模式：纯暴力发包（固定 pfifo_fast 抢带宽，无智能算法）")
     elif run(["systemctl", "is-active", ADAPTIVE_QOS_SERVICE], timeout=5).returncode == 0:
         echo("\n🔄 自适应 QoS：运行中")
         echo(f"  → 阈值: {Cfg.ADAPTIVE_QOS_THRESHOLD // 1024} KB/s  "
