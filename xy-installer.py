@@ -2685,10 +2685,9 @@ def update_cores():
     setup_core_update_cron()                             # 顺手确保每月自动更新的 cron 在
     print("更新完成。")
 
-def uninstall_all():
-    print("\n将卸载本脚本安装的：sing-box/xray/订阅服务、配置、证书、端口跳跃规则、bgpeer 命令。")
-    if (_ask("确认卸载? [y/N]: ") or "n").lower() not in ("y", "yes"):
-        print("已取消。"); return
+def _uninstall_core():
+    """卸载代理主体：sing-box/xray、订阅服务、证书、AdGuard、CDN 节点、命令、cron。
+       不含网络优化(BBR/QoS，独立模块)——由调用方决定要不要一起 --reset。"""
     cdn_svcs = [n["svc"] for n in _cdn_load() if n.get("svc")]   # 全部 CDN 套用节点服务
     for svc in ["sing-box", "xray", "xy-sub", CDN_SVC] + cdn_svcs:
         sh(f"systemctl disable --now {svc}", check=False)
@@ -2715,7 +2714,35 @@ def uninstall_all():
               "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
               CORE_CRON_FILE, CORE_CRON_LOG):
         sh(f"rm -rf {p}", check=False)
-    print("已卸载完毕。")
+
+def uninstall_all():
+    """卸载子菜单：只卸代理主体 / 全部卸载(再带上网络优化) / 返回。
+       AdGuard 自建DNS 本就随代理主体一起卸(它的 DoT 依赖 acme 证书，证书会被删)；
+       唯一独立、需单独带上的是网络优化(BBR/QoS，写在 /etc/net-optimize)。"""
+    nopt = os.path.exists(NETOPT_CONFIG)
+    print("\n" + "=" * 60 + "\n卸载\n" + "=" * 60)
+    print("  代理主体：sing-box/xray、订阅服务、证书、AdGuard自建DNS、CDN 节点、bgpeer 命令、定时任务")
+    print(f"  网络优化(BBR/QoS)：{'已启用（独立模块）' if nopt else '未启用'}")
+    print("-" * 60)
+    print("  1 卸载代理主体（网络优化保留）")
+    print("  2 全部卸载（代理主体 + 网络优化，一次清干净、恢复系统默认）")
+    print("  0 返回")
+    c = _ask("选择: ").strip()
+    if c == "1":
+        if _ask("\n  确认卸载代理主体（AdGuard 一并卸；网络优化保留）? [y/N]: ").lower() in ("y", "yes"):
+            _uninstall_core()
+            print("\n已卸载代理主体。" + ("网络优化仍在（想卸进『网络优化→卸载』或重跑本项选 2）。" if nopt else ""))
+    elif c == "2":
+        if _ask("\n  确认全部卸载（含网络优化，恢复系统默认）? [y/N]: ").lower() in ("y", "yes"):
+            if nopt:
+                print("\n【1/2】卸载网络优化…")
+                _run_net_optimize("--reset")                 # 先卸它——它的脚本缓存在 /etc/bgpeer，等下会被主体一起删
+            else:
+                print("\n【1/2】网络优化未启用，跳过。")
+            print("\n【2/2】卸载代理主体…")
+            _uninstall_core()
+            print("\n✅ 全部卸载完毕，已恢复到装脚本前的干净状态。")
+    # 0/其它 → 返回
 
 # ============================================================================ 屏蔽中国域名/IP（独立文件）
 def ensure_remote_script(url, local):
