@@ -2336,7 +2336,7 @@ def run(sb_names, xr_names):
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
     if sched:
-        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 13 手动立即更新。')
+        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 16 手动立即更新。')
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
 
 # ============================================================================ 管理面板 / 快捷命令
@@ -3115,6 +3115,201 @@ def smux_menu():
         elif c in ("0", ""):
             return
 
+# ============================================================================ 更换伪装域名（reality 借用的 SNI）
+_SNI_LINK_RE = re.compile(r'([?&]sni=)[^&#]*')
+
+def _sb_reality_inbounds(data):
+    return [ib for ib in data.get("inbounds", [])
+            if isinstance(ib.get("tls"), dict) and isinstance(ib["tls"].get("reality"), dict)]
+
+def _current_sni():
+    """读当前 reality 借用域名(SNI)：sing-box 优先，回落 xray；没有 reality 节点返回 ''。"""
+    data, _ = _load_sb_cfg()
+    if data:
+        for ib in _sb_reality_inbounds(data):
+            s = ib["tls"].get("server_name")
+            if s:
+                return s
+    try:
+        xd = json.load(open(f"{XRAY_DIR}/config.json"))
+        for ib in xd.get("inbounds", []):
+            rs = (ib.get("streamSettings") or {}).get("realitySettings") or {}
+            names = rs.get("serverNames") or []
+            if names:
+                return names[0]
+    except Exception:
+        pass
+    return ""
+
+def _set_sni_singbox(data, new):
+    """把 sing-box 里所有 reality 入站(+shadowtls 握手)的 SNI 改成 new，返回改动条数。"""
+    n = 0
+    for ib in data.get("inbounds", []):
+        tls = ib.get("tls")
+        if isinstance(tls, dict) and isinstance(tls.get("reality"), dict):
+            tls["server_name"] = new
+            hs = tls["reality"].get("handshake")
+            if isinstance(hs, dict):
+                hs["server"] = new
+            n += 1
+        if ib.get("type") == "shadowtls" and isinstance(ib.get("handshake"), dict):
+            ib["handshake"]["server"] = new
+            n += 1
+    return n
+
+def _set_sni_xray(data, new):
+    """把 xray 里所有 reality 入站的 dest/serverNames 改成 new，返回改动条数。"""
+    n = 0
+    for ib in data.get("inbounds", []):
+        rs = (ib.get("streamSettings") or {}).get("realitySettings")
+        if isinstance(rs, dict):
+            rs["dest"] = f"{new}:443"
+            rs["serverNames"] = [new]
+            n += 1
+    return n
+
+def _links_set_sni(new, path=NODE_FILE):
+    """改写保存的分享链接里 reality 节点的 sni=（只动带 security=reality 的，域名类节点不误伤）；
+       『# 订阅链接:』尾部原样保留。"""
+    try:
+        lines = open(path).read().split("\n")
+    except OSError:
+        return
+    out, tail = [], False
+    for ln in lines:
+        if ln.strip().startswith("#"):
+            tail = True
+        if not tail and "://" in ln and "security=reality" in ln:
+            ln = _SNI_LINK_RE.sub(lambda m: m.group(1) + new, ln)
+        out.append(ln)
+    open(path, "w").write("\n".join(out))
+
+def _nginx_split_set_sni(old, new):
+    """sni-split(443 分流)启用时，把 stream map 里旧 SNI 的那条映射改成新 SNI。改了返回 True。"""
+    if not old or not os.path.exists(NGINX_STREAM_CONF):
+        return False
+    try:
+        txt = open(NGINX_STREAM_CONF).read()
+    except OSError:
+        return False
+    new_txt = re.sub(rf'(?m)^(\s*){re.escape(old)}(\s+127\.0\.0\.1:)',
+                     rf'\g<1>{new}\g<2>', txt)
+    if new_txt == txt:
+        return False
+    open(NGINX_STREAM_CONF, "w").write(new_txt)
+    return True
+
+def change_sni_apply(new):
+    """把 reality 借用域名换成 new：改两核心配置 + nginx 分流 + 链接 + 订阅，
+       任一核心校验不过就整体回滚、不重启（单台 VPS 也不会被坏配置锁死）。"""
+    old = _current_sni()
+    sbcfg, xrcfg = f"{SB_DIR}/config.json", f"{XRAY_DIR}/config.json"
+    items = []                                            # (cfg, bin, svc, old_text)
+    if os.path.exists(sbcfg):
+        try: data = json.load(open(sbcfg))
+        except Exception: data = None
+        if data and _set_sni_singbox(data, new):
+            old_text = open(sbcfg).read()
+            json.dump(data, open(sbcfg, "w"), indent=2)
+            items.append((sbcfg, SB_BIN, "sing-box", old_text))
+    if os.path.exists(xrcfg):
+        try: xd = json.load(open(xrcfg))
+        except Exception: xd = None
+        if xd and _set_sni_xray(xd, new):
+            old_text = open(xrcfg).read()
+            json.dump(xd, open(xrcfg, "w"), indent=2)
+            items.append((xrcfg, XRAY_BIN, "xray", old_text))
+    if not items:
+        print("  没找到 reality 节点，无需更换伪装域名。"); return False
+    errors = []
+    for cfg, binp, svc, _ in items:
+        if os.path.exists(binp):
+            ok, msg = core_check(binp, cfg)
+            if not ok:
+                errors.append((svc, msg))
+    if errors:
+        for cfg, binp, svc, old_text in items:            # 任一不过 → 全回滚
+            open(cfg, "w").write(old_text)
+        print("  ✗ 配置校验未通过，已回滚、未改动（节点照常）:")
+        for svc, msg in errors:
+            print(f"    {svc}: {msg.splitlines()[-1] if msg else '校验失败'}")
+        return False
+    # nginx sni-split（如启用）：改 map → nginx -t，不过则连核心配置一起回滚
+    if _nginx_split_set_sni(old, new):
+        chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+        if chk.returncode:
+            _nginx_split_set_sni(new, old)
+            for cfg, binp, svc, old_text in items:
+                open(cfg, "w").write(old_text)
+            print("  ✗ nginx 分流校验未通过，已整体回滚：\n   "
+                  + (chk.stderr or chk.stdout).strip().replace("\n", "\n   ")); return False
+        sh("systemctl reload nginx", check=False)
+    _links_set_sni(new)                                   # 校验都过了才动链接/订阅
+    G["host"] = _host()
+    try:
+        build_subscription(read_saved_links(), new_token=False)
+    except Exception as e:
+        print("  订阅刷新跳过（不影响节点）:", e)
+    restart_services(*[svc for _, _, svc, _ in items])
+    return True
+
+def _choose_new_sni(cur):
+    print("  1 随机挑一个（内置大站池，自动避开当前）   2 手动输入   0 取消")
+    c = _ask("  选择: ").strip()
+    if c == "1":
+        pool = [s for s in REALITY_SNI_POOL if s != cur]
+        return secrets.choice(pool) if pool else None
+    if c == "2":
+        s = _ask("  输入域名（如 www.microsoft.com）: ").strip().lower().rstrip(".")
+        if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", s):
+            print("  域名格式不对。"); return None
+        return s
+    return None
+
+def change_sni_menu():
+    G_, Y_, R_, N_ = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    while True:
+        cur = _current_sni()
+        print("\n" + "=" * 60)
+        print("  更换伪装域名（reality 借用的 SNI 目标站）")
+        print("=" * 60)
+        if not cur:
+            print("  本机没有 reality 类节点（vless-reality-*），没有伪装域名可换。")
+            return
+        print(f"  当前伪装域名: {G_}{cur}{N_}")
+        ok, detail = _reality_sni_ok(cur)                 # 从本机实连一下：连通 + TLS1.3 + h2
+        if ok:
+            print(f"  连通性检测: {G_}通 · {detail}{N_}")
+        else:
+            print(f"  连通性检测: {R_}不通 · {detail}{N_}")
+            print(f"  {Y_}↑ 你 VPS 连不上/这个站不合格，reality 伪装会打折，建议更换。{N_}")
+        print("-" * 60)
+        print("  1 更换（随机挑 / 手动输入）")
+        print("  0 返回")
+        c = _ask("选择: ").strip()
+        if c == "1":
+            new = _choose_new_sni(cur)
+            if not new or new == cur:
+                if new == cur:
+                    print("  和当前一样，未改动。")
+                continue
+            ok2, detail2 = _reality_sni_ok(new)
+            if ok2:
+                print(f"  新域名 {new}: {G_}通 · {detail2}{N_}")
+            else:
+                print(f"  新域名 {new}: {R_}不通 · {detail2}{N_}")
+                if _ask("  这个站从你 VPS 检测不理想，仍要用? y 继续 / n 重选: ").strip().lower() \
+                        not in ("y", "yes"):
+                    continue
+            if _ask(f"  确认把伪装域名从 {cur} 换成 {new}? y 确认 / n 取消: ").strip().lower() \
+                    in ("y", "yes"):
+                if change_sni_apply(new):
+                    print(f"\n  ✓ 已更换为 {new}，配置 + 订阅已刷新，核心正在后台重启（订阅 URL 不变）。")
+                    print("  客户端重新拉取订阅即可生效——无需重装、无需重新导入。")
+                    print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常，操作已在服务端完成。")
+        elif c in ("0", ""):
+            return
+
 # ============================================================================ BT/PT 下载屏蔽
 def bt_enabled():
     try: return bool(json.load(open(BT_STATE)).get("enabled"))
@@ -3791,19 +3986,20 @@ def main_menu():
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
         print("  3. 聚合节点链接（连机VPS合并多台VPS节点）")
-        print("  4. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
-        print("  5. mihomo 配置")
-        print("  6. sing-box 配置")
-        print("  7. 小火箭配置")
-        print("  8. CDN套用（利用CF中转，IP被墙时使用，延时比较高）")
-        print("  9. 屏蔽中国域名和IP（可做白名单放行）")
-        print("  10. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
-        print("  11. 网络优化（BBR/QoS 内核调优）")
-        print("  12. 自建DNS（AdGuard Home·全设备去广告）")
-        print("  13. GitHub中转（规则/图标走本机·默认开，可关）")
-        print("  14. 更新脚本（不影响节点）")
-        print("  15. 更新核心（sing-box / xray）")
-        print("  16. 卸载")
+        print("  4. 更换伪装域名（reality 借用的 SNI·带连通检测，不用重装）")
+        print("  5. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
+        print("  6. mihomo 配置")
+        print("  7. sing-box 配置")
+        print("  8. 小火箭配置")
+        print("  9. CDN套用（利用CF中转，IP被墙时使用，延时比较高）")
+        print("  10. 屏蔽中国域名和IP（可做白名单放行）")
+        print("  11. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
+        print("  12. 网络优化（BBR/QoS 内核调优）")
+        print("  13. 自建DNS（AdGuard Home·全设备去广告）")
+        print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
+        print("  15. 更新脚本（不影响节点）")
+        print("  16. 更新核心（sing-box / xray）")
+        print("  17. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -3813,19 +4009,20 @@ def main_menu():
         if c == "1":     install_flow()
         elif c == "2":   show_links()
         elif c == "3":   peers_menu()
-        elif c == "4":   smux_menu()
-        elif c == "5":   config_menu("yaml")
-        elif c == "6":   config_menu("json")
-        elif c == "7":   config_menu("conf")
-        elif c == "8":   cdn_menu()
-        elif c == "9":   cn_block_menu()
-        elif c == "10":  bt_menu()
-        elif c == "11":  net_optimize_menu()
-        elif c == "12":  adguard_menu()
-        elif c == "13":  ghrelay_menu()
-        elif c == "14":  update_script()
-        elif c == "15":  update_cores()
-        elif c == "16":  uninstall_all()
+        elif c == "4":   change_sni_menu()
+        elif c == "5":   smux_menu()
+        elif c == "6":   config_menu("yaml")
+        elif c == "7":   config_menu("json")
+        elif c == "8":   config_menu("conf")
+        elif c == "9":   cdn_menu()
+        elif c == "10":  cn_block_menu()
+        elif c == "11":  bt_menu()
+        elif c == "12":  net_optimize_menu()
+        elif c == "13":  adguard_menu()
+        elif c == "14":  ghrelay_menu()
+        elif c == "15":  update_script()
+        elif c == "16":  update_cores()
+        elif c == "17":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
