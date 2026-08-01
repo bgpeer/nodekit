@@ -3894,7 +3894,7 @@ def install_flow():
         print("没选任何协议，退出。"); return
 
     domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
-    email = _ask("acme 注册邮箱(回车=默认): ") if domain else ""
+    email = ""   # 证书自动续期、默认占位邮箱即可签发，不再交互问；想指定用命令行 --email
     nginx = ""
     if domain:
         nginx = "1" if (_ask("用 nginx 前置(443伪装站+webroot证书, ws类藏443)? [y/N]: ")
