@@ -310,7 +310,14 @@ def status():
     print("  53 端口:", "空闲" if not b53 else f"被 {b53} 占用")
     _usage(port)
 
-def uninstall():
+def _selfdns_remove():
+    """卸载 AdGuard 时：若之前用菜单 6 把自建 DNS 写进过订阅，就交给主脚本从订阅移除并刷新
+       （没写入则主脚本内部静默跳过）。避免订阅里留着指向已卸载 AGH 的死 DoH。"""
+    xy = BGP_DIR + "/xy-installer.py"
+    if os.path.exists(xy):
+        subprocess.run(f"python3 {xy} selfdns-off", shell=True)
+
+def uninstall(refresh_sub=True):
     if not _installed():
         print("  没检测到 AdGuard Home，无需卸载。"); return
     if _ask("  确认卸载 AdGuard Home（去广告 DNS）? [y/N]: ").lower() not in ("y", "yes"):
@@ -321,6 +328,8 @@ def uninstall():
     sh("systemctl disable AdGuardHome")
     try: shutil.rmtree(AGH_DIR)
     except OSError: pass
+    if refresh_sub:                                  # 单独卸载：把之前写进订阅的自建 DNS 一并撤掉并刷新
+        _selfdns_remove()                            # （全量卸载时订阅整个删掉，不必刷新，refresh_sub=False）
     print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）。")
     print("  记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
 
@@ -676,7 +685,7 @@ def menu():
         print("  当前状态:", st)
         print("-" * 60)
         print("  1 安装（装 AdGuard Home + 起服务，之后网页后台点几下完成设置）")
-        print("  2 卸载（彻底移除，不动节点）")
+        print("  2 卸载（彻底移除，不动节点；若写过订阅会自动从订阅撤掉自建DNS并刷新）")
         print("  3 查看状态 / 设备怎么设置")
         print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
         print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
@@ -696,8 +705,8 @@ def menu():
 
 def main():
     act = sys.argv[1] if len(sys.argv) > 1 else ""
-    if act == "remove":                              # 主脚本整体卸载时可调用
-        uninstall()
+    if act == "remove":                              # 主脚本整体卸载时可调用（订阅整体删，不必刷新）
+        uninstall(refresh_sub=False)
     else:
         menu()
 

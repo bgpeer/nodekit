@@ -2887,6 +2887,24 @@ def selfdns_toggle():
     else:
         print("  刷新配置失败（没有可用节点？）。")
 
+def selfdns_off():
+    """非交互移除：卸载 AdGuard 时调用。若自建 DNS 已写入订阅则清标记并刷新订阅（不换 token）；
+       没写入则静默返回（什么都不打印）。adguard 卸载调用（selfdns-off）。"""
+    if not os.path.exists(SELFDNS_FLAG):
+        return
+    try: os.remove(SELFDNS_FLAG)
+    except OSError: pass
+    dom = _host()
+    links = read_saved_links()
+    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or "") or not links:
+        return                                               # 没域名/没节点：标记已清，订阅无从刷新，跳过
+    G["host"] = dom
+    try:
+        if build_subscription(links):                        # 重新生成三格式（不含自建 DoH）并托管，不换 token
+            print("  ✓ 已从订阅移除自建 DNS 并刷新（客户端重拉订阅即恢复原 DNS）。")
+    except Exception as e:
+        print("  订阅刷新跳过（不影响卸载）:", e)
+
 def cn_block_reapply():
     """重装后调用：若之前开启过屏蔽，用 cn-block.py 重新注入（未开启则内部直接跳过）。"""
     if not cnblock_load().get("enabled"):
@@ -4153,6 +4171,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "selfdns-toggle":  # adguard 菜单调用：开关"自建DNS写入订阅"
         selfdns_toggle()
+        sys.exit(0)
+    if sys.argv[1] == "selfdns-off":     # adguard 卸载调用：若已写入则从订阅移除并刷新
+        selfdns_off()
         sys.exit(0)
     ap = argparse.ArgumentParser(
         description="sing-box + xray 双核心多协议安装器",
