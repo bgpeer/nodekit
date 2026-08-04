@@ -1010,10 +1010,14 @@ SB = {"vless-vision": sb_vless_vision,
 # xray 协议表 —— builder 返回 (inbound_dict, share_link)
 # ============================================================================
 def _xr_reality_stream(priv, sid, network, extra=None):
+    # minClientVer=1.0.0：xray v26.7.11+ 的 reality 服务端默认 minClientVer=26.3.27，会静默
+    # 拒掉上报旧版本的客户端（mihomo/Clash 系硬编码 1.8.2、sing-box、旧 xray）→ 连不上。
+    # 显式设成 1.0.0（接受所有客户端），兼容优先，避免自动升级 xray 后老客户端集体连不上。
     st = {"network": network, "security": "reality",
           "realitySettings": {"show": False, "dest": f"{G['sni']}:443",
                               "xver": 0, "serverNames": [G["sni"]],
-                              "privateKey": priv, "shortIds": [sid]}}
+                              "privateKey": priv, "shortIds": [sid],
+                              "minClientVer": "1.0.0"}}
     if extra:
         st.update(extra)
     return st
@@ -2643,6 +2647,37 @@ def _core_update_schedule_str():
     local = datetime.datetime(2001, 6, 2, 4, 0, tzinfo=bj).astimezone()
     return f"每月 {local.day} 号 {local:%H:%M}（本机时区，= 北京每月 2 号 04:00）"
 
+def _xray_heal_minclientver(restart=True):
+    """给现有 xray reality 入站补 minClientVer（缺才补）。
+       xray v26.7.11+ reality 服务端默认 minClientVer=26.3.27，静默拒掉上报旧版本的客户端
+       (mihomo/Clash 系硬编码 1.8.2、sing-box、旧 xray)。补成 1.0.0(接受所有客户端)。
+       只在确有缺失时改配置+校验+重启；校验不过则回滚。改了返回 True。"""
+    cfg = f"{XRAY_DIR}/config.json"
+    if not os.path.exists(cfg):
+        return False
+    try:
+        data = json.load(open(cfg))
+    except Exception:
+        return False
+    changed = False
+    for ib in data.get("inbounds", []):
+        rs = (ib.get("streamSettings") or {}).get("realitySettings")
+        if isinstance(rs, dict) and not rs.get("minClientVer"):
+            rs["minClientVer"] = "1.0.0"
+            changed = True
+    if not changed:
+        return False
+    old = open(cfg).read()
+    json.dump(data, open(cfg, "w"), indent=2)
+    if os.path.exists(XRAY_BIN):
+        ok, msg = core_check(XRAY_BIN, cfg)
+        if not ok:
+            open(cfg, "w").write(old)                        # 回滚，绝不留坏配置
+            return False
+    if restart:
+        sh("systemctl restart xray", check=False)
+    return True
+
 def update_cores_auto():
     """非交互更新已安装的内核到最新并重启（cron 每月调用）。起不来会记进日志。"""
     ensure_deps()
@@ -2659,6 +2694,8 @@ def update_cores_auto():
             print(f"{ts} {name} 更新完成（{act}）: {ver}")
         except Exception as e:
             print(f"{ts} {name} 更新失败:", e)
+    if _xray_heal_minclientver():                            # 升级到 xray 26.7.11+ 后补 minClientVer，兼容旧客户端
+        print(f"{ts} xray reality 已补 minClientVer=1.0.0（兼容 mihomo/旧客户端）")
 
 def update_cores():
     print("\n当前版本:")
@@ -2682,6 +2719,8 @@ def update_cores():
         install_xray(); sh("systemctl restart xray", check=False)
         v = sh(f"{XRAY_BIN} version", check=False)
         print("xray 现版本:", v.splitlines()[0] if v else "?")
+        if _xray_heal_minclientver():
+            print("已给 reality 补 minClientVer=1.0.0（xray 26.7.11+ 默认会拒旧客户端，补上兼容 mihomo 等）")
     setup_core_update_cron()                             # 顺手确保每月自动更新的 cron 在
     print("更新完成。")
 
@@ -3993,6 +4032,11 @@ def cdn_menu():
             return
 
 def main_menu():
+    # 一次性自愈：xray 26.7.11+ 默认 minClientVer=26.3.27 会拒旧客户端(mihomo 硬编码 1.8.2 等)，
+    # 给缺这项的 reality 入站补 1.0.0。只在首次(确有缺失时)改配置+重启 xray，之后即为 no-op。
+    if _xray_heal_minclientver():
+        print("  ⓘ 已给 xray reality 补 minClientVer=1.0.0：新版 xray(26.7.11+)默认会静默拒掉\n"
+              "     mihomo/Clash 等上报旧版本的客户端，补上后它们又能连了（xray 已后台重启一次）。")
     while True:
         print("\n" + "=" * 60)
         print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
