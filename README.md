@@ -33,6 +33,11 @@ sudo python3 /tmp/xy.py
   续期后自动重启 sing-box / xray（有 nginx 顺带 reload）使新证书生效，无需手动干预
 - **内核自动更新**：安装后自动挂 cron，**每月北京时间 2 号凌晨 04:00** 把 sing-box / xray 更新到最新并重启一次
   （无新版则跳过）；也可随时进管理面板 **16 更新核心** 手动立即更新。日志在 `/var/log/bgpeer-coreupdate.log`
+- **xray 26.7.11+ reality 兼容自愈**：xray 从 v26.7.11 起，reality 服务端**默认 `minClientVer=26.3.27`**，会
+  **静默拒掉上报旧版本的客户端**（mihomo/Clash 系内核硬编码 reality 版本 `1.8.2`、sing-box、旧 xray）——表现为
+  升级 xray 后 reality 节点客户端**连不上、也不报错**（全被丢进 fallback）。本脚本给 xray reality 入站显式写
+  `minClientVer: "1.0.0"`（接受所有客户端）规避：**新装**即带；**老装**在「更新核心」或下次打开面板时**自动补上并重启 xray**
+  （只在缺失时补一次，之后不再动）。sing-box 内核无此改动、不受影响。
 
 ---
 
