@@ -19,7 +19,7 @@ keep-alive-interval: 30
 bind-address: "*"
 authentication: ["meta:88888888"]
 skip-auth-prefixes: ["127.0.0.1/8", "::1/128"]
-lan-allowed-ips: ["0.0.0.0/0", "::/0"]
+lan-allowed-ips: ["127.0.0.1/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10"]
 lan-disallowed-ips: []
 global-ua: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
 profile: {store-selected: true, store-fake-ip: true}
