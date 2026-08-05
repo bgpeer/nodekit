@@ -1959,42 +1959,6 @@ def _mihomo_direct_ip(tpl, targets):
         return tpl
     return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n" + "\n".join(new), tpl, count=1)
 
-def _mihomo_hosts_pin(tpl, host, ip):
-    """mihomo：把本机域名钉进 hosts:，连节点时完全跳过 DNS 解析。
-
-       为什么值得做：节点域名能解析是所有节点能用的前置条件，默认它由
-       proxy-server-nameserver 里那串境外 DoH 在国内直连查，1.1.1.1/dns.google
-       这类在国内又慢又常被打断，等于每次冷启动都先卡在这一步。钉进 hosts 之后
-       这一步直接消失——resolver 查 hosts 命中就短路返回，根本走不到 DNS
-       (component/resolver/resolver.go 里 DefaultHosts.Search 在解析路径最前)，
-       比换任何 DNS 服务器都快，而且精确到这一个域名、不影响别的解析。
-       注：hosts 不受 use-hosts 开关门控（executor.go 的 updateHosts 无条件生效），
-       自定义模板里关了 use-hosts 也照样管用。
-
-       ⚠ 这会让订阅里出现本机真实 IP，与 _direct_targets「有域名就用域名、配置里
-       不出现裸 IP」的取舍相反。域名的 A 记录本来就是公开可查的，但分享订阅时这一行
-       等于把 IP 一起给出去了。
-
-       安全网：只在域名当前**确实解析到本机公网 IP** 时才钉。域名要是走了 CDN、
-       DDNS 指向别处或还没生效，钉死就会把节点连到错误的地址上，这种情况直接不写。
-       模板里没有 hosts: 段时原样返回。"""
-    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", host or ""):
-        return tpl                                           # 本机是 IP 不是域名：没有可钉的域名
-    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip or ""):
-        return tpl                                           # 拿不到本机公网 IP
-    try:                                                     # 多条 A 记录时只要包含本机 IP 就算数
-        a_records = {r[4][0] for r in socket.getaddrinfo(host, None, socket.AF_INET)}
-    except OSError:
-        return tpl                                           # 解析不了：无从校验，不冒险钉
-    if ip not in a_records:
-        return tpl                                           # 域名指向别处(CDN/DDNS/未生效)：钉了会连错地方
-    tpl = re.sub(r'(?m)^[ \t]*"%s"[ \t]*:[ \t]*[0-9a-fA-F.:]+[ \t]*$\n?' % re.escape(host),
-                 '', tpl)                                    # 幂等：先清旧的（换过 IP 也在这里被换掉）
-    if not re.search(r'(?m)^hosts:[ \t]*$', tpl):
-        return tpl
-    return re.sub(r'(?m)^(hosts:[ \t]*)$',
-                  lambda m: m.group(1) + f'\n  "{host}": {ip}', tpl, count=1)
-
 def _sb_direct_ip(cfg, targets):
     """sing-box：把直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
        就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。"""
@@ -2042,7 +2006,6 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
     tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
-    tpl = _mihomo_hosts_pin(tpl, _host(), _self_ip())          # 本机域名钉进 hosts：连节点时跳过 DNS 解析
     tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
