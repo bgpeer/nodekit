@@ -111,7 +111,7 @@ dns:
     "rule-set:Alibaba": *cn-dns
     "rule-set:Tencent": *cn-dns
     "rule-set:games-cn": *cn-dns
-    "rule-set:private": *cn-dns
+    "rule-set:private": ["system"]   # 内网域名(*.lan/*.local 等)只有本机/路由器的 DNS 知道，交给公共 DoH 必然解析失败
     "rule-set:cn-domain": *cn-dns
 
 hosts: 
