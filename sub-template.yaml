@@ -86,6 +86,7 @@ dns:
   proxy-server-nameserver: ["https://1.1.1.1/dns-query", "https://dns.google/dns-query", "https://cloudflare-dns.com/dns-query", "https://dns.quad9.net/dns-query", "https://dns.adguard.com/dns-query", "https://public.dns.iij.jp/dns-query", "tls://cloudflare-dns.com:853", "tls://dns.google:853"]  
   direct-nameserver-follow-policy: true
   nameserver-policy:
+    "rule-set:private": ["system"]   
     "rule-set:reject": ["https://dns.adguard.com/dns-query"]
     "rule-set:Google-zj": *global-dns
     "rule-set:OpenAI-zj": *global-dns
@@ -111,7 +112,6 @@ dns:
     "rule-set:Alibaba": *cn-dns
     "rule-set:Tencent": *cn-dns
     "rule-set:games-cn": *cn-dns
-    "rule-set:private": ["system"]   # 内网域名(*.lan/*.local 等)只有本机/路由器的 DNS 知道，交给公共 DoH 必然解析失败
     "rule-set:cn-domain": *cn-dns
 
 hosts: 
