@@ -138,7 +138,6 @@ proxies:
 
 pg-anchor:
   - &URLTEST_COMMON {type: url-test, lazy: true, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/bypass.png, include-all: true, exclude-type: direct, url: "https://www.gstatic.com/generate_204", interval: 120, tolerance: 30, timeout: 5000, hidden: true}
-  # 国家随机组用它(同 URLTEST_COMMON 但不隐藏，面板可见)；节点由 include-all + 各组 filter 客户端自动收拢
   - &COUNTRY_COMMON {type: url-test, lazy: true, icon: https://gh-proxy.com/https://raw.githubusercontent.com/bgpeer/icons/main/color/bypass.png, include-all: true, exclude-type: direct, url: "https://www.gstatic.com/generate_204", interval: 120, tolerance: 30, timeout: 5000}
   - &GLOBAL_PROXIES ["🌍全球加速","♻️全部随机","🎯直连"__XY_NAMES__]
   - &GLOBAL_WITH_DIRECT ["🎯直连","🌍全球加速","♻️全部随机"__XY_NAMES__]
