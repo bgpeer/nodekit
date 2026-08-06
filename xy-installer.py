@@ -4,9 +4,12 @@
 # ----------------------------------------------------------------------------
 # 设计原则（对应“逻辑和加密要做好”）：
 #   1. 密钥一律调用核心自带生成器，绝不在 Python 里手搓 x25519 / UUID
-#   2. 内核版本跟随 GitHub latest（和 mack-a 一致）：sing-box 下限 1.12
-#                （anytls inbound 是 1.12 才加的），xray reality 传输用 raw；
-#                拉不到 latest 时回落到 SB_VER / XRAY_VER 兜底常量
+#   2. 内核版本跟随 GitHub：sing-box 取 /releases/latest（只认正式版，避免误跳
+#                1.14.0-beta 那条并行的测试线），下限 1.12（anytls inbound 是
+#                1.12 才加的）；xray 取全部 release 里版本号最大的（含标了预发行
+#                的——XTLS 从 v26.6.1 起每个 release 都标预发行，只认 latest 会
+#                永远停在 v26.3.27）。xray reality 传输用 raw；
+#                拉不到时回落到 SB_VER / XRAY_VER 兜底常量
 #   3. 证书三态：reality 借目标站证书(无需域名) / hy2·tuic·anytls 自签 /
 #                ws·trojan 给域名走 acme.sh，不给则自签 + 链接带 insecure
 #   4. 加协议 = 往 SB / XRAY 表里加一个 builder，返回 (inbound, share_link)
@@ -21,10 +24,11 @@ import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, ur
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
 SCRIPT_VERSION = "1.0.38"
 
-# 版本：安装时优先取 GitHub 最新正式版；下面是取不到时的兜底。
+# 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
+# ⚠ 兜底值别落后于线上实际版本：install_xray 用「版本号不匹配就重装」判断，兜底比现装的旧会把它降级。
 SB_VER   = "1.12.0"
-XRAY_VER = "25.3.6"
+XRAY_VER = "26.7.28"
 SB_BIN, XRAY_BIN = "/usr/local/bin/sing-box", "/usr/local/bin/xray"
 SB_DIR,  XRAY_DIR = "/etc/sing-box", "/usr/local/etc/xray"
 CERT, KEY = "/etc/ssl/sb/self.crt", "/etc/ssl/sb/self.key"     # 自签
@@ -678,6 +682,39 @@ def latest_gh_release(repo, fallback):
     except Exception:
         return fallback
 
+def _ver_key(v):
+    """版本排序键，按 semver 惯例：同一版本号下带预发行后缀的小于正式版。
+         "26.7.28"      → ((26,7,28), 1, "")
+         "1.14.0-beta.7"→ ((1,14,0),  0, "beta.7")   ← 小于 1.14.0 正式版"""
+    core, _, pre = str(v).partition("-")
+    nums = tuple(int(x) if x.isdigit() else 0 for x in core.split("."))
+    return (nums, 0 if pre else 1, pre)
+
+def newest_gh_release(repo, fallback):
+    """取版本号最大的 release tag（**把标了预发行的也算进来**）。去掉前导 v，取不到用 fallback。
+
+       为什么需要它：GitHub 的 /releases/latest 按定义只返回「非预发行」的那个，而 XTLS 从
+       v26.6.1 起把每个 Xray release 都标成了预发行(prerelease: true)——于是 /releases/latest
+       永远停在 v26.3.27，比实际最新落后 5 个版本、约四个月，且每月的 cron 自动更新每次都拿到
+       同一个答案，永远推不动。注意预发行是 release 上的独立标志位，跟 tag 叫什么无关：Xray 的
+       tag 一律是 v26.7.28 这种纯版本号，光看 tag 名根本分辨不出来。
+
+       为什么只给 Xray 用、sing-box 仍走 latest_gh_release：Xray 没有并行的测试分支，所有
+       release 是一条线性递增的序列(…26.6.27 → 26.7.11 → 26.7.28)，只是习惯性都打预发行标记，
+       所以「取最大」就等于「取真正的最新版」。sing-box 相反——它 1.13 正式线和 1.14.0-beta 线
+       **并行维护**，而 1.14.0-beta.7 的版本号是大于 1.13.16 的，取最大会把人送上 beta 线，
+       跨小版本换配置 schema，节点可能直接起不来。"""
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases?per_page=20",
+            headers={"User-Agent": "xy-installer", "Accept": "application/vnd.github+json"})
+        rels = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        tags = [str(r["tag_name"]).lstrip("v") for r in rels
+                if isinstance(r, dict) and r.get("tag_name") and not r.get("draft")]
+        return max(tags, key=_ver_key) if tags else fallback
+    except Exception:
+        return fallback
+
 def install_singbox():
     ver = latest_gh_release("SagerNet/sing-box", SB_VER)
     if os.path.exists(SB_BIN) and ver in sh(f"{SB_BIN} version", check=False):
@@ -690,7 +727,7 @@ def install_singbox():
     os.makedirs(SB_DIR, exist_ok=True)
 
 def install_xray():
-    ver = latest_gh_release("XTLS/Xray-core", XRAY_VER)
+    ver = newest_gh_release("XTLS/Xray-core", XRAY_VER)   # 含预发行取最大：XTLS 把每个 release 都标预发行
     if os.path.exists(XRAY_BIN) and ver in sh(f"{XRAY_BIN} version", check=False):
         return
     a = arch_tag()
