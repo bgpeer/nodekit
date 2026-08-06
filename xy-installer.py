@@ -2715,12 +2715,18 @@ def _xray_heal_minclientver(restart=True):
         sh("systemctl restart xray", check=False)
     return True
 
-def update_cores_auto():
-    """非交互更新已安装的内核到最新并重启（cron 每月调用）。起不来会记进日志。"""
+CORE_DONE_MARK = "本次更新结束"     # 前台跟随日志时用它判断后台已跑完
+
+def update_cores_auto(only=None):
+    """非交互更新已安装的内核到最新并重启。起不来会记进日志。
+       两个入口共用：cron 每月自动更新，以及菜单16 转到后台时。
+       only: None 或 "both" → 两个都更；"sing-box" / "xray" → 只更那一个。"""
     ensure_deps()
     ts = time.strftime("%F %T")
     for name, binpath, installer in (("sing-box", SB_BIN, install_singbox),
                                      ("xray", XRAY_BIN, install_xray)):
+        if only not in (None, "both") and name != only:
+            continue
         if not os.path.exists(binpath):
             continue
         try:
@@ -2733,6 +2739,8 @@ def update_cores_auto():
             print(f"{ts} {name} 更新失败:", e)
     if _xray_heal_minclientver():                            # 升级到 xray 26.7.11+ 后补 minClientVer，兼容旧客户端
         print(f"{ts} xray reality 已补 minClientVer=1.0.0（兼容 mihomo/旧客户端）")
+    setup_core_update_cron()                                 # 顺手确保每月自动更新的 cron 在
+    print(f"{time.strftime('%F %T')} {CORE_DONE_MARK}")      # 后台跑时用 python3 -u，逐行落盘不缓冲
 
 def update_cores():
     print("\n当前版本:")
@@ -2747,19 +2755,56 @@ def update_cores():
     c = _ask("选择: ")
     if c == "0" or not c:
         return
-    ensure_deps()
-    if c in ("1", "3") and os.path.exists(SB_BIN):
-        install_singbox(); sh("systemctl restart sing-box", check=False)
-        v = sh(f"{SB_BIN} version", check=False)
-        print("sing-box 现版本:", v.splitlines()[0] if v else "?")
-    if c in ("2", "3") and os.path.exists(XRAY_BIN):
-        install_xray(); sh("systemctl restart xray", check=False)
-        v = sh(f"{XRAY_BIN} version", check=False)
-        print("xray 现版本:", v.splitlines()[0] if v else "?")
-        if _xray_heal_minclientver():
-            print("已给 reality 补 minClientVer=1.0.0（xray 26.7.11+ 默认会拒旧客户端，补上兼容 mihomo 等）")
-    setup_core_update_cron()                             # 顺手确保每月自动更新的 cron 在
-    print("更新完成。")
+    target = {"1": "sing-box", "2": "xray", "3": "both"}.get(c)
+    if not target:
+        return
+    _run_core_update_detached(target)
+
+def _run_core_update_detached(target):
+    """把更新派到独立会话里跑，前台只负责跟日志。
+
+       为什么不能在前台直接跑：更新的最后一步是 systemctl restart，而很多人是**挂着本机
+       代理来管理这台机**的——重启核心会当场掐断 SSH，前台的 python 进程随即收到 SIGHUP
+       死掉。表现就是「先更的那个成功了，后更的那个没动」（两个都选时 sing-box 先重启，
+       SSH 一断，xray 就永远轮不到）。start_new_session=True 让它脱离控制终端，SIGHUP
+       打不到它，断了照样在服务端跑完——这也是 restart_services() 一直遵循的那条原则。
+
+       前台跟随日志只是为了给你看进度；SSH 断了顶多是看不到后半段，不影响后台那个进程。"""
+    try:
+        start = os.path.getsize(CORE_CRON_LOG) if os.path.exists(CORE_CRON_LOG) else 0
+    except OSError:
+        start = 0
+    try:
+        subprocess.Popen(                                # -u：不缓冲，日志逐行落盘才跟得上
+            f"python3 -u {SELF_LOCAL} update-cores {target} >> {CORE_CRON_LOG} 2>&1",
+            shell=True, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print("\n  转后台失败，改在前台直接更新:", e)     # 兜底：宁可前台跑完，也不能不更新
+        update_cores_auto(target)
+        return
+    print(f"\n  已转入后台执行（断开 SSH 也会在服务端跑完）。日志: {CORE_CRON_LOG}")
+    print("  下面实时跟随进度，看够了可以直接 Ctrl-C 或断开，不影响后台：\n")
+    pos, deadline = start, time.time() + 600
+    try:
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                if os.path.getsize(CORE_CRON_LOG) <= pos:
+                    continue
+                with open(CORE_CRON_LOG, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except OSError:
+                continue
+            text = chunk.decode("utf-8", "replace")
+            print("  " + text.rstrip("\n").replace("\n", "\n  "))
+            if CORE_DONE_MARK in text:
+                return
+        print(f"\n  等了 10 分钟还没跑完，后台仍在继续。稍后看日志: tail {CORE_CRON_LOG}")
+    except KeyboardInterrupt:
+        print(f"\n  已退出跟随，后台继续执行。稍后看日志: tail {CORE_CRON_LOG}")
 
 def _uninstall_core():
     """卸载代理主体：sing-box/xray、订阅服务、证书、AdGuard、CDN 节点、命令、cron。
@@ -4247,8 +4292,8 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:          # 不带参数 → 管理面板（bgpeer 也走这里）
         main_menu()
         sys.exit(0)
-    if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新内核调这个
-        update_cores_auto()
+    if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单16 转后台都调这个
+        update_cores_auto(sys.argv[2] if len(sys.argv) > 2 else None)   # 可选 sing-box/xray/both
         sys.exit(0)
     if sys.argv[1] == "selfdns-toggle":  # adguard 菜单调用：开关"自建DNS写入订阅"
         selfdns_toggle()
