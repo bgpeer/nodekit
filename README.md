@@ -33,6 +33,12 @@ sudo python3 /tmp/xy.py
   续期后自动重启 sing-box / xray（有 nginx 顺带 reload）使新证书生效，无需手动干预
 - **内核自动更新**：安装后自动挂 cron，**每月北京时间 2 号凌晨 04:00** 把 sing-box / xray 更新到最新并重启一次
   （无新版则跳过）；也可随时进管理面板 **16 更新核心** 手动立即更新。日志在 `/var/log/bgpeer-coreupdate.log`
+- **两个核心的取版本策略不同**（不是笔误，是刻意的）：**xray** 取全部 release 里**版本号最大的那个，包含被标为
+  「预发行」的**——XTLS 从 `v26.6.1` 起把每个 release 都标成了预发行，而 GitHub 的 `/releases/latest` 按定义只返回
+  非预发行版，只认它会**永远停在 `v26.3.27`**、每月的自动更新也推不动。注意预发行是 release 上的独立标志位、跟 tag
+  名无关（xray 的 tag 一律是 `v26.7.28` 这种纯版本号，看 tag 名分辨不出来）。**sing-box** 则仍只认 `/releases/latest`
+  的正式版：它 `1.13` 正式线和 `1.14.0-beta` 线**并行维护**，而 `1.14.0-beta.7` 的版本号大于 `1.13.16`，取最大会把人
+  送上 beta 线、跨小版本换配置 schema，节点可能直接起不来
 - **xray 26.7.11+ reality 兼容自愈**：xray 从 v26.7.11 起，reality 服务端**默认 `minClientVer=26.3.27`**，会
   **静默拒掉上报旧版本的客户端**（mihomo/Clash 系内核硬编码 reality 版本 `1.8.2`、sing-box、旧 xray）——表现为
   升级 xray 后 reality 节点客户端**连不上、也不报错**（全被丢进 fallback）。本脚本给 xray reality 入站显式写
