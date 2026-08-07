@@ -1648,12 +1648,17 @@ def other_members(names, present):
     rxs = [re.compile(p) for _, p, _ in present]
     return [n for n in norm if not any(rx.search(n) for rx in rxs)]
 
-def _sb_country_groups(tags):
+def _sb_country_groups(tags, existing=()):
     """sing-box 国家随机组：无 filter，按正则算好每国成员显式列入 urltest。
-       返回 (国家组对象列表, 组名列表)。tag 用原始名（保留 🇺🇲 等，匹配用归一名）。"""
+       返回 (国家组对象列表, 组名列表)。tag 用原始名（保留 🇺🇲 等，匹配用归一名）。
+
+       existing：模板 outbounds 里已有的 tag。**同名的不再生成**，让模板里那个说了算——
+       sing-box 遇到重复 tag 是硬失败(FATAL: duplicate outbound/endpoint tag)，整份配置
+       解析不了。与 mihomo 侧同一套取舍：同名接管、不同名并存。"""
     present = detect_countries(tags)
     if not present:                                      # 没有任何国家 → 不建组（含"其他随机"），与 mihomo 一致
         return [], []
+    existing = set(existing)
     objs, names = [], []
     mk = lambda tag, members: {"tag": tag, "type": "urltest", "outbounds": members,
                                "url": "https://www.gstatic.com/generate_204",
@@ -1661,12 +1666,16 @@ def _sb_country_groups(tags):
     for gname, pat, _ in present:
         rx = re.compile(pat)
         members = [t for t in tags if rx.search(_norm_us_flag(t))]
-        objs.append(mk(gname, members)); names.append(gname)
+        if gname not in existing:
+            objs.append(mk(gname, members))
+        names.append(gname)                              # 名字照样展开（指向模板里的同名出站）
     if OTHER_GROUP:
         rxs = [re.compile(p) for _, p, _ in present]
         omembers = [t for t in tags if not any(r.search(_norm_us_flag(t)) for r in rxs)]
         if omembers:
-            objs.append(mk(OTHER_GROUP, omembers)); names.append(OTHER_GROUP)
+            if OTHER_GROUP not in existing:
+                objs.append(mk(OTHER_GROUP, omembers))
+            names.append(OTHER_GROUP)
     return objs, names
 
 def build_singbox_sub(nodes, tpl_url):
@@ -1686,7 +1695,10 @@ def build_singbox_sub(nodes, tpl_url):
     static_tags = [o["tag"] for o in cfg.get("outbounds", [])
                    if isinstance(o, dict) and o.get("type") in _SB_NODE_TYPES and o.get("tag")]
     tags = [o["tag"] for o in objs] + static_tags
-    country_objs, country_names = _sb_country_groups(tags)
+    # 模板里已有的 tag（含手写的策略组和静态节点）：同名的国家组不再生成，避免 duplicate tag
+    existing_tags = {o["tag"] for o in cfg.get("outbounds", [])
+                     if isinstance(o, dict) and o.get("tag")}
+    country_objs, country_names = _sb_country_groups(tags, existing_tags)
     def expand_list(lst):
         out = []
         for x in lst:
@@ -1764,9 +1776,9 @@ def shadowrocket_line(name, d):
                          "tls=1", f"sni={sni}", f"skip-cert-verify={scv}"])
     return None
 
-def _sr_static_names(tpl):
-    """抽取 shadowrocket 模板 [Proxy] 段里用户手写的静态节点名（"名 = 协议,..." 行）。"""
-    m = re.search(r"(?ms)^\[Proxy\]\s*\n(.*?)(?=^\[|\Z)", tpl)
+def _sr_section_keys(tpl, section):
+    """抽取 shadowrocket 模板某个段里所有 "名 = ..." 行的等号左边（跳过注释和带锚点的行）。"""
+    m = re.search(r"(?ms)^\[" + re.escape(section) + r"\]\s*\n(.*?)(?=^\[|\Z)", tpl)
     if not m:
         return []
     out = []
@@ -1776,24 +1788,42 @@ def _sr_static_names(tpl):
             out.append(ln.split("=", 1)[0].strip())
     return out
 
-def _sr_country_groups(names_list):
+def _sr_static_names(tpl):
+    """抽取 shadowrocket 模板 [Proxy] 段里用户手写的静态节点名（"名 = 协议,..." 行）。"""
+    return _sr_section_keys(tpl, "Proxy")
+
+def _sr_group_names(tpl):
+    """抽取 shadowrocket 模板 [Proxy Group] 段里用户手写的策略组名。
+       注意带 __XY_NAMES__ 的行会被跳过——那种行是模板自带的组、名字里不含国家组名，
+       跳过它们不影响判断，反倒避免把锚点当成组名。"""
+    return _sr_section_keys(tpl, "Proxy Group")
+
+def _sr_country_groups(names_list, existing=()):
     """shadowrocket 国家随机组：显式列成员（不依赖 shadowrocket 正则引擎，稳）。
-       返回 (组定义行文本, 拼进服务组的组名片段[前导逗号, 裸名])。"""
+       返回 (组定义行文本, 拼进服务组的组名片段[前导逗号, 裸名])。
+
+       existing：模板 [Proxy Group] 段里已有的组名。**同名的不再生成**，让模板里那个说了算。
+       与 mihomo / sing-box 侧同一套取舍：同名接管、不同名并存。（mihomo 和 sing-box 的
+       重名硬失败已实测确认；小火箭是 iOS 客户端没法在这里跑，但同段里出现两条同名定义
+       本身就是歧义的，一并防住。）"""
     present = detect_countries(names_list)
     if not present:                                      # 没有任何国家 → 不建组（含"其他随机"），与 mihomo 一致
         return "", ""
     U = "url=http://www.gstatic.com/generate_204,interval=120,tolerance=30,timeout=5"
+    existing = set(existing)
     lines, gnames = [], []
     for gname, pat, _ in present:
         rx = re.compile(pat)
         members = [t for t in names_list if rx.search(_norm_us_flag(t))]
-        lines.append(f"{gname} = url-test,{','.join(members)},{U}")
-        gnames.append(gname)
+        if gname not in existing:
+            lines.append(f"{gname} = url-test,{','.join(members)},{U}")
+        gnames.append(gname)                             # 名字照样展开（指向模板里的同名组）
     if OTHER_GROUP:
         rxs = [re.compile(p) for _, p, _ in present]
         omembers = [t for t in names_list if not any(r.search(_norm_us_flag(t)) for r in rxs)]
         if omembers:
-            lines.append(f"{OTHER_GROUP} = url-test,{','.join(omembers)},{U}")
+            if OTHER_GROUP not in existing:
+                lines.append(f"{OTHER_GROUP} = url-test,{','.join(omembers)},{U}")
             gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f",{g}" for g in gnames)
 
@@ -1811,7 +1841,8 @@ def build_shadowrocket_sub(nodes, tpl_url):
     tpl = _ghrelay_rewrite(fetch_url(tpl_url))               # 规则/图标链接：开启则改走本机 GitHub 中转
     # 国家检测/成员池 = 注入节点 + 用户手写进模板 [Proxy] 段的静态节点（"名 = 协议,..." 行）
     static = _sr_static_names(tpl)
-    groups_txt, names_frag = _sr_country_groups(names_list + static)
+    # 模板 [Proxy Group] 段里已有的组名：同名的国家组不再生成，避免同段两条同名定义
+    groups_txt, names_frag = _sr_country_groups(names_list + static, _sr_group_names(tpl))
     out = tpl
     out = _fill_block(out, "__XY_NODES__", "\n".join(lines))    # 块锚点整行替换，缩进容错
     out = _fill_block(out, "__XY_GROUPS__", groups_txt)
@@ -1823,21 +1854,51 @@ def _node_names(nodes):
     """从解析后的节点取名字列表（去引号），供国家检测用。"""
     return [d.get("name", "").strip('"') or k for k, d in nodes]
 
-def _mihomo_country(names):
+_GNAME_RE = re.compile(r'''name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^,}\n]+))''')
+
+def tpl_group_names(tpl):
+    """取模板 proxy-groups: 段里已经写好的组名（三种写法都认：双引号/单引号/不加引号）。
+       只扫这一段：pg-anchor 里的 &GLOBAL_PROXIES 之类是组名【引用】不是【定义】，
+       扫进来会把自动建组全误判成已存在。"""
+    m = re.search(r'(?m)^proxy-groups:[ \t]*$', tpl)
+    if not m:
+        return set()
+    seg = []
+    for line in tpl[m.end():].splitlines():
+        if line and not line[0].isspace():                     # 碰到下一个顶级键就停
+            break
+        seg.append(line)
+    out = set()
+    for a, b, c in _GNAME_RE.findall("\n".join(seg)):
+        n = (a or b or c).strip().strip("\"'")
+        if n:
+            out.add(n)
+    return out
+
+def _mihomo_country(names, existing=()):
     """mihomo 国家随机组：返回 (组定义 yaml 行, 拼进🌍全球加速的组名片段)。无国家则空串。
-       用 filter+include-all，客户端按正则自动收拢；filter 用单引号 YAML 串避免 \\b 被转义。"""
+       用 filter+include-all，客户端按正则自动收拢；filter 用单引号 YAML 串避免 \\b 被转义。
+
+       existing：模板 proxy-groups 里已有的组名。**同名的不再生成**，让模板里那个说了算——
+       mihomo 遇到重名组是硬失败(ProxyGroup xxx: duplicate group name)，整份配置加载不了。
+       名字不同则照常生成，两个组并存互不干扰（想在模板里自定义样式就用同名覆盖，
+       想额外多一个组就换个名字）。被跳过的组名仍拼进 🌍全球加速——那个引用会指向模板里
+       的同名组，效果不变；即便你自己也把它写进了某个 proxies 列表，重复引用 mihomo 是允许的。"""
     present = detect_countries(names)
     if not present:
         return "", ""
     # hidden: true 让国家组不占面板卡片位（仍可在🌍全球加速里选到）；显式写在组上，
     # 覆盖 <<: *COUNTRY_COMMON，自定义模板不改锚点也生效。
+    existing = set(existing)
     lines, gnames = [], []
     for gname, pat, _ in present:
-        lines.append(f"  - {{name: \"{gname}\", <<: *COUNTRY_COMMON, filter: '{pat}', hidden: true}}")
+        if gname not in existing:
+            lines.append(f"  - {{name: \"{gname}\", <<: *COUNTRY_COMMON, filter: '{pat}', hidden: true}}")
         gnames.append(gname)
     if OTHER_GROUP and other_members(names, present):          # 有漏网节点才建"其他随机"
-        allpat = "|".join(p for _, p, _ in present)
-        lines.append(f"  - {{name: \"{OTHER_GROUP}\", <<: *COUNTRY_COMMON, exclude-filter: '{allpat}', hidden: true}}")
+        if OTHER_GROUP not in existing:
+            allpat = "|".join(p for _, p, _ in present)
+            lines.append(f"  - {{name: \"{OTHER_GROUP}\", <<: *COUNTRY_COMMON, exclude-filter: '{allpat}', hidden: true}}")
         gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f', "{g}"' for g in gnames)
 
@@ -2037,7 +2098,8 @@ def gen_mihomo(ylines, nodes, tpl_url):
     # 国家检测要看"全部节点"：注入的订阅节点 + 用户手写进模板的静态节点。
     # 静态节点名取 proxy-groups 段之前的 name:（策略组名在 proxy-groups 里，且不含国旗，不会误检）。
     static = re.findall(r'name:\s*"([^"]*)"', tpl.split("proxy-groups:")[0])
-    groups_yaml, names_frag = _mihomo_country(_node_names(nodes) + static)
+    groups_yaml, names_frag = _mihomo_country(_node_names(nodes) + static,
+                                              tpl_group_names(tpl))   # 模板里已手写的同名组不再自动生成
     # 块锚点(独占一行)整行替换，缩进容错：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组
     tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
