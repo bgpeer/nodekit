@@ -801,15 +801,20 @@ def _q_dot(port, sni, name):
         try: c.close()
         except Exception: pass
 
-def _q_doh(port, sni, name):
+def _q_doh(port, sni, name, path="/dns-query"):
+    """DoH 查询。返回 (HTTP状态码, DNS rcode, [A记录], 服务端证书, 错误)。
+
+       必须把 DNS 层的 rcode 也解出来：设了访问白名单之后，AdGuard 对不带 ClientID 的
+       查询是回【HTTP 200 + DNS REFUSED】——只看 HTTP 状态码会误判成"正常"。
+       path 可带 ClientID（/dns-query/<id>），用来测真实客户端走的那条路。"""
     try:
         c = _tls_conn(port, sni)
     except Exception as e:
-        return -1, None, f"{type(e).__name__}: {e}"
+        return -1, -1, [], None, f"{type(e).__name__}: {e}"
     cert = c.getpeercert()          # 同上：服务端 Connection: close 后就取不到了
     try:
         d = base64.urlsafe_b64encode(_dns_packet(name)).rstrip(b"=").decode()
-        c.sendall((f"GET /dns-query?dns={d} HTTP/1.1\r\nHost: {sni}\r\n"
+        c.sendall((f"GET {path}?dns={d} HTTP/1.1\r\nHost: {sni}\r\n"
                    "Accept: application/dns-message\r\nConnection: close\r\n\r\n").encode())
         buf = b""
         while True:
@@ -817,11 +822,14 @@ def _q_doh(port, sni, name):
             if not chunk:
                 break
             buf += chunk
-        first = buf.split(b"\r\n", 1)[0].decode(errors="replace")
+        head, _, body = buf.partition(b"\r\n\r\n")
+        first = head.split(b"\r\n", 1)[0].decode(errors="replace")
         m = re.search(r"\s(\d{3})\s", first + " ")
-        return (int(m.group(1)) if m else -1), cert, ""
+        code = int(m.group(1)) if m else -1
+        rc, ips = _dns_parse(body) if body else (-1, [])
+        return code, rc, ips, cert, ""
     except Exception as e:
-        return -1, cert, f"{type(e).__name__}: {e}"
+        return -1, -1, [], cert, f"{type(e).__name__}: {e}"
     finally:
         try: c.close()
         except Exception: pass
@@ -917,19 +925,42 @@ def selfcheck():
     probe = "www.qq.com"
     if not ("AdGuardHome" in b53 or (enc_on and dom and (p_dot or p_doh))):
         print(f"    {warn} 没有可测的服务（53 不在 AGH 手上，加密也没开）—— 先把上面两步弄好")
+    # 设了访问白名单之后，必须【按真实客户端走的那条路】去测，否则全是假失败/假通过：
+    # 不带 ClientID 的查询会被 AdGuard 拒（DoT 回 rcode=5，DoH 回 HTTP 200 + rcode=5，
+    # 明文 53 直接不应答）。这些"失败"是白名单在正常工作，不是故障。
+    cid_p  = _selfdns_clientid()
+    wild_p = _cert_wildcard_ok(dom)
+    allow_p = _yaml_list(txt, "allowed_clients") or []
+    REFUSED = 5
+    if allow_p:
+        print(f"    {Y}已设访问白名单 → 下面按客户端真实用的地址测（带 ClientID）{N}")
     if "AdGuardHome" in b53:
         (rc, ips), err = _q_plain(53, probe)
         if rc == 0 and ips:
             print(f"    {ok} 明文 53  解析 {probe} → {ips[0]}")
+        elif allow_p:
+            print(f"    {warn} 明文 53  被白名单拒绝（{Y}预期之内{N}，53 没有 ClientID 机制）"
+                  f"—— 电视/IoT 用不了这台 DNS")
         else:
             print(f"    {bad} 明文 53  {R}解析失败{N} {err or f'rcode={rc}'}")
             fix.append("53 解析不出来：看后台『设置 → DNS设置 → 上游DNS服务器』是否填了能用的上游")
     if enc_on and dom and p_dot:
-        (rc, ips), peer, err = _q_dot(p_dot, dom, probe)
+        sni = f"{cid_p}.{dom}" if (cid_p and wild_p) else dom
+        (rc, ips), peer, err = _q_dot(p_dot, sni, probe)
+        tail = f"（SNI={sni}）" if sni != dom else ""
         if rc == 0 and ips:
-            print(f"    {ok} DoT {p_dot}  握手+解析都正常 → {ips[0]}   {G}(安卓私人DNS 可用){N}")
+            print(f"    {ok} DoT {p_dot}  握手+解析都正常 → {ips[0]}   {G}(安卓私人DNS 可用){N}{tail}")
+        elif rc == REFUSED and allow_p:
+            if cid_p and cid_p not in allow_p:
+                print(f"    {bad} DoT {p_dot}  {R}被白名单拒绝{N}：当前 ClientID {cid_p} 不在名单里")
+                fix.append(f"把当前 ClientID 加进「允许的客户端」: {cid_p}")
+            elif not wild_p:
+                print(f"    {bad} DoT {p_dot}  {R}被白名单拒绝{N}：没签泛域名证书，ID 传不进 SNI")
+                fix.append("要用安卓 DoT 就回菜单选『8 让 DoT 也能带 ClientID』")
+            else:
+                print(f"    {bad} DoT {p_dot}  {R}被白名单拒绝{N}{tail} —— 名单里的 ID 与实际不符?")
         else:
-            print(f"    {bad} DoT {p_dot}  {R}失败{N}: {err or f'rcode={rc}'}")
+            print(f"    {bad} DoT {p_dot}  {R}失败{N}: {err or f'rcode={rc}'}{tail}")
             print(f"       {Y}这一条挂掉 = 填了私人DNS 的安卓机会整机断网{N}")
             if "CERTIFICATE" in err.upper() or "SSLCert" in err:
                 fix.append("DoT 证书校验没过：证书过期或填的不是 acme 真证书，去加密设置重填 "
@@ -937,25 +968,37 @@ def selfcheck():
             else:
                 fix.append("DoT 连不上：确认加密设置里 DoT 端口填了、服务已重启")
     if enc_on and dom and p_doh:
-        code, pc, err = _q_doh(p_doh, dom, probe)
+        path = f"/dns-query/{cid_p}" if cid_p else "/dns-query"
+        code, rc, ips, pc, err = _q_doh(p_doh, dom, probe, path)
         peer = peer or pc
-        if code == 200:
-            print(f"    {ok} DoH {p_doh} 正常 (HTTP 200)")
+        if code == 200 and rc == 0 and ips:
+            print(f"    {ok} DoH {p_doh} 解析正常 → {ips[0]}（{path}）")
+        elif code == 200 and rc == REFUSED:
+            print(f"    {bad} DoH {p_doh} {R}被白名单拒绝{N}（HTTP 200 但 DNS rcode=5）"
+                  f"—— 订阅里的 DoH 会失效")
+            if cid_p and cid_p not in allow_p:
+                fix.append(f"把当前 ClientID 加进「允许的客户端」: {cid_p}")
         else:
-            print(f"    {bad} DoH {p_doh} {R}失败{N}: {err or f'HTTP {code}'}")
+            print(f"    {bad} DoH {p_doh} {R}失败{N}: {err or f'HTTP {code} / rcode={rc}'}")
     days, exp = _cert_days_left(peer)
     if days is not None:
         tag = ok if days > 20 else (warn if days > 7 else bad)
         print(f"    {tag} 证书还有 {days} 天到期（{exp}）")
         if days <= 20:
             fix.append(f"证书 {days} 天后到期——续期后记得 systemctl restart AdGuardHome 让 AGH 重新加载")
-    # 顺手验一下广告到底拦没拦
-    if "AdGuardHome" in b53:
-        (rc, ips), _ = _q_plain(53, "doubleclick.net")
+    # 顺手验一下广告到底拦没拦。设了白名单时明文 53 会被拒、测不出结果，
+    # 改走 DoH（带 ClientID）——那本来就是客户端真实用的路。
+    ad = "doubleclick.net"
+    rc = ips = None
+    if allow_p and enc_on and dom and p_doh:
+        _, rc, ips, _, _ = _q_doh(p_doh, dom, ad, f"/dns-query/{cid_p}" if cid_p else "/dns-query")
+    elif "AdGuardHome" in b53:
+        (rc, ips), _ = _q_plain(53, ad)
+    if rc is not None:
         if rc == 3 or (ips and ips[0] in ("0.0.0.0", "127.0.0.1")) or (rc == 0 and not ips):
-            print(f"    {ok} 广告过滤生效（doubleclick.net 已被拦）")
+            print(f"    {ok} 广告过滤生效（{ad} 已被拦）")
         elif rc == 0 and ips:
-            print(f"    {warn} doubleclick.net 没被拦 → {ips[0]}；后台『过滤器』里确认拦截名单是开的")
+            print(f"    {warn} {ad} 没被拦 → {ips[0]}；后台『过滤器』里确认拦截名单是开的")
 
     # ---- 5 访问控制（这次把你锁在外面的就是它）----
     print("\n  【5/7 访问控制】")
