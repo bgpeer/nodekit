@@ -96,6 +96,7 @@ CN_BLOCK_URL   = _RAW + "cn-block.py"            # 仓库里的 cn-block.py（�
 ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.py
 ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（去广告 DNS·AdGuard Home）
 SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
+SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid" # AdGuard ClientID（DoH 地址末段；填进「允许的客户端」即可只放行自己）
 GHRELAY_OFF    = BGP_DIR + "/ghrelay.off"        # 开关：规则/图标走本机 GitHub 中转（默认开；存在此文件=用户手动关了）
 GHRELAY_TOKEN_FILE = BGP_DIR + "/ghrelay.token"  # 本机中转的 token（防别人蹭；在 BGP_DIR 不在 SUB_DIR，不会被下载）
 
@@ -1999,9 +2000,32 @@ def _ghrelay_rewrite(text):
     text = _GH_URL_RE.sub(lambda m: p + m.group(1), text)
     return text.replace("https://gh-proxy.com/", p)
 
+def selfdns_clientid():
+    """AdGuard ClientID：DoH 地址的末段（.../dns-query/<id>）。没有就生成一个存下来。
+       存 BGP_DIR（不在 SUB_DIR，不会被静态服务下载），同 ghrelay token 的套路。
+       用途：把这个 ID 填进 AdGuard「设置→DNS设置→访问设置→允许的客户端」，DoH 就只
+       放行自己——不填白名单时它对谁都开放，公网上被扫到就成了别人的免费解析器。
+       ID 只用小写字母和数字：AdGuard 要求 ClientID 是合法的域名标签。"""
+    try:
+        t = open(SELFDNS_CID_FILE).read().strip()
+        if t:
+            return t
+    except OSError:
+        pass
+    t = "xy" + secrets.token_hex(6)                      # 14 字符，纯小写字母数字
+    os.makedirs(BGP_DIR, exist_ok=True)
+    open(SELFDNS_CID_FILE, "w").write(t)
+    return t
+
 def _selfdns_doh():
-    """开关开启且本机是域名时，返回本机 AdGuard 的 DoH 地址 https://域名:端口/dns-query，
-       否则返回 ''。DoH 端口从 AdGuardHome.yaml 的 port_https 读，读不到默认 10443。"""
+    """开关开启且本机是域名时，返回本机 AdGuard 的 DoH 地址
+       https://域名:端口/dns-query/<ClientID>，否则返回 ''。
+       DoH 端口从 AdGuardHome.yaml 的 port_https 读，读不到默认 10443。
+
+       末段带 ClientID 是为了能在 AdGuard 侧只放行自己（见 selfdns_clientid）。
+       手机流量 IP 天天变、没法按 IP 白名单，ClientID 与 IP 无关，正合适。
+       向后兼容：AdGuard 未配置「允许的客户端」时对任意 ClientID 都放行，所以带上它
+       不会让原本能用的配置失效——它只是把「可以收紧」这个选项交到你手里。"""
     if not os.path.exists(SELFDNS_FLAG):
         return ""
     dom = _host()
@@ -2014,7 +2038,7 @@ def _selfdns_doh():
             port = int(m.group(1))
     except OSError:
         pass
-    return f"https://{dom}:{port}/dns-query"
+    return f"https://{dom}:{port}/dns-query/{selfdns_clientid()}"
 
 def _selfdns_prepend_list(tpl, prefix_re, item):
     """在匹配 prefix_re（以 [ 收尾）的单行列表最前插入 item；该列表已含 item 则不动（幂等）。"""
@@ -3078,6 +3102,10 @@ def selfdns_toggle():
         if act == "已写入":
             print(f"  写入的 DoH：{_selfdns_doh()}")
             print("  ⚠ 确保 AdGuard 已开加密、防火墙放行 DoH 端口；没通也不影响——会自动回落到原 DNS。")
+            print(f"\n  ▸ 建议顺手关掉「开放解析器」：DoH 挂在公网上，不设白名单谁扫到都能用。")
+            print(f"    AdGuard 后台 → 设置 → DNS设置 → 访问设置 → 允许的客户端，填入这一行：")
+            print(f"        {selfdns_clientid()}")
+            print(f"    手机流量 IP 会变、没法按 IP 白名单，这个 ClientID 与 IP 无关，换网络也不影响。")
         print("  客户端重新拉一次订阅即生效。")
     else:
         print("  刷新配置失败（没有可用节点？）。")
