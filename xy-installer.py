@@ -2024,16 +2024,28 @@ def _selfdns_prepend_list(tpl, prefix_re, item):
     return re.sub(prefix_re, repl, tpl, count=1)
 
 def _mihomo_selfdns(tpl, url):
-    """mihomo：把自建 DoH 写进两处，都放列表最前当主用、原有留兜底（DoH 没通自动回落）：
+    """mihomo：把自建 DoH 写进三处，都放列表最前当主用、原有留兜底（DoH 没通自动回落）：
        ① nameserver —— 默认解析用它
        ② global-dns 锚点 —— nameserver-policy 里所有走代理的域名组(*global-dns)共用它，
           改锚点一行即全部生效。cn-dns 不动：国内域名该用国内解析拿就近 CDN，
-          用境外自建 DNS 解析反而慢。"""
+          用境外自建 DNS 解析反而慢。
+       ③ proxy-server-nameserver —— 解析节点 server 域名用。是【加进列表一起竞速】
+          而不是替换：这一栏 mihomo 是并发查询、谁先回用谁(dns/util.go 的 picker)，
+          所以自建 DoH 通了就用它，挂了只是输掉比赛，剩下几条照常顶上，不会因为
+          「DNS 建在自己要解析的节点上」而把整批节点的可用性绑死在一台机上。
+          注：这一栏的查询 mihomo 强制直连、不走规则(config.go 里 respectRules 传
+          false)，所以不存在「查DNS→走代理→要先解析节点域名」的套娃。
+
+       地址由 _selfdns_doh() 按本机域名动态生成，不写死在模板里——每个人的自建
+       域名都不一样。关掉开关时 url 为空、直接原样返回；模板每次生成都是实时重新
+       拉取的，所以「不插入」本身就等于「已删除」，不需要单独的移除逻辑。"""
     if not url:
         return tpl
     q = f'"{url}"'
     tpl = _selfdns_prepend_list(tpl, r'(?m)^(\s*nameserver:\s*\[)(.*)$', q)
     tpl = _selfdns_prepend_list(tpl, r'(?m)^(\s*global-dns:\s*&global-dns\s*\[)(.*)$', q)
+    # 用 :\s*\[ 收尾，不会误命中 proxy-server-nameserver-policy（那个 key 后面跟的是 -policy）
+    tpl = _selfdns_prepend_list(tpl, r'(?m)^(\s*proxy-server-nameserver:\s*\[)(.*)$', q)
     return tpl
 
 def _sr_selfdns(path, url):
