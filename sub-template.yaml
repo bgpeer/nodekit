@@ -62,10 +62,6 @@ tun:
   route-exclude-cidr: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10", "fc00::/7", "fe80::/10"]
 
 dns-anchor:
-  # DoH/DoT 一律写 IP 形式：域名形式的 DNS 服务器，它自己的域名要先被 default-nameserver 解析一次，
-  # 而 dns.google / cloudflare-dns.com / dns.quad9.net 在国内正是被污染的对象——解析到假 IP 就握手失败，
-  # 那几条等于白填。IP 形式跳过这一步，不依赖任何前置解析。
-  # doh.pub 例外保留域名：DNSPod 从 2024-09 起不再公开 IP 接入。
   cn-dns: &cn-dns ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"]
   global-dns: &global-dns ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query", "tls://1.1.1.1:853", "tls://8.8.8.8:853"]
 
@@ -89,8 +85,6 @@ dns:
   # 留两个就够：114 不支持 EDNS、污染时表现最差，百度那个也不稳，去掉。
   default-nameserver: ["223.5.5.5", "119.29.29.29"]
   nameserver: ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query", "https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query", "tls://1.1.1.1:853", "tls://8.8.8.8:853"]
-  # 只解析节点 server 域名，用不着堆一大串——原来八条里有一半是域名形式(cloudflare-dns.com /
-  # dns.google / public.dns.iij.jp)，在国内被污染就是死条目。三条 IP 形式的 DoH 并发竞速足够。
   proxy-server-nameserver: ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"]
   direct-nameserver-follow-policy: true
   nameserver-policy:
