@@ -81,8 +81,6 @@ dns:
   fake-ip-ttl: 60
   fake-ip-filter: ["localhost","+.lan","+.local","+.arpa","+.ntp.org","captive.apple.com","connectivitycheck.gstatic.com","msftconnecttest.com","msftncsi.com","openai.*","+.openai.*","report-v2.samsung.japps.cn","rule-set:private"]
   direct-nameserver: ["system"]
-  # 只用来解析上面那些「域名形式」的 DNS 服务器地址。DoH 改 IP 形式后这里几乎用不上了，
-  # 留两个就够：114 不支持 EDNS、污染时表现最差，百度那个也不稳，去掉。
   default-nameserver: ["223.5.5.5", "119.29.29.29"]
   nameserver: ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query", "https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query", "tls://1.1.1.1:853", "tls://8.8.8.8:853"]
   proxy-server-nameserver: ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query"]
