@@ -342,6 +342,69 @@ def _replace_cf_token():
     print(f"  下次证书续期(约90天后)会用新 Token；想立刻验证可跑：")
     print(f"      ~/.acme.sh/acme.sh --renew -d {_domain()} --ecc --force")
 
+def _revert_wildcard(dom, cid=""):
+    """撤销泛域名：把证书重签回只覆盖『域名』，DoT 就不能再带 ClientID 了。
+
+       80 端口空着就用 HTTP-01 重签——这样连 acme.sh 的续期方式也一并回到装机时的
+       样子，之后不再依赖 CF Token，可以把它从 account.conf 里清掉。80 被占（nginx
+       等）则退回 DNS-01，此时 Token 必须留着，否则 90 天后续期会失败。
+
+       同样是失败安全的：acme.sh 只有签发成功才覆盖证书文件。"""
+    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
+    print(f"\n  撤销之后：")
+    print(f"    · 安卓「专用DNS」要改回填 {G}{dom}{N}（不能再带 ClientID）")
+    if _allowed_clients():
+        print(f"    · {R}你已经设了访问白名单 —— 撤销后安卓 DoT 会被挡掉、连不上{N}，")
+        print(f"      要么同时把白名单清掉，要么就别撤销。")
+    print(f"    · DoH 不受影响，照旧带 ClientID")
+    if _ask("\n  确认撤销? [y/N]: ").lower() not in ("y", "yes"):
+        print("  已取消，没有任何改动。"); return
+
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print(f"  {R}找不到 acme.sh{N}，无法重签。"); return
+    http01 = not _port_busy(80)
+    if http01:
+        issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256 --server letsencrypt --force"
+        how = "HTTP-01（80 端口空闲，撤销后不再依赖 CF Token）"
+    else:
+        issue = f"{acme} --issue -d {dom} --dns dns_cf --keylength ec-256 --server letsencrypt --force"
+        how = f"DNS-01（80 被占用，{Y}CF Token 仍需保留供续期{N}）"
+    print(f"\n  正在重签单域名证书，验证方式：{how} …")
+    r = subprocess.run(issue, shell=True, text=True, capture_output=True)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode and "Cert success" not in out:
+        print(f"\n  {R}❌ 重签失败，原证书原封未动（泛域名仍然有效）。{N}报错：")
+        for ln in out.splitlines()[-10:]:
+            print("     " + ln)
+        return
+    reload_hook = (" --reloadcmd '"
+                   "systemctl reload nginx 2>/dev/null; "
+                   "systemctl restart sing-box 2>/dev/null; "
+                   "systemctl restart xray 2>/dev/null; "
+                   "systemctl restart xy-sub 2>/dev/null; "
+                   "systemctl restart AdGuardHome 2>/dev/null; true'")
+    sh(f"{acme} --install-cert -d {dom} --ecc "
+       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+    if _cert_wildcard_ok(dom):
+        print(f"  {R}❌ 证书里仍有 *.{dom}，撤销没生效。{N}"
+              f"看 `openssl x509 -in {ACME_CRT} -noout -text | grep DNS:` 确认。")
+        return
+    sh("systemctl restart AdGuardHome", check=False)
+    time.sleep(3)
+    print(f"  {G}✓ 证书已改回只覆盖 {dom}{N}")
+    print(f"  安卓「专用DNS」现在要填：{G}{dom}{N}")
+    if http01:
+        conf = os.path.expanduser("~/.acme.sh/account.conf")
+        if os.path.exists(conf) and re.search(r"(?m)^SAVED_CF_Token=", open(conf).read()):
+            if _ask("  续期已不需要 CF Token，把它从 account.conf 清掉? [Y/n]: ").lower() not in ("n", "no"):
+                txt = re.sub(r"(?m)^SAVED_CF_Token=.*$\n?", "", open(conf).read())
+                shutil.copy(conf, conf + ".bak"); open(conf, "w").write(txt); os.chmod(conf, 0o600)
+                print(f"  {G}✓ 已清除{N}（备份 {conf}.bak）。{Y}记得回 CF 把该 Token 删掉。{N}")
+    if cid and _allowed_clients():
+        print(f"  {R}⚠ 白名单还留着 {cid}{N} —— 现在安卓 DoT 带不了它了，会被挡。"
+              f"要用 DoT 就去 AdGuard 把白名单清空。")
+
 def dot_clientid():
     """把 acme 证书重签成同时覆盖『域名』和『*.域名』，让安卓 DoT 也能带 ClientID。
 
@@ -374,9 +437,16 @@ def dot_clientid():
             print(f"  {R}⚠ 但 *.{dom} 的 DNS 通配记录没生效{N}——手机会解析不出这个主机名。")
             print(f"    去 Cloudflare 加一条：类型 {G}A{N}  名称 {G}*.{dom.split('.',1)[0] if dom.count('.')>1 else '*'}{N}"
                   f"  内容 {G}{_public_ip()}{N}  代理状态 {Y}仅DNS(灰云){N}")
-        print(f"\n  Token 存在 {G}~/.acme.sh/account.conf{N}，约 90 天后自动续期还要用它。")
-        if _ask("  要更换 Cloudflare API Token 吗（旧的泄露了/被吊销了就换）? [y/N]: ").lower() in ("y", "yes"):
+        print(f"  Token 存在 {G}~/.acme.sh/account.conf{N}，约 90 天后自动续期还要用它。")
+        print("  " + "-" * 56)
+        print(f"  1 更换 Cloudflare API 令牌（旧的泄露了/被吊销了）")
+        print(f"  2 删除 DoT ClientID 支持（证书改回单域名）")
+        print(f"  0 返回")
+        c = _ask("  选择: ").strip()
+        if c == "1":
             _replace_cf_token()
+        elif c == "2":
+            _revert_wildcard(dom, cid)
         return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
