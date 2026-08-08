@@ -66,6 +66,7 @@ TOKENS_FILE  = BGP_DIR + "/tokens.json"      # 每格式独立订阅 token
 LINKS_FILE   = BGP_DIR + "/nodes.links"      # 本机节点链接（供多机聚合拉取的 .links 端点）
 PEERS_FILE   = BGP_DIR + "/peers.json"       # 聚合的成员机 .links 地址列表
 CUSTPL_FILE  = BGP_DIR + "/custom_tpl.json"  # 每格式自定义模板链接（gist/GitHub）
+TPLSRC_FILE  = BGP_DIR + "/tpl_source.json"  # 每格式当前用的是哪套模板："author" / "custom"
 BT_STATE     = BGP_DIR + "/bt.json"          # BT/PT 下载屏蔽开关状态
 SUBPORT_FILE = BGP_DIR + "/sub.port"         # 订阅托管端口（首装随机挑一次永久沿用，每台机器不同）
 _RAW         = "https://raw.githubusercontent.com/bgpeer/nodekit/main/"
@@ -2172,6 +2173,32 @@ def del_custpl(ext):
 def tpl_url_for(ext, custom=False):
     return (load_custpl().get(ext) if custom else "") or FMT[ext]["author"]
 
+def load_tplsrc():   return _load_json(TPLSRC_FILE)
+def set_tplsrc(ext, src):
+    """记住该格式当前用的是哪套模板（"author"/"custom"）。三个格式各记各的。"""
+    d = load_tplsrc(); d[ext] = src
+    os.makedirs(BGP_DIR, exist_ok=True); json.dump(d, open(TPLSRC_FILE, "w"), ensure_ascii=False, indent=2)
+
+def tpl_src_of(ext):
+    """该格式当前该用哪套模板。没有记录时的兜底：有自定义链接就算自定义（沿用老装行为），
+       否则作者模板——第一次用的人本来就是作者模板。"""
+    src = load_tplsrc().get(ext)
+    if src in ("author", "custom"):
+        return src if (src == "author" or load_custpl().get(ext)) else "author"
+    return "custom" if load_custpl().get(ext) else "author"
+
+def tpl_url_current(ext):
+    """按【用户当前的选择】取模板 URL —— 所有会重新生成订阅的功能都该走这里。
+
+       为什么不能一律优先自定义：多路复用开关、GitHub 中转、自建 DNS 这些功能都会顺手
+       重生成订阅。原先它们写死 custom=True，于是只要设过自定义链接，哪怕你后来在
+       『更新配置』里明确选了作者模板，下次一按开关又被悄悄换回自定义模板——用户看到的
+       配置跟他以为的不是同一份，而且没有任何提示。改成跟随最后一次的显式选择。
+       三个格式互相独立：可以 mihomo 用自己的、sing-box 用作者的。"""
+    if tpl_src_of(ext) == "custom":
+        return load_custpl().get(ext) or FMT[ext]["author"]
+    return FMT[ext]["author"]
+
 # ============================================================================ 多机聚合
 def load_peers():
     try: return [u for u in json.load(open(PEERS_FILE)) if u]
@@ -2281,7 +2308,7 @@ def build_subscription(all_links, new_token=False):
     os.makedirs(BGP_DIR, exist_ok=True)
     for ext, meta in FMT.items():
         try:
-            meta["gen"](ylines, nodes, tpl_url_for(ext, custom=True))
+            meta["gen"](ylines, nodes, tpl_url_current(ext))   # 跟随该格式当前选的模板
         except Exception as e:
             print(f"{meta['label']} 配置生成跳过:", e)
     open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先）
@@ -2650,7 +2677,9 @@ def _validate_generated(ext, path):
     return True, ""
 
 def _regen_config(ext, url, which):
-    """用指定模板重生成单格式配置；不动节点、不换 token；失败回滚保留原配置。返回是否成功。"""
+    """用指定模板重生成单格式配置；不动节点、不换 token；失败回滚保留原配置。返回是否成功。
+       成功后记住这次用的是哪套模板（which），之后多路复用/中转/自建DNS 等功能重生成
+       订阅时会跟着这个选择走，不再被自定义链接单方面劫持。"""
     if not read_saved_links():
         print("  没有已保存节点。"); return False
     G["host"] = _host(); ensure_deps()
@@ -2671,7 +2700,10 @@ def _regen_config(ext, url, which):
             print("     " + ln)
         return False
     serve_sub()                                                     # 保持 token，URL 不变
+    set_tplsrc(ext, "custom" if which == "自定义" else "author")    # 记住选择，后续功能跟着走
     print(f"\n  ✅ 更新成功（{which}模板，节点/URL 未变）：\n  {sub_url(ext)}")
+    print(f"  ▸ {FMT[ext]['label']} 之后一律按【{which}模板】生成"
+          f"（多路复用/GitHub中转/自建DNS 改动时也跟着它）。")
     return True
 
 def update_one_config(ext):
@@ -2694,9 +2726,12 @@ def config_menu(ext):
     while True:
         cust = load_custpl().get(ext)
         print("\n" + "=" * 60 + f"\n{meta['label']} 配置\n" + "=" * 60)
+        src = tpl_src_of(ext)
         print(f"  配置文件: {meta['file']}")
         print(f"  当前订阅: {sub_url(ext)}")
         print(f"  自定义模板: {cust or '(未设置)'}")
+        print(f"  ▸ 当前生效: 【{'自定义模板' if src == 'custom' else '作者模板'}】"
+              f"  ← 多路复用/GitHub中转/自建DNS 重生成订阅时也用它")
         print("-" * 60)
         print("  1 修改配置（编辑器打开）")
         print("  2 修改订阅（显示当前 / 换 token）")
@@ -2719,8 +2754,8 @@ def config_menu(ext):
                 print("  1 更换   2 删除（改回作者模板）   0 返回")
                 s = _ask("  选择: ").strip()
                 if s == "2":
-                    del_custpl(ext)
-                    print("  ✓ 已删除自定义模板链接，之后『3 更新配置』默认用作者模板。")
+                    del_custpl(ext); set_tplsrc(ext, "author")   # 链接没了，当前选择同步切回作者
+                    print("  ✓ 已删除自定义模板链接，之后一律用作者模板。")
                     if _ask("  现在就用作者模板重新生成一次配置? [y/N]: ").lower() in ("y", "yes"):
                         _regen_config(ext, FMT[ext]["author"], "作者")   # 立即生效
                     continue

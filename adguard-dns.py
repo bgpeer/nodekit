@@ -132,12 +132,68 @@ def _first_setup():
     print(f"  4) 完成后后台地址就是 \033[1;32mhttp://{ip}:{WEB_PORT}\033[0m；想改端口防扫描，回菜单选 \033[1;32m5\033[0m 改（带回滚，安全）")
     _usage(WEB_PORT)
 
+SELFDNS_FLAG     = BGP_DIR + "/selfdns.on"        # 主脚本：自建 DNS 是否已写进订阅
+SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid"  # 主脚本生成的 AdGuard ClientID
+
+def _selfdns_clientid():
+    """读主脚本生成的 ClientID（只读，不生成——它由菜单 6 打开写入订阅时创建）。"""
+    try:
+        return open(SELFDNS_CID_FILE).read().strip()
+    except OSError:
+        return ""
+
+def _doh_port():
+    """当前 DoH(HTTPS) 端口：从 AdGuardHome.yaml 的 tls.port_https 读，读不到按 10443。"""
+    try:
+        p = int(_yaml_val(_tls_block(open(_agh_yaml()).read()), "port_https") or 0)
+        return p or 10443
+    except (OSError, ValueError):
+        return 10443
+
+def _allowed_clients():
+    """AdGuardHome.yaml 里的访问白名单 allowed_clients；没这个键返回 None，空列表返回 []。"""
+    try:
+        return _yaml_list(open(_agh_yaml()).read(), "allowed_clients")
+    except OSError:
+        return None
+
 def _usage(port=None):
-    """一步步的使用说明：登录后台 → 开加密 → 设备指过来。写给不懂的人看。"""
+    """一步步的使用说明：当前配置一览 → 登录后台 → 开加密 → 设备指过来。写给不懂的人看。"""
     ip = _public_ip(); dom = _domain()
     port = port or _current_web_port() or WEB_PORT
-    G = "\033[1;32m"; Y = "\033[1;33m"; N = "\033[0m"     # 绿=要填的值，黄=提示
+    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; C = "\033[1;36m"; N = "\033[0m"
+    dohp = _doh_port(); cid = _selfdns_clientid()
+    enc = _https_panel() is not None
+    allow = _allowed_clients()
+    doh_url = f"https://{dom}:{dohp}/dns-query" + (f"/{cid}" if cid else "")
+
     print("\n" + "  " + "=" * 56)
+    print(f"  {C}当前配置信息{N}（下面的值都是从你这台机实时读出来的）")
+    print("  " + "=" * 56)
+    print(f"    域名          : {G}{dom or '（无，只能用明文 53）'}{N}")
+    print(f"    公网 IP       : {G}{ip}{N}")
+    print(f"    后台端口      : {G}{port}{N}")
+    print(f"    加密(DoT/DoH) : {(G+'已开启'+N) if enc else (Y+'未开启 —— 第二步去开'+N)}")
+    print(f"    DoH 端口      : {G}{dohp}{N}        DoT 端口: {G}853{N}       明文: {G}53{N}")
+    if cid:
+        print(f"    {C}ClientID{N}      : {G}{cid}{N}")
+        print(f"                    {Y}这是给「访问设置 → 允许的客户端」用的{N}，填了它就只放行你自己；")
+        print(f"                    不填的话你的 DoH 挂在公网上，{R}谁扫到都能当免费解析器用{N}。")
+    else:
+        print(f"    ClientID      : {Y}还没有 —— 菜单『6 把自建DNS写入订阅配置』打开一次即生成{N}")
+    if allow:
+        print(f"    访问白名单    : {G}已设置{N} {allow}")
+        print(f"      {R}⚠ 白名单一旦设置，只有能带上 ClientID 的方式才进得来：{N}")
+        print(f"        · DoH  {G}可以{N}（ID 在网址末段）")
+        print(f"        · DoT / 明文53  {R}会被挡掉{N} —— DoT 传 ID 要靠 tls://<ID>.域名 的 SNI，")
+        print(f"          {R}需要泛域名证书{N}(*.域名)，而本机 acme 只签了单域名；明文 53 根本没有 ID 机制。")
+        print(f"        要继续用安卓 DoT / 电视明文，得把设备 IP 也加进白名单（家宽 IP 会变，不好使）。")
+    else:
+        print(f"    访问白名单    : {Y}未设置 —— 对全公网开放{N}"
+              + (f"（建议填入上面的 ClientID）" if cid else ""))
+    print(f"    写入订阅      : {(G+'已写入 mihomo/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
+
+    print("\n  " + "=" * 56)
     print("  怎么用它去广告 —— 照着下面三步做")
     print("  " + "=" * 56)
 
@@ -174,14 +230,16 @@ def _usage(port=None):
         print(f"        手机：设置 → 网络 → 专用DNS → 选『私人DNS提供商主机名』→ 填：{G}{dom}{N}")
         print(f"        需要：先做完第二步开加密；VPS 防火墙放行 {G}853{N}(TCP)")
         print(f"    ③ DoH 加密 —— 电脑浏览器 / 支持 DoH 的 App")
-        print(f"        DoH 地址：  {G}https://{dom}:10443/dns-query{N}")
-        print(f"        需要：VPS 防火墙放行 {G}10443{N}(TCP)")
+        print(f"        DoH 地址：  {G}{doh_url}{N}")
+        if cid:
+            print(f"        {Y}↑ 末段那串就是 ClientID，必须带上{N}（设了白名单之后不带会被拒）")
+        print(f"        需要：VPS 防火墙放行 {G}{dohp}{N}(TCP)")
 
     print("\n  " + "-" * 56)
     print("  三种 DNS 怎么选（一句话）：")
     print(f"    · 明文 53     简单通用、不加密 —— 电视/IoT/内网设备")
     print(f"    · DoT 853     加密、安卓系统原生支持、一次设置全系统去广告 {Y}【首选】{N}")
-    print(f"    · DoH 10443   加密、浏览器/App 用；因本机 443 被节点占，所以带端口")
+    print(f"    · DoH {dohp}   加密、浏览器/App 用；因本机 443 被节点占，所以带端口")
     print("\n  想拦更多广告：")
     print("    · 后台 → 过滤器 → DNS 拦截列表 → 添加名单（推荐 anti-AD：https://anti-ad.net/easylist.txt）")
     print("    · 后台 → 查询日志 → 找到广告域名 → 点『屏蔽』")
@@ -686,7 +744,7 @@ def menu():
         print("-" * 60)
         print("  1 安装（装 AdGuard Home + 起服务，之后网页后台点几下完成设置）")
         print("  2 卸载（彻底移除，不动节点；若写过订阅会自动从订阅撤掉自建DNS并刷新）")
-        print("  3 查看状态 / 设备怎么设置")
+        print("  3 使用方法（当前配置信息 + 设备怎么设置，照着填即可）")
         print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
         print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
         print("  6 把自建DNS写入订阅配置（开/关：第一次写入·再点移除，自动刷新）")
