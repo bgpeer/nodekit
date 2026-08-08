@@ -38,6 +38,11 @@ sudo python3 /tmp/xy.py
 - **更新核心不怕 SSH 断**：更新的最后一步是重启核心，而很多人是**挂着本机代理管理这台机**的，重启会当场掐断 SSH。
   菜单 16 会把更新**派到独立会话里执行**（脱离控制终端，SIGHUP 打不到它），断开后仍在服务端跑完；前台只是实时跟随
   日志给你看进度，随时 Ctrl-C 或直接断开都不影响。重连后 `tail /var/log/bgpeer-coreupdate.log` 看结果
+- **自建 DNS 的 DoH 地址带 ClientID**（形如 `https://域名:10443/dns-query/xy<随机>`）：AdGuard 的 DoH 挂在公网上，
+  **不设白名单谁扫到都能拿去当免费解析器**。把开关打开时打印的那个 ClientID 填进 AdGuard 后台
+  **设置 → DNS 设置 → 访问设置 → 允许的客户端**，就只放行你自己。手机流量 IP 天天变、没法按 IP 白名单，
+  ClientID 与 IP 无关正合适。ID 存在 `/etc/bgpeer/selfdns.clientid`，不在托管目录、不会被下载。
+  向后兼容：没配「允许的客户端」时 AdGuard 对任意 ClientID 都放行，所以带上它不会让原本能用的配置失效
 - **自建 DNS 写入订阅时会写三处**（菜单 13 的开关打开时）：`nameserver`（默认解析）、`global-dns` 锚点
   （所有走代理的域名组共用）、`proxy-server-nameserver`（解析节点服务器域名）。三处都是**插到列表最前、
   原有条目留作兜底**——mihomo 对这些列表是并发查询、谁先回用谁，所以自建 DoH 通了就用它，**挂了只是输掉
