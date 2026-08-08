@@ -1948,8 +1948,14 @@ def _direct_targets(nodes):
     return out
 
 def _direct_rule_text(kind, val):
-    """mihomo / 小火箭通用规则文本：IP 走 IP-CIDR(+no-resolve)，域名走 DOMAIN。"""
-    return f"IP-CIDR,{val}/32,DIRECT,no-resolve" if kind == "ip" else f"DOMAIN,{val},DIRECT"
+    """mihomo / 小火箭通用规则文本：IP 走 IP-CIDR(+no-resolve)，域名走 DOMAIN-SUFFIX。
+
+       域名用后缀而不是精确匹配，是因为节点域名底下会长出子域名：AdGuard 的 DoT 要带
+       ClientID 时用的是 <ID>.节点域名（见 adguard-dns.py 菜单 8）。精确匹配漏掉它，
+       那条查询就会掉进 MATCH 走代理——绕一圈再回到自己的 VPS，多一跳，代理挂了还可能
+       连不上。用后缀只扩到「本节点域名及其子域」，不扩到整个注册域，以后在同一个域名下
+       挂想走代理的东西仍有余地。"""
+    return f"IP-CIDR,{val}/32,DIRECT,no-resolve" if kind == "ip" else f"DOMAIN-SUFFIX,{val},DIRECT"
 
 def _ghrelay_token():
     """本机中转的 token（防别人蹭）；没有就生成一个存下来。存 BGP_DIR（不在 SUB_DIR，不会被静态服务下载）。"""
@@ -2096,7 +2102,9 @@ def _mihomo_direct_ip(tpl, targets):
 
 def _sb_direct_ip(cfg, targets):
     """sing-box：把直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
-       就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。"""
+       就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。
+       域名用 domain_suffix 而非 domain，理由同 _direct_rule_text：要覆盖节点域名
+       底下的子域（AdGuard DoT 的 <ClientID>.节点域名）。"""
     if not targets:
         return
     route = cfg.get("route")
@@ -2112,7 +2120,7 @@ def _sb_direct_ip(cfg, targets):
     add = []
     for kind, val in targets:
         rule = {"ip_cidr": [f"{val}/32"], "outbound": direct} if kind == "ip" \
-               else {"domain": [val], "outbound": direct}
+               else {"domain_suffix": [val], "outbound": direct}
         if rule not in rules and rule not in add:
             add.append(rule)
     if add:
