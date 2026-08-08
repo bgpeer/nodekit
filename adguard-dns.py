@@ -150,6 +150,23 @@ def _doh_port():
     except (OSError, ValueError):
         return 10443
 
+def _cert_wildcard_ok(dom):
+    """本机 acme 证书是否覆盖 *.dom —— 这决定 DoT 能不能带 ClientID。
+       DoT 的 ClientID 是塞在 SNI 第一段(tls://<ID>.域名)传过去的，证书里没有
+       *.域名 这个 SAN，客户端握手就会因证书名不匹配而拒连。"""
+    if not (dom and os.path.exists(ACME_CRT)):
+        return False
+    return f"DNS:*.{dom}" in sh(f"openssl x509 -in {ACME_CRT} -noout -text 2>/dev/null")
+
+def _wildcard_dns_ok(dom):
+    """*.dom 的 DNS 通配记录是否已生效：随便取个不存在的子域，能解析出 IP 就算通。
+       证书能签下来不代表客户端找得到路——通配 A 记录得单独加。"""
+    try:
+        socket.getaddrinfo(f"dotcheck{secrets.token_hex(3)}.{dom}", None, socket.AF_INET)
+        return True
+    except OSError:
+        return False
+
 def _allowed_clients():
     """AdGuardHome.yaml 里的访问白名单 allowed_clients；没这个键返回 None，空列表返回 []。"""
     try:
@@ -166,6 +183,8 @@ def _usage(port=None):
     enc = _https_panel() is not None
     allow = _allowed_clients()
     doh_url = f"https://{dom}:{dohp}/dns-query" + (f"/{cid}" if cid else "")
+    wild = _cert_wildcard_ok(dom)                     # 证书覆盖 *.域名 → DoT 可带 ClientID
+    dot_host = f"{cid}.{dom}" if (wild and cid) else dom
 
     print("\n" + "  " + "=" * 56)
     print(f"  {C}当前配置信息{N}（下面的值都是从你这台机实时读出来的）")
@@ -222,7 +241,9 @@ def _usage(port=None):
     print(f"        需要：VPS 防火墙放行 {G}53{N}(UDP+TCP)；若 53 被占，回菜单选『4 腾出53端口』")
     if dom:
         print(f"    ② DoT 加密 —— 安卓手机「专用DNS」，全系统生效，{Y}最推荐{N}")
-        print(f"        手机：设置 → 网络 → 专用DNS → 选『私人DNS提供商主机名』→ 填：{G}{dom}{N}")
+        print(f"        手机：设置 → 网络 → 专用DNS → 选『私人DNS提供商主机名』→ 填：{G}{dot_host}{N}")
+        if wild and cid:
+            print(f"        {Y}↑ 前面那段就是 ClientID{N}（已签泛域名证书，所以 DoT 也能带上它、白名单放行）")
         print(f"        需要：先做完第二步开加密；VPS 防火墙放行 {G}853{N}(TCP)")
         print(f"    ③ DoH 加密 —— 电脑浏览器 / 支持 DoH 的 App")
         print(f"        DoH 地址：  {G}{doh_url}{N}")
@@ -244,14 +265,20 @@ def _usage(port=None):
         print(f"\n        {G}{cid}{N}\n")
         print(f"    手机流量 IP 天天变、没法按 IP 做白名单，这个 ClientID 与 IP 无关，换网络也不影响。")
         print(f"    保存后客户端重新拉一次订阅即生效。")
-    if cid:
+    if cid and wild:
+        print(f"    {G}✓ 已签泛域名证书{N}：DoH 和 DoT 都能带 ClientID，白名单都放行——")
+        print(f"        · DoH（上面③）  {G}正常{N}，ID 在网址末段")
+        print(f"        · DoT（上面②）  {G}正常{N}，ID 在主机名最前面 → {G}{dot_host}{N}")
+        print(f"        · 明文53（上面①）  {R}仍会被挡{N} —— 这个协议根本没有 ID 机制，")
+        print(f"          电视/IoT 要么把它们的固定 IP 也填进白名单，要么别用这台 DNS。")
+    elif cid:
         print(f"    {R}⚠ 代价要先知道{N}：白名单一设，只有能带上 ClientID 的方式进得来——")
         print(f"        · DoH（上面③）  {G}正常{N}，ID 就在网址末段")
         print(f"        · DoT（上面②，安卓专用DNS）/ 明文53（上面①）  {R}会被挡掉{N}")
         print(f"          DoT 传 ID 要靠 tls://<ID>.域名 的 SNI，{R}需要泛域名证书{N}(*.域名)，")
         print(f"          而本机 acme 只签了单域名；明文 53 根本没有 ID 机制。")
-        print(f"        {Y}还要继续用安卓 DoT / 电视明文的话，就别设白名单{N}——或者把那些设备的")
-        print(f"        固定 IP 也一并填进去（家宽/流量 IP 会变，多半不好使）。")
+        print(f"        {C}→ 想让安卓 DoT 也能用：回菜单选『8 让 DoT 也能带 ClientID』{N}（签泛域名证书）")
+        print(f"        {Y}不想折腾就别设白名单{N}——或者把设备固定 IP 填进去（家宽/流量 IP 会变，多半不好使）。")
 
     print("\n  " + "-" * 56)
     print("  三种 DNS 怎么选（一句话）：")
@@ -261,6 +288,108 @@ def _usage(port=None):
     print("\n  想拦更多广告：")
     print("    · 后台 → 过滤器 → DNS 拦截列表 → 添加名单（推荐 anti-AD：https://anti-ad.net/easylist.txt）")
     print("    · 后台 → 查询日志 → 找到广告域名 → 点『屏蔽』")
+
+def dot_clientid():
+    """把 acme 证书重签成同时覆盖『域名』和『*.域名』，让安卓 DoT 也能带 ClientID。
+
+       为什么这么做就够：AdGuard 的证书路径本来就指着 /etc/ssl/sb/acme.crt，把这个文件
+       换成覆盖面更大的同一张证书即可 —— AdGuard 配置一个字都不用改，也就没有改坏配置
+       再回滚的风险。新证书是旧证书的超集，走域名的节点(ws/trojan)照常握手，不受影响。
+
+       为什么必须 DNS-01：Let's Encrypt 不允许用 HTTP-01 签泛域名，只能靠在 DNS 里放
+       TXT 记录验证。域名托管在 Cloudflare，所以用 acme.sh 的 dns_cf 插件 + API token。
+
+       失败不会留下半吊子状态：acme.sh 只有签发成功才会覆盖证书文件，中途失败原证书原封不动。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return
+    dom = _domain()
+    if not dom:
+        print("  没有域名，DoT 本来就用不了，这一步无意义。"); return
+    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; C = "\033[1;36m"; N = "\033[0m"
+    cid = _selfdns_clientid()
+
+    print("\n  " + "=" * 56)
+    print(f"  让安卓 DoT 也能带 ClientID（签泛域名证书）")
+    print("  " + "=" * 56)
+    if _cert_wildcard_ok(dom):
+        print(f"  {G}✓ 证书已经覆盖 *.{dom}，这一步做过了。{N}")
+        if cid:
+            print(f"    安卓「专用DNS」填：{G}{cid}.{dom}{N}")
+        if not _wildcard_dns_ok(dom):
+            print(f"  {R}⚠ 但 *.{dom} 的 DNS 通配记录没生效{N}——手机会解析不出这个主机名。")
+            print(f"    去 Cloudflare 加一条：类型 {G}A{N}  名称 {G}*.{dom.split('.',1)[0] if dom.count('.')>1 else '*'}{N}"
+                  f"  内容 {G}{_public_ip()}{N}  代理状态 {Y}仅DNS(灰云){N}")
+        return
+    print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
+    print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
+    print(f"\n  {Y}需要你先准备两样：{N}")
+    print(f"    1) Cloudflare 上加一条通配 A 记录，指向本机 {G}{_public_ip()}{N}，{Y}灰云(仅DNS){N}")
+    print(f"       —— 没有它，手机连 {cid or '<ID>'}.{dom} 时根本解析不出地址")
+    print(f"    2) Cloudflare API Token（{C}Zone:DNS:Edit{N} + {C}Zone:Zone:Read{N} 权限，限定到这个域名即可）")
+    print(f"       在 CF 后台 → 右上头像 → My Profile → API Tokens → Create Token 生成")
+
+    if _ask("\n  两样都准备好了，继续? [y/N]: ").lower() not in ("y", "yes"):
+        print("  已取消，没有任何改动。"); return
+    if not _wildcard_dns_ok(dom):
+        print(f"\n  {R}❌ 检测不到 *.{dom} 的解析{N}——通配 A 记录还没加或还没生效。")
+        print(f"     先去 Cloudflare 加好（灰云），等一两分钟再回来。签证书前就查，省得签完才发现没路。")
+        return
+    print(f"  {G}✓ 通配解析已生效{N}")
+
+    token = _ask("  粘贴 Cloudflare API Token: ").strip()
+    if not token:
+        print("  没输入，已取消。"); return
+
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print("  找不到 acme.sh —— 你的证书可能不是本脚本签的，不便自动接管。"); return
+
+    print(f"\n  正在签发（DNS-01 验证，需要等 CF 记录传播，约 1-2 分钟）…")
+    issue = (f"CF_Token='{token}' {acme} --issue --dns dns_cf "
+             f"-d {dom} -d '*.{dom}' --keylength ec-256 --server letsencrypt")
+    r = subprocess.run(issue, shell=True, text=True, capture_output=True)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
+        print(f"\n  {R}❌ 签发失败，原证书原封未动，节点不受影响。{N}报错：")
+        for ln in out.splitlines()[-12:]:
+            print("     " + ln)
+        print(f"\n  常见原因：Token 权限不够（要 Zone:DNS:Edit + Zone:Zone:Read）、"
+              f"或 Token 没覆盖到 {dom} 所在的区域。")
+        return
+
+    # 续期时要连 AdGuardHome 一起重启：它跟 sing-box/xray 一样是启动时把证书读进内存的
+    reload_hook = (" --reloadcmd '"
+                   "systemctl reload nginx 2>/dev/null; "
+                   "systemctl restart sing-box 2>/dev/null; "
+                   "systemctl restart xray 2>/dev/null; "
+                   "systemctl restart xy-sub 2>/dev/null; "
+                   "systemctl restart AdGuardHome 2>/dev/null; true'")
+    sh(f"{acme} --install-cert -d {dom} --ecc "
+       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+    if not _cert_wildcard_ok(dom):
+        print(f"\n  {R}❌ 证书导出后仍未覆盖 *.{dom}，没有生效。{N}原证书可能已被替换，"
+              f"建议看 `openssl x509 -in {ACME_CRT} -noout -text | grep DNS:`。")
+        return
+    print(f"  {G}✓ 证书已覆盖 *.{dom}{N}")
+
+    sh("systemctl restart AdGuardHome", check=False)
+    time.sleep(3)
+    if cid:
+        (rc, ips), _, err = _q_dot(853, f"{cid}.{dom}", "example.com")
+        if rc == 0 and ips:
+            print(f"  {G}✓ 用 {cid}.{dom} 做 SNI 实测 DoT 查询成功{N}")
+        else:
+            print(f"  {Y}⚠ DoT 实测没通过（{err or 'rcode=' + str(rc)}）{N}——证书是对的，"
+                  f"可能是 853 端口没开或 AdGuard 还没起好，稍后用菜单 7 自检再看。")
+
+    print(f"\n  {G}做完了。{N}安卓「专用DNS」现在填：")
+    print(f"      {G}{cid + '.' + dom if cid else '<ClientID>.' + dom}{N}")
+    if not cid:
+        print(f"  {Y}（还没有 ClientID —— 菜单 6 打开一次自建DNS写入订阅即生成）{N}")
+    print(f"  之后就可以放心在「允许的客户端」里只填 ClientID：DoH 和 DoT 都带得上它。")
+    print(f"  {Y}明文 53 仍然带不了{N}，电视/IoT 要么填固定 IP 进白名单，要么别用这台 DNS。")
 
 def _do_free53():
     """真正腾 53：关掉 systemd-resolved 的桩监听 + 把 resolv.conf 指到公共 DNS（可逆）。
@@ -767,6 +896,7 @@ def menu():
         print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
         print("  6 把自建DNS写入订阅配置（开/关：第一次写入·再点移除，自动刷新）")
         print("  7 自检（服务/端口/证书/解析/访问控制 一次查清，只读不改）")
+        print("  8 让 DoT 也能带 ClientID（签泛域名证书；设了白名单后安卓专用DNS仍可用）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -776,6 +906,7 @@ def menu():
         elif c == "5": change_web_port()
         elif c == "6": _selfdns_toggle()
         elif c == "7": selfcheck()
+        elif c == "8": dot_clientid()
         elif c in ("0", ""):
             return
 
