@@ -852,7 +852,7 @@ def selfcheck():
     fix = []                                     # 收集结论里要给的处置建议
 
     # ---- 1 服务 ----
-    print("\n  【1/6 服务】")
+    print("\n  【1/7 服务】")
     if _running():
         print(f"    {ok} AdGuardHome 运行中")
     else:
@@ -872,7 +872,7 @@ def selfcheck():
     web    = _current_web_port()
 
     # ---- 2 监听 ----
-    print("\n  【2/6 端口监听】")
+    print("\n  【2/7 端口监听】")
     b53 = _port_busy(53)
     if "AdGuardHome" in b53:
         print(f"    {ok} 53   明文DNS  由 AdGuardHome 监听")
@@ -899,7 +899,7 @@ def selfcheck():
             print(f"    {tag} {label} {note}")
 
     # ---- 3 证书 ----
-    print("\n  【3/6 证书】")
+    print("\n  【3/7 证书】")
     peer = None
     if not dom:
         print(f"    {warn} 装节点时没用域名 —— 加密用不了，跳过")
@@ -913,7 +913,7 @@ def selfcheck():
             print(f"    {ok} 服务器名称 {sname or dom}")
 
     # ---- 4 真实解析 ----
-    print("\n  【4/6 真实解析测试】(本机直连，绕开公网)")
+    print("\n  【4/7 真实解析测试】(本机直连，绕开公网)")
     probe = "www.qq.com"
     if not ("AdGuardHome" in b53 or (enc_on and dom and (p_dot or p_doh))):
         print(f"    {warn} 没有可测的服务（53 不在 AGH 手上，加密也没开）—— 先把上面两步弄好")
@@ -958,24 +958,71 @@ def selfcheck():
             print(f"    {warn} doubleclick.net 没被拦 → {ips[0]}；后台『过滤器』里确认拦截名单是开的")
 
     # ---- 5 访问控制（这次把你锁在外面的就是它）----
-    print("\n  【5/6 访问控制】")
+    print("\n  【5/7 访问控制】")
     allow = _yaml_list(txt, "allowed_clients")
     deny  = _yaml_list(txt, "disallowed_clients")
+    cid = _selfdns_clientid()
+    wild = _cert_wildcard_ok(dom)
     if allow:
-        print(f"    {bad} 允许列表里只放了: {R}{', '.join(allow)}{N}")
-        print(f"       {Y}这表示除这些来源外一律拒绝。手机一从 WiFi 切到 4G，出口IP 变了就会被拒，")
-        print(f"       而私人DNS 没有回落 → 整机解析全挂。{N}")
-        fix.append("后台 → 设置 → 客户端设置 → 访问设置：把「允许的客户端」清空"
-                   "（在外面用移动网络的设备没法固定 IP）")
+        # ClientID 是域名标签（只有字母数字和连字符）；带点或斜杠的是 IP/CIDR。
+        # 两者性质完全不同：ClientID 与 IP 无关，移动网络随便切；IP 白名单才怕出口变化。
+        ids = [x for x in allow if re.fullmatch(r"[A-Za-z0-9-]+", x)]
+        ips = [x for x in allow if x not in ids]
+        if ids:
+            print(f"    {ok} 用 ClientID 限制: {G}{', '.join(ids)}{N} —— 与 IP 无关，切 WiFi/4G 都不受影响")
+            if cid and cid not in ids:
+                print(f"    {bad} {R}但当前 ClientID 是 {cid}，不在名单里{N} —— 订阅里的 DoH 会被拒！")
+                fix.append(f"把当前 ClientID 加进「允许的客户端」: {cid}")
+        if ips:
+            print(f"    {warn} 名单里还有 IP/CIDR: {', '.join(ips)}")
+            print(f"       {Y}这些是按来源 IP 放行的；移动网络出口 IP 会变，对应设备可能被拒。{N}")
+        print(f"    {warn} 白名单一开，{Y}明文 53 一律被拒{N}（协议本身没有 ID 机制）—— 电视/IoT 会没 DNS")
+        if not wild:
+            print(f"    {bad} {R}安卓 DoT 也会被拒{N}：没签泛域名证书，ID 传不进 SNI")
+            fix.append("要用安卓 DoT 就回菜单选『8 让 DoT 也能带 ClientID』签泛域名证书")
+        elif cid:
+            print(f"    {ok} 安卓 DoT 可用（已签泛域名证书）—— 手机填 {G}{cid}.{dom}{N}")
     else:
-        print(f"    {ok} 没设允许列表（任何来源可查）—— 移动网络下也能用")
-        if allow == []:
-            print(f"       {Y}注意：这同时意味着它是台公开解析器，别到处外传你的域名。{N}")
+        print(f"    {warn} 没设允许列表 —— {R}对全公网开放，谁扫到都能当免费解析器用{N}")
+        print(f"       {Y}明文 53 尤其要紧：UDP 可伪造源 IP，是 DNS 放大攻击的经典跳板。{N}")
+        if cid:
+            fix.append(f"关掉开放解析器：「允许的客户端」填入 ClientID {cid}"
+                       + ("" if wild else "（但会挡掉安卓DoT，除非先用菜单 8 签泛域名证书）"))
     if deny:
         print(f"    {warn} 拒绝列表: {', '.join(deny)}")
 
-    # ---- 6 本机防火墙 ----
-    print("\n  【6/6 本机防火墙】")
+    # ---- 6 后台暴露面 ----
+    # 「允许的客户端」只管 DNS 请求，管不到网页后台。而后台常常挂在【两个】公网入口上，
+    # 其中 HTTPS 那个和 DoH 同端口、根路径就是登录页——很容易被忽略，扫到就是撞密码。
+    print("\n  【6/7 后台暴露面】")
+    addr = re.search(r'(?m)^\s*address:\s+(\S+):(\d+)\s*$', txt)
+    bind = addr.group(1) if addr else ""
+    entries = []
+    if web:
+        entries.append(("明文 HTTP", f"http://{ip}:{web}", bind not in ("127.0.0.1", "::1")))
+    if enc_on and dom and p_doh and (not sname or sname == dom):
+        entries.append(("HTTPS（与 DoH 同端口，根路径即登录页）", f"https://{dom}:{p_doh}/", True))
+    pub = [e for e in entries if e[2]]
+    if not entries:
+        print(f"    {warn} 没读到后台监听地址")
+    for label, url, exposed in entries:
+        mark = bad if (exposed and label.startswith("明文")) else (warn if exposed else ok)
+        where = f"{R}公网可达{N}" if exposed else f"{G}仅本机{N}"
+        print(f"    {mark} {label}: {url}  [{where}]")
+    if len(pub) > 1:
+        print(f"    {warn} {Y}后台有 {len(pub)} 个公网入口{N}——把 {web} 藏起来也没用，"
+              f"{p_doh} 的根路径照样是登录页")
+    if any(e[2] and e[0].startswith("明文") for e in entries):
+        fix.append(f"别再用明文入口登录后台（密码明文过网），改用 https://{dom}:{p_doh}/"
+                   if (enc_on and dom and p_doh) else "后台是明文 HTTP，密码会明文过网")
+    if pub:
+        print(f"    {Y}挡在后台前面的只有你的登录密码{N} —— 弱密码撞出来就全丢了，务必设强密码。")
+        print(f"       想彻底不暴露：把后台绑到 127.0.0.1，管理时走 SSH 隧道")
+        print(f"       ssh -L {web or 3000}:127.0.0.1:{web or 3000} root@{ip}   然后浏览器开 http://127.0.0.1:{web or 3000}")
+        print(f"       {Y}注意 {p_doh or 10443} 那个入口关不掉{N}——它跟着加密走，是 AdGuard 自带的。")
+
+    # ---- 7 本机防火墙 ----
+    print("\n  【7/7 本机防火墙】")
     hit = False
     u = sh("ufw status 2>/dev/null")
     if "Status: active" in u:
