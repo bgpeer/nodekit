@@ -182,15 +182,10 @@ def _usage(port=None):
     else:
         print(f"    ClientID      : {Y}还没有 —— 菜单『6 把自建DNS写入订阅配置』打开一次即生成{N}")
     if allow:
-        print(f"    访问白名单    : {G}已设置{N} {allow}")
-        print(f"      {R}⚠ 白名单一旦设置，只有能带上 ClientID 的方式才进得来：{N}")
-        print(f"        · DoH  {G}可以{N}（ID 在网址末段）")
-        print(f"        · DoT / 明文53  {R}会被挡掉{N} —— DoT 传 ID 要靠 tls://<ID>.域名 的 SNI，")
-        print(f"          {R}需要泛域名证书{N}(*.域名)，而本机 acme 只签了单域名；明文 53 根本没有 ID 机制。")
-        print(f"        要继续用安卓 DoT / 电视明文，得把设备 IP 也加进白名单（家宽 IP 会变，不好使）。")
+        print(f"    访问白名单    : {G}已设置{N} {allow}   （只放行名单内，见第四步）")
     else:
-        print(f"    访问白名单    : {Y}未设置 —— 对全公网开放{N}"
-              + (f"（建议填入上面的 ClientID）" if cid else ""))
+        print(f"    访问白名单    : {R}未设置 —— 对全公网开放{N}"
+              + ("（第四步教你关掉）" if cid else ""))
     print(f"    写入订阅      : {(G+'已写入 mihomo/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
 
     print("\n  " + "=" * 56)
@@ -234,6 +229,29 @@ def _usage(port=None):
         if cid:
             print(f"        {Y}↑ 末段那串就是 ClientID，必须带上{N}（设了白名单之后不带会被拒）")
         print(f"        需要：VPS 防火墙放行 {G}{dohp}{N}(TCP)")
+
+    # 第四步：关开放解析器。写成能照做的步骤（完整路径 + ID 单独一行方便复制），
+    # 不能只在菜单 6 打开开关的那一瞬间提示一次——用户回头再看时是进这个页面找的。
+    print(f"\n  【第四步 · 关掉「开放解析器」{Y}强烈建议{N}】")
+    if not cid:
+        print(f"    {Y}还没有 ClientID{N} —— 先去菜单『6 把自建DNS写入订阅配置』打开一次，会自动生成。")
+    elif allow:
+        print(f"    {G}✓ 已经设好了{N}（当前白名单：{allow}），不用再动。")
+    else:
+        print(f"    你的 DoH 挂在公网上，{R}不设白名单谁扫到都能拿去当免费解析器用{N}"
+              f"（烧你的 CPU 和流量，查询日志里还会混进陌生人的记录）。")
+        print(f"    AdGuard 后台 → 设置 → DNS设置 → {C}访问设置{N} → {C}允许的客户端{N}，填入这一行：")
+        print(f"\n        {G}{cid}{N}\n")
+        print(f"    手机流量 IP 天天变、没法按 IP 做白名单，这个 ClientID 与 IP 无关，换网络也不影响。")
+        print(f"    保存后客户端重新拉一次订阅即生效。")
+    if cid:
+        print(f"    {R}⚠ 代价要先知道{N}：白名单一设，只有能带上 ClientID 的方式进得来——")
+        print(f"        · DoH（上面③）  {G}正常{N}，ID 就在网址末段")
+        print(f"        · DoT（上面②，安卓专用DNS）/ 明文53（上面①）  {R}会被挡掉{N}")
+        print(f"          DoT 传 ID 要靠 tls://<ID>.域名 的 SNI，{R}需要泛域名证书{N}(*.域名)，")
+        print(f"          而本机 acme 只签了单域名；明文 53 根本没有 ID 机制。")
+        print(f"        {Y}还要继续用安卓 DoT / 电视明文的话，就别设白名单{N}——或者把那些设备的")
+        print(f"        固定 IP 也一并填进去（家宽/流量 IP 会变，多半不好使）。")
 
     print("\n  " + "-" * 56)
     print("  三种 DNS 怎么选（一句话）：")
