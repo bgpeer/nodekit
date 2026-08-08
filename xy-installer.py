@@ -3119,7 +3119,14 @@ def selfdns_toggle():
         print("  还没有节点，先『1.安装』。"); return
     on = os.path.exists(SELFDNS_FLAG)
     if on:
-        if _ask("  自建 DNS 已写入订阅。移除它? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print(f"\n  自建 DNS 已写入订阅。当前 ClientID: {selfdns_clientid()}")
+        print("  1 从订阅移除")
+        print("  2 更换 ClientID（泄露了就换——截图/贴日志很容易带出去）")
+        print("  0 返回")
+        c = _ask("  选择: ").strip()
+        if c == "2":
+            rotate_selfdns_clientid(); return
+        if c != "1":
             return
         try: os.remove(SELFDNS_FLAG)
         except OSError: pass
@@ -3144,6 +3151,38 @@ def selfdns_toggle():
         print("  客户端重新拉一次订阅即生效。")
     else:
         print("  刷新配置失败（没有可用节点？）。")
+
+def rotate_selfdns_clientid():
+    """换一个新的 ClientID 并刷新订阅。ClientID 一旦被填进 AdGuard「允许的客户端」，
+       它就等价于一把口令——而它会明晃晃出现在订阅配置、使用说明、终端输出里，截个图、
+       贴段日志就带出去了。所以得有换的办法，跟 GitHub 中转 token 可以刷新是一个道理。
+
+       换的顺序很重要：先把新 ID【加】进白名单（旧的先留着），再刷新订阅、改安卓 DoT，
+       最后才删掉旧 ID —— 反过来做中间会有一段时间连不上。"""
+    old = selfdns_clientid()
+    dom = _host()
+    print(f"\n  当前 ClientID: {old}")
+    if _ask("  确认更换? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("  已取消。"); return
+    new = "xy" + secrets.token_hex(6)
+    os.makedirs(BGP_DIR, exist_ok=True)
+    open(SELFDNS_CID_FILE, "w").write(new)
+    G["host"] = dom; ensure_deps()
+    if not build_subscription(read_saved_links()):
+        open(SELFDNS_CID_FILE, "w").write(old)          # 订阅没刷成就退回，别让两边对不上
+        print("  ✗ 订阅刷新失败，已还原为原 ClientID。"); return
+    wild = "DNS:*." + dom in sh(f"openssl x509 -in {ACME_CRT} -noout -text 2>/dev/null", check=False)
+    print(f"\n  ✓ 已更换：{old}  →  {new}")
+    print(f"  订阅已刷新，新的 DoH：{_selfdns_doh()}")
+    print("\n  接下来按这个顺序做，中间不会断：")
+    print(f"    1) AdGuard 后台 → 设置 → DNS设置 → 访问设置 → 允许的客户端，")
+    print(f"       先【添加】一行 {new}（旧的 {old} 暂时留着）")
+    print(f"    2) 客户端重新拉一次订阅")
+    if wild:
+        print(f"    3) 安卓「专用DNS」改填 {new}.{dom}")
+        print(f"    4) 确认都通了，再把白名单里的 {old} 删掉")
+    else:
+        print(f"    3) 确认都通了，再把白名单里的 {old} 删掉")
 
 def selfdns_off():
     """非交互移除：卸载 AdGuard 时调用。若自建 DNS 已写入订阅则清标记并刷新订阅（不换 token）；
