@@ -10,6 +10,9 @@
 #   - 加密走 DoT(853，复用 acme 证书)：安卓「专用 DNS」填域名即可全系统去广告；
 #     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
 #   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
+#   - 卸载(菜单2)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
+#     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 8 里的「删除 DoT」
+#     只撤泛域名证书这一项，AdGuard 本体继续跑。
 import os, re, sys, time, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
@@ -17,6 +20,8 @@ HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域�
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"   # 主脚本 acme 证书
 AGH_DIR = "/opt/AdGuardHome"
 AGH_BIN = AGH_DIR + "/AdGuardHome"
+RESOLVED_DIR    = "/etc/systemd/resolved.conf.d"
+RESOLVED_DROPIN = RESOLVED_DIR + "/adguard.conf"  # 腾 53 时写的 drop-in（卸载时据此还原本机解析）
 AGH_INSTALL = "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh"
 WEB_PORT = 3000
 
@@ -342,23 +347,28 @@ def _replace_cf_token():
     print(f"  下次证书续期(约90天后)会用新 Token；想立刻验证可跑：")
     print(f"      ~/.acme.sh/acme.sh --renew -d {_domain()} --ecc --force")
 
-def _revert_wildcard(dom, cid=""):
+def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
     """撤销泛域名：把证书重签回只覆盖『域名』，DoT 就不能再带 ClientID 了。
 
        80 端口空着就用 HTTP-01 重签——这样连 acme.sh 的续期方式也一并回到装机时的
        样子，之后不再依赖 CF Token，可以把它从 account.conf 里清掉。80 被占（nginx
        等）则退回 DNS-01，此时 Token 必须留着，否则 90 天后续期会失败。
 
-       同样是失败安全的：acme.sh 只有签发成功才覆盖证书文件。"""
+       同样是失败安全的：acme.sh 只有签发成功才覆盖证书文件。
+
+       两个调用方：菜单 8 的「删除 DoT」用默认参数——单独撤这一项，要自己确认，Token
+       清不清也再问一次；卸载流程用 ask=False, auto_token=True——那边总确认里已经把这件
+       事列出来过了，不该在中途再拦一次，Token 也没有留着的理由，直接清。"""
     G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
-    print(f"\n  撤销之后：")
-    print(f"    · 安卓「专用DNS」要改回填 {G}{dom}{N}（不能再带 ClientID）")
-    if _allowed_clients():
-        print(f"    · {R}你已经设了访问白名单 —— 撤销后安卓 DoT 会被挡掉、连不上{N}，")
-        print(f"      要么同时把白名单清掉，要么就别撤销。")
-    print(f"    · DoH 不受影响，照旧带 ClientID")
-    if _ask("\n  确认撤销? [y/N]: ").lower() not in ("y", "yes"):
-        print("  已取消，没有任何改动。"); return
+    if ask:
+        print(f"\n  撤销之后：")
+        print(f"    · 安卓「专用DNS」要改回填 {G}{dom}{N}（不能再带 ClientID）")
+        if _allowed_clients():
+            print(f"    · {R}你已经设了访问白名单 —— 撤销后安卓 DoT 会被挡掉、连不上{N}，")
+            print(f"      要么同时把白名单清掉，要么就别撤销。")
+        print(f"    · DoH 不受影响，照旧带 ClientID")
+        if _ask("\n  确认撤销? [y/N]: ").lower() not in ("y", "yes"):
+            print("  已取消，没有任何改动。"); return
 
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
@@ -393,15 +403,21 @@ def _revert_wildcard(dom, cid=""):
     sh("systemctl restart AdGuardHome", check=False)
     time.sleep(3)
     print(f"  {G}✓ 证书已改回只覆盖 {dom}{N}")
-    print(f"  安卓「专用DNS」现在要填：{G}{dom}{N}")
+    if ask:
+        print(f"  安卓「专用DNS」现在要填：{G}{dom}{N}")
+    # DNS-01 重签的话续期还要读 Token，不能清；HTTP-01 才是真的用不着了
     if http01:
         conf = os.path.expanduser("~/.acme.sh/account.conf")
         if os.path.exists(conf) and re.search(r"(?m)^SAVED_CF_Token=", open(conf).read()):
-            if _ask("  续期已不需要 CF Token，把它从 account.conf 清掉? [Y/n]: ").lower() not in ("n", "no"):
+            if auto_token or _ask("  续期已不需要 CF Token，把它从 account.conf 清掉? [Y/n]: ").lower() not in ("n", "no"):
                 txt = re.sub(r"(?m)^SAVED_CF_Token=.*$\n?", "", open(conf).read())
                 shutil.copy(conf, conf + ".bak"); open(conf, "w").write(txt); os.chmod(conf, 0o600)
-                print(f"  {G}✓ 已清除{N}（备份 {conf}.bak）。{Y}记得回 CF 把该 Token 删掉。{N}")
-    if cid and _allowed_clients():
+                print(f"  {G}✓ 已清除 acme.sh 里的 CF Token{N}（备份 {conf}.bak）。"
+                      f"{Y}记得回 CF 把该 Token 删掉。{N}")
+    elif auto_token:
+        print(f"  {Y}⚠ 80 端口被占，只能走 DNS-01 重签 —— acme.sh 里的 CF Token 必须留着{N}"
+              f"（约 90 天后续期还要用它），所以没有清除。")
+    if ask and cid and _allowed_clients():
         print(f"  {R}⚠ 白名单还留着 {cid}{N} —— 现在安卓 DoT 带不了它了，会被挡。"
               f"要用 DoT 就去 AdGuard 把白名单清空。")
 
@@ -440,7 +456,8 @@ def dot_clientid():
         print(f"  Token 存在 {G}~/.acme.sh/account.conf{N}，约 90 天后自动续期还要用它。")
         print("  " + "-" * 56)
         print(f"  1 更换 Cloudflare API 令牌（旧的泄露了/被吊销了）")
-        print(f"  2 删除 DoT ClientID 支持（证书改回单域名）")
+        print(f"  2 删除 DoT ClientID 支持（证书改回单域名；{C}只撤这一项，AdGuard 照常跑{N}）")
+        print(f"    —— 想把整套自建 DNS 都卸掉，回上级菜单选 2")
         print(f"  0 返回")
         c = _ask("  选择: ").strip()
         if c == "1":
@@ -521,9 +538,8 @@ def _do_free53():
     """真正腾 53：关掉 systemd-resolved 的桩监听 + 把 resolv.conf 指到公共 DNS（可逆）。
        不含确认/占用者判断，供安装流程与菜单复用。"""
     try:
-        d = "/etc/systemd/resolved.conf.d"
-        os.makedirs(d, exist_ok=True)
-        open(d + "/adguard.conf", "w").write("[Resolve]\nDNSStubListener=no\n")
+        os.makedirs(RESOLVED_DIR, exist_ok=True)
+        open(RESOLVED_DROPIN, "w").write("[Resolve]\nDNSStubListener=no\n")
         # resolv.conf 常是指向 stub(127.0.0.53) 的软链；关桩后要换成真能用的解析
         try: os.remove("/etc/resolv.conf")
         except OSError: pass
@@ -535,7 +551,7 @@ def _do_free53():
             print(f"  53 仍被 {left} 占，请手动检查 `ss -lntup 'sport = :53'`。")
         else:
             print("  ✓ 已腾出 53。")
-        print("  （撤销：删 /etc/systemd/resolved.conf.d/adguard.conf 后 systemctl restart systemd-resolved）")
+        print(f"  （撤销：删 {RESOLVED_DROPIN} 后 systemctl restart systemd-resolved；卸载时会自动还原）")
     except OSError as e:
         print("  腾 53 失败:", e)
 
@@ -648,21 +664,111 @@ def _selfdns_remove():
     if os.path.exists(xy):
         subprocess.run(f"python3 {xy} selfdns-off", shell=True)
 
+def _sys_dns_ok():
+    """本机系统解析当前是否可用。特意用 getent 起新进程测，而不是本进程 socket：
+       glibc 的解析器在进程内会把 resolv.conf 读进来，刚改完再自己查未必反映真实状态。"""
+    return any(sh(f"getent hosts {h} 2>/dev/null") for h in ("cloudflare.com", "example.com"))
+
+def _restore_resolved():
+    """还原装 AdGuard 时「腾 53」对本机解析做的改动：删掉我们写的 drop-in，
+       把 /etc/resolv.conf 交回 systemd-resolved（软链回 stub），重启服务。
+
+       为什么每一步都要验证再落地：这台机自己的 DNS 是命脉——apt / curl / acme 续期
+       全指着它。所以还原成软链后先实测一次解析，通了才算数；不通就立刻退回「写死公共
+       DNS 的普通文件」这个已知能用的状态。宁可留着不完美的配置，也不能把机器搞成没
+       DNS 可用——那种情况 SSH 还连得上，但装什么、续什么证书都会失败，很难查。"""
+    G = "\033[1;32m"; Y = "\033[1;33m"; N = "\033[0m"
+    if not os.path.exists(RESOLVED_DROPIN):
+        return                                       # 没腾过 53，本机解析本来就没被动过
+    keep = ""
+    try: keep = open("/etc/resolv.conf").read()      # 留一份现状，还原失败要退回来
+    except OSError: pass
+    try:
+        os.remove(RESOLVED_DROPIN)
+    except OSError as e:
+        print(f"  {Y}⚠ 删不掉 {RESOLVED_DROPIN}：{e}，本机解析未还原。{N}"); return
+    sh("systemctl restart systemd-resolved")
+    time.sleep(1)
+    stub = "/run/systemd/resolve/stub-resolv.conf"
+    if sh("systemctl is-active systemd-resolved") != "active" or not os.path.exists(stub):
+        # 这台机根本没跑 systemd-resolved（有些镜像不装），那就保持现在这份公共 DNS 的
+        # resolv.conf —— 它本来就是能用的，没有「原状」可回。
+        print(f"  {Y}· 本机没在跑 systemd-resolved，/etc/resolv.conf 保持现状"
+              f"（公共 DNS，可用）。{N}")
+        return
+    try:
+        os.remove("/etc/resolv.conf")
+        os.symlink(stub, "/etc/resolv.conf")
+    except OSError as e:
+        print(f"  {Y}⚠ resolv.conf 软链没建成：{e}，保持现状（公共 DNS，可用）。{N}"); return
+    time.sleep(1)
+    if _sys_dns_ok():
+        print(f"  {G}✓ 本机解析已交回 systemd-resolved（腾 53 的改动还原）{N}")
+        return
+    try: os.remove("/etc/resolv.conf")               # 交回去反而不通 → 退回能用的那份
+    except OSError: pass
+    open("/etc/resolv.conf", "w").write(keep or "nameserver 1.1.1.1\nnameserver 223.5.5.5\n")
+    print(f"  {Y}⚠ 交回 systemd-resolved 后解析不通，已退回写死公共 DNS 的 /etc/resolv.conf"
+          f"（本机 DNS 仍然可用）。{N}")
+
 def uninstall(refresh_sub=True):
+    """卸载：把这套自建 DNS 留下的东西一次撤干净，回到没装过的样子。
+
+       为什么不只是删服务：这些东西是连在一起的一整套，只删 AdGuard 会留下一地孤儿——
+       订阅里还指着一个没人应答的 DoH、证书上挂着没用的 *.域名、acme.sh 里躺着续期用的
+       CF Token、本机解析还钉在公共 DNS 上。用户点「卸载」的意思是这套东西整个不要了。
+       （菜单 8 的「删除 DoT」是另一回事：只撤泛域名证书这一项，AdGuard 本体照常跑。）
+
+       各项彼此独立、按「先撤依赖它的，再撤它本身」排序，中间某项失败不影响后面：证书
+       重签失败原证书原封不动，本机解析还原不通会自动退回能用的状态。"""
+    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
     if not _installed():
         print("  没检测到 AdGuard Home，无需卸载。"); return
-    if _ask("  确认卸载 AdGuard Home（去广告 DNS）? [y/N]: ").lower() not in ("y", "yes"):
-        return
+    dom  = _domain()                                 # 这些状态要趁 AGH 目录还在先读出来
+    cid  = _selfdns_clientid()
+    wild = refresh_sub and dom and _cert_wildcard_ok(dom)
+    subw = os.path.exists(SELFDNS_FLAG)
+    res  = os.path.exists(RESOLVED_DROPIN)
+    allow = _allowed_clients()
+
+    print("\n  卸载会一次撤掉下面这些，不用再去别处收尾：")
+    print("    · AdGuard Home 服务 + /opt/AdGuardHome")
+    print(f"      （{Y}后台设置、允许的客户端、过滤规则、查询日志全部删除，不可恢复{N}）")
+    if subw: print("    · 订阅里写入的自建 DoH —— 移除并刷新订阅")
+    if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
+                   f"顺带清掉 acme.sh 存的 CF Token\n"
+                   f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
+    if res:  print("    · 腾 53 时改的本机解析 —— 交回 systemd-resolved")
+    if cid:  print(f"    · ClientID 记录（{cid}）")
+    print(f"\n  {G}不会动{N}：sing-box / xray / 节点 / 订阅本身"
+          + (f"——{ACME_CRT} 仍是节点在用的那张证书，只是覆盖范围改回单域名。" if wild else "。"))
+    if allow:
+        print(f"\n  {R}先做这件事再卸载{N}：AdGuard 里设了白名单，卸载后这台 DNS 整个没了，"
+              f"而安卓「专用DNS」是严格模式、没有回落——")
+        print(f"  先把手机/路由器的 DNS 改回自动/默认，否则那些设备会立刻全部解析失败。")
+    if _ask("\n  确认卸载? [y/N]: ").lower() not in ("y", "yes"):
+        print("  已取消，没有任何改动。"); return
+
+    if refresh_sub:                                  # 先撤订阅：客户端别再往这台已死的 DoH 打
+        _selfdns_remove()                            # （全量卸载时订阅整个删掉，不必刷新，refresh_sub=False）
     if os.path.exists(AGH_BIN):
         sh(f"{AGH_BIN} -s uninstall")                # 官方卸载（停服务 + 注销 systemd）
     sh("systemctl stop AdGuardHome")
     sh("systemctl disable AdGuardHome")
     try: shutil.rmtree(AGH_DIR)
     except OSError: pass
-    if refresh_sub:                                  # 单独卸载：把之前写进订阅的自建 DNS 一并撤掉并刷新
-        _selfdns_remove()                            # （全量卸载时订阅整个删掉，不必刷新，refresh_sub=False）
-    print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）。")
-    print("  记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
+    print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）")
+    if wild:
+        _revert_wildcard(dom, cid, ask=False, auto_token=True)
+    _restore_resolved()
+    if cid:
+        try:
+            os.remove(SELFDNS_CID_FILE)
+            print(f"  {G}✓ 已清除 ClientID 记录{N}（重新安装会生成新的）")
+        except OSError:
+            pass
+    print(f"\n  {G}卸载完成。{N}"
+          f"记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
 
 # ===================== 自检 =====================
 # 为什么要有这个：安卓「私人DNS」是严格模式——填了主机名就只用这一台 DoT，没有任何回落，
@@ -1106,7 +1212,7 @@ def menu():
         print("  当前状态:", st)
         print("-" * 60)
         print("  1 安装（装 AdGuard Home + 起服务，之后网页后台点几下完成设置）")
-        print("  2 卸载（彻底移除，不动节点；若写过订阅会自动从订阅撤掉自建DNS并刷新）")
+        print("  2 卸载（整套撤干净：服务+数据、订阅里的自建DNS、泛域名证书、腾53的改动；不动节点）")
         print("  3 使用方法（当前配置信息 + 设备怎么设置，照着填即可）")
         print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
         print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
