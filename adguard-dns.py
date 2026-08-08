@@ -38,6 +38,33 @@ def _ask(prompt=""):
     except (OSError, EOFError):
         return input(prompt).strip()
 
+def _ask_secret(prompt=""):
+    """读密钥类输入且【不回显】。API Token 一旦回显就会留在终端回滚缓冲里，
+       随手一张截图、一次录屏、一次贴日志求助就泄露了——而它能改你整个域名的 DNS。"""
+    try:
+        import termios
+        with open("/dev/tty", "r+") as t:
+            fd = t.fileno()
+            old = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] &= ~termios.ECHO                      # 关掉回显
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, new)
+                t.write(prompt); t.flush()
+                line = t.readline()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                t.write("\n"); t.flush()
+            if line == "":
+                raise EOFError
+            return line.rstrip("\n").strip()
+    except Exception:
+        try:
+            import getpass
+            return getpass.getpass(prompt).strip()        # 兜底：非 tty 环境
+        except Exception:
+            return _ask(prompt)
+
 def _host():
     try: return open(HOST_FILE).read().strip()
     except OSError: return ""
@@ -289,6 +316,32 @@ def _usage(port=None):
     print("    · 后台 → 过滤器 → DNS 拦截列表 → 添加名单（推荐 anti-AD：https://anti-ad.net/easylist.txt）")
     print("    · 后台 → 查询日志 → 找到广告域名 → 点『屏蔽』")
 
+def _replace_cf_token():
+    """换掉 acme.sh 存的 Cloudflare Token（旧的泄露/被吊销时用）。
+       acme.sh 把它存成 account.conf 里的 SAVED_CF_Token='…'，续期时读这里。
+       只换这一个值，不重签证书——证书还好好的，没必要浪费一次 LE 签发额度。"""
+    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
+    conf = os.path.expanduser("~/.acme.sh/account.conf")
+    if not os.path.exists(conf):
+        print(f"  {R}找不到 {conf}{N}，你的证书可能不是本脚本签的。"); return
+    new = _ask_secret("  粘贴新的 Cloudflare API Token（不回显）: ").strip()
+    if not new:
+        print("  没输入，未改动。"); return
+    txt = open(conf).read()
+    line = f"SAVED_CF_Token='{new}'"
+    if re.search(r"(?m)^SAVED_CF_Token=.*$", txt):
+        txt = re.sub(r"(?m)^SAVED_CF_Token=.*$", line, txt)
+    else:
+        txt = txt.rstrip("\n") + "\n" + line + "\n"
+    bak = conf + ".bak"
+    shutil.copy(conf, bak)
+    open(conf, "w").write(txt)
+    os.chmod(conf, 0o600)                                # 里面是密钥，别让别的用户读到
+    print(f"  {G}✓ 已更新{N}（旧文件备份在 {bak}）。")
+    print(f"  {Y}记得回 Cloudflare 把旧 Token 删掉{N}，否则它仍然能改你的 DNS。")
+    print(f"  下次证书续期(约90天后)会用新 Token；想立刻验证可跑：")
+    print(f"      ~/.acme.sh/acme.sh --renew -d {_domain()} --ecc --force")
+
 def dot_clientid():
     """把 acme 证书重签成同时覆盖『域名』和『*.域名』，让安卓 DoT 也能带 ClientID。
 
@@ -321,6 +374,9 @@ def dot_clientid():
             print(f"  {R}⚠ 但 *.{dom} 的 DNS 通配记录没生效{N}——手机会解析不出这个主机名。")
             print(f"    去 Cloudflare 加一条：类型 {G}A{N}  名称 {G}*.{dom.split('.',1)[0] if dom.count('.')>1 else '*'}{N}"
                   f"  内容 {G}{_public_ip()}{N}  代理状态 {Y}仅DNS(灰云){N}")
+        print(f"\n  Token 存在 {G}~/.acme.sh/account.conf{N}，约 90 天后自动续期还要用它。")
+        if _ask("  要更换 Cloudflare API Token 吗（旧的泄露了/被吊销了就换）? [y/N]: ").lower() in ("y", "yes"):
+            _replace_cf_token()
         return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
@@ -338,7 +394,7 @@ def dot_clientid():
         return
     print(f"  {G}✓ 通配解析已生效{N}")
 
-    token = _ask("  粘贴 Cloudflare API Token: ").strip()
+    token = _ask_secret("  粘贴 Cloudflare API Token（不回显，粘完直接回车）: ").strip()
     if not token:
         print("  没输入，已取消。"); return
 
