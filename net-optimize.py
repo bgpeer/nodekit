@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ==============================================================================
-# 🚀 Net-Optimize-Ultimate v4.2.0 (Python 重构版)
-# 功能对齐 bash v3.8.0，所有功能 1:1 保留：
+# 🚀 Net-Optimize-Ultimate v4.2.1 (Python 重构版)
+# v4.2.1 修复：
+#   1) 检测到容器运行时(Docker/containerd/podman/k8s)时不再设 vm.overcommit_memory=2。
+#      严格提交记账会把 Go 写的容器工具链预留的虚拟地址计入 commit，十几个容器
+#      即顶满 CommitLimit，导致物理内存充足却起不来容器、报
+#      "write init-p: broken pipe"，且 dmesg 无 OOM 记录，极难排查。
+# 功能对齐 bash v3.8.1，所有功能 1:1 保留：
 #   自动更新(SHA256SUMS 校验) / 低内存临时 swap / dpkg 自愈 / ulimit /
 #   BBRv3→BBRv2→bbrplus→BBR 拥塞算法 / fq_pie 队列 / RAM 自适应缓冲区 /
 #   tcp_mem 动态计算 / sysctl 权威收敛(last-wins override) / rp_filter 逐接口 /
@@ -193,6 +198,22 @@ def apt(args, timeout=900):
 
 def have_cmd(name):
     return shutil.which(name) is not None
+
+
+def container_runtime_present():
+    """本机是否存在容器运行时（Docker / containerd / podman / k8s）。
+
+    用于决定 vm.overcommit_memory 取值：容器工具链是 Go 写的，Go 运行时启动时
+    会预留大片虚拟地址空间，与严格提交记账（=2）冲突。详见写入 sysctl 处的注释。
+    """
+    for c in ("docker", "containerd", "podman", "runc", "k3s", "kubelet"):
+        if have_cmd(c):
+            return True
+    for p in ("/var/run/docker.sock", "/run/docker.sock",
+              "/run/containerd/containerd.sock"):
+        if os.path.exists(p):
+            return True
+    return False
 
 
 def echo(msg=""):
@@ -967,8 +988,21 @@ def write_sysctl_conf():
     a("vm.mmap_min_addr = 65536")
     a("vm.max_map_count = 1048576")
     a("vm.swappiness = 1")
-    a("vm.overcommit_memory = 2")   # 适度超量，避免 =1 彻底关闭 OOM 保护
-    a("vm.overcommit_ratio = 100")  # 无 swap 小内存机 commit 上限修复
+    # overcommit_memory=2 是严格提交记账：所有进程申请的虚拟内存总和不得超过
+    # CommitLimit(= swap + RAM*ratio%)。纯代理节点上没问题，但容器工具链
+    # (dockerd/containerd/containerd-shim/runc) 全是 Go 写的，Go 运行时启动时
+    # 会预留大片虚拟地址空间——预留不等于占用物理内存，可严格模式照样计入 commit。
+    # 每起一个容器要拉起 shim + runc 两个 Go 进程，十几个容器就能顶满 CommitLimit，
+    # 表现为：物理内存明明充足、swap 没动、dmesg 里没有任何 OOM kill，
+    # 只有 __vm_enough_memory 报错，容器随机起不来并崩在
+    # "write init-p: broken pipe"。这种症状极难联想到 sysctl，排查成本很高。
+    # 所以检测到容器运行时就退回内核默认的启发式模式 0。
+    # 注意 0 并不会关闭 OOM killer（那是另一套机制），只是不再做严格准入。
+    if container_runtime_present():
+        a("vm.overcommit_memory = 0")   # 检测到容器运行时 → 内核默认启发式
+    else:
+        a("vm.overcommit_memory = 2")   # 严格提交记账，避免 =1 完全不设防
+        a("vm.overcommit_ratio = 100")  # 无 swap 小内存机 commit 上限修复
     a("kernel.pid_max = 4194304")
     a("")
     a("fs.protected_fifos = 1")
@@ -2577,8 +2611,14 @@ def cmd_check():
     echo(f"   🔹 wmem_max = {get_sysctl('net.core.wmem_max')}")
     echo(f"   🔹 netdev_max_backlog = {get_sysctl('net.core.netdev_max_backlog')}")
     echo("✅ 内存提交策略（ratio=100 防无 swap 小内存机大分配失败）：")
-    echo(f"   🔹 vm.overcommit_memory = {get_sysctl('vm.overcommit_memory')}  "
+    _oc = get_sysctl("vm.overcommit_memory")
+    echo(f"   🔹 vm.overcommit_memory = {_oc}  "
          f"vm.overcommit_ratio = {get_sysctl('vm.overcommit_ratio')}")
+    if _oc == "2" and container_runtime_present():
+        yellow("   ⚠️ 本机有容器运行时，但仍是严格提交记账(=2)，两者不兼容：")
+        yellow("      容器会随机起不来，报 write init-p: broken pipe，")
+        yellow("      而 dmesg 里只有 __vm_enough_memory、没有 OOM，极易误判为内存不足。")
+        yellow("      修复：sysctl -w vm.overcommit_memory=0（重跑本工具也会自动改）")
 
     rp = get_sysctl("net.ipv4.conf.all.rp_filter")
     rp_msg = {"0": (yellow, "⚠️ rp_filter = 0（关闭）"),
