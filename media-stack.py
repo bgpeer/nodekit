@@ -1210,22 +1210,30 @@ def set_emby_api_key():
     cur = read_emby_api_key(d)
     print()
     if cur:
+        # 已经填过就先拦一道 —— 直接把光标丢给用户很容易手滑覆盖掉正在用的 Key
         print(f"  当前已填：{CYAN}{BOLD}{cur}{RST}")
-        print(f"  {DIM}直接回车＝保持不变；要换就贴新的。{RST}")
+        if not ask_yn("已经填过了，要更换吗？", False):
+            print("保持不变。")
+            return
     else:
         print(f"  {YELLOW}当前为空 —— 302 直链不会生效。{RST}")
     print(f"  {DIM}到哪拿：Emby → 设置 → 高级 → API 密钥 → 新建 → 复制那串字符{RST}")
-    key = ask("Emby API Key", cur).strip()
-    if not key:
-        print("没填，保持原样。")
-        return
-    # Emby 的 Key 是 32 位十六进制。不符也放行（版本差异），但提醒一句，
-    # 免得把「新建 API 密钥」旁边的应用名之类的东西粘进来还查不出原因。
-    if not re.fullmatch(r"[0-9a-fA-F]{32}", key):
-        warn("这串不像 Emby 的 API Key（通常是 32 位十六进制），确认没复制错？")
-        if not ask_yn("仍然使用它？", False):
-            print("已取消。")
+
+    # 循环到拿到一个能用的值为止，输错不用从菜单重来
+    key = ""
+    while True:
+        key = ask("Emby API Key（留空取消）").strip()
+        if not key:
+            print("已取消，保持原样。")
             return
+        # Emby 的 Key 是 32 位十六进制。不符也放行（版本差异），但提醒一句，
+        # 免得把「新建 API 密钥」旁边的应用名之类的东西粘进来还查不出原因。
+        if re.fullmatch(r"[0-9a-fA-F]{32}", key):
+            break
+        warn(f"这串是 {len(key)} 个字符，不像 Emby 的 API Key（通常 32 位十六进制）。")
+        if ask_yn("仍然使用它？", False):
+            break
+        print(f"  {DIM}那就重新贴一次，或直接回车取消。{RST}")
 
     lines = open(path).read().splitlines()
     hit = False
@@ -1257,6 +1265,98 @@ def set_emby_api_key():
     print(f"  验证：{BOLD}media-stack 302{RST} 然后播一集，日志出现 302 就说明直链生效了。")
 
 
+def write_secret(path, key, value):
+    """在 .secrets 里就地改一个键，没有就追加。整文件重写会丢掉别的键。"""
+    lines = []
+    hit = False
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        pass
+    for i, ln in enumerate(lines):
+        if ln.startswith(key + "="):
+            lines[i] = f"{key}={value}"
+            hit = True
+            break
+    if not hit:
+        lines.append(f"{key}={value}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+
+
+def patch_credentials_file(install_dir, user, password):
+    """同步 CREDENTIALS.txt 里的两行 —— emby / media-stack 命令都读它，
+       不改的话敲 emby 看到的还是旧密码，比不显示更误导。"""
+    p = os.path.join(install_dir, "CREDENTIALS.txt")
+    try:
+        with open(p) as f:
+            txt = f.read()
+    except OSError:
+        return
+    txt = re.sub(r"(?m)^(\s*用户名\s+).*$", lambda m: m.group(1) + user, txt)
+    txt = re.sub(r"(?m)^(\s*密\s+码\s+).*$", lambda m: m.group(1) + password, txt)
+    with open(p, "w") as f:
+        f.write(txt)
+    os.chmod(p, 0o600)
+
+
+def set_web_credentials():
+    """改「第一层」的浏览器弹框账号密码（除 Emby 外所有服务共用那个）。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    sec = os.path.join(d, ".secrets")
+    env = os.path.join(d, ".env")
+    cur_user = read_env(sec, "BA_USER", fallback=env) or "media"
+    cur_pass = read_env(sec, "BA_PASS", fallback=env)
+
+    if not cur_pass or not os.path.exists(HTPASSWD_FILE):
+        print()
+        warn("当前没有启用统一密码（Homepage / OpenList 是裸奔的）。")
+        warn("要启用：跑「1 安装」，在「给它们加一道统一密码」那步选是。")
+        return
+
+    print()
+    print(f"  当前用户名：{CYAN}{BOLD}{cur_user}{RST}")
+    print(f"  当前密码　：{CYAN}{BOLD}{cur_pass}{RST}")
+    print(f"  {DIM}这是浏览器弹框那一层，除 Emby 外所有服务共用。{RST}")
+    if not ask_yn("要修改吗？", False):
+        print("保持不变。")
+        return
+
+    new_user = ask("新用户名（回车＝不改）", cur_user).strip() or cur_user
+    print(f"  {DIM}密码：回车＝不改；输 r ＝生成一个随机的；也可以直接输你要的。{RST}")
+    typed = ask("新密码（回车不改）").strip()
+    if typed == "r":
+        new_pass = rand_pw(16)
+    elif typed:
+        new_pass = typed
+    else:
+        new_pass = cur_pass
+
+    if new_user == cur_user and new_pass == cur_pass:
+        print("没有任何变化。")
+        return
+
+    if not write_htpasswd(new_user, new_pass):
+        err("生成密码文件失败（没有 openssl？），没有改动。")
+        return
+    write_secret(sec, "BA_USER", new_user)
+    write_secret(sec, "BA_PASS", new_pass)
+    patch_credentials_file(d, new_user, new_pass)
+    nginx_reload()
+
+    ok("已更新")
+    print()
+    print(f"      用户名  {CYAN}{BOLD}{new_user}{RST}")
+    print(f"      密  码  {CYAN}{BOLD}{new_pass}{RST}")
+    print(f"  {DIM}浏览器多半记着旧密码，下次弹框可能不弹 —— 用无痕窗口试，"
+          f"或清一下该站点的登录状态。{RST}")
+
+
 def params_menu():
     """后补参数：装完之后才拿得到、需要回头再填的东西。"""
     while True:
@@ -1266,7 +1366,12 @@ def params_menu():
         print(f"  {BOLD}后补参数{RST}{DIM}（装完之后再填的东西）{RST}")
         print("-" * 60)
         state = (f"{GREEN}已填{RST}" if cur else f"{YELLOW}空 · 302 不生效{RST}")
+        # 顺带把「有没有启用统一密码」也显示出来,省得进去才发现没开
+        sec = os.path.join(d, ".secrets")
+        has_ba = bool(read_env(sec, "BA_PASS", fallback=os.path.join(d, ".env")))
+        ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
         print(f"  1. 添加 API 密钥（Emby API Key）   当前：{state}")
+        print(f"  2. 修改用户名 / 密码（浏览器弹框那层）  当前：{ba_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -1274,6 +1379,8 @@ def params_menu():
             return
         if c == "1":
             set_emby_api_key()
+        elif c == "2":
+            set_web_credentials()
         else:
             print("无效选择。")
             continue
@@ -1330,6 +1437,8 @@ if __name__ == "__main__":
             do_update()
         elif arg in ("apikey", "key"):
             require_root(); set_emby_api_key()
+        elif arg in ("passwd", "password"):
+            require_root(); set_web_credentials()
         elif arg == "install":
             main()
         else:
