@@ -877,15 +877,47 @@ def show_info():
     print()
 
 
+def rebuild_cfg_from_disk(d):
+    """从落盘状态重建一份最小 cfg，够重新生成 nginx 站点和 Homepage 配置用。
+
+    这样「更新」就能把脚本层面的改动（比如某个服务不再套 Basic Auth）应用上，
+    不用重跑整轮安装问答 —— 那些问题的答案本来就都躺在磁盘上。
+    """
+    env_file = os.path.join(d, ".env")
+    sec_file = os.path.join(d, ".secrets")
+    cfg = {
+        "install_dir": d,
+        "domain":   read_env(env_file, "DOMAIN"),
+        "data_root": read_env(env_file, "DATA_ROOT") or os.path.join(d, "media"),
+        "ol_user":  "admin",
+        "ol_pass":  read_env(sec_file, "OPENLIST_PASS", fallback=env_file),
+        "ba_user":  read_env(sec_file, "BA_USER", fallback=env_file) or "media",
+        "ba_pass":  read_env(sec_file, "BA_PASS", fallback=env_file),
+        # 装了 Homepage 就有这个目录；容器可能被手动停掉，用目录判断更稳
+        "homepage": os.path.isdir(os.path.join(d, "homepage", "config")),
+        "host_ip":  "",     # 只有无域名模式才用得上，下面按需取
+    }
+    cfg["has_domain"] = bool(cfg["domain"]) and have("nginx")
+    cfg["basic_auth"] = bool(cfg["ba_pass"]) and os.path.exists(HTPASSWD_FILE)
+    cfg["ngx_port"] = detect_nginx_https_port()
+    cfg["http2_directive"] = nginx_supports_http2_directive()
+    cfg["crt"] = f"/etc/nginx/certs/{cfg['domain']}.crt" if cfg["domain"] else ""
+    cfg["key"] = f"/etc/nginx/certs/{cfg['domain']}.key" if cfg["domain"] else ""
+    if not cfg["has_domain"]:
+        cfg["host_ip"] = public_ip()
+    return cfg
+
+
 def do_update():
-    """更新：拉最新镜像并重启。配置和数据都不动。"""
+    """更新：拉最新镜像 + 按当前脚本重新生成配置。用户数据和密码都不动。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
     compose = os.path.join(d, "docker-compose.yml")
     env_file = os.path.join(d, ".env")
-    info("拉取最新镜像（配置和数据不动）...")
+
+    info("拉取最新镜像...")
     r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} pull",
                        shell=True, timeout=1800)
     if r.returncode != 0:
@@ -894,11 +926,44 @@ def do_update():
     info("用新镜像重启容器...")
     r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
                        shell=True, timeout=900)
-    if r.returncode == 0:
-        ok("已更新到最新镜像")
-        sh("docker image prune -f", timeout=300)
-    else:
+    if r.returncode != 0:
         err("重启失败，看上面的报错。")
+        return
+    ok("镜像已更新")
+    sh("docker image prune -f", timeout=300)
+
+    # 再把脚本生成的那几份配置按当前版本重刷一遍。
+    # 只重刷「纯脚本产物」：nginx 站点、Homepage 导航。
+    # mediawarp / autofilm 的配置里有 API Key、挂载路径、cron 这些用户填的东西，
+    # 也可能被手改过，这里一律不碰 —— 更新不该悄悄覆盖用户的输入。
+    cfg = rebuild_cfg_from_disk(d)
+    if cfg["homepage"]:
+        info("刷新 Homepage 导航配置...")
+        hp = os.path.join(d, "homepage", "config")
+        s, sv, w = gen_homepage_conf(cfg)
+        open(os.path.join(hp, "settings.yaml"), "w").write(s)
+        open(os.path.join(hp, "services.yaml"), "w").write(sv)
+        open(os.path.join(hp, "widgets.yaml"), "w").write(w)
+        subprocess.run(["docker", "restart", "homepage"], capture_output=True)
+        ok("Homepage 配置已刷新")
+
+    if cfg["has_domain"] and os.path.exists(NGX_SITE):
+        if not (os.path.exists(cfg["crt"]) and os.path.exists(cfg["key"])):
+            warn(f"证书文件不在 {cfg['crt']}，跳过 nginx 配置刷新。")
+        else:
+            info("按当前版本重新生成 nginx 站点配置...")
+            apply_nginx_site(cfg)     # 内部已带 nginx -t + 失败回滚
+
+    # 总览表也重刷一遍，免得 emby / media-stack 命令显示的还是旧版式
+    cred = os.path.join(d, "CREDENTIALS.txt")
+    if os.path.exists(cred):
+        with open(cred, "w") as f:
+            f.write(build_summary(cfg, colored=False) + "\n")
+        os.chmod(cred, 0o600)
+
+    print()
+    ok("更新完成：镜像、nginx 站点、导航面板都已是当前版本")
+    print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
 
 
 def do_uninstall():
@@ -1405,7 +1470,7 @@ def main_menu():
         print("  1. 安装" + ("（已装，重跑可改配置）" if installed else ""))
         print("  2. 使用信息（地址 / 账号密码 / 常用命令）")
         print("  3. 后补参数（Emby API Key 等装完才拿得到的东西）")
-        print("  4. 更新（拉最新镜像并重启）")
+        print("  4. 更新（拉最新镜像 + 按新版本刷新配置）")
         print("  5. 卸载")
         print("  0. 返回")
         print("-" * 60)
