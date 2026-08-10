@@ -12,8 +12,9 @@
 #    · 绝不碰 nginx.conf、bgpeer.conf、bgpeer-stream.conf、state.json
 #    · nginx 配置先 nginx -t，不过就还原并继续，绝不让节点因为本脚本挂掉
 #
-#  单独运行：sudo python3 media-stack.py
-#  卸载：    sudo python3 media-stack.py uninstall
+#  单独运行：sudo python3 media-stack.py          （进子菜单）
+#  也可直接指定动作：install / info / update / uninstall
+#      sudo python3 media-stack.py info
 # ============================================================================
 import json
 import os
@@ -30,6 +31,7 @@ SCRIPT_VERSION = "1.0.0"
 # ---- 节点（xy-installer.py）的落盘状态，只读 ----
 BGP_DIR    = "/etc/bgpeer"
 STATE_FILE = BGP_DIR + "/state.json"        # 含 domain / sni_split 等
+MS_STATE   = BGP_DIR + "/media-stack.json"  # 本脚本自己的：记住装在哪个目录
 ACME_CRT   = "/etc/ssl/sb/acme.crt"         # 节点的 acme 证书（判断有没有真证书）
 
 # ---- 本脚本自己的东西 ----
@@ -100,6 +102,12 @@ def ask_yn(prompt, default=True):
     return v.lower().startswith("y")
 
 
+def pad(s, width):
+    """按终端显示宽度补空格。中文一个字占两列，直接用 len() 对齐会错位。"""
+    w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
+    return s + " " * max(0, width - w)
+
+
 def rand_pw(n=16):
     alphabet = string.ascii_letters + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(n))
@@ -137,6 +145,33 @@ def node_state():
             return json.load(f)
     except Exception:
         return {}
+
+
+def save_ms_state(install_dir):
+    """记住装在哪，「使用信息 / 更新 / 卸载」就不用每次问一遍安装目录。"""
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        with open(MS_STATE, "w") as f:
+            json.dump({"install_dir": install_dir}, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def ms_install_dir():
+    """取安装目录：先读自己的状态文件，没有就退回默认路径。"""
+    try:
+        with open(MS_STATE) as f:
+            d = json.load(f).get("install_dir", "")
+            if d:
+                return d
+    except Exception:
+        pass
+    return DEFAULT_DIR
+
+
+def is_installed(install_dir=None):
+    d = install_dir or ms_install_dir()
+    return os.path.exists(os.path.join(d, "docker-compose.yml"))
 
 
 def detect_nginx_https_port():
@@ -734,7 +769,7 @@ def build_summary(cfg, colored=True):
             "  " + "-" * 58,
             "  " + c(GREEN + BOLD, "第二层 · 各服务自己的账号") + c(DIM, "（弹框之后，在网页里登录）"),
         ]
-    lines.append("  %-12s %-34s %s" % ("服务", "访问地址", "账号/密码"))
+    lines.append("  " + pad("服务", 14) + pad("访问地址", 36) + "账号/密码")
     lines.append("  " + "-" * 58)
 
     for sub, port, container, label in SUBDOMAINS:
@@ -748,7 +783,7 @@ def build_summary(cfg, colored=True):
             cred = "首登自设"
         else:
             cred = "—"
-        lines.append("  %-12s %-34s %s" % (label, url, cred))
+        lines.append("  " + pad(label, 14) + pad(url, 36) + cred)
 
     lines.append("  " + "-" * 58)
     if cfg["basic_auth"]:
@@ -759,15 +794,119 @@ def build_summary(cfg, colored=True):
 
 
 # ============================================================================ 卸载
+def show_info():
+    """使用信息：把怎么进、用什么账号密码，全部从落盘的配置里读出来打印。
+       不写死任何值 —— 用户改过、重跑过，这里显示的都得是当前真正生效的。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+
+    env_file = os.path.join(d, ".env")
+    sec_file = os.path.join(d, ".secrets")
+    domain   = read_env(env_file, "DOMAIN")
+    ol_pass  = read_env(sec_file, "OPENLIST_PASS", fallback=env_file)
+    ba_user  = read_env(sec_file, "BA_USER", fallback=env_file) or "media"
+    ba_pass  = read_env(sec_file, "BA_PASS", fallback=env_file)
+    data_root = read_env(env_file, "DATA_ROOT") or os.path.join(d, "media")
+
+    print()
+    print("=" * 60)
+    print(f"  {BOLD}媒体栈使用信息{RST}")
+    print("=" * 60)
+
+    print(f"\n  {BOLD}▸ 访问地址{RST}")
+    for sub, port, container, label in SUBDOMAINS:
+        if container == "homepage" and not os.path.isdir(os.path.join(d, "homepage")):
+            continue
+        url = f"https://{sub}.{domain}" if domain else f"http://{public_ip()}:{port}"
+        print(f"      {pad(label, 11)}{CYAN}{BOLD}{url}{RST}")
+    if domain:
+        print(f"      {DIM}首页入口就是导航面板，所有服务都能从那里点进去。{RST}")
+
+    if ba_pass:
+        print(f"\n  {YELLOW}{BOLD}▸ 第一层 · 浏览器弹框{RST}{DIM}（除 Emby 外所有服务共用）{RST}")
+        print(f"      用户名   {CYAN}{BOLD}{ba_user}{RST}")
+        print(f"      密  码   {CYAN}{BOLD}{ba_pass}{RST}")
+        print(f"      {DIM}打开任意地址会先弹这个框，过了才看得到网页。{RST}")
+
+    print(f"\n  {GREEN}{BOLD}▸ 第二层 · 各服务自己的账号{RST}"
+          f"{DIM}（弹框之后，在网页里登录）{RST}")
+    print(f"      Emby       {DIM}首次打开自己设；不走弹框（App 客户端处理不了 Basic Auth）{RST}")
+    print(f"      OpenList   {CYAN}{BOLD}admin{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
+
+    print(f"\n  {BOLD}▸ 常用命令{RST}")
+    print(f"      {GREEN}{BOLD}emby{RST}                甩出面板地址")
+    print(f"      {GREEN}{BOLD}media-stack{RST}         全部地址 + 密码 + 容器状态")
+    print(f"      {GREEN}{BOLD}media-stack 302{RST}     播一集看有没有 302，验证直链是否真生效")
+    print(f"      {GREEN}{BOLD}media-stack strm{RST}    立刻跑一次 strm 生成")
+    print(f"      {GREEN}{BOLD}media-stack logs{RST} <服务>   跟踪日志")
+
+    print(f"\n  {BOLD}▸ 路径{RST}")
+    print(f"      安装目录   {d}")
+    print(f"      媒体目录   {data_root}")
+    print(f"      strm 目录  {os.path.join(data_root, 'strm', STRM_SUBDIR)}"
+          f"   {DIM}(Emby 媒体库指向容器内的 {STRM_PATH}){RST}")
+    print(f"      凭据存档   {os.path.join(d, 'CREDENTIALS.txt')}")
+    if os.path.exists(NGX_SITE):
+        print(f"      nginx 站点 {NGX_SITE}")
+
+    print(f"\n  {BOLD}▸ 容器状态{RST}")
+    r = sh(f"docker compose -f {os.path.join(d, 'docker-compose.yml')} "
+           f"--env-file {env_file} ps", timeout=60)
+    out = (r.stdout or "").strip()
+    print("\n".join("      " + ln for ln in out.splitlines()) if out
+          else f"      {YELLOW}容器没在跑，用「3 更新」或 media-stack start 拉起来。{RST}")
+
+    # API Key 是空的话 302 根本不生效，这是最容易被忽略的一步，单独提醒
+    try:
+        with open(os.path.join(d, "mediawarp/config/config.yaml")) as f:
+            if re.search(r"^\s*auth:\s*$", f.read(), re.M):
+                print()
+                warn("MediaWarp 的 Emby API Key 还是空的 —— 302 直链不会生效！")
+                warn("去 Emby：设置 → 高级 → API 密钥 → 新建，然后重跑「1 安装」填进去。")
+    except OSError:
+        pass
+    print()
+
+
+def do_update():
+    """更新：拉最新镜像并重启。配置和数据都不动。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    compose = os.path.join(d, "docker-compose.yml")
+    env_file = os.path.join(d, ".env")
+    info("拉取最新镜像（配置和数据不动）...")
+    r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} pull",
+                       shell=True, timeout=1800)
+    if r.returncode != 0:
+        err("拉取镜像失败，看上面的报错。")
+        return
+    info("用新镜像重启容器...")
+    r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
+                       shell=True, timeout=900)
+    if r.returncode == 0:
+        ok("已更新到最新镜像")
+        sh("docker image prune -f", timeout=300)
+    else:
+        err("重启失败，看上面的报错。")
+
+
 def do_uninstall():
     require_root()
-    install_dir = ask("安装目录", DEFAULT_DIR)
+    install_dir = ms_install_dir()
+    if not is_installed(install_dir):
+        install_dir = ask("安装目录", install_dir)
     compose = os.path.join(install_dir, "docker-compose.yml")
     print()
     warn("将要删除：媒体栈的容器、nginx 站点配置、media-stack/emby 命令。")
     warn("节点(bgpeer)的任何文件都不会被碰。")
-    if not ask_yn("确认继续？", False):
-        print("已取消。")
+    print(f"  {DIM}输入 {RST}{RED}{BOLD}yes{RST}{DIM} 确认；回车 / n / 其它任何输入都是取消。{RST}")
+    # 卸载是不可逆操作，故意不接受 y —— 必须完整打出 yes，避免手滑
+    if ask("确认卸载？").strip().lower() != "yes":
+        print("已取消，什么都没动。")
         return
 
     if os.path.exists(compose):
@@ -784,7 +923,7 @@ def do_uninstall():
             ok("已移除 nginx 站点配置")
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
-    for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS):
+    for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -1004,6 +1143,7 @@ DOMAIN={cfg['domain']}
 
     # ---- 管理命令 ----
     install_cli(cfg["install_dir"])
+    save_ms_state(cfg["install_dir"])   # 记住装在哪，菜单里的 2/3/4 就不用再问
 
     # ---- 总览 ----
     cred_file = os.path.join(cfg["install_dir"], "CREDENTIALS.txt")
@@ -1034,12 +1174,54 @@ DOMAIN={cfg['domain']}
     warn("Emby 的 8096 已收进 127.0.0.1，对外只能走 MediaWarp。直连 8096 会绕过 302。")
 
 
-if __name__ == "__main__":
-    try:
-        if len(sys.argv) > 1 and sys.argv[1] in ("uninstall", "remove"):
+def main_menu():
+    require_root()
+    while True:
+        installed = is_installed()
+        print("\n" + "=" * 60)
+        print(f"  {BOLD}自建 Emby · 网盘直链媒体服务器{RST}   "
+              f"{DIM}v{SCRIPT_VERSION}{RST}")
+        print(f"  {DIM}Emby + OpenList + AutoFilm + MediaWarp（302 直链）{RST}")
+        print("=" * 60)
+        print(f"  状态：" + (f"{GREEN}已安装{RST}  {DIM}{ms_install_dir()}{RST}"
+                            if installed else f"{YELLOW}未安装{RST}"))
+        print("-" * 60)
+        print("  1. 安装" + ("（已装，重跑可补 API Key / 改配置）" if installed else ""))
+        print("  2. 使用信息（地址 / 账号密码 / 常用命令）")
+        print("  3. 更新（拉最新镜像并重启）")
+        print("  4. 卸载")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            main()
+        elif c == "2":
+            show_info()
+        elif c == "3":
+            do_update()
+        elif c == "4":
             do_uninstall()
         else:
+            print("无效选择。")
+            continue
+        ask("\n按回车返回菜单...")
+
+
+if __name__ == "__main__":
+    try:
+        arg = sys.argv[1] if len(sys.argv) > 1 else ""
+        if arg in ("uninstall", "remove"):
+            do_uninstall()
+        elif arg == "info":
+            show_info()
+        elif arg == "update":
+            do_update()
+        elif arg == "install":
             main()
+        else:
+            main_menu()
     except KeyboardInterrupt:
         print("\n已中断。")
         sys.exit(130)
