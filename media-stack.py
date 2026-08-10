@@ -1178,6 +1178,108 @@ DOMAIN={cfg['domain']}
     warn("Emby 的 8096 已收进 127.0.0.1，对外只能走 MediaWarp。直连 8096 会绕过 302。")
 
 
+def mediawarp_conf_path(install_dir=None):
+    return os.path.join(install_dir or ms_install_dir(), "mediawarp/config/config.yaml")
+
+
+def read_emby_api_key(install_dir=None):
+    """从 MediaWarp 配置里读当前的 API Key，读不到或为空都返回空串。"""
+    try:
+        with open(mediawarp_conf_path(install_dir)) as f:
+            m = re.search(r"^\s*auth:[ \t]*(\S*)", f.read(), re.M)
+            return m.group(1) if m and not m.group(1).startswith("#") else ""
+    except OSError:
+        return ""
+
+
+def set_emby_api_key():
+    """单独补 Emby API Key。
+
+    这是装完之后唯一必须回头再填的东西（首次部署时 Emby 还没初始化，拿不到 Key），
+    为它重跑一整轮安装问答太笨，所以单开一个入口。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    path = mediawarp_conf_path(d)
+    if not os.path.exists(path):
+        err(f"找不到 {path}，先跑一次「1 安装」。")
+        return
+
+    cur = read_emby_api_key(d)
+    print()
+    if cur:
+        print(f"  当前已填：{CYAN}{BOLD}{cur}{RST}")
+        print(f"  {DIM}直接回车＝保持不变；要换就贴新的。{RST}")
+    else:
+        print(f"  {YELLOW}当前为空 —— 302 直链不会生效。{RST}")
+    print(f"  {DIM}到哪拿：Emby → 设置 → 高级 → API 密钥 → 新建 → 复制那串字符{RST}")
+    key = ask("Emby API Key", cur).strip()
+    if not key:
+        print("没填，保持原样。")
+        return
+    # Emby 的 Key 是 32 位十六进制。不符也放行（版本差异），但提醒一句，
+    # 免得把「新建 API 密钥」旁边的应用名之类的东西粘进来还查不出原因。
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", key):
+        warn("这串不像 Emby 的 API Key（通常是 32 位十六进制），确认没复制错？")
+        if not ask_yn("仍然使用它？", False):
+            print("已取消。")
+            return
+
+    lines = open(path).read().splitlines()
+    hit = False
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(\s*auth:)(.*)$", ln)
+        if not m:
+            continue
+        # 保留原有缩进和行尾注释，只换值
+        cm = re.search(r"(\s+#.*)$", m.group(2))
+        lines[i] = f"{m.group(1)} {key}{cm.group(1) if cm else ''}"
+        hit = True
+        break
+    if not hit:
+        err(f"{path} 里没找到 auth: 这一行，没敢乱改。请手动填。")
+        return
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)
+    ok("API Key 已写入 MediaWarp 配置")
+
+    info("重启 MediaWarp...")
+    if subprocess.run(["docker", "restart", "mediawarp"],
+                      capture_output=True).returncode != 0:
+        err("重启失败，MediaWarp 可能没在跑。用「3 更新」或 media-stack start 拉起来。")
+        return
+    time.sleep(3)
+    ok("MediaWarp 已重启")
+    print()
+    print(f"  验证：{BOLD}media-stack 302{RST} 然后播一集，日志出现 302 就说明直链生效了。")
+
+
+def params_menu():
+    """后补参数：装完之后才拿得到、需要回头再填的东西。"""
+    while True:
+        d = ms_install_dir()
+        cur = read_emby_api_key(d) if is_installed(d) else ""
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}后补参数{RST}{DIM}（装完之后再填的东西）{RST}")
+        print("-" * 60)
+        state = (f"{GREEN}已填{RST}" if cur else f"{YELLOW}空 · 302 不生效{RST}")
+        print(f"  1. 添加 API 密钥（Emby API Key）   当前：{state}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            set_emby_api_key()
+        else:
+            print("无效选择。")
+            continue
+        ask("\n按回车返回...")
+
+
 def main_menu():
     require_root()
     while True:
@@ -1190,10 +1292,11 @@ def main_menu():
         print(f"  状态：" + (f"{GREEN}已安装{RST}  {DIM}{ms_install_dir()}{RST}"
                             if installed else f"{YELLOW}未安装{RST}"))
         print("-" * 60)
-        print("  1. 安装" + ("（已装，重跑可补 API Key / 改配置）" if installed else ""))
+        print("  1. 安装" + ("（已装，重跑可改配置）" if installed else ""))
         print("  2. 使用信息（地址 / 账号密码 / 常用命令）")
-        print("  3. 更新（拉最新镜像并重启）")
-        print("  4. 卸载")
+        print("  3. 后补参数（Emby API Key 等装完才拿得到的东西）")
+        print("  4. 更新（拉最新镜像并重启）")
+        print("  5. 卸载")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -1204,8 +1307,11 @@ def main_menu():
         elif c == "2":
             show_info()
         elif c == "3":
-            do_update()
+            params_menu()
+            continue          # 子菜单自己管停顿，回来别再多按一次回车
         elif c == "4":
+            do_update()
+        elif c == "5":
             do_uninstall()
         else:
             print("无效选择。")
@@ -1222,6 +1328,8 @@ if __name__ == "__main__":
             show_info()
         elif arg == "update":
             do_update()
+        elif arg in ("apikey", "key"):
+            require_root(); set_emby_api_key()
         elif arg == "install":
             main()
         else:
