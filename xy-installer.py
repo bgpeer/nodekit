@@ -96,6 +96,8 @@ CN_BLOCK_LOCAL = BGP_DIR + "/cn-block.py"        # 本地缓存的 cn-block.py
 CN_BLOCK_URL   = _RAW + "cn-block.py"            # 仓库里的 cn-block.py（每次尽量拉最新）
 ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.py
 ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（去广告 DNS·AdGuard Home）
+MEDIA_LOCAL    = BGP_DIR + "/media-stack.py"     # 本地缓存的 media-stack.py
+MEDIA_URL      = _RAW + "media-stack.py"         # 仓库里的 media-stack.py（自建 Emby·网盘直链）
 SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid" # AdGuard ClientID（DoH 地址末段；填进「允许的客户端」即可只放行自己）
 GHRELAY_OFF    = BGP_DIR + "/ghrelay.off"        # 开关：规则/图标走本机 GitHub 中转（默认开；存在此文件=用户手动关了）
@@ -3031,6 +3033,18 @@ def adguard_menu():
         print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
     subprocess.run(f"python3 {ADGUARD_LOCAL}", shell=True)
 
+def media_stack_menu():
+    """打开独立的 media-stack.py（自建 Emby·网盘直链媒体服务器）。
+
+    它是完全独立的一个文件：只【读】本脚本的 state.json（拿域名）和 nginx 的
+    内部 https 端口，只【写】/etc/nginx/conf.d/media-stack.conf 和它自己的安装
+    目录，绝不碰 nginx.conf / bgpeer.conf / bgpeer-stream.conf。写 nginx 前会先
+    nginx -t，不过就自动还原 —— 不会因为装媒体服务把节点搞坏。
+    """
+    if not ensure_remote_script(MEDIA_URL, MEDIA_LOCAL):
+        print("拉取 media-stack.py 失败，且本地无缓存。请检查网络。"); return
+    subprocess.run(f"python3 {MEDIA_LOCAL}", shell=True)
+
 def _ghrelay_regen():
     """重新生成三格式订阅 + 重写托管服务（含中转/新 token）。"""
     G["host"] = _host(); ensure_deps()
@@ -4328,6 +4342,7 @@ def main_menu():
         print("  15. 更新脚本（不影响节点）")
         print("  16. 更新核心（sing-box / xray）")
         print("  17. 卸载")
+        print("  18. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -4351,6 +4366,7 @@ def main_menu():
         elif c == "15":  update_script()
         elif c == "16":  update_cores()
         elif c == "17":  uninstall_all()
+        elif c == "18":  media_stack_menu()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
