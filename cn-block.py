@@ -589,8 +589,14 @@ def custom_allow_menu():
         print(f"\n  {Y}域名按后缀匹配{N}：填 example.com，它和它的所有子域都放行")
         print("  1 添加（可一次多个，逗号分隔）   2 删除   0 返回")
         c = _ask("  选择: ").strip()
+        # 直接在这里贴域名/IP 也认。上面写着「1 添加（可一次多个，逗号分隔）」，
+        # 紧接着就是「选择」，很容易让人以为在这儿直接输 —— 实际使用中就是这么
+        # 填了一次、看到「还没添加」以为功能坏了。与其让他白填，不如认下来。
+        pre = ""
+        if c not in ("", "0", "1", "2") and re.search(r"[.:]", c):
+            pre, c = c, "1"
         if c == "1":
-            s = _ask("  输入域名或IP(可逗号分隔，如 baidu.com,1.2.3.4,10.0.0.0/8): ").strip()
+            s = pre or _ask("  输入域名或IP(可逗号分隔，如 baidu.com,1.2.3.4,10.0.0.0/8): ").strip()
             if not s:
                 continue
             added = 0
