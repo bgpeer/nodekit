@@ -99,8 +99,34 @@ sudo python3 /tmp/xy.py
   15. 更新脚本（不影响节点）
   16. 更新核心（sing-box / xray）
   17. 卸载
+  18. 自建Emby（网盘直链媒体服务器·不影响节点）
   0. 退出
 ```
+
+> **`18 自建Emby`**：在这台机器上再跑一套**网盘直链媒体服务器**——
+> **Emby + OpenList + AutoFilm + MediaWarp**。网盘（夸克等）挂进 OpenList，
+> AutoFilm 定时把里面的影片生成 `.strm` 文本挂进 Emby 媒体库，播放时 MediaWarp
+> 拦截请求并 **302 重定向到网盘直链**，视频流直接从客户端到网盘、**不经过你的 VPS 带宽**。
+> 本地只落地几 KB 的 strm，小盘机也能开大媒体库。
+>
+> **和节点的关系**：`media-stack.py` 是独立文件，只**读**节点的域名（`state.json`）、
+> nginx 内部 https 端口和 acme 证书状态；只**写**它自己的 `/etc/nginx/conf.d/media-stack.conf`
+> 和安装目录，**绝不碰** `nginx.conf` / `bgpeer.conf` / `bgpeer-stream.conf`。
+> 写 nginx 前先 `nginx -t`，不过就自动还原备份——不会因为装媒体服务把节点搞坏。
+> 节点开了 SNI 分流也没关系：分流表的 `default` 已经兜到内部 8443，媒体子域名自动落进去，
+> **不需要改节点的任何配置**。
+>
+> **端口**：不占 80/443。Emby 的 8096 会被收进 `127.0.0.1`（直连它会绕过 302 拦截，
+> 退化成服务器中转），对外只走 MediaWarp。
+>
+> 装完敲 **`emby`** 甩出面板地址，敲 **`media-stack`** 看全部地址和密码，
+> `media-stack 302` 可验证直链是否真的生效。卸载：`python3 /etc/bgpeer/media-stack.py uninstall`。
+>
+> ⚠️ **夸克必须用 `QuarkTV` 驱动**才支持 302；普通 `Quark` 驱动因限速只能本机中转，
+> 那样流量仍然全走你的 VPS，等于没做直链。
+>
+> ⚠️ **不能转码**：文件在网盘上，Emby 拿不到本地文件，只能原盘直出，
+> 客户端不支持的编码就播不了（换 Infuse / VidHub 比换服务器管用）。
 
 > **`14 GitHub中转`**：订阅里的**规则集/图标链接**默认用第三方 `gh-proxy.com` 中转（国内直连 GitHub 常被墙）。
 > 本项把它换成**本机自建中转**——用你自己的域名 `https://本机域名:订阅端口/<token>/gh/...`，不再依赖别人的服务。
