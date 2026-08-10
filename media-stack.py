@@ -207,21 +207,27 @@ def acme_has_cf_creds():
 
 
 # ============================================================================ .env 读写
-def read_env(path, key):
-    try:
-        with open(path) as f:
-            for line in f:
-                if line.startswith(key + "="):
-                    return line.split("=", 1)[1].strip()
-    except OSError:
-        pass
+def read_env(path, key, fallback=""):
+    """先读 path，没有就读 fallback（老版本把密码写在 .env 里，要能迁移过来）。"""
+    for p in (path, fallback):
+        if not p:
+            continue
+        try:
+            with open(p) as f:
+                for line in f:
+                    if line.startswith(key + "="):
+                        v = line.split("=", 1)[1].strip()
+                        if v:
+                            return v
+        except OSError:
+            continue
     return ""
 
 
-def keep_or_new(path, key, n=16):
+def keep_or_new(path, key, n=16, fallback=""):
     """脚本是幂等的、也鼓励重跑（补 API Key、改配置），但重跑时把已经在用的
        密码冲掉很坑：用户手上记的、浏览器存的全失效，而且他未必意识到密码变了。"""
-    return read_env(path, key) or rand_pw(n)
+    return read_env(path, key, fallback) or rand_pw(n)
 
 
 # ============================================================================ Docker
@@ -581,7 +587,10 @@ def apply_nginx_site(cfg):
 def write_htpasswd(user, password):
     """生成 APR1 哈希的密码文件。用 openssl 而不是 htpasswd，
        免得为此去装 apache2-utils。"""
-    r = sh(f"openssl passwd -apr1 {subprocess.list2cmdline([password])}")
+    # 不走 shell:密码可能含 $ " ! 等字符,拼进 shell 字符串会被二次解释。
+    # 直接传参数列表,内核 execve 原样送达,没有任何解析环节。
+    r = subprocess.run(["openssl", "passwd", "-apr1", password],
+                       text=True, capture_output=True)
     if r.returncode != 0 or not r.stdout.strip():
         return False
     with open(HTPASSWD_FILE, "w") as f:
@@ -848,10 +857,13 @@ def main():
     hr()
 
     env_file = os.path.join(cfg["install_dir"], ".env")
+    # 密码单独放,不进 .env —— docker compose 读 .env 时会做变量插值,
+    # 密码里出现 $ 会被当成变量引用,轻则告警重则报 invalid interpolation
+    secret_file = os.path.join(cfg["install_dir"], ".secrets")
     cfg["ol_user"] = "admin"
-    cfg["ol_pass"] = keep_or_new(env_file, "OPENLIST_PASS")
-    cfg["ba_user"] = "media"
-    cfg["ba_pass"] = read_env(env_file, "BA_PASS")
+    cfg["ol_pass"] = keep_or_new(secret_file, "OPENLIST_PASS", fallback=env_file)
+    cfg["ba_user"] = read_env(secret_file, "BA_USER", fallback=env_file) or "media"
+    cfg["ba_pass"] = read_env(secret_file, "BA_PASS", fallback=env_file)
     cfg["basic_auth"] = False
     cfg["host_ip"] = public_ip()
 
@@ -886,8 +898,15 @@ def main():
             print()
             warn("Homepage 和 OpenList 挂上公网后，知道域名的人就能打开。")
             cfg["basic_auth"] = ask_yn("给它们加一道统一密码（Emby 除外，它自带账号）？", True)
-            if cfg["basic_auth"] and not cfg["ba_pass"]:
-                cfg["ba_pass"] = rand_pw(16)
+            if cfg["basic_auth"]:
+                cfg["ba_user"] = ask("登录用户名", cfg["ba_user"])
+                print(f"  {DIM}密码留空=自动生成随机的（更安全）；想自己定就直接输。{RST}")
+                typed = ask("登录密码（留空则随机生成）", "")
+                # 优先级：这次手填的 > 上次存下来的 > 新随机生成的
+                if typed:
+                    cfg["ba_pass"] = typed
+                elif not cfg["ba_pass"]:
+                    cfg["ba_pass"] = rand_pw(16)
         hr()
 
     # ---- 建目录 ----
@@ -910,11 +929,16 @@ PGID={cfg['pgid']}
 TZ={cfg['tz']}
 DATA_ROOT={cfg['data_root']}
 DOMAIN={cfg['domain']}
-# ↓ 密码存这里是为了重跑时能沿用，不要手改
-OPENLIST_PASS={cfg['ol_pass']}
-BA_PASS={cfg['ba_pass']}
 """)
     os.chmod(env_file, 0o600)
+
+    # 密码写进独立的 .secrets（不给 docker compose 读），重跑时靠它沿用
+    with open(secret_file, "w") as f:
+        f.write("# 由 media-stack.py 生成，供重跑时沿用已有密码。别手改。\n"
+                f"OPENLIST_PASS={cfg['ol_pass']}\n"
+                f"BA_USER={cfg['ba_user']}\n"
+                f"BA_PASS={cfg['ba_pass']}\n")
+    os.chmod(secret_file, 0o600)
 
     with open(os.path.join(cfg["install_dir"], "docker-compose.yml"), "w") as f:
         f.write(gen_compose(cfg))
@@ -951,8 +975,9 @@ BA_PASS={cfg['ba_pass']}
     info("为 OpenList 设置管理员密码...")
     done = False
     for _ in range(20):
-        if sh(f"docker exec openlist ./openlist admin set "
-              f"{subprocess.list2cmdline([cfg['ol_pass']])}").returncode == 0:
+        if subprocess.run(["docker", "exec", "openlist", "./openlist",
+                           "admin", "set", cfg["ol_pass"]],
+                          capture_output=True).returncode == 0:
             done = True
             break
         time.sleep(3)
