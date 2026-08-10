@@ -554,9 +554,13 @@ def gen_nginx_site(cfg):
     for sub, port, container, _label in SUBDOMAINS:
         if sub == "home" and not cfg["homepage"]:
             continue
-        # Emby 不加 Basic Auth：它自带账号体系，而且 Emby 的 App 客户端
-        # 处理不了 Basic Auth，套上去 App 会直接连不上。
-        a = "" if sub == "emby" else auth_block
+        # 自带账号体系的服务不加 Basic Auth：
+        #   emby —— 有自己的用户系统，而且 App 客户端处理不了 Basic Auth，套上去连不上
+        #   list —— OpenList 有 admin 账号，再套一层就变成连输两次不同的密码，
+        #            实际使用中反复被这个绊住：弹框过了，又对着 OpenList 的登录页
+        #            输弹框那对账号，然后以为"登不进去"。徒增困惑，安全上也没多拿到什么。
+        # 只有 Homepage 是真的零认证，谁打开都能看到全部服务地址，那层必须保留。
+        a = "" if sub in ("emby", "list") else auth_block
         out.append(f"""
 server {{
 {listen_line}
@@ -766,12 +770,12 @@ def build_summary(cfg, colored=True):
              "  " + "-" * 58]
     if cfg["basic_auth"]:
         lines += [
-            "  " + c(YELLOW + BOLD, "第一层 · 浏览器弹框") + c(DIM, "（除 Emby 外所有服务共用这一个）"),
+            "  " + c(YELLOW + BOLD, "浏览器弹框") + c(DIM, "（只有首页入口会弹，它没有自己的账号）"),
             "      用户名  " + c(CYAN + BOLD, cfg["ba_user"]),
             "      密  码  " + c(CYAN + BOLD, cfg["ba_pass"]),
-            "      " + c(DIM, "打开任意地址会先弹这个框，过了才看得到网页。"),
+            "      " + c(DIM, "打开首页入口时会弹，输它。"),
             "  " + "-" * 58,
-            "  " + c(GREEN + BOLD, "第二层 · 各服务自己的账号") + c(DIM, "（弹框之后，在网页里登录）"),
+            "  " + c(GREEN + BOLD, "各服务自己的账号"),
         ]
     lines.append("  " + pad("服务", 14) + pad("访问地址", 36) + "账号/密码")
     lines.append("  " + "-" * 58)
@@ -791,7 +795,7 @@ def build_summary(cfg, colored=True):
 
     lines.append("  " + "-" * 58)
     if cfg["basic_auth"]:
-        lines.append("  " + c(DIM, "Emby 不走弹框（自带账号，且 App 客户端处理不了 Basic Auth）。"))
+        lines.append("  " + c(DIM, "Emby 和 OpenList 不弹框，直接用它们自己的账号登录。"))
         lines.append("  " + "-" * 58)
     lines.append(f"  安装目录：{cfg['install_dir']}    媒体目录：{cfg['data_root']}")
     return "\n".join(lines)
@@ -829,13 +833,12 @@ def show_info():
         print(f"      {DIM}首页入口就是导航面板，所有服务都能从那里点进去。{RST}")
 
     if ba_pass:
-        print(f"\n  {YELLOW}{BOLD}▸ 第一层 · 浏览器弹框{RST}{DIM}（除 Emby 外所有服务共用）{RST}")
+        print(f"\n  {YELLOW}{BOLD}▸ 浏览器弹框{RST}{DIM}（只有首页入口会弹）{RST}")
         print(f"      用户名   {CYAN}{BOLD}{ba_user}{RST}")
         print(f"      密  码   {CYAN}{BOLD}{ba_pass}{RST}")
-        print(f"      {DIM}打开任意地址会先弹这个框，过了才看得到网页。{RST}")
+        print(f"      {DIM}打开首页入口时会弹，输它。{RST}")
 
-    print(f"\n  {GREEN}{BOLD}▸ 第二层 · 各服务自己的账号{RST}"
-          f"{DIM}（弹框之后，在网页里登录）{RST}")
+    print(f"\n  {GREEN}{BOLD}▸ 各服务自己的账号{RST}")
     print(f"      Emby       {DIM}首次打开自己设；不走弹框（App 客户端处理不了 Basic Auth）{RST}")
     print(f"      OpenList   {CYAN}{BOLD}admin{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
 
@@ -1039,8 +1042,8 @@ def main():
                     cfg["crt"] = ask("证书 fullchain 路径", cfg["crt"])
                     cfg["key"] = ask("证书私钥路径", cfg["key"])
             print()
-            warn("Homepage 和 OpenList 挂上公网后，知道域名的人就能打开。")
-            cfg["basic_auth"] = ask_yn("给它们加一道统一密码（Emby 除外，它自带账号）？", True)
+            warn("Homepage 是零认证的，挂上公网后知道域名的人就能看到你全部服务地址。")
+            cfg["basic_auth"] = ask_yn("给它加一道密码？（Emby / OpenList 有自己的账号，不套）", True)
             if cfg["basic_auth"]:
                 cfg["ba_user"] = ask("登录用户名", cfg["ba_user"])
                 print(f"  {DIM}密码留空=自动生成随机的（更安全）；想自己定就直接输。{RST}")
@@ -1303,7 +1306,7 @@ def patch_credentials_file(install_dir, user, password):
 
 
 def set_web_credentials():
-    """改「第一层」的浏览器弹框账号密码（除 Emby 外所有服务共用那个）。"""
+    """改浏览器弹框那层的账号密码（首页入口用的那个）。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
@@ -1322,7 +1325,7 @@ def set_web_credentials():
     print()
     print(f"  当前用户名：{CYAN}{BOLD}{cur_user}{RST}")
     print(f"  当前密码　：{CYAN}{BOLD}{cur_pass}{RST}")
-    print(f"  {DIM}这是浏览器弹框那一层，除 Emby 外所有服务共用。{RST}")
+    print(f"  {DIM}这是首页入口的弹框；Emby / OpenList 用它们自己的账号，不受影响。{RST}")
     if not ask_yn("要修改吗？", False):
         print("保持不变。")
         return
