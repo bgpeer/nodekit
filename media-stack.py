@@ -97,8 +97,12 @@ def ask(prompt, default=""):
 
 
 def ask_yn(prompt, default=True):
-    hint = "Y/n" if default else "y/N"
-    v = ask(f"{prompt} [{hint}]", "Y" if default else "N")
+    # 不把默认值当 ask 的 default 传进去 —— 那样会显示成
+    # 「问题？ [Y/n] [Y]:」，同一个提示叠两遍，看着像要填别的东西。
+    # 这里只给 [Y/n] 一个提示，空输入在下面自己兜。
+    v = ask(f"{prompt} [{'Y/n' if default else 'y/N'}]")
+    if not v:
+        return default
     return v.lower().startswith("y")
 
 
