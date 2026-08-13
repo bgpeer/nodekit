@@ -34,12 +34,30 @@ jobs:
 
       - name: Compute version (auto-bump patch, honor manual bump)
         id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           file_ver=$(grep -Po '^SCRIPT_VERSION\s*=\s*"\K[^"]+' xy-installer.py)
           latest_tag=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
           latest_ver=${latest_tag#v}
           echo "file=$file_ver latest_tag=${latest_tag:-none}"
+
+          # 最新的 tag 在、Release 却不在：api.github.com 偶发 5xx 会留下这种半截状态
+          # （tag ref 先建好，创建 Release 的那一步才失败）。要把它补完，而不是当成
+          # "已发布"再往上涨一个号 —— 否则那个版本永远补不上，而且每失败一次就白扔
+          # 一个版本号。这里不回写文件、不重新打 tag，只补建 Release。
+          if [ -n "$latest_tag" ] && ! gh release view "$latest_tag" >/dev/null 2>&1; then
+            echo "Tag $latest_tag has no release, completing it instead of bumping."
+            {
+              echo "skip=false"
+              echo "new_ver=$latest_ver"
+              echo "bump=false"
+              echo "file_ver=$file_ver"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [ -z "$latest_tag" ]; then
             # 第一次发布：直接用文件里的版本号
             new_ver="$file_ver"; bump=false
@@ -94,17 +112,35 @@ jobs:
           # 若上一步回写了版本号，要把 tag 打在回写后的那个提交上
           git fetch origin main
           target="$(git rev-parse origin/main)"
-          prev_tag="$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)"
+          # 排掉正要发的这个版本自己：补建半截 Release 时，最新的 tag 就是它，
+          # 不排掉的话更新说明的区间变成 vX..vX，永远是空的
+          prev_tag="$(git tag -l 'v[0-9]*' --sort=-v:refname | grep -vx "v$new_ver" | head -1)"
           # 更新说明：直接从提交主题生成——这样不管是 PR 合并（squash 后主题即 PR 标题）
           # 还是直接在网页改文件提交，都能列出来，不再出现空说明。过滤掉发版/校验和这类
           # 自动提交。取不到上一个 tag（首发）则退回 GitHub 自动生成。
-          if [ -n "$prev_tag" ]; then
-            notes="$(git log --no-merges --pretty='- %s' "$prev_tag..$target" \
-                     | grep -vE '^- (chore\(release\):|chore: auto-update SHA256SUMS)' || true)"
-            [ -z "$notes" ] && notes="- 维护性更新"
-            body="$(printf '## 更新内容\n\n%s\n\n**Full Changelog**: https://github.com/bgpeer/nodekit/compare/%s...v%s\n' \
-                    "$notes" "$prev_tag" "$new_ver")"
-            gh release create "v$new_ver" --target "$target" --title "v$new_ver" --notes "$body"
-          else
-            gh release create "v$new_ver" --target "$target" --title "v$new_ver" --generate-notes
-          fi
+          create() {
+            if [ -n "$prev_tag" ]; then
+              notes="$(git log --no-merges --pretty='- %s' "$prev_tag..$target" \
+                       | grep -vE '^- (chore\(release\):|chore: auto-update SHA256SUMS)' || true)"
+              [ -z "$notes" ] && notes="- 维护性更新"
+              body="$(printf '## 更新内容\n\n%s\n\n**Full Changelog**: https://github.com/bgpeer/nodekit/compare/%s...v%s\n' \
+                      "$notes" "$prev_tag" "$new_ver")"
+              gh release create "v$new_ver" --target "$target" --title "v$new_ver" --notes "$body"
+            else
+              gh release create "v$new_ver" --target "$target" --title "v$new_ver" --generate-notes
+            fi
+          }
+
+          # api.github.com 会偶发 5xx（这条流水线就被 502 打断过一次，留下了一个
+          # 有 tag 没 Release 的版本）。重试几轮；每轮失败后先确认是不是其实已经
+          # 建成了 —— 502 可能是在服务端建好之后才返回的。
+          for i in 1 2 3 4 5; do
+            if create; then
+              echo "Release v$new_ver created."; exit 0
+            fi
+            if gh release view "v$new_ver" >/dev/null 2>&1; then
+              echo "Release v$new_ver exists after all (server-side succeeded)."; exit 0
+            fi
+            echo "gh release create failed, retry=${i}"; sleep $((i * 5))
+          done
+          echo "Failed to create release after retries."; exit 1
