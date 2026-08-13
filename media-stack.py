@@ -797,7 +797,10 @@ case "${1:-info}" in
     sed -i 's|cron: ".*"|cron: "0 * * * * *"|' "$CFG"
     TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     docker restart autofilm >/dev/null 2>&1 || { echo "autofilm 没在运行"; exit 1; }
-    echo "${b}已临时改成每分钟跑一次,最多等 60 秒开始。跑完自动还原。${r}"
+    echo "${b}已临时改成每分钟跑一次,最多等 60 秒开始。${r}"
+    echo "${y}跑完会自己退出并还原定时设置 —— 中途别按 Ctrl-C,那会把任务掐断,"
+    echo "strm 只生成一半,Emby 里就会报「找不到目录」。${r}"
+    echo "${b}等到出现「Alist2Strm 任务完成」那一行为止,中间安静一阵是正常的。${r}"
     echo
 
     docker logs -f --since "$TS" autofilm 2>&1 &
