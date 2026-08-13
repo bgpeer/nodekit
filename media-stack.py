@@ -517,6 +517,14 @@ layout:
     style: row
     columns: 3
 """
+    # 健康检查要打「实际在监听的那个容器:端口」，不是卡片名字对应的容器。
+    # Emby 的对外入口是 MediaWarp（9000），Emby 自己在 8096 —— 早先这里拼成了
+    # emby:9000，那个端口上什么都没有，卡片就一直显示错误码。
+    monitor = {
+        "emby":     f"http://mediawarp:{MEDIAWARP_PORT}",
+        "openlist": f"http://openlist:{OPENLIST_PORT}",
+        "homepage": "http://homepage:3000",
+    }
     services = ["- 媒体:"]
     for sub, port, container, label in SUBDOMAINS:
         if sub == "home":
@@ -526,7 +534,7 @@ layout:
         icon: {icon}
         href: {url_for(sub, port)}
         description: {'影视播放' if container == 'emby' else '网盘挂载'}
-        siteMonitor: http://{container}:{9000 if container == 'emby' else 5244}""")
+        siteMonitor: {monitor.get(container, f'http://{container}:{port}')}""")
     widgets = """- resources:
     cpu: true
     memory: true
