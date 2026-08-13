@@ -520,8 +520,12 @@ layout:
     # 健康检查要打「实际在监听的那个容器:端口」，不是卡片名字对应的容器。
     # Emby 的对外入口是 MediaWarp（9000），Emby 自己在 8096 —— 早先这里拼成了
     # emby:9000，那个端口上什么都没有，卡片就一直显示错误码。
+    # 打专门的健康检查端点，别打根路径：Emby 的 / 会 302 跳到 /web/index.html，
+    # MediaWarp 原样透传，Homepage 收到跳转就把卡片标成异常（显示 RESPONSE）。
+    # /System/Info/Public 是 Emby 的公开信息接口，不需要认证、稳定返回 200 JSON。
     monitor = {
-        "emby":     f"http://mediawarp:{MEDIAWARP_PORT}",
+        "emby":     f"http://mediawarp:{MEDIAWARP_PORT}/System/Info/Public",
+        # OpenList 打根路径就正常返回 200，别改成 /ping —— 现在是好的，不动它
         "openlist": f"http://openlist:{OPENLIST_PORT}",
         "homepage": "http://homepage:3000",
     }
@@ -539,6 +543,9 @@ layout:
     cpu: true
     memory: true
     disk: /
+- search:
+    provider: duckduckgo
+    target: _blank
 """
     return settings, "\n".join(services) + "\n", widgets
 
