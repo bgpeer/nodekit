@@ -1097,8 +1097,11 @@ def xr_reality_xhttp(port, tag):
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid}], "decryption": "none"},
           "streamSettings": st}
+    # host 显式带上、并与 sni 保持一致：mihomo 留空时会回退到 servername，结果一样，
+    # 但写出来就不依赖客户端的回退实现，换客户端/版本也不会变。
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=reality"
-          f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp&path={path}#{tag}")
+          f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp"
+          f"&host={G['sni']}&path={path}#{tag}")
     return ib, lk
 
 def _xr_tls(certfile, keyfile):
@@ -1241,14 +1244,16 @@ def link_to_proxy(u):
             if mlkem_ok():
                 d["reality-opts"]["support-x25519mlkem768"] = "true"
             if net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
-            elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}  # xray 专属
+            # xhttp 的 host 显式写出：mihomo 留空会回退到 servername(结果相同)，
+            # 但别的客户端未必这么回退，写死更稳。xray 专属传输。
+            elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/"), "host": qs.get("host") or qs.get("sni") or host}
             else: d["network"] = "tcp"
         else:
             if insec: d["skip-cert-verify"] = "true"
             if net == "ws": d["network"] = "ws"; d["ws-opts"] = {"path": qs.get("path", "/"), "headers": {"Host": qs.get("host", host)}}
             elif net == "httpupgrade": d["network"] = "ws"; d["ws-opts"] = {"path": qs.get("path", "/"), "headers": {"Host": qs.get("host", host)}, "v2ray-http-upgrade": "true"}
             elif net == "grpc": d["network"] = "grpc"; d["grpc-opts"] = {"grpc-service-name": qs.get("serviceName") or qs.get("path", "")}
-            elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/")}
+            elif net == "xhttp": d["network"] = "xhttp"; d["xhttp-opts"] = {"path": qs.get("path", "/"), "host": qs.get("host") or qs.get("sni") or host}
             else: d["network"] = "tcp"
             if qs.get("smux") == "1" and d.get("network") == "ws": d["smux"] = _SMUX
         return d
