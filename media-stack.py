@@ -393,11 +393,17 @@ def gen_compose(cfg):
 def gen_autofilm_conf(cfg):
     """AutoFilm：定时遍历 OpenList，把网盘里的视频写成 .strm 文本文件。
 
-    mode 必须是 AlistURL 而不是 RawURL：RawURL 会把网盘的临时直链写死进 strm，
-    而夸克这类直链只有几小时有效期，过期后整个媒体库集体播放失败。
-    AlistURL 存的是 OpenList 的永久路径，播放时才由 MediaWarp 实时换取新鲜直链。
+    mode 三个取值里必须选 AlistPath：
+      · RawURL   —— 把网盘的临时直链写死进 strm。夸克这类直链几小时就过期，
+                    过期后整个媒体库集体播放失败。
+      · AlistURL —— 写完整的 OpenList 下载地址(http://openlist:5244/d/...?sign=)。
+                    看着合理，但 MediaWarp 的 alist_strm 是把 strm 内容当【路径】
+                    去调 OpenList API 的，拿到整条 URL 就会拼成
+                    /http:/openlist:5244/d/... 然后报 storage not found，
+                    302 失败、回退成 Emby 自己拉流 —— 视频全程经过本机带宽。
+      · AlistPath —— 只写 OpenList 上的路径，正是 MediaWarp 要的形态。
     """
-    return f"""# 由 media-stack.py 自动生成。改完执行 docker restart autofilm 生效。
+    return f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
 alist:
   - id: openlist
     base_url: http://openlist:5244
@@ -414,7 +420,7 @@ alist2strm_tasks:
     alist: openlist
     source_dir: {cfg['cloud_mount']}
     target_dir: {STRM_PATH}
-    mode: AlistURL          # 见上方注释，网盘场景不要改成 RawURL
+    mode: AlistPath         # 见上方注释，必须是 AlistPath，另外两个都会让 302 失效
     flatten_mode: false
     overwrite: false
     concurrency: 5          # 网盘限流，并发别开太高
@@ -437,7 +443,7 @@ alist2strm_tasks:
 
 def gen_mediawarp_conf(cfg):
     """MediaWarp：反代在 Emby 前面，拦截播放请求并 302 到网盘直链。"""
-    return f"""# 由 media-stack.py 自动生成。改完执行 docker restart mediawarp 生效。
+    return f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
 port: 9000
 
 server:
@@ -486,10 +492,11 @@ http_strm:
 alist_strm:
   enable: true
   proxy: true
-  # raw_url: false 表示 302 到 OpenList，再由 OpenList 跳到网盘（两跳），
-  # 兼容性最好。想少一跳可改 true 让 MediaWarp 直接拿网盘直链，
-  # 但网盘对请求头较敏感，改之前先确认能正常播放。
-  raw_url: false
+  # 必须是 true。false 的话 MediaWarp 会拿下面的 addr 拼重定向地址，把播放器
+  # 302 到 http://openlist:5244/d/... —— 那是容器内部地址，手机/电视根本连不上。
+  # true 表示 MediaWarp 自己调 OpenList API 换出网盘直链，直接把播放器 302 过去，
+  # 视频流从网盘直达播放器，完全不经过本机带宽 —— 这正是这套东西存在的意义。
+  raw_url: true
   list:
     - addr: http://openlist:5244
       username: {cfg['ol_user']}
@@ -987,6 +994,23 @@ def show_info():
     print()
 
 
+def read_yaml_scalar(path, key, fallback=""):
+    """从脚本自己生成的 yaml 里读一个标量值。
+
+    故意不引 PyYAML —— 这脚本要能在只有 python3 标准库的裸机上跑。
+    只认「key: value」这一种形态，读的又都是自己写出去的文件，够用。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                m = re.match(rf"^\s*{re.escape(key)}:\s*(.*)$", ln.split("#", 1)[0].rstrip())
+                if m:
+                    return m.group(1).strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return fallback
+
+
 def rebuild_cfg_from_disk(d):
     """从落盘状态重建一份最小 cfg，够重新生成 nginx 站点和 Homepage 配置用。
 
@@ -1007,6 +1031,13 @@ def rebuild_cfg_from_disk(d):
         "homepage": os.path.isdir(os.path.join(d, "homepage", "config")),
         "host_ip":  "",     # 只有无域名模式才用得上，下面按需取
     }
+    # 这三个是装的时候用户填的，脚本没有别的地方存 —— 从上次生成的配置里读回来，
+    # 「更新」才能重新生成 autofilm / mediawarp 的配置而不丢用户的输入。
+    af = os.path.join(d, "autofilm", "config", "config.yaml")
+    mw = os.path.join(d, "mediawarp", "config", "config.yaml")
+    cfg["emby_api_key"] = read_yaml_scalar(mw, "auth")
+    cfg["cloud_mount"]  = read_yaml_scalar(af, "source_dir", "/quark")
+    cfg["strm_cron"]    = read_yaml_scalar(af, "cron", "0 0 5 * * *")
     cfg["has_domain"] = bool(cfg["domain"]) and have("nginx")
     cfg["basic_auth"] = bool(cfg["ba_pass"]) and os.path.exists(HTPASSWD_FILE)
     cfg["ngx_port"] = detect_nginx_https_port()
@@ -1090,10 +1121,31 @@ def do_update():
             sh("docker image prune -f", timeout=300)
 
     # 再把脚本生成的那几份配置按当前版本重刷一遍。
-    # 只重刷「纯脚本产物」：nginx 站点、Homepage 导航。
-    # mediawarp / autofilm 的配置里有 API Key、挂载路径、cron 这些用户填的东西，
-    # 也可能被手改过，这里一律不碰 —— 更新不该悄悄覆盖用户的输入。
+    #
+    # mediawarp / autofilm 的配置以前是不碰的,理由是"里面有用户填的东西"。
+    # 那个理由站不住:用户填的就三样(Emby API Key、网盘挂载路径、cron),
+    # 全都能从上次生成的文件里读回来。代价却是配置层面的 bug 永远修不到已装的
+    # 机器上 —— strm 的 mode 填错、raw_url 填错,都是改完仓库、用户更新完
+    # 依旧原样。所以改成:读回用户的三个值,然后整份重新生成。
     cfg = rebuild_cfg_from_disk(d)
+    mw_cfg = os.path.join(d, "mediawarp", "config", "config.yaml")
+    af_cfg = os.path.join(d, "autofilm", "config", "config.yaml")
+    for path, gen, svc in ((mw_cfg, gen_mediawarp_conf, "mediawarp"),
+                           (af_cfg, gen_autofilm_conf, "autofilm")):
+        if not os.path.exists(path):
+            continue
+        info(f"按当前版本重新生成 {svc} 配置...")
+        with open(path, "w") as f:
+            f.write(gen(cfg))
+        subprocess.run(["docker", "restart", svc], capture_output=True)
+    if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
+        warn("MediaWarp 的 Emby API Key 是空的，302 直链不会生效。")
+        warn("用「3 后补参数 → 添加 API 密钥」补上。")
+
+    # CLI 也要跟着换:它是脚本生成的,里面的命令逻辑会随版本变
+    # (比如 strm 从"只重启容器"改成"真的跑一次任务")。不重装一遍就拿不到。
+    install_cli(d)
+
     if cfg["homepage"]:
         info("刷新 Homepage 导航配置...")
         hp = os.path.join(d, "homepage", "config")
