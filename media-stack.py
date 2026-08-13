@@ -772,8 +772,8 @@ case "${1:-info}" in
     if [[ -f "$S" ]]; then python3 "$S" update; else dc pull && dc up -d; fi ;;
   strm)
     # AutoFilm v2 没有手动触发的入口:./autofilm --help 只有 --config/--log/--timezone
-    # 这些开关,启动时也只注册 cron、不跑任务。所以这里临时把 cron 改成每分钟,
-    # 跑完一轮立刻还原 —— 不能让它一直每分钟去撸网盘,夸克那边风控很严。
+    # 这些开关,启动时也只注册 cron、不跑任务。所以这里临时把 cron 改成
+    # "两分钟后的那一分钟"、只触发一次,跑完立刻还原成用户原来的定时设置。
     CFG="${D}/autofilm/config/config.yaml"
     [[ -f "$CFG" ]] || { echo "找不到 ${CFG}"; exit 1; }
     BAK="${CFG}.strmbak.$$"
@@ -794,10 +794,25 @@ case "${1:-info}" in
     trap 'exit 130' INT TERM
     trap restore EXIT
 
-    sed -i 's|cron: ".*"|cron: "0 * * * * *"|' "$CFG"
+    # 定成"每分钟"是错的:一轮跑不完下一轮就压上来,几轮任务并发扫同一个目录、
+    # 互相删对方刚写出去的 strm(实测跨境网络慢时一轮要 121 秒,同时跑了三轮,
+    # 最后 io error: No such file or directory)。改成【指定时刻只触发一次】。
+    # 时刻要按 autofilm 容器自己的时区算 —— 调度器用的是容器里的本地时间,
+    # 拿宿主机的时间去填,时区一差就永远等不到。
+    CT="$(docker exec autofilm date +'%H %M' 2>/dev/null)"
+    if [[ -z "$CT" ]]; then CT="$(date +'%H %M')"; fi
+    read -r CH CM <<<"$CT"
+    T=$(( (10#$CH * 60 + 10#$CM + 2) % 1440 ))     # +2 分钟,留足重启和对齐的余量
+    FH="$(printf '%02d' $((T / 60)))"; FM="$(printf '%02d' $((T % 60)))"
+    # 引号用变量带进去。这整段是 Python 的三引号字符串,在里面用反斜杠转义双引号
+    # 会被 Python 自己吃掉,落到 bash 里就是引号错乱的一行,sed 静默不替换 ——
+    # 而且不报错,只是 cron 没改成,人会以为是网盘慢。用变量就完全绕开这个坑。
+    q='"'
+    sed -i "s|cron: ${q}.*${q}|cron: ${q}0 $FM $FH * * *${q}|" "$CFG"
+
     TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     docker restart autofilm >/dev/null 2>&1 || { echo "autofilm 没在运行"; exit 1; }
-    echo "${b}已临时改成每分钟跑一次,最多等 60 秒开始。${r}"
+    echo "${b}已安排在 ${FH}:${FM}(容器时间)触发一次,最多等 2 分钟开始。${r}"
     echo "${y}跑完会自己退出并还原定时设置 —— 中途别按 Ctrl-C,那会把任务掐断,"
     echo "strm 只生成一半,Emby 里就会报「找不到目录」。${r}"
     echo "${b}等到出现「Alist2Strm 任务完成」那一行为止,中间安静一阵是正常的。${r}"
@@ -806,8 +821,10 @@ case "${1:-info}" in
     docker logs -f --since "$TS" autofilm 2>&1 &
     LP=$!
     # 轮询完成标记而不是死等日志:任务跑完后日志就安静了,
-    # 只跟着 docker logs 的话会一直挂在那里,得靠人去按 Ctrl-C
-    for _ in $(seq 1 90); do            # 4s x 90 ≈ 6 分钟封顶
+    # 只跟着 docker logs 的话会一直挂在那里,得靠人去按 Ctrl-C。
+    # 封顶给到 15 分钟:网盘慢的时候一轮真的能跑十几分钟,提前收工会让人
+    # 以为"又失败了",其实还在跑。
+    for _ in $(seq 1 225); do           # 4s x 225 = 15 分钟封顶
       sleep 4
       if docker logs --since "$TS" autofilm 2>&1 | grep -q "Alist2Strm 任务完成"; then
         sleep 1; break
