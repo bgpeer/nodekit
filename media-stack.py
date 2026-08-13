@@ -25,8 +25,12 @@ import string
 import subprocess
 import sys
 import time
+import urllib.request
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
+
+# 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
+SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
 
 # ---- 节点（xy-installer.py）的落盘状态，只读 ----
 BGP_DIR    = "/etc/bgpeer"
@@ -753,7 +757,11 @@ case "${1:-info}" in
   restart) shift; dc restart "$@" && echo "已重启" ;;
   start|up)   dc up -d ;;
   stop|down)  dc down ;;
-  update)  dc pull && dc up -d && echo "已更新到最新镜像" ;;
+  update)
+    # 走脚本的更新流程，而不是只 pull 镜像 —— 两条路必须做同一件事，
+    # 否则从这里更新的人拿不到配置修复，只会以为"更新过了还是老样子"
+    S=/etc/bgpeer/media-stack.py
+    if [[ -f "$S" ]]; then python3 "$S" update; else dc pull && dc up -d; fi ;;
   strm)
     docker restart autofilm >/dev/null 2>&1 || { echo "autofilm 没在运行"; exit 1; }
     echo "已触发 strm 生成，Ctrl-C 可退出日志跟踪:"; docker logs -f --tail 50 autofilm ;;
@@ -923,29 +931,76 @@ def rebuild_cfg_from_disk(d):
     return cfg
 
 
+def self_update():
+    """把脚本自己换成仓库里的最新版；换过了返回 True，调用方应立刻 re-exec。
+
+    没有这一步，「更新」只是按【这台机器上现有的那份脚本】重新生成一遍配置 ——
+    仓库里修好的东西永远到不了机器上。之前 Homepage 的健康检查地址在仓库里改了
+    两轮，用户那边 services.yaml 却一字未变，就是卡在这里。
+
+    URL 上带时间戳绕开 CDN 缓存：raw.githubusercontent 和各家镜像都会缓存几分钟
+    到几小时，不绕开的话「刚推的修复」拉下来还是旧的，看起来就像改了没用。
+    """
+    me = os.path.realpath(__file__)
+    if not os.access(me, os.W_OK):
+        return False
+    try:
+        req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}",
+                                     headers={"User-Agent": "media-stack"})
+        body = urllib.request.urlopen(req, timeout=20).read().decode()
+    except Exception as e:
+        warn(f"拉取最新脚本失败（{e}）")
+        print(f"  {DIM}继续用本机这份 v{SCRIPT_VERSION} 刷新配置。{RST}")
+        return False
+    # 只接受长得像本脚本的内容，别把一页 404/限流提示写进去，那会直接废掉这个文件
+    if "SCRIPT_VERSION" not in body or len(body) < 10000:
+        warn("拉到的内容不像 media-stack.py，已忽略，继续用本机这份。")
+        return False
+    try:
+        if body == open(me, encoding="utf-8").read():
+            return False
+    except OSError:
+        return False
+    m = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', body)
+    tmp = me + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(body)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, me)          # 先写临时文件再原子替换，中途断网也不会留个半截脚本
+    ok(f"脚本已更新：v{SCRIPT_VERSION} → v{m.group(1) if m else '?'}，用新版继续...")
+    return True
+
+
 def do_update():
-    """更新：拉最新镜像 + 按当前脚本重新生成配置。用户数据和密码都不动。"""
+    """更新：脚本自身 + 镜像 + 按新脚本重新生成配置。用户数据和密码都不动。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
+
+    if self_update():
+        me = os.path.realpath(__file__)
+        os.execv(sys.executable, [sys.executable, me, "update"])
+
     compose = os.path.join(d, "docker-compose.yml")
     env_file = os.path.join(d, ".env")
 
+    # 镜像拉不动就跳过，不再 return —— 跨境网络本来就时好时坏，
+    # 而下面重刷配置才是修 bug 的那一步，不该被一次拉取失败连坐掉。
     info("拉取最新镜像...")
     r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} pull",
                        shell=True, timeout=1800)
     if r.returncode != 0:
-        err("拉取镜像失败，看上面的报错。")
-        return
-    info("用新镜像重启容器...")
-    r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
-                       shell=True, timeout=900)
-    if r.returncode != 0:
-        err("重启失败，看上面的报错。")
-        return
-    ok("镜像已更新")
-    sh("docker image prune -f", timeout=300)
+        warn("拉取镜像失败（网络问题居多），跳过换镜像，继续刷新配置。")
+    else:
+        info("用新镜像重启容器...")
+        r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
+                           shell=True, timeout=900)
+        if r.returncode != 0:
+            warn("用新镜像重启失败，看上面的报错；配置照常刷新。")
+        else:
+            ok("镜像已更新")
+            sh("docker image prune -f", timeout=300)
 
     # 再把脚本生成的那几份配置按当前版本重刷一遍。
     # 只重刷「纯脚本产物」：nginx 站点、Homepage 导航。
@@ -977,7 +1032,7 @@ def do_update():
         os.chmod(cred, 0o600)
 
     print()
-    ok("更新完成：镜像、nginx 站点、导航面板都已是当前版本")
+    ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
 
 
