@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import string
 import subprocess
 import sys
@@ -824,6 +825,34 @@ def build_summary(cfg, colored=True):
     return "\n".join(lines)
 
 
+def openlist_storages(d):
+    """读 OpenList 的库，把挂好的网盘和几个关键参数列出来。
+
+    只取挂载点、驱动、状态、根文件夹ID —— refresh_token / cookie 这些一概不碰，
+    「使用信息」这段输出是会被截图发出来的。库不在、表名对不上就静默返回空，
+    这只是锦上添花，不该让整个使用信息因为它报错。
+    """
+    db = os.path.join(d, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return []
+    try:
+        # 只读方式打开，绝不因为看一眼信息而动到 OpenList 正在用的库
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = con.execute("select mount_path, driver, status, addition "
+                           "from x_storages order by mount_path").fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for mp, drv, status, add in rows:
+        try:
+            root = str(json.loads(add).get("root_folder_id", ""))
+        except Exception:
+            root = ""
+        out.append((mp, drv, status, root))
+    return out
+
+
 # ============================================================================ 卸载
 def show_info():
     """使用信息：把怎么进、用什么账号密码，全部从落盘的配置里读出来打印。
@@ -880,6 +909,23 @@ def show_info():
     print(f"      凭据存档   {os.path.join(d, 'CREDENTIALS.txt')}")
     if os.path.exists(NGX_SITE):
         print(f"      nginx 站点 {NGX_SITE}")
+
+    stores = openlist_storages(d)
+    if stores:
+        print(f"\n  {BOLD}▸ 网盘挂载{RST}")
+        for mp, drv, status, root in stores:
+            col = GREEN if status == "work" else YELLOW
+            print(f"      {pad(mp, 14)}{pad(drv, 12)}{col}{status}{RST}"
+                  + (f"   {DIM}根文件夹ID={root}{RST}" if root else ""))
+        # 夸克要的是「文件夹 ID」，根目录是 0。填成 / 这种路径写法，夸克会回
+        # "必传参数不能为空"——表现极具迷惑性：存储状态是 work、二维码也扫过了，
+        # 但点进去目录是空的，AutoFilm 每晚跑完 strm_created_count 都是 0。
+        for mp, drv, _status, root in stores:
+            if drv.lower().startswith("quark") and (not root or "/" in root):
+                print()
+                warn(f"{mp} 的根文件夹ID 是 {root or '<空>'}，夸克认的是文件夹 ID 不是路径。")
+                warn("根目录要填 0，否则目录挂得上但是空的，strm 一个也不会生成。")
+                warn("改：OpenList 管理 → 存储 → 编辑 → 根文件夹ID 填 0 → 全部重新加载。")
 
     print(f"\n  {BOLD}▸ 容器状态{RST}")
     r = sh(f"docker compose -f {os.path.join(d, 'docker-compose.yml')} "
