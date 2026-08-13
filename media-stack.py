@@ -764,8 +764,49 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     if [[ -f "$S" ]]; then python3 "$S" update; else dc pull && dc up -d; fi ;;
   strm)
+    # AutoFilm v2 没有手动触发的入口:./autofilm --help 只有 --config/--log/--timezone
+    # 这些开关,启动时也只注册 cron、不跑任务。所以这里临时把 cron 改成每分钟,
+    # 跑完一轮立刻还原 —— 不能让它一直每分钟去撸网盘,夸克那边风控很严。
+    CFG="${D}/autofilm/config/config.yaml"
+    [[ -f "$CFG" ]] || { echo "找不到 ${CFG}"; exit 1; }
+    BAK="${CFG}.strmbak.$$"
+    cp "$CFG" "$BAK" || exit 1
+    LP=""
+    restore() {
+      [[ -n "$LP" ]] && { kill "$LP" 2>/dev/null; wait "$LP" 2>/dev/null; }
+      # 还原是必须发生的,哪怕用户中途 Ctrl-C、哪怕 docker 命令失败
+      if [[ -f "$BAK" ]]; then
+        mv -f "$BAK" "$CFG"
+        docker restart autofilm >/dev/null 2>&1
+        echo; echo "${y}已还原原来的定时设置。${r}"
+      fi
+    }
+    # INT/TERM 只负责退出:bash 跑完信号处理函数后默认【继续往下执行】,
+    # 直接把 restore 挂在 INT 上的话,Ctrl-C 会还原配置然后接着轮询六分钟。
+    # 还原统一交给 EXIT,正常结束和被中断走同一条路。
+    trap 'exit 130' INT TERM
+    trap restore EXIT
+
+    sed -i 's|cron: ".*"|cron: "0 * * * * *"|' "$CFG"
+    TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     docker restart autofilm >/dev/null 2>&1 || { echo "autofilm 没在运行"; exit 1; }
-    echo "已触发 strm 生成，Ctrl-C 可退出日志跟踪:"; docker logs -f --tail 50 autofilm ;;
+    echo "${b}已临时改成每分钟跑一次,最多等 60 秒开始。跑完自动还原。${r}"
+    echo
+
+    docker logs -f --since "$TS" autofilm 2>&1 &
+    LP=$!
+    # 轮询完成标记而不是死等日志:任务跑完后日志就安静了,
+    # 只跟着 docker logs 的话会一直挂在那里,得靠人去按 Ctrl-C
+    for _ in $(seq 1 90); do            # 4s x 90 ≈ 6 分钟封顶
+      sleep 4
+      if docker logs --since "$TS" autofilm 2>&1 | grep -q "Alist2Strm 任务完成"; then
+        sleep 1; break
+      fi
+    done
+    echo
+    echo "${b}看上面那行「Alist2Strm 任务完成」里的 strm_created_count / strm_skipped_count。${r}"
+    echo "${y}skipped 不是失败,是文件已经在了。之后去 Emby 扫一次媒体库。${r}"
+    ;;
   302)
     echo "跟踪 MediaWarp 日志。现在去播放一集，看到 302 就说明直链生效:"
     docker logs -f --tail 20 mediawarp ;;
