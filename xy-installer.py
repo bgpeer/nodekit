@@ -3015,13 +3015,27 @@ def uninstall_all():
 
 # ============================================================================ 屏蔽中国域名/IP（独立文件）
 def ensure_remote_script(url, local):
-    """把仓库里的脚本拉到本地（每次尽量拉最新）；拉不到就用本地缓存。"""
+    """把仓库里的脚本拉到本地（每次尽量拉最新）；拉不到就用本地缓存。
+
+    两个坑都在这几行里踩过：
+      · 原来是 open(local,"w").write(fetch_url(url))，Python 会先把本地文件截成
+        0 字节再去发请求，网络一抖缓存就没了；而 os.path.exists 依然为真，于是
+        "成功"跑起一个空脚本，菜单点进去毫无反应。改成拉全、校验、再原子替换。
+      · URL 上带时间戳绕开 CDN 缓存：raw.githubusercontent 和 jsDelivr 都会缓存
+        几分钟到几小时，仓库明明改了、机器上拉到的还是旧版，修复就一直到不了。
+    """
     os.makedirs(BGP_DIR, exist_ok=True)
     try:
-        open(local, "w").write(fetch_url(url))
+        sep = "&" if "?" in url else "?"
+        body = fetch_url(f"{url}{sep}_t={int(time.time())}")
+        if body.strip():
+            tmp = local + ".new"
+            with open(tmp, "w") as f:
+                f.write(body)
+            os.replace(tmp, local)
     except Exception:
         pass
-    return os.path.exists(local)
+    return os.path.exists(local) and os.path.getsize(local) > 0
 
 def ensure_cn_block():
     return ensure_remote_script(CN_BLOCK_URL, CN_BLOCK_LOCAL)
