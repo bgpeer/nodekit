@@ -435,8 +435,14 @@ alist2strm_tasks:
       enabled: true         # 网盘删了文件，本地 strm 跟着删
       ignore:
       smart_protection:
-        enabled: true       # 防止网盘抽风返回空目录时把整个媒体库误删
-        threshold: 100
+        enabled: true
+        # threshold 是「待删除数量达到多少【才】启动保护」，不是「超过多少就不删」。
+        # 原来写 100 等于给小媒体库判了死刑：库里只有几十个 strm 时永远够不到阈值，
+        # 保护形同虚设 —— 夸克列目录超时一次(跨境线路上是家常便饭)，AutoFilm 就当
+        # 远端文件没了，把整库 strm 一次删光，Emby 里媒体库瞬间变空。实际就这么丢过。
+        # 填 1 表示「只要有文件要删就先进保护」，配合 grace_scans 连续确认 3 轮，
+        # 网络抖一两次不会误删，真在网盘里删掉的文件第 3 轮之后照样会清理。
+        threshold: 1
         grace_scans: 3
 """
 
