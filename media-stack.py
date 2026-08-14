@@ -803,12 +803,22 @@ case "${1:-info}" in
     # 定成"每分钟"是错的:一轮跑不完下一轮就压上来,几轮任务并发扫同一个目录、
     # 互相删对方刚写出去的 strm(实测跨境网络慢时一轮要 121 秒,同时跑了三轮,
     # 最后 io error: No such file or directory)。改成【指定时刻只触发一次】。
-    # 时刻要按 autofilm 容器自己的时区算 —— 调度器用的是容器里的本地时间,
-    # 拿宿主机的时间去填,时区一差就永远等不到。
-    CT="$(docker exec autofilm date +'%H %M' 2>/dev/null)"
-    if [[ -z "$CT" ]]; then CT="$(date +'%H %M')"; fi
-    read -r CH CM <<<"$CT"
-    T=$(( (10#$CH * 60 + 10#$CM + 2) % 1440 ))     # +2 分钟,留足重启和对齐的余量
+    # 时刻必须按【AutoFilm 调度器自己那套时钟】算。不能用 docker exec autofilm date:
+    # 容器里的 date 认 TZ 环境变量返回本地时间,而 AutoFilm 启动时打印的是
+    # 「使用应用时区 timezone=UTC」—— 它没读到 TZ、回落到了 UTC,两者差好几个小时。
+    # 实测:date 说 19:57、AutoFilm 认为是 11:56,cron 写成 "0 57 19" 要等到次日
+    # 凌晨才触发,表现就是"点了没反应、卡住不动"。
+    # 日志时间戳末尾的偏移(+00:00 / +09:00 / Z)才是调度器真正用的时钟。
+    OFF="$(docker logs --tail 80 autofilm 2>&1 \
+           | grep -oE 'T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})' \
+           | tail -1 | grep -oE '(Z|[+-][0-9]{2}:[0-9]{2})$')"
+    case "$OFF" in
+      ""|Z) OFFMIN=0 ;;
+      *)    OFFMIN=$(( 10#${OFF:1:2} * 60 + 10#${OFF:4:2} ))
+            [[ "${OFF:0:1}" == "-" ]] && OFFMIN=$(( -OFFMIN )) ;;
+    esac
+    NOW=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+    T=$(( (NOW + OFFMIN + 2 + 1440) % 1440 ))      # +2 分钟,留足重启和对齐的余量
     FH="$(printf '%02d' $((T / 60)))"; FM="$(printf '%02d' $((T % 60)))"
     # 引号用变量带进去。这整段是 Python 的三引号字符串,在里面用反斜杠转义双引号
     # 会被 Python 自己吃掉,落到 bash 里就是引号错乱的一行,sed 静默不替换 ——
@@ -818,7 +828,7 @@ case "${1:-info}" in
 
     TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     docker restart autofilm >/dev/null 2>&1 || { echo "autofilm 没在运行"; exit 1; }
-    echo "${b}已安排在 ${FH}:${FM}(容器时间)触发一次,最多等 2 分钟开始。${r}"
+    echo "${b}已安排在 ${FH}:${FM}(AutoFilm 调度器时间)触发一次,最多等 2 分钟开始。${r}"
     echo "${y}跑完会自己退出并还原定时设置 —— 中途别按 Ctrl-C,那会把任务掐断,"
     echo "strm 只生成一半,Emby 里就会报「找不到目录」。${r}"
     echo "${b}等到出现「Alist2Strm 任务完成」那一行为止,中间安静一阵是正常的。${r}"
@@ -1592,6 +1602,35 @@ def strm_count(d):
     return n
 
 
+def autofilm_clock():
+    """AutoFilm 调度器当前认为的 (时, 分)。取不到返回 None。
+
+    **不能用 `docker exec autofilm date`**：容器里的 date 认 TZ 环境变量，返回的是
+    用户设的本地时间；而 AutoFilm 自己启动时打印的是「使用应用时区 timezone=UTC」
+    —— 它没读到 TZ，回落到了 UTC。两者能差好几个小时。
+
+    实测踩过：date 说 19:57，AutoFilm 认为现在是 11:56，于是 cron 写成
+    "0 57 19 * * *" 要等到 19:57 UTC（次日凌晨）才触发，表现就是「点了没反应、
+    卡住不动」。
+
+    它日志时间戳末尾那个偏移量（+00:00 / +09:00 / Z）才是调度器真正用的那套时钟，
+    从那里取偏移，再加到宿主机的 UTC 时间上，才和 cron 的解释方式对得上。
+    """
+    out = sh("docker logs --tail 80 autofilm", timeout=30)
+    text = (out.stdout or "") + (out.stderr or "")
+    off = None
+    for m in re.finditer(r"T\d{2}:\d{2}:\d{2}(?:\.\d+)?(Z|[+-]\d{2}:\d{2})", text):
+        off = m.group(1)                       # 取最后一条，最新
+    if off is None:
+        return None
+    if off == "Z":
+        mins = 0
+    else:
+        mins = (int(off[1:3]) * 60 + int(off[4:6])) * (1 if off[0] == "+" else -1)
+    t = time.gmtime(time.time() + mins * 60)
+    return t.tm_hour, t.tm_min
+
+
 def do_strm():
     """立刻跑一次 strm 生成，跑完顺手让 Emby 扫一次媒体库。
 
@@ -1621,13 +1660,12 @@ def do_strm():
     print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
 
     original = open(cfg_path, encoding="utf-8").read()
-    # 触发时刻要按 autofilm 容器自己的时区算：调度器用的是容器里的本地时间，
-    # 拿宿主机时间去填，时区一差就永远等不到那个点。
-    r = sh("docker exec autofilm date +'%H %M'", timeout=30)
-    hm = (r.stdout or "").strip().split()
-    if len(hm) != 2 or not all(x.isdigit() for x in hm):
-        hm = time.strftime("%H %M").split()
-    t = (int(hm[0]) * 60 + int(hm[1]) + 2) % 1440
+    hm = autofilm_clock()
+    if hm is None:
+        g = time.gmtime()
+        hm = (g.tm_hour, g.tm_min)
+        warn("读不到 AutoFilm 的时区，按 UTC 估算触发时刻。")
+    t = (hm[0] * 60 + hm[1] + 2) % 1440
     fire = f"0 {t % 60:02d} {t // 60:02d} * * *"
 
     patched = re.sub(r'(?m)^(\s*cron:\s*)".*"$', lambda m: f'{m.group(1)}"{fire}"',
