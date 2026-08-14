@@ -1870,6 +1870,122 @@ def set_web_credentials():
           f"或清一下该站点的登录状态。{RST}")
 
 
+LINK_METHODS = {
+    "download":  ("原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
+                            "跨境线路上 4K 原盘经常拉不动"),
+    "streaming": ("转码流",   "网盘自己转码后的流，码率低一个量级，卡的时候选它；"
+                            "转码在网盘那边做，不吃本机 CPU"),
+}
+
+
+def link_method_storages(d):
+    """列出支持切换直链方式的存储：(id, 挂载点, 驱动, 当前值)。
+
+    只有夸克/UC 的 TV 驱动有 link_method 这个字段，所以按「addition 里有没有这个键」
+    来筛，而不是按驱动名硬编 —— 以后多几个驱动支持也能自动认出来。
+    """
+    db = os.path.join(d, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = con.execute("select id, mount_path, driver, addition "
+                           "from x_storages order by mount_path").fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for sid, mp, drv, add in rows:
+        try:
+            a = json.loads(add)
+        except Exception:
+            continue
+        if "link_method" in a:
+            out.append((sid, mp, drv, str(a.get("link_method") or "")))
+    return out
+
+
+def set_link_method():
+    """切换网盘直链的获取方式：原画直链 ↔ 转码流。
+
+    这个开关在跨境线路上是决定性的：同一个 4K 文件，原画直链只能跑几百 KB/s、
+    每两秒卡一次，换成转码流立刻 5 MB/s 流畅。而两者的差别只是 OpenList 存储里
+    的一个字段。以前只能自己去改 sqlite 或者在网页表单里翻，所以做成按钮。
+
+    先显示当前值再问要不要换，和「添加 API 密钥」那个按钮一个路子 —— 点进来
+    先告诉你现在是什么状态，而不是上来就改。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    stores = link_method_storages(d)
+    if not stores:
+        warn("没有找到支持切换的网盘存储。")
+        print(f"  {DIM}只有夸克 / UC 的 TV 版驱动（QuarkTV、UCTV）有这个选项。{RST}")
+        print(f"  {DIM}还没在 OpenList 里添加网盘的话，先去加一个。{RST}")
+        return
+
+    print()
+    for _sid, mp, drv, cur in stores:
+        name, why = LINK_METHODS.get(cur, (cur or "未知", ""))
+        print(f"  {BOLD}{mp}{RST}  {DIM}({drv}){RST}   当前：{CYAN}{BOLD}{name}{RST} "
+              f"{DIM}[{cur}]{RST}")
+        if why:
+            print(f"      {DIM}{why}{RST}")
+    print()
+    for k, (name, why) in LINK_METHODS.items():
+        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why}")
+    print()
+
+    # 全部存储当前值一致时直接给出"换到另一个"，否则让用户明确选一个
+    curs = {c for _s, _m, _d, c in stores}
+    if len(curs) == 1 and curs.pop() in LINK_METHODS:
+        cur = stores[0][3]
+        target = "streaming" if cur == "download" else "download"
+        if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
+            print("没有改动。")
+            return
+    else:
+        print("  1. 原画直链（download）")
+        print("  2. 转码流（streaming）")
+        c = ask("要切换成哪个？（回车取消）").strip()
+        target = {"1": "download", "2": "streaming"}.get(c, "")
+        if not target:
+            print("没有改动。")
+            return
+
+    # OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停，避免锁冲突
+    info("停止 OpenList...")
+    subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
+    db = os.path.join(d, "openlist", "config", "data.db")
+    bak = db + ".bak"
+    try:
+        shutil.copy2(db, bak)
+        con = sqlite3.connect(db)
+        for sid, mp, _drv, cur in stores:
+            row = con.execute("select addition from x_storages where id=?", (sid,)).fetchone()
+            a = json.loads(row[0])
+            a["link_method"] = target
+            con.execute("update x_storages set addition=? where id=?",
+                        (json.dumps(a, ensure_ascii=False), sid))
+            ok(f"{mp}: {cur or '空'} → {target}")
+        con.commit()
+        con.close()
+    except Exception as e:
+        err(f"写入失败：{e}")
+        if os.path.exists(bak):
+            shutil.copy2(bak, db)
+            warn("已从备份还原。")
+    finally:
+        subprocess.run(["docker", "start", "openlist"], capture_output=True, timeout=120)
+        info("OpenList 已重启")
+
+    print()
+    print(f"  {DIM}strm 文件不用重新生成 —— 里面存的是网盘路径，{RST}")
+    print(f"  {DIM}清晰度是播放那一刻才决定的。直接播一次就能看出区别。{RST}")
+
+
 def params_menu():
     """后补参数：装完之后才拿得到、需要回头再填的东西。"""
     while True:
@@ -1883,8 +1999,17 @@ def params_menu():
         sec = os.path.join(d, ".secrets")
         has_ba = bool(read_env(sec, "BA_PASS", fallback=os.path.join(d, ".env")))
         ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
+        # 直链方式在跨境线路上是决定成败的开关，当前值直接摆在菜单上
+        lms = link_method_storages(d) if is_installed(d) else []
+        if lms:
+            vals = {c for _s, _m, _d, c in lms}
+            lm_state = (f"{CYAN}{LINK_METHODS.get(lms[0][3], (lms[0][3],))[0]}{RST}"
+                        if len(vals) == 1 else f"{YELLOW}各存储不一致{RST}")
+        else:
+            lm_state = f"{DIM}未挂网盘{RST}"
         print(f"  1. 添加 API 密钥（Emby API Key）   当前：{state}")
         print(f"  2. 修改用户名 / 密码（浏览器弹框那层）  当前：{ba_state}")
+        print(f"  3. 直链方式：原画 / 转码流（卡就换这个）  当前：{lm_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -1894,6 +2019,8 @@ def params_menu():
             set_emby_api_key()
         elif c == "2":
             set_web_credentials()
+        elif c == "3":
+            set_link_method()
         else:
             print("无效选择。")
             continue
