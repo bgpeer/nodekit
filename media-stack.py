@@ -33,6 +33,10 @@ SCRIPT_VERSION = "1.1.0"
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
 
+# 容器日志里的 ANSI 颜色码。解析日志前必须剥掉，否则字段名被转义序列包着，
+# 正则一个都匹配不到（而粘贴出来的文本又是干净的，极难察觉）
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 # ---- 节点（xy-installer.py）的落盘状态，只读 ----
 BGP_DIR    = "/etc/bgpeer"
 STATE_FILE = BGP_DIR + "/state.json"        # 含 domain / sni_split 等
@@ -432,16 +436,23 @@ alist2strm_tasks:
       other_ext: []
       concurrency: 5
     sync:
-      enabled: true         # 网盘删了文件，本地 strm 跟着删
+      # 默认【关】。同步删除的前提是"扫描结果可信"，而网盘扫描根本不满足这个前提：
+      # 跨境线路上列目录超时是常态，AutoFilm 跳过该目录照样报"任务完成"，于是那
+      # 一整个目录的文件就被判定为"远端已删除"，本地 strm 跟着清掉。
+      # 实际后果：第一轮扫出 387 个文件、生成 56 个 strm；之后每轮只扫到一两个，
+      # 每轮都删掉一批 —— 跑得越多剩得越少，用户看到的是"越搞越拉垮"。
+      #
+      # 先前试过 smart_protection.threshold 从 100 改成 1 来堵，堵不住：
+      # 只要扫描本身不可靠，同步删除就是个错误的默认值。
+      # 权衡很清楚 —— 网盘里删掉的文件在本地留个失效 strm，点开报错而已；
+      # 而整库被清空是灾难，而且现象诡异到根本查不出原因。
+      # 真要开就把 enabled 改成 true，下面的保护参数已经调好了。
+      enabled: false
       ignore:
       smart_protection:
         enabled: true
         # threshold 是「待删除数量达到多少【才】启动保护」，不是「超过多少就不删」。
-        # 原来写 100 等于给小媒体库判了死刑：库里只有几十个 strm 时永远够不到阈值，
-        # 保护形同虚设 —— 夸克列目录超时一次(跨境线路上是家常便饭)，AutoFilm 就当
-        # 远端文件没了，把整库 strm 一次删光，Emby 里媒体库瞬间变空。实际就这么丢过。
-        # 填 1 表示「只要有文件要删就先进保护」，配合 grace_scans 连续确认 3 轮，
-        # 网络抖一两次不会误删，真在网盘里删掉的文件第 3 轮之后照样会清理。
+        # 填 1 表示「只要有文件要删就先进保护」，配合 grace_scans 连续确认 3 轮。
         threshold: 1
         grace_scans: 3
 """
@@ -1691,7 +1702,11 @@ def do_strm():
             # 合并 stdout 和 stderr：不同版本的 AutoFilm/Docker 日志落在哪一路
             # 并不一致，只读 stdout 会漏掉统计数字（表现是最后那行全是问号）
             r = sh(f"docker logs --since {since} autofilm", timeout=60)
-            out = (r.stdout or "") + (r.stderr or "")
+            # 先剥掉 ANSI 颜色码：AutoFilm 默认 --colorful-log，日志里的字段名被
+            # 转义序列包着(strm_created_count 前后各有一段 \x1b[..m)，直接拿正则
+            # 找 xxx_count=数字 一个都匹配不到，最后只能打出一排问号。
+            # 这个坑很隐蔽：粘贴到聊天/文档里时终端把颜色码剥掉了，看起来完全干净。
+            out = ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
             for ln in out.splitlines():
                 if "Alist2Strm 任务完成" in ln:
                     done = ln                      # 不 break：取最后一条，也就是最新那轮
