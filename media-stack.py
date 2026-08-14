@@ -479,7 +479,14 @@ log:
 cache:
   enable: true
   http_strm_ttl: 1m
-  alist_api_ttl: 10m
+  # 默认 10m 太短。每次缓存过期,MediaWarp 就要让 OpenList 重新去网盘换一次直链;
+  # 跨境线路上这个调用实测 0.3 秒到 44 秒不等,还经常直接超时 —— 日志里表现为
+  #   404 | 30.3s | GET /emby/Videos/11/stream
+  # 播放器等不到地址,画面就停在那儿。一部 93 分钟的电影按 10m 算要换约 9 次,
+  # 等于把 9 次赌博串进一次观影。
+  # 夸克直链的 auth_key 实测有效期约 30 小时,缓存 2 小时安全余量很足,
+  # 一部片子只需要成功换一次。
+  alist_api_ttl: 2h
   image_ttl: 10m
   subtitle_ttl: 2h
 
