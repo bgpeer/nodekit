@@ -1688,14 +1688,16 @@ def do_strm():
 
         done = ""
         for i in range(225):                       # 4s x 225 = 15 分钟封顶
-            time.sleep(4)
-            out = sh(f"docker logs --since {since} autofilm", timeout=60).stdout or ""
+            # 合并 stdout 和 stderr：不同版本的 AutoFilm/Docker 日志落在哪一路
+            # 并不一致，只读 stdout 会漏掉统计数字（表现是最后那行全是问号）
+            r = sh(f"docker logs --since {since} autofilm", timeout=60)
+            out = (r.stdout or "") + (r.stderr or "")
             for ln in out.splitlines():
                 if "Alist2Strm 任务完成" in ln:
-                    done = ln
-                    break
+                    done = ln                      # 不 break：取最后一条，也就是最新那轮
             if done:
                 break
+            time.sleep(4)
             if i % 15 == 14:
                 print(f"  {DIM}...已等待 {(i + 1) * 4 // 60} 分钟{RST}")
         if not done:
@@ -1709,10 +1711,23 @@ def do_strm():
     after = strm_count(d)
     print()
     if done:
-        nums = dict(re.findall(r"(\w+_count)=(\d+)", done))
-        ok(f"生成完成：新增/更新 {nums.get('strm_created_count', '?')}，"
-           f"已存在跳过 {nums.get('strm_skipped_count', '?')}，"
-           f"失败 {nums.get('failed_path_count', '?')}")
+        nums = dict(re.findall(r"([a-z_]+_count)=(\d+)", done))
+        if nums:
+            ok(f"生成完成：新增 {nums.get('strm_created_count', '?')}，"
+               f"已存在跳过 {nums.get('strm_skipped_count', '?')}，"
+               f"失败 {nums.get('failed_path_count', '?')}")
+            # 扫到的目录数同样关键：网盘目录列不出来时它是 0,而"新增 0"看起来
+            # 和"本来就没有新文件"一模一样,不把这两个数摆出来根本分不清
+            print(f"  {DIM}扫描目录 {nums.get('scanned_dir_count', '?')} 个"
+                  f"（跳过 {nums.get('skipped_dir_count', '?')} 个），"
+                  f"发现文件 {nums.get('discovered_file_count', '?')} 个{RST}")
+            if nums.get("skipped_dir_count", "0") != "0":
+                warn(f"有 {nums['skipped_dir_count']} 个目录没列出来就被跳过了 —— "
+                     f"网盘那边超时了，里面的文件这轮不会生成。再跑一次通常能补上。")
+        else:
+            # 解析不出来就把原始那行摆出来，别拿一排问号糊弄人
+            ok("生成完成，AutoFilm 的统计行：")
+            print(f"  {DIM}{done.strip()[-400:]}{RST}")
     print(f"  本地 strm：{before} → {BOLD}{after}{RST}")
 
     if after == 0:
