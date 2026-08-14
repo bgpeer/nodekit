@@ -166,12 +166,30 @@ def node_state():
         return {}
 
 
-def save_ms_state(install_dir):
-    """记住装在哪，「使用信息 / 更新 / 卸载」就不用每次问一遍安装目录。"""
+def ms_state():
+    """读本脚本自己的状态文件；读不到就返回空 dict。"""
+    try:
+        with open(MS_STATE) as f:
+            v = json.load(f)
+            return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_ms_state(install_dir=None, **extra):
+    """记住装在哪、以及那些从生成的配置里读不回来的选择（比如扫描路径是不是 auto）。
+
+    合并写而不是整份覆盖：这个文件现在不止一个键了，某处只想更新其中一个的时候，
+    整份覆盖会把别的键悄悄抹掉。
+    """
+    cur = ms_state()
+    if install_dir:
+        cur["install_dir"] = install_dir
+    cur.update(extra)
     try:
         os.makedirs(BGP_DIR, exist_ok=True)
         with open(MS_STATE, "w") as f:
-            json.dump({"install_dir": install_dir}, f, ensure_ascii=False, indent=2)
+            json.dump(cur, f, ensure_ascii=False, indent=2)
     except OSError:
         pass
 
@@ -406,6 +424,54 @@ def gen_compose(cfg):
     return "\n".join(parts)
 
 
+SCAN_AUTO = "auto"          # 扫描路径的「跟随 OpenList 已挂载存储」模式
+
+
+def parse_scan_spec(s):
+    """把用户输入归一成扫描路径规格。
+
+    接受三种写法，因为这三种都是用户会自然打出来的：
+      · y / Y / auto / 自动        → SCAN_AUTO，跟随 OpenList 里已挂载的存储
+      · /quark                     → 单条路径
+      · /quark,/aliyun  或空格分隔  → 多条路径
+
+    返回 SCAN_AUTO 或去重后的路径列表；给不出有效内容时返回 None，由调用方决定兜底。
+    """
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.lower() in ("y", "yes", "auto") or s in ("自动", "是"):
+        return SCAN_AUTO
+    out, seen = [], set()
+    for p in re.split(r"[,，\s]+", s):
+        p = p.strip().rstrip("/")
+        if not p:
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out or None
+
+
+def resolve_scan_paths(d, spec):
+    """把规格展开成实际要扫的路径列表。
+
+    auto 模式在【生成配置的那一刻】才去读 OpenList 已挂载的存储 —— 这样以后加了
+    新网盘，不用回来改这里的设置，重新生成一次就自动带上。
+    """
+    if spec == SCAN_AUTO:
+        return [mp for mp, _drv, _st, _root in openlist_storages(d) if mp and mp != "/"]
+    return list(spec or [])
+
+
+def scan_task_id(path):
+    """由路径生成任务 id。AutoFilm 用它给状态文件命名，多任务时必须唯一。"""
+    t = re.sub(r"[^\w一-鿿]+", "_", path.strip("/")) or "root"
+    return t
+
+
 def gen_autofilm_conf(cfg):
     """AutoFilm：定时遍历 OpenList，把网盘里的视频写成 .strm 文本文件。
 
@@ -419,7 +485,9 @@ def gen_autofilm_conf(cfg):
                     302 失败、回退成 Emby 自己拉流 —— 视频全程经过本机带宽。
       · AlistPath —— 只写 OpenList 上的路径，正是 MediaWarp 要的形态。
     """
-    return f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
+    paths = list(cfg.get("scan_paths") or [])
+    head = f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
+# 要改扫描哪些路径：emby → 3 后补参数 → 4 扫描路径
 alist:
   - id: openlist
     base_url: http://openlist:5244
@@ -430,12 +498,25 @@ alist:
     token:
     wait_time: 0.2          # 每次请求间隔，夸克风控较严，别调成 0
 
-alist2strm_tasks:
-  - id: 网盘
+alist2strm_tasks:"""
+    if not paths:
+        # 一条路径都没有时给个空列表:AutoFilm 启动会打印 scheduled_count=0 而不是报错,
+        # 比塞一个 "/" 进去强 —— 那会让它去扫整个 OpenList 根目录
+        return head + " []\n"
+    # 所有任务共用同一个 target_dir：AutoFilm 会按源目录结构镜像出来，
+    # 多个网盘的内容各自落在自己的子目录里，Emby 那边仍然只需要指向一个媒体库路径。
+    return head + "\n" + "".join(_gen_strm_task(cfg, p) for p in paths)
+
+
+def _gen_strm_task(cfg, path):
+    """单个 alist2strm 任务。多网盘时每条扫描路径生成一个。"""
+    # id 和路径都加引号：纯数字的挂载路径（比如 /115）不加引号会被 YAML 读成整数，
+    # 路径里带冒号、井号之类的字符也会把这一行拆坏
+    return f"""  - id: "{scan_task_id(path)}"
     cron: "{cfg['strm_cron']}"
     alist: openlist
-    source_dir: {cfg['cloud_mount']}
-    target_dir: {STRM_PATH}
+    source_dir: "{path}"
+    target_dir: "{STRM_PATH}"
     mode: AlistPath         # 见上方注释，必须是 AlistPath，另外两个都会让 302 失效
     flatten_mode: false
     overwrite: false
@@ -1107,6 +1188,22 @@ def read_yaml_scalar(path, key, fallback=""):
     return fallback
 
 
+def read_yaml_all(path, key):
+    """把 yaml 里所有 `key: value` 的值都读出来（多任务时 source_dir 会出现多次）。"""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                mm = re.match(rf"^\s*{re.escape(key)}:\s*(.*)$", ln.split("#", 1)[0].rstrip())
+                if mm:
+                    v = mm.group(1).strip().strip('"').strip("'")
+                    if v and v not in out:
+                        out.append(v)
+    except OSError:
+        pass
+    return out
+
+
 def rebuild_cfg_from_disk(d):
     """从落盘状态重建一份最小 cfg，够重新生成 nginx 站点和 Homepage 配置用。
 
@@ -1132,7 +1229,16 @@ def rebuild_cfg_from_disk(d):
     af = os.path.join(d, "autofilm", "config", "config.yaml")
     mw = os.path.join(d, "mediawarp", "config", "config.yaml")
     cfg["emby_api_key"] = read_yaml_scalar(mw, "auth")
-    cfg["cloud_mount"]  = read_yaml_scalar(af, "source_dir", "/quark")
+    # 扫描路径：auto 这种「意图」从生成出来的 yaml 里读不回来（里面只有展开后的结果），
+    # 所以存在状态文件里。老机器没有这个键，就退回去读 yaml 里已有的 source_dir。
+    spec = ms_state().get("scan_spec")
+    if spec == SCAN_AUTO:
+        cfg["scan_spec"] = SCAN_AUTO
+    elif isinstance(spec, list) and spec:
+        cfg["scan_spec"] = spec
+    else:
+        cfg["scan_spec"] = read_yaml_all(af, "source_dir") or ["/quark"]
+    cfg["scan_paths"] = resolve_scan_paths(d, cfg["scan_spec"])
     cfg["strm_cron"]    = read_yaml_scalar(af, "cron", DEFAULT_STRM_CRON)
     # 只迁移「没被动过的旧默认值」：以前默认 0 0 5 * * *，而 AutoFilm 当时按 UTC 解释，
     # 对国内用户等于下午一点多在跑。现在调度器钉在北京时间、默认值改成 05:15，
@@ -1369,7 +1475,17 @@ def main():
     hr()
 
     # ---- 网盘 ----
-    cfg["cloud_mount"] = ask("网盘在 OpenList 里的挂载路径", "/quark")
+    print(f"  {DIM}扫描路径：可以填一条（/quark）、多条用逗号隔开（/quark,/aliyun），{RST}")
+    print(f"  {DIM}或者填 {RST}{BOLD}y{RST}{DIM} 表示自动跟随 OpenList 里已挂载的全部存储"
+          f"（以后加网盘不用回来改）。{RST}")
+    while True:
+        cfg["scan_spec"] = parse_scan_spec(ask("扫描路径", "/quark"))
+        if cfg["scan_spec"]:
+            break
+        warn("填一条路径、多条逗号隔开、或者 y（自动）。")
+    # 这一步 OpenList 还没挂任何网盘,auto 现在展开必然是空的 —— 那不是错,
+    # 装完加了存储再点「4 生成媒体库」就会带上。这里只是先把意图记下来。
+    cfg["scan_paths"] = resolve_scan_paths(cfg["install_dir"], cfg["scan_spec"])
     print(f"  {DIM}下面这个时刻按【北京时间】算（调度器已钉在 {AUTOFILM_TZ}），"
           f"和服务器在哪无关。{RST}")
     cfg["strm_cron"] = ask("strm 生成 cron（6 位：秒 分 时 日 月 周）", DEFAULT_STRM_CRON)
@@ -1527,7 +1643,9 @@ DOMAIN={cfg['domain']}
 
     # ---- 管理命令 ----
     install_cli(cfg["install_dir"])
-    save_ms_state(cfg["install_dir"])   # 记住装在哪，菜单里的 2/3/4 就不用再问
+    # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
+    # auto 从生成出来的 yaml 里读不回来，只能存在这
+    save_ms_state(cfg["install_dir"], scan_spec=cfg["scan_spec"])
 
     # ---- 总览 ----
     cred_file = os.path.join(cfg["install_dir"], "CREDENTIALS.txt")
@@ -1543,12 +1661,17 @@ DOMAIN={cfg['domain']}
     print(f"  以后敲 {BOLD}emby{RST} 甩出面板地址，敲 {BOLD}media-stack{RST} 看全部。")
     print()
     warn("接下来这几步脚本代劳不了（顺序不能乱）：")
-    print(f"  1) OpenList → 存储 → 添加 → 驱动选 {BOLD}QuarkTV{RST}（不是 Quark！）")
-    print(f"     挂载路径填 {BOLD}{cfg['cloud_mount']}{RST} → 保存 → 用网盘手机 App 扫码")
-    print(f"     → 扫完把该存储{BOLD}先禁用再启用{RST}，token 才会生效")
+    want = ("你在 OpenList 里挂的存储" if cfg["scan_spec"] == SCAN_AUTO
+            else "、".join(cfg["scan_paths"]) or "你填的那条路径")
+    print(f"  1) OpenList → 存储 → 添加，挂载路径填 {BOLD}{want}{RST}")
+    print(f"     {DIM}阿里云盘 / 115 / 天翼这些 OpenList 支持的网盘都可以，本套东西不挑驱动。{RST}")
+    print(f"     {YELLOW}夸克要选 {BOLD}QuarkTV{RST}{YELLOW}，不是 Quark{RST}"
+          f"{DIM}（普通 Quark 驱动不支持 302，只能本机中转）{RST}")
+    print(f"     {YELLOW}根文件夹ID 必须填 {BOLD}0{RST}{DIM}（填 / 或留空会返回空目录）{RST}")
+    print(f"     保存 → 用网盘手机 App 扫码 → 扫完把该存储{BOLD}先禁用再启用{RST}，token 才生效")
     print("  2) 打开 Emby 完成首次安装向导 → 设置 → 高级 → API 密钥 → 新建并复制")
     print("  3) 重跑本脚本，在「Emby API Key」那步粘贴进去")
-    print("  4) media-stack strm  触发一次 strm 生成")
+    print(f"  4) 重跑本脚本 → {BOLD}4 生成媒体库{RST}（也可以敲 media-stack strm）")
     print(f"  5) Emby 添加媒体库，路径指向 {BOLD}{STRM_PATH}{RST}")
     print(f"  6) {YELLOW}重要{RST}：该媒体库高级设置里关掉「章节图像提取」和「实时监控」，")
     print("     否则 Emby 会为了截图去拉整部影片，把网盘刷到限流。")
@@ -2021,6 +2144,70 @@ def set_link_method():
     print(f"  {DIM}清晰度是播放那一刻才决定的。直接播一次就能看出区别。{RST}")
 
 
+def scan_spec_human(spec, paths):
+    """把扫描路径的设置说成人话，auto 要把当前展开的结果一起显示出来 ——
+       只说「自动」看不出实际在扫什么，加了网盘没生效也发现不了。"""
+    if spec == SCAN_AUTO:
+        return (f"自动（跟随 OpenList 已挂载的存储）" +
+                (f"　→ 当前 {len(paths)} 条：{'、'.join(paths)}" if paths
+                 else "　→ 当前还没挂任何网盘"))
+    return "、".join(paths) if paths else "未设置"
+
+
+def set_scan_paths():
+    """改 AutoFilm 要扫哪些路径，改完立刻重新生成配置并重启。
+
+    做成按钮而不是「重跑安装」：加一个网盘就要把整轮安装问答再走一遍太重，
+    而且重跑安装还会顺带碰 nginx、证书、密码这些完全无关的东西。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    cfg = rebuild_cfg_from_disk(d)
+    print()
+    print(f"  当前：{CYAN}{BOLD}{scan_spec_human(cfg['scan_spec'], cfg['scan_paths'])}{RST}")
+
+    mounted = [mp for mp, _drv, _st, _root in openlist_storages(d) if mp and mp != "/"]
+    if mounted:
+        print(f"  {DIM}OpenList 里已挂载：{'、'.join(mounted)}{RST}")
+    else:
+        print(f"  {DIM}OpenList 里还没挂任何网盘。{RST}")
+    print()
+    print(f"  {DIM}填一条（/quark）、多条逗号隔开（/quark,/aliyun）、"
+          f"或 {RST}{BOLD}y{RST}{DIM} 自动跟随已挂载的存储。回车不改。{RST}")
+    spec = parse_scan_spec(ask("扫描路径", ""))
+    if not spec:
+        print("没有改动。")
+        return
+
+    paths = resolve_scan_paths(d, spec)
+    if not paths:
+        warn("展开后一条路径都没有（OpenList 里还没挂网盘？），没有改动。")
+        return
+    print(f"  将扫描：{BOLD}{'、'.join(paths)}{RST}")
+    # 提前把「填了但没挂上」挑出来:AutoFilm 扫不存在的目录只会在日志里留一行 WARN,
+    # 用户看到的是"点了生成但什么都没多",很难联想到是路径打错了
+    if mounted:
+        unknown = [p for p in paths if not any(p == mp or p.startswith(mp.rstrip("/") + "/")
+                                               for mp in mounted)]
+        if unknown:
+            warn(f"这些路径不在已挂载的存储里：{'、'.join(unknown)}")
+            print(f"  {DIM}拼错了或者还没在 OpenList 里挂上，扫的时候会被跳过。{RST}")
+    if not ask_yn("确认改成上面这些？", True):
+        print("没有改动。")
+        return
+
+    cfg["scan_spec"], cfg["scan_paths"] = spec, paths
+    af = os.path.join(d, "autofilm", "config", "config.yaml")
+    with open(af, "w", encoding="utf-8") as f:
+        f.write(gen_autofilm_conf(cfg))
+    save_ms_state(scan_spec=spec)
+    subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
+    ok(f"已改成 {len(paths)} 条扫描路径，AutoFilm 已重启")
+    print(f"  {DIM}回菜单点「4 生成媒体库」立刻扫一次，或等每天定时任务。{RST}")
+
+
 def params_menu():
     """后补参数：装完之后才拿得到、需要回头再填的东西。"""
     while True:
@@ -2045,6 +2232,13 @@ def params_menu():
         print(f"  1. 添加 API 密钥（Emby API Key）   当前：{state}")
         print(f"  2. 修改用户名 / 密码（浏览器弹框那层）  当前：{ba_state}")
         print(f"  3. 直链方式：原画 / 转码流（卡就换这个）  当前：{lm_state}")
+        if is_installed(d):
+            c0 = rebuild_cfg_from_disk(d)
+            sp_state = scan_spec_human(c0["scan_spec"], c0["scan_paths"])
+        else:
+            sp_state = f"{DIM}未安装{RST}"
+        print(f"  4. 扫描路径（加网盘 / 换目录）")
+        print(f"     {DIM}当前：{sp_state}{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -2056,6 +2250,8 @@ def params_menu():
             set_web_credentials()
         elif c == "3":
             set_link_method()
+        elif c == "4":
+            set_scan_paths()
         else:
             print("无效选择。")
             continue
