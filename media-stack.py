@@ -1001,6 +1001,20 @@ def show_info():
                 warn("根目录要填 0，否则目录挂得上但是空的，strm 一个也不会生成。")
                 warn("改：OpenList 管理 → 存储 → 编辑 → 根文件夹ID 填 0 → 全部重新加载。")
 
+    # strm 数量是判断「Emby 里为什么是空的」最直接的指标，放在容器状态前面
+    n = strm_count(d)
+    print(f"\n  {BOLD}▸ 媒体库内容{RST}")
+    if n:
+        print(f"      已生成 {GREEN}{BOLD}{n}{RST} 个 strm")
+        print(f"      Emby 媒体库指向 {CYAN}{BOLD}{STRM_PATH}{RST}   {DIM}(容器内路径){RST}")
+    else:
+        print(f"      {YELLOW}{BOLD}0 个 strm —— Emby 里现在一定是空的{RST}")
+        print(f"      {DIM}还差两步，按顺序做：{RST}")
+        print(f"        1. 在 OpenList（上面的网盘挂载地址）里添加网盘存储")
+        print(f"           {DIM}夸克类驱动的「根文件夹ID」必须填 {RST}{BOLD}0{RST}")
+        print(f"        2. 回本菜单点 {GREEN}{BOLD}4 生成媒体库{RST}")
+        print(f"      {DIM}生成完再去 Emby 添加媒体库，路径填 {STRM_PATH}{RST}")
+
     print(f"\n  {BOLD}▸ 容器状态{RST}")
     r = sh(f"docker compose -f {os.path.join(d, 'docker-compose.yml')} "
            f"--env-file {env_file} ps", timeout=60)
@@ -1568,6 +1582,127 @@ def set_emby_api_key():
     print(f"  验证：{BOLD}media-stack 302{RST} 然后播一集，日志出现 302 就说明直链生效了。")
 
 
+def strm_count(d):
+    """本地已生成的 .strm 数量。0 就意味着 Emby 里一定是空的。"""
+    root = os.path.join(read_env(os.path.join(d, ".env"), "DATA_ROOT")
+                        or os.path.join(d, "media"), "strm")
+    n = 0
+    for _dirpath, _dirnames, files in os.walk(root):
+        n += sum(1 for f in files if f.endswith(".strm"))
+    return n
+
+
+def do_strm():
+    """立刻跑一次 strm 生成，跑完顺手让 Emby 扫一次媒体库。
+
+    为什么必须有这个按钮：装完的那一刻网盘还没挂上 —— OpenList 里的存储得用户自己
+    在网页里添加。所以安装流程里跑 strm 一定是空的，等用户挂好网盘之后，必须再触发
+    一次生成，Emby 里才会出现片子。
+
+    以前这一步只有命令行 `media-stack strm`。不看文档、不敲命令的人到这里就死局了：
+    OpenList 里文件明明都在，Emby 里永远刷不出来，界面上没有任何东西提示还差一步。
+    这是把人挡在门外的设计，不是用户的问题。
+
+    触发方式和 CLI 那条一致：AutoFilm v2 没有手动执行的入口(--help 里只有
+    --config/--log/--timezone 这类开关)，启动时也只注册 cron、不跑任务。所以临时把
+    cron 改成两分钟后只触发一次，跑完立刻还原。不用「每分钟」是因为网盘慢的时候一轮
+    要一两分钟，几轮压在一起会并发扫同一个目录、互相删对方刚写出的 strm。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    cfg_path = os.path.join(d, "autofilm", "config", "config.yaml")
+    if not os.path.exists(cfg_path):
+        warn(f"找不到 {cfg_path}，AutoFilm 可能没装。")
+        return
+
+    before = strm_count(d)
+    print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
+
+    original = open(cfg_path, encoding="utf-8").read()
+    # 触发时刻要按 autofilm 容器自己的时区算：调度器用的是容器里的本地时间，
+    # 拿宿主机时间去填，时区一差就永远等不到那个点。
+    r = sh("docker exec autofilm date +'%H %M'", timeout=30)
+    hm = (r.stdout or "").strip().split()
+    if len(hm) != 2 or not all(x.isdigit() for x in hm):
+        hm = time.strftime("%H %M").split()
+    t = (int(hm[0]) * 60 + int(hm[1]) + 2) % 1440
+    fire = f"0 {t % 60:02d} {t // 60:02d} * * *"
+
+    patched = re.sub(r'(?m)^(\s*cron:\s*)".*"$', lambda m: f'{m.group(1)}"{fire}"',
+                     original, count=1)
+    if patched == original:
+        # 还没动过文件就退出，别进 try —— 否则 finally 会白重启一次容器
+        err("没能改写 cron 那一行，为安全起见没有继续。")
+        return
+
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(patched)
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if subprocess.run(["docker", "restart", "autofilm"],
+                          capture_output=True).returncode != 0:
+            err("重启 AutoFilm 失败，它可能没在跑。")
+            return
+        info(f"已安排在 {fire.split()[2]}:{fire.split()[1]}（容器时间）触发一次，最多等 2 分钟开始。")
+        print(f"  {DIM}扫描期间日志会安静一阵，正常。整个过程最长 15 分钟。{RST}")
+
+        done = ""
+        for i in range(225):                       # 4s x 225 = 15 分钟封顶
+            time.sleep(4)
+            out = sh(f"docker logs --since {since} autofilm", timeout=60).stdout or ""
+            for ln in out.splitlines():
+                if "Alist2Strm 任务完成" in ln:
+                    done = ln
+                    break
+            if done:
+                break
+            if i % 15 == 14:
+                print(f"  {DIM}...已等待 {(i + 1) * 4 // 60} 分钟{RST}")
+        if not done:
+            warn("15 分钟内没等到「任务完成」。网盘可能一直超时，稍后再试一次。")
+    finally:
+        # 还原是必须发生的：中途报错、Ctrl-C 都不能把用户的定时设置留在临时值上
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(original)
+        subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
+
+    after = strm_count(d)
+    print()
+    if done:
+        nums = dict(re.findall(r"(\w+_count)=(\d+)", done))
+        ok(f"生成完成：新增/更新 {nums.get('strm_created_count', '?')}，"
+           f"已存在跳过 {nums.get('strm_skipped_count', '?')}，"
+           f"失败 {nums.get('failed_path_count', '?')}")
+    print(f"  本地 strm：{before} → {BOLD}{after}{RST}")
+
+    if after == 0:
+        print()
+        warn("一个 strm 都没生成，说明 OpenList 那边没读到网盘文件。检查：")
+        print(f"  {DIM}·{RST} OpenList 里的存储状态是不是 work（看「2 使用信息」的网盘挂载那段）")
+        print(f"  {DIM}·{RST} 夸克类驱动的根文件夹ID 必须填 {BOLD}0{RST}，填 / 或留空都会返回空目录")
+        print(f"  {DIM}·{RST} AutoFilm 扫的是 {BOLD}{read_yaml_scalar(cfg_path, 'source_dir', '/')}{RST}，"
+              f"这个路径在 OpenList 里点得开吗")
+        return
+
+    # 生成完顺手让 Emby 扫一遍，省得用户还要再进 Emby 后台找「扫描媒体库」
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if key:
+        info("通知 Emby 扫描媒体库...")
+        sh(f"curl -sS -m 30 -X POST 'http://127.0.0.1:8096/Library/Refresh?api_key={key}'",
+           timeout=60)
+        ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
+    else:
+        warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
+        print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
+
+    print()
+    print(f"  {BOLD}Emby 媒体库要指向的路径{RST}（容器内路径，不是宿主机路径）：")
+    print(f"      {CYAN}{BOLD}{STRM_PATH}{RST}")
+    print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 → 内容类型选「电影」→ 文件夹填上面这个{RST}")
+
+
 def write_secret(path, key, value):
     """在 .secrets 里就地改一个键，没有就追加。整文件重写会丢掉别的键。"""
     lines = []
@@ -1705,8 +1840,11 @@ def main_menu():
         print("  1. 安装" + ("（已装，重跑可改配置）" if installed else ""))
         print("  2. 使用信息（地址 / 账号密码 / 常用命令）")
         print("  3. 后补参数（Emby API Key 等装完才拿得到的东西）")
-        print("  4. 更新（拉最新镜像 + 按新版本刷新配置）")
-        print("  5. 卸载")
+        # 装完网盘还没挂，所以这一步只能等用户在 OpenList 里挂好之后自己点。
+        # 没有这个按钮的话，不敲命令的人就卡在「OpenList 里有文件、Emby 里空的」
+        print("  4. 生成媒体库（网盘挂好后点这个，Emby 才看得到片子）")
+        print("  5. 更新（拉最新镜像 + 按新版本刷新配置）")
+        print("  6. 卸载")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -1720,8 +1858,10 @@ def main_menu():
             params_menu()
             continue          # 子菜单自己管停顿，回来别再多按一次回车
         elif c == "4":
-            do_update()
+            do_strm()
         elif c == "5":
+            do_update()
+        elif c == "6":
             do_uninstall()
         else:
             print("无效选择。")
