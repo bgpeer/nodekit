@@ -51,6 +51,12 @@ CLI_PATH      = "/usr/local/bin/media-stack"
 CLI_ALIAS     = "/usr/local/bin/emby"
 SNI_HTTPS_PORT_FALLBACK = 8443              # 和 xy-installer.py 的常量一致
 
+# AutoFilm 调度器的时区，以及默认的 strm 生成时刻（该时区下的 05:15）。
+# 钉在北京时间：网盘在国内，「凌晨闲时」是按北京时间定义的，跟 VPS 摆在哪无关。
+AUTOFILM_TZ       = "Asia/Shanghai"
+DEFAULT_STRM_CRON = "0 15 5 * * *"          # 秒 分 时 日 月 周 —— 北京时间 05:15
+OLD_STRM_CRON     = "0 0 5 * * *"           # 旧默认值，更新时静默迁移到上面那个
+
 OPENLIST_PORT  = 5244
 MEDIAWARP_PORT = 9000
 STRM_SUBDIR    = "cloud"
@@ -348,6 +354,12 @@ def gen_compose(cfg):
     image: akimio/autofilm:latest
     container_name: autofilm
     restart: unless-stopped
+    # AutoFilm 读不到 TZ 环境变量（启动日志里会打印「使用应用时区 timezone=UTC」），
+    # 所以定时任务的时刻必须靠 --timezone 显式指定，否则 cron 里写的 05:15 会被当成
+    # 05:15 UTC —— 对国内用户就是下午一点多，完全不是想要的"凌晨闲时"。
+    # 钉死在北京时间而不是跟随服务器本地时区：网盘在国内，"闲时"是按北京时间定义的，
+    # 跟这台 VPS 摆在日本还是美国没有关系。
+    command: ["--timezone", "{AUTOFILM_TZ}"]
     environment:
       - TZ=${{TZ}}
     volumes:
@@ -927,6 +939,19 @@ def build_summary(cfg, colored=True):
     return "\n".join(lines)
 
 
+def cron_human(cron):
+    """把 6 位 cron 说成人话：'0 15 5 * * *' → '每天 05:15（北京时间）'。
+
+    时刻按哪个时区解释，是这里最容易被误解的一点(我们把调度器钉在了北京时间,
+    不是服务器本地时区),所以时区必须跟着时刻一起显示,不能只报一个 05:15。
+    看不懂的格式就原样打出来,不猜。
+    """
+    p = cron.split()
+    if len(p) == 6 and p[3] == p[4] == p[5] == "*" and all(x.isdigit() for x in p[:3]):
+        return f"每天 {int(p[2]):02d}:{int(p[1]):02d}（北京时间）"
+    return f"{cron}   {DIM}(6 位 cron，按北京时间){RST}"
+
+
 def openlist_storages(d):
     """读 OpenList 的库，把挂好的网盘和几个关键参数列出来。
 
@@ -1035,6 +1060,9 @@ def show_info():
     if n:
         print(f"      已生成 {GREEN}{BOLD}{n}{RST} 个 strm")
         print(f"      Emby 媒体库指向 {CYAN}{BOLD}{STRM_PATH}{RST}   {DIM}(容器内路径){RST}")
+        cron = read_yaml_scalar(os.path.join(d, "autofilm", "config", "config.yaml"), "cron")
+        if cron:
+            print(f"      自动生成 {cron_human(cron)}")
     else:
         print(f"      {YELLOW}{BOLD}0 个 strm —— Emby 里现在一定是空的{RST}")
         print(f"      {DIM}还差两步，按顺序做：{RST}")
@@ -1105,7 +1133,12 @@ def rebuild_cfg_from_disk(d):
     mw = os.path.join(d, "mediawarp", "config", "config.yaml")
     cfg["emby_api_key"] = read_yaml_scalar(mw, "auth")
     cfg["cloud_mount"]  = read_yaml_scalar(af, "source_dir", "/quark")
-    cfg["strm_cron"]    = read_yaml_scalar(af, "cron", "0 0 5 * * *")
+    cfg["strm_cron"]    = read_yaml_scalar(af, "cron", DEFAULT_STRM_CRON)
+    # 只迁移「没被动过的旧默认值」：以前默认 0 0 5 * * *，而 AutoFilm 当时按 UTC 解释，
+    # 对国内用户等于下午一点多在跑。现在调度器钉在北京时间、默认值改成 05:15，
+    # 老机器更新时顺手带过去。用户自己改过 cron 的一律保持原样，不越俎代庖。
+    if cfg["strm_cron"] == OLD_STRM_CRON:
+        cfg["strm_cron"] = DEFAULT_STRM_CRON
     cfg["has_domain"] = bool(cfg["domain"]) and have("nginx")
     cfg["basic_auth"] = bool(cfg["ba_pass"]) and os.path.exists(HTPASSWD_FILE)
     cfg["ngx_port"] = detect_nginx_https_port()
@@ -1337,7 +1370,9 @@ def main():
 
     # ---- 网盘 ----
     cfg["cloud_mount"] = ask("网盘在 OpenList 里的挂载路径", "/quark")
-    cfg["strm_cron"] = ask("strm 生成 cron（6 位：秒 分 时 日 月 周）", "0 0 5 * * *")
+    print(f"  {DIM}下面这个时刻按【北京时间】算（调度器已钉在 {AUTOFILM_TZ}），"
+          f"和服务器在哪无关。{RST}")
+    cfg["strm_cron"] = ask("strm 生成 cron（6 位：秒 分 时 日 月 周）", DEFAULT_STRM_CRON)
     print()
     warn("MediaWarp 需要 Emby 的 API Key。首次部署时 Emby 还没初始化，这里可以留空；")
     warn("装完按提示去 Emby 生成，再重跑本脚本填上即可（幂等，重跑安全）。")
