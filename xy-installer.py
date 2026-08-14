@@ -1929,14 +1929,35 @@ def _self_ip():
         _SELF_IP_CACHE = ip or ""
     return _SELF_IP_CACHE
 
+def _root_domain(host):
+    """收敛到可注册域：dmcn2.679588.xyz → 679588.xyz。
+
+       多机聚合时同一个注册域下会冒出一堆子域（各节点域名、订阅域名、AdGuard DoT 的
+       <ClientID>.域名…），逐条写进规则里又长又重复，还全是同一个域。收敛成一条就够。
+
+       没有引 Public Suffix List（这脚本只用标准库、不为这点事联网），用常见的二级
+       公共后缀兜一下：xx.co.uk / xx.com.cn 这类取三段，其余取两段。判断不准的最坏
+       结果只是规则比需要的宽一点，而这几条现在插在 MATCH 上一层，前面任何自己写的
+       规则都盖得住它。"""
+    parts = [p for p in (host or "").strip(".").split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    second = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne"}
+    if len(parts[-1]) == 2 and parts[-2] in second:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
 def _direct_targets(nodes):
     """要直连的目标：本机 + 各节点服务器字面量。**有域名就用域名，没域名才落地 IP**——
        用域名时配置里不出现裸 IP（分享配置也不暴露真实 IP）；多机聚合后自动覆盖各成员机
        地址，挂着聚合代理管理任意一台，SSH/管理流量都走直连、不被重启核心掐断。
+       域名一律先收敛到注册域再去重：多机聚合时十几个子域其实就一两个域，写全了没意义。
        返回 [(kind, val)]，kind 为 'ip' 或 'domain'。"""
     out, seen = [], set()
     def add(kind, val):
         val = (val or "").strip()
+        if kind == "domain":
+            val = _root_domain(val)
         if val and val not in seen:
             seen.add(val); out.append((kind, val))
     h = (_host() or "").strip()                              # 本机：sub.host 存的是域名或 IP
@@ -1960,8 +1981,11 @@ def _direct_rule_text(kind, val):
        域名用后缀而不是精确匹配，是因为节点域名底下会长出子域名：AdGuard 的 DoT 要带
        ClientID 时用的是 <ID>.节点域名（见 adguard-dns.py 菜单 8）。精确匹配漏掉它，
        那条查询就会掉进 MATCH 走代理——绕一圈再回到自己的 VPS，多一跳，代理挂了还可能
-       连不上。用后缀只扩到「本节点域名及其子域」，不扩到整个注册域，以后在同一个域名下
-       挂想走代理的东西仍有余地。"""
+       连不上。
+
+       后缀取的是注册域（见 _root_domain），所以这一条会罩住整个域名下的全部子域。
+       代价是「想让某个子域走代理」不能靠这条规则让路——但这几条现在插在 MATCH 上一层，
+       把自己的分流规则写在前面就能盖过它。"""
     return f"IP-CIDR,{val}/32,DIRECT,no-resolve" if kind == "ip" else f"DOMAIN-SUFFIX,{val},DIRECT"
 
 def _ghrelay_token():
@@ -2099,13 +2123,29 @@ def _sr_selfdns(path, url):
         open(path, "w").write(new)
 
 def _mihomo_direct_ip(tpl, targets):
-    """mihomo：在 rules: 段顶部插本机/各 VPS 直连，避免挂本机代理管理时 SSH 被路由进代理。"""
+    """mihomo：把本机/各 VPS 直连插到 rules: 段的 MATCH 上一层，避免挂本机代理管理时
+       SSH 被路由进代理。
+
+       以前插在 rules: 最顶上，那几条就永远第一个命中：想给自己域名下的某个子域单独
+       分流（比如 blog.域名 走代理）根本写不了，写在下面永远够不着。放到 MATCH 上一层
+       之后，自己写的规则在前面都能盖过它，而没被任何规则命中的自建域名/IP 仍然被它兜住。
+
+       模板里没写 MATCH 就退回原来的行为（插在 rules: 顶部）——位置不理想，
+       总比整段规则丢掉强。"""
     if not targets or "rules:" not in tpl:
         return tpl
-    new = [f"  - {r}" for r in (_direct_rule_text(k, v) for k, v in targets) if r not in tpl]
-    if not new:
+    rules = [r for r in (_direct_rule_text(k, v) for k, v in targets) if r not in tpl]
+    if not rules:
         return tpl
-    return re.sub(r"(?m)^rules:[ \t]*$", "rules:\n" + "\n".join(new), tpl, count=1)
+    m = None
+    for m in re.finditer(r"(?m)^([ \t]*)-[ \t]*MATCH\b.*$", tpl):
+        pass                                   # 取最后一条 MATCH：兜底规则只可能在最末
+    if m:
+        indent = m.group(1)                    # 跟着 MATCH 那行的缩进走，别写死两个空格
+        block = "".join(f"{indent}- {r}\n" for r in rules)
+        return tpl[:m.start()] + block + tpl[m.start():]
+    return re.sub(r"(?m)^rules:[ \t]*$",
+                  "rules:\n" + "\n".join(f"  - {r}" for r in rules), tpl, count=1)
 
 def _sb_direct_ip(cfg, targets):
     """sing-box：把直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
@@ -2131,10 +2171,13 @@ def _sb_direct_ip(cfg, targets):
         if rule not in rules and rule not in add:
             add.append(rule)
     if add:
-        route["rules"] = add + rules
+        # 追加到最后而不是插到最前：sing-box 的兜底走 route.final、没有 MATCH 这一条，
+        # 排在末尾就等价于 mihomo 那边的「MATCH 上一层」——自己写的规则一律优先。
+        route["rules"] = rules + add
 
 def _sr_direct_ip(path, targets):
-    """Shadowrocket：在 [Rule] 段顶部插本机/各 VPS 直连。"""
+    """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。
+       没有 FINAL 就退回插在 [Rule] 顶部。"""
     if not targets:
         return
     try: tpl = open(path).read()
@@ -2142,7 +2185,14 @@ def _sr_direct_ip(path, targets):
     if "[Rule]" not in tpl:
         return
     new = [r for r in (_direct_rule_text(k, v) for k, v in targets) if r not in tpl]
-    if new:
+    if not new:
+        return
+    m = None
+    for m in re.finditer(r"(?m)^[ \t]*FINAL[ \t]*,.*$", tpl):
+        pass
+    if m:
+        open(path, "w").write(tpl[:m.start()] + "\n".join(new) + "\n" + tpl[m.start():])
+    else:
         open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + "\n".join(new), 1))
 
 def gen_mihomo(ylines, nodes, tpl_url):
