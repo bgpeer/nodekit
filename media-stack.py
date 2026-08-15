@@ -675,10 +675,32 @@ layout:
         href: {url_for(sub, port)}
         description: {'影视播放' if container == 'emby' else '网盘挂载'}
         siteMonitor: {monitor.get(container, f'http://{container}:{port}')}""")
+    # 三块系统资源各自单独成组：Homepage 的 label 是「给这一组起名」，写在同一个
+    # resources 块里只会出一个标题，所以拆成三块才能分别标上 CPU / 内存 / 硬盘。
+    #
+    # 标题里【不要】写核数、内存总量这类硬件数字。每台机器配置不一样，而写进
+    # widgets.yaml 的是生成那一刻的快照 —— 升配、换机之后不跑「更新」就一直是错的，
+    # 面板上摆一个错数字比不摆更糟。核数尤其没法做成实时的：Homepage 的
+    # /api/widgets/resources?type=cpu 只返回 usage 和 load，压根没有核数这个字段。
+    #
+    # expanded 让内存/硬盘除了「剩余」再显示「已用 / 总量」，CPU 多显示 load —— 这些
+    # 都是容器自己实时读的。硬盘那格万一又读不出来（显示 -），旁边还有总量兜底。
+    #
+    # 盯 /app/config 而不是 / ：容器里的 / 是 overlay，Homepage 官方文档写明要监控的
+    # 盘必须挂进容器。/app/config 是 {安装目录}/homepage/config 的 bind mount，
+    # df 出来是真实的块设备（/dev/vda1），读的就是宿主机根分区的容量。
     widgets = """- resources:
+    label: CPU
+    expanded: true
     cpu: true
+- resources:
+    label: 内存
+    expanded: true
     memory: true
-    disk: /
+- resources:
+    label: 硬盘
+    expanded: true
+    disk: /app/config
 - search:
     provider: duckduckgo
     target: _blank
