@@ -27,6 +27,7 @@ import string
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 SCRIPT_VERSION = "1.1.0"
@@ -2361,6 +2362,60 @@ def _short_err(s):
     return s[:70] + ("…" if len(s) > 70 else "")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随重定向 —— 要的就是那个 302 本身和它的 Location。"""
+    def redirect_request(self, *_a, **_kw):
+        return None
+
+
+def probe_302(key):
+    """真的发一次播放请求，看 MediaWarp 到底回不回 302、302 到哪。
+
+    这是整套东西唯一的端到端证明。前面那些检查(存储 work、能换到直链)都只说明
+    "零件是好的",而播放实际走哪条路要看这一下:
+      · 302 → 网盘 CDN     视频从网盘直达播放器,不经过本机 —— 这才是目的
+      · 302 → 内部地址     客户端根本连不上(raw_url: false 就是这个后果)
+      · 200 不是 302       MediaWarp 没拦住,视频要经过本机中转,吃你的带宽
+
+    返回 (state, 说明)。
+    """
+    if not key:
+        return "skip", "没有 Emby API Key"
+    try:
+        u = (f"http://127.0.0.1:8096/Items?Recursive=true&Limit=8"
+             f"&IncludeItemTypes=Movie,Episode&Fields=Path&api_key={key}")
+        with urllib.request.urlopen(u, timeout=20) as resp:
+            items = (json.load(resp).get("Items") or [])
+    except Exception as e:
+        return "skip", f"取不到媒体条目（{_short_err(e)}）"
+    item = next((i for i in items if STRM_PATH in str(i.get("Path", ""))), None)
+    if not item:
+        return "skip", "媒体库里还没有网盘条目"
+
+    iid = item.get("Id")
+    url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
+           f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(url, timeout=90) as resp:
+            # 没抛异常就是没重定向
+            return "bad", f"返回 {resp.status}，不是 302 —— 视频会经过本机中转"
+    except urllib.error.HTTPError as e:
+        if e.code not in (301, 302, 303, 307, 308):
+            return "bad", f"HTTP {e.code}（换直链失败时就是这样）"
+        loc = e.headers.get("Location", "")
+        host = loc.split("/")[2] if "://" in loc else loc[:40]
+        bare = host.split(":")[0]
+        internal = (bare in ("openlist", "emby", "mediawarp", "localhost")
+                    or _is_private_ip(bare))
+        if internal:
+            return "bad", f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
+        kind = "转码流" if ".m3u8" in loc else "原画"
+        return "ok", f"302 → {host}  {DIM}({kind}，直连网盘、不经过本机){RST}"
+    except Exception as e:
+        return "bad", _short_err(e)
+
+
 def _is_private_ip(ip):
     """内网 / 本机地址。这些是自己人（nginx 回环、docker 网段、家里局域网），不算外部访问。"""
     if ip.startswith(("127.", "10.", "192.168.", "169.254.", "::1", "fc", "fd")):
@@ -2557,6 +2612,21 @@ def do_healthcheck():
     except Exception as e:
         _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
+    # ---- 302 端到端 ----
+    st302, msg302 = probe_302(key)
+    _hc("302 直链", st302, msg302)
+    if st302 == "bad":
+        if "不是 302" in msg302:
+            todo.append(("MediaWarp 没有拦截播放请求，视频会经过本机中转",
+                         "检查 mediawarp/config.yaml 的 alist_strm.prefix_list "
+                         f"是不是 {STRM_PATH}，以及 strm 内容是不是纯路径"))
+        elif "内部地址" in msg302:
+            todo.append(("302 指向了容器内部地址，播放器连不上",
+                         "mediawarp/config.yaml 里 raw_url 要是 true；"
+                         "「6 更新」会重新生成这份配置"))
+        else:
+            todo.append(("302 没生成", "多半是上一行的换直链失败，等线路恢复再试"))
+
     if key:
         _hc("Emby API Key", "ok", "已填")
     else:
