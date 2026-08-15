@@ -2654,8 +2654,18 @@ def do_healthcheck():
                 _hc(f"列目录 {p}", "warn", f"{el:.1f} 秒  空目录")
                 todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
             else:
-                _hc(f"列目录 {p}", "ok", f"{el:.1f} 秒  {len(items)} 项")
+                # 列目录也要看耗时。以前只给「换直链」设了阈值,列目录无论多慢都判绿,
+                # 结果出现过「列目录 47.0 秒」和结论「全部正常」同屏 —— 那比不体检更误导。
+                # 而且这一项直接决定「生成媒体库」跑不跑得完:AutoFilm 每个目录都要列一次,
+                # 47 秒一个目录,几十个目录就必然半路超时(用户那些"扫到一半"就是这么来的)。
+                st = "ok" if el < 3 else ("warn" if el <= 15 else "bad")
+                extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 3 秒）")
+                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {len(items)} 项{extra}")
                 listed_ok.append((p, items))
+                if st == "bad":
+                    todo.append((f"列 {p} 用了 {el:.0f} 秒，「生成媒体库」很可能扫到一半就超时",
+                                 "网盘接口到本机的线路问题。把扫描路径收窄到具体的媒体目录"
+                                 "（3 后补参数 → 4 扫描路径），目录少了成功率高很多"))
         except Exception as e:
             _hc(f"列目录 {p}", "bad", _short_err(e))
 
