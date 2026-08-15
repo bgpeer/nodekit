@@ -2497,8 +2497,18 @@ def probe_302(key):
                     or _is_private_ip(bare))
         if internal:
             return "bad", f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
-        kind = "转码流" if ".m3u8" in loc else "原画"
-        return "ok", f"302 → {host}  {DIM}({kind}，直连网盘、不经过本机){RST}"
+        # 判断实际拿到的是原画还是转码流。光看 .m3u8 会判错:夸克的转码流地址是
+        # video-play-*.drive.quark.cn,并不一定以 m3u8 结尾,而原画是 dl-*。
+        # 实际就出现过「302 那行说原画、直链方式那行说转码流」自相矛盾。
+        # 认不出来的主机名就不瞎标 —— 报错的标签比没有标签更坏。
+        if ".m3u8" in loc or bare.startswith(("video-play", "play-")):
+            kind = "转码流"
+        elif bare.startswith(("dl-", "download")):
+            kind = "原画"
+        else:
+            kind = ""
+        tail = f"（{kind}，直连网盘、不经过本机）" if kind else "（直连网盘、不经过本机）"
+        return "ok", f"302 → {host}  {DIM}{tail}{RST}"
     except Exception as e:
         return "bad", _short_err(e)
 
@@ -2593,7 +2603,7 @@ def do_healthcheck():
         r = _ol_api("/api/auth/login", {"username": "admin", "password": pw}, timeout=30)
         token = (r.get("data") or {}).get("token", "")
         _hc("OpenList 登录", "ok" if token else "bad",
-            f"{time.monotonic() - t0:.1f}s" if token else f"{r.get('message', '没拿到 token')}")
+            f"{time.monotonic() - t0:.1f} 秒" if token else f"{r.get('message', '没拿到 token')}")
     except Exception as e:
         _hc("OpenList 登录", "bad", _short_err(e))
     if not token:
@@ -2601,6 +2611,7 @@ def do_healthcheck():
                      "看 docker logs --tail 50 openlist"))
 
     # ---- 存储 ----
+    stale_status = {}          # 挂载点 → 上次初始化时的报错（等实测结果出来再定性）
     stores = openlist_storages(d)
     if not stores:
         _hc("网盘存储", "bad", "一个都没有")
@@ -2609,15 +2620,14 @@ def do_healthcheck():
     for mp, drv, st, root in stores:
         bad_root = drv.lower().startswith("quark") or drv.lower().startswith("uc")
         if st != "work":
+            # status 是【存储初始化那一刻】写进去的,之后成功了也不会自动改回 work。
+            # 拿它当实时状态用,会把一条陈年记录报成当前故障 —— 实际就出现过
+            # 「存储 ✖ 网盘接口超时」和下一行「列目录 ✔ 22 项」自相矛盾。
+            # 所以这里只报为「上次初始化的记录」,真正的结论交给下面的实测,
+            # 并把它记下来,等实测结果出来再决定要不要进问题清单。
             brief = _short_err(st)
-            _hc(f"存储 {mp}", "bad", f"{drv}  {brief}")
-            if "超时" in brief or "解析失败" in brief or "拒绝" in brief:
-                todo.append((f"{mp} 连不上网盘接口（{brief}）",
-                             "线路问题，不是配置错了。等几分钟再跑一次体检；"
-                             "已生成的 strm 不受影响"))
-            else:
-                todo.append((f"{mp} 状态不是 work：{brief}",
-                             "去 OpenList 网页里看那个存储的完整报错"))
+            _hc(f"存储 {mp}", "warn", f"{drv}  {DIM}上次初始化时：{brief}{RST}")
+            stale_status[mp] = brief
         elif bad_root and (not root or "/" in root):
             _hc(f"存储 {mp}", "bad", f"{drv}  work  {RED}根文件夹ID={root or '空'}{RST}")
             todo.append((f"{mp} 的根文件夹ID 是 {root or '空'}，夸克要的是文件夹 ID",
@@ -2638,16 +2648,25 @@ def do_healthcheck():
             el = time.monotonic() - t0
             items = (r.get("data") or {}).get("content")
             if r.get("code") != 200:
-                _hc(f"列目录 {p}", "bad", f"{el:.1f}s  {r.get('message', '')[:40]}")
+                _hc(f"列目录 {p}", "bad", f"{el:.1f} 秒  {r.get('message', '')[:40]}")
                 todo.append((f"{p} 列不出来：{r.get('message', '')[:40]}", "见上面的存储检查"))
             elif not items:
-                _hc(f"列目录 {p}", "warn", f"{el:.1f}s  空目录")
+                _hc(f"列目录 {p}", "warn", f"{el:.1f} 秒  空目录")
                 todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
             else:
-                _hc(f"列目录 {p}", "ok", f"{el:.1f}s  {len(items)} 项")
+                _hc(f"列目录 {p}", "ok", f"{el:.1f} 秒  {len(items)} 项")
                 listed_ok.append((p, items))
         except Exception as e:
             _hc(f"列目录 {p}", "bad", _short_err(e))
+
+    # 存储 status 是陈旧记录，只有当【实测也失败】时才算真故障
+    live_ok = {p for p, _ in listed_ok}
+    for mp, brief in stale_status.items():
+        if any(p == mp or p.startswith(mp.rstrip("/") + "/") for p in live_ok):
+            continue                                   # 实际能列出来，那条记录已经过期了
+        todo.append((f"{mp} 连不上网盘接口（{brief}）",
+                     "线路问题，不是配置错了。等几分钟再跑一次体检；"
+                     "已生成的 strm 不受影响"))
 
     # ---- 换直链：整套东西最关键的一项 ----
     # 播放卡顿的根因几乎都在这:MediaWarp 每次要新地址都得让 OpenList 去网盘换一次,
@@ -2670,15 +2689,15 @@ def do_healthcheck():
             el = time.monotonic() - t0
             raw = (r.get("data") or {}).get("raw_url", "")
             if not raw:
-                _hc("换直链", "bad", f"{el:.1f}s  {r.get('message', '没拿到 raw_url')[:40]}")
+                _hc("换直链", "bad", f"{el:.1f} 秒  {r.get('message', '没拿到 raw_url')[:40]}")
                 todo.append(("换不到直链，302 不可能生效", "看 docker logs --tail 50 openlist"))
             elif el > 8:
-                _hc("换直链", "bad", f"{RED}{el:.1f}s{RST}  太慢  →  {raw.split('/')[2]}")
+                _hc("换直链", "bad", f"{RED}{el:.1f} 秒{RST}  太慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
                 todo.append((f"换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
                              "网盘接口到本机的线路问题，服务端改不了；"
                              "缓存已开 2h，同一部片只慢第一次"))
             elif el > 2:
-                _hc("换直链", "warn", f"{el:.1f}s  偏慢  →  {raw.split('/')[2]}")
+                _hc("换直链", "warn", f"{el:.1f} 秒  偏慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
             else:
                 _hc("换直链", "ok", f"{el:.1f}s  →  {raw.split('/')[2]}")
         except Exception as e:
@@ -2695,7 +2714,7 @@ def do_healthcheck():
                 f"http://127.0.0.1:{MEDIAWARP_PORT}/System/Info/Public", timeout=20) as resp:
             el = time.monotonic() - t0
             _hc("MediaWarp→Emby", "ok" if resp.status == 200 else "bad",
-                f"{el:.1f}s  HTTP {resp.status}")
+                f"{el:.1f} 秒  HTTP {resp.status}")
     except Exception as e:
         _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
@@ -2757,7 +2776,7 @@ def do_healthcheck():
     else:
         mins = int((time.time() - ka.get("ts", 0)) / 60)
         if ka.get("ok"):
-            _hc("链路保活", "ok", f"{mins} 分钟前成功，耗时 {ka.get('elapsed', 0)}s")
+            _hc("链路保活", "ok", f"{mins} 分钟前成功，耗时 {ka.get('elapsed', 0)} 秒")
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
