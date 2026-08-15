@@ -667,7 +667,9 @@ layout:
     for sub, port, container, label in SUBDOMAINS:
         if sub == "home":
             continue
-        icon = {"emby": "emby.png", "openlist": "alist.png"}.get(container, "")
+        # 用 openlist.png 而不是 alist.png：跑的是 OpenList，挂 Alist 的旧标不对。
+        # 两个图标在 homarr-labs/dashboard-icons 里都在，确认过 HTTP 200。
+        icon = {"emby": "emby.png", "openlist": "openlist.png"}.get(container, "")
         services.append(f"""    - {label}:
         icon: {icon}
         href: {url_for(sub, port)}
