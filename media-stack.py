@@ -1528,6 +1528,18 @@ def do_update():
             f.write(build_summary(cfg, colored=False) + "\n")
         os.chmod(cred, 0o600)
 
+    # 更新过程重启了容器，连接池被清空，这一刻链路是【冷的】——
+    # 不补这一下的话，更新完马上去播，第一部片八成要转圈几十秒，
+    # 而用户会以为是这次更新弄坏了什么。顺便也立刻验证网盘还通不通。
+    info("热一下网盘链路...")
+    do_keepalive()
+    ka = keepalive_state(d)
+    if ka.get("ok"):
+        ok(f"网盘链路已热好（{ka.get('elapsed', 0)}s），现在去播不会卡在开头")
+    elif ka:
+        warn(f"网盘暂时不通：{ka.get('error', '')}")
+        print(f"  {DIM}和这次更新无关，是线路问题。保活每 {KEEPALIVE_MIN} 分钟会自己重试。{RST}")
+
     print()
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
