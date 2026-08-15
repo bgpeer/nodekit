@@ -2915,9 +2915,16 @@ def do_healthcheck():
             try:
                 exp = time.mktime(time.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z"))
                 days = int((exp - time.time()) / 86400)
-                _hc("证书", "ok" if days > 14 else "warn", f"还有 {days} 天")
+                # 14 天这条线不是"快到期了提醒一下"，是"续期已经失败了"：
+                # acme.sh 默认剩 30 天就自动重签，还能看到 14 天说明那一步没跑成。
+                # 常见三种断法都写进 todo，省得用户以为只是还没到时候。
+                _hc("证书", "ok" if days > 14 else "bad", f"还有 {days} 天")
                 if days <= 14:
-                    todo.append((f"证书还有 {days} 天到期", "acme.sh 一般会自动续期，留意一下"))
+                    todo.append((f"证书只剩 {days} 天 —— acme.sh 剩 30 天就该自动续了，"
+                                 f"还能看到这个数说明续期已经失败",
+                                 "依次查：crontab -l | grep acme（cron 在不在）、"
+                                 "/root/.acme.sh/*/*.conf 里的 Le_ReloadCmd 和 "
+                                 "Le_RealFullChainPath、以及 Cloudflare Token 是不是换过了"))
             except ValueError:
                 _hc("证书", "skip", m.group(1).strip()[:40])
 
