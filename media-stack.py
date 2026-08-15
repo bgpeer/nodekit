@@ -675,10 +675,29 @@ layout:
         href: {url_for(sub, port)}
         description: {'影视播放' if container == 'emby' else '网盘挂载'}
         siteMonitor: {monitor.get(container, f'http://{container}:{port}')}""")
-    widgets = """- resources:
+    # 三块系统资源各自单独成组：Homepage 的 label 是「给这一组起名」，写在同一个
+    # resources 块里只会出一个标题，所以拆成三块才能分别标上 CPU / 内存 / 硬盘。
+    # 核数只能写死在标题里 —— Homepage 的 CPU 格子只渲染百分比，没有核数这个字段。
+    # 数字是生成配置时从宿主机读的，换配置后跑一次「更新」就会重新写。
+    cores = os.cpu_count() or 1
+    # expanded 让内存/硬盘除了「剩余」再显示「已用 / 总量」，不然只有一个 Free 数字，
+    # 坏掉的时候（显示 -）根本看不出它本来该是什么。
+    #
+    # 盯 /app/config 而不是 / ：容器里的 / 是 overlay，Homepage 官方文档写明要监控的
+    # 盘必须挂进容器。/app/config 是 {安装目录}/homepage/config 的 bind mount，
+    # df 出来是真实的块设备（/dev/vda1），读的就是宿主机根分区的容量。
+    widgets = f"""- resources:
+    label: CPU · {cores} 核
+    expanded: true
     cpu: true
+- resources:
+    label: 内存
+    expanded: true
     memory: true
-    disk: /
+- resources:
+    label: 硬盘
+    expanded: true
+    disk: /app/config
 - search:
     provider: duckduckgo
     target: _blank
