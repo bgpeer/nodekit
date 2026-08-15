@@ -2671,38 +2671,49 @@ def do_healthcheck():
     # ---- 换直链：整套东西最关键的一项 ----
     # 播放卡顿的根因几乎都在这:MediaWarp 每次要新地址都得让 OpenList 去网盘换一次,
     # 这个调用慢或超时,播放器就停在那儿等
-    strm = sorted(glob.glob(os.path.join(
-        read_env(os.path.join(d, ".env"), "DATA_ROOT") or os.path.join(d, "media"),
-        "strm", "**", "*.strm"), recursive=True))
+    # 按网盘分组各测一个:多盘的时候一个好一个坏,只测一个文件根本看不出来
+    # (以前取的是所有 strm 里字典序第一个,属于哪个盘全看运气)
+    by_mount = {}
+    for f in sorted(glob.glob(os.path.join(
+            read_env(os.path.join(d, ".env"), "DATA_ROOT") or os.path.join(d, "media"),
+            "strm", "**", "*.strm"), recursive=True)):
+        try:
+            fp = open(f, encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if not fp.startswith("/"):
+            continue
+        mount = "/" + fp.lstrip("/").split("/")[0]      # /quark/电影/x.mp4 → /quark
+        by_mount.setdefault(mount, fp)
     if not token:
         _hc("换直链", "skip", "OpenList 没登上")
-    elif not strm:
+    elif not by_mount:
         _hc("换直链", "skip", "还没有 strm 文件，无从测起")
-    else:
-        try:
-            fp = open(strm[0], encoding="utf-8").read().strip()
-        except OSError:
-            fp = ""
+    for mount, fp in list(by_mount.items())[:3]:       # 封顶 3 个,每个最坏要等半分钟
+        label = "换直链" if len(by_mount) == 1 else f"换直链 {mount}"
         t0 = time.monotonic()
         try:
             r = _ol_api("/api/fs/get", {"path": fp, "password": ""}, token)
             el = time.monotonic() - t0
             raw = (r.get("data") or {}).get("raw_url", "")
             if not raw:
-                _hc("换直链", "bad", f"{el:.1f} 秒  {r.get('message', '没拿到 raw_url')[:40]}")
-                todo.append(("换不到直链，302 不可能生效", "看 docker logs --tail 50 openlist"))
+                _hc(label, "bad", f"{el:.1f} 秒  {r.get('message', '没拿到 raw_url')[:40]}")
+                todo.append((f"{mount} 换不到直链，302 不可能生效",
+                             "看 docker logs --tail 50 openlist"))
             elif el > 8:
-                _hc("换直链", "bad", f"{RED}{el:.1f} 秒{RST}  太慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
-                todo.append((f"换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
+                _hc(label, "bad",
+                    f"{RED}{el:.1f} 秒{RST}  太慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
+                todo.append((f"{mount} 换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
                              "网盘接口到本机的线路问题，服务端改不了；"
                              "缓存已开 2h，同一部片只慢第一次"))
             elif el > 2:
-                _hc("换直链", "warn", f"{el:.1f} 秒  偏慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
+                _hc(label, "warn",
+                    f"{el:.1f} 秒  偏慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
             else:
-                _hc("换直链", "ok", f"{el:.1f}s  →  {raw.split('/')[2]}")
+                _hc(label, "ok", f"{el:.1f} 秒  →  {raw.split('/')[2]}")
         except Exception as e:
-            _hc("换直链", "bad", _short_err(e))
-            todo.append(("换直链失败，此刻播放会卡在开头",
+            _hc(label, "bad", _short_err(e))
+            todo.append((f"{mount} 换直链失败，此刻这个盘的片子会卡在开头",
                          "网盘接口不通（线路问题，不是配置错了）。"
                          "已生成的 strm 不受影响，等几分钟再跑一次体检"))
 
