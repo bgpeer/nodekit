@@ -48,6 +48,9 @@ ACME_CRT   = "/etc/ssl/sb/acme.crt"         # 节点的 acme 证书（判断有�
 DEFAULT_DIR   = "/opt/media-stack"
 NGX_SITE      = "/etc/nginx/conf.d/media-stack.conf"
 HTPASSWD_FILE = "/etc/nginx/.media-stack.htpasswd"
+# 媒体服务单独一份访问日志，「链路体检」靠它统计公网访问；
+# 和节点的日志混在一起就分不出是谁在敲哪个服务了
+NGX_ACCESS_LOG = "/var/log/nginx/media-stack.access.log"
 CLI_PATH      = "/usr/local/bin/media-stack"
 CLI_ALIAS     = "/usr/local/bin/emby"
 SNI_HTTPS_PORT_FALLBACK = 8443              # 和 xy-installer.py 的常量一致
@@ -714,6 +717,12 @@ server {{
     ssl_certificate     {cfg['crt']};
     ssl_certificate_key {cfg['key']};
 
+    # 单独一份访问日志:和节点的日志混在一起就分不出是谁在敲媒体服务了。
+    # 「5 链路体检」靠它统计有多少陌生外网 IP 访问过 —— 这几个服务是公网可达的,
+    # 拿到域名就能敲门,总得有个地方能看见。logrotate 的默认规则匹配
+    # /var/log/nginx/*.log,不用额外配置轮转。
+    access_log {NGX_ACCESS_LOG};
+
     client_max_body_size 0;
 {a}
     location / {{
@@ -1257,6 +1266,75 @@ def rebuild_cfg_from_disk(d):
     return cfg
 
 
+# 拉镜像失败时的兜底源。按顺序试,第一个成功就停。
+# 故意【不】改 /etc/docker/daemon.json 的 registry-mirrors —— 那要重启 dockerd,
+# 会把这台机器上跑着的节点容器一起带下来,为了拉个镜像不值当。
+# 这里的做法是直接从镜像站 docker pull,再 docker tag 回原名,compose 就能在本地找到。
+# 这些都是第三方公益站,会挂会换;挂了不影响正常流程,只是兜底失效。
+IMAGE_MIRRORS = [
+    ("ghcr.io/",  ["ghcr.nju.edu.cn/", "ghcr.m.daocloud.io/"]),
+    ("",          ["docker.m.daocloud.io/", "dockerproxy.net/", "docker.1ms.run/"]),
+]
+
+
+def compose_images(compose):
+    """从 compose 文件里抠出所有 image: 值。不引 PyYAML,只认自己生成的格式。"""
+    out = []
+    try:
+        with open(compose, encoding="utf-8") as f:
+            for ln in f:
+                m = re.match(r"^\s*image:\s*(\S+)\s*$", ln.split("#", 1)[0])
+                if m and m.group(1) not in out:
+                    out.append(m.group(1))
+    except OSError:
+        pass
+    return out
+
+
+def pull_via_mirror(image):
+    """从镜像站拉一个镜像并 tag 回原名。成功返回用到的镜像站前缀，失败返回 ''。"""
+    for prefix, mirrors in IMAGE_MIRRORS:
+        if prefix and not image.startswith(prefix):
+            continue
+        body = image[len(prefix):]                  # ghcr.io/a/b -> a/b
+        for mi in mirrors:
+            cand = mi + body
+            if sh(f"docker pull {cand}", timeout=900).returncode != 0:
+                continue
+            if sh(f"docker tag {cand} {image}", timeout=60).returncode == 0:
+                sh(f"docker rmi {cand}", timeout=120)   # 只留原名那份,别占两份空间
+                return mi
+        break                                       # 前缀匹配上了就只试它那组
+    return ""
+
+
+def pull_images(compose, env_file):
+    """拉镜像：先走正常渠道，失败了再逐个走镜像站兜底。全部成功返回 True。"""
+    info("拉取最新镜像...")
+    if subprocess.run(f"docker compose -f {compose} --env-file {env_file} pull",
+                      shell=True, timeout=1800).returncode == 0:
+        return True
+    warn("直连拉取失败，改从镜像站逐个试...")
+    failed = []
+    for img in compose_images(compose):
+        if sh(f"docker pull {img}", timeout=900).returncode == 0:
+            continue                                # 这个其实能拉，只是刚才某一个拖垮了整批
+        used = pull_via_mirror(img)
+        if used:
+            ok(f"{img}  {DIM}←{RST} {used}")
+        else:
+            failed.append(img)
+    if failed:
+        err("这几个镜像所有源都拉不下来：")
+        for f in failed:
+            print(f"     {f}")
+        print(f"  {DIM}镜像站是第三方公益服务，会挂会换。可以过一阵再试，"
+              f"或者手动 docker pull 之后再跑更新。{RST}")
+        return False
+    ok("镜像已就绪（部分走了镜像站）")
+    return True
+
+
 def self_update():
     """把脚本自己换成仓库里的最新版；换过了返回 True，调用方应立刻 re-exec。
 
@@ -1313,11 +1391,8 @@ def do_update():
 
     # 镜像拉不动就跳过，不再 return —— 跨境网络本来就时好时坏，
     # 而下面重刷配置才是修 bug 的那一步，不该被一次拉取失败连坐掉。
-    info("拉取最新镜像...")
-    r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} pull",
-                       shell=True, timeout=1800)
-    if r.returncode != 0:
-        warn("拉取镜像失败（网络问题居多），跳过换镜像，继续刷新配置。")
+    if not pull_images(compose, env_file):
+        warn("镜像没拉全，跳过换镜像，继续刷新配置。")
     else:
         info("用新镜像重启容器...")
         r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
@@ -2286,6 +2361,44 @@ def _short_err(s):
     return s[:70] + ("…" if len(s) > 70 else "")
 
 
+def _is_private_ip(ip):
+    """内网 / 本机地址。这些是自己人（nginx 回环、docker 网段、家里局域网），不算外部访问。"""
+    if ip.startswith(("127.", "10.", "192.168.", "169.254.", "::1", "fc", "fd")):
+        return True
+    if ip.startswith("172."):
+        try:
+            return 16 <= int(ip.split(".")[1]) <= 31
+        except (IndexError, ValueError):
+            return False
+    return False
+
+
+def public_visitors(limit=20000):
+    """从媒体服务自己那份 nginx 访问日志里，统计非内网来源的 IP。
+
+    为什么值得看:emby / list / home 这三个子域是公网可达的,任何人拿到域名就能敲门。
+    Homepage 有 Basic Auth,但 Emby 和 OpenList 走的是它们自己的登录页 —— 有没有人在
+    外面试,只有日志知道。
+
+    返回 (总请求数, [(ip, 次数), ...] 按次数降序)；日志不存在返回 (0, [])。
+    """
+    hits = {}
+    total = 0
+    for path in (NGX_ACCESS_LOG, NGX_ACCESS_LOG + ".1"):
+        try:
+            with open(path, errors="replace") as f:
+                lines = f.readlines()[-limit:]      # 只看最近的，日志可能很大
+        except OSError:
+            continue
+        for ln in lines:
+            ip = ln.split(" ", 1)[0].strip()
+            if not ip or _is_private_ip(ip):
+                continue
+            total += 1
+            hits[ip] = hits.get(ip, 0) + 1
+    return total, sorted(hits.items(), key=lambda kv: -kv[1])
+
+
 def _ol_api(path, body, token=None, timeout=60):
     req = urllib.request.Request(
         f"http://127.0.0.1:{OPENLIST_PORT}{path}",
@@ -2476,6 +2589,26 @@ def do_healthcheck():
         cur = lms[0][3]
         _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
                              f"{DIM}（卡顿就去 3 后补参数 → 3 切换）{RST}")
+    # ---- 公网访问 ----
+    if cfg["has_domain"]:
+        if os.path.exists(NGX_ACCESS_LOG):
+            total, tops = public_visitors()
+            if not tops:
+                _hc("公网访问", "ok", "最近没有外网 IP 访问过")
+            else:
+                head = "、".join(f"{ip}({n}次)" for ip, n in tops[:3])
+                # 只是提示，不判错:自己在外面用手机看片也会记在这里
+                _hc("公网访问", "warn" if len(tops) > 3 else "ok",
+                    f"{len(tops)} 个外网 IP / {total} 次请求")
+                print(f"    {pad('', 20)}{DIM}最多的：{head}{RST}")
+                if len(tops) > 3:
+                    todo.append((f"有 {len(tops)} 个不同的外网 IP 访问过媒体服务",
+                                 "自己在外面用手机看也会记在这里；"
+                                 "认不出来的话去 Emby/OpenList 改密码，"
+                                 f"完整日志 {NGX_ACCESS_LOG}"))
+        else:
+            _hc("公网访问", "skip", f"还没有日志（下次「6 更新」刷新 nginx 配置后就有）")
+
     if cfg["has_domain"] and os.path.exists(cfg["crt"]):
         r = sh(f"openssl x509 -enddate -noout -in {cfg['crt']}", timeout=20)
         m = re.search(r"notAfter=(.+)", r.stdout or "")
