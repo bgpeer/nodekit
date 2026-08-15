@@ -980,6 +980,79 @@ esac
 '''
 
 
+KEEPALIVE_CRON = "/etc/cron.d/media-stack-keepalive"
+KEEPALIVE_MIN  = 20                     # 每 20 分钟一次 ≈ 72 次/天，对网盘很温和
+
+
+def keepalive_state(d):
+    try:
+        with open(os.path.join(d, "keepalive.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def do_keepalive():
+    """给网盘链路保温：定时做一次真实的目录列举，把 token 和连接先热好。
+
+    为什么需要:冷启动的第一次播放要等 OpenList 去网盘刷 access_token、再换直链,
+    在跨境线路上这一下要十几秒到半分钟,表现就是"点开一直转圈打不开"。而只要最近
+    有过一次成功调用,后面就都是零点几秒 —— 用户自己摸索出的"先去挂载里点一下唤醒"
+    就是在手动做这件事。
+
+    交给定时任务做,把那半分钟的等待挪到没人看片的时候。输出写进 json 给体检读,
+    不往日志里堆东西。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    cfg = rebuild_cfg_from_disk(d)
+    pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                  fallback=os.path.join(d, ".env"))
+    rec = {"ts": int(time.time()), "ok": False, "elapsed": 0.0, "error": ""}
+    t0 = time.monotonic()
+    try:
+        tok = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+                       timeout=30).get("data") or {}).get("token", "")
+        if not tok:
+            raise RuntimeError("登录失败")
+        # 只列第一条扫描路径就够:目的是让 token 和到网盘的连接活着,不是把库扫一遍
+        p = (cfg["scan_paths"] or ["/"])[0]
+        r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
+                                     "per_page": 1}, tok, timeout=120)
+        if r.get("code") != 200:
+            raise RuntimeError(r.get("message", "list 失败")[:60])
+        rec["ok"] = True
+    except Exception as e:
+        rec["error"] = _short_err(e)
+    rec["elapsed"] = round(time.monotonic() - t0, 1)
+    try:
+        with open(os.path.join(d, "keepalive.json"), "w") as f:
+            json.dump(rec, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def install_keepalive(install_dir):
+    """装保活定时任务。用 cron.d 而不是 crontab -e：这样卸载时删一个文件就干净了。"""
+    try:
+        txt = (f"# media-stack 网盘链路保活：每 {KEEPALIVE_MIN} 分钟做一次目录列举，\n"
+               f"# 把 token 和连接热着，避免第一次播放卡在「换直链」上转圈。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               # 指向当前正在跑的这份脚本：「更新」是原地替换这个文件的，
+               # 所以 cron 会一直调到最新版，不用回来改这条
+               f"*/{KEEPALIVE_MIN} * * * * root python3 {os.path.realpath(__file__)} "
+               "keepalive >/dev/null 2>&1\n")
+        with open(KEEPALIVE_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(KEEPALIVE_CRON, 0o644)
+        return True
+    except OSError as e:
+        warn(f"装保活定时任务失败（不影响使用）：{e}")
+        return False
+
+
 def install_cli(install_dir):
     with open(CLI_PATH, "w") as f:
         f.write(CLI_TEMPLATE.replace("__DIR__", install_dir))
@@ -1429,6 +1502,7 @@ def do_update():
     # CLI 也要跟着换:它是脚本生成的,里面的命令逻辑会随版本变
     # (比如 strm 从"只重启容器"改成"真的跑一次任务")。不重装一遍就拿不到。
     install_cli(d)
+    install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
 
     if cfg["homepage"]:
         info("刷新 Homepage 导航配置...")
@@ -1488,7 +1562,7 @@ def do_uninstall():
             ok("已移除 nginx 站点配置")
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
-    for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE):
+    for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE, KEEPALIVE_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -1720,6 +1794,7 @@ DOMAIN={cfg['domain']}
 
     # ---- 管理命令 ----
     install_cli(cfg["install_dir"])
+    install_keepalive(cfg["install_dir"])
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
     save_ms_state(cfg["install_dir"], scan_spec=cfg["scan_spec"])
@@ -2659,6 +2734,22 @@ def do_healthcheck():
         cur = lms[0][3]
         _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
                              f"{DIM}（卡顿就去 3 后补参数 → 3 切换）{RST}")
+    # ---- 保活 ----
+    ka = keepalive_state(d)
+    if not os.path.exists(KEEPALIVE_CRON):
+        _hc("链路保活", "warn", "没装 —— 冷启动第一次播放会转圈几十秒")
+        todo.append(("保活定时任务没装",
+                     "跑一次「6 更新」会自动补上"))
+    elif not ka:
+        _hc("链路保活", "skip", f"已装，还没跑过（每 {KEEPALIVE_MIN} 分钟一次）")
+    else:
+        mins = int((time.time() - ka.get("ts", 0)) / 60)
+        if ka.get("ok"):
+            _hc("链路保活", "ok", f"{mins} 分钟前成功，耗时 {ka.get('elapsed', 0)}s")
+        else:
+            _hc("链路保活", "warn",
+                f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
+
     # ---- 公网访问 ----
     if cfg["has_domain"]:
         if os.path.exists(NGX_ACCESS_LOG):
@@ -2760,6 +2851,8 @@ if __name__ == "__main__":
             show_info()
         elif arg in ("check", "doctor", "healthcheck"):
             do_healthcheck()
+        elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
+            do_keepalive()
         elif arg == "update":
             do_update()
         elif arg in ("apikey", "key"):
