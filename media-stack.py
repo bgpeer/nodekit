@@ -2127,6 +2127,17 @@ def do_strm():
     print(f"  {BOLD}Emby 媒体库要指向的路径{RST}（容器内路径，不是宿主机路径）：")
     print(f"      {CYAN}{BOLD}{STRM_PATH}{RST}")
     print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 → 内容类型选「电影」→ 文件夹填上面这个{RST}")
+    # 刮不出海报的两个高频原因,都在建库那一屏,建完再回头改很麻烦
+    print(f"  {YELLOW}同一屏里还要改两处，不然刮不出海报：{RST}")
+    # 这里【只是提示】,脚本不碰 Emby 的媒体库设置(体检那段也只读不写)。
+    # 语言不是硬规定:它决定刮回来的标题/简介用哪种语言显示,不限制能刮哪国的片子。
+    # 会出事的只有「文件名是中文 + 语言按英文搜」这一种组合。
+    print(f"  {DIM}·{RST} 首选语言{BOLD}别留空{RST}"
+          f"{DIM} —— 留空按服务器默认（通常英文）去 TMDb 搜，中文片名一条都搜不到。{RST}")
+    print(f"    {DIM}片名是中文就选中文/中国。这只影响标题简介显示成哪种语言，"
+          f"不限制能刮哪国的片子，随时能在 Emby 里改。{RST}")
+    print(f"  {DIM}·{RST} 片子文件名要像 {BOLD}流浪地球 (2019).mkv{RST}"
+          f"{DIM} —— 带发布组标记的（[BT]xxx.1080p.WEB-DL-YYY）Emby 解析不出片名{RST}")
 
 
 def write_secret(path, key, value):
@@ -2367,8 +2378,9 @@ def set_scan_paths():
     else:
         print(f"  {DIM}OpenList 里还没挂任何网盘。{RST}")
     print()
-    print(f"  {DIM}填一条（/quark）、多条逗号隔开（/quark,/aliyun）、"
+    print(f"  {DIM}填一条（/quark/电影）、多条逗号隔开（/quark/电影,/quark/剧集）、"
           f"或 {RST}{BOLD}y{RST}{DIM} 自动跟随已挂载的存储。回车不改。{RST}")
+    print(f"  {YELLOW}填到影视目录那一层，别填网盘根目录{RST}{DIM} —— 原因见确认前的提示。{RST}")
     spec = parse_scan_spec(ask("扫描路径", ""))
     if not spec:
         print("没有改动。")
@@ -2387,6 +2399,21 @@ def set_scan_paths():
         if unknown:
             warn(f"这些路径不在已挂载的存储里：{'、'.join(unknown)}")
             print(f"  {DIM}拼错了或者还没在 OpenList 里挂上，扫的时候会被跳过。{RST}")
+
+    # 扫网盘根目录是个大坑,而且是「看起来成功了」的那种坑:
+    #   1. 整个盘都会被镜像成 strm —— 手机备份、微信截图、扫描件、壁纸全堆进媒体库,
+    #      Emby 把每个目录当成一部电影去 TMDb 搜,搜不到,于是"有条目没海报"
+    #   2. download.image 会把网盘里【所有】图片真的下载到 VPS 本地(不只是影视封面),
+    #      小盘 VPS 会被自己的相册备份撑爆
+    # 实测扫 /quark 生成 61 个 strm,其中只有 3 个跟影视沾边。
+    bare = [p for p in paths if p.strip("/").count("/") == 0]
+    if bare:
+        warn(f"{'、'.join(bare)} 是网盘根目录 —— 整个盘都会被扫进来")
+        print(f"  {DIM}手机备份、截图、扫描件都会变成 strm 堆在媒体库里，Emby 拿这些去")
+        print(f"  刮削当然搜不到，表现就是「有一堆条目、全都没有海报」。{RST}")
+        print(f"  {DIM}而且图片会{RST}真的下载到 VPS 本地{DIM}占硬盘，不只是影视封面。{RST}")
+        print(f"  {DIM}建议填到影视目录那一层，比如 {RST}{BOLD}{bare[0]}/电影{RST}")
+
     if not ask_yn("确认改成上面这些？", True):
         print("没有改动。")
         return
@@ -2811,6 +2838,19 @@ def do_healthcheck():
             if not hit:
                 todo.append((f"Emby 里没有指向 {STRM_PATH} 的媒体库",
                              f"Emby → 设置 → 媒体库 → 添加，路径填 {STRM_PATH}"))
+
+            # 元数据语言留空 = 跟服务器默认走(通常是 en)。中文片名拿去 TMDb 的英文
+            # 索引里搜是搜不到的,表现为「条目都在、一张海报都没有」,而且这个设置藏在
+            # 建库那一屏里,建完之后基本没人会回去看,所以单独拎出来报一条。
+            noln = [lb.get("Name") or "?" for lb in libs
+                    if not (lb.get("LibraryOptions") or {}).get("PreferredMetadataLanguage")]
+            if noln:
+                _hc("刮削语言", "warn", f"{'、'.join(noln)} 没设语言  {YELLOW}中文片名搜不到{RST}")
+                todo.append((f"媒体库「{noln[0]}」的元数据语言是空的，会按服务器默认（通常英文）搜",
+                             "Emby → 设置 → 媒体库 → 点该库 → 首选语言按片名的语种选"
+                             "（中文片名就选中文/中国），再「扫描媒体库文件」"))
+            else:
+                _hc("刮削语言", "ok", "都设了")
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
 
