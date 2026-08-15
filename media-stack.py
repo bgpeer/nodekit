@@ -16,6 +16,7 @@
 #  也可直接指定动作：install / info / update / uninstall
 #      sudo python3 media-stack.py info
 # ============================================================================
+import glob
 import json
 import os
 import re
@@ -2258,6 +2259,219 @@ def params_menu():
         ask("\n按回车返回...")
 
 
+# ============================================================================ 链路体检
+def _hc(label, state, detail=""):
+    icon = {"ok": f"{GREEN}✔{RST}", "warn": f"{YELLOW}⚠{RST}",
+            "bad": f"{RED}✖{RST}", "skip": f"{DIM}—{RST}"}[state]
+    print(f"    {pad(label, 20)}{icon}  {detail}")
+
+
+def _ol_api(path, body, token=None, timeout=60):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{OPENLIST_PORT}{path}",
+        data=json.dumps(body).encode(), method="POST",
+        headers={"Content-Type": "application/json",
+                 **({"Authorization": token} if token else {})})
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
+def do_healthcheck():
+    """把整条链路挨个打一遍，每项报耗时和结论。
+
+    为什么需要这个:这套东西的失败模式几乎全是「看起来正常、实际是废的」——
+    存储状态 work 但根目录ID 填错所以目录是空的;strm 生成了但 mode 错了所以 302
+    永远失败;302 成功了但换一次直链要 30 秒所以播放卡在开头。每一个都只能靠翻
+    容器日志一层层挖,而日志里那句真正的报错往往被几百行访问日志淹掉。
+
+    这里的每一项都对应一个真实踩过的坑,不是凭空设计的检查表。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    cfg = rebuild_cfg_from_disk(d)
+    todo = []                      # 收集「发现的问题 + 该怎么办」，最后统一打印
+
+    print("\n" + "=" * 60)
+    print(f"  {BOLD}链路体检{RST}   {DIM}每一项都对应一个真实卡过的地方{RST}")
+    print("=" * 60)
+
+    # ---- 容器 ----
+    want = ["emby", "openlist", "mediawarp", "autofilm"]
+    if cfg["homepage"]:
+        want.append("homepage")
+    running = (sh("docker ps --format '{{.Names}}'", timeout=30).stdout or "").split()
+    dead = [c for c in want if c not in running]
+    if dead:
+        _hc("容器", "bad", f"{len(want) - len(dead)}/{len(want)} 在跑，"
+                           f"{RED}没起来：{' '.join(dead)}{RST}")
+        todo.append(("容器没起全", f"docker compose -f {d}/docker-compose.yml up -d"))
+    else:
+        _hc("容器", "ok", f"{len(want)}/{len(want)} 在跑")
+
+    # ---- OpenList 登录 ----
+    pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                  fallback=os.path.join(d, ".env"))
+    token = ""
+    t0 = time.monotonic()
+    try:
+        r = _ol_api("/api/auth/login", {"username": "admin", "password": pw}, timeout=30)
+        token = (r.get("data") or {}).get("token", "")
+        _hc("OpenList 登录", "ok" if token else "bad",
+            f"{time.monotonic() - t0:.1f}s" if token else f"{r.get('message', '没拿到 token')}")
+    except Exception as e:
+        _hc("OpenList 登录", "bad", str(e)[:60])
+    if not token:
+        todo.append(("OpenList 登不上，后面几项没法测",
+                     "看 docker logs --tail 50 openlist"))
+
+    # ---- 存储 ----
+    stores = openlist_storages(d)
+    if not stores:
+        _hc("网盘存储", "bad", "一个都没有")
+        todo.append(("OpenList 里还没挂网盘",
+                     "浏览器打开 OpenList → 存储 → 添加"))
+    for mp, drv, st, root in stores:
+        bad_root = drv.lower().startswith("quark") or drv.lower().startswith("uc")
+        if st != "work":
+            _hc(f"存储 {mp}", "bad", f"{drv}  状态 {st}")
+            todo.append((f"{mp} 状态不是 work", "去 OpenList 里看那个存储的报错"))
+        elif bad_root and (not root or "/" in root):
+            _hc(f"存储 {mp}", "bad", f"{drv}  work  {RED}根文件夹ID={root or '空'}{RST}")
+            todo.append((f"{mp} 的根文件夹ID 是 {root or '空'}，夸克要的是文件夹 ID",
+                         "OpenList → 存储 → 编辑 → 根文件夹ID 填 0 → 全部重新加载"))
+        else:
+            _hc(f"存储 {mp}", "ok", f"{drv}  work" + (f"  根目录ID={root}" if root else ""))
+
+    # ---- 列目录 ----
+    listed_ok = []
+    for p in (cfg["scan_paths"] or [])[:5]:            # 最多测 5 条，别把体检拖太久
+        if not token:
+            _hc(f"列目录 {p}", "skip", "OpenList 没登上")
+            continue
+        t0 = time.monotonic()
+        try:
+            r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
+                                         "per_page": 0}, token)
+            el = time.monotonic() - t0
+            items = (r.get("data") or {}).get("content")
+            if r.get("code") != 200:
+                _hc(f"列目录 {p}", "bad", f"{el:.1f}s  {r.get('message', '')[:40]}")
+                todo.append((f"{p} 列不出来：{r.get('message', '')[:40]}", "见上面的存储检查"))
+            elif not items:
+                _hc(f"列目录 {p}", "warn", f"{el:.1f}s  空目录")
+                todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
+            else:
+                _hc(f"列目录 {p}", "ok", f"{el:.1f}s  {len(items)} 项")
+                listed_ok.append((p, items))
+        except Exception as e:
+            _hc(f"列目录 {p}", "bad", str(e)[:50])
+
+    # ---- 换直链：整套东西最关键的一项 ----
+    # 播放卡顿的根因几乎都在这:MediaWarp 每次要新地址都得让 OpenList 去网盘换一次,
+    # 这个调用慢或超时,播放器就停在那儿等
+    strm = sorted(glob.glob(os.path.join(
+        read_env(os.path.join(d, ".env"), "DATA_ROOT") or os.path.join(d, "media"),
+        "strm", "**", "*.strm"), recursive=True))
+    if not token:
+        _hc("换直链", "skip", "OpenList 没登上")
+    elif not strm:
+        _hc("换直链", "skip", "还没有 strm 文件，无从测起")
+    else:
+        try:
+            fp = open(strm[0], encoding="utf-8").read().strip()
+        except OSError:
+            fp = ""
+        t0 = time.monotonic()
+        try:
+            r = _ol_api("/api/fs/get", {"path": fp, "password": ""}, token)
+            el = time.monotonic() - t0
+            raw = (r.get("data") or {}).get("raw_url", "")
+            if not raw:
+                _hc("换直链", "bad", f"{el:.1f}s  {r.get('message', '没拿到 raw_url')[:40]}")
+                todo.append(("换不到直链，302 不可能生效", "看 docker logs --tail 50 openlist"))
+            elif el > 8:
+                _hc("换直链", "bad", f"{RED}{el:.1f}s{RST}  太慢  →  {raw.split('/')[2]}")
+                todo.append((f"换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
+                             "网盘接口到本机的线路问题，服务端改不了；"
+                             "缓存已开 2h，同一部片只慢第一次"))
+            elif el > 2:
+                _hc("换直链", "warn", f"{el:.1f}s  偏慢  →  {raw.split('/')[2]}")
+            else:
+                _hc("换直链", "ok", f"{el:.1f}s  →  {raw.split('/')[2]}")
+        except Exception as e:
+            _hc("换直链", "bad", str(e)[:50])
+            todo.append(("换直链失败", "网盘接口不通，稍后再试"))
+
+    # ---- MediaWarp ----
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{MEDIAWARP_PORT}/System/Info/Public", timeout=20) as resp:
+            el = time.monotonic() - t0
+            _hc("MediaWarp→Emby", "ok" if resp.status == 200 else "bad",
+                f"{el:.1f}s  HTTP {resp.status}")
+    except Exception as e:
+        _hc("MediaWarp→Emby", "bad", str(e)[:50])
+        todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
+    if key:
+        _hc("Emby API Key", "ok", "已填")
+    else:
+        _hc("Emby API Key", "bad", "空 —— 302 不会生效")
+        todo.append(("MediaWarp 没有 Emby API Key", "3 后补参数 → 1 添加 API 密钥"))
+
+    # ---- strm / 媒体库 ----
+    n = strm_count(d)
+    _hc("strm 文件", "ok" if n else "bad", f"{n} 个" if n else "0 个 —— Emby 里一定是空的")
+    if not n:
+        todo.append(("一个 strm 都没有", "先确认上面的列目录正常，再点「4 生成媒体库」"))
+    if key:
+        try:
+            u = (f"http://127.0.0.1:8096/Library/VirtualFolders?api_key={key}")
+            with urllib.request.urlopen(u, timeout=20) as resp:
+                libs = json.load(resp)
+            paths = [p for lb in libs for p in (lb.get("Locations") or [])]
+            hit = any(STRM_PATH in p or p in STRM_PATH for p in paths)
+            _hc("Emby 媒体库", "ok" if hit else "warn",
+                f"{len(libs)} 个库" + ("" if hit else f"  {YELLOW}没有指向 {STRM_PATH}{RST}"))
+            if not hit:
+                todo.append((f"Emby 里没有指向 {STRM_PATH} 的媒体库",
+                             f"Emby → 设置 → 媒体库 → 添加，路径填 {STRM_PATH}"))
+        except Exception as e:
+            _hc("Emby 媒体库", "warn", str(e)[:50])
+
+    # ---- 直链方式 / 证书 ----
+    lms = link_method_storages(d)
+    if lms:
+        cur = lms[0][3]
+        _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
+                             f"{DIM}（卡顿就去 3 后补参数 → 3 切换）{RST}")
+    if cfg["has_domain"] and os.path.exists(cfg["crt"]):
+        r = sh(f"openssl x509 -enddate -noout -in {cfg['crt']}", timeout=20)
+        m = re.search(r"notAfter=(.+)", r.stdout or "")
+        if m:
+            try:
+                exp = time.mktime(time.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z"))
+                days = int((exp - time.time()) / 86400)
+                _hc("证书", "ok" if days > 14 else "warn", f"还有 {days} 天")
+                if days <= 14:
+                    todo.append((f"证书还有 {days} 天到期", "acme.sh 一般会自动续期，留意一下"))
+            except ValueError:
+                _hc("证书", "skip", m.group(1).strip()[:40])
+
+    print("=" * 60)
+    if todo:
+        print(f"\n  {YELLOW}{BOLD}发现 {len(todo)} 个问题{RST}")
+        for i, (what, how) in enumerate(todo, 1):
+            print(f"  {i}. {what}")
+            print(f"     {DIM}→ {how}{RST}")
+    else:
+        print(f"\n  {GREEN}{BOLD}全部正常。{RST}"
+              f"{DIM}播放仍然卡的话，多半是播放设备到网盘那条线，不在服务器这边。{RST}")
+    print()
+
+
 def main_menu():
     require_root()
     while True:
@@ -2276,8 +2490,9 @@ def main_menu():
         # 装完网盘还没挂，所以这一步只能等用户在 OpenList 里挂好之后自己点。
         # 没有这个按钮的话，不敲命令的人就卡在「OpenList 里有文件、Emby 里空的」
         print("  4. 生成媒体库（网盘挂好后点这个，Emby 才看得到片子）")
-        print("  5. 更新（拉最新镜像 + 按新版本刷新配置）")
-        print("  6. 卸载")
+        print("  5. 链路体检（卡住 / 不出片子时先跑这个）")
+        print("  6. 更新（拉最新镜像 + 按新版本刷新配置）")
+        print("  7. 卸载")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -2293,8 +2508,10 @@ def main_menu():
         elif c == "4":
             do_strm()
         elif c == "5":
-            do_update()
+            do_healthcheck()
         elif c == "6":
+            do_update()
+        elif c == "7":
             do_uninstall()
         else:
             print("无效选择。")
@@ -2309,6 +2526,8 @@ if __name__ == "__main__":
             do_uninstall()
         elif arg == "info":
             show_info()
+        elif arg in ("check", "doctor", "healthcheck"):
+            do_healthcheck()
         elif arg == "update":
             do_update()
         elif arg in ("apikey", "key"):
