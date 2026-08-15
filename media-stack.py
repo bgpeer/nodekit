@@ -2129,8 +2129,13 @@ def do_strm():
     print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 → 内容类型选「电影」→ 文件夹填上面这个{RST}")
     # 刮不出海报的两个高频原因,都在建库那一屏,建完再回头改很麻烦
     print(f"  {YELLOW}同一屏里还要改两处，不然刮不出海报：{RST}")
-    print(f"  {DIM}·{RST} 首选语言选{BOLD}中文{RST}、国家/地区选{BOLD}中国{RST}"
-          f"{DIM} —— 留空会按英文去 TMDb 搜，中文片名一条都搜不到{RST}")
+    # 这里【只是提示】,脚本不碰 Emby 的媒体库设置(体检那段也只读不写)。
+    # 语言不是硬规定:它决定刮回来的标题/简介用哪种语言显示,不限制能刮哪国的片子。
+    # 会出事的只有「文件名是中文 + 语言按英文搜」这一种组合。
+    print(f"  {DIM}·{RST} 首选语言{BOLD}别留空{RST}"
+          f"{DIM} —— 留空按服务器默认（通常英文）去 TMDb 搜，中文片名一条都搜不到。{RST}")
+    print(f"    {DIM}片名是中文就选中文/中国。这只影响标题简介显示成哪种语言，"
+          f"不限制能刮哪国的片子，随时能在 Emby 里改。{RST}")
     print(f"  {DIM}·{RST} 片子文件名要像 {BOLD}流浪地球 (2019).mkv{RST}"
           f"{DIM} —— 带发布组标记的（[BT]xxx.1080p.WEB-DL-YYY）Emby 解析不出片名{RST}")
 
@@ -2841,9 +2846,9 @@ def do_healthcheck():
                     if not (lb.get("LibraryOptions") or {}).get("PreferredMetadataLanguage")]
             if noln:
                 _hc("刮削语言", "warn", f"{'、'.join(noln)} 没设语言  {YELLOW}中文片名搜不到{RST}")
-                todo.append((f"媒体库「{noln[0]}」的元数据语言是空的，中文片名刮不出海报",
-                             "Emby → 设置 → 媒体库 → 点该库 → 首选语言选中文、地区选中国，"
-                             "再「扫描媒体库文件」"))
+                todo.append((f"媒体库「{noln[0]}」的元数据语言是空的，会按服务器默认（通常英文）搜",
+                             "Emby → 设置 → 媒体库 → 点该库 → 首选语言按片名的语种选"
+                             "（中文片名就选中文/中国），再「扫描媒体库文件」"))
             else:
                 _hc("刮削语言", "ok", "都设了")
         except Exception as e:
