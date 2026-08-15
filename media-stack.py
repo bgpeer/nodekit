@@ -1016,10 +1016,15 @@ def do_keepalive():
                        timeout=30).get("data") or {}).get("token", "")
         if not tok:
             raise RuntimeError("登录失败")
-        # 只列第一条扫描路径就够:目的是让 token 和到网盘的连接活着,不是把库扫一遍
+        # refresh: true 是关键 —— 不加的话 OpenList 直接返回目录缓存、根本不联网,
+        # 保活就成了每 20 分钟读一次本地缓存的空转。实测过:那种保活记录的耗时是
+        # 0.0 秒,而下一次真正联网的调用照样要等三十几秒。
+        # 那三十几秒是跨境建连接的固定成本(体检里"谁先碰网络谁付这个钱"的现象),
+        # 只有真发一次网络请求才能把它提前付掉。
         p = (cfg["scan_paths"] or ["/"])[0]
         r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
-                                     "per_page": 1}, tok, timeout=120)
+                                     "per_page": 1, "refresh": True},
+                    tok, timeout=180)
         if r.get("code") != 200:
             raise RuntimeError(r.get("message", "list 失败")[:60])
         rec["ok"] = True
@@ -2643,8 +2648,13 @@ def do_healthcheck():
             continue
         t0 = time.monotonic()
         try:
+            # refresh: true —— 不加的话 OpenList 直接返回目录缓存,这一行永远是 0.0 秒,
+            # 那个数字对判断链路好坏毫无意义。实测同一台机器三次体检:列目录
+            # 0.0 / 47.0 / 0.0 秒,而慢的那次恰好是缓存刚被清空 —— 说明快的两次
+            # 根本没联网。体检要量的是真实链路,不是缓存命中率。
             r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
-                                         "per_page": 0}, token)
+                                         "per_page": 0, "refresh": True},
+                        token, timeout=180)
             el = time.monotonic() - t0
             items = (r.get("data") or {}).get("content")
             if r.get("code") != 200:
