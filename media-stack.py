@@ -2266,6 +2266,26 @@ def _hc(label, state, detail=""):
     print(f"    {pad(label, 20)}{icon}  {detail}")
 
 
+def _short_err(s):
+    """把 OpenList 存回来的错误信息压成一行能看的。
+
+    存储的 status 字段在出错时装的是整条 Go 错误,里面带着请求 URL —— 而那个 URL 的
+    query 里有 access_token。体检的输出是会被截图发出去的,原样打印等于把网盘令牌
+    公开。所以先把每个 URL 砍到问号前,再压掉换行、截断。
+    """
+    s = re.sub(r'(https?://[^\s"?]+)\?[^\s"]*', r"\1?…", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    # 常见网络错误给个人话结论,原文太长且对定位没有额外帮助
+    for pat, msg in (("context deadline exceeded", "网盘接口超时"),
+                     ("i/o timeout", "网盘接口超时"),
+                     ("TLS handshake timeout", "网盘接口 TLS 握手超时"),
+                     ("connection refused", "连接被拒绝"),
+                     ("no such host", "域名解析失败")):
+        if pat in s:
+            return msg
+    return s[:70] + ("…" if len(s) > 70 else "")
+
+
 def _ol_api(path, body, token=None, timeout=60):
     req = urllib.request.Request(
         f"http://127.0.0.1:{OPENLIST_PORT}{path}",
@@ -2320,7 +2340,7 @@ def do_healthcheck():
         _hc("OpenList 登录", "ok" if token else "bad",
             f"{time.monotonic() - t0:.1f}s" if token else f"{r.get('message', '没拿到 token')}")
     except Exception as e:
-        _hc("OpenList 登录", "bad", str(e)[:60])
+        _hc("OpenList 登录", "bad", _short_err(e))
     if not token:
         todo.append(("OpenList 登不上，后面几项没法测",
                      "看 docker logs --tail 50 openlist"))
@@ -2334,8 +2354,15 @@ def do_healthcheck():
     for mp, drv, st, root in stores:
         bad_root = drv.lower().startswith("quark") or drv.lower().startswith("uc")
         if st != "work":
-            _hc(f"存储 {mp}", "bad", f"{drv}  状态 {st}")
-            todo.append((f"{mp} 状态不是 work", "去 OpenList 里看那个存储的报错"))
+            brief = _short_err(st)
+            _hc(f"存储 {mp}", "bad", f"{drv}  {brief}")
+            if "超时" in brief or "解析失败" in brief or "拒绝" in brief:
+                todo.append((f"{mp} 连不上网盘接口（{brief}）",
+                             "线路问题，不是配置错了。等几分钟再跑一次体检；"
+                             "已生成的 strm 不受影响"))
+            else:
+                todo.append((f"{mp} 状态不是 work：{brief}",
+                             "去 OpenList 网页里看那个存储的完整报错"))
         elif bad_root and (not root or "/" in root):
             _hc(f"存储 {mp}", "bad", f"{drv}  work  {RED}根文件夹ID={root or '空'}{RST}")
             todo.append((f"{mp} 的根文件夹ID 是 {root or '空'}，夸克要的是文件夹 ID",
@@ -2365,7 +2392,7 @@ def do_healthcheck():
                 _hc(f"列目录 {p}", "ok", f"{el:.1f}s  {len(items)} 项")
                 listed_ok.append((p, items))
         except Exception as e:
-            _hc(f"列目录 {p}", "bad", str(e)[:50])
+            _hc(f"列目录 {p}", "bad", _short_err(e))
 
     # ---- 换直链：整套东西最关键的一项 ----
     # 播放卡顿的根因几乎都在这:MediaWarp 每次要新地址都得让 OpenList 去网盘换一次,
@@ -2400,8 +2427,10 @@ def do_healthcheck():
             else:
                 _hc("换直链", "ok", f"{el:.1f}s  →  {raw.split('/')[2]}")
         except Exception as e:
-            _hc("换直链", "bad", str(e)[:50])
-            todo.append(("换直链失败", "网盘接口不通，稍后再试"))
+            _hc("换直链", "bad", _short_err(e))
+            todo.append(("换直链失败，此刻播放会卡在开头",
+                         "网盘接口不通（线路问题，不是配置错了）。"
+                         "已生成的 strm 不受影响，等几分钟再跑一次体检"))
 
     # ---- MediaWarp ----
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
@@ -2413,7 +2442,7 @@ def do_healthcheck():
             _hc("MediaWarp→Emby", "ok" if resp.status == 200 else "bad",
                 f"{el:.1f}s  HTTP {resp.status}")
     except Exception as e:
-        _hc("MediaWarp→Emby", "bad", str(e)[:50])
+        _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
     if key:
         _hc("Emby API Key", "ok", "已填")
@@ -2439,7 +2468,7 @@ def do_healthcheck():
                 todo.append((f"Emby 里没有指向 {STRM_PATH} 的媒体库",
                              f"Emby → 设置 → 媒体库 → 添加，路径填 {STRM_PATH}"))
         except Exception as e:
-            _hc("Emby 媒体库", "warn", str(e)[:50])
+            _hc("Emby 媒体库", "warn", _short_err(e))
 
     # ---- 直链方式 / 证书 ----
     lms = link_method_storages(d)
