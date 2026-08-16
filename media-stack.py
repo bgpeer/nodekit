@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SCRIPT_VERSION = "1.1.0"
@@ -2880,14 +2881,45 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def probe_302(key):
+def strm_target_path(content):
+    """从 strm 内容里还原出它在 OpenList 上的路径。两种形态都要认:
+
+      · 路径形式(旧)   /quark/电影/x.mp4
+      · URL 形式(新)   https://list.<域名>/d/quark/电影/x.mp4?sign=…
+
+    体检里有几项要按「挂载点」给文件分组,只认路径形式的话,升级之后会得出
+    「还没有 strm 文件」这种和上一行「strm 文件 3 个」直接打架的结论。
+    """
+    c = (content or "").strip()
+    if not c:
+        return ""
+    if c.startswith("/"):
+        return c
+    if not c.lower().startswith("http"):
+        return ""
+    try:
+        p = urllib.parse.unquote(urllib.parse.urlsplit(c).path)
+    except Exception:
+        return ""
+    # OpenList 的下载端点是 /d/<路径>，也见过带签名前缀的 /dav/ 形态
+    for pre in ("/d/", "/dav/"):
+        if p.startswith(pre):
+            return "/" + p[len(pre):]
+    return p or ""
+
+
+def probe_302(key, own_host=""):
     """真的发一次播放请求，看 MediaWarp 到底回不回 302、302 到哪。
 
     这是整套东西唯一的端到端证明。前面那些检查(存储 work、能换到直链)都只说明
     "零件是好的",而播放实际走哪条路要看这一下:
-      · 302 → 网盘 CDN     视频从网盘直达播放器,不经过本机 —— 这才是目的
-      · 302 → 内部地址     客户端根本连不上(raw_url: false 就是这个后果)
+      · 302 → 内部地址     客户端根本连不上
       · 200 不是 302       MediaWarp 没拦住,视频要经过本机中转,吃你的带宽
+
+    strm 改成 URL 形式之后这里【多了一跳】,只看第一跳会得出错误结论:
+    MediaWarp 现在 302 到的是 OpenList 的公网地址(own_host),播放器要再跟一次
+    才到网盘 CDN。所以拿到第一跳之后还要再跟一次,确认后半段也是通的 ——
+    否则「302 → 自己的域名」看起来像成功,实际上可能第二跳就死了。
 
     返回 (state, 说明)。
     """
@@ -2922,6 +2954,29 @@ def probe_302(key):
                     or _is_private_ip(bare))
         if internal:
             return "bad", f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
+
+        # 第一跳落在自己的 OpenList 公网域名上 —— 这是 URL 形式 strm 的正常形态,
+        # 但还没到网盘。必须再跟一跳才知道后半段通不通:只看第一跳的话,
+        # 「302 → 自己的域名」看起来像成功,实际可能第二跳就死了。
+        if own_host and bare == own_host:
+            try:
+                with opener.open(loc, timeout=60) as r2:
+                    return "bad", (f"302 → {bare} 之后没有再跳转（HTTP {r2.status}）"
+                                   f"  {RED}视频会经过本机{RST}")
+            except urllib.error.HTTPError as e2:
+                if e2.code not in (301, 302, 303, 307, 308):
+                    return "bad", f"{bare} 返回 HTTP {e2.code}  {RED}换直链失败{RST}"
+                loc = e2.headers.get("Location", "")
+                host = loc.split("/")[2] if "://" in loc else loc[:40]
+                bare = host.split(":")[0]
+                if bare in ("openlist", "emby", "mediawarp", "localhost") or _is_private_ip(bare):
+                    return "bad", f"第二跳 → {host}  {RED}内部地址，客户端连不上{RST}"
+                two_hop = True
+            except Exception as ex:
+                return "bad", f"{bare} 那一跳失败：{_short_err(ex)}"
+        else:
+            two_hop = False
+
         # 判断实际拿到的是原画还是转码流。光看 .m3u8 会判错:夸克的转码流地址是
         # video-play-*.drive.quark.cn,并不一定以 m3u8 结尾,而原画是 dl-*。
         # 实际就出现过「302 那行说原画、直链方式那行说转码流」自相矛盾。
@@ -2932,8 +2987,9 @@ def probe_302(key):
             kind = "原画"
         else:
             kind = ""
-        tail = f"（{kind}，直连网盘、不经过本机）" if kind else "（直连网盘、不经过本机）"
-        return "ok", f"302 → {host}  {DIM}{tail}{RST}"
+        head = f"302 →{' ' + own_host + ' →' if two_hop else ''} {host}"
+        tail = (f"（{kind}，" if kind else "（") + "视频直达网盘，不经过本机）"
+        return "ok", f"{head}  {DIM}{tail}{RST}"
     except Exception as e:
         return "bad", _short_err(e)
 
@@ -3128,9 +3184,13 @@ def do_healthcheck():
             read_env(os.path.join(d, ".env"), "DATA_ROOT") or os.path.join(d, "media"),
             "strm", "**", "*.strm"), recursive=True)):
         try:
-            fp = open(f, encoding="utf-8").read().strip()
+            raw = open(f, encoding="utf-8").read()
         except OSError:
             continue
+        # strm 有两种形态(路径 / URL),统一还原成 OpenList 上的路径再分组。
+        # 只认路径形式的话,升级之后这里会空掉,体检就会打出「还没有 strm 文件」
+        # 而上一行明明写着「strm 文件 3 个」—— 自相矛盾比不检查更误导。
+        fp = strm_target_path(raw)
         if not fp.startswith("/"):
             continue
         mount = "/" + fp.lstrip("/").split("/")[0]      # /quark/电影/x.mp4 → /quark
@@ -3181,16 +3241,18 @@ def do_healthcheck():
         _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
     # ---- 302 端到端 ----
-    st302, msg302 = probe_302(key)
+    own_host = urllib.parse.urlsplit(openlist_public_url(cfg)).hostname or ""
+    _hc_wait("302 直链", 90)
+    st302, msg302 = probe_302(key, own_host)
     _hc("302 直链", st302, msg302)
     if st302 == "bad":
         if "不是 302" in msg302:
             todo.append(("MediaWarp 没有拦截播放请求，视频会经过本机中转",
-                         "检查 mediawarp/config.yaml 的 alist_strm.prefix_list "
-                         f"是不是 {STRM_PATH}，以及 strm 内容是不是纯路径"))
+                         "检查 mediawarp/config.yaml 的 http_strm.enable 是不是 true、"
+                         f"prefix_list 是不是 {STRM_PATH}；「6 更新」会重新生成"))
         elif "内部地址" in msg302:
             todo.append(("302 指向了容器内部地址，播放器连不上",
-                         "mediawarp/config.yaml 里 raw_url 要是 true；"
+                         "autofilm 的 public_url 要填播放器能访问的地址；"
                          "「6 更新」会重新生成这份配置"))
         else:
             todo.append(("302 没生成", "多半是上一行的换直链失败，等线路恢复再试"))
