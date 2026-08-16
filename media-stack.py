@@ -2243,8 +2243,10 @@ def items_without_duration(key):
     return out
 
 
-RESUME_MIN_SECONDS = 10     # 播够多少秒才值得记续播点
-RESUME_MIN_PCT     = 1      # 播到百分之几才值得记
+# 两个值要一起看,只改秒数没用:百分比那条是【按时长算】的,1% 对一部 94 分钟的
+# 电影就是 56 秒,秒数设再小也会被它卡住。所以百分比直接设 0,让秒数说了算。
+RESUME_MIN_SECONDS = 2      # 播够多少秒才值得记续播点
+RESUME_MIN_PCT     = 0      # 播到百分之几才值得记（0 = 不按比例卡）
 
 
 def tune_resume_thresholds(key):
