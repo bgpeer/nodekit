@@ -612,7 +612,10 @@ log:
 
 cache:
   enable: true
-  http_strm_ttl: 1m
+  # final_url: false 之后这一项其实用不上了(没有"最终地址"需要缓存),
+  # 但留个长值兜底:万一以后谁把 final_url 打开,1 分钟的缓存等于每分钟都要重付
+  # 一次连 CDN 的代价,那一跳实测能到 32 秒。
+  http_strm_ttl: 2h
   # 默认 10m 太短。每次缓存过期,MediaWarp 就要让 OpenList 重新去网盘换一次直链;
   # 跨境线路上这个调用实测 0.3 秒到 44 秒不等,还经常直接超时 —— 日志里表现为
   #   404 | 30.3s | GET /emby/Videos/11/stream
@@ -649,7 +652,17 @@ client:
 http_strm:
   enable: true
   proxy: false          # true 会让 MediaWarp 自己中转，等于白白吃本机带宽
-  final_url: true
+  # final_url 必须是 false。true 表示 MediaWarp 自己去连网盘 CDN、跟着跳转
+  # 解析出最终地址再给播放器 —— 而【本机到 CDN】这一跳正是最慢最不稳的一段,
+  # 实测连接耗时 0.11 / 2.5 / 32.4 秒(同一台机器三个文件)。超过它内部的 10 秒
+  # 上限就放弃,日志里表现为:
+  #   302 | 10.002492s | GET /emby/Videos/120/stream
+  # 整整 10 秒才吐出重定向,而且没有「HTTPStrm 重定向至」那一行。
+  #
+  # false 表示直接把 strm 里那个地址 302 给播放器,由播放器自己跟跳转。
+  # 这条路上 OpenList 的 /d/ 只调网盘【接口】换直链、不碰 CDN,实测 0.2~0.6 秒,
+  # 而 CDN 那一跳由播放器自己去连 —— 它本来就要连,而且走的是自己的线路。
+  final_url: false
   compatibility_mode: false
   prefix_list:
     - {STRM_PATH}
