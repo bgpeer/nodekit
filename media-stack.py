@@ -2117,6 +2117,105 @@ def emby_scan_wait(key, timeout=600):
     return False
 
 
+def _emby(path, key, method="GET", timeout=60):
+    u = f"http://127.0.0.1:8096{path}{'&' if '?' in path else '?'}api_key={key}"
+    with urllib.request.urlopen(
+            urllib.request.Request(u, method=method), timeout=timeout) as r:
+        body = r.read()
+    return json.loads(body) if body.strip() else {}
+
+
+def items_without_duration(key):
+    """Emby 里还没探测出时长的影视条目 [(id, 名字), ...]。
+
+    枚举方式是照抄 Emby 网页端自己发的请求:ParentId 填【媒体库条目 id】
+    (VirtualFolders 里的 ItemId)、带 Recursive 和 IncludeItemTypes。
+    少了 IncludeItemTypes 的话 Emby 会把媒体库节点本身当结果返回,看起来就像
+    "库里只有一个条目",排查时会被带到沟里去。
+    """
+    out = []
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+    except Exception:
+        return out
+    uid = ""
+    try:
+        users = _emby("/Users", key)
+        uid = (users[0] or {}).get("Id", "") if users else ""
+    except Exception:
+        pass
+    if not uid:
+        return out
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid:
+            continue
+        try:
+            d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path", key)
+        except Exception:
+            continue
+        for i in d.get("Items") or []:
+            if not (i.get("RunTimeTicks") or 0):
+                out.append((uid, i.get("Id"), i.get("Name") or "?"))
+    return out
+
+
+def warm_media_info(d, key):
+    """提前把每个新条目探测一遍，别等用户按下播放时才现探。
+
+    这是 URL 形式 strm 的代价:Emby 要真的去网盘 CDN 拉一段文件头,才知道时长和
+    编码。同一台机器实测这一步的耗时(三个文件):
+        连接 0.11 / 2.5 / 32.4 秒，首字节 0.90 / 20.2 / 39.4 秒
+    而 Emby 把它放在 PlaybackInfo 里做 —— 也就是【用户按下播放的那一刻】。
+    浏览器等不到,38 秒就自己取消,日志里是
+        502 | 38.28s | POST /emby/Items/119/PlaybackInfo?...IsPlayback=true
+        http: proxy error: context canceled
+    用户看到的是转圈或者「当前没有兼容的流」。
+
+    路径形式的 strm 没有这个问题,因为 Emby 压根不碰网盘 —— 所以这是换成 URL
+    形式之后【新增】的失败模式,必须一起解决,不能只改一半。
+
+    好在这个代价只付一次:探测成功后媒体信息就存库了。所以挪到这里来做,
+    生成媒体库之后、没人等着看片的时候。
+    """
+    pend = items_without_duration(key)
+    if not pend:
+        return
+    print()
+    info(f"给 {len(pend)} 个条目预探测媒体信息（时长、编码）...")
+    print(f"  {DIM}不做这一步的话，第一次点播放要等 Emby 现去网盘拉文件头，")
+    print(f"  跨境线路上实测能到 40 秒，播放器等不了那么久会直接报错。{RST}")
+    print(f"  {DIM}每个最多等 3 分钟，慢是正常的，做完一次以后就都是现成的。{RST}")
+    done = 0
+    for uid, iid, name in pend:
+        try:
+            _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&IsPlayback=true"
+                  f"&AutoOpenLiveStream=true&MediaSourceId=mediasource_{iid}"
+                  f"&StartTimeTicks=0&MaxStreamingBitrate=200000000",
+                  key, method="POST", timeout=200)
+        except Exception as e:
+            print(f"  {DIM}·{RST} {name[:28]}  {YELLOW}{_short_err(e)}{RST}")
+            continue
+        # 拿回来确认一下,PlaybackInfo 返回 200 不代表探测成功
+        try:
+            it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
+            mins = (it.get("RunTimeTicks") or 0) / 6e8
+        except Exception:
+            mins = 0
+        if mins:
+            done += 1
+            print(f"  {GREEN}✔{RST} {name[:28]}  {mins:.0f} 分钟")
+        else:
+            print(f"  {DIM}·{RST} {name[:28]}  {YELLOW}没探到，第一次播放时会再试{RST}")
+    if done == len(pend):
+        ok(f"{done} 个条目全部探测完成，进度条和续播现在可用")
+    else:
+        warn(f"{done}/{len(pend)} 个探测成功")
+        print(f"  {DIM}没成功的多半是当时网盘那条线在抖。再点一次「4 生成媒体库」")
+        print(f"  会只补没探到的那些，已经好的不会重来。{RST}")
+
+
 def migrate_strm_format(d):
     """把老的路径形式 strm 迁移成 URL 形式。返回是否需要在之后重新生成。
 
@@ -2311,9 +2410,11 @@ def do_strm():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if key:
         info("通知 Emby 扫描媒体库...")
-        sh(f"curl -sS -m 30 -X POST 'http://127.0.0.1:8096/Library/Refresh?api_key={key}'",
-           timeout=60)
-        ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
+        if emby_scan_wait(key, timeout=900):
+            ok("Emby 已扫完")
+        else:
+            ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
+        warm_media_info(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
