@@ -1710,6 +1710,13 @@ def do_update():
             f.write(build_summary(cfg, colored=False) + "\n")
         os.chmod(cred, 0o600)
 
+    # 更新会按当前版本重写 mediawarp 配置（切回 alist_strm）。磁盘上要是还留着
+    # 老版本写的 URL 形式 strm，那些片子立刻就播不了了 —— 而且症状很误导：
+    # 挂载里点开好好的，只有 Emby 转圈。所以配置刷完顺手把 strm 归一化。
+    fixed = normalize_strm_files(d)
+    if fixed:
+        ok(f"{fixed} 个 strm 从 URL 形式改回路径形式（老版本留下的）")
+
     # 更新过程重启了所有容器，这一步顺便验证网盘还通不通 —— 更新完立刻发现
     # 网盘挂了，总比晚上想看片时才发现强。
     # 注意：这【不是】"把链路热好"。实测耗时和空闲时间不相关（见 do_keepalive
@@ -2275,6 +2282,48 @@ def _strm_host_path(d, item_path):
     return os.path.join(strm_root(d), STRM_SUBDIR, item_path[len(STRM_PATH):].lstrip("/"))
 
 
+def normalize_strm_files(d):
+    """把所有 strm 统一成【路径形式】。返回改了几个。
+
+    路径形式是常态,URL 形式只该在 heal_media_info() 补探测的那几秒里存在。
+    但有两种情况会留下 URL 形式的残留,而且残留的后果很重:
+
+      · 老版本(strm 一律写 URL 那一版)生成的文件。heal_media_info 只处理
+        【没有时长】的条目,已经探到时长的会被跳过 —— 于是它们的 strm 永远
+        停在 URL 形式,没人去动
+      · heal 过程中脚本被 Ctrl-C 掉、或者进程被杀
+
+    后果:MediaWarp 用的是 alist_strm,而它【只认路径】。拿到 URL 会当成路径去
+    查 OpenList,查不到就不 302,播放器一直转圈 —— 而挂载那边点开却是好的,
+    因为那条路根本不经过 MediaWarp。这个"挂载能播、Emby 转圈"的组合极具迷惑性。
+
+    所以每次生成媒体库、每次更新都无条件扫一遍。只读写本地几十字节的文本,
+    没有网络调用,成本可以忽略。
+    """
+    n = 0
+    for dirpath, _dirnames, files in os.walk(strm_root(d)):
+        for fn in files:
+            if not fn.endswith(".strm"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                cur = open(p, encoding="utf-8").read().strip()
+            except OSError:
+                continue
+            if not cur or cur.startswith("/"):
+                continue
+            want = strm_target_path(cur)
+            if not want or not want.startswith("/"):
+                continue
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(want)
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
 def heal_media_info(d, key):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
@@ -2444,6 +2493,12 @@ def do_strm():
         warn(f"找不到 {cfg_path}，AutoFilm 可能没装。")
         return
 
+    fixed = normalize_strm_files(d)
+    if fixed:
+        ok(f"{fixed} 个 strm 从 URL 形式改回路径形式")
+        print(f"  {DIM}URL 形式只该在补探测的那几秒存在。留在磁盘上的话 MediaWarp")
+        print(f"  的 alist_strm 认不出来，表现是「挂载能播、Emby 一直转圈」。{RST}")
+
     before = strm_count(d)
     print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
 
@@ -2541,6 +2596,7 @@ def do_strm():
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
         tune_resume_thresholds(key)
         heal_media_info(d, key)
+        normalize_strm_files(d)      # heal 中途被打断的兜底
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
