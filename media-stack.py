@@ -2078,6 +2078,21 @@ def emby_scan_wait(key, timeout=600):
     """
     if not key:
         return False
+
+    def scan_task():
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:8096/ScheduledTasks?api_key={key}", timeout=30) as r:
+                return next((x for x in json.load(r)
+                             if x.get("Key") == "RefreshLibrary"), None)
+        except Exception:
+            return None
+
+    # 先记下上一次执行的结束时间。只靠「State 从 Running 变回 Idle」是不够的:
+    # 小媒体库一两秒就扫完了,轮询第一次去看时任务早就 Idle,于是永远等不到那个
+    # 状态跳变,只能干等到超时(实测 60 个文件的库就这样卡满 10 分钟)。
+    # 结束时间变了同样说明这一轮跑完了,两个条件哪个先成立都算数。
+    before = ((scan_task() or {}).get("LastExecutionResult") or {}).get("EndTimeUtc", "")
     try:
         urllib.request.urlopen(
             urllib.request.Request(
@@ -2085,23 +2100,19 @@ def emby_scan_wait(key, timeout=600):
             timeout=30).close()
     except Exception:
         return False
+
     deadline = time.time() + timeout
     seen_running = False
     while time.time() < deadline:
-        time.sleep(4)
-        try:
-            with urllib.request.urlopen(
-                    f"http://127.0.0.1:8096/ScheduledTasks?api_key={key}", timeout=30) as r:
-                tasks = json.load(r)
-        except Exception:
+        time.sleep(3)
+        t = scan_task()
+        if t is None:
             continue
-        t = next((x for x in tasks if x.get("Key") == "RefreshLibrary"), None)
-        if not t:
-            time.sleep(20)          # 找不到任务就退回固定等待，总比不等强
-            return False
-        if t.get("State") == "Running":
+        if t.get("State") != "Idle":
             seen_running = True
-        elif seen_running:
+            continue
+        end = (t.get("LastExecutionResult") or {}).get("EndTimeUtc", "")
+        if seen_running or (end and end != before):
             return True
     return False
 
