@@ -654,10 +654,14 @@ http_strm:
   prefix_list:
     - {STRM_PATH}
 
-# alist_strm 保持开启，只为兼容【升级前生成的、路径形式的老 strm】。
-# 两个处理器按 strm 内容各管各的，互不干扰。老 strm 能播，但没有时长。
+# alist_strm 必须关掉，不能和 http_strm 并存。
+# 试过留着它「兼容老 strm」，结果老 strm 直接播不了了，报「当前没有兼容的流」：
+# MediaWarp 是按【路径前缀】选处理器的，而两者的 prefix_list 只能是同一个
+# {STRM_PATH}（strm 全在这一个目录下）。http_strm 抢先接管整个前缀，然后把老
+# strm 里的 /quark/电影/x.mp4 当成 URL 去重定向 —— 那不是合法 URL，于是失败。
+# 所以老格式的 strm 必须迁移掉（见 migrate_strm_format），没有共存这条路。
 alist_strm:
-  enable: true
+  enable: false
   proxy: true
   # 必须是 true。false 的话 MediaWarp 会拿下面的 addr 拼重定向地址，把播放器
   # 302 到 http://openlist:5244/d/... —— 那是容器内部地址，手机/电视根本连不上。
@@ -1608,14 +1612,31 @@ def do_update():
             f.write(build_summary(cfg, colored=False) + "\n")
         os.chmod(cred, 0o600)
 
-    # 更新过程重启了容器，连接池被清空，这一刻链路是【冷的】——
-    # 不补这一下的话，更新完马上去播，第一部片八成要转圈几十秒，
-    # 而用户会以为是这次更新弄坏了什么。顺便也立刻验证网盘还通不通。
-    info("热一下网盘链路...")
+    # 新版把播放交给 http_strm，而它和 alist_strm 不能共存（同一个路径前缀，
+    # 见 gen_mediawarp_conf）。所以更新之后，旧格式的 strm 会【立刻播不了】，
+    # 点开报「当前没有兼容的流」。不能让用户停在这个状态上自己去发现 ——
+    # 更新的最后一步必须把它挑明，并且当场给出出口。
+    old = old_format_strm(d)
+    if old:
+        print()
+        warn(f"有 {len(old)} 个旧格式 strm —— 这些片子现在{BOLD}暂时播不了{RST}")
+        print(f"  {DIM}新版本改由 http_strm 处理播放，它只认 URL 形式的 strm；")
+        print(f"  旧的是网盘路径形式，点开会报「当前没有兼容的流」。{RST}")
+        print(f"  {DIM}重新生成一次就恢复，而且顺带拿到时长（进度条、续播才能用）。{RST}")
+        if ask_yn("现在就重新生成媒体库吗？", True):
+            do_strm()
+        else:
+            print(f"  {YELLOW}在你点「4 生成媒体库」之前，那些片子一直播不了。{RST}")
+
+    # 更新过程重启了所有容器，这一步顺便验证网盘还通不通 —— 更新完立刻发现
+    # 网盘挂了，总比晚上想看片时才发现强。
+    # 注意：这【不是】"把链路热好"。实测耗时和空闲时间不相关（见 do_keepalive
+    # 的文档字符串），所以别在这里承诺"现在去播不会卡"。
+    info("顺便测一下网盘链路...")
     do_keepalive()
     ka = keepalive_state(d)
     if ka.get("ok"):
-        ok(f"网盘链路已热好（{ka.get('elapsed', 0)}s），现在去播不会卡在开头")
+        ok(f"网盘链路正常（列目录 {ka.get('elapsed', 0)}s）")
     elif ka:
         warn(f"网盘暂时不通：{ka.get('error', '')}")
         print(f"  {DIM}和这次更新无关，是线路问题。保活每 {KEEPALIVE_MIN} 分钟会自己重试。{RST}")
