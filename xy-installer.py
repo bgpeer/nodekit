@@ -1930,7 +1930,7 @@ def _self_ip():
     return _SELF_IP_CACHE
 
 def _root_domain(host):
-    """收敛到可注册域：dmcn2.679588.xyz → 679588.xyz。
+    """收敛到可注册域：node2.example.com → example.com。
 
        多机聚合时同一个注册域下会冒出一堆子域（各节点域名、订阅域名、AdGuard DoT 的
        <ClientID>.域名…），逐条写进规则里又长又重复，还全是同一个域。收敛成一条就够。

@@ -2130,12 +2130,15 @@ def emby_scan_wait(key, timeout=600):
     return False
 
 
-def _emby(path, key, method="GET", timeout=60):
+def _emby(path, key, method="GET", timeout=60, body=None):
     u = f"http://127.0.0.1:8096{path}{'&' if '?' in path else '?'}api_key={key}"
-    with urllib.request.urlopen(
-            urllib.request.Request(u, method=method), timeout=timeout) as r:
-        body = r.read()
-    return json.loads(body) if body.strip() else {}
+    req = urllib.request.Request(
+        u, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json"} if body is not None else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = r.read()
+    return json.loads(out) if out.strip() else {}
 
 
 def items_without_duration(key):
@@ -2174,6 +2177,51 @@ def items_without_duration(key):
     return out
 
 
+RESUME_MIN_SECONDS = 10     # 播够多少秒才值得记续播点
+RESUME_MIN_PCT     = 1      # 播到百分之几才值得记
+
+
+def tune_resume_thresholds(key):
+    """把媒体库的续播门槛调到对短片子也公平的值。
+
+    Emby 每个媒体库有三个续播参数,默认值是按"电影"设计的:
+        MinResumeDurationSeconds  120   播放位置不到 120 秒就不记
+        MinResumePct                2   不到总时长 2% 不记
+        MaxResumePct               90   超过 90% 判定看完,清掉续播点
+    网盘库里什么长度都有。一个 1 分多钟的片子,播放位置【永远】到不了 120 秒,
+    于是永远没有续播记忆 —— 用户看到的是"长的能记住、短的记不住",像是坏了,
+    其实是规则如此。而这三个值 Emby 的网页设置里不给改,只能走接口。
+
+    只动指向本脚本 strm 目录的媒体库:用户自己另外建的库(本地电影、音乐之类)
+    不该被这个脚本碰。MaxResumePct 也不动 —— 那条是按比例算的,长短本来就公平。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+    except Exception:
+        return
+    for lb in libs:
+        if not any(STRM_PATH in p or p in STRM_PATH for p in (lb.get("Locations") or [])):
+            continue
+        o = lb.get("LibraryOptions") or {}
+        cur_s = o.get("MinResumeDurationSeconds")
+        cur_p = o.get("MinResumePct")
+        if cur_s == RESUME_MIN_SECONDS and cur_p == RESUME_MIN_PCT:
+            continue
+        o["MinResumeDurationSeconds"] = RESUME_MIN_SECONDS
+        o["MinResumePct"] = RESUME_MIN_PCT
+        try:
+            _emby("/Library/VirtualFolders/LibraryOptions",
+                  key, method="POST",
+                  body={"Id": lb.get("ItemId"), "LibraryOptions": o})
+        except Exception as e:
+            warn(f"改「{lb.get('Name')}」的续播门槛失败：{_short_err(e)}")
+            continue
+        ok(f"媒体库「{lb.get('Name')}」续播门槛：{cur_s}秒/{cur_p}% → "
+           f"{RESUME_MIN_SECONDS}秒/{RESUME_MIN_PCT}%")
+        print(f"  {DIM}默认的 120 秒是按电影长度定的，短片子永远够不到，"
+              f"表现为「长的记得住、短的记不住」。{RST}")
+
+
 def warm_media_info(d, key):
     """提前把每个新条目探测一遍，别等用户按下播放时才现探。
 
@@ -2182,7 +2230,7 @@ def warm_media_info(d, key):
         连接 0.11 / 2.5 / 32.4 秒，首字节 0.90 / 20.2 / 39.4 秒
     而 Emby 把它放在 PlaybackInfo 里做 —— 也就是【用户按下播放的那一刻】。
     浏览器等不到,38 秒就自己取消,日志里是
-        502 | 38.28s | POST /emby/Items/119/PlaybackInfo?...IsPlayback=true
+        502 | 38.28s | POST /emby/Items/<id>/PlaybackInfo?...IsPlayback=true
         http: proxy error: context canceled
     用户看到的是转圈或者「当前没有兼容的流」。
 
@@ -2427,6 +2475,7 @@ def do_strm():
             ok("Emby 已扫完")
         else:
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
+        tune_resume_thresholds(key)
         warm_media_info(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
