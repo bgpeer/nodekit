@@ -2840,7 +2840,18 @@ def params_menu():
 def _hc(label, state, detail=""):
     icon = {"ok": f"{GREEN}✔{RST}", "warn": f"{YELLOW}⚠{RST}",
             "bad": f"{RED}✖{RST}", "skip": f"{DIM}—{RST}"}[state]
-    print(f"    {pad(label, 20)}{icon}  {detail}")
+    print(f"\r\x1b[2K    {pad(label, 20)}{icon}  {detail}")
+
+
+def _hc_wait(label, secs):
+    """慢检查开始前先把行占上，让人看得见它在等什么、要等多久。
+
+    体检恰恰是「东西已经坏了」的时候才会跑的：网盘接口不通时，列目录会一直等到
+    超时，屏幕上却停在上一行不动。用户看到的是「体检自己卡死了」——最需要它说话
+    的时刻，它反而一声不吭。
+    这里先打一行不换行的占位，_hc 用 \\r + 清行覆盖掉它。
+    """
+    print(f"    {pad(label, 20)}{DIM}测试中…最多 {secs} 秒{RST}", end="", flush=True)
 
 
 def _short_err(s):
@@ -3055,6 +3066,7 @@ def do_healthcheck():
         if not token:
             _hc(f"列目录 {p}", "skip", "OpenList 没登上")
             continue
+        _hc_wait(f"列目录 {p}", 120)
         t0 = time.monotonic()
         try:
             # refresh: true —— 不加的话 OpenList 直接返回目录缓存,这一行永远是 0.0 秒,
@@ -3063,7 +3075,10 @@ def do_healthcheck():
             # 根本没联网。体检要量的是真实链路,不是缓存命中率。
             r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
                                          "per_page": 0, "refresh": True},
-                        token, timeout=180)
+                        # 120 秒封顶,不是 180:体检本来就是"东西坏了"才跑的,
+                        # 网盘不通时每条路径干等 3 分钟,人只会以为体检自己死了。
+                        # 实测最慢的一次真实列目录是 119.8 秒,120 刚好盖住。
+                        token, timeout=120)
             el = time.monotonic() - t0
             items = (r.get("data") or {}).get("content")
             if r.get("code") != 200:
@@ -3126,9 +3141,10 @@ def do_healthcheck():
         _hc("换直链", "skip", "还没有 strm 文件，无从测起")
     for mount, fp in list(by_mount.items())[:3]:       # 封顶 3 个,每个最坏要等半分钟
         label = "换直链" if len(by_mount) == 1 else f"换直链 {mount}"
+        _hc_wait(label, 60)
         t0 = time.monotonic()
         try:
-            r = _ol_api("/api/fs/get", {"path": fp, "password": ""}, token)
+            r = _ol_api("/api/fs/get", {"path": fp, "password": ""}, token, timeout=60)
             el = time.monotonic() - t0
             raw = (r.get("data") or {}).get("raw_url", "")
             if not raw:
