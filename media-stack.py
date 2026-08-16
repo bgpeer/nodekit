@@ -477,26 +477,62 @@ def scan_task_id(path):
     return t
 
 
+def openlist_public_url(cfg):
+    """strm 里要写的 OpenList 地址。
+
+    必须是【播放器也能访问】的地址,不能用容器内网的 http://openlist:5244 ——
+    Emby 的 ffprobe 在同一个 docker 网络里访问得了,但 MediaWarp 的 HTTPStrm
+    是把这个地址 302 给播放器的,手机/电视解析不了 openlist 这个主机名。
+    """
+    sub = next(s for s, _p, c, _l in SUBDOMAINS if c == "openlist")
+    if cfg["has_domain"]:
+        return f"https://{sub}.{cfg['domain']}"
+    # 没域名时 openlist 的端口是 0.0.0.0 绑定的(见 gen_compose 的 bind),
+    # 直接用 IP:端口,和用户平时打开 OpenList 界面的地址一样
+    return f"http://{cfg['host_ip']}:{OPENLIST_PORT}"
+
+
 def gen_autofilm_conf(cfg):
     """AutoFilm：定时遍历 OpenList，把网盘里的视频写成 .strm 文本文件。
 
-    mode 三个取值里必须选 AlistPath：
-      · RawURL   —— 把网盘的临时直链写死进 strm。夸克这类直链几小时就过期，
-                    过期后整个媒体库集体播放失败。
-      · AlistURL —— 写完整的 OpenList 下载地址(http://openlist:5244/d/...?sign=)。
-                    看着合理，但 MediaWarp 的 alist_strm 是把 strm 内容当【路径】
-                    去调 OpenList API 的，拿到整条 URL 就会拼成
-                    /http:/openlist:5244/d/... 然后报 storage not found，
-                    302 失败、回退成 Emby 自己拉流 —— 视频全程经过本机带宽。
-      · AlistPath —— 只写 OpenList 上的路径，正是 MediaWarp 要的形态。
+    mode 必须选 AlistURL,而且 public_url 必须填。这个结论是实测出来的,三种取值
+    都试过,别照着「看起来合理」去改:
+
+      · RawURL   —— 把网盘的临时直链写死进 strm。夸克直链几小时就过期,过期后
+                    整个媒体库集体播放失败。
+
+      · AlistPath —— 只写 OpenList 上的路径(/quark/电影/x.mp4)。302 能work,
+                    但【Emby 拿不到时长】:它把 strm 内容当本地文件喂给 ffprobe,
+                    日志里是 `file:/quark/...: No such file or directory`,
+                    RunTimeTicks 停在 0。而 Emby 判断续播点是按时长算百分比的
+                    (MinResumePct 2 / MaxResumePct 90),分母为 0 这套逻辑整个失效:
+                    停止播放时直接判定「已看完」,续播点清零、打上已看标记,
+                    下次点进去从头开始,进度条也拖不动(播放器以为总长是 0)。
+                    补 .nfo 也没用 —— nfo 的 title 会生效,但 ffprobe provider
+                    在 nfo 之后跑,失败后把媒体信息覆盖掉。
+
+      · AlistURL  —— 写完整的 OpenList 下载地址。Emby 对 URL 形式的 strm 在
+                    【扫描时不探测】,推迟到第一次播放时才探测 —— 播一次之后
+                    时长/分辨率/编码/音轨全部写进库,续播和进度条随之恢复。
+                    配 MediaWarp 的 http_strm 拦截,302 依旧是 3 毫秒直达网盘 CDN。
+
+    早先这里写着「AlistURL 会让 MediaWarp 拼成 /http:/openlist:5244/... 然后
+    storage not found」——那是把 URL 形式的 strm 交给了 alist_strm 处理器造成的,
+    alist_strm 只认路径。正确做法是开 http_strm 让它接管(见 gen_mediawarp_conf)。
+
+    sign 的前提:OpenList 默认 sign_all=true,不带签名访问 /d/ 会 401;
+    link_expiration 默认 0 表示签名永不过期,所以 strm 写一次就一直有效。
     """
     paths = list(cfg.get("scan_paths") or [])
     head = f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
 # 要改扫描哪些路径：emby → 3 后补参数 → 4 扫描路径
 alist:
   - id: openlist
+    # base_url 走容器内网:AutoFilm 自己调接口列目录,不必绕一圈公网。
+    # public_url 才是写进 strm 的地址,必须是播放器能访问到的 —— 两者分开正好
+    # 满足「内网调接口、公网给播放器」这个要求。
     base_url: http://openlist:5244
-    public_url:
+    public_url: {openlist_public_url(cfg)}
     username: {cfg['ol_user']}
     password: {cfg['ol_pass']}
     otp_code:
@@ -522,7 +558,7 @@ def _gen_strm_task(cfg, path):
     alist: openlist
     source_dir: "{path}"
     target_dir: "{STRM_PATH}"
-    mode: AlistPath         # 见上方注释，必须是 AlistPath，另外两个都会让 302 失效
+    mode: AlistURL          # 见 gen_autofilm_conf 的注释，三种取值都实测过
     flatten_mode: false
     overwrite: false
     concurrency: 5          # 网盘限流，并发别开太高
@@ -604,13 +640,22 @@ client:
   mode: BlackList
   list: []
 
+# AutoFilm 现在生成的是 URL 形式的 strm（mode: AlistURL），由 http_strm 接管。
+# 实测日志:
+#   HTTPStrm 重定向至: https://video-play-p-zb.drive.quark.cn/...
+#   302 | 3.09ms | GET /emby/Videos/116/stream
+# 3 毫秒 302 直达网盘 CDN，流量不经过本机 —— 和原来 alist_strm 的效果一样，
+# 但多拿到了时长（Emby 会在第一次播放时探测 URL），进度条和续播因此能用。
 http_strm:
-  enable: false
-  proxy: false
+  enable: true
+  proxy: false          # true 会让 MediaWarp 自己中转，等于白白吃本机带宽
   final_url: true
   compatibility_mode: false
-  prefix_list: []
+  prefix_list:
+    - {STRM_PATH}
 
+# alist_strm 保持开启，只为兼容【升级前生成的、路径形式的老 strm】。
+# 两个处理器按 strm 内容各管各的，互不干扰。老 strm 能播，但没有时长。
 alist_strm:
   enable: true
   proxy: true
@@ -1967,14 +2012,122 @@ def set_emby_api_key():
     print(f"  验证：{BOLD}media-stack 302{RST} 然后播一集，日志出现 302 就说明直链生效了。")
 
 
+def strm_root(d):
+    return os.path.join(read_env(os.path.join(d, ".env"), "DATA_ROOT")
+                        or os.path.join(d, "media"), "strm")
+
+
 def strm_count(d):
     """本地已生成的 .strm 数量。0 就意味着 Emby 里一定是空的。"""
-    root = os.path.join(read_env(os.path.join(d, ".env"), "DATA_ROOT")
-                        or os.path.join(d, "media"), "strm")
     n = 0
-    for _dirpath, _dirnames, files in os.walk(root):
+    for _dirpath, _dirnames, files in os.walk(strm_root(d)):
         n += sum(1 for f in files if f.endswith(".strm"))
     return n
+
+
+def old_format_strm(d):
+    """内容是【路径】而不是 URL 的老 strm —— 这些条目在 Emby 里永远没有时长。
+
+    v1.1 之前 AutoFilm 用 mode: AlistPath 生成 /quark/电影/x.mp4 这种内容,
+    Emby 的 ffprobe 当本地文件打开必然失败,RunTimeTicks 停在 0,于是续播和
+    进度条都用不了(详见 gen_autofilm_conf 的注释)。
+    """
+    out = []
+    for dirpath, _dirnames, files in os.walk(strm_root(d)):
+        for f in files:
+            if not f.endswith(".strm"):
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    head = fh.read(8).strip().lower()
+            except OSError:
+                continue
+            if not head.startswith("http"):
+                out.append(p)
+    return out
+
+
+def emby_scan_wait(key, timeout=600):
+    """让 Emby 扫一次媒体库并【等它扫完】。返回是否确认扫完。
+
+    必须等:迁移时要靠「先扫一次看到文件没了」来让 Emby 真正删掉旧条目,
+    没等完就去重新生成的话,Emby 一次扫描里同时看到删和加,会当成没变过,
+    旧条目的错误媒体信息就留下来了 —— 那正是这次要修的东西。
+    """
+    if not key:
+        return False
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"http://127.0.0.1:8096/Library/Refresh?api_key={key}", method="POST"),
+            timeout=30).close()
+    except Exception:
+        return False
+    deadline = time.time() + timeout
+    seen_running = False
+    while time.time() < deadline:
+        time.sleep(4)
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:8096/ScheduledTasks?api_key={key}", timeout=30) as r:
+                tasks = json.load(r)
+        except Exception:
+            continue
+        t = next((x for x in tasks if x.get("Key") == "RefreshLibrary"), None)
+        if not t:
+            time.sleep(20)          # 找不到任务就退回固定等待，总比不等强
+            return False
+        if t.get("State") == "Running":
+            seen_running = True
+        elif seen_running:
+            return True
+    return False
+
+
+def migrate_strm_format(d):
+    """把老的路径形式 strm 迁移成 URL 形式。返回是否需要在之后重新生成。
+
+    不能只是重写文件内容 —— 实测过:同一个条目改了 strm 内容之后,重新扫描、
+    全量刷新元数据、甚至重新播放,Emby 都不会再探测一次,时长永远是 0。
+    只有【全新的条目】才会走完整流程。所以必须删掉文件、让 Emby 扫一次看到
+    「文件没了」把条目删掉,之后重新生成才会被当成新文件收进来。
+    代价是这批条目的观看记录会清空,这个必须提前讲清楚,不能偷偷做。
+    """
+    old = old_format_strm(d)
+    if not old:
+        return False
+    print()
+    warn(f"发现 {len(old)} 个旧格式的 strm（内容是网盘路径，不是 URL）")
+    print(f"  {DIM}这些条目在 Emby 里时长是 0，因此：进度条拖不动、不记续播、")
+    print(f"  看一半退出会被当成看完。新版本改用 URL 形式，能拿到时长。{RST}")
+    print()
+    print(f"  {BOLD}要修好它们，必须让 Emby 把这些条目当成新文件重新收一遍。{RST}")
+    print(f"  {YELLOW}代价：这 {len(old)} 个条目的观看记录（看到哪、看过没）会清空。{RST}")
+    print(f"  {DIM}片子本身不会丢 —— strm 只是几十字节的文本，会重新生成。{RST}")
+    print(f"  {DIM}选 n 就保持现状：老条目继续没有时长，新加的片子不受影响。{RST}")
+    if not ask_yn("现在迁移吗？", True):
+        print("  跳过迁移。")
+        return False
+
+    for p in old:
+        try:
+            os.remove(p)
+        except OSError as e:
+            warn(f"删不掉 {p}：{e}")
+    ok(f"已删除 {len(old)} 个旧 strm")
+
+    key = read_emby_api_key(d)
+    if key:
+        info("让 Emby 扫一次，确认它看到这些文件没了...")
+        if emby_scan_wait(key):
+            ok("Emby 已确认，旧条目清掉了")
+        else:
+            warn("没等到扫描结束。等它扫完再点「4 生成媒体库」，否则可能白迁移一次。")
+    else:
+        warn("没有 Emby API Key，没法自动触发扫描。")
+        print(f"  {DIM}去 Emby 后台手动「扫描媒体库文件」，扫完再回来生成。{RST}")
+    return True
 
 
 def autofilm_clock():
@@ -2030,6 +2183,10 @@ def do_strm():
     if not os.path.exists(cfg_path):
         warn(f"找不到 {cfg_path}，AutoFilm 可能没装。")
         return
+
+    # 迁移放在生成【之前】：删掉旧格式文件、等 Emby 确认条目已清除，
+    # 紧接着的这一轮生成就会以新格式重新写出来，用户只需要点一次按钮。
+    migrate_strm_format(d)
 
     before = strm_count(d)
     print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
