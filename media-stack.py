@@ -16,6 +16,7 @@
 #  也可直接指定动作：install / info / update / uninstall
 #      sudo python3 media-stack.py info
 # ============================================================================
+import base64
 import glob
 import json
 import os
@@ -1250,6 +1251,47 @@ def openlist_storages(d):
         except Exception:
             root = ""
         out.append((mp, drv, status, root))
+    return out
+
+
+def storage_token_days(d):
+    """各网盘授权令牌还剩几天 [(挂载点, 天数), ...]。取不到就不返回那一条。
+
+    为什么需要:令牌过期的表现和「网盘不通」一模一样 —— 列目录还行(读缓存)、
+    一点开文件就转圈。实测过一次令牌只剩 5 天的情况,那天要是到期了,用户会
+    以为又是跨境线路抽风,而这个是能修的(重新扫码授权),线路那个不能。
+    静默过期是最坏的一种坏法,所以提前把天数摆出来。
+
+    只解 JWT 的 payload 取 exp。【不返回令牌本身】—— 这个函数的输出会进体检,
+    而体检结果是会被截图发出去的。
+    """
+    db = os.path.join(d, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = con.execute("select mount_path, addition from x_storages").fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for mp, add in rows:
+        try:
+            a = json.loads(add)
+        except Exception:
+            continue
+        for k, v in a.items():
+            if "token" not in k.lower() or not isinstance(v, str) or v.count(".") != 2:
+                continue
+            try:
+                seg = v.split(".")[1]
+                seg += "=" * (-len(seg) % 4)
+                exp = json.loads(base64.urlsafe_b64decode(seg)).get("exp")
+            except Exception:
+                continue
+            if exp:
+                out.append((mp, (exp - time.time()) / 86400))
+                break
     return out
 
 
@@ -3483,6 +3525,24 @@ def do_healthcheck():
                 _hc("刮削语言", "ok", "都设了")
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
+
+    # ---- 网盘授权令牌 ----
+    # 令牌过期的表现和「网盘不通」一模一样：列目录还行（读缓存），一点开文件就转圈。
+    # 但这两件事一个能修（重新扫码）、一个只能等（跨境线路），混在一起会让人一直
+    # 往线路方向找，找不到根子。所以把天数明摆出来。
+    for mp, days in storage_token_days(d):
+        if days <= 0:
+            _hc(f"授权 {mp}", "bad", f"{RED}已过期 {-days:.0f} 天{RST}")
+            todo.append((f"{mp} 的网盘授权已过期 —— 目录还列得出来（读缓存），"
+                         f"但点开任何文件都会转圈",
+                         "OpenList → 存储 → 编辑该存储 → 重新扫码授权"))
+        elif days < 3:
+            _hc(f"授权 {mp}", "warn", f"{YELLOW}还剩 {days:.1f} 天{RST}")
+            todo.append((f"{mp} 的网盘授权 {days:.1f} 天后到期",
+                         "到期当天会突然打不开任何文件。"
+                         "OpenList → 存储 → 编辑该存储 → 重新扫码授权"))
+        else:
+            _hc(f"授权 {mp}", "ok", f"还剩 {days:.0f} 天")
 
     # ---- 直链方式 / 证书 ----
     lms = link_method_storages(d)
