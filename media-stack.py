@@ -1319,22 +1319,21 @@ def show_info():
     if os.path.exists(NGX_SITE):
         print(f"      nginx 站点 {NGX_SITE}")
 
+    # 这一屏是「地址 / 账号密码 / 怎么用」，不是诊断屏。所以这里只列【挂了哪些盘】,
+    # 状态细节和修法全部交给「5 链路体检」——
+    #   · status 字段装的是整条 Go 错误，里面带着 access_token。原样打印等于把网盘
+    #     令牌摆在屏幕上，而这一屏恰恰是最常被截图发出去的
+    #   · 而且它是【存储初始化那一刻】写进去的，之后恢复了也不会改回 work，
+    #     拿它当实时状态用会把陈年记录报成当前故障
     stores = openlist_storages(d)
     if stores:
         print(f"\n  {BOLD}▸ 网盘挂载{RST}")
         for mp, drv, status, root in stores:
-            col = GREEN if status == "work" else YELLOW
-            print(f"      {pad(mp, 14)}{pad(drv, 12)}{col}{status}{RST}"
-                  + (f"   {DIM}根文件夹ID={root}{RST}" if root else ""))
-        # 夸克要的是「文件夹 ID」，根目录是 0。填成 / 这种路径写法，夸克会回
-        # "必传参数不能为空"——表现极具迷惑性：存储状态是 work、二维码也扫过了，
-        # 但点进去目录是空的，AutoFilm 每晚跑完 strm_created_count 都是 0。
-        for mp, drv, _status, root in stores:
-            if drv.lower().startswith("quark") and (not root or "/" in root):
-                print()
-                warn(f"{mp} 的根文件夹ID 是 {root or '<空>'}，夸克认的是文件夹 ID 不是路径。")
-                warn("根目录要填 0，否则目录挂得上但是空的，strm 一个也不会生成。")
-                warn("改：OpenList 管理 → 存储 → 编辑 → 根文件夹ID 填 0 → 全部重新加载。")
+            print(f"      {pad(mp, 14)}{pad(drv, 12)}"
+                  + (f"{DIM}根文件夹ID={root}{RST}" if root else ""))
+        if any(s != "work" for _m, _d, s, _r in stores):
+            print(f"      {YELLOW}有存储上次初始化时报过错{RST}"
+                  f"{DIM} —— 跑「5 链路体检」看现在通不通、怎么修{RST}")
 
     # strm 数量是判断「Emby 里为什么是空的」最直接的指标，放在容器状态前面
     n = strm_count(d)
@@ -1353,12 +1352,35 @@ def show_info():
         print(f"        2. 回本菜单点 {GREEN}{BOLD}4 生成媒体库{RST}")
         print(f"      {DIM}生成完再去 Emby 添加媒体库，路径填 {STRM_PATH}{RST}")
 
-    print(f"\n  {BOLD}▸ 容器状态{RST}")
-    r = sh(f"docker compose -f {os.path.join(d, 'docker-compose.yml')} "
-           f"--env-file {env_file} ps", timeout=60)
-    out = (r.stdout or "").strip()
-    print("\n".join("      " + ln for ln in out.splitlines()) if out
-          else f"      {YELLOW}容器没在跑，用「3 更新」或 media-stack start 拉起来。{RST}")
+    if metatube_on(d):
+        print(f"\n  {BOLD}▸ MetaTube 番号刮削{RST}")
+        print(f"      服务端地址 {CYAN}{BOLD}http://metatube:{METATUBE_PORT}{RST}"
+              f"   {DIM}(容器内地址，填进 Emby 插件设置){RST}")
+        print(f"      {DIM}用法：{RST}")
+        print(f"        1. Emby → 设置 → 插件 → MetaTube → 服务器地址填上面那个")
+        print(f"        2. 要用它的媒体库 → 编辑 → 刮削器勾上 {BOLD}MetaTube{RST} → 再扫一次")
+        print(f"      {DIM}只对文件名是番号（ABC-123 这种）的片子有效；")
+        print(f"      普通电影电视剧交给 Emby 自带的 TMDb，别在同一个库里混着开。{RST}")
+        print(f"      {DIM}装/卸：3 后补参数 → 5{RST}")
+
+    # 容器只报「几个在跑」。以前这里直接贴 docker compose ps 的原始输出,在手机上
+    # 每行都折成三四行,IMAGE/COMMAND/PORTS 糊成一片,而真正要看的只有"跑没跑"。
+    # 详细状态在「5 链路体检」里。
+    print(f"\n  {BOLD}▸ 容器{RST}")
+    want = ["emby", "openlist", "autofilm", "mediawarp"]
+    if os.path.isdir(os.path.join(d, "homepage")):
+        want.append("homepage")
+    if metatube_on(d):
+        want.append("metatube")
+    r = sh("docker ps --format '{{.Names}}'", timeout=60)
+    live = set((r.stdout or "").split())
+    down = [n for n in want if n not in live]
+    if not down:
+        print(f"      {GREEN}{len(want)}/{len(want)} 在跑{RST}")
+    else:
+        print(f"      {YELLOW}{len(want) - len(down)}/{len(want)} 在跑"
+              f"   没起来：{'、'.join(down)}{RST}")
+        print(f"      {DIM}拉起来：media-stack start{RST}")
 
     # API Key 是空的话 302 根本不生效，这是最容易被忽略的一步，单独提醒
     try:
