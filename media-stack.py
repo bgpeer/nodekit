@@ -30,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 SCRIPT_VERSION = "1.1.0"
 
@@ -423,6 +424,28 @@ def gen_compose(cfg):
       - {d}/homepage/config:/app/config
     ports:
       - "{bind}3000:3000"
+    networks: [mediastack]
+""")
+
+    if cfg.get("metatube"):
+        # 【不映射端口】：只有同一个 docker 网络里的 Emby 需要访问它，nginx 也不
+        # 给它建站点。所以不设 -token —— 在这个拓扑下加了也拦不住任何人，代价却是
+        # 用户要把一串随机字符抄进 Emby 的插件设置页。真要对外开放时再补。
+        #
+        # -dsn 要的是【纯文件路径】，不是 URL。实测：
+        #   /data/metatube.db            ✔ 建表成功
+        #   sqlite:///data/metatube.db   ✖ unable to open database file
+        # 不带 -dsn 也能跑，但数据不落盘，重启后缓存全丢、每次都要重新抓站。
+        parts.append(f"""  metatube:
+    image: {METATUBE_IMAGE}
+    container_name: metatube
+    restart: unless-stopped
+    environment:
+      - TZ=${{TZ}}
+    volumes:
+      - {d}/metatube:/data
+    command: ["-port", "{METATUBE_PORT}", "-bind", "0.0.0.0",
+              "-dsn", "/data/metatube.db", "-db-auto-migrate"]
     networks: [mediastack]
 """)
 
@@ -1400,6 +1423,9 @@ def rebuild_cfg_from_disk(d):
         "ba_pass":  read_env(sec_file, "BA_PASS", fallback=env_file),
         # 装了 Homepage 就有这个目录；容器可能被手动停掉，用目录判断更稳
         "homepage": os.path.isdir(os.path.join(d, "homepage", "config")),
+        # MetaTube 用 compose 里有没有这个服务来判断，不看目录:关掉之后数据目录
+        # 是留着的(里面是刮好的元数据缓存,再打开能直接接着用),看目录会误判成"装着"
+        "metatube": metatube_on(d),
         "host_ip":  "",     # 只有无域名模式才用得上，下面按需取
     }
     # 这三个是装的时候用户填的，脚本没有别的地方存 —— 从上次生成的配置里读回来，
@@ -2587,6 +2613,42 @@ def set_web_credentials():
           f"或清一下该站点的登录状态。{RST}")
 
 
+# ============================================================================ MetaTube
+# 按番号刮削的 Emby 插件。跟这套网盘直链没有任何关系，纯粹是「Emby 拿到文件之后
+# 怎么刮信息」那一层的补充，默认不装。
+#
+# 它是【两件东西】,少一件就是"装了但不工作":
+#   · MetaTube Server —— 独立后端,插件自己不抓站,所有请求都转给它
+#   · Emby 插件本体   —— 放进 Emby 的 plugins 目录
+METATUBE_IMAGE = "ghcr.io/metatube-community/metatube-server:latest"
+METATUBE_PORT  = 8080
+METATUBE_API   = ("https://api.github.com/repos/metatube-community"
+                  "/jellyfin-plugin-metatube/releases/latest")
+# 下载地址在运行时查 Releases,不写死:写死的话人家发新版就断了。
+# 同一个 release 里 Emby 和 Jellyfin 各一个包,按前缀挑 —— 实测资产名形如
+#   Emby.MetaTube@v2025.1102.2200.0.zip
+#   Jellyfin.MetaTube@v2025.1102.2200.0.zip
+METATUBE_ASSET_PREFIX = "Emby."
+
+
+def metatube_dir(d):
+    return os.path.join(d, "metatube")
+
+
+def emby_plugin_dir(d):
+    """Emby 容器里的 /config/plugins 对应的宿主机目录。"""
+    return os.path.join(d, "emby", "config", "plugins")
+
+
+def metatube_on(d):
+    """compose 里有没有 metatube 这个服务。"""
+    try:
+        with open(os.path.join(d, "docker-compose.yml"), encoding="utf-8") as f:
+            return "container_name: metatube" in f.read()
+    except OSError:
+        return False
+
+
 LINK_METHODS = {
     "download":  ("原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                             "跨境线路上 4K 原盘经常拉不动"),
@@ -2620,6 +2682,139 @@ def link_method_storages(d):
         if "link_method" in a:
             out.append((sid, mp, drv, str(a.get("link_method") or "")))
     return out
+
+
+def _compose_up(d):
+    compose = os.path.join(d, "docker-compose.yml")
+    env_file = os.path.join(d, ".env")
+    return subprocess.run(
+        f"docker compose -f {compose} --env-file {env_file} up -d --remove-orphans",
+        shell=True, timeout=900).returncode == 0
+
+
+def _metatube_fetch_plugin(d):
+    """下载并解压 Emby 版插件，返回落地的文件名列表。"""
+    req = urllib.request.Request(
+        METATUBE_API,
+        headers={"Accept": "application/vnd.github+json",
+                 # GitHub 的 API 不带 UA 会直接 403
+                 "User-Agent": "media-stack"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        rel = json.load(r)
+    asset = next((a for a in rel.get("assets") or []
+                  if str(a.get("name", "")).startswith(METATUBE_ASSET_PREFIX)
+                  and str(a.get("name", "")).endswith(".zip")), None)
+    if not asset:
+        names = "、".join(a.get("name", "?") for a in (rel.get("assets") or [])) or "（空）"
+        raise RuntimeError(f"这个 release 里没有 Emby 版插件包。现有：{names}")
+    info(f"下载 {asset['name']}（{rel.get('tag_name', '')}）...")
+    dst = emby_plugin_dir(d)
+    os.makedirs(dst, exist_ok=True)
+    tmp = os.path.join(dst, ".metatube.zip.part")
+    req = urllib.request.Request(asset["browser_download_url"],
+                                 headers={"User-Agent": "media-stack"})
+    with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
+        shutil.copyfileobj(r, f)
+    written = []
+    try:
+        with zipfile.ZipFile(tmp) as z:
+            for n in z.namelist():
+                # 只取压缩包根部的普通文件,挡掉 ../ 之类的路径穿越
+                base = os.path.basename(n)
+                if not base or n.endswith("/"):
+                    continue
+                with z.open(n) as src, open(os.path.join(dst, base), "wb") as out:
+                    shutil.copyfileobj(src, out)
+                written.append(base)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if not written:
+        raise RuntimeError("压缩包里没有文件")
+    return written
+
+
+def toggle_metatube():
+    """装 / 卸 MetaTube（服务端容器 + Emby 插件），一个按钮来回切。
+
+    两件东西必须一起动:只装插件不装服务端的话,插件什么都刮不出来,而界面上
+    看起来"装好了" —— 那种状态最难排查。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    on = metatube_on(d)
+    files = ms_state().get("metatube_files") or []
+
+    print()
+    print(f"  {BOLD}MetaTube{RST} {DIM}—— 按番号刮削的 Emby 插件{RST}")
+    print(f"  {DIM}给文件名是番号（ABC-123 这种）的片子刮标题、封面、演员。")
+    print(f"  普通电影电视剧用不上它 —— 那些 Emby 自带的 TMDb 就够了。{RST}")
+    print(f"  {DIM}要求 Emby 4.9 及以上。{RST}")
+    print()
+    print(f"  当前：{(GREEN + BOLD + '已安装' + RST) if on else (DIM + '未安装' + RST)}")
+    print()
+
+    if on:
+        print(f"  {DIM}卸载会：删掉 metatube 容器、删掉插件文件、重启 Emby。{RST}")
+        print(f"  {DIM}已经刮好的元数据缓存（{metatube_dir(d)}）留着不删，")
+        print(f"  以后再装回来能直接接着用。{RST}")
+        if not ask_yn("现在卸载吗？", False):
+            print("没有改动。")
+            return
+        for n in files:
+            try:
+                os.remove(os.path.join(emby_plugin_dir(d), n))
+            except OSError:
+                pass
+        cfg = rebuild_cfg_from_disk(d)
+        cfg["metatube"] = False
+        with open(os.path.join(d, "docker-compose.yml"), "w") as f:
+            f.write(gen_compose(cfg))
+        subprocess.run(["docker", "rm", "-f", "metatube"], capture_output=True)
+        _compose_up(d)
+        subprocess.run(["docker", "restart", "emby"], capture_output=True)
+        save_ms_state(metatube_files=[])
+        ok("已卸载（元数据缓存保留）")
+        return
+
+    print(f"  {DIM}安装会新增一个容器（几十 MB），并下载插件到 Emby 的插件目录。{RST}")
+    print(f"  {DIM}服务端不映射端口，只有同网络的 Emby 连得到。{RST}")
+    if not ask_yn("现在安装吗？", False):
+        print("没有改动。")
+        return
+
+    try:
+        files = _metatube_fetch_plugin(d)
+    except Exception as e:
+        err(f"插件下载失败：{_short_err(e)}")
+        print(f"  {DIM}容器还没动，什么都没改。网络好了再试一次。{RST}")
+        return
+    ok(f"插件已就位：{'、'.join(files)}")
+
+    cfg = rebuild_cfg_from_disk(d)
+    cfg["metatube"] = True
+    os.makedirs(metatube_dir(d), exist_ok=True)
+    with open(os.path.join(d, "docker-compose.yml"), "w") as f:
+        f.write(gen_compose(cfg))
+    info("启动 MetaTube 服务端...")
+    if not _compose_up(d):
+        err("容器启动失败，看上面的报错。")
+        return
+    subprocess.run(["docker", "restart", "emby"], capture_output=True)
+    save_ms_state(metatube_files=files)
+    ok("装好了")
+    print()
+    print(f"  {YELLOW}还有两步要你在 Emby 里手动做{RST}{DIM}（脚本代劳不了，"
+          f"那是插件自己的设置页）：{RST}")
+    print(f"  {DIM}1.{RST} Emby → 设置 → 插件 → MetaTube → 服务器地址填 "
+          f"{CYAN}{BOLD}http://metatube:{METATUBE_PORT}{RST}")
+    print(f"  {DIM}2.{RST} 要用它的那个媒体库 → 编辑 → 刮削器里勾上 "
+          f"{BOLD}MetaTube{RST}，再扫一次")
+    print(f"  {DIM}插件没出现的话，Emby 可能还没加载完，等一会儿刷新设置页。{RST}")
 
 
 def set_link_method():
@@ -2814,6 +3009,9 @@ def params_menu():
             sp_state = f"{DIM}未安装{RST}"
         print(f"  4. 扫描路径（加网盘 / 换目录）")
         print(f"     {DIM}当前：{sp_state}{RST}")
+        mt_state = ((f"{GREEN}已安装{RST}" if metatube_on(d) else f"{DIM}未安装{RST}")
+                    if is_installed(d) else f"{DIM}未安装{RST}")
+        print(f"  5. MetaTube 刮削插件（番号识别）  当前：{mt_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -2827,6 +3025,8 @@ def params_menu():
             set_link_method()
         elif c == "4":
             set_scan_paths()
+        elif c == "5":
+            toggle_metatube()
         else:
             print("无效选择。")
             continue
