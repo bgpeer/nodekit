@@ -1721,14 +1721,27 @@ def do_update():
     # 网盘挂了，总比晚上想看片时才发现强。
     # 注意：这【不是】"把链路热好"。实测耗时和空闲时间不相关（见 do_keepalive
     # 的文档字符串），所以别在这里承诺"现在去播不会卡"。
+    # 失败要重试一次，而且必须等够。上面刚 docker compose up -d 把容器全重启了,
+    # OpenList 起来之后还要花几秒【初始化存储】——在那之前列目录会报
+    #   failed get objs: failed get dir: object not found
+    # 看着像网盘挂了,其实只是问的太早。实测就出现过:更新完报"网盘暂时不通",
+    # 手动列同一个路径三层全部 code 200。
+    # 每次更新都误报一次"不通",用户很快就会学会忽略这一行 —— 那比不报还坏。
     info("顺便测一下网盘链路...")
     do_keepalive()
     ka = keepalive_state(d)
+    if not ka.get("ok"):
+        print(f"  {DIM}第一次没通 —— 容器刚重启，等 20 秒让 OpenList 挂载好再试一次...{RST}")
+        time.sleep(20)
+        do_keepalive()
+        ka = keepalive_state(d)
     if ka.get("ok"):
         ok(f"网盘链路正常（列目录 {ka.get('elapsed', 0)}s）")
     elif ka:
         warn(f"网盘暂时不通：{ka.get('error', '')}")
-        print(f"  {DIM}和这次更新无关，是线路问题。保活每 {KEEPALIVE_MIN} 分钟会自己重试。{RST}")
+        print(f"  {DIM}重试过一次仍然不通。和这次更新无关，"
+              f"保活每 {KEEPALIVE_MIN} 分钟会自己重试。{RST}")
+        print(f"  {DIM}想知道断在哪一层：跑「5 链路体检」。{RST}")
 
     print()
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
