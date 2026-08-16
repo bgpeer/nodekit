@@ -25,7 +25,7 @@
   },
   "experimental": {
     "cache_file": {"enabled": true, "path": "cache.db", "store_fakeip": true, "store_dns": true},
-    "clash_api": {"external_controller": "127.0.0.1:9091", "secret": "88888888", "external_ui": "zashboard", "external_ui_download_url": "https://codeload.github.com/Zephyruso/zashboard/zip/refs/heads/gh-pages", "default_mode": "规则", "access_control_allow_origin": ["*"], "access_control_allow_private_network": true}
+    "clash_api": {"external_controller": "127.0.0.1:9091", "secret": "88888888", "external_ui": "zashboard", "external_ui_download_url": "https://gh-proxy.com/https://codeload.github.com/Zephyruso/zashboard/zip/refs/heads/gh-pages", "default_mode": "规则", "access_control_allow_origin": ["*"], "access_control_allow_private_network": true}
   },
   "inbounds": [
     {"tag": "mixed-in", "type": "mixed", "listen": "0.0.0.0", "listen_port": 7898},
