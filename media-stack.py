@@ -2866,83 +2866,119 @@ def _qr115_get(url, timeout=35):
         return json.load(r)
 
 
-def qr115_login():
-    """走一遍 115 扫码，拿到 OpenList 要的「二维码令牌」。
+def _qr115_show(uid, at=0):
+    """把令牌、二维码地址、OpenList 该怎么填，一次性摊开。
 
-    令牌就是扫码会话的 uid：用户扫码确认之后，OpenList 拿这个 uid 去换 cookie。
-    所以顺序不能反 —— 必须先在手机上确认，再去 OpenList 保存，而且别隔太久，
-    那个会话是一次性的。
+    这些要【在等待扫码之前】就显示出来:用户是拿着手机在操作,等的过程中正好
+    可以先把 OpenList 那几栏填好,确认完直接点保存。藏到成功之后才给,等于逼人干等。
+    """
+    print()
+    print(f"  {BOLD}当前令牌{RST}   {GREEN}{BOLD}{uid}{RST}"
+          + (f"   {DIM}（{(time.time() - at) / 60:.0f} 分钟前生成）{RST}" if at else ""))
+    print(f"  {BOLD}二维码{RST}     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
+    print()
+    print(f"  {DIM}OpenList → 管理 → 存储 → 添加 → 驱动选「115 网盘」，然后：{RST}")
+    print(f"     Cookie       {DIM}留空{RST}")
+    print(f"     二维码令牌   {GREEN}上面那串{RST}")
+    print(f"     二维码源     {GREEN}{BOLD}网页{RST}"
+          f"   {DIM}← 必须是网页，选安卓/TV 会报「系统已下架」{RST}")
+    print(f"     根文件夹ID   {GREEN}{BOLD}0{RST}")
+    print(f"     挂载路径     {GREEN}{BOLD}/115{RST}   {DIM}（自己定，别和已有的重名）{RST}")
+
+
+def _qr115_new():
+    """申请一个新二维码，并等扫码确认。"""
+    info("正在向 115 申请二维码...")
+    try:
+        d = (_qr115_get(QR115_TOKEN).get("data") or {})
+        uid, tm, sign = d.get("uid"), d.get("time"), d.get("sign")
+    except Exception as e:
+        err(f"申请失败：{_short_err(e)}")
+        return
+    if not uid:
+        err("115 没有返回二维码信息，稍后再试。")
+        return
+    save_ms_state(qr115_uid=uid, qr115_at=int(time.time()))
+
+    _qr115_show(uid)
+    print()
+    print(f"  {BOLD}怎么扫{RST}：手机浏览器打开上面那个二维码地址 → 长按存图 →")
+    print(f"          115 App → 扫一扫 → {BOLD}从相册{RST}选那张图 → 确认登录")
+    print(f"  {DIM}（二维码和手机是同一台设备，扫不了自己的屏幕，只能走相册）{RST}")
+    print()
+    info("等你扫码确认，最多 5 分钟。Ctrl-C 可以中断，令牌已经存下来了。")
+
+    state, last_err = None, ""
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        try:
+            state = (_qr115_get(QR115_STATUS.format(
+                uid, tm, sign, int(time.time() * 1000))).get("data") or {}).get("status")
+            last_err = ""
+        except Exception as e:
+            # 以前这里把异常吞掉只显示「状态 None」，用户完全看不出发生了什么。
+            # 状态接口是长轮询，超时是常态，照实说出来比装作没事强。
+            state, last_err = None, _short_err(e)
+        if state in (2, -1, -2):
+            break
+        tip = {0: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(state)
+        if tip is None:
+            tip = f"重试中（{last_err[:24]}）" if last_err else f"状态 {state}"
+        left = int(deadline - time.time())
+        print(f"\r    {DIM}{pad(tip, 40)}还剩 {left // 60}:{left % 60:02d}{RST}",
+              end="", flush=True)
+        time.sleep(2)
+    print("\r\x1b[2K", end="")
+
+    if state == 2:
+        ok("扫码确认成功")
+        print(f"  {YELLOW}现在就去 OpenList 保存{RST}{DIM} —— 这个会话是一次性的，"
+              f"保存那一下才真正去兑换。{RST}")
+    elif state == -1:
+        warn("二维码过期了，重新制作一个。")
+    elif state == -2:
+        warn("你在手机上取消了。")
+    else:
+        warn("没等到确认。令牌还在，扫完码可以直接去 OpenList 保存试试。")
+        if last_err:
+            print(f"  {DIM}最后一次查询状态失败：{last_err}{RST}")
+
+
+def qr115_login():
+    """115 扫码登录：先摊开当前令牌，要不要重做由用户决定。
+
+    进来就自动申请是错的 —— 用户可能只是想回来看一眼上次那串令牌是什么
+    （比如 OpenList 那边填错了要重填），结果反而把旧的作废了。
     """
     while True:
+        st = ms_state()
+        uid, at = st.get("qr115_uid") or "", st.get("qr115_at") or 0
         print()
+        print("-" * 60)
         print(f"  {BOLD}115 网盘扫码登录{RST}")
-        print(f"  {DIM}OpenList 的 115 驱动需要一个「二维码令牌」，但它自己不生成二维码。")
-        print(f"  这个按钮替你走完 115 的扫码流程，把令牌取出来。{RST}")
-        print()
-        info("正在向 115 申请二维码...")
-        try:
-            d = (_qr115_get(QR115_TOKEN).get("data") or {})
-            uid, tm, sign = d.get("uid"), d.get("time"), d.get("sign")
-        except Exception as e:
-            err(f"申请失败：{_short_err(e)}")
-            return
-        if not uid:
-            err("115 没有返回二维码信息，稍后再试。")
-            return
-
-        print()
-        print(f"  {BOLD}① 手机浏览器打开这个地址，把二维码图片保存到相册{RST}")
-        print(f"     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
-        print()
-        print(f"  {BOLD}② 打开 115 App → 扫一扫 → 从相册选那张图 → 确认登录{RST}")
-        print()
-        print(f"  {DIM}（二维码在同一台手机上，所以要先存图再从相册选，扫不了屏幕）{RST}")
-        print()
-        info("等着你扫码确认...（Ctrl-C 可中断）")
-
-        state = None
-        for _ in range(150):
-            try:
-                state = (_qr115_get(QR115_STATUS.format(
-                    uid, tm, sign, int(time.time() * 1000))).get("data") or {}).get("status")
-            except Exception:
-                state = None
-            if state in (2, -1, -2):
-                break
-            tip = {0: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(
-                state, f"状态 {state}")
-            print(f"\r    {DIM}{pad(tip, 34)}{RST}", end="", flush=True)
-            time.sleep(2)
-        print("\r\x1b[2K", end="")
-
-        if state == 2:
-            ok("扫码确认成功")
+        print("-" * 60)
+        print(f"  {DIM}OpenList 的「115 网盘」驱动要一个「二维码令牌」，但它自己不生成")
+        print(f"  二维码，界面上也没说这串东西从哪来。这个按钮替你走完 115 的扫码流程。{RST}")
+        if uid:
+            _qr115_show(uid, at)
             print()
-            print(f"  {BOLD}③ 现在去 OpenList 填这几项{RST}"
-                  f"{DIM}（管理 → 存储 → 添加 → 驱动选「115 网盘」）{RST}")
-            print()
-            print(f"     {DIM}Cookie{RST}         {DIM}留空{RST}")
-            print(f"     {DIM}二维码令牌{RST}     {GREEN}{BOLD}{uid}{RST}")
-            print(f"     {DIM}二维码源{RST}       {GREEN}{BOLD}网页{RST}")
-            print(f"     {DIM}根文件夹ID{RST}     {GREEN}{BOLD}0{RST}")
-            print(f"     {DIM}挂载路径{RST}       {GREEN}{BOLD}/115{RST}   {DIM}（自己定，别和已有的重名）{RST}")
-            print()
-            print(f"  {YELLOW}趁热填，别放太久{RST}{DIM} —— 这个会话是一次性的，"
-                  f"OpenList 保存那一下才真正去兑换。{RST}")
-            print(f"  {DIM}「二维码源」一定要选{RST}网页{DIM}：令牌是用 115 的 web 端点申请的，")
-            print(f"  选成安卓/TV 属于跨端兑换，115 会回「登录失败，系统已下架」。{RST}")
-            print(f"  {DIM}代价是会占用 web 登录槽位 —— 之后你再用浏览器登录 115.com，")
-            print(f"  可能把 OpenList 这个顶下线，那就回来重扫一次。{RST}")
-            return
-        if state == -1:
-            warn("二维码过期了。")
-        elif state == -2:
-            warn("你在手机上取消了。")
+            print(f"  {DIM}上面这串还能用就直接拿去填；提示「系统已下架」或者过期了，"
+                  f"再重新制作。{RST}")
         else:
-            warn("等待超时，没等到确认。")
+            print()
+            print(f"  {DIM}还没生成过令牌。{RST}")
         print()
-        if not ask_yn("重新生成一个二维码？", True):
+        print(f"  1. 重新制作二维码")
+        print(f"  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", ""):
             return
+        if c == "1":
+            _qr115_new()
+            ask("\n按回车继续...")
+        else:
+            print("无效选择。")
 
 
 def toggle_metatube():
