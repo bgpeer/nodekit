@@ -2657,8 +2657,17 @@ def do_strm():
 
     触发方式和 CLI 那条一致：AutoFilm v2 没有手动执行的入口(--help 里只有
     --config/--log/--timezone 这类开关)，启动时也只注册 cron、不跑任务。所以临时把
-    cron 改成两分钟后只触发一次，跑完立刻还原。不用「每分钟」是因为网盘慢的时候一轮
-    要一两分钟，几轮压在一起会并发扫同一个目录、互相删对方刚写出的 strm。
+    cron 改成两分钟后只触发一次。不用「每分钟」是因为网盘慢的时候一轮要一两分钟，
+    几轮压在一起会并发扫同一个目录、互相删对方刚写出的 strm。
+
+    【为什么还原不等到最后】AutoFilm 是启动时把 config.yaml 读进内存注册 cron 的，
+    之后再改磁盘上那份不影响已经排好的这一轮。所以容器一起来就立刻还原，从那一秒起
+    脚本对磁盘不欠任何东西 —— 用户可以随时 Ctrl-C 走人，不会留下临时定时值，也不用
+    在末尾再重启一次容器（那次重启才是"必须干等到底"的真正原因）。
+
+    代价是那条临时 cron 以每天一次的形式留在内存里，直到容器下次重启。无害：
+    overwrite 是 false、同步删除是关的，重复跑一轮只是白扫一遍。而且本函数开头就会
+    重启容器，之前积下的那条随之清掉 —— 任何时刻最多只存在一条。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -2690,10 +2699,23 @@ def do_strm():
     patched = re.sub(r'(?m)^(\s*cron:\s*)".*"$', lambda m: f'{m.group(1)}"{fire}"',
                      original, count=1)
     if patched == original:
-        # 还没动过文件就退出，别进 try —— 否则 finally 会白重启一次容器
+        # 还没动过文件就退出，别进 try —— 否则 finally 会白写一次文件
         err("没能改写 cron 那一行，为安全起见没有继续。")
         return
 
+    def autofilm_log(since):
+        r"""合并 stdout 和 stderr 并剥掉颜色码。
+
+        两路都要读：不同版本的 AutoFilm/Docker 日志落在哪一路并不一致，只读 stdout
+        会漏掉统计数字（表现是最后那行全是问号）。
+        颜色码必须先剥：AutoFilm 默认 --colorful-log，日志里的字段名被转义序列包着
+        (strm_created_count 前后各有一段 \x1b[..m)，直接拿正则找 xxx_count=数字
+        一个都匹配不到。这个坑很隐蔽 —— 粘进聊天框时终端把颜色码剥掉了，看着很干净。
+        """
+        r = sh(f"docker logs --since {since} autofilm", timeout=60)
+        return ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
+
+    done = ""
     try:
         with open(cfg_path, "w", encoding="utf-8") as f:
             f.write(patched)
@@ -2702,34 +2724,66 @@ def do_strm():
                           capture_output=True).returncode != 0:
             err("重启 AutoFilm 失败，它可能没在跑。")
             return
-        info(f"已安排在 {fire.split()[2]}:{fire.split()[1]}（容器时间）触发一次，最多等 2 分钟开始。")
-        print(f"  {DIM}扫描期间日志会安静一阵，正常。整个过程最长 15 分钟。{RST}")
 
-        done = ""
+        # 等它把配置读进内存（启动会打印 scheduled_count），然后【立刻】还原磁盘。
+        # 见函数开头的说明：还原之后这一轮照跑，而脚本从此可以随时被打断。
+        for _ in range(20):
+            if "scheduled_count" in autofilm_log(since):
+                break
+            time.sleep(1)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            f.write(original)
+        base_lines = len(autofilm_log(since).splitlines())
+
+        info(f"已安排在 {fire.split()[2]}:{fire.split()[1]}（容器时间）触发，最多等 2 分钟开始。")
+        print(f"  {GREEN}这一步不用守着{RST}{DIM}：定时设置已经还原，扫描在容器里跑。"
+              f"按 Ctrl-C 随时可以走人，不会打断它。{RST}")
+        print(f"  {DIM}整个过程最长 15 分钟。等在这儿的好处是跑完会接着补时长、"
+              f"清失效条目、通知 Emby 扫描 —— 走人的话这三步要下次再点。{RST}")
+
+        started, last = False, ""
         for i in range(225):                       # 4s x 225 = 15 分钟封顶
-            # 合并 stdout 和 stderr：不同版本的 AutoFilm/Docker 日志落在哪一路
-            # 并不一致，只读 stdout 会漏掉统计数字（表现是最后那行全是问号）
-            r = sh(f"docker logs --since {since} autofilm", timeout=60)
-            # 先剥掉 ANSI 颜色码：AutoFilm 默认 --colorful-log，日志里的字段名被
-            # 转义序列包着(strm_created_count 前后各有一段 \x1b[..m)，直接拿正则
-            # 找 xxx_count=数字 一个都匹配不到，最后只能打出一排问号。
-            # 这个坑很隐蔽：粘贴到聊天/文档里时终端把颜色码剥掉了，看起来完全干净。
-            out = ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
-            for ln in out.splitlines():
+            out = autofilm_log(since)
+            lines = out.splitlines()
+            for ln in lines:
                 if "Alist2Strm 任务完成" in ln:
                     done = ln                      # 不 break：取最后一条，也就是最新那轮
             if done:
                 break
+            # 日志行数超过"刚启动"那一刻，就说明任务真的动起来了。用行数而不是认
+            # 某句中文：AutoFilm 各版本的措辞不一样，认死了会一直显示"还没开始"
+            if len(lines) > base_lines:
+                started = True
+                for ln in reversed(lines):
+                    if ln.strip():
+                        last = ln.strip()
+                        break
             time.sleep(4)
-            if i % 15 == 14:
-                print(f"  {DIM}...已等待 {(i + 1) * 4 // 60} 分钟{RST}")
+            if i % 8 == 7:                         # 每 32 秒报一次，别让人以为卡死了
+                el = (i + 1) * 4
+                phase = "正在扫描网盘" if started else "等 AutoFilm 到点触发"
+                print(f"  {DIM}...{phase}，已等 {el // 60} 分 {el % 60} 秒{RST}")
+                if last:
+                    print(f"  {DIM}   {last[-88:]}{RST}")
         if not done:
             warn("15 分钟内没等到「任务完成」。网盘可能一直超时，稍后再试一次。")
+    except KeyboardInterrupt:
+        print()
+        warn("不等了 —— 扫描在容器里继续跑，strm 会照常生成。")
+        print(f"  {DIM}没跑的是后面三步：补时长（进度条要靠它）、清失效条目、"
+              f"通知 Emby 扫描。{RST}")
+        print(f"  {DIM}过十来分钟再点一次「4 生成媒体库」：那一次文件已经在了，"
+              f"生成会秒过，这三步在那次补上。{RST}")
+        return
     finally:
-        # 还原是必须发生的：中途报错、Ctrl-C 都不能把用户的定时设置留在临时值上
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(original)
-        subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
+        # 兜底：中途报错也不能把临时定时值留在用户的配置里。正常路径上面已经还原过，
+        # 这里读一眼、不一样才写，省掉一次无谓的磁盘写入
+        try:
+            if open(cfg_path, encoding="utf-8").read() != original:
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    f.write(original)
+        except OSError:
+            pass
 
     after = strm_count(d)
     print()
