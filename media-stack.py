@@ -4235,8 +4235,15 @@ def do_healthcheck():
 
             nodur = items_without_duration(key)
             if nodur:
+                # 必须把片名列出来。只报个数字的话，用户看到"某个媒体库没有进度条
+                # 记忆"会以为是那个库的设置没生效 —— 而实际上门槛早就调好了，
+                # 缺的只是【某一部片子】的时长。一个是库的问题，一个是条目的问题，
+                # 排查方向完全相反，光给数字分不出来。
+                names = "、".join(n for _u, _i, n in nodur[:3])
+                if len(nodur) > 3:
+                    names += f" 等 {len(nodur)} 个"
                 _hc("条目时长", "bad",
-                    f"{len(nodur)} 个没有时长  {YELLOW}这些片子不会有进度条记忆{RST}")
+                    f"{names}  {YELLOW}没有时长，不会有进度条记忆{RST}")
                 todo.append((f"{len(nodur)} 个条目没探到时长，"
                              f"它们看到一半退出会被当成看完、下次从头开始",
                              "点「4 生成媒体库」会挨个补探一遍；"
