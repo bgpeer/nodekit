@@ -2430,6 +2430,65 @@ def _strm_host_path(d, item_path):
     return os.path.join(strm_root(d), STRM_SUBDIR, item_path[len(STRM_PATH):].lstrip("/"))
 
 
+def _strm_container_path(d, host_path):
+    """宿主机上的 strm 文件路径 → Emby 看到的容器内路径。_strm_host_path 的反向。"""
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    rel = os.path.relpath(host_path, base)
+    if rel.startswith(".."):
+        return ""
+    return STRM_PATH + "/" + rel.replace(os.sep, "/")
+
+
+def strm_not_in_emby(d, key):
+    """本地有 strm、Emby 却没收进去的文件。返回容器内路径列表。
+
+    这是整套东西里最难自查的一类失败：文件在网盘上、strm 生成了、媒体库路径也
+    没填错，Emby 就是不认它 —— 而界面上【一个字的提示都没有】。用户看到的只是
+    "我明明放了两部，只出来一部"，然后开始怀疑脚本、怀疑网盘、怀疑自己。
+
+    原因基本都在 Emby 自己的电影库布局规则上：一个文件夹被当成一部电影、同名
+    文件被并成"版本"、文件名里带 [第154集•4K] 这类标记解析不出片名。这些规则
+    Emby 从不解释，出问题也不报错，只是安静地少一个条目。
+
+    脚本改不了 Emby 的规则，但至少能把"少了哪个"指出来 —— 从"莫名其妙少东西"
+    变成"这个文件没被收录"，用户才有得可查。
+
+    枚举时【不加 IncludeItemTypes】：万一 Emby 把它归成了别的类型（音乐视频、
+    额外内容之类），加了类型过滤反而会把它算成"没收录"，报出假阳性。只按
+    路径以 .strm 结尾来认。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return []
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return []
+    known = set()
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not any(STRM_PATH in p or p in STRM_PATH
+                              for p in (lb.get("Locations") or [])):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true&Fields=Path", key)
+        except Exception:
+            return []                  # 有一个库问不到就整个放弃，别报假阳性
+        for i in r.get("Items") or []:
+            p = str(i.get("Path") or "")
+            if p.endswith(".strm"):
+                known.add(p)
+    if not known:
+        return []                      # 一个都没有多半是库还没建，那是另一回事
+    missing = []
+    for hp, _tgt in strm_inventory(d):
+        cp = _strm_container_path(d, hp)
+        if cp and cp not in known:
+            missing.append(cp)
+    return sorted(missing)
+
+
 def normalize_strm_files(d):
     """把所有 strm 统一成【路径形式】。返回改了几个。
 
@@ -2470,6 +2529,33 @@ def normalize_strm_files(d):
             except OSError:
                 pass
     return n
+
+
+def report_not_in_emby(d, key):
+    """把 Emby 没收录的 strm 摆出来，并说清楚该怎么改。
+
+    单独一个函数是因为「4 生成媒体库」和「5 链路体检」都要用，而这段话的价值
+    全在措辞上 —— 只说"少了 1 个"等于没说，得指名道姓 + 给出可执行的改法。
+    """
+    missing = strm_not_in_emby(d, key)
+    if not missing:
+        return 0
+    print()
+    warn(f"有 {len(missing)} 个 strm 生成了，但 Emby 没把它收进媒体库：")
+    for p in missing[:8]:
+        print(f"  {DIM}·{RST} {p}")
+    if len(missing) > 8:
+        print(f"  {DIM}...另外 {len(missing) - 8} 个{RST}")
+    print(f"  {DIM}文件和 strm 都没问题，是 Emby 的电影库布局规则把它吃掉了：{RST}")
+    print(f"  {DIM}同一个文件夹里放了多部片子时，Emby 可能只认其中一部"
+          f"（另一部当成「版本」或者直接忽略）。{RST}")
+    print(f"  {YELLOW}改法：在网盘里给每部片子单独建一个文件夹，一部片一个文件夹。{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/A.mp4        ← 两部挤在一个文件夹，会丢{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/B.mp4{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/A/A.mp4      ← 各自一个文件夹，稳{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/B/B.mp4{RST}")
+    print(f"  {DIM}改完回来点一次「4 生成媒体库」。{RST}")
+    return len(missing)
 
 
 def strm_inventory(d):
@@ -3024,6 +3110,7 @@ def do_strm():
         tune_resume_thresholds(key)
         heal_media_info(d, key)
         normalize_strm_files(d)      # heal 中途被打断的兜底
+        report_not_in_emby(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
@@ -4250,6 +4337,21 @@ def do_healthcheck():
                              "补不上多半是当时网盘那条线在抖，再点一次"))
             elif slibs:
                 _hc("条目时长", "ok", "都有")
+
+            # strm 数和 Emby 条目数对不上，是"加了片子却不出来"的头号原因，
+            # 而且 Emby 那边一声不吭。体检必须替它把这句话说出来。
+            miss = strm_not_in_emby(d, key)
+            if miss:
+                _hc("Emby 收录", "bad",
+                    f"{len(miss)} 个 strm 没被收进媒体库  "
+                    f"{YELLOW}{os.path.basename(miss[0])}{RST}"
+                    + (f" 等" if len(miss) > 1 else ""))
+                todo.append((f"{len(miss)} 个 strm 生成了但 Emby 不认，"
+                             f"表现是「网盘里加了片子，Emby 里不出来」",
+                             "同一个文件夹里放多部片子时 Emby 只认其中一部；"
+                             "在网盘里给每部片子单独建一个文件夹，再点「4 生成媒体库」"))
+            elif slibs and n:
+                _hc("Emby 收录", "ok", f"{n} 个 strm 都收进去了")
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
 
