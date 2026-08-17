@@ -2968,17 +2968,26 @@ def qr115_login():
             print()
             print(f"  {DIM}还没生成过令牌。{RST}")
         print()
-        print(f"  1. 重新制作二维码")
+        # 一个按钮按当前状态走两条路:没有就直接做,有了先问 —— 刷新会让旧令牌作废,
+        # 而用户很可能只是回来看一眼那串东西,不该顺手把它废掉
+        print(f"  1. 制作二维码" + (f"{DIM}（已有一个，会先问要不要刷新）{RST}" if uid else ""))
         print(f"  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", ""):
             return
-        if c == "1":
-            _qr115_new()
-            ask("\n按回车继续...")
-        else:
+        if c != "1":
             print("无效选择。")
+            continue
+        if uid:
+            print()
+            warn("已经有一个令牌了，重新制作会让上面那串立刻作废。")
+            print(f"  {DIM}OpenList 里如果已经用它挂好了存储，那个存储不受影响"
+                  f"（它早换成 cookie 了）。{RST}")
+            if not ask_yn("确定要重新制作吗？", False):
+                continue
+        _qr115_new()
+        ask("\n按回车继续...")
 
 
 def toggle_metatube():
