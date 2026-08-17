@@ -2339,6 +2339,167 @@ def normalize_strm_files(d):
     return n
 
 
+def strm_inventory(d):
+    """本地每个 strm 和它在 OpenList 上的目标路径 [(本地文件, 网盘路径), ...]。"""
+    out = []
+    for dirpath, _dirnames, files in os.walk(strm_root(d)):
+        for fn in files:
+            if not fn.endswith(".strm"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                tgt = strm_target_path(open(p, encoding="utf-8").read())
+            except OSError:
+                continue
+            if tgt.startswith("/"):
+                out.append((p, tgt))
+    return out
+
+
+def _strm_sidecars(strm_path):
+    """跟这个 strm 同名的附属文件（nfo / 海报 / 字幕）。
+
+    必须带上那个点再比前缀：拿 `第01集` 直接比的话，`第01集完整版.nfo` 也会中枪。
+    另一个 .strm 无论如何不碰 —— 那是另一部片子，它的死活单独判断。
+    """
+    dirn, fn = os.path.split(strm_path)
+    stem = fn[:-len(".strm")] + "."
+    out = []
+    try:
+        for f in os.listdir(dirn):
+            if f == fn or not f.startswith(stem) or f.endswith(".strm"):
+                continue
+            out.append(os.path.join(dirn, f))
+    except OSError:
+        pass
+    return out
+
+
+def _ol_exists(path, token):
+    """网盘上还有这个文件吗。True 有 / False 确认没有 / None 问不出来。
+
+    三态是这个函数的全部意义。AutoFilm 自带的同步删除是两态的（不在扫描结果里
+    就算删了），跨境线路上列目录超时是常态，于是"没扫到"被当成"已删除"，整个
+    目录的 strm 被清掉 —— 所以那个开关在 gen_autofilm_conf 里是【关】的。
+
+    这里换成逐个文件问 OpenList，并且只认它明确回答的那一句。除此之外的一切
+    —— 超时、报错、连不上 —— 都归到 None，宁可留一堆废文件也不误删一个。
+    """
+    try:
+        r = _ol_api("/api/fs/get", {"path": path, "password": ""}, token, timeout=30)
+    except Exception:
+        return None
+    if r.get("code") == 200:
+        return True
+    msg = (r.get("message") or "").lower()
+    # 只认 object not found。"storage not found" 是【存储没挂上/掉线】，那一刻
+    # 这个挂载点下面每个文件都会这么回答 —— 认成"已删除"就是清空整个媒体库
+    if "object not found" in msg and "storage not found" not in msg:
+        return False
+    return None
+
+
+def prune_dead_strm(d):
+    """删掉网盘上【确认已经不存在】的 strm。返回删了几个。
+
+    为什么需要：用户在网盘里整理片子（新建文件夹、分类、改名）之后，AutoFilm
+    会在新路径下生成一批新的 strm，但旧路径那批不会消失 —— 同步删除是关着的。
+    表现就是 Emby 里同一部片子出现两次，一个能放、一个点开报错，而且整理得越
+    勤长得越多。这是"生成"这条路本身补不上的缺口，得单独有人来收尾。
+
+    删除前逐个问 OpenList，只删它明确回答"对象不存在"的。判断依据见 _ol_exists。
+    """
+    inv = strm_inventory(d)
+    if not inv:
+        return 0
+    pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                  fallback=os.path.join(d, ".env"))
+    try:
+        token = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+                         timeout=30).get("data") or {}).get("token", "")
+    except Exception:
+        token = ""
+    if not token:
+        warn("OpenList 登不上，跳过失效 strm 清理（不影响已生成的片子）。")
+        return 0
+
+    print()
+    info(f"核对 {len(inv)} 个 strm 在网盘上还在不在...")
+    print(f"  {DIM}只删网盘明确回答「对象不存在」的。超时、报错、存储掉线一律"
+          f"当成还在 —— 宁可留废文件，不能误删。{RST}")
+
+    dead, unknown = [], 0
+    for i, (local, tgt) in enumerate(inv):
+        v = _ol_exists(tgt, token)
+        if v is False:
+            dead.append((local, tgt))
+        elif v is None:
+            unknown += 1
+        if (i + 1) % 25 == 0 and i + 1 < len(inv):
+            print(f"  {DIM}...已核对 {i + 1}/{len(inv)}{RST}")
+
+    if not dead:
+        if unknown:
+            warn(f"{unknown} 个没问出结果（超时或报错），这轮不动它们。")
+        else:
+            ok("没有失效的 strm，本地和网盘对得上。")
+        return 0
+
+    def mount_of(p):
+        return "/" + p.lstrip("/").split("/")[0]
+
+    print()
+    warn(f"有 {len(dead)} 个 strm 指向的文件在网盘上已经没有了：")
+    # 按挂载点摆出「死了几个 / 一共几个」：整个盘都判死通常是存储出了问题，
+    # 而不是用户真把片子删光了，这个比例必须让人一眼看见再决定
+    counts = {}
+    for _l, t in dead:
+        counts[mount_of(t)] = counts.get(mount_of(t), 0) + 1
+    for m, n in sorted(counts.items()):
+        tot = sum(1 for _l, t in inv if mount_of(t) == m)
+        flag = (f"   {YELLOW}← 这个挂载点下面全没了，先去 OpenList 确认盘还正常{RST}"
+                if n == tot and tot > 1 else "")
+        print(f"  {DIM}·{RST} {m}  {n}/{tot} 个{flag}")
+    print()
+    for _l, t in dead[:10]:
+        print(f"    {DIM}{t}{RST}")
+    if len(dead) > 10:
+        print(f"    {DIM}...另外 {len(dead) - 10} 个{RST}")
+    if unknown:
+        print(f"  {DIM}另有 {unknown} 个没问出结果，不在删除范围内。{RST}")
+
+    print()
+    print(f"  {DIM}删掉之后 Emby 里那些点不开的条目会在下一次扫描时消失。{RST}")
+    print(f"  {DIM}注意：在网盘里移动或改名过的片子，Emby 会当成一部新片 ——"
+          f"观看进度和已看标记不会跟过去。{RST}")
+    print(f"  {DIM}Emby 是按文件路径认片子的，路径变了就是新条目，这条脚本改不了。{RST}")
+    if not ask_yn("删掉这些失效 strm（连同同名的 nfo / 海报 / 字幕）？", False):
+        print(f"  {DIM}没删。留着不影响新片子，只是 Emby 里会多出一批点不开的条目。{RST}")
+        return 0
+
+    n = 0
+    for local, _t in dead:
+        for f in [local] + _strm_sidecars(local):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        n += 1
+    # 顺手收掉空目录：整理之后旧的目录层级会整层空下来，留着 Emby 里就是一排空文件夹。
+    # 深的先删，这样父目录轮到自己时看到的已经是子目录删完之后的状态
+    root = strm_root(d)
+    for dirpath, _dn, _f in sorted(os.walk(root), key=lambda x: -len(x[0])):
+        if os.path.abspath(dirpath) == os.path.abspath(root):
+            continue
+        try:
+            if not os.listdir(dirpath):
+                os.rmdir(dirpath)
+        except OSError:
+            pass
+    ok(f"删掉 {n} 个失效 strm")
+    return n
+
+
 def heal_media_info(d, key):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
@@ -2600,6 +2761,11 @@ def do_strm():
         print(f"  {DIM}·{RST} AutoFilm 扫的是 {BOLD}{read_yaml_scalar(cfg_path, 'source_dir', '/')}{RST}，"
               f"这个路径在 OpenList 里点得开吗")
         return
+
+    # 生成只会【加】不会【减】。用户在网盘里整理过片子的话，旧路径那批 strm
+    # 还留在本地，Emby 里就是同一部片子两个条目、一个点不开。放在扫描之前收尾，
+    # 让 Emby 这一趟同时看到"新的多了"和"旧的没了"。
+    prune_dead_strm(d)
 
     # 生成完顺手让 Emby 扫一遍，省得用户还要再进 Emby 后台找「扫描媒体库」
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
@@ -3905,7 +4071,7 @@ def main_menu():
         print("  3. 后补参数（Emby API Key 等装完才拿得到的东西）")
         # 装完网盘还没挂，所以这一步只能等用户在 OpenList 里挂好之后自己点。
         # 没有这个按钮的话，不敲命令的人就卡在「OpenList 里有文件、Emby 里空的」
-        print("  4. 生成媒体库（网盘挂好后点这个，Emby 才看得到片子）")
+        print("  4. 生成媒体库（网盘挂好、或在网盘里整理过片子之后点这个）")
         print("  5. 链路体检（卡住 / 不出片子时先跑这个）")
         print("  6. 更新（拉最新镜像 + 按新版本刷新配置）")
         print("  7. 卸载")
