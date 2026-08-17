@@ -2357,6 +2357,21 @@ def tune_resume_thresholds(key):
         except Exception as e:
             warn(f"改「{lb.get('Name')}」的续播门槛失败：{_short_err(e)}")
             continue
+        # 【必须回读确认】这个接口对不认识的字段是静默忽略的：HTTP 200 不代表改进去了。
+        # 不回读的话，脚本会年复一年地打印"已改成 2 秒"，而 Emby 那边纹丝不动 ——
+        # 用户照着这行字排除掉"门槛"这个方向，真正的原因反而永远查不到。
+        try:
+            back = _emby("/Library/VirtualFolders", key)
+            now = next((x.get("LibraryOptions") or {} for x in back
+                        if x.get("ItemId") == lb.get("ItemId")), {})
+        except Exception:
+            now = {}
+        if now.get("MinResumeDurationSeconds") != RESUME_MIN_SECONDS:
+            warn(f"「{lb.get('Name')}」的续播门槛没改动成功"
+                 f"（回读还是 {now.get('MinResumeDurationSeconds')} 秒）")
+            print(f"  {DIM}Emby 收下了请求但没生效，这个版本的接口可能不吃这个字段。"
+                  f"短片子的进度条记忆会受影响。{RST}")
+            continue
         ok(f"媒体库「{lb.get('Name')}」续播门槛：{cur_s}秒/{cur_p}% → "
            f"{RESUME_MIN_SECONDS}秒/{RESUME_MIN_PCT}%")
         print(f"  {DIM}默认的 120 秒是按电影长度定的，短片子永远够不到，"
