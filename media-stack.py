@@ -1146,58 +1146,6 @@ def do_keepalive():
         pass
 
 
-def probe_retry_reason(err):
-    """这次失败值不值得再等几秒重试。返回给人看的原因，不值得重试就返回空。
-
-    只有【容器刚起来还没就绪】那一类才值得重试：OpenList 的 HTTP 还没开始监听、
-    存储还在初始化。这些几秒后自己就好了，而且失败是瞬时的（连接被拒绝、本地查表
-    没查到），重试几乎不花时间。
-
-    网盘本身超时完全是另一回事：那是跨境线路在抖，一次要等到 timeout 才返回。
-    连试五次就是用户抱怨的"每次都让人等一分钟"，而且五次的结论必然一样。
-    这种情况问一次就够，把真实错误如实报出来。
-
-    上一版在这里犯的错是【不看原因一律重试，还统一打印"存储还没挂好"】——
-    用户网盘明明挂了好几天，屏幕上却说没挂好，等于一边慢一边撒谎。
-    """
-    e = err or ""
-    if "超时" in e or "解析失败" in e:
-        return ""                       # 线路/DNS 的问题，等 13 秒不会变
-    if "连接被拒绝" in e:
-        return "OpenList 还没起来"
-    if "登录失败" in e:
-        return "OpenList 还没准备好接受登录"
-    if "storage not found" in e.lower() or "存储" in e:
-        return "存储还在初始化"
-    return "还没通"
-
-
-def netdisk_probe(d, waits=(0, 2, 3, 5, 8, 13)):
-    """测网盘链路，容器刚重启时退避重试。返回 (最后一次的记录, 重试了几次)。
-
-    最早这里写的是"测一次、没通就固定睡 20 秒、再测一次"：存储 3 秒就绪也要等满
-    20 秒，而 20 秒不够时又只剩一次机会。
-
-    退避重试在【刚重启】这个场景几乎免费 —— 那类失败是瞬时的，就绪多快就多快返回。
-    但前提是要分清失败的原因：网盘超时也照着重试的话，等待时间反而比固定 20 秒更长，
-    因为每一次都要等到 timeout。所以由 probe_retry_reason 决定还试不试。
-    """
-    ka = {}
-    for i, w in enumerate(waits):
-        if w:
-            time.sleep(w)
-        do_keepalive()
-        ka = keepalive_state(d)
-        if ka.get("ok"):
-            return ka, i
-        why = probe_retry_reason(ka.get("error", ""))
-        if not why or i + 1 >= len(waits):
-            return ka, i                # 再试也是同样的结论，别耗着用户
-        print(f"  {DIM}{why}，{waits[i + 1]} 秒后再试"
-              f"（第 {i + 1}/{len(waits) - 1} 次）：{ka.get('error', '')[:40]}{RST}")
-    return ka, len(waits) - 1
-
-
 def install_keepalive(install_dir):
     """装保活定时任务。用 cron.d 而不是 crontab -e：这样卸载时删一个文件就干净了。"""
     try:
@@ -1853,30 +1801,22 @@ def do_update():
     if fixed:
         ok(f"{fixed} 个 strm 从 URL 形式改回路径形式（老版本留下的）")
 
-    # 更新过程重启了所有容器，这一步顺便验证网盘还通不通 —— 更新完立刻发现
-    # 网盘挂了，总比晚上想看片时才发现强。
-    # 注意：这【不是】"把链路热好"。实测耗时和空闲时间不相关（见 do_keepalive
-    # 的文档字符串），所以别在这里承诺"现在去播不会卡"。
-    # 失败要重试一次，而且必须等够。上面刚 docker compose up -d 把容器全重启了,
-    # OpenList 起来之后还要花几秒【初始化存储】——在那之前列目录会报
+    # 这里【不测网盘】。曾经在这一步顺手列一次目录"验证网盘还通不通"，但那是
+    # 跨境调用，快的时候几百毫秒，慢的时候实测 66 秒 —— 而更新本身早就做完了，
+    # 人却被钉在屏幕前等一个和更新毫无关系的结果。
+    #
+    # 而且这个位置天生容易误报：上面刚 docker compose up -d 把容器全重启，
+    # OpenList 起来之后还要花几秒初始化存储，在那之前列目录会报
     #   failed get objs: failed get dir: object not found
-    # 看着像网盘挂了,其实只是问的太早。实测就出现过:更新完报"网盘暂时不通",
-    # 手动列同一个路径三层全部 code 200。
-    # 每次更新都误报一次"不通",用户很快就会学会忽略这一行 —— 那比不报还坏。
-    info("顺便测一下网盘链路...")
-    ka, tried = netdisk_probe(d)
-    if ka.get("ok"):
-        ok(f"网盘链路正常（列目录 {ka.get('elapsed', 0)}s"
-           + (f"，重试 {tried} 次" if tried else "") + "）")
-    elif ka:
-        warn(f"网盘暂时不通：{ka.get('error', '')}")
-        print(f"  {DIM}退避重试 {tried} 次仍然不通。和这次更新无关，"
-              f"保活每 {KEEPALIVE_MIN} 分钟会自己重试。{RST}")
-        print(f"  {DIM}想知道断在哪一层：跑「5 链路体检」。{RST}")
-
+    # 看着像网盘挂了，其实只是问得太早。为了绕开它又要加重试、加退避、加就绪
+    # 判断 —— 一堆复杂度全花在一个不属于这里的检查上。
+    #
+    # 网盘通不通归「5 链路体检」管，那边测得更细（列目录 / 换直链 / 302 各一项，
+    # 带耗时和阈值），而且是用户主动去问的时候才跑。
     print()
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
+    print(f"  {DIM}想确认网盘通不通：跑「5 链路体检」。{RST}")
 
 
 def do_uninstall():
