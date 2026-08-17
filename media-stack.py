@@ -2807,7 +2807,12 @@ def do_strm():
         print(f"  {DIM}整个过程最长 15 分钟。等在这儿的好处是跑完会接着补时长、"
               f"清失效条目、通知 Emby 扫描 —— 走人的话这三步要下次再点。{RST}")
 
-        started, last = False, ""
+        # last  = 日志里最新那行；shown = 上次报进度时已经打出去过的那行。
+        # 两个都要留：日志安静的时候把同一行反复打出来，看起来就像任务在原地打转
+        # （用户原话"感觉他一直在重复一件事"），而实际上那是【一行都没新增】。
+        # 这两种情况必须显示成不同的样子，否则最要紧的信息 —— 卡了多久 —— 反而没了。
+        started, last, shown, quiet_since = False, "", "", time.monotonic()
+        slow_warned = False
         for i in range(225):                       # 4s x 225 = 15 分钟封顶
             out = autofilm_log(since)
             lines = out.splitlines()
@@ -2820,17 +2825,26 @@ def do_strm():
             # 某句中文：AutoFilm 各版本的措辞不一样，认死了会一直显示"还没开始"
             if len(lines) > base_lines:
                 started = True
-                for ln in reversed(lines):
-                    if ln.strip():
-                        last = ln.strip()
-                        break
+                newest = next((l.strip() for l in reversed(lines) if l.strip()), "")
+                if newest and newest != last:
+                    last, quiet_since = newest, time.monotonic()
             time.sleep(4)
             if i % 8 == 7:                         # 每 32 秒报一次，别让人以为卡死了
                 el = (i + 1) * 4
                 phase = "正在扫描网盘" if started else "等 AutoFilm 到点触发"
                 print(f"  {DIM}...{phase}，已等 {el // 60} 分 {el % 60} 秒{RST}")
-                if last:
+                quiet = time.monotonic() - quiet_since
+                if last and last != shown:
                     print(f"  {DIM}   {last[-88:]}{RST}")
+                    shown = last
+                elif last:
+                    print(f"  {DIM}   日志 {quiet:.0f} 秒没有新内容，还停在上面那行{RST}")
+                # 跨境列目录慢是常态，但安静两分钟以上通常是某个目录在超时重试。
+                # 说一句免得用户以为脚本死了 —— 这时候它确实什么都做不了，只能等
+                if quiet > 120 and started and not slow_warned:
+                    slow_warned = True
+                    print(f"  {YELLOW}   网盘那边在超时重试，这是跨境线路的老毛病。"
+                          f"AutoFilm 会跳过列不出来的目录继续往下走。{RST}")
         if not done:
             warn("15 分钟内没等到「任务完成」。网盘可能一直超时，稍后再试一次。")
     except KeyboardInterrupt:
