@@ -2848,6 +2848,103 @@ def _metatube_fetch_plugin(d):
     return written
 
 
+# ============================================================================ 115 扫码
+# OpenList 的「115 网盘」驱动要一个【已经拿到的】二维码令牌,它自己不生成二维码 ——
+# 源码 drivers/115/util.go 里是 if d.QRCodeToken != "" 直接拿去兑换,没有任何
+# 生成流程。于是用户在界面上只看到一个空输入框,和一句「需要二维码令牌和 Cookie
+# 其中之一」,完全不知道那串东西从哪儿来。取 Cookie 又要开发者工具,手机上做不了。
+#
+# 所以这里把 115 的扫码流程做成按钮。接口地址来自 SheltonZhu/115driver 的
+# pkg/driver/api.go（OpenList 的 115 驱动就是用的这个库）。
+QR115_TOKEN  = "https://qrcodeapi.115.com/api/1.0/web/1.0/token"
+QR115_IMAGE  = "https://qrcodeapi.115.com/api/1.0/mac/1.0/qrcode?uid={}"
+QR115_STATUS = "https://qrcodeapi.115.com/get/status/?uid={}&time={}&sign={}&_={}"
+
+
+def _qr115_get(url, timeout=35):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.load(r)
+
+
+def qr115_login():
+    """走一遍 115 扫码，拿到 OpenList 要的「二维码令牌」。
+
+    令牌就是扫码会话的 uid：用户扫码确认之后，OpenList 拿这个 uid 去换 cookie。
+    所以顺序不能反 —— 必须先在手机上确认，再去 OpenList 保存，而且别隔太久，
+    那个会话是一次性的。
+    """
+    while True:
+        print()
+        print(f"  {BOLD}115 网盘扫码登录{RST}")
+        print(f"  {DIM}OpenList 的 115 驱动需要一个「二维码令牌」，但它自己不生成二维码。")
+        print(f"  这个按钮替你走完 115 的扫码流程，把令牌取出来。{RST}")
+        print()
+        info("正在向 115 申请二维码...")
+        try:
+            d = (_qr115_get(QR115_TOKEN).get("data") or {})
+            uid, tm, sign = d.get("uid"), d.get("time"), d.get("sign")
+        except Exception as e:
+            err(f"申请失败：{_short_err(e)}")
+            return
+        if not uid:
+            err("115 没有返回二维码信息，稍后再试。")
+            return
+
+        print()
+        print(f"  {BOLD}① 手机浏览器打开这个地址，把二维码图片保存到相册{RST}")
+        print(f"     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
+        print()
+        print(f"  {BOLD}② 打开 115 App → 扫一扫 → 从相册选那张图 → 确认登录{RST}")
+        print()
+        print(f"  {DIM}（二维码在同一台手机上，所以要先存图再从相册选，扫不了屏幕）{RST}")
+        print()
+        info("等着你扫码确认...（Ctrl-C 可中断）")
+
+        state = None
+        for _ in range(150):
+            try:
+                state = (_qr115_get(QR115_STATUS.format(
+                    uid, tm, sign, int(time.time() * 1000))).get("data") or {}).get("status")
+            except Exception:
+                state = None
+            if state in (2, -1, -2):
+                break
+            tip = {0: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(
+                state, f"状态 {state}")
+            print(f"\r    {DIM}{pad(tip, 34)}{RST}", end="", flush=True)
+            time.sleep(2)
+        print("\r\x1b[2K", end="")
+
+        if state == 2:
+            ok("扫码确认成功")
+            print()
+            print(f"  {BOLD}③ 现在去 OpenList 填这几项{RST}"
+                  f"{DIM}（管理 → 存储 → 添加 → 驱动选「115 网盘」）{RST}")
+            print()
+            print(f"     {DIM}Cookie{RST}         {DIM}留空{RST}")
+            print(f"     {DIM}二维码令牌{RST}     {GREEN}{BOLD}{uid}{RST}")
+            print(f"     {DIM}二维码源{RST}       {GREEN}{BOLD}网页{RST}")
+            print(f"     {DIM}根文件夹ID{RST}     {GREEN}{BOLD}0{RST}")
+            print(f"     {DIM}挂载路径{RST}       {GREEN}{BOLD}/115{RST}   {DIM}（自己定，别和已有的重名）{RST}")
+            print()
+            print(f"  {YELLOW}趁热填，别放太久{RST}{DIM} —— 这个会话是一次性的，"
+                  f"OpenList 保存那一下才真正去兑换。{RST}")
+            print(f"  {DIM}「二维码源」一定要选{RST}网页{DIM}：令牌是用 115 的 web 端点申请的，")
+            print(f"  选成安卓/TV 属于跨端兑换，115 会回「登录失败，系统已下架」。{RST}")
+            print(f"  {DIM}代价是会占用 web 登录槽位 —— 之后你再用浏览器登录 115.com，")
+            print(f"  可能把 OpenList 这个顶下线，那就回来重扫一次。{RST}")
+            return
+        if state == -1:
+            warn("二维码过期了。")
+        elif state == -2:
+            warn("你在手机上取消了。")
+        else:
+            warn("等待超时，没等到确认。")
+        print()
+        if not ask_yn("重新生成一个二维码？", True):
+            return
+
+
 def toggle_metatube():
     """装 / 卸 MetaTube（服务端容器 + Emby 插件），一个按钮来回切。
 
@@ -3124,6 +3221,7 @@ def params_menu():
         mt_state = ((f"{GREEN}已安装{RST}" if metatube_on(d) else f"{DIM}未安装{RST}")
                     if is_installed(d) else f"{DIM}未安装{RST}")
         print(f"  5. MetaTube 刮削插件（番号识别）  当前：{mt_state}")
+        print(f"  6. 115 网盘扫码登录{DIM}（拿「二维码令牌」，挂 115 用）{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -3139,6 +3237,8 @@ def params_menu():
             set_scan_paths()
         elif c == "5":
             toggle_metatube()
+        elif c == "6":
+            qr115_login()
         else:
             print("无效选择。")
             continue
