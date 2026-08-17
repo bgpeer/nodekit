@@ -1230,19 +1230,48 @@ def do_sync():
       3. tune       给【所有】指向 strm 的媒体库调续播门槛，新建的库在这里被兜住
       4. scan       让 Emby 看到增删
       5. heal       给没时长的条目补探测 —— 必须在 scan 之后，新条目才存在
+
+    【结果必须落盘】cron 里跑的东西输出全进了 /dev/null。用户第二天看到问题还在，
+    完全无从判断是"任务没跑"还是"跑了但没修好" —— 只能来问人。所以把这一轮做了
+    什么写进 sync.json，体检那边读出来报给用户看。
     """
     d = ms_install_dir()
     if not is_installed(d):
         return
-    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
-    normalize_strm_files(d)
-    prune_dead_strm(d)
-    if not key:
-        return                     # 没有 API Key 就只能做到本地这一层
-    tune_resume_thresholds(key)
-    emby_scan_wait(key, timeout=900)
-    heal_media_info(d, key)
-    normalize_strm_files(d)        # heal 中途被打断的兜底
+    rec = {"ts": int(time.time()), "ok": False, "pruned": 0, "nodur_before": 0,
+           "nodur_after": 0, "missing": 0, "error": ""}
+    try:
+        key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                               "auth")
+        normalize_strm_files(d)
+        rec["pruned"] = prune_dead_strm(d)
+        if not key:
+            rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
+        else:
+            rec["nodur_before"] = len(items_without_duration(key))
+            tune_resume_thresholds(key)
+            emby_scan_wait(key, timeout=900)
+            heal_media_info(d, key)
+            normalize_strm_files(d)    # heal 中途被打断的兜底
+            rec["nodur_after"] = len(items_without_duration(key))
+            rec["missing"] = len(strm_not_in_emby(d, key))
+            rec["ok"] = True
+    except Exception as e:
+        rec["error"] = _short_err(e)
+    try:
+        with open(os.path.join(d, "sync.json"), "w") as f:
+            json.dump(rec, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def sync_state(d):
+    """上一次每日对齐做了什么。取不到就返回空 —— 体检那边按"还没跑过"处理。"""
+    try:
+        with open(os.path.join(d, "sync.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def install_cli(install_dir):
@@ -4380,8 +4409,31 @@ def do_healthcheck():
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
 
     if os.path.exists(SYNC_CRON):
-        _hc("每日对齐", "ok", f"北京时间 {SYNC_HOUR_CST}"
-                              f"{DIM}（清失效 / 调续播门槛 / 补时长）{RST}")
+        # 光说"装了、排在几点"不够。用户第二天发现问题还在时，要能当场分辨
+        # 是【没跑】还是【跑了但没修好】—— 这两种情况下一步做的事完全不同
+        sy = sync_state(d)
+        if not sy:
+            _hc("每日对齐", "skip",
+                f"已装，排在北京时间 {SYNC_HOUR_CST}，还没到点跑过")
+        else:
+            hrs = (time.time() - sy.get("ts", 0)) / 3600
+            when = f"{hrs:.0f} 小时前" if hrs >= 1 else f"{hrs * 60:.0f} 分钟前"
+            if not sy.get("ok"):
+                _hc("每日对齐", "warn", f"{when}跑过但没跑完："
+                                        f"{sy.get('error', '')[:40]}")
+            else:
+                did = []
+                if sy.get("pruned"):
+                    did.append(f"清了 {sy['pruned']} 个失效")
+                fixed = sy.get("nodur_before", 0) - sy.get("nodur_after", 0)
+                if fixed > 0:
+                    did.append(f"补了 {fixed} 个时长")
+                if sy.get("nodur_after"):
+                    did.append(f"{YELLOW}还有 {sy['nodur_after']} 个没时长{RST}")
+                if sy.get("missing"):
+                    did.append(f"{YELLOW}{sy['missing']} 个没被 Emby 收录{RST}")
+                _hc("每日对齐", "ok",
+                    f"{when}跑过  {'、'.join(did) if did else '没有需要处理的'}")
     else:
         _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「4 生成媒体库」")
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
