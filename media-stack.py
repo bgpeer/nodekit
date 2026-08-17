@@ -4057,6 +4057,45 @@ def do_healthcheck():
                              "（中文片名就选中文/中国），再「扫描媒体库文件」"))
             else:
                 _hc("刮削语言", "ok", "都设了")
+
+            # ---- 进度条记忆 ----
+            # 这是本项目最容易复发、也最难自查的一项：用户看到的永远是"看完退出来，
+            # 下次点进去从头开始"，而背后是两个完全不同的原因，光看现象分不出来。
+            #
+            #   ① 条目没有时长(RunTimeTicks=0)。Emby 按时长的百分比判断续播点,
+            #      分母为 0 整套逻辑失效 —— 直接判定看完、清掉续播点、打上已看标记。
+            #      新生成的条目都是这个状态,要靠 heal_media_info 去补。
+            #   ② 媒体库的续播门槛还是默认值(120 秒)。一分多钟的片子播放位置永远
+            #      到不了 120 秒,于是永远没有记忆 —— 长的记得住、短的记不住。
+            #
+            # ② 尤其阴险:门槛是【每个媒体库】各自一份的,用户新建一个媒体库,它就是
+            # 默认值。之前调好的那次不会自动惠及后来建的库,而用户完全不知道有这回事。
+            slibs = [lb for lb in libs
+                     if any(STRM_PATH in p or p in STRM_PATH
+                            for p in (lb.get("Locations") or []))]
+            stale = [lb.get("Name") or "?" for lb in slibs
+                     if (lb.get("LibraryOptions") or {}).get(
+                         "MinResumeDurationSeconds") != RESUME_MIN_SECONDS]
+            if slibs and stale:
+                _hc("续播门槛", "bad",
+                    f"{'、'.join(stale)} 还是默认值  {YELLOW}短片子不会有记忆{RST}")
+                todo.append((f"媒体库「{stale[0]}」的续播门槛是默认的 120 秒，"
+                             f"比这短的片子永远记不住播放位置",
+                             "点「4 生成媒体库」会自动调成 "
+                             f"{RESUME_MIN_SECONDS} 秒（新建的媒体库要再点一次）"))
+            elif slibs:
+                _hc("续播门槛", "ok", f"{RESUME_MIN_SECONDS} 秒 / {RESUME_MIN_PCT}%")
+
+            nodur = items_without_duration(key)
+            if nodur:
+                _hc("条目时长", "bad",
+                    f"{len(nodur)} 个没有时长  {YELLOW}这些片子不会有进度条记忆{RST}")
+                todo.append((f"{len(nodur)} 个条目没探到时长，"
+                             f"它们看到一半退出会被当成看完、下次从头开始",
+                             "点「4 生成媒体库」会挨个补探一遍；"
+                             "补不上多半是当时网盘那条线在抖，再点一次"))
+            elif slibs:
+                _hc("条目时长", "ok", "都有")
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
 
