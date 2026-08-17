@@ -2489,11 +2489,16 @@ def report_not_in_emby(d, key):
     print(f"  {DIM}文件和 strm 都没问题，是 Emby 的电影库布局规则把它吃掉了：{RST}")
     print(f"  {DIM}同一个文件夹里放了多部片子时，Emby 可能只认其中一部"
           f"（另一部当成「版本」或者直接忽略）。{RST}")
-    print(f"  {YELLOW}改法：在网盘里给每部片子单独建一个文件夹，一部片一个文件夹。{RST}")
-    print(f"  {DIM}  /quark/电影/仙逆/A.mp4        ← 两部挤在一个文件夹，会丢{RST}")
-    print(f"  {DIM}  /quark/电影/仙逆/B.mp4{RST}")
-    print(f"  {DIM}  /quark/电影/仙逆/A/A.mp4      ← 各自一个文件夹，稳{RST}")
-    print(f"  {DIM}  /quark/电影/仙逆/B/B.mp4{RST}")
+    print(f"  {YELLOW}改法：只把上面这几个挪进各自的单独文件夹，别的不用动。{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/A [4K].mp4      ← 名字相近，被当成同一部{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/A 剧场版.mp4{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/A/A [4K].mp4    ← 各自一个文件夹，稳{RST}")
+    print(f"  {DIM}  /quark/电影/仙逆/A 剧场版/A 剧场版.mp4{RST}")
+    # 不建议无差别地"每部片一个文件夹"：扫描耗时取决于目录个数，不是片子个数。
+    # 100 部片摊成 100 个目录，就是 100 次跨境列目录 —— 名字本来就不相近的片子
+    # 平铺在一个文件夹里 Emby 认得很好，没必要为它们付这个代价。
+    print(f"  {DIM}名字差别大的片子平铺在一个文件夹里没问题，不用全拆 ——"
+          f"目录越多，每次扫描要跨境列的次数越多。{RST}")
     print(f"  {DIM}改完回来点一次「4 生成媒体库」。{RST}")
     return len(missing)
 
@@ -2949,9 +2954,21 @@ def do_strm():
         # 两个都要留：日志安静的时候把同一行反复打出来，看起来就像任务在原地打转
         # （用户原话"感觉他一直在重复一件事"），而实际上那是【一行都没新增】。
         # 这两种情况必须显示成不同的样子，否则最要紧的信息 —— 卡了多久 —— 反而没了。
+        # 【为什么不是固定 15 分钟】扫描耗时取决于【目录个数】，不是片子个数 ——
+        # AutoFilm 每个目录列一次，一次跨境调用；同一个目录里放 3 部还是 300 部，
+        # 列目录的次数一样。所以片库长大之后，真正会撑爆时限的是目录层级变多。
+        #
+        # 固定时限在这里是错的模型：线路好的时候 100 个目录几分钟就完了，线路烂的
+        # 时候 3 个目录也能耗掉一刻钟。按"还在不在动"判断才对得上实际 —— 只要日志
+        # 还在往前走就一直等，真正卡死（长时间一行不出）才放弃。
+        QUIET_GIVEUP = 360         # 连续这么久没有新日志才认定卡死（单次列目录最长也就两分多钟）
+        NOSTART_GIVEUP = 300       # 一直等不到开始：cron 最多 2 分钟就该触发，5 分钟还没动就是没触发
+        HARD_CAP = 3600            # 兜底总时限，防止异常情况下无限等下去
         started, last, shown, quiet_since = False, "", "", time.monotonic()
         slow_warned = False
-        for i in range(225):                       # 4s x 225 = 15 分钟封顶
+        t_start = time.monotonic()
+        give_up = ""
+        while True:
             out = autofilm_log(since)
             lines = out.splitlines()
             for ln in lines:
@@ -2967,11 +2984,20 @@ def do_strm():
                 if newest and newest != last:
                     last, quiet_since = newest, time.monotonic()
             time.sleep(4)
-            if i % 8 == 7:                         # 每 32 秒报一次，别让人以为卡死了
-                el = (i + 1) * 4
+            el = int(time.monotonic() - t_start)
+            quiet = time.monotonic() - quiet_since
+            if started and quiet > QUIET_GIVEUP:
+                give_up = f"日志已经 {quiet / 60:.0f} 分钟没动静，判定卡住了"
+                break
+            if not started and el > NOSTART_GIVEUP:
+                give_up = "一直没等到任务开始，AutoFilm 可能没接到这次触发"
+                break
+            if el > HARD_CAP:
+                give_up = f"已经等了 {el // 60} 分钟，先收工"
+                break
+            if el % 32 < 4:                        # 每 32 秒报一次，别让人以为卡死了
                 phase = "正在扫描网盘" if started else "等 AutoFilm 到点触发"
                 print(f"  {DIM}...{phase}，已等 {el // 60} 分 {el % 60} 秒{RST}")
-                quiet = time.monotonic() - quiet_since
                 if last and last != shown:
                     print(f"  {DIM}   {last[-88:]}{RST}")
                     shown = last
@@ -2984,7 +3010,9 @@ def do_strm():
                     print(f"  {YELLOW}   网盘那边在超时重试，这是跨境线路的老毛病。"
                           f"AutoFilm 会跳过列不出来的目录继续往下走。{RST}")
         if not done:
-            warn("15 分钟内没等到「任务完成」。网盘可能一直超时，稍后再试一次。")
+            warn(f"没等到「任务完成」：{give_up}。")
+            print(f"  {DIM}扫描本身还在容器里跑，不会因为这里不等了就停。"
+                  f"已经写出来的 strm 照常生效。{RST}")
     except KeyboardInterrupt:
         print()
         warn("不等了 —— 扫描在容器里继续跑，strm 会照常生成。")
