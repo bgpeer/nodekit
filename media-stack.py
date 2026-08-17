@@ -1079,6 +1079,10 @@ esac
 
 
 KEEPALIVE_CRON = "/etc/cron.d/media-stack-keepalive"
+SYNC_CRON      = "/etc/cron.d/media-stack-sync"
+# 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
+# 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
+SYNC_HOUR_CST  = "05:45"
 # 每 20 分钟一次 ≈ 72 次/天。别为了"让链路更热"去调小它 —— 实测耗时和空闲时间
 # 不相关，理由见 do_keepalive() 的文档字符串。
 KEEPALIVE_MIN  = 20
@@ -1186,6 +1190,85 @@ def install_keepalive(install_dir):
     except OSError as e:
         warn(f"装保活定时任务失败（不影响使用）：{e}")
         return False
+
+
+def cst_to_local_cron(hhmm):
+    """北京时间 HH:MM → 本机时区下的 cron "分 时"。
+
+    三个时钟必须对齐，少换算一次就错位：
+      · AutoFilm 的调度器钉死在 Asia/Shanghai（生成 strm 的时刻按北京时间定）
+      · cron 用的是【宿主机时区】—— VPS 默认多半是 UTC，但也见过跟机房走的
+        （这台在日本，可能是 JST）
+      · 对齐任务必须跑在生成之后，否则每天都在拿昨天的文件对齐
+
+    所以偏移只能【运行时从本机读】，不能假设是 UTC。tm_gmtoff 拿的是当前实际生效
+    的偏移，夏令时也算在里面。按分钟算而不是按小时，是因为存在 +5:30 这种时区。
+    """
+    h, m = (int(x) for x in hhmm.split(":"))
+    off = time.localtime().tm_gmtoff or 0            # 本机相对 UTC 的偏移（秒）
+    total = (h * 60 + m + (off - 8 * 3600) // 60) % 1440
+    return total % 60, total // 60
+
+
+def install_sync_cron(install_dir):
+    """装每天一次的自动对齐任务。
+
+    为什么要有它：清失效 strm、调续播门槛、补时长这三件事以前只在用户手点
+    「4 生成媒体库」时才跑。而 AutoFilm 每天那次定时【只生成、不做后面三步】，
+    于是有两个洞：
+
+      · 网盘里删掉/挪走的片子，Emby 里一直留着点不开的条目，直到用户想起来点 4
+      · 新建一个媒体库，它的续播门槛就是默认的 120 秒 —— 短片子永远没有记忆，
+        而这事用户根本不知道要回来点一次
+
+    第二个洞尤其要命：门槛是每个媒体库各自一份的，加库的动作在 Emby 里做，
+    脚本这边毫无感知。用定时任务兜住之后，"以后再加多少文件夹和媒体库"都不用
+    记着回来点什么。
+    """
+    m, h = cst_to_local_cron(SYNC_HOUR_CST)
+    try:
+        txt = (f"# media-stack 每天自动对齐：清失效 strm、给新媒体库调续播门槛、\n"
+               f"# 补时长、通知 Emby 扫描。北京时间 {SYNC_HOUR_CST}"
+               f"（本机 {h:02d}:{m:02d}），在 AutoFilm 生成 strm 之后。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               # 和保活那条一样指向当前这份脚本：「更新」原地替换它，cron 自动跟到最新版
+               f"{m} {h} * * * root python3 {os.path.realpath(__file__)} "
+               "sync >/dev/null 2>&1\n")
+        with open(SYNC_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(SYNC_CRON, 0o644)
+        return True
+    except OSError as e:
+        warn(f"装每日对齐任务失败（不影响使用）：{e}")
+        return False
+
+
+def do_sync():
+    """每天自动跑的对齐：把 Emby 的状态和网盘、和当前媒体库配置拉齐。
+
+    就是「4 生成媒体库」末尾那几步，减掉触发 AutoFilm 那一段（那个有它自己的
+    定时任务）。全程不问任何问题 —— 没人在终端前面。
+
+    顺序是有讲究的：
+      1. normalize  URL 形式的 strm 归一回路径形式（heal 被打断时的残留）
+      2. prune      删掉网盘上确认没有的（三态判据，超时一律当成还在）
+      3. tune       给【所有】指向 strm 的媒体库调续播门槛，新建的库在这里被兜住
+      4. scan       让 Emby 看到增删
+      5. heal       给没时长的条目补探测 —— 必须在 scan 之后，新条目才存在
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    normalize_strm_files(d)
+    prune_dead_strm(d)
+    if not key:
+        return                     # 没有 API Key 就只能做到本地这一层
+    tune_resume_thresholds(key)
+    emby_scan_wait(key, timeout=900)
+    heal_media_info(d, key)
+    normalize_strm_files(d)        # heal 中途被打断的兜底
 
 
 def install_cli(install_dir):
@@ -1711,6 +1794,7 @@ def do_update():
     # (比如 strm 从"只重启容器"改成"真的跑一次任务")。不重装一遍就拿不到。
     install_cli(d)
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
+    install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
 
     if cfg["homepage"]:
         info("刷新 Homepage 导航配置...")
@@ -1798,7 +1882,8 @@ def do_uninstall():
             ok("已移除 nginx 站点配置")
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
-    for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE, KEEPALIVE_CRON):
+    for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
+              KEEPALIVE_CRON, SYNC_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -2031,6 +2116,7 @@ DOMAIN={cfg['domain']}
     # ---- 管理命令 ----
     install_cli(cfg["install_dir"])
     install_keepalive(cfg["install_dir"])
+    install_sync_cron(cfg["install_dir"])
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
     save_ms_state(cfg["install_dir"], scan_spec=cfg["scan_spec"])
@@ -4175,6 +4261,14 @@ def do_healthcheck():
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
 
+    if os.path.exists(SYNC_CRON):
+        _hc("每日对齐", "ok", f"北京时间 {SYNC_HOUR_CST}"
+                              f"{DIM}（清失效 / 调续播门槛 / 补时长）{RST}")
+    else:
+        _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「4 生成媒体库」")
+        todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
+                     "跑一次「6 更新」会自动补上"))
+
     # ---- 公网访问 ----
     if cfg["has_domain"]:
         if os.path.exists(NGX_ACCESS_LOG):
@@ -4285,6 +4379,8 @@ if __name__ == "__main__":
             do_healthcheck()
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             do_keepalive()
+        elif arg == "sync":               # cron 调的每日对齐，同样不交互
+            require_root(); do_sync()
         elif arg == "update":
             do_update()
         elif arg in ("apikey", "key"):
