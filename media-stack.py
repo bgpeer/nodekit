@@ -1142,6 +1142,32 @@ def do_keepalive():
         pass
 
 
+def netdisk_probe(d, waits=(0, 2, 3, 5, 8, 13)):
+    """测网盘链路，容器刚重启时自动退避重试。返回 (最后一次的记录, 重试了几次)。
+
+    以前这里写的是"先测一次、没通就固定睡 20 秒、再测一次"。两头都不划算：
+    存储 3 秒就挂好了也要干等满 20 秒（用户看到的就是每次更新末尾卡一分钟）；
+    而 20 秒不够用的时候又只剩最后一次机会，照样报"暂时不通"。
+
+    退避重试对这个场景几乎是免费的，因为【没就绪时失败得极快】—— 存储还没挂上时
+    OpenList 直接返回 storage not found，那是本地查表，根本不出网。所以等待期间的
+    每次尝试都是几毫秒，就绪那一次才会真的跨境列一趟目录。就绪多快就多快返回。
+
+    唯一真正耗时的路径是"存储已就绪、但网盘本身慢"，那一次跨境列目录省不掉，
+    也不该省 —— 那正是这项要测的东西。
+    """
+    ka = {}
+    for i, w in enumerate(waits):
+        if w:
+            print(f"  {DIM}存储还没挂好，{w} 秒后再试（第 {i}/{len(waits) - 1} 次）...{RST}")
+            time.sleep(w)
+        do_keepalive()
+        ka = keepalive_state(d)
+        if ka.get("ok"):
+            return ka, i
+    return ka, len(waits) - 1
+
+
 def install_keepalive(install_dir):
     """装保活定时任务。用 cron.d 而不是 crontab -e：这样卸载时删一个文件就干净了。"""
     try:
@@ -1728,18 +1754,13 @@ def do_update():
     # 手动列同一个路径三层全部 code 200。
     # 每次更新都误报一次"不通",用户很快就会学会忽略这一行 —— 那比不报还坏。
     info("顺便测一下网盘链路...")
-    do_keepalive()
-    ka = keepalive_state(d)
-    if not ka.get("ok"):
-        print(f"  {DIM}第一次没通 —— 容器刚重启，等 20 秒让 OpenList 挂载好再试一次...{RST}")
-        time.sleep(20)
-        do_keepalive()
-        ka = keepalive_state(d)
+    ka, tried = netdisk_probe(d)
     if ka.get("ok"):
-        ok(f"网盘链路正常（列目录 {ka.get('elapsed', 0)}s）")
+        ok(f"网盘链路正常（列目录 {ka.get('elapsed', 0)}s"
+           + (f"，重试 {tried} 次" if tried else "") + "）")
     elif ka:
         warn(f"网盘暂时不通：{ka.get('error', '')}")
-        print(f"  {DIM}重试过一次仍然不通。和这次更新无关，"
+        print(f"  {DIM}退避重试 {tried} 次仍然不通。和这次更新无关，"
               f"保活每 {KEEPALIVE_MIN} 分钟会自己重试。{RST}")
         print(f"  {DIM}想知道断在哪一层：跑「5 链路体检」。{RST}")
 
