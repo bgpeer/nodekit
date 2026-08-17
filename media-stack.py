@@ -2873,8 +2873,13 @@ def _qr115_show(uid, at=0):
     可以先把 OpenList 那几栏填好,确认完直接点保存。藏到成功之后才给,等于逼人干等。
     """
     print()
-    print(f"  {BOLD}当前令牌{RST}   {GREEN}{BOLD}{uid}{RST}"
-          + (f"   {DIM}（{(time.time() - at) / 60:.0f} 分钟前生成）{RST}" if at else ""))
+    age = ""
+    if at:
+        m = (time.time() - at) / 60
+        age = (f"{m:.0f} 分钟前" if m < 60 else
+               f"{m / 60:.0f} 小时前" if m < 1440 else f"{m / 1440:.0f} 天前")
+        age = f"   {DIM}（{age}生成）{RST}"
+    print(f"  {BOLD}当前令牌{RST}   {GREEN}{BOLD}{uid}{RST}{age}")
     print(f"  {BOLD}二维码{RST}     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
     print()
     print(f"  {DIM}OpenList → 管理 → 存储 → 添加 → 驱动选「115 网盘」，然后：{RST}")
@@ -2898,7 +2903,9 @@ def _qr115_new():
     if not uid:
         err("115 没有返回二维码信息，稍后再试。")
         return
-    save_ms_state(qr115_uid=uid, qr115_at=int(time.time()))
+    # time/sign 也存下来：下次进菜单要拿它们回查这个令牌还有没有效
+    save_ms_state(qr115_uid=uid, qr115_tm=tm, qr115_sign=sign,
+                  qr115_at=int(time.time()))
 
     _qr115_show(uid)
     print()
@@ -2944,6 +2951,29 @@ def _qr115_new():
             print(f"  {DIM}最后一次查询状态失败：{last_err}{RST}")
 
 
+def qr115_status(uid, tm, sign):
+    """回查一个令牌现在还有没有效。返回 (状态码, 人话)。
+
+    为什么要查:扫码会话是【分钟级】的,115 的状态接口专门有个 -1 已过期。
+    而菜单只显示"几分钟前生成",两天前那个和刚生成的看起来一模一样 ——
+    等于让用户自己猜。猜错的代价是拿一串废令牌去填,然后对着 OpenList 的报错
+    发懵(报的还是"系统已下架"那种完全不相干的话)。
+
+    状态接口是长轮询:没变化时它会挂住,所以这里给 8 秒就够 —— 超时本身就说明
+    "状态没变化",也就是还停在等待扫码那一步。已过期/已确认都是立刻返回的。
+    """
+    try:
+        st = (_qr115_get(QR115_STATUS.format(uid, tm, sign, int(time.time() * 1000)),
+                         timeout=8).get("data") or {}).get("status")
+    except Exception:
+        return None, "还没扫码"          # 长轮询超时 = 状态没变 = 仍在等扫码
+    return st, {2: "已确认，可以拿去填",
+                1: "扫了但还没在手机上点确认",
+                0: "还没扫码",
+                -1: "已过期，要重新制作",
+                -2: "手机上取消过了"}.get(st, f"状态 {st}")
+
+
 def qr115_login():
     """115 扫码登录：先摊开当前令牌，要不要重做由用户决定。
 
@@ -2962,8 +2992,17 @@ def qr115_login():
         if uid:
             _qr115_show(uid, at)
             print()
-            print(f"  {DIM}上面这串还能用就直接拿去填；提示「系统已下架」或者过期了，"
-                  f"再重新制作。{RST}")
+            print(f"    {DIM}正在确认这串还有没有效...{RST}", end="", flush=True)
+            st_code, st_txt = qr115_status(uid, st.get("qr115_tm"), st.get("qr115_sign"))
+            col = {2: GREEN, -1: RED, -2: RED}.get(st_code, YELLOW)
+            print(f"\r\x1b[2K  {BOLD}状态{RST}       {col}{st_txt}{RST}")
+            if st_code == 2:
+                print(f"  {DIM}直接拿去填 OpenList 就行。{RST}")
+            elif st_code in (-1, -2):
+                print(f"  {DIM}这串已经没用了，选 1 重新制作。{RST}")
+            else:
+                print(f"  {DIM}扫码会话是分钟级的，隔一段时间没扫就会失效 —— "
+                      f"拿不准就选 1 重做一个，很快。{RST}")
         else:
             print()
             print(f"  {DIM}还没生成过令牌。{RST}")
