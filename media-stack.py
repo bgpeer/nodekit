@@ -2407,7 +2407,15 @@ def prune_dead_strm(d):
     表现就是 Emby 里同一部片子出现两次，一个能放、一个点开报错，而且整理得越
     勤长得越多。这是"生成"这条路本身补不上的缺口，得单独有人来收尾。
 
-    删除前逐个问 OpenList，只删它明确回答"对象不存在"的。判断依据见 _ol_exists。
+    【不问，直接删】。本地就该是网盘的镜像：网盘里改了结构、挪了片子、删了文件，
+    本地跟着走。之所以敢不问，是因为判据是逐个文件问 OpenList 要来的【肯定回答】，
+    而不是 AutoFilm 那种"不在扫描结果里就算删了"—— 后者在跨境线路上会把超时当成
+    删除，整库清空。三态判断见 _ol_exists。
+
+    唯一保留的刹车是"整个挂载点全判死"：那更像是存储掉线、根目录ID 填错之类的配置
+    问题，而不是用户真把一个盘清空了。这种情况第一轮只记账不删，下一轮结论一样才
+    动手。真删光了的话无非晚一轮；而配置抖一下造成的误判，第二轮就自己消失了。
+    strm 本身随时能重新生成，真正删不回来的是 Emby 那边的观看记录 —— 刹车是为它踩的。
     """
     inv = strm_inventory(d)
     if not inv:
@@ -2438,7 +2446,17 @@ def prune_dead_strm(d):
         if (i + 1) % 25 == 0 and i + 1 < len(inv):
             print(f"  {DIM}...已核对 {i + 1}/{len(inv)}{RST}")
 
+    hold_path = os.path.join(d, "prune_hold.json")
+
     if not dead:
+        # 一个都不判死，说明上一轮记下的刹车（如果有）是存储抖了一下造成的误判，
+        # 现在盘已经恢复 —— 账必须销掉。留着的话下次真出配置问题时，那条陈年记录
+        # 会和新结论对上，刹车直接被跳过，等于白装
+        if os.path.exists(hold_path):
+            try:
+                os.remove(hold_path)
+            except OSError:
+                pass
         if unknown:
             warn(f"{unknown} 个没问出结果（超时或报错），这轮不动它们。")
         else:
@@ -2448,34 +2466,59 @@ def prune_dead_strm(d):
     def mount_of(p):
         return "/" + p.lstrip("/").split("/")[0]
 
-    print()
-    warn(f"有 {len(dead)} 个 strm 指向的文件在网盘上已经没有了：")
-    # 按挂载点摆出「死了几个 / 一共几个」：整个盘都判死通常是存储出了问题，
-    # 而不是用户真把片子删光了，这个比例必须让人一眼看见再决定
-    counts = {}
+    counts, totals = {}, {}
     for _l, t in dead:
         counts[mount_of(t)] = counts.get(mount_of(t), 0) + 1
-    for m, n in sorted(counts.items()):
-        tot = sum(1 for _l, t in inv if mount_of(t) == m)
-        flag = (f"   {YELLOW}← 这个挂载点下面全没了，先去 OpenList 确认盘还正常{RST}"
-                if n == tot and tot > 1 else "")
-        print(f"  {DIM}·{RST} {m}  {n}/{tot} 个{flag}")
+    for _l, t in inv:
+        totals[mount_of(t)] = totals.get(mount_of(t), 0) + 1
+
+    # ---- 唯一的刹车：整个挂载点全判死，第一轮只记账不删 ----
+    try:
+        hold = json.load(open(hold_path, encoding="utf-8"))
+    except Exception:
+        hold = {}
+    held, new_hold = {}, {}
+    for m, n in counts.items():
+        # 少于 5 个的挂载点不设刹车：那个规模上"全没了"本来就很正常
+        # （比如只放了两部片的盘，删掉一部就是 50%，删掉两部就是全部）
+        if n == totals.get(m, 0) and totals.get(m, 0) >= 5:
+            if hold.get(m, {}).get("n") == n:
+                pass                       # 上一轮同样的结论，这轮照删
+            else:
+                held[m] = n
+                new_hold[m] = {"n": n, "ts": int(time.time())}
+    # 只在结论变了才落盘。写的是"本轮仍然全判死"的挂载点，所以上一轮记过、这一轮
+    # 恢复正常的会自动从账上消失 —— 刹车不会一直留着
+    if new_hold != hold:
+        try:
+            with open(hold_path, "w", encoding="utf-8") as f:
+                json.dump(new_hold, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    if held:
+        dead = [(l, t) for l, t in dead if mount_of(t) not in held]
+        print()
+        for m, n in sorted(held.items()):
+            warn(f"{m} 下面 {n} 个文件【全部】判定为已删除 —— 这轮先不动。")
+        print(f"  {DIM}整个盘都判死，更像是存储掉线或根文件夹ID 填错，而不是你真把它清空了。")
+        print(f"  先去 OpenList 点一下这个挂载点确认还列得出东西。真是你删的话，")
+        print(f"  下次再点「4 生成媒体库」结论一样就会删掉，无非晚一轮。{RST}")
+        if not dead:
+            return 0
+
     print()
+    info(f"网盘上已经没有的 strm：{len(dead)} 个，跟着删掉。")
+    for m, n in sorted(counts.items()):
+        if m in held:
+            continue
+        print(f"  {DIM}·{RST} {m}  {n}/{totals.get(m, 0)} 个")
     for _l, t in dead[:10]:
         print(f"    {DIM}{t}{RST}")
     if len(dead) > 10:
         print(f"    {DIM}...另外 {len(dead) - 10} 个{RST}")
     if unknown:
-        print(f"  {DIM}另有 {unknown} 个没问出结果，不在删除范围内。{RST}")
-
-    print()
-    print(f"  {DIM}删掉之后 Emby 里那些点不开的条目会在下一次扫描时消失。{RST}")
-    print(f"  {DIM}注意：在网盘里移动或改名过的片子，Emby 会当成一部新片 ——"
-          f"观看进度和已看标记不会跟过去。{RST}")
-    print(f"  {DIM}Emby 是按文件路径认片子的，路径变了就是新条目，这条脚本改不了。{RST}")
-    if not ask_yn("删掉这些失效 strm（连同同名的 nfo / 海报 / 字幕）？", False):
-        print(f"  {DIM}没删。留着不影响新片子，只是 Emby 里会多出一批点不开的条目。{RST}")
-        return 0
+        print(f"  {DIM}另有 {unknown} 个没问出结果（超时或报错），当成还在，没删。{RST}")
 
     n = 0
     for local, _t in dead:
@@ -2496,7 +2539,9 @@ def prune_dead_strm(d):
                 os.rmdir(dirpath)
         except OSError:
             pass
-    ok(f"删掉 {n} 个失效 strm")
+    ok(f"删掉 {n} 个失效 strm，本地和网盘对齐")
+    print(f"  {DIM}Emby 里那些点不开的条目会在下一次扫描时消失。移动过位置的片子"
+          f"算新条目，观看进度不跟过去 —— Emby 按路径认片子，这条改不了。{RST}")
     return n
 
 
