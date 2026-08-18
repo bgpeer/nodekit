@@ -2316,6 +2316,17 @@ def items_without_duration(key):
     (VirtualFolders 里的 ItemId)、带 Recursive 和 IncludeItemTypes。
     少了 IncludeItemTypes 的话 Emby 会把媒体库节点本身当结果返回,看起来就像
     "库里只有一个条目",排查时会被带到沟里去。
+
+    【判据看 MediaSource，不看条目】条目的 RunTimeTicks 有两个来源：文件探测，
+    以及刮削（TMDb 给的片长）。刮削那份是【元数据】不是【探测结果】—— 探测失败
+    的条目照样能从 TMDb 拿到一个片长填在条目上,而 MediaSource 那边还是 0。
+
+    后果是这个函数会认为它"已经有时长了"而跳过，补时长那步【永远不会再试它】,
+    这条修复路径就此断掉。用户看到的是"明明显示 17 分钟,进度条还是记不住",
+    而体检也跟着报「条目时长 都有」—— 两边一起把人往错的方向带。
+
+    实例：仙逆那部探测失败(日志里明写"没探到"),但 TMDb 匹配上一部同名剧场版、
+    回填了 17.7 分钟,于是它从待补列表里消失了。
     """
     out = []
     try:
@@ -2336,11 +2347,16 @@ def items_without_duration(key):
             continue
         try:
             d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
-                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path", key)
+                      f"&IncludeItemTypes=Movie,Episode,Video"
+                      f"&Fields=Path,MediaSources", key)
         except Exception:
             continue
         for i in d.get("Items") or []:
-            if not (i.get("RunTimeTicks") or 0):
+            srcs = i.get("MediaSources") or []
+            # 有源就以源为准（源才是文件的真实探测结果）；一个源都没有时退回看条目
+            need = (any(not (s.get("RunTimeTicks") or 0) for s in srcs) if srcs
+                    else not (i.get("RunTimeTicks") or 0))
+            if need:
                 out.append((uid, i.get("Id"), i.get("Name") or "?"))
     return out
 
