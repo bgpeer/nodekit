@@ -2460,7 +2460,7 @@ def split_shared_identities(d, key):
         return 0
     if not uid:
         return 0
-    n = 0
+    n, stuck = 0, []
     for sig, group in dup.items():
         names = "、".join(nm for _i, nm in group)
         warn(f"这几个条目刮到了同一部片（{dict(sig)}），"
@@ -2475,15 +2475,39 @@ def split_shared_identities(d, key):
             full["ProviderIds"] = {}
             try:
                 _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
-                n += 1
             except Exception as e:
-                warn(f"清「{nm[:20]}」的刮削身份失败：{_short_err(e)}")
+                stuck.append((nm[:22], _short_err(e)))
+                continue
+            # 【回读】HTTP 200 不代表改进去了。这一项实测就栽过：脚本打出"已清掉"，
+            # 接口里两个条目的 Tmdb id 一个没少，用户照着那行绿勾以为修好了，
+            # 白等一晚上。写操作一律回读，没有例外。
+            try:
+                back = _emby(f"/Users/{uid}/Items/{iid}?Fields=ProviderIds",
+                             key, timeout=30)
+                left = {k: v for k, v in (back.get("ProviderIds") or {}).items()
+                        if k.lower() in ("tmdb", "imdb", "tvdb")}
+            except Exception:
+                left = {}
+            if left:
+                stuck.append((nm[:22], f"回读还是 {left}"))
+                continue
+            n += 1
+    if stuck:
+        err(f"{len(stuck)} 个条目的刮削身份【没能清掉】：")
+        for nm, why in stuck:
+            print(f"  {DIM}·{RST} {nm}  {why}")
+        # Emby 收下了请求却没生效，最常见的原因是身份被写在了 .nfo 里：
+        # SaveLocalMetadata 开着时 Emby 会把 tmdbid 存进媒体文件旁边的 .nfo，
+        # 每次扫描再读回来 —— 从数据库里清掉多少次都会被文件重新灌进去。
+        print(f"  {YELLOW}Emby 收下了请求但值没变。多半是身份被写进了 .nfo 文件，"
+              f"每次扫描又读回来。{RST}")
+        print(f"  {DIM}排查：ls {os.path.join(strm_root(d), STRM_SUBDIR)} 下面那几个"
+              f"同名的 .nfo，里面会有 <tmdbid>。{RST}")
+        print(f"  {DIM}这两个条目会继续共用观看进度，进度条数值仍然不可信。{RST}")
     if n:
         ok(f"{n} 个条目的刮削身份已清掉，观看进度从此各归各")
         print(f"  {DIM}海报和简介不受影响（那些存在 Emby 自己的库里）。"
               f"想重新认一部片，用条目里的「识别」指定就行。{RST}")
-        print(f"  {DIM}已经串过的续播点不会自动分开 —— 去那几个条目上"
-              f"取消「已播放」，重新播一次就各自记各自的了。{RST}")
     return n
 
 
