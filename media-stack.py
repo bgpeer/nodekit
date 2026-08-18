@@ -939,7 +939,7 @@ def issue_cert(domain, crt, key, cf_token):
 
 
 # ============================================================================ 管理命令
-CLI_TEMPLATE = '''#!/usr/bin/env bash
+CLI_TEMPLATE = r'''#!/usr/bin/env bash
 # media-stack 管理命令（由 media-stack.py 生成）
 set -uo pipefail
 D="${MEDIA_STACK_DIR:-__DIR__}"
@@ -3955,11 +3955,18 @@ def set_title_policy():
     print("-" * 60)
     c = ask("选 1 或 2（回车不改）").strip()
     want = {"1": "scrape", "2": "filename"}.get(c)
-    if not want or want == cur:
+    if not want:
         print("没有改动。")
         return
-    save_ms_state(title_policy=want)
-    ok(f"已改成：{'网盘文件名' if want == 'filename' else '刮削结果'}")
+    # 【选了同一个也要套用一遍】设置存在本地，条目改在 Emby 上，两边可能不一致 ——
+    # 上一版套用失败时就是这样：设置显示"网盘文件名"，Emby 里一个没改。这时候用户
+    # 再选一次同样的值，本意是"再来一次"，而旧代码答"没有改动"然后什么都不做，
+    # 把唯一的重试入口堵死了。
+    if want != cur:
+        save_ms_state(title_policy=want)
+        ok(f"已改成：{'网盘文件名' if want == 'filename' else '刮削结果'}")
+    else:
+        print(f"  {DIM}选的还是当前这个，按它重新套用一遍。{RST}")
     d = ms_install_dir()
     key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                             "auth") if is_installed(d) else "")
