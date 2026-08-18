@@ -2479,7 +2479,7 @@ def apply_title_policy(d, key):
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
         return 0
-    n = 0
+    n, seen, failed = 0, 0, []
     for lb in libs:
         pid = lb.get("ItemId")
         if not pid or not any(STRM_PATH in p or p in STRM_PATH
@@ -2495,9 +2495,15 @@ def apply_title_policy(d, key):
             if not path.endswith(".strm"):
                 continue
             iid = i.get("Id")
+            seen += 1
+            # 取单个条目必须走 /Users/{uid}/Items/{iid}。裸的 /Items/{iid} 在 Emby
+            # 上没有 GET 实现，会 404 —— 而这里原本 except 掉就 continue，于是每个
+            # 条目都被静默跳过，整个功能一声不吭地什么都不做。改片名【是】写操作，
+            # 失败必须看得见，不能和"本来就不用改"长得一样。
             try:
-                full = _emby(f"/Items/{iid}", key, timeout=30)
-            except Exception:
+                full = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
+            except Exception as e:
+                failed.append((str(i.get("Name") or "?")[:20], _short_err(e)))
                 continue
             locked = list(full.get("LockedFields") or [])
             stem = os.path.splitext(os.path.basename(path))[0]
@@ -2512,11 +2518,16 @@ def apply_title_policy(d, key):
                     continue
                 locked = [x for x in locked if x != "Name"]
             full["LockedFields"] = locked
+            # 更新走 POST /Items/{id}，这个是 Emby 网页端改元数据时用的那个
             try:
                 _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
                 n += 1
             except Exception as e:
-                warn(f"改「{(i.get('Name') or '?')[:20]}」的片名失败：{_short_err(e)}")
+                failed.append((str(i.get("Name") or "?")[:20], _short_err(e)))
+    if failed:
+        warn(f"{len(failed)} 个条目的片名没改成：")
+        for nm, why in failed[:5]:
+            print(f"  {DIM}·{RST} {nm}  {why}")
     if n:
         if want_filename:
             ok(f"{n} 个条目的片名已改成网盘文件名（并锁定，刮削不再覆盖）")
@@ -2524,6 +2535,10 @@ def apply_title_policy(d, key):
         else:
             ok(f"{n} 个条目的片名解锁，交回给刮削")
             print(f"  {DIM}标题会在下一次刮削时被覆盖回去。{RST}")
+    elif seen and not failed:
+        ok(f"{seen} 个条目的片名已经是想要的样子，没有需要改的")
+    elif not seen:
+        warn("没找到 strm 条目 —— Emby 媒体库可能还没建或还没扫。")
     return n
 
 
