@@ -2431,9 +2431,17 @@ def clear_impossible_progress(key):
     return n
 
 
+# 三种写法都要认。只写成对标签的话，自闭合和空标签会漏网 —— 实测漏掉一行之后
+# grep 还能在文件里搜到 uniqueid，而"清干净了没有"这种事不该靠肉眼去数。
+_NFO_ID_TAGS = "tmdbid|imdbid|tvdbid|uniqueid|tmdbcolid"
 NFO_ID_RE = re.compile(
-    r"[ \t]*<(tmdbid|imdbid|tvdbid|uniqueid)\b[^>]*>.*?</\1>[ \t]*\r?\n?",
+    r"[ \t]*(?:"
+    rf"<({_NFO_ID_TAGS})\b[^>]*/>"          # <uniqueid type="tmdb"/>
+    rf"|<({_NFO_ID_TAGS})\b[^>]*>.*?</\2>"  # <tmdbid>123</tmdbid>
+    r")[ \t]*\r?\n?",
     re.IGNORECASE | re.DOTALL)
+# 抠完回头自查用：文件里还能搜到这些词，就说明有形态没覆盖到
+NFO_ID_LEFT_RE = re.compile(rf"<(?:{_NFO_ID_TAGS})\b", re.IGNORECASE)
 
 
 def strip_nfo_ids(strm_host_path):
@@ -2458,11 +2466,19 @@ def strip_nfo_ids(strm_host_path):
     try:
         with open(nfo, "w", encoding="utf-8") as f:
             f.write(out)
-        print(f"  {DIM}·{RST} 已从 {os.path.basename(nfo)} 里抠掉刮削 id")
-        return True
     except OSError as e:
         warn(f"改 {os.path.basename(nfo)} 失败：{e}")
         return False
+    # 【自查】写完再搜一遍。漏掉一种写法的后果不是"少清了一行"，而是刮削身份
+    # 下次扫描又被灌回去 —— 也就是这个函数存在的全部意义落空，而且从输出上
+    # 完全看不出来。宁可吵一句，不要静悄悄地留个尾巴
+    if NFO_ID_LEFT_RE.search(out):
+        warn(f"{os.path.basename(nfo)} 里还残留 id 标签，可能是没见过的写法。")
+        print(f"  {DIM}这个条目的刮削身份可能会被扫描重新读回去。"
+              f"看一眼：grep -n 'uniqueid\\|tmdbid' '{nfo}'{RST}")
+        return False
+    print(f"  {DIM}·{RST} 已从 {os.path.basename(nfo)} 里抠掉刮削 id")
+    return True
 
 
 def split_shared_identities(d, key):
