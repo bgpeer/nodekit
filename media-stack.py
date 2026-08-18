@@ -2310,6 +2310,54 @@ def _emby(path, key, method="GET", timeout=60, body=None):
     return json.loads(out) if out.strip() else {}
 
 
+def shared_identity_items(key):
+    """strm 媒体库里刮到了【同一个身份】的条目，按身份分组返回 {身份: [(id, 名字)]}。
+
+    为什么这个必须查：Emby 的观看记录不是按条目 id 存的，而是按一组"用户数据键"，
+    其中就包含刮削到的外部 id（TMDb/IMDb 那些）。两个不同的文件如果被刮成了同一部
+    电影，它们就【共用一份观看进度】—— 看了 A，B 也跟着变成看过；A 的续播点会出现
+    在 B 上，哪怕 B 根本没那么长。
+
+    实测这一例：一集 17 分钟的动画和一部 93 分钟的剧场版，都被刮成了 TMDb 上同一部
+    片，于是两个条目的续播点都是 38:21 —— 而 38 分钟已经超过那一集的总长了。
+
+    网盘库里这种误撞非常容易发生：文件名带 [第154集•4K] 这类标记，Emby 解析不出
+    片名，拿去搜就是碰运气，几个文件撞到同一条结果毫不稀奇。而它坏掉的是【观看
+    记录】—— 这套东西里最不该出错、也最难恢复的那样东西。
+    """
+    groups = {}
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return {}
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return {}
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not any(STRM_PATH in p or p in STRM_PATH
+                              for p in (lb.get("Locations") or [])):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video"
+                      f"&Fields=Path,ProviderIds", key)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            pids = i.get("ProviderIds") or {}
+            # 只认真正能当身份用的那几个外部库 id。Emby 自己的内部 id 每个条目都不同，
+            # 算进来就永远分不到一组
+            sig = tuple(sorted((k, v) for k, v in pids.items()
+                               if k.lower() in ("tmdb", "imdb", "tvdb")))
+            if not sig:
+                continue
+            groups.setdefault(sig, []).append((i.get("Id"),
+                                               str(i.get("Name") or "?")))
+    return {k: v for k, v in groups.items() if len(v) > 1}
+
+
 def items_without_duration(key):
     """Emby 里还没探测出时长的影视条目 [(id, 名字), ...]。
 
@@ -4680,6 +4728,22 @@ def do_healthcheck():
             elif slibs:
                 _hc("媒体库选项", "ok",
                     f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、多版本合并已关")
+
+            # 刮到同一个身份 = 共用观看进度。这个坏的是观看记录，比刮错标题严重得多，
+            # 而且现象极具迷惑性（A 的续播点出现在 B 上，甚至超过 B 的总长）
+            dup = shared_identity_items(key)
+            if dup:
+                names = "、".join(n for g in dup.values() for _i, n in g)[:60]
+                _hc("刮削身份", "bad",
+                    f"{len(dup)} 组条目刮到了同一部片  "
+                    f"{YELLOW}它们共用观看进度{RST}")
+                print(f"     {DIM}{names}{RST}")
+                todo.append(("多个条目被刮成了同一部片，Emby 会让它们共用观看进度"
+                             "（一个看过另一个也变成看过，续播点互相串）",
+                             "进那些条目 → ⋯ → 识别 → 各自指到正确的片子；"
+                             "网盘片子常常在 TMDb 上没有对应条目，那就把刮削身份清掉"))
+            else:
+                _hc("刮削身份", "ok", "没有条目撞身份")
 
             nodur = items_without_duration(key)
             if nodur:
