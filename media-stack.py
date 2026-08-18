@@ -2431,6 +2431,40 @@ def clear_impossible_progress(key):
     return n
 
 
+NFO_ID_RE = re.compile(
+    r"[ \t]*<(tmdbid|imdbid|tvdbid|uniqueid)\b[^>]*>.*?</\1>[ \t]*\r?\n?",
+    re.IGNORECASE | re.DOTALL)
+
+
+def strip_nfo_ids(strm_host_path):
+    """把 strm 同名 .nfo 里的外部 id 标签抠掉。返回有没有改动。
+
+    只删 id，标题、简介、演职人员这些原样留着 —— 要断的是"两个文件是同一部片"
+    这个关联，不是把用户看得见的资料清空。
+
+    改文件而不是删文件：.nfo 有可能是网盘里自带、由 AutoFilm 下载下来的，那是
+    用户自己的东西。整个删掉等于替他做主。
+    """
+    if not strm_host_path or not strm_host_path.endswith(".strm"):
+        return False
+    nfo = strm_host_path[:-len(".strm")] + ".nfo"
+    try:
+        txt = open(nfo, encoding="utf-8").read()
+    except OSError:
+        return False
+    out = NFO_ID_RE.sub("", txt)
+    if out == txt:
+        return False
+    try:
+        with open(nfo, "w", encoding="utf-8") as f:
+            f.write(out)
+        print(f"  {DIM}·{RST} 已从 {os.path.basename(nfo)} 里抠掉刮削 id")
+        return True
+    except OSError as e:
+        warn(f"改 {os.path.basename(nfo)} 失败：{e}")
+        return False
+
+
 def split_shared_identities(d, key):
     """把撞在一起的刮削身份清掉，让每个视频文件各有各的观看记录。返回改了几个条目。
 
@@ -2472,6 +2506,9 @@ def split_shared_identities(d, key):
             except Exception as e:
                 warn(f"读不到「{nm[:20]}」：{_short_err(e)}")
                 continue
+            # 先拆掉文件里那份存档，再改数据库。顺序反了的话，Emby 随时可能
+            # 因为一次刷新把 .nfo 里的 id 重新读进来，前脚清完后脚就回来了
+            strip_nfo_ids(_strm_host_path(d, full.get("Path") or ""))
             full["ProviderIds"] = {}
             try:
                 _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
@@ -2588,6 +2625,14 @@ STRM_LIB_OPTIONS = {
     # 坏处。两个都关掉 —— 有几个文件就有几个条目，这才是用户预期的行为。
     "EnableMultiVersionByFiles": False,
     "EnableMultiVersionByMetadata": False,
+    # 别把元数据写回 strm 目录。默认开着时 Emby 会在每个媒体文件旁边生成 .nfo，
+    # 里面带 <uniqueid type="tmdb">。那个文件成了刮削身份的【第二份存档】：
+    # 从数据库里清掉多少次，下一次扫描读 .nfo 又灌回去 —— 实测两个条目的 tmdb id
+    # 就是这么怎么清都清不掉的，而 .nfo 的修改时间还在清理动作之后。
+    #
+    # 何况 strm 目录本来就是脚本生成、脚本清理的镜像目录，不是用户的资料库；
+    # 网盘里自带的 .nfo 由 AutoFilm 下载过来，那份才是用户的东西，不受这个影响。
+    "SaveLocalMetadata": False,
 }
 # 体检那边要单独引用，避免两处各写一份魔法数字
 RESUME_MIN_SECONDS = STRM_LIB_OPTIONS["MinResumeDurationSeconds"]
