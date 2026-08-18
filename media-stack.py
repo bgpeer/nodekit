@@ -2617,7 +2617,11 @@ def items_without_duration(key):
         return out
     for lb in libs:
         pid = lb.get("ItemId")
-        if not pid:
+        # 和其它几处保持一致：只看指向本脚本 strm 目录的媒体库。用户自己建的本地库
+        # 不归这个脚本管 —— 本地文件 Emby 自己就能探到时长，报出来只是噪音，而且
+        # heal 那边拿到非 strm 路径也只会跳过，等于报了一堆修不了的东西
+        if not pid or not any(STRM_PATH in p or p in STRM_PATH
+                              for p in (lb.get("Locations") or [])):
             continue
         try:
             d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
