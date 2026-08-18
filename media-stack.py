@@ -2893,9 +2893,17 @@ def heal_media_info(d, key):
                       key, method="POST", timeout=200)
             except Exception:
                 pass          # 探测本身超时也要走到 finally 把文件还原
+            # 【核对源的时长，不是条目的】条目的 RunTimeTicks 可能是刮削回填的
+            # （TMDb 给的片长）。拿它当探测结果的话，探测明明失败了也会报"✔ 18 分钟"
+            # —— 谎报成功比报失败坏得多：这个条目从此被当成已修好，再也不会重试，
+            # 而进度条依然是坏的。判据必须和 items_without_duration 保持一致。
             try:
-                mins = (_emby(f"/Users/{uid}/Items/{iid}", key,
-                              timeout=30).get("RunTimeTicks") or 0) / 6e8
+                got = _emby(f"/Users/{uid}/Items/{iid}?Fields=MediaSources",
+                            key, timeout=30)
+                srcs = got.get("MediaSources") or []
+                ticks = (min((s.get("RunTimeTicks") or 0) for s in srcs) if srcs
+                         else (got.get("RunTimeTicks") or 0))
+                mins = ticks / 6e8
             except Exception:
                 mins = 0
         finally:
