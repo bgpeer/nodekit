@@ -2526,6 +2526,16 @@ def split_shared_identities(d, key):
             # 因为一次刷新把 .nfo 里的 id 重新读进来，前脚清完后脚就回来了
             strip_nfo_ids(_strm_host_path(d, full.get("Path") or ""))
             full["ProviderIds"] = {}
+            # 【关键的一步：连锁定一起设】只清 id 是拦不住的 —— 清完之后条目就成了
+            # "没有身份的条目"，下一次刮削刷新会拿【片名】重新去搜，而片名没变，
+            # 于是搜回同一部片、写回同一个 id。实测就是这么长回来的：验证时是 {}，
+            # 过一阵又变回 1599191，两个条目重新共用进度。
+            #
+            # LockData 让 Emby 跳过这个条目的元数据刷新，身份才停得住。代价是海报和
+            # 简介也不再自动更新 —— 但这些条目的身份本来就是认错的，那份"自动更新"
+            # 更新的也是错的东西。已经刮到的海报简介原样保留，用户想重新认一部片，
+            # 「识别」照样能指定（那个操作会自己覆盖锁定）。
+            full["LockData"] = True
             try:
                 _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
             except Exception as e:
@@ -2539,10 +2549,15 @@ def split_shared_identities(d, key):
                              key, timeout=30)
                 left = {k: v for k, v in (back.get("ProviderIds") or {}).items()
                         if k.lower() in ("tmdb", "imdb", "tvdb")}
+                locked = bool(back.get("LockData"))
             except Exception:
-                left = {}
+                left, locked = {}, True
             if left:
                 stuck.append((nm[:22], f"回读还是 {left}"))
+                continue
+            if not locked:
+                # 没锁住就等于没修：id 清掉了，但下次刷新会照着片名再搜回来
+                stuck.append((nm[:22], "id 清掉了但没锁住，刷新后会再长回来"))
                 continue
             n += 1
     if stuck:
@@ -2558,9 +2573,13 @@ def split_shared_identities(d, key):
               f"同名的 .nfo，里面会有 <tmdbid>。{RST}")
         print(f"  {DIM}这两个条目会继续共用观看进度，进度条数值仍然不可信。{RST}")
     if n:
-        ok(f"{n} 个条目的刮削身份已清掉，观看进度从此各归各")
-        print(f"  {DIM}海报和简介不受影响（那些存在 Emby 自己的库里）。"
-              f"想重新认一部片，用条目里的「识别」指定就行。{RST}")
+        ok(f"{n} 个条目的刮削身份已清掉并锁定，观看进度从此各归各")
+        print(f"  {DIM}锁定是必须的：只清 id 的话，下次刷新会拿片名重新搜，"
+              f"搜回同一部片、写回同一个 id。{RST}")
+        print(f"  {DIM}已经刮到的海报和简介原样保留，只是不再自动更新 —— "
+              f"这些条目的身份本来就认错了，自动更新的也是错的东西。{RST}")
+        print(f"  {DIM}想给某部片重新认一个正确的，用条目里的「识别」指定，"
+              f"那个操作会覆盖锁定。{RST}")
     return n
 
 
