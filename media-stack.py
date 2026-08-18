@@ -1249,7 +1249,7 @@ def do_sync():
             rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
         else:
             rec["nodur_before"] = len(items_without_duration(key))
-            tune_resume_thresholds(key)
+            tune_strm_libraries(key)
             emby_scan_wait(key, timeout=900)
             heal_media_info(d, key)
             normalize_strm_files(d)    # heal 中途被打断的兜底
@@ -2361,25 +2361,44 @@ def items_without_duration(key):
     return out
 
 
-# 两个值要一起看,只改秒数没用:百分比那条是【按时长算】的,1% 对一部 94 分钟的
-# 电影就是 56 秒,秒数设再小也会被它卡住。所以百分比直接设 0,让秒数说了算。
-RESUME_MIN_SECONDS = 2      # 播够多少秒才值得记续播点
-RESUME_MIN_PCT     = 0      # 播到百分之几才值得记（0 = 不按比例卡）
+# 指向 strm 的媒体库要改的选项。默认值全是按【本地整理好的片库】设计的，
+# 用在网盘库上每一条都会出事，而且 Emby 的网页设置里这些都不给改，只能走接口。
+STRM_LIB_OPTIONS = {
+    # 续播门槛：默认 120 秒 / 2%。网盘库里什么长度都有，一个 1 分多钟的片子播放
+    # 位置永远到不了 120 秒，于是永远没有续播记忆 —— 表现为"长的记得住、短的记
+    # 不住"，像坏了，其实是规则如此。
+    # 两个值要一起改：百分比那条是【按时长算】的，1% 对一部 94 分钟的电影就是
+    # 56 秒，秒数设再小也会被它卡住。所以百分比设 0，让秒数说了算。
+    "MinResumeDurationSeconds": 2,
+    "MinResumePct": 0,
+    # 多版本合并：默认开。它本意是伺候「流浪地球 4K.mkv + 流浪地球 1080p.mkv」
+    # 这种同一部电影的不同画质 —— 合并成一个条目、共用一个进度，对本地片库很合理。
+    #
+    # 但它是按【清理后的文件名】和【刮削到的元数据】分组的，不是按文件。网盘里
+    # 名字相近的两部片（仙逆 [第154集•4K] 和 仙逆剧场版 [神临之战•4K]，去掉方括号
+    # 后前缀一样）会被强行并成一个条目，后果有两层：
+    #   · 少一部片 —— Emby 里只剩一个条目，用户以为文件没扫出来
+    #   · 进度条坏掉 —— 合并后的条目挂着两个源，探测失败的那个时长是 0，
+    #     Emby 拿它算续播百分比就判定"看完了"，续播点存不下来
+    # 第二层尤其难查：片子看得见、点得开、能播，只有进度条不对。
+    #
+    # 网盘库里几乎不存在"同一部片多个画质放同一个文件夹"的用法，合并带来的全是
+    # 坏处。两个都关掉 —— 有几个文件就有几个条目，这才是用户预期的行为。
+    "EnableMultiVersionByFiles": False,
+    "EnableMultiVersionByMetadata": False,
+}
+# 体检那边要单独引用，避免两处各写一份魔法数字
+RESUME_MIN_SECONDS = STRM_LIB_OPTIONS["MinResumeDurationSeconds"]
+RESUME_MIN_PCT     = STRM_LIB_OPTIONS["MinResumePct"]
+
+# MaxResumePct 不动 —— 那条是按比例算的，长短本来就公平。
 
 
-def tune_resume_thresholds(key):
-    """把媒体库的续播门槛调到对短片子也公平的值。
+def tune_strm_libraries(key):
+    """把指向 strm 的媒体库选项调成适合网盘库的值。见 STRM_LIB_OPTIONS。
 
-    Emby 每个媒体库有三个续播参数,默认值是按"电影"设计的:
-        MinResumeDurationSeconds  120   播放位置不到 120 秒就不记
-        MinResumePct                2   不到总时长 2% 不记
-        MaxResumePct               90   超过 90% 判定看完,清掉续播点
-    网盘库里什么长度都有。一个 1 分多钟的片子,播放位置【永远】到不了 120 秒,
-    于是永远没有续播记忆 —— 用户看到的是"长的能记住、短的记不住",像是坏了,
-    其实是规则如此。而这三个值 Emby 的网页设置里不给改,只能走接口。
-
-    只动指向本脚本 strm 目录的媒体库:用户自己另外建的库(本地电影、音乐之类)
-    不该被这个脚本碰。MaxResumePct 也不动 —— 那条是按比例算的,长短本来就公平。
+    只动指向本脚本 strm 目录的媒体库：用户自己另外建的库(本地电影、音乐之类)
+    不该被这个脚本碰。
     """
     try:
         libs = _emby("/Library/VirtualFolders", key)
@@ -2389,38 +2408,45 @@ def tune_resume_thresholds(key):
         if not any(STRM_PATH in p or p in STRM_PATH for p in (lb.get("Locations") or [])):
             continue
         o = lb.get("LibraryOptions") or {}
-        cur_s = o.get("MinResumeDurationSeconds")
-        cur_p = o.get("MinResumePct")
-        if cur_s == RESUME_MIN_SECONDS and cur_p == RESUME_MIN_PCT:
+        diff = {k: v for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v}
+        if not diff:
             continue
-        o["MinResumeDurationSeconds"] = RESUME_MIN_SECONDS
-        o["MinResumePct"] = RESUME_MIN_PCT
+        was = {k: o.get(k) for k in diff}
+        o.update(diff)
         try:
             _emby("/Library/VirtualFolders/LibraryOptions",
                   key, method="POST",
                   body={"Id": lb.get("ItemId"), "LibraryOptions": o})
         except Exception as e:
-            warn(f"改「{lb.get('Name')}」的续播门槛失败：{_short_err(e)}")
+            warn(f"改「{lb.get('Name')}」的媒体库选项失败：{_short_err(e)}")
             continue
         # 【必须回读确认】这个接口对不认识的字段是静默忽略的：HTTP 200 不代表改进去了。
         # 不回读的话，脚本会年复一年地打印"已改成 2 秒"，而 Emby 那边纹丝不动 ——
-        # 用户照着这行字排除掉"门槛"这个方向，真正的原因反而永远查不到。
+        # 用户照着这行字排除掉这个方向，真正的原因反而永远查不到。
         try:
             back = _emby("/Library/VirtualFolders", key)
             now = next((x.get("LibraryOptions") or {} for x in back
                         if x.get("ItemId") == lb.get("ItemId")), {})
         except Exception:
             now = {}
-        if now.get("MinResumeDurationSeconds") != RESUME_MIN_SECONDS:
-            warn(f"「{lb.get('Name')}」的续播门槛没改动成功"
-                 f"（回读还是 {now.get('MinResumeDurationSeconds')} 秒）")
-            print(f"  {DIM}Emby 收下了请求但没生效，这个版本的接口可能不吃这个字段。"
-                  f"短片子的进度条记忆会受影响。{RST}")
+        bad = [k for k in diff if now.get(k) != STRM_LIB_OPTIONS[k]]
+        if bad:
+            warn(f"「{lb.get('Name')}」有选项没改动成功："
+                 f"{'、'.join(f'{k}={now.get(k)}' for k in bad)}")
+            print(f"  {DIM}Emby 收下了请求但没生效，这个版本的接口可能不吃这些字段。{RST}")
             continue
-        ok(f"媒体库「{lb.get('Name')}」续播门槛：{cur_s}秒/{cur_p}% → "
-           f"{RESUME_MIN_SECONDS}秒/{RESUME_MIN_PCT}%")
-        print(f"  {DIM}默认的 120 秒是按电影长度定的，短片子永远够不到，"
-              f"表现为「长的记得住、短的记不住」。{RST}")
+        name = lb.get("Name")
+        if "MinResumeDurationSeconds" in diff or "MinResumePct" in diff:
+            ok(f"媒体库「{name}」续播门槛：{was.get('MinResumeDurationSeconds')}秒/"
+               f"{was.get('MinResumePct')}% → {RESUME_MIN_SECONDS}秒/{RESUME_MIN_PCT}%")
+            print(f"  {DIM}默认的 120 秒是按电影长度定的，短片子永远够不到，"
+                  f"表现为「长的记得住、短的记不住」。{RST}")
+        if "EnableMultiVersionByFiles" in diff or "EnableMultiVersionByMetadata" in diff:
+            ok(f"媒体库「{name}」已关闭多版本自动合并")
+            print(f"  {DIM}Emby 默认会把名字相近的文件并成同一部片的多个「版本」。"
+                  f"网盘库里那基本都是误判 —— 少一部片，而且进度条会坏。{RST}")
+            print(f"  {DIM}关掉之后有几个文件就有几个条目。已经并在一起的，"
+                  f"下一次扫描会拆开。{RST}")
 
 
 def _strm_host_path(d, item_path):
@@ -3146,7 +3172,7 @@ def do_strm():
             ok("Emby 已扫完")
         else:
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
-        tune_resume_thresholds(key)
+        tune_strm_libraries(key)
         heal_media_info(d, key)
         normalize_strm_files(d)      # heal 中途被打断的兜底
         report_not_in_emby(d, key)
@@ -4346,18 +4372,30 @@ def do_healthcheck():
             slibs = [lb for lb in libs
                      if any(STRM_PATH in p or p in STRM_PATH
                             for p in (lb.get("Locations") or []))]
-            stale = [lb.get("Name") or "?" for lb in slibs
-                     if (lb.get("LibraryOptions") or {}).get(
-                         "MinResumeDurationSeconds") != RESUME_MIN_SECONDS]
+            stale = {}
+            for lb in slibs:
+                o = lb.get("LibraryOptions") or {}
+                off = [k for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v]
+                if off:
+                    stale[lb.get("Name") or "?"] = off
             if slibs and stale:
-                _hc("续播门槛", "bad",
-                    f"{'、'.join(stale)} 还是默认值  {YELLOW}短片子不会有记忆{RST}")
-                todo.append((f"媒体库「{stale[0]}」的续播门槛是默认的 120 秒，"
-                             f"比这短的片子永远记不住播放位置",
-                             "点「4 生成媒体库」会自动调成 "
-                             f"{RESUME_MIN_SECONDS} 秒（新建的媒体库要再点一次）"))
+                # 两类选项分开报：一类只影响短片子的记忆，一类会让片子少掉、
+                # 顺带把进度条弄坏。混成一句"设置不对"用户不知道自己中的是哪个
+                names = "、".join(stale)
+                allk = {k for v in stale.values() for k in v}
+                what = []
+                if allk & {"MinResumeDurationSeconds", "MinResumePct"}:
+                    what.append("续播门槛还是默认值（短片子不会有记忆）")
+                if allk & {"EnableMultiVersionByFiles", "EnableMultiVersionByMetadata"}:
+                    what.append("多版本合并没关（名字相近的片子会被并成一部，进度条也会坏）")
+                _hc("媒体库选项", "bad", f"{names}  {YELLOW}{'；'.join(what)}{RST}")
+                todo.append((f"媒体库「{names.split('、')[0]}」的选项还是 Emby 默认值，"
+                             f"对网盘库不合适",
+                             "点「4 生成媒体库」会自动调好（新建的媒体库要再点一次，"
+                             "或者等第二天的每日对齐）"))
             elif slibs:
-                _hc("续播门槛", "ok", f"{RESUME_MIN_SECONDS} 秒 / {RESUME_MIN_PCT}%")
+                _hc("媒体库选项", "ok",
+                    f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、多版本合并已关")
 
             nodur = items_without_duration(key)
             if nodur:
