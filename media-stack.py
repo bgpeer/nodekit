@@ -2456,13 +2456,20 @@ def strm_not_in_emby(d, key):
                               for p in (lb.get("Locations") or [])):
             continue
         try:
-            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true&Fields=Path", key)
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&Fields=Path,MediaSources", key)
         except Exception:
             return []                  # 有一个库问不到就整个放弃，别报假阳性
         for i in r.get("Items") or []:
-            p = str(i.get("Path") or "")
-            if p.endswith(".strm"):
-                known.add(p)
+            # 条目自己的 Path 【不一定】是那个 strm。片子单独放一个文件夹时，
+            # Emby 把整个文件夹当成这部电影，条目的 Path 是【文件夹】，真正的
+            # 文件在 MediaSources 里。只看 Path 的话，凡是按"一部片一个文件夹"
+            # 摆的片子会全部被误报成"没收录" —— 而那个摆法恰恰是本脚本推荐的，
+            # 等于谁照着建议做谁中招。两处都收。
+            for p in [str(i.get("Path") or "")] + \
+                     [str(s.get("Path") or "") for s in (i.get("MediaSources") or [])]:
+                if p.endswith(".strm"):
+                    known.add(p)
     if not known:
         return []                      # 一个都没有多半是库还没建，那是另一回事
     missing = []
