@@ -3429,6 +3429,99 @@ def metatube_on(d):
         return False
 
 
+METATUBE_FETCHER = "MetaTube"
+
+
+def metatube_libraries(key):
+    """每个媒体库有没有启用 MetaTube。返回 [(名字, ItemId, 是否启用, LibraryOptions)]。
+
+    Emby 的刮削器是【每个媒体库、每种内容类型】各一份名单，存在
+    LibraryOptions.TypeOptions 里。装插件这个动作本身不写这些名单 —— 是 Emby
+    在遇到没见过的刮削器时，默认把它当成"启用"。
+    """
+    out = []
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+    except Exception:
+        return out
+    for lb in libs:
+        o = lb.get("LibraryOptions") or {}
+        on = any(METATUBE_FETCHER in (t.get("MetadataFetchers") or [])
+                 or METATUBE_FETCHER in (t.get("ImageFetchers") or [])
+                 for t in (o.get("TypeOptions") or []))
+        out.append((lb.get("Name") or "?", lb.get("ItemId"), on, o))
+    return out
+
+
+def set_metatube_libraries(key, enable_ids):
+    """只在 enable_ids 里的媒体库启用 MetaTube，其余一律摘掉。返回改了几个库。
+
+    为什么必须由脚本兜底：MetaTube 是【按番号刮日本成人片】的刮削器。装上之后
+    Emby 默认把它加进每个媒体库的刮削器名单，于是它会去动画库、家庭录像库里
+    乱认 —— 实测一集国产动画被配上了 JAV 封面。用户根本没在那个库勾选过它，
+    也不会想到要去每个库里挨个取消。
+
+    装一个成人内容刮削器却让它对全库生效，这个默认值本身就不该由用户来擦屁股。
+    """
+    n = 0
+    for name, iid, on, o in metatube_libraries(key):
+        want = iid in enable_ids
+        if want == on:
+            continue
+        tos = o.get("TypeOptions") or []
+        for t in tos:
+            for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
+                            ("ImageFetchers", "ImageFetcherOrder")):
+                lst = list(t.get(fk) or [])
+                order = list(t.get(ok_) or [])
+                if want:
+                    if METATUBE_FETCHER not in lst:
+                        lst.append(METATUBE_FETCHER)
+                    if METATUBE_FETCHER not in order:
+                        order.append(METATUBE_FETCHER)
+                else:
+                    lst = [x for x in lst if x != METATUBE_FETCHER]
+                    order = [x for x in order if x != METATUBE_FETCHER]
+                t[fk] = lst
+                t[ok_] = order
+        o["TypeOptions"] = tos
+        try:
+            _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
+                  body={"Id": iid, "LibraryOptions": o}, timeout=30)
+            n += 1
+            print(f"  {DIM}·{RST} {name}：MetaTube "
+                  f"{GREEN + '已启用' + RST if want else DIM + '已移除' + RST}")
+        except Exception as e:
+            warn(f"改「{name}」的刮削器名单失败：{_short_err(e)}")
+    return n
+
+
+def choose_metatube_libraries(key):
+    """让用户选 MetaTube 在哪些媒体库生效。不选就是一个都不启用。"""
+    libs = metatube_libraries(key)
+    if not libs:
+        warn("读不到媒体库列表，MetaTube 的适用范围没能设置。")
+        print(f"  {DIM}稍后可以在 Emby → 媒体库 → 某个库 → 刮削器里自己勾。{RST}")
+        return
+    print()
+    print(f"  {BOLD}MetaTube 要在哪些媒体库生效？{RST}")
+    print(f"  {YELLOW}它是按番号刮日本成人片的。放进动画库、电影库只会乱认 ——"
+          f"实测一集国产动画被配上了 JAV 封面。{RST}")
+    print()
+    for i, (name, _iid, on, _o) in enumerate(libs, 1):
+        print(f"    {i}) {name}   {DIM}当前：{'启用' if on else '未启用'}{RST}")
+    print()
+    print(f"  {DIM}输入编号，多个用逗号隔开（比如 1,3）。"
+          f"直接回车 = 一个都不启用。{RST}")
+    raw = ask("选哪些").strip()
+    picked = set()
+    for x in re.split(r"[,，\s]+", raw):
+        if x.isdigit() and 1 <= int(x) <= len(libs):
+            picked.add(libs[int(x) - 1][1])
+    if set_metatube_libraries(key, picked) == 0:
+        print(f"  {DIM}刮削器名单本来就是这样，没有改动。{RST}")
+
+
 LINK_METHODS = {
     "download":  ("原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                             "跨境线路上 4K 原盘经常拉不动"),
@@ -3768,13 +3861,25 @@ def toggle_metatube():
     subprocess.run(["docker", "restart", "emby"], capture_output=True)
     save_ms_state(metatube_files=files)
     ok("装好了")
+
+    # 装完【必须】立刻圈定适用范围。Emby 遇到没见过的刮削器默认当成启用，于是
+    # 一个按番号刮成人片的插件会自动对所有媒体库生效 —— 用户没在那些库勾过它，
+    # 也不会想到要去每个库里挨个取消。这个默认值不该由用户来擦屁股。
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if key:
+        time.sleep(8)          # 等 Emby 重启完，不然媒体库列表读不到
+        choose_metatube_libraries(key)
+    else:
+        warn("没有 Emby API Key，没法自动圈定 MetaTube 的适用范围。")
+        print(f"  {DIM}请手动去每个不需要它的媒体库里取消勾选 MetaTube，"
+              f"否则它会去动画库、电影库里乱认。{RST}")
+
     print()
-    print(f"  {YELLOW}还有两步要你在 Emby 里手动做{RST}{DIM}（脚本代劳不了，"
+    print(f"  {YELLOW}还有一步要你在 Emby 里手动做{RST}{DIM}（脚本代劳不了，"
           f"那是插件自己的设置页）：{RST}")
-    print(f"  {DIM}1.{RST} Emby → 设置 → 插件 → MetaTube → 服务器地址填 "
+    print(f"  {DIM}·{RST} Emby → 设置 → 插件 → MetaTube → 服务器地址填 "
           f"{CYAN}{BOLD}http://metatube:{METATUBE_PORT}{RST}")
-    print(f"  {DIM}2.{RST} 要用它的那个媒体库 → 编辑 → 刮削器里勾上 "
-          f"{BOLD}MetaTube{RST}，再扫一次")
     print(f"  {DIM}插件没出现的话，Emby 可能还没加载完，等一会儿刷新设置页。{RST}")
 
 
@@ -4016,6 +4121,11 @@ def params_menu():
         tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
               else f"{DIM}刮削结果{RST}")
         print(f"  7. 片名用哪个            当前：{tp}")
+        if metatube_on(d):
+            mtl = [n for n, _i, on, _o in metatube_libraries(
+                read_emby_api_key(d) or "") if on]
+            print(f"  8. MetaTube 在哪些库生效  当前："
+                  + (f"{CYAN}{'、'.join(mtl)}{RST}" if mtl else f"{DIM}都不启用{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -4035,6 +4145,17 @@ def params_menu():
             qr115_login()
         elif c == "7":
             set_title_policy()
+        elif c == "8":
+            d0 = ms_install_dir()
+            k0 = (read_yaml_scalar(os.path.join(d0, "mediawarp", "config",
+                                                "config.yaml"), "auth")
+                  if is_installed(d0) else "")
+            if not metatube_on(d0):
+                warn("MetaTube 没装，先在「5」里装。")
+            elif not k0:
+                warn("没有 Emby API Key，先填「1」。")
+            else:
+                choose_metatube_libraries(k0)
         else:
             print("无效选择。")
             continue
@@ -4620,6 +4741,22 @@ def do_healthcheck():
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
+
+    # MetaTube 是按番号刮成人片的。它出现在动画库/电影库的刮削器名单里，几乎肯定
+    # 是装插件时被 Emby 默认加进去的，而不是用户的本意 —— 后果是那些库里冒出
+    # JAV 封面。这种事必须主动报，用户不会想到去每个库翻刮削器名单。
+    if metatube_on(d) and key:
+        mt_on = [n for n, _i, on, _o in metatube_libraries(key) if on]
+        if len(mt_on) > 1:
+            _hc("MetaTube 范围", "warn",
+                f"{'、'.join(mt_on)}  {YELLOW}多个库都启用了{RST}")
+            todo.append(("MetaTube（按番号刮成人片）在多个媒体库里生效，"
+                         "非番号片子会被配上无关的封面",
+                         "「3 后补参数 → 8 MetaTube 在哪些库生效」只留需要的那个"))
+        elif mt_on:
+            _hc("MetaTube 范围", "ok", f"只在 {mt_on[0]} 生效")
+        else:
+            _hc("MetaTube 范围", "ok", "所有媒体库都没启用")
 
     if os.path.exists(SYNC_CRON):
         # 光说"装了、排在几点"不够。用户第二天发现问题还在时，要能当场分辨
