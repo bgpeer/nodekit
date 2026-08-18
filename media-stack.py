@@ -3497,7 +3497,16 @@ def set_metatube_libraries(key, enable_ids):
 
 
 def choose_metatube_libraries(key):
-    """让用户选 MetaTube 在哪些媒体库生效。不选就是一个都不启用。"""
+    """让用户选 MetaTube 在哪些媒体库生效。
+
+    【这是一次性的初始设置，不是脚本要接管这份名单】刚装好插件的那一刻，名单是
+    Emby 替用户填的（遇到没见过的刮削器默认全部启用），用户从没表过态 —— 一个按
+    番号刮成人片的插件就这么进了动画库。在这个时点问一句，是补上那次缺失的选择。
+
+    问完就不再管：本函数只在装插件时、和用户主动点菜单时跑，do_strm / do_sync
+    都不碰它。之后用户在 Emby 的「媒体库 → 刮削器」里怎么改都算数，新建的媒体库
+    也照样按 Emby 自己的默认走 —— 那是软件的设置，脚本不该反复覆盖。
+    """
     libs = metatube_libraries(key)
     if not libs:
         warn("读不到媒体库列表，MetaTube 的适用范围没能设置。")
@@ -3505,19 +3514,25 @@ def choose_metatube_libraries(key):
         return
     print()
     print(f"  {BOLD}MetaTube 要在哪些媒体库生效？{RST}")
-    print(f"  {YELLOW}它是按番号刮日本成人片的。放进动画库、电影库只会乱认 ——"
+    print(f"  {DIM}它是按番号刮日本成人片的。留在动画库、电影库里会乱认 ——"
           f"实测一集国产动画被配上了 JAV 封面。{RST}")
     print()
     for i, (name, _iid, on, _o) in enumerate(libs, 1):
         print(f"    {i}) {name}   {DIM}当前：{'启用' if on else '未启用'}{RST}")
     print()
-    print(f"  {DIM}输入编号，多个用逗号隔开（比如 1,3）。"
-          f"直接回车 = 一个都不启用。{RST}")
-    raw = ask("选哪些").strip()
-    picked = set()
-    for x in re.split(r"[,，\s]+", raw):
-        if x.isdigit() and 1 <= int(x) <= len(libs):
-            picked.add(libs[int(x) - 1][1])
+    print(f"  {DIM}输入编号，多个用逗号隔开（比如 1,3）；{RST}{BOLD}a{RST}"
+          f"{DIM} = 全部启用；直接回车 = 全部不启用。{RST}")
+    print(f"  {DIM}这只是这一次的初始设置 —— 之后你在 Emby 的「媒体库 → 刮削器」"
+          f"里怎么勾都算数，脚本不会再动它；{RST}")
+    print(f"  {DIM}以后新建的媒体库也按 Emby 自己的默认来，不受这里影响。{RST}")
+    raw = ask("选哪些").strip().lower()
+    if raw == "a":
+        picked = {iid for _n, iid, _on, _o in libs}
+    else:
+        picked = set()
+        for x in re.split(r"[,，\s]+", raw):
+            if x.isdigit() and 1 <= int(x) <= len(libs):
+                picked.add(libs[int(x) - 1][1])
     if set_metatube_libraries(key, picked) == 0:
         print(f"  {DIM}刮削器名单本来就是这样，没有改动。{RST}")
 
@@ -4745,18 +4760,12 @@ def do_healthcheck():
     # MetaTube 是按番号刮成人片的。它出现在动画库/电影库的刮削器名单里，几乎肯定
     # 是装插件时被 Emby 默认加进去的，而不是用户的本意 —— 后果是那些库里冒出
     # JAV 封面。这种事必须主动报，用户不会想到去每个库翻刮削器名单。
+    # 只陈述当前在哪些库生效，不判断对错 —— 开几个库是用户自己的事，体检的职责
+    # 是让他看得见。真出问题（动画库冒 JAV 封面）时，这一行就是他要的那条线索
     if metatube_on(d) and key:
         mt_on = [n for n, _i, on, _o in metatube_libraries(key) if on]
-        if len(mt_on) > 1:
-            _hc("MetaTube 范围", "warn",
-                f"{'、'.join(mt_on)}  {YELLOW}多个库都启用了{RST}")
-            todo.append(("MetaTube（按番号刮成人片）在多个媒体库里生效，"
-                         "非番号片子会被配上无关的封面",
-                         "「3 后补参数 → 8 MetaTube 在哪些库生效」只留需要的那个"))
-        elif mt_on:
-            _hc("MetaTube 范围", "ok", f"只在 {mt_on[0]} 生效")
-        else:
-            _hc("MetaTube 范围", "ok", "所有媒体库都没启用")
+        _hc("MetaTube 范围", "ok",
+            "、".join(mt_on) if mt_on else f"{DIM}所有媒体库都没启用{RST}")
 
     if os.path.exists(SYNC_CRON):
         # 光说"装了、排在几点"不够。用户第二天发现问题还在时，要能当场分辨
