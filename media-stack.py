@@ -1253,6 +1253,7 @@ def do_sync():
             emby_scan_wait(key, timeout=900)
             heal_media_info(d, key)
             normalize_strm_files(d)    # heal 中途被打断的兜底
+            apply_title_policy(d, key)
             rec["nodur_after"] = len(items_without_duration(key))
             rec["missing"] = len(strm_not_in_emby(d, key))
             rec["ok"] = True
@@ -2449,6 +2450,83 @@ def tune_strm_libraries(key):
                   f"下一次扫描会拆开。{RST}")
 
 
+def title_policy():
+    """片名用哪个来源。"filename" = 网盘文件名，"scrape" = 刮削结果（默认）。"""
+    return ms_state().get("title_policy") or "scrape"
+
+
+def apply_title_policy(d, key):
+    """按当前设置把 strm 条目的片名改成文件名，或者放回给刮削。返回改了几个。
+
+    为什么需要：网盘里的文件名常常带 [第154集•4K] 这类标记，Emby 解析不出片名，
+    拿去 TMDb 就是乱撞 —— 实测一集动画被刮成了同名剧场版，两个不同的文件还刮出
+    了一模一样的标题。用户认得自己的文件名，反而是最准的那个。
+
+    【关键是只锁 Name 这一个字段】Emby 的 LockedFields 是按字段锁的。锁掉 Name
+    之后刮削照常跑、海报简介照常更新，只有标题不再被覆盖 —— 这样"片名跟文件走、
+    海报跟刮削走"才能同时成立。整条目锁死（lockdata）会把海报一起冻住，那不是
+    用户要的。
+
+    切回 scrape 时把 Name 从锁定列表里去掉就行，不去动标题本身：下一次刮削会自然
+    把它覆盖回去，而在那之前保持现状总比立刻变成一串文件名强。
+    """
+    want_filename = title_policy() == "filename"
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return 0
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return 0
+    n = 0
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not any(STRM_PATH in p or p in STRM_PATH
+                              for p in (lb.get("Locations") or [])):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path", key)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            path = str(i.get("Path") or "")
+            if not path.endswith(".strm"):
+                continue
+            iid = i.get("Id")
+            try:
+                full = _emby(f"/Items/{iid}", key, timeout=30)
+            except Exception:
+                continue
+            locked = list(full.get("LockedFields") or [])
+            stem = os.path.splitext(os.path.basename(path))[0]
+            if want_filename:
+                if full.get("Name") == stem and "Name" in locked:
+                    continue
+                full["Name"] = stem
+                if "Name" not in locked:
+                    locked.append("Name")
+            else:
+                if "Name" not in locked:
+                    continue
+                locked = [x for x in locked if x != "Name"]
+            full["LockedFields"] = locked
+            try:
+                _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
+                n += 1
+            except Exception as e:
+                warn(f"改「{(i.get('Name') or '?')[:20]}」的片名失败：{_short_err(e)}")
+    if n:
+        if want_filename:
+            ok(f"{n} 个条目的片名已改成网盘文件名（并锁定，刮削不再覆盖）")
+            print(f"  {DIM}只锁了标题这一个字段，海报和简介照常跟着刮削更新。{RST}")
+        else:
+            ok(f"{n} 个条目的片名解锁，交回给刮削")
+            print(f"  {DIM}标题会在下一次刮削时被覆盖回去。{RST}")
+    return n
+
+
 def _strm_host_path(d, item_path):
     """Emby 报的容器内路径 → 宿主机上的 strm 文件路径。"""
     if not item_path or not item_path.startswith(STRM_PATH):
@@ -3183,6 +3261,7 @@ def do_strm():
         tune_strm_libraries(key)
         heal_media_info(d, key)
         normalize_strm_files(d)      # heal 中途被打断的兜底
+        apply_title_policy(d, key)   # 放在刮削之后：要覆盖的正是刮出来的那个标题
         report_not_in_emby(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
@@ -3843,6 +3922,38 @@ def set_scan_paths():
     print(f"  {DIM}回菜单点「4 生成媒体库」立刻扫一次，或等每天定时任务。{RST}")
 
 
+def set_title_policy():
+    """选片名用网盘文件名还是刮削结果。"""
+    cur = title_policy()
+    print("\n" + "-" * 60)
+    print(f"  {BOLD}片名用哪个{RST}")
+    print("-" * 60)
+    print(f"  当前：{CYAN}{'网盘文件名' if cur == 'filename' else '刮削结果'}{RST}\n")
+    print(f"  {BOLD}1) 刮削结果{RST}{DIM}（Emby 默认）{RST}")
+    print(f"     {DIM}文件名规整（流浪地球 (2019).mkv）时最好看，能拿到正式译名。{RST}")
+    print(f"     {DIM}但文件名带 [第154集•4K] 这类标记时 Emby 解析不出片名，"
+          f"去 TMDb 就是乱撞。{RST}")
+    print(f"  {BOLD}2) 网盘文件名{RST}")
+    print(f"     {DIM}片名 = 你在网盘里看到的文件名，不会认错。{RST}")
+    print(f"     {DIM}只锁标题这一个字段 —— {RST}{BOLD}海报和简介照常跟着刮削走{RST}"
+          f"{DIM}，不受影响。{RST}")
+    print("-" * 60)
+    c = ask("选 1 或 2（回车不改）").strip()
+    want = {"1": "scrape", "2": "filename"}.get(c)
+    if not want or want == cur:
+        print("没有改动。")
+        return
+    save_ms_state(title_policy=want)
+    ok(f"已改成：{'网盘文件名' if want == 'filename' else '刮削结果'}")
+    d = ms_install_dir()
+    key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                            "auth") if is_installed(d) else "")
+    if key:
+        apply_title_policy(d, key)
+    else:
+        print(f"  {DIM}没有 Emby API Key，下次点「4 生成媒体库」时生效。{RST}")
+
+
 def params_menu():
     """后补参数：装完之后才拿得到、需要回头再填的东西。"""
     while True:
@@ -3878,6 +3989,9 @@ def params_menu():
                     if is_installed(d) else f"{DIM}未安装{RST}")
         print(f"  5. MetaTube 刮削插件（番号识别）  当前：{mt_state}")
         print(f"  6. 115 网盘扫码登录{DIM}（拿「二维码令牌」，挂 115 用）{RST}")
+        tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
+              else f"{DIM}刮削结果{RST}")
+        print(f"  7. 片名用哪个            当前：{tp}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -3895,6 +4009,8 @@ def params_menu():
             toggle_metatube()
         elif c == "6":
             qr115_login()
+        elif c == "7":
+            set_title_policy()
         else:
             print("无效选择。")
             continue
