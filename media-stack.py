@@ -2548,14 +2548,18 @@ def report_not_in_emby(d, key):
     if not missing:
         return 0
     print()
-    warn(f"有 {len(missing)} 个 strm 生成了，但 Emby 没把它收进媒体库：")
+    warn(f"有 {len(missing)} 个 strm 生成了，但 Emby 里没有对应的独立条目：")
     for p in missing[:8]:
         print(f"  {DIM}·{RST} {p}")
     if len(missing) > 8:
         print(f"  {DIM}...另外 {len(missing) - 8} 个{RST}")
     print(f"  {DIM}文件和 strm 都没问题，是 Emby 的电影库布局规则把它吃掉了：{RST}")
-    print(f"  {DIM}同一个文件夹里放了多部片子时，Emby 可能只认其中一部"
-          f"（另一部当成「版本」或者直接忽略）。{RST}")
+    print(f"  {DIM}同一个文件夹里放了多部片子时，Emby 可能只认其中一部，"
+          f"另一部要么被忽略，要么被并成前一部的一个「版本」。{RST}")
+    # 并成"版本"比直接忽略更难查，而且会顺带把进度条弄坏：合并后的条目挂着两个源，
+    # 其中探测失败的那个时长是 0，Emby 一按它算续播百分比就判定"看完了"
+    print(f"  {YELLOW}被并成「版本」的话还会连累进度条 —— 那个条目会同时挂着两个源，"
+          f"探测失败的那个时长是 0，续播点就存不下来。{RST}")
     print(f"  {YELLOW}改法：只把上面这几个挪进各自的单独文件夹，别的不用动。{RST}")
     print(f"  {DIM}  /quark/电影/仙逆/A [4K].mp4      ← 名字相近，被当成同一部{RST}")
     print(f"  {DIM}  /quark/电影/仙逆/A 剧场版.mp4{RST}")
