@@ -1254,6 +1254,7 @@ def do_sync():
             heal_media_info(d, key)
             normalize_strm_files(d)    # heal 中途被打断的兜底
             apply_title_policy(d, key)
+            split_shared_identities(d, key)
             rec["nodur_after"] = len(items_without_duration(key))
             rec["missing"] = len(strm_not_in_emby(d, key))
             rec["ok"] = True
@@ -2358,6 +2359,62 @@ def shared_identity_items(key):
     return {k: v for k, v in groups.items() if len(v) > 1}
 
 
+def split_shared_identities(d, key):
+    """把撞在一起的刮削身份清掉，让每个视频文件各有各的观看记录。返回改了几个条目。
+
+    Emby 把观看记录挂在【刮削到的身份】上，不是挂在文件上 —— 这是它的有意设计：
+    同一部电影放在两个媒体库里，看过一个另一个也该显示看过。
+
+    但前提是那个身份【认对了】。网盘库里认错是常态：文件名带 [第154集•4K] 这类
+    标记，Emby 解析不出片名，搜索就是碰运气。实测这一例，一集 17 分钟的动画和一部
+    93 分钟的剧场版拿到了同一个 TMDb id，于是共用一份进度 —— 两边都显示 38:21，
+    而 38 分钟已经超过那一集的总长。
+
+    【为什么整组都清，不留一个】留一个的话，留哪个都是猜。这一组里至少有一个是
+    认错的，多半两个都错（第 154 集在 TMDb 的电影库里本来就没有对应条目）。全清
+    之后每个条目回落到用自己的内部 id 做记录键，观看进度立刻各归各 —— 这才是用户
+    要的"一个视频一份进度"。
+
+    已经下载好的海报、简介不受影响：那些存在 Emby 自己的元数据库里，和身份 id 是
+    两回事。想重新认一个正确的，随时可以用 Emby 的「识别」指定。
+    """
+    dup = shared_identity_items(key)
+    if not dup:
+        return 0
+    try:
+        users = _emby("/Users", key)
+        uid = (users[0] or {}).get("Id", "") if users else ""
+    except Exception:
+        return 0
+    if not uid:
+        return 0
+    n = 0
+    for sig, group in dup.items():
+        names = "、".join(nm for _i, nm in group)
+        warn(f"这几个条目刮到了同一部片（{dict(sig)}），"
+             f"Emby 会让它们共用观看进度：")
+        print(f"  {DIM}{names}{RST}")
+        for iid, nm in group:
+            try:
+                full = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
+            except Exception as e:
+                warn(f"读不到「{nm[:20]}」：{_short_err(e)}")
+                continue
+            full["ProviderIds"] = {}
+            try:
+                _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
+                n += 1
+            except Exception as e:
+                warn(f"清「{nm[:20]}」的刮削身份失败：{_short_err(e)}")
+    if n:
+        ok(f"{n} 个条目的刮削身份已清掉，观看进度从此各归各")
+        print(f"  {DIM}海报和简介不受影响（那些存在 Emby 自己的库里）。"
+              f"想重新认一部片，用条目里的「识别」指定就行。{RST}")
+        print(f"  {DIM}已经串过的续播点不会自动分开 —— 去那几个条目上"
+              f"取消「已播放」，重新播一次就各自记各自的了。{RST}")
+    return n
+
+
 def items_without_duration(key):
     """Emby 里还没探测出时长的影视条目 [(id, 名字), ...]。
 
@@ -3327,6 +3384,7 @@ def do_strm():
         heal_media_info(d, key)
         normalize_strm_files(d)      # heal 中途被打断的兜底
         apply_title_policy(d, key)   # 放在刮削之后：要覆盖的正是刮出来的那个标题
+        split_shared_identities(d, key)
         report_not_in_emby(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
