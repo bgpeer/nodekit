@@ -1255,6 +1255,7 @@ def do_sync():
             normalize_strm_files(d)    # heal 中途被打断的兜底
             apply_title_policy(d, key)
             split_shared_identities(d, key)
+            clear_impossible_progress(key)
             rec["nodur_after"] = len(items_without_duration(key))
             rec["missing"] = len(strm_not_in_emby(d, key))
             rec["ok"] = True
@@ -2359,6 +2360,77 @@ def shared_identity_items(key):
     return {k: v for k, v in groups.items() if len(v) > 1}
 
 
+def clear_impossible_progress(key):
+    """把「续播点比片长还大」的记录清零。返回清了几个。
+
+    这种记录在物理上不可能，一定是别的条目串过来的（见 split_shared_identities：
+    两个文件刮到同一个身份时 Emby 让它们共用一份观看进度）。界面上的表现是
+    「剩余 -35 分钟」，恢复播放会跳到一个根本不存在的位置。
+
+    【为什么必须由脚本清】断开身份只是让以后不再串，已经写进库里的那个数不会自己
+    消失。而让用户手动清也不现实：Emby 的界面里没有"清除续播点"这个操作，取消
+    「已播放」也不一定连带清掉位置 —— 我先前让用户去点绿勾，那条建议是无效的。
+
+    判据只用一条【客观不可能】：位置 > 片长。留 2% 余量，因为刮削回填的片长和文件
+    实际长度常有零点几分钟的出入，不该把正常的"看到最后"误判成脏数据。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return 0
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return 0
+    n, failed = 0, []
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not any(STRM_PATH in p or p in STRM_PATH
+                              for p in (lb.get("Locations") or [])):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=UserData", key)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            run = i.get("RunTimeTicks") or 0
+            pos = (i.get("UserData") or {}).get("PlaybackPositionTicks") or 0
+            if not run or pos <= run * 1.02:
+                continue
+            iid, nm = i.get("Id"), str(i.get("Name") or "?")
+            try:
+                _emby(f"/Users/{uid}/Items/{iid}/UserData", key, method="POST",
+                      body={"PlaybackPositionTicks": 0, "Played": False},
+                      timeout=30)
+            except Exception as e:
+                failed.append((nm[:22], _short_err(e)))
+                continue
+            # 回读确认 —— 这个接口在不同 Emby 版本上的行为不一致，
+            # 不核对的话会打出"已清零"而库里纹丝不动
+            try:
+                back = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
+                still = (back.get("UserData") or {}).get(
+                    "PlaybackPositionTicks") or 0
+            except Exception:
+                still = 0
+            if still > run * 1.02:
+                failed.append((nm[:22], f"清了但回读还是 {still / 6e8:.1f} 分"))
+                continue
+            n += 1
+            print(f"  {DIM}·{RST} {nm[:26]}  续播点 {pos / 6e8:.1f} 分 → 0"
+                  f"{DIM}（片长只有 {run / 6e8:.1f} 分）{RST}")
+    if failed:
+        warn(f"{len(failed)} 个条目的脏续播点没清掉：")
+        for nm, why in failed[:5]:
+            print(f"  {DIM}·{RST} {nm}  {why}")
+        print(f"  {DIM}可以在 Emby 里点开那个条目，标记成「已播放」再取消一次，"
+              f"多数版本会连带把位置清掉。{RST}")
+    if n:
+        ok(f"清掉 {n} 个不可能的续播点（位置比片长还大）")
+    return n
+
+
 def split_shared_identities(d, key):
     """把撞在一起的刮削身份清掉，让每个视频文件各有各的观看记录。返回改了几个条目。
 
@@ -3385,6 +3457,7 @@ def do_strm():
         normalize_strm_files(d)      # heal 中途被打断的兜底
         apply_title_policy(d, key)   # 放在刮削之后：要覆盖的正是刮出来的那个标题
         split_shared_identities(d, key)
+        clear_impossible_progress(key)
         report_not_in_emby(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
