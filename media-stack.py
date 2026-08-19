@@ -4558,61 +4558,68 @@ def strm_target_path(content):
     return p or ""
 
 
-def warm_links(d, key, limit=40):
-    """给每个条目提前换好直链、并让网盘把流准备好。返回 (成功数, 总数)。
+def resume_items(key, uid, limit=10):
+    """「继续观看」里的前 N 部（只要 strm 的）。返回 [(id, 名字, 续播点ticks, 源)]。
 
-    用户原话："这些调整或更新之后应该把那些该热的线路给他接上，或者视频开头也
-    播放1秒直接让他把转码都给他接上"。就是这个意思。
+    Emby 的正规入口是 /Users/{uid}/Items/Resume。万一某个版本没有这个路由，
+    退回用 Filters=IsResumable 自己筛 —— 这个文件里已经因为猜错接口路径栽过两次，
+    带个兜底比赌它一定在强。
+    """
+    q = (f"?Limit={limit * 3}&MediaTypes=Video&Recursive=true"
+         f"&Fields=Path,MediaSources")
+    for path in (f"/Users/{uid}/Items/Resume{q}",
+                 f"/Users/{uid}/Items{q}&Filters=IsResumable"):
+        try:
+            r = _emby(path, key, timeout=30)
+        except Exception:
+            continue
+        out = []
+        for i in r.get("Items") or []:
+            if not str(i.get("Path") or "").endswith(".strm"):
+                continue
+            srcs = i.get("MediaSources") or []
+            pos = (i.get("UserData") or {}).get("PlaybackPositionTicks") or 0
+            out.append((i.get("Id"), str(i.get("Name") or "?"), pos,
+                        srcs[0] if srcs else {}))
+            if len(out) >= limit:
+                break
+        if out:
+            return out
+    return []
 
-    第一次播放为什么慢，是两件事叠在一起：
-      · MediaWarp 缓存里没有这个文件的直链，要现去问 OpenList 换一次
-        （跨境调用，实测 0.3～27 秒不等）
-      · 转码流模式下，夸克那边还要把切片准备好
 
-    两件事都可以【提前】做掉 —— 换直链的结果进 MediaWarp 缓存，拉一小段字节让
-    网盘把流准备好。之后用户点播放就是直接开始。
+def warm_links(d, key, limit=10):
+    """给「继续观看」里的前几部提前接好线路。返回 (成功数, 总数)。
 
-    走的是和真实播放【完全相同】的那条路（MediaWarp 的 /Videos/{id}/stream），
-    所以热的正是待会儿要用的那份缓存，不是另一条旁路。
+    用户定的范围："热这个线路按继续播放里面的前10个，提取进度条记忆播放一秒就可以
+    了，搞多了我怕他搞太慢了，其他的就在播放器里面点开"。这个取舍是对的：
 
-    限制说清楚：MediaWarp 的直链缓存是 2 小时（alist_api_ttl），所以这个预热只在
-    两小时内有效。放在切换直链方式、生成媒体库之后跑最划算 —— 那正是缓存刚被清空、
-    用户马上要去看的时刻。想让隔夜的第一次也快，得靠离看片更近的时间点再热一次。
+      · 每热一个都要跨境换一次直链（实测 0.3～27 秒）。整库热的话，片子一多就从
+        "省时间"变成"耗时间"，而且绝大多数根本不会在缓存有效期内被点开
+      · 「继续观看」里的那几部恰恰是最可能被点开的 —— 看了一半的东西
+
+    热的做法和真实播放【完全一样】：走 MediaWarp 的 /Videos/{id}/stream 拿 302，
+    再从【续播点那个位置】拉一小段字节。位置对得上才有意义 —— 用户下次点的是
+    "继续播放"，网盘要准备的也是那一段，从头拉反而热错了地方。
     """
     try:
-        libs = _emby("/Library/VirtualFolders", key)
         users = _emby("/Users", key)
     except Exception:
         return 0, 0
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
         return 0, 0
-    items = []
-    for lb in libs:
-        pid = lb.get("ItemId")
-        if not pid or not any(STRM_PATH in p or p in STRM_PATH
-                              for p in (lb.get("Locations") or [])):
-            continue
-        try:
-            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
-                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path", key)
-        except Exception:
-            continue
-        for i in r.get("Items") or []:
-            if str(i.get("Path") or "").endswith(".strm"):
-                items.append((i.get("Id"), str(i.get("Name") or "?")))
-    if not items:
+    cut = resume_items(key, uid, limit)
+    if not cut:
         return 0, 0
-    cut = items[:limit]
+
     print()
-    info(f"给 {len(cut)} 个片子提前接好线路...")
-    print(f"  {DIM}换直链 + 让网盘把流准备好，之后点播放就直接开始。"
+    info(f"给「继续观看」里的 {len(cut)} 部提前接好线路...")
+    print(f"  {DIM}换直链 + 从续播点拉一小段，让网盘把那一段准备好。"
           f"这份缓存 2 小时内有效。{RST}")
-    if len(items) > limit:
-        print(f"  {DIM}只热前 {limit} 个 —— 每个都要跨境调一次，全热反而更慢。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
     done = 0
-    for iid, name in cut:
+    for iid, name, pos, src in cut:
         t0 = time.monotonic()
         url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
                f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
@@ -4625,19 +4632,29 @@ def warm_links(d, key, limit=40):
         except Exception:
             pass
         if not loc:
-            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}没换到直链{RST}")
+            print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}没换到直链{RST}")
             continue
-        # 再拉一小段，逼网盘把流真正准备好。拿不到也不算失败 —— 直链已经进缓存了，
-        # 而 VPS 到 CDN 那一跳本来就常超时，跟播放设备走的不是同一条路
+        # 按续播点估算字节位置。转码流是 m3u8（整份播放列表），没有位置可言，
+        # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
+        size = src.get("Size") or 0
+        run = src.get("RunTimeTicks") or 0
+        head = {}
+        at = ""
+        if size and run and pos and (src.get("Container") or "").lower() != "hls":
+            off = min(int(size * pos / run), max(size - 65536, 0))
+            head["Range"] = f"bytes={off}-{off + 65535}"
+            at = f"  {DIM}（从 {pos / 6e8:.0f} 分处）{RST}"
+        else:
+            head["Range"] = "bytes=0-65535"
         try:
-            req = urllib.request.Request(loc, headers={"Range": "bytes=0-65535"})
-            urllib.request.urlopen(req, timeout=45).read(1024)
+            urllib.request.urlopen(
+                urllib.request.Request(loc, headers=head), timeout=45).read(1024)
         except Exception:
-            pass
+            pass          # 直链已经进缓存了；VPS 到 CDN 那一跳跟播放设备不同路
         done += 1
-        print(f"  {GREEN}\u2714{RST} {name[:26]}  {time.monotonic() - t0:.1f} 秒")
+        print(f"  {GREEN}\u2714{RST} {name[:24]}  {time.monotonic() - t0:.1f} 秒{at}")
     if done:
-        ok(f"{done}/{len(cut)} 个已接好，现在点播放不用等换直链")
+        ok(f"{done}/{len(cut)} 部已接好，点「继续播放」不用等换直链")
     else:
         warn("一个都没接上 —— 网盘接口可能正好在抖，跑「5 链路体检」看看。")
     return done, len(cut)
