@@ -1161,6 +1161,75 @@ def do_keepalive():
             json.dump(rec, f, ensure_ascii=False)
     except OSError:
         pass
+    append_hist(d, rec)
+
+
+# 保活每 KEEPALIVE_MIN 分钟就在测同一条路径，可它一直把结果【覆盖】掉 ——
+# 等于每次都把证据扔了。于是「列目录到底是偶尔慢还是一直慢」这种问题，
+# 只能靠翻聊天记录里零散的截图来吵，谁也说服不了谁。
+# 改成追加一行 jsonl，一分钱额外开销都不用花（探测本来就在跑），
+# 换来的是一条连续 24 小时的曲线。体检直接把分布打出来，用数据说话。
+KEEPALIVE_HIST = "keepalive-history.jsonl"
+HIST_KEEP      = 1000            # 每 15 分钟一条 ≈ 10 天，足够看趋势又不会撑大
+
+
+def append_hist(d, rec):
+    """把一次探测结果追加进历史，顺便把老记录裁掉。"""
+    path = os.path.join(d, KEEPALIVE_HIST)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # 裁剪不必每次都做：文件小的时候读一遍再写一遍纯属浪费
+        if os.path.getsize(path) > HIST_KEEP * 120:
+            with open(path, encoding="utf-8") as f:
+                lines = f.readlines()[-HIST_KEEP:]
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+    except OSError:
+        pass
+
+
+def keepalive_history(d, hours=24):
+    """读最近 hours 小时的探测记录。"""
+    cut = time.time() - hours * 3600
+    out = []
+    try:
+        with open(os.path.join(d, KEEPALIVE_HIST), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue                   # 写了一半的行，跳过就是
+                if r.get("ts", 0) >= cut:
+                    out.append(r)
+    except OSError:
+        pass
+    return out
+
+
+def hist_summary(recs):
+    """把一串探测记录压成一句人话。没有样本就返回空串。
+
+    只报成功那些的耗时分布 —— 失败的耗时量的是超时设置，混进中位数会把
+    整条曲线拉歪，得出「一直很慢」这种和事实相反的结论。失败单独计数。
+    """
+    if not recs:
+        return ""
+    ok = sorted(r.get("elapsed", 0) for r in recs if r.get("ok"))
+    bad = len(recs) - len(ok)
+    span = (max(r.get("ts", 0) for r in recs) - min(r.get("ts", 0) for r in recs)) / 3600
+    head = f"{len(recs)} 次探测／{span:.0f} 小时"
+    if not ok:
+        return f"{head}　全部失败"
+    med = ok[len(ok) // 2]
+    p90 = ok[min(len(ok) - 1, int(len(ok) * 0.9))]
+    slow = sum(1 for e in ok if e >= 5)
+    out = (f"{head}　中位 {med:.1f} 秒　九成快于 {p90:.1f} 秒　最慢 {ok[-1]:.1f} 秒")
+    if slow:
+        out += f"　{slow} 次 ≥5 秒"
+    if bad:
+        out += f"　{bad} 次失败"
+    return out
 
 
 def install_keepalive(install_dir):
@@ -5250,113 +5319,128 @@ def do_healthcheck():
 
     # ---- 列目录 ----
     listed_ok = []
+
+    def _list_once(path, tmo=120):
+        """列一次目录并计时，顺手把这一次记进历史。返回 (耗时, code, 报错, 条数)。
+
+        refresh: true 是必须的 —— 不加的话 OpenList 直接返回目录缓存、根本不联网，
+        记下来的耗时永远是 0.0 秒，量的是缓存命中率不是链路。
+        per_page 跟保活那边(do_keepalive)对齐成 1。注意【这不是提速】—— 实测同一
+        路径 per_page 0 与 1 交替各打 4 次：0→1.2 1→0.6 0→0.5 1→0.5 0→0.5 1→1.3
+        0→1.2 1→0.5 秒，两者没有差别（OpenList 本来就是把整个目录从网盘拉回来再
+        本地分页）。对齐的理由是【可比】：保活和体检并排打在同一屏上，两行必须量
+        的是同一件事，否则拿 3.6 秒和 52.1 秒对比只会得出错误结论。
+        条数从 data.total 取：OpenList 无论 per_page 多少都给全量总数。
+        """
+        t = time.monotonic()
+        try:
+            # 120 秒封顶，不是 180：体检本来就是「东西坏了」才跑的，网盘不通时
+            # 每条路径干等 3 分钟，人只会以为体检自己死了。实测最慢的一次真实
+            # 列目录是 119.8 秒，120 刚好盖住。
+            rr = _ol_api("/api/fs/list", {"path": path, "password": "", "page": 1,
+                                          "per_page": 1, "refresh": True},
+                         token, timeout=tmo)
+            e = time.monotonic() - t
+            dd = rr.get("data") or {}
+            n = dd.get("total")
+            if not isinstance(n, int):
+                n = len(dd.get("content") or [])
+            code = rr.get("code")
+            msg = "" if code == 200 else str(rr.get("message") or "list 失败")[:60]
+        except Exception as ex:
+            e, code, msg, n = time.monotonic() - t, 0, _short_err(ex), 0
+        append_hist(d, {"ts": int(time.time()), "ok": code == 200,
+                        "elapsed": round(e, 1), "error": msg, "src": "体检"})
+        return e, code, msg, n
+
     for p in (cfg["scan_paths"] or [])[:5]:            # 最多测 5 条，别把体检拖太久
         if not token:
             _hc(f"列目录 {p}", "skip", "OpenList 没登上")
             continue
         _hc_wait(f"列目录 {p}", 120)
-        t0 = time.monotonic()
-        try:
-            # refresh: true —— 不加的话 OpenList 直接返回目录缓存,这一行永远是 0.0 秒,
-            # 那个数字对判断链路好坏毫无意义。实测同一台机器三次体检:列目录
-            # 0.0 / 47.0 / 0.0 秒,而慢的那次恰好是缓存刚被清空 —— 说明快的两次
-            # 根本没联网。体检要量的是真实链路,不是缓存命中率。
-            # per_page 跟保活那边(do_keepalive)对齐成 1。注意【这不是提速】——
-            # 实测同一路径 per_page 0 与 1 交替各打 4 次:
-            #   0→1.2  1→0.6  0→0.5  1→0.5  0→0.5  1→1.3  0→1.2  1→0.5 秒
-            # 两者没有差别(OpenList 本来就是把整个目录从网盘拉回来再本地分页)。
-            # 对齐的理由是【可比】:保活和体检并排打在同一屏上,两行必须量的是
-            # 同一件事,否则用户拿 3.6 秒和 52.1 秒对比,只会得出错误结论。
-            # 目录条数改从 data.total 取:OpenList 无论 per_page 多少都给全量总数,
-            # 所以只拿 1 条回来照样能打「N 项」。
-            # 那 52 秒的真正来源见 netdisk_load() —— 是排队,不是线路。
-            r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
-                                         "per_page": 1, "refresh": True},
-                        # 120 秒封顶,不是 180:体检本来就是"东西坏了"才跑的,
-                        # 网盘不通时每条路径干等 3 分钟,人只会以为体检自己死了。
-                        # 实测最慢的一次真实列目录是 119.8 秒,120 刚好盖住。
-                        token, timeout=120)
-            el = time.monotonic() - t0
-            data = r.get("data") or {}
-            n_items = data.get("total")
-            if not isinstance(n_items, int):
-                n_items = len(data.get("content") or [])
-            if r.get("code") != 200:
-                _hc(f"列目录 {p}", "bad", f"{el:.1f} 秒  {r.get('message', '')[:40]}")
-                todo.append((f"{p} 列不出来：{r.get('message', '')[:40]}", "见上面的存储检查"))
-            elif not n_items:
-                _hc(f"列目录 {p}", "warn", f"{el:.1f} 秒  空目录")
-                todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
-            else:
-                # 列目录也要看耗时。以前只给「换直链」设了阈值,列目录无论多慢都判绿,
-                # 结果出现过「列目录 47.0 秒」和结论「全部正常」同屏 —— 那比不体检更误导。
-                # 而且这一项直接决定「生成媒体库」跑不跑得完:AutoFilm 每个目录都要列一次,
-                # 47 秒一个目录,几十个目录就必然半路超时(用户那些"扫到一半"就是这么来的)。
-                # 阈值按实测重标过,不是拍脑袋的。同一台机器同一条路径采样 9 次
-                # (刻意用 30/60/120/300/600 秒的不同空闲间隔):
-                #   1.7 / 12.6 / 4.9 / 0.5 / 3.4 / 3.0 / 5.1 / 2.6 / 1.2 秒
-                # 中位数 ~3 秒,正常波动到 12 秒。原来的「< 3 秒才算绿」等于让一条
-                # 健康的跨境线路永远飘黄 —— 一直报警就等于没报警。
-                # 30 秒这条线的依据是后果:超过它,几十个目录的扫描必然半路超时。
-                st = "ok" if el < 5 else ("warn" if el <= 30 else "bad")
-                # 慢的时候，紧跟着对【同一条路径】再打一发。这一发是判因用的，
-                # 不是重试 —— 一次的耗时根本区分不了「这条路不通」和「这一下赶上了
-                # 一次性开销」，而这两种情况该做的事完全相反。
-                # 逼出这个设计的实测：体检报 55.2 秒的同一屏上，换直链（同一个夸克
-                # 存储、同一分钟）只用 0.6 秒；用户手工对同一条路径连打 8 次带
-                # refresh 的 fs/list，全部 ≤1.3 秒。线路要是坏的，这两样不可能快。
-                # 所以第二发快 = 第一发那 55 秒是一次性开销（存储要重新初始化、
-                # 目录缓存刚被清、后台正在抢接口），不是线路问题。
-                el2 = None
-                if st != "ok":
-                    _hc_wait(f"列目录 {p}", 60)
-                    t1 = time.monotonic()
-                    try:
-                        r2 = _ol_api("/api/fs/list",
-                                     {"path": p, "password": "", "page": 1,
-                                      "per_page": 1, "refresh": True}, token, timeout=60)
-                        if r2.get("code") == 200:
-                            el2 = time.monotonic() - t1
-                    except Exception:
-                        pass
-                # 第二发就快了，说明路是通的。降级成提醒，别再打红叉 ——
-                # 「列目录 ✖」配上「换直链 ✔ 0.6 秒」同屏出现，是这个体检自己在自相矛盾。
-                if el2 is not None and el2 < 5:
-                    st = "warn"
-                # 还要看有没有人在同时敲网盘。原来这里无条件写「线路问题，服务端
-                # 改不了」，会把用户支去折腾一条没毛病的网络，而真凶（后台在扫库）
-                # 反而没人提，再等几分钟它自己就消失了。
-                load = netdisk_load(d, key) if st != "ok" else ""
-                if el2 is None:
-                    extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）")
-                    second = ""
-                else:
-                    extra = ""
-                    second = (f"  →  再打一次 {el2:.1f} 秒"
-                              + ("  第一次是一次性开销，路是通的"
-                                 if el2 < 5 else "  两次都慢，这条路真有问题"))
-                # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
-                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {n_items} 项{extra}{second}"
-                                       + (f"\n{' ' * 27}{DIM}同时在敲网盘：{load}{RST}"
-                                          if load else ""))
-                listed_ok.append((p, n_items))
-                if el2 is not None and el2 < 5:
-                    todo.append((f"列 {p} 第一次用了 {el:.0f} 秒，紧接着再列只要 {el2:.1f} 秒 ——"
-                                 f"线路是通的，慢在第一次的一次性开销"
-                                 + (f"（同一刻 {load}）" if load else ""),
-                                 "不用改网络。「生成媒体库」要是扫到一半停了，"
-                                 "错开后台扫库的时间再点一次"))
-                elif st == "bad" and load:
-                    todo.append((f"列 {p} 用了 {el:.0f} 秒 —— 但同一刻 {load}，"
-                                 f"这个数字量的是排队，不一定是线路",
-                                 "等后台那件事跑完再体检一次。两次都慢才是线路问题"))
-                elif st == "bad":
-                    todo.append((f"列 {p} 用了 {el:.0f} 秒，「生成媒体库」很可能扫到一半就超时",
-                                 "此刻没有别的东西在占网盘，所以是接口到本机的线路问题。"
-                                 "把扫描路径收窄到具体的媒体目录"
-                                 "（3 后补参数 → 4 扫描路径），目录少了成功率高很多"))
-        except Exception as e:
-            _hc(f"列目录 {p}", "bad", _short_err(e))
+        el, code, msg, n_items = _list_once(p)
+
+        # 慢【或者失败】都紧跟着对同一条路径再打一发。这一发是判因用的，不是重试 ——
+        # 一次读数根本区分不了「这条路不通」和「这一下赶上了一次性开销」，而这两种
+        # 情况该做的事完全相反。
+        # 逼出这个设计的实测：体检报 55.2 秒的同一屏上，换直链（同一个夸克存储、
+        # 同一分钟）只用 0.6 秒；手工对同一条路径连打 8 次带 refresh 的 fs/list，
+        # 全部 ≤1.3 秒。线路要是坏的，这两样不可能快。
+        # 【失败也要再打一发】：上一版只在「成功但慢」的分支里加了第二发，结果真
+        # 出故障那次(failed get dir: object，99 秒)反而没采到第二个数据点 ——
+        # 最需要判因的那一次，判因的手段没跑。
+        el2 = code2 = msg2 = None
+        if code != 200 or el >= 5:
+            _hc_wait(f"列目录 {p}", 60)
+            el2, code2, msg2, n2 = _list_once(p, 60)
+            if code2 == 200:
+                n_items = n2
+        second = ""
+        if el2 is not None:
+            second = (f"  →  再打一次 {el2:.1f} 秒"
+                      + (f" {msg2[:24]}" if code2 != 200 else ""))
+
+        if code != 200 and (el2 is None or code2 != 200):
+            # 两发都失败 —— 是真故障，不是慢
+            _hc(f"列目录 {p}", "bad", f"{el:.1f} 秒  {msg}{second}")
+            todo.append((f"{p} 列不出来：{msg}",
+                         "两次都失败。多半是这个存储在 OpenList 里没初始化成功"
+                         "（看上面「存储」那行）：OpenList → 存储 → 找到它 → "
+                         "先停用再启用，重新加载一次；还不行就 docker restart openlist"))
+        elif code != 200:
+            # 第一发失败、第二发就通了 —— 间歇性，别当成故障报
+            _hc(f"列目录 {p}", "warn",
+                f"{el:.1f} 秒 {msg}{second}  第一发失败第二发就通了，间歇性")
+            listed_ok.append((p, n_items))
+            todo.append((f"{p} 第一次列失败（{msg}），紧接着再列就通了 —— 间歇性抽风",
+                         "不是配置错了。要是「生成媒体库」老扫到一半停，"
+                         "错开后台扫库的时间再点一次"))
+        elif not n_items:
+            _hc(f"列目录 {p}", "warn", f"{el:.1f} 秒  空目录")
+            todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
+        else:
+            # 列目录也要看耗时。以前只给「换直链」设了阈值，列目录无论多慢都判绿，
+            # 结果出现过「列目录 47.0 秒」和结论「全部正常」同屏 —— 那比不体检更误导。
+            # 而且这一项直接决定「生成媒体库」跑不跑得完：AutoFilm 每个目录都要列
+            # 一次，47 秒一个目录，几十个目录就必然半路超时。
+            # 阈值按实测重标过：同一台机器同一条路径采样 9 次（刻意用不同空闲间隔）
+            #   1.7 / 12.6 / 4.9 / 0.5 / 3.4 / 3.0 / 5.1 / 2.6 / 1.2 秒
+            # 中位数 ~3 秒，正常波动到 12 秒。原来的「< 3 秒才算绿」等于让一条健康
+            # 的跨境线路永远飘黄 —— 一直报警就等于没报警。
+            st = "ok" if el < 5 else ("warn" if el <= 30 else "bad")
+            # 第二发就快了，说明路是通的。降级成提醒，别再打红叉 ——「列目录 ✖」
+            # 配上「换直链 ✔ 0.6 秒」同屏出现，是这个体检自己在自相矛盾。
+            if el2 is not None and code2 == 200 and el2 < 5:
+                st = "warn"
+                second += "  第一次是一次性开销，路是通的"
+            elif el2 is not None and code2 == 200:
+                second += "  两次都慢，这条路真有问题"
+            # 还要看有没有人在同时敲网盘。原来这里无条件写「线路问题，服务端改不了」，
+            # 会把用户支去折腾一条没毛病的网络，而真凶（后台在扫库）反而没人提，
+            # 再等几分钟它自己就消失了。
+            load = netdisk_load(d, key) if st != "ok" else ""
+            extra = ("" if st == "ok" or second
+                     else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）"))
+            # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
+            _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {n_items} 项{extra}{second}"
+                                   + (f"\n{' ' * 27}{DIM}同时在敲网盘：{load}{RST}"
+                                      if load else ""))
+            listed_ok.append((p, n_items))
+            if el2 is not None and code2 == 200 and el2 < 5:
+                todo.append((f"列 {p} 第一次用了 {el:.0f} 秒，紧接着再列只要 {el2:.1f} 秒"
+                             f" —— 线路是通的，慢在第一次的一次性开销"
+                             + (f"（同一刻 {load}）" if load else ""),
+                             "不用改网络。「生成媒体库」要是扫到一半停了，"
+                             "错开后台扫库的时间再点一次"))
+            elif st == "bad" and load:
+                todo.append((f"列 {p} 用了 {el:.0f} 秒 —— 但同一刻 {load}，"
+                             f"这个数字量的是排队，不一定是线路",
+                             "等后台那件事跑完再体检一次。两次都慢才是线路问题"))
+            elif st == "bad":
+                todo.append((f"列 {p} 用了 {el:.0f} 秒，「生成媒体库」很可能扫到一半就超时",
+                             "此刻没有别的东西在占网盘，两次都慢，是接口到本机的线路问题。"
+                             "把扫描路径收窄到具体的媒体目录"
+                             "（3 后补参数 → 4 扫描路径），目录少了成功率高很多"))
 
     # 存储 status 是陈旧记录，只有当【实测也失败】时才算真故障
     live_ok = {p for p, _ in listed_ok}
@@ -5641,6 +5725,15 @@ def do_healthcheck():
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
+
+    # 单次读数说服不了任何人。「列目录 55 秒」到底是这一下赶上了，还是它就没快过？
+    # 保活每 KEEPALIVE_MIN 分钟本来就在测同一条路径，把结果攒起来，这个问题就不用
+    # 猜了 —— 直接看分布。体检自己的探测也记在同一本账上。
+    hs = hist_summary(keepalive_history(d, 24))
+    if hs:
+        _hc("列目录历史", "ok", f"{DIM}24 小时内{RST}  {hs}")
+    else:
+        _hc("列目录历史", "skip", "还没攒够记录（保活每跑一次记一条）")
 
     # MetaTube 是按番号刮成人片的。它出现在动画库/电影库的刮削器名单里，几乎肯定
     # 是装插件时被 Emby 默认加进去的，而不是用户的本意 —— 后果是那些库里冒出
