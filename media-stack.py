@@ -5133,9 +5133,14 @@ def do_healthcheck():
     print("=" * 60)
 
     # ---- 容器 ----
+    # 这份名单必须和 compose 里实际起了哪些服务一致，否则「5/5 在跑」会在
+    # 6 个容器的机器上打出来 —— 一个漏掉的容器（metatube 死了）永远不会被报出来，
+    # 而用户看到的是一片绿。装了 metatube 却不数它，就是这个下场。
     want = ["emby", "openlist", "mediawarp", "autofilm"]
     if cfg["homepage"]:
         want.append("homepage")
+    if metatube_on(d):
+        want.append("metatube")
     running = (sh("docker ps --format '{{.Names}}'", timeout=30).stdout or "").split()
     dead = [c for c in want if c not in running]
     if dead:
@@ -5214,18 +5219,26 @@ def do_healthcheck():
             # 那个数字对判断链路好坏毫无意义。实测同一台机器三次体检:列目录
             # 0.0 / 47.0 / 0.0 秒,而慢的那次恰好是缓存刚被清空 —— 说明快的两次
             # 根本没联网。体检要量的是真实链路,不是缓存命中率。
+            # per_page 要和保活那边(do_keepalive)【一模一样】。以前这里填 0
+            # (=全部返回),保活填 1,于是同一条路径同一分钟,保活报 3.6 秒、体检报
+            # 52.1 秒 —— 两个数没有可比性,用户只能看见体检那个大数字,以为链路坏了。
+            # 目录条数改从 data.total 取:OpenList 无论 per_page 多少都会给全量总数,
+            # 所以只拿 1 条回来照样能打「N 项」,不用为了数数把整个目录搬过来。
             r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
-                                         "per_page": 0, "refresh": True},
+                                         "per_page": 1, "refresh": True},
                         # 120 秒封顶,不是 180:体检本来就是"东西坏了"才跑的,
                         # 网盘不通时每条路径干等 3 分钟,人只会以为体检自己死了。
                         # 实测最慢的一次真实列目录是 119.8 秒,120 刚好盖住。
                         token, timeout=120)
             el = time.monotonic() - t0
-            items = (r.get("data") or {}).get("content")
+            data = r.get("data") or {}
+            n_items = data.get("total")
+            if not isinstance(n_items, int):
+                n_items = len(data.get("content") or [])
             if r.get("code") != 200:
                 _hc(f"列目录 {p}", "bad", f"{el:.1f} 秒  {r.get('message', '')[:40]}")
                 todo.append((f"{p} 列不出来：{r.get('message', '')[:40]}", "见上面的存储检查"))
-            elif not items:
+            elif not n_items:
                 _hc(f"列目录 {p}", "warn", f"{el:.1f} 秒  空目录")
                 todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
             else:
@@ -5241,8 +5254,8 @@ def do_healthcheck():
                 # 30 秒这条线的依据是后果:超过它,几十个目录的扫描必然半路超时。
                 st = "ok" if el < 5 else ("warn" if el <= 30 else "bad")
                 extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）")
-                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {len(items)} 项{extra}")
-                listed_ok.append((p, items))
+                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {n_items} 项{extra}")
+                listed_ok.append((p, n_items))
                 if st == "bad":
                     todo.append((f"列 {p} 用了 {el:.0f} 秒，「生成媒体库」很可能扫到一半就超时",
                                  "网盘接口到本机的线路问题。把扫描路径收窄到具体的媒体目录"
