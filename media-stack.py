@@ -5111,6 +5111,46 @@ def stack_versions(key=""):
     return {k: v for k, v in out.items() if v}
 
 
+def netdisk_load(d, key=""):
+    """此刻还有谁在同时敲网盘。列目录慢的时候，先看这个再去怪线路。
+
+    为什么需要这个：体检报「列目录 /quark/电影 52.1 秒」的那台机器，对【同一条
+    路径】手工连打 8 次带 refresh 的 fs/list（per_page 0 和 1 交替），结果是
+      1.2 / 0.6 / 0.5 / 0.5 / 0.5 / 1.3 / 1.2 / 0.5 秒
+    全部在 1.3 秒以内。所以那 52 秒不是这条跨境线路的往返延迟 —— 单独跑它很快。
+    慢的是【那一次请求排在了别人后面】：夸克对同一个账号有并发和频率限制，
+    而 Emby 扫库、AutoFilm 生成 strm 都会在后台把同一个接口打满。
+    同一路径先前采到的 0.8 → 12.9 → 52 → 79 → 97 → 106 秒也是这个形状：
+    单调爬升，是排队/退避的曲线，不是线路抖动的曲线（抖动会上下跳）。
+
+    这件事必须报出来，因为体检原来对慢的结论是「网盘接口到本机的线路问题，
+    服务端改不了」—— 用户照着这句话只会去折腾一条根本没毛病的网络，
+    而真正的原因（后台正在扫库）再等几分钟就自己没了。
+
+    没查到并发就返回空串。那时候才轮到怀疑线路。
+    """
+    busy = []
+    # Emby 扫库是最凶的那个：一次全库扫描会把每个 strm 都读一遍，每读一个
+    # MediaWarp 就要向 OpenList 要一次直链，全压在同一个网盘账号上。
+    if key:
+        try:
+            for t in _emby("/ScheduledTasks", key, timeout=15) or []:
+                if t.get("State") != "Running":
+                    continue
+                pct = t.get("CurrentProgressPercentage")
+                busy.append(f"Emby 在跑「{t.get('Name') or '?'}」"
+                            + (f" {pct:.0f}%" if isinstance(pct, (int, float)) else ""))
+        except Exception:
+            pass
+    # AutoFilm 空闲时是不写日志的（它在等下一次定时），所以近两分钟有日志
+    # 基本就等于它正在跑。只陈述观察到的东西，不替它下判断。
+    r = sh("docker logs --since 2m autofilm", timeout=20)
+    n = len([x for x in ((r.stdout or "") + (r.stderr or "")).splitlines() if x.strip()])
+    if n:
+        busy.append(f"AutoFilm 近 2 分钟有 {n} 行日志（在生成 strm）")
+    return "；".join(busy[:3])
+
+
 def do_healthcheck():
     """把整条链路挨个打一遍，每项报耗时和结论。
 
@@ -5126,6 +5166,8 @@ def do_healthcheck():
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
     cfg = rebuild_cfg_from_disk(d)
+    # 早点读出来：列目录那一项慢的时候要拿它去问 Emby 是不是正在扫库
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     todo = []                      # 收集「发现的问题 + 该怎么办」，最后统一打印
 
     print("\n" + "=" * 60)
@@ -5133,9 +5175,14 @@ def do_healthcheck():
     print("=" * 60)
 
     # ---- 容器 ----
+    # 这份名单必须和 compose 里实际起了哪些服务一致，否则「5/5 在跑」会在
+    # 6 个容器的机器上打出来 —— 一个漏掉的容器（metatube 死了）永远不会被报出来，
+    # 而用户看到的是一片绿。装了 metatube 却不数它，就是这个下场。
     want = ["emby", "openlist", "mediawarp", "autofilm"]
     if cfg["homepage"]:
         want.append("homepage")
+    if metatube_on(d):
+        want.append("metatube")
     running = (sh("docker ps --format '{{.Names}}'", timeout=30).stdout or "").split()
     dead = [c for c in want if c not in running]
     if dead:
@@ -5214,18 +5261,30 @@ def do_healthcheck():
             # 那个数字对判断链路好坏毫无意义。实测同一台机器三次体检:列目录
             # 0.0 / 47.0 / 0.0 秒,而慢的那次恰好是缓存刚被清空 —— 说明快的两次
             # 根本没联网。体检要量的是真实链路,不是缓存命中率。
+            # per_page 跟保活那边(do_keepalive)对齐成 1。注意【这不是提速】——
+            # 实测同一路径 per_page 0 与 1 交替各打 4 次:
+            #   0→1.2  1→0.6  0→0.5  1→0.5  0→0.5  1→1.3  0→1.2  1→0.5 秒
+            # 两者没有差别(OpenList 本来就是把整个目录从网盘拉回来再本地分页)。
+            # 对齐的理由是【可比】:保活和体检并排打在同一屏上,两行必须量的是
+            # 同一件事,否则用户拿 3.6 秒和 52.1 秒对比,只会得出错误结论。
+            # 目录条数改从 data.total 取:OpenList 无论 per_page 多少都给全量总数,
+            # 所以只拿 1 条回来照样能打「N 项」。
+            # 那 52 秒的真正来源见 netdisk_load() —— 是排队,不是线路。
             r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
-                                         "per_page": 0, "refresh": True},
+                                         "per_page": 1, "refresh": True},
                         # 120 秒封顶,不是 180:体检本来就是"东西坏了"才跑的,
                         # 网盘不通时每条路径干等 3 分钟,人只会以为体检自己死了。
                         # 实测最慢的一次真实列目录是 119.8 秒,120 刚好盖住。
                         token, timeout=120)
             el = time.monotonic() - t0
-            items = (r.get("data") or {}).get("content")
+            data = r.get("data") or {}
+            n_items = data.get("total")
+            if not isinstance(n_items, int):
+                n_items = len(data.get("content") or [])
             if r.get("code") != 200:
                 _hc(f"列目录 {p}", "bad", f"{el:.1f} 秒  {r.get('message', '')[:40]}")
                 todo.append((f"{p} 列不出来：{r.get('message', '')[:40]}", "见上面的存储检查"))
-            elif not items:
+            elif not n_items:
                 _hc(f"列目录 {p}", "warn", f"{el:.1f} 秒  空目录")
                 todo.append((f"{p} 是空的", "路径写错了？或者网盘里这个目录本来就没东西"))
             else:
@@ -5240,12 +5299,61 @@ def do_healthcheck():
                 # 健康的跨境线路永远飘黄 —— 一直报警就等于没报警。
                 # 30 秒这条线的依据是后果:超过它,几十个目录的扫描必然半路超时。
                 st = "ok" if el < 5 else ("warn" if el <= 30 else "bad")
-                extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）")
-                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {len(items)} 项{extra}")
-                listed_ok.append((p, items))
-                if st == "bad":
+                # 慢的时候，紧跟着对【同一条路径】再打一发。这一发是判因用的，
+                # 不是重试 —— 一次的耗时根本区分不了「这条路不通」和「这一下赶上了
+                # 一次性开销」，而这两种情况该做的事完全相反。
+                # 逼出这个设计的实测：体检报 55.2 秒的同一屏上，换直链（同一个夸克
+                # 存储、同一分钟）只用 0.6 秒；用户手工对同一条路径连打 8 次带
+                # refresh 的 fs/list，全部 ≤1.3 秒。线路要是坏的，这两样不可能快。
+                # 所以第二发快 = 第一发那 55 秒是一次性开销（存储要重新初始化、
+                # 目录缓存刚被清、后台正在抢接口），不是线路问题。
+                el2 = None
+                if st != "ok":
+                    _hc_wait(f"列目录 {p}", 60)
+                    t1 = time.monotonic()
+                    try:
+                        r2 = _ol_api("/api/fs/list",
+                                     {"path": p, "password": "", "page": 1,
+                                      "per_page": 1, "refresh": True}, token, timeout=60)
+                        if r2.get("code") == 200:
+                            el2 = time.monotonic() - t1
+                    except Exception:
+                        pass
+                # 第二发就快了，说明路是通的。降级成提醒，别再打红叉 ——
+                # 「列目录 ✖」配上「换直链 ✔ 0.6 秒」同屏出现，是这个体检自己在自相矛盾。
+                if el2 is not None and el2 < 5:
+                    st = "warn"
+                # 还要看有没有人在同时敲网盘。原来这里无条件写「线路问题，服务端
+                # 改不了」，会把用户支去折腾一条没毛病的网络，而真凶（后台在扫库）
+                # 反而没人提，再等几分钟它自己就消失了。
+                load = netdisk_load(d, key) if st != "ok" else ""
+                if el2 is None:
+                    extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）")
+                    second = ""
+                else:
+                    extra = ""
+                    second = (f"  →  再打一次 {el2:.1f} 秒"
+                              + ("  第一次是一次性开销，路是通的"
+                                 if el2 < 5 else "  两次都慢，这条路真有问题"))
+                # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
+                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {n_items} 项{extra}{second}"
+                                       + (f"\n{' ' * 27}{DIM}同时在敲网盘：{load}{RST}"
+                                          if load else ""))
+                listed_ok.append((p, n_items))
+                if el2 is not None and el2 < 5:
+                    todo.append((f"列 {p} 第一次用了 {el:.0f} 秒，紧接着再列只要 {el2:.1f} 秒 ——"
+                                 f"线路是通的，慢在第一次的一次性开销"
+                                 + (f"（同一刻 {load}）" if load else ""),
+                                 "不用改网络。「生成媒体库」要是扫到一半停了，"
+                                 "错开后台扫库的时间再点一次"))
+                elif st == "bad" and load:
+                    todo.append((f"列 {p} 用了 {el:.0f} 秒 —— 但同一刻 {load}，"
+                                 f"这个数字量的是排队，不一定是线路",
+                                 "等后台那件事跑完再体检一次。两次都慢才是线路问题"))
+                elif st == "bad":
                     todo.append((f"列 {p} 用了 {el:.0f} 秒，「生成媒体库」很可能扫到一半就超时",
-                                 "网盘接口到本机的线路问题。把扫描路径收窄到具体的媒体目录"
+                                 "此刻没有别的东西在占网盘，所以是接口到本机的线路问题。"
+                                 "把扫描路径收窄到具体的媒体目录"
                                  "（3 后补参数 → 4 扫描路径），目录少了成功率高很多"))
         except Exception as e:
             _hc(f"列目录 {p}", "bad", _short_err(e))
@@ -5313,8 +5421,7 @@ def do_healthcheck():
                          "网盘接口不通（线路问题，不是配置错了）。"
                          "已生成的 strm 不受影响，等几分钟再跑一次体检"))
 
-    # ---- MediaWarp ----
-    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    # ---- MediaWarp ----（key 在函数开头就读好了，列目录那一项要用）
     t0 = time.monotonic()
     try:
         with urllib.request.urlopen(
