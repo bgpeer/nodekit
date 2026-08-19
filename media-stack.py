@@ -1084,6 +1084,9 @@ WARM_CRON      = "/etc/cron.d/media-stack-warm"
 # 每几小时热一次「继续观看」的直链。必须【小于】MediaWarp 的 alist_api_ttl(2h)，
 # 否则缓存会在两次预热之间过期，等于白跑。1 小时留了一倍余量。
 WARM_EVERY_H   = 1
+WARM_STEP_T    = 20     # 单步封顶（秒）。超过这个还没换到直链，这一轮就不值得等了
+WARM_BUDGET    = 180    # 整轮封顶（秒）。剩下的留给一小时后的下一轮
+WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段准备好，又不占带宽
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
 SYNC_HOUR_CST  = "05:45"
@@ -4704,46 +4707,87 @@ def warm_links(d, key, limit=10):
 
     print()
     info(f"给「继续观看」里的 {len(cut)} 部提前接好线路...")
-    print(f"  {DIM}换直链 + 从续播点拉一小段，让网盘把那一段准备好。"
-          f"这份缓存 2 小时内有效。{RST}")
+    print(f"  {DIM}只换直链、拉 64KB，不上报任何播放进度 —— 续播点不会被推着走。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
-    done = 0
+    done, dead = 0, []
+    t_all = time.monotonic()
     for iid, name, pos, src in cut:
+        # 【总时长封顶】跨境慢的时候一个能耗掉半分钟。这是后台定时任务，跑太久没意义
+        # —— 下一轮一小时后还会再来，剩下的留给它
+        if time.monotonic() - t_all > WARM_BUDGET:
+            print(f"  {DIM}...已用满 {WARM_BUDGET // 60} 分钟，剩下的交给下一轮{RST}")
+            break
         t0 = time.monotonic()
         url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
                f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
-        loc = ""
+        loc, why = "", ""
         try:
-            opener.open(url, timeout=90)
+            opener.open(url, timeout=WARM_STEP_T)
         except urllib.error.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308):
                 loc = e.headers.get("Location", "")
-        except Exception:
-            pass
+            else:
+                why = f"HTTP {e.code}"
+        except Exception as e:
+            why = _short_err(e)
         if not loc:
-            print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}没换到直链{RST}")
+            # 换不到直链最常见的原因就是【文件已经从网盘删了】。这里只记账不重试：
+            # 每日对齐会把失效的 strm 连同 Emby 条目一起清掉，届时它自然从
+            # 「继续观看」里消失，也就不会再被热。在那之前每小时白跑一次，成本
+            # 是一个 20 秒封顶的请求 —— 比在这儿反复重试划算得多
+            dead.append(name[:24])
+            print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}跳过{RST}"
+                  f"{DIM}（换不到直链{'：' + why if why else ''}，"
+                  f"多半是网盘里已经删了）{RST}")
             continue
         # 按续播点估算字节位置。转码流是 m3u8（整份播放列表），没有位置可言，
         # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
         size = src.get("Size") or 0
         run = src.get("RunTimeTicks") or 0
-        head = {}
-        at = ""
+        head, at = {}, ""
         if size and run and pos and (src.get("Container") or "").lower() != "hls":
-            off = min(int(size * pos / run), max(size - 65536, 0))
-            head["Range"] = f"bytes={off}-{off + 65535}"
+            off = min(int(size * pos / run), max(size - WARM_BYTES, 0))
+            head["Range"] = f"bytes={off}-{off + WARM_BYTES - 1}"
             at = f"  {DIM}（从 {pos / 6e8:.0f} 分处）{RST}"
         else:
-            head["Range"] = "bytes=0-65535"
+            head["Range"] = f"bytes=0-{WARM_BYTES - 1}"
         try:
-            urllib.request.urlopen(
-                urllib.request.Request(loc, headers=head), timeout=45).read(1024)
+            urllib.request.urlopen(urllib.request.Request(loc, headers=head),
+                                   timeout=WARM_STEP_T).read(4096)
         except Exception:
             pass          # 直链已经进缓存了；VPS 到 CDN 那一跳跟播放设备不同路
         done += 1
         print(f"  {GREEN}\u2714{RST} {name[:24]}  {time.monotonic() - t0:.1f} 秒{at}")
+
+    # 【自查：续播点有没有被推着走】用户担心的正是这个 —— "热着热着一天下来那个
+    # 继续播放进度条都跑完了"。理论上不会：预热只请求流、从不调 Emby 的播放上报
+    # 接口，而且 MediaWarp 直接 302 掉、Emby 根本看不见这次请求。
+    # 但"理论上不会"这句话今天已经被打脸好几次了，所以实测一遍：对不上就改回去。
+    moved = []
+    for iid, name, pos, _src in cut:
+        try:
+            now = ((_emby(f"/Users/{uid}/Items/{iid}", key, timeout=20)
+                    .get("UserData") or {}).get("PlaybackPositionTicks") or 0)
+        except Exception:
+            continue
+        if abs(now - pos) < 6e8 / 60:          # 1 秒以内的抖动不算
+            continue
+        moved.append((name[:24], pos, now))
+        try:
+            _emby(f"/Users/{uid}/Items/{iid}/UserData", key, method="POST",
+                  body={"PlaybackPositionTicks": pos}, timeout=20)
+        except Exception:
+            pass
+    if moved:
+        warn(f"预热把 {len(moved)} 个条目的续播点推动了，已改回原值：")
+        for nm, was, now in moved:
+            print(f"  {DIM}·{RST} {nm}  {now / 6e8:.1f} → 改回 {was / 6e8:.1f} 分")
+        print(f"  {DIM}这不该发生，说明预热的请求被当成了真实播放。{RST}")
+
     if done:
         ok(f"{done}/{len(cut)} 部已接好，点「继续播放」不用等换直链")
+    elif dead:
+        warn(f"{len(dead)} 部换不到直链，一部都没热成 —— 这些文件可能已经不在网盘上了。")
     else:
         warn("一个都没接上 —— 网盘接口可能正好在抖，跑「5 链路体检」看看。")
     return done, len(cut)
