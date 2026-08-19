@@ -1080,6 +1080,10 @@ esac
 
 KEEPALIVE_CRON = "/etc/cron.d/media-stack-keepalive"
 SYNC_CRON      = "/etc/cron.d/media-stack-sync"
+WARM_CRON      = "/etc/cron.d/media-stack-warm"
+# 每几小时热一次「继续观看」的直链。必须【小于】MediaWarp 的 alist_api_ttl(2h)，
+# 否则缓存会在两次预热之间过期，等于白跑。1 小时留了一倍余量。
+WARM_EVERY_H   = 1
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
 SYNC_HOUR_CST  = "05:45"
@@ -1216,6 +1220,42 @@ def install_sync_cron(install_dir):
     except OSError as e:
         warn(f"装每日对齐任务失败（不影响使用）：{e}")
         return False
+
+
+def install_warm_cron(install_dir):
+    """装定时预热。
+
+    为什么不能挂在每日对齐（05:45）里：MediaWarp 的直链缓存只有 2 小时，05:45 热完
+    07:45 就过期了 —— 而用户起床看片多半在那之后。热在错的时间等于没热。
+
+    所以单独一条、每小时一次：这样不管几点想看，缓存里都是热的。成本很低 ——
+    每次只热「继续观看」的前 10 部，而那正是最可能被点开的。
+    """
+    try:
+        txt = (f"# media-stack 直链预热：每 {WARM_EVERY_H} 小时给「继续观看」的前几部\n"
+               f"# 提前换好直链，省掉点播放时那几秒到几十秒的跨境等待。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"0 */{WARM_EVERY_H} * * * root python3 {os.path.realpath(__file__)} "
+               "warm >/dev/null 2>&1\n")
+        with open(WARM_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(WARM_CRON, 0o644)
+        return True
+    except OSError as e:
+        warn(f"装预热定时任务失败（不影响使用）：{e}")
+        return False
+
+
+def do_warm():
+    """cron 调的预热，安静跑。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if key:
+        warm_links(d, key)
 
 
 def do_sync():
@@ -1801,6 +1841,7 @@ def do_update():
     install_cli(d)
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
+    install_warm_cron(d)      # 定时预热同上
 
     if cfg["homepage"]:
         info("刷新 Homepage 导航配置...")
@@ -1849,6 +1890,13 @@ def do_update():
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
     print(f"  {DIM}想确认网盘通不通：跑「5 链路体检」。{RST}")
+    # 上面 docker compose up -d 把容器全重启了，MediaWarp 的直链缓存随之清空。
+    # 不热的话，用户更新完顺手去点一部片子，等的就是那几秒到几十秒的跨境换直链 ——
+    # 而他刚做的是"更新"，不会想到这是更新造成的
+    _k = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                          "auth")
+    if _k and wait_openlist_ready(d, timeout=60):
+        warm_links(d, _k)
 
 
 def do_uninstall():
@@ -1881,7 +1929,7 @@ def do_uninstall():
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
-              KEEPALIVE_CRON, SYNC_CRON):
+              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -2115,6 +2163,7 @@ DOMAIN={cfg['domain']}
     install_cli(cfg["install_dir"])
     install_keepalive(cfg["install_dir"])
     install_sync_cron(cfg["install_dir"])
+    install_warm_cron(cfg["install_dir"])
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
     save_ms_state(cfg["install_dir"], scan_spec=cfg["scan_spec"])
@@ -5265,6 +5314,15 @@ def do_healthcheck():
         _hc("MetaTube 范围", "ok",
             "、".join(mt_on) if mt_on else f"{DIM}所有媒体库都没启用{RST}")
 
+    if os.path.exists(WARM_CRON):
+        _hc("直链预热", "ok",
+            f"每 {WARM_EVERY_H} 小时热一次「继续观看」的前几部"
+            f"{DIM}（省掉点播放时的换直链等待）{RST}")
+    else:
+        _hc("直链预热", "warn", "没装 —— 隔一阵没看，第一次点播放要等换直链")
+        todo.append(("直链预热没装，冷启动时第一次播放要等几秒到几十秒",
+                     "跑一次「6 更新」会自动补上"))
+
     if os.path.exists(SYNC_CRON):
         # 光说"装了、排在几点"不够。用户第二天发现问题还在时，要能当场分辨
         # 是【没跑】还是【跑了但没修好】—— 这两种情况下一步做的事完全不同
@@ -5408,6 +5466,8 @@ if __name__ == "__main__":
             do_keepalive()
         elif arg == "sync":               # cron 调的每日对齐，同样不交互
             require_root(); do_sync()
+        elif arg == "warm":               # cron 调的直链预热
+            require_root(); do_warm()
         elif arg == "update":
             do_update()
         elif arg in ("apikey", "key"):
