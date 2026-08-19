@@ -4971,6 +4971,33 @@ def _ol_api(path, body, token=None, timeout=60):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
+def stack_versions(key=""):
+    """各组件的版本。取不到的返回空串 —— 宁可不显示，也不编一个。
+
+    能问出真版本号的只有 Emby 和 OpenList（它们有自己的接口）。MediaWarp 和
+    AutoFilm 没有版本接口，退而取【镜像的构建日期】：这套东西全用 :latest 标签，
+    构建日期就是"你手上这份有多新"最实在的答案，比没有强。
+    """
+    out = {}
+    if key:
+        try:
+            out["Emby"] = str(_emby("/System/Info", key, timeout=20).get("Version") or "")
+        except Exception:
+            pass
+    try:
+        r = _ol_api("/api/public/settings", {}, timeout=15)
+        out["OpenList"] = str((r.get("data") or {}).get("version") or "")
+    except Exception:
+        pass
+    for name, img in (("MediaWarp", "akimio/mediawarp:latest"),
+                      ("AutoFilm", "akimio/autofilm:latest")):
+        r = sh(f"docker image inspect {img} -f '{{{{.Created}}}}'", timeout=30)
+        v = (r.stdout or "").strip().strip("'")[:10]
+        if v and v[:4].isdigit():
+            out[name] = f"{v} 构建"
+    return {k: v for k, v in out.items() if v}
+
+
 def do_healthcheck():
     """把整条链路挨个打一遍，每项报耗时和结论。
 
@@ -5004,6 +5031,14 @@ def do_healthcheck():
         todo.append(("容器没起全", f"docker compose -f {d}/docker-compose.yml up -d"))
     else:
         _hc("容器", "ok", f"{len(want)}/{len(want)} 在跑")
+
+    # 版本必须看得见。全用 :latest 标签，「6 更新」每次都会拉最新的 —— 但用户
+    # 无从知道自己手上是哪一版，也就没法判断某个毛病是不是升级带来的、或者
+    # 已经被上游修掉了。能问出版本号的就报版本号，问不出的报镜像构建日期
+    vers = stack_versions(read_emby_api_key(d) or "")
+    if vers:
+        _hc("版本", "ok", "  ".join(f"{k} {v}" for k, v in vers.items()))
+        print(f"     {DIM}镜像都是 :latest，「6 更新」会拉最新版{RST}")
 
     # ---- OpenList 登录 ----
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
