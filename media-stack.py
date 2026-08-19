@@ -4267,11 +4267,19 @@ def set_link_method():
         #
         # 最坑的是它【不会立刻暴露】：已经缓存了直链的片子照样能播（命中缓存只要
         # 3 毫秒，根本不问 OpenList），只有缓存里没有的那些才失败。用户看到的是
-        # "有的能放有的不能放"，完全联想不到是刚才那次切换造成的。实测就是这样：
-        # 播过的两部好好的，没播过的两部直接 load fail。
-        subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
-                       timeout=120)
-        info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
+        # "有的能放有的不能放"，完全联想不到是刚才那次切换造成的。
+        #
+        # 【但顺序不能反】MediaWarp 是在启动那一刻登录的，只登一次。OpenList 还没
+        # 起好就重启它，那次登录直接失败，它照样握着一个没用的令牌 —— 和不重启一样
+        # 糟，而且更难想到。实测就栽在这里：重启完立刻预热，四部片子全部"没换到直链"。
+        if wait_openlist_ready(d):
+            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
+                           timeout=120)
+            info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
+        else:
+            warn("OpenList 迟迟没就绪，没有重启 MediaWarp。")
+            print(f"  {DIM}它手里还是切换前的旧令牌，换直链会被拒。等 OpenList 好了敲："
+                  f"{RST}{BOLD}docker restart mediawarp{RST}")
 
     print()
     print(f"  {DIM}strm 文件不用重新生成 —— 里面存的是网盘路径，{RST}")
@@ -4586,6 +4594,38 @@ def resume_items(key, uid, limit=10):
         if out:
             return out
     return []
+
+
+def wait_openlist_ready(d, timeout=90):
+    """等 OpenList 能正常登录。返回是否等到了。
+
+    只用「登录成功」作判据，不去列目录：登目录要跨境，慢的时候要一两分钟，而这里
+    要问的只是"OpenList 自己起好了没有"，那是本机的事，答得很快。
+
+    存在的理由是 MediaWarp 只在启动那一刻登录一次 —— 必须等 OpenList 能接受登录了
+    再去重启它，否则那一次登录失败，之后它一直握着废令牌。
+    """
+    pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                  fallback=os.path.join(d, ".env"))
+    t0 = time.monotonic()
+    said = False
+    while time.monotonic() - t0 < timeout:
+        try:
+            tok = (_ol_api("/api/auth/login",
+                           {"username": "admin", "password": pw},
+                           timeout=10).get("data") or {}).get("token", "")
+            if tok:
+                el = time.monotonic() - t0
+                if said:
+                    print(f"  {DIM}OpenList 就绪（等了 {el:.0f} 秒）{RST}")
+                return True
+        except Exception:
+            pass
+        if not said:
+            print(f"  {DIM}等 OpenList 起好再重启 MediaWarp...{RST}")
+            said = True
+        time.sleep(2)
+    return False
 
 
 def warm_links(d, key, limit=10):
@@ -5016,7 +5056,12 @@ def do_healthcheck():
     # 只要命中了直链缓存就照样 302 成功（3 毫秒，根本不问 OpenList），而缓存里
     # 没有的片子全部 404。用户看到的是"有的能放有的不能放"，体检却一片绿。
     # 所以直接去日志里找那句话 —— 它是这个故障唯一确定的信号。
-    r = sh("docker logs --since 6h mediawarp", timeout=60)
+    # 【必须只看本次启动之后的日志】docker restart 不会清掉旧日志，用固定的
+    # --since 6h 会把重启【之前】那些 401 一起读进来 —— 于是修好了还报故障，
+    # 用户照着待办再重启一次，还是报。实测就撞上了这个。
+    r = sh("docker inspect -f '{{.State.StartedAt}}' mediawarp", timeout=30)
+    since = (r.stdout or "").strip().strip("'") or "6h"
+    r = sh(f"docker logs --since {since} mediawarp", timeout=60)
     mwlog = ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
     if "token is invalidated" in mwlog or "响应状态码: 401" in mwlog:
         _hc("MediaWarp 令牌", "bad",
@@ -5025,7 +5070,7 @@ def do_healthcheck():
                      "已缓存直链的片子还能放，其余的报错 —— 表现是「有的能放有的不能放」",
                      "docker restart mediawarp　（它启动时会重新登录换新令牌）"))
     elif mwlog.strip():
-        _hc("MediaWarp 令牌", "ok", "最近 6 小时没有换直链被拒的记录")
+        _hc("MediaWarp 令牌", "ok", "本次启动以来没有换直链被拒的记录")
 
     st302, msg302 = probe_302(key, own_host, _want)
     _hc("302 直链", st302, msg302)
