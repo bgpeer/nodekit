@@ -4535,7 +4535,7 @@ def strm_target_path(content):
     return p or ""
 
 
-def probe_302(key, own_host=""):
+def probe_302(key, own_host="", want_kind=""):
     """真的发一次播放请求，看 MediaWarp 到底回不回 302、302 到哪。
 
     这是整套东西唯一的端到端证明。前面那些检查(存储 work、能换到直链)都只说明
@@ -4616,6 +4616,12 @@ def probe_302(key, own_host=""):
             kind = ""
         head = f"302 →{' ' + own_host + ' →' if two_hop else ''} {host}"
         tail = (f"（{kind}，" if kind else "（") + "视频直达网盘，不经过本机）"
+        # 实际拿到的形态和设置里的直链方式对不上，几乎一定是【直链缓存还没过期】：
+        # MediaWarp 的 alist_api_ttl 是 2 小时，刚切换完，老地址还在缓存里。
+        # 不说明的话，用户会以为切换没生效 —— 而其实只是还没轮到这个文件换。
+        if kind and want_kind and kind != want_kind:
+            tail += (f"  {YELLOW}← 设置里是{want_kind}，这条是切换前缓存的地址，"
+                     f"最多 2 小时后自动换过来{RST}")
         return "ok", f"{head}  {DIM}{tail}{RST}"
     except Exception as e:
         return "bad", _short_err(e)
@@ -4877,7 +4883,11 @@ def do_healthcheck():
     # ---- 302 端到端 ----
     own_host = urllib.parse.urlsplit(openlist_public_url(cfg)).hostname or ""
     _hc_wait("302 直链", 90)
-    st302, msg302 = probe_302(key, own_host)
+    # 把设置里的直链方式传进去，好让 302 那行能指出"拿到的和设的不一致"
+    _lm = link_method_storages(d) if is_installed(d) else []
+    _want = ({"download": "原画", "streaming": "转码流"}.get(_lm[0][3], "")
+             if len({c for _s, _m, _d, c in _lm}) == 1 and _lm else "")
+    st302, msg302 = probe_302(key, own_host, _want)
     _hc("302 直链", st302, msg302)
     if st302 == "bad":
         if "不是 302" in msg302:
