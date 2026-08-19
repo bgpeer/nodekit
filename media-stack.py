@@ -4618,6 +4618,16 @@ def strm_target_path(content):
     return p or ""
 
 
+def now_playing_ids(key):
+    """当前正在播放的条目 id 集合。取不到就返回空集（宁可不热，也不误判）。"""
+    try:
+        return {str((s.get("NowPlayingItem") or {}).get("Id"))
+                for s in _emby("/Sessions", key, timeout=20)
+                if s.get("NowPlayingItem")}
+    except Exception:
+        return set()
+
+
 def resume_items(key, uid, limit=10):
     """「继续观看」里的前 N 部（只要 strm 的）。返回 [(id, 名字, 续播点ticks, 源)]。
 
@@ -4704,10 +4714,25 @@ def warm_links(d, key, limit=10):
     cut = resume_items(key, uid, limit)
     if not cut:
         return 0, 0
+    # 【正在播的一律不碰】这是用户点出来的区别："机器刷新的应该可以回退……人在
+    # 播放器里面点的又不一样"。他说得对，而且这正是回退逻辑的致命处：光看"续播点
+    # 动了没有"，分不清是预热推的还是【用户此刻正在看】。整点那次预热要是撞上他在
+    # 看片，回退就会把真实进度抹掉 —— 修 bug 修出个更严重的。
+    #
+    # 正在播的片子本来也不需要热：它的直链早就在缓存里了。跳过它，两个问题一起没。
+    playing = now_playing_ids(key)
+    if playing:
+        skip = [n for i, n, _p, _s in cut if str(i) in playing]
+        cut = [x for x in cut if str(x[0]) not in playing]
+        for n in skip:
+            print(f"  {DIM}·{RST} {n[:24]}  {DIM}正在播，跳过（本来就是热的）{RST}")
+    if not cut:
+        return 0, 0
 
     print()
     info(f"给「继续观看」里的 {len(cut)} 部提前接好线路...")
-    print(f"  {DIM}只换直链、拉 64KB，不上报任何播放进度 —— 续播点不会被推着走。{RST}")
+    print(f"  {DIM}只换直链、拉 {WARM_BYTES // 1024}KB，不上报播放进度；"
+          f"热完回读一遍，被推动了就改回原值。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
     done, dead = 0, []
     t_all = time.monotonic()
@@ -4764,7 +4789,13 @@ def warm_links(d, key, limit=10):
     # 接口，而且 MediaWarp 直接 302 掉、Emby 根本看不见这次请求。
     # 但"理论上不会"这句话今天已经被打脸好几次了，所以实测一遍：对不上就改回去。
     moved = []
+    # 回退前【重新】取一次正在播的集合：预热这几分钟里用户完全可能刚点开播放。
+    # 那种情况下续播点是他自己推的，绝不能改回去
+    playing = now_playing_ids(key)
     for iid, name, pos, _src in cut:
+        if str(iid) in playing:
+            print(f"  {DIM}·{RST} {name[:24]}  {DIM}期间开始播放了，续播点归你，不动{RST}")
+            continue
         try:
             now = ((_emby(f"/Users/{uid}/Items/{iid}", key, timeout=20)
                     .get("UserData") or {}).get("PlaybackPositionTicks") or 0)
