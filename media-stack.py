@@ -3567,6 +3567,7 @@ def do_strm():
         split_shared_identities(d, key)
         clear_impossible_progress(key)
         report_not_in_emby(d, key)
+        warm_links(d, key)
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
@@ -4274,8 +4275,18 @@ def set_link_method():
 
     print()
     print(f"  {DIM}strm 文件不用重新生成 —— 里面存的是网盘路径，{RST}")
-    print(f"  {DIM}清晰度是播放那一刻才决定的。直接播一次就能看出区别。{RST}")
-    print(f"  {DIM}直链缓存里切换前的地址还会留最多 2 小时，那期间部分片子仍按老方式播。{RST}")
+    print(f"  {DIM}清晰度是播放那一刻才决定的。{RST}")
+    # 刚重启完 MediaWarp，缓存是空的：这时候用户去点播放，每部片子都要等一次
+    # 跨境换直链（实测 0.3～27 秒），转码流还要等网盘准备切片 —— 表现就是一直转圈。
+    # 趁这里替他热一遍，切完就能直接看
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if key:
+        time.sleep(5)          # 等 MediaWarp 起来并登录 OpenList
+        warm_links(d, key)
+    else:
+        print(f"  {DIM}没有 Emby API Key，没法提前接线路 —— "
+              f"第一次播放会等一会儿换直链。{RST}")
 
 
 def scan_spec_human(spec, paths):
@@ -4545,6 +4556,91 @@ def strm_target_path(content):
         if p.startswith(pre):
             return "/" + p[len(pre):]
     return p or ""
+
+
+def warm_links(d, key, limit=40):
+    """给每个条目提前换好直链、并让网盘把流准备好。返回 (成功数, 总数)。
+
+    用户原话："这些调整或更新之后应该把那些该热的线路给他接上，或者视频开头也
+    播放1秒直接让他把转码都给他接上"。就是这个意思。
+
+    第一次播放为什么慢，是两件事叠在一起：
+      · MediaWarp 缓存里没有这个文件的直链，要现去问 OpenList 换一次
+        （跨境调用，实测 0.3～27 秒不等）
+      · 转码流模式下，夸克那边还要把切片准备好
+
+    两件事都可以【提前】做掉 —— 换直链的结果进 MediaWarp 缓存，拉一小段字节让
+    网盘把流准备好。之后用户点播放就是直接开始。
+
+    走的是和真实播放【完全相同】的那条路（MediaWarp 的 /Videos/{id}/stream），
+    所以热的正是待会儿要用的那份缓存，不是另一条旁路。
+
+    限制说清楚：MediaWarp 的直链缓存是 2 小时（alist_api_ttl），所以这个预热只在
+    两小时内有效。放在切换直链方式、生成媒体库之后跑最划算 —— 那正是缓存刚被清空、
+    用户马上要去看的时刻。想让隔夜的第一次也快，得靠离看片更近的时间点再热一次。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return 0, 0
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return 0, 0
+    items = []
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not any(STRM_PATH in p or p in STRM_PATH
+                              for p in (lb.get("Locations") or [])):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path", key)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            if str(i.get("Path") or "").endswith(".strm"):
+                items.append((i.get("Id"), str(i.get("Name") or "?")))
+    if not items:
+        return 0, 0
+    cut = items[:limit]
+    print()
+    info(f"给 {len(cut)} 个片子提前接好线路...")
+    print(f"  {DIM}换直链 + 让网盘把流准备好，之后点播放就直接开始。"
+          f"这份缓存 2 小时内有效。{RST}")
+    if len(items) > limit:
+        print(f"  {DIM}只热前 {limit} 个 —— 每个都要跨境调一次，全热反而更慢。{RST}")
+    opener = urllib.request.build_opener(_NoRedirect)
+    done = 0
+    for iid, name in cut:
+        t0 = time.monotonic()
+        url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
+               f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
+        loc = ""
+        try:
+            opener.open(url, timeout=90)
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                loc = e.headers.get("Location", "")
+        except Exception:
+            pass
+        if not loc:
+            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}没换到直链{RST}")
+            continue
+        # 再拉一小段，逼网盘把流真正准备好。拿不到也不算失败 —— 直链已经进缓存了，
+        # 而 VPS 到 CDN 那一跳本来就常超时，跟播放设备走的不是同一条路
+        try:
+            req = urllib.request.Request(loc, headers={"Range": "bytes=0-65535"})
+            urllib.request.urlopen(req, timeout=45).read(1024)
+        except Exception:
+            pass
+        done += 1
+        print(f"  {GREEN}\u2714{RST} {name[:26]}  {time.monotonic() - t0:.1f} 秒")
+    if done:
+        ok(f"{done}/{len(cut)} 个已接好，现在点播放不用等换直链")
+    else:
+        warn("一个都没接上 —— 网盘接口可能正好在抖，跑「5 链路体检」看看。")
+    return done, len(cut)
 
 
 def probe_302(key, own_host="", want_kind=""):
