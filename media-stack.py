@@ -1087,8 +1087,10 @@ WARM_EVERY_H   = 1
 # 单步的 socket 超时。注意它【不是总时限】：urllib 的 timeout 管的是单次读写等待，
 # 只要对端还在断续地回数据就不会触发 —— 实测有一部花了 100 秒。真正兜底的是
 # WARM_BUDGET 那个整轮预算
-WARM_STEP_T    = 20
-WARM_BUDGET    = 180    # 整轮封顶（秒）。剩下的留给一小时后的下一轮
+WARM_STEP_T    = 45     # 后台跑，等久点没关系 —— 热不成才是白跑
+WARM_BUDGET    = 600    # 整轮封顶（秒）。用满就收工，剩下的交给一小时后那轮
+WARM_RETRY     = 2      # 每部最多试几次。跨境超时多是偶发，隔一轮再试往往就成了
+WARM_LIMIT     = 10     # 每轮热几部。「继续观看」里靠前的那几部才是真会被点开的
 WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段准备好，又不占带宽
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
@@ -1899,10 +1901,21 @@ def do_update():
     # 上面 docker compose up -d 把容器全重启了，MediaWarp 的直链缓存随之清空。
     # 不热的话，用户更新完顺手去点一部片子，等的就是那几秒到几十秒的跨境换直链 ——
     # 而他刚做的是"更新"，不会想到这是更新造成的
+    # 【后台跑】预热要跨境换直链，慢的时候一部就几十秒。更新本身早就做完了，
+    # 没道理让用户对着它干等 —— 何况热不热得上跟这次更新成没成功毫无关系。
+    # 丢到后台去，用户按回车就能走。
     _k = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                           "auth")
-    if _k and wait_openlist_ready(d, timeout=60):
-        warm_links(d, _k)
+    if _k:
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.realpath(__file__), "warm"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            print(f"  {DIM}已在后台给「继续观看」的前 {WARM_LIMIT} 部预热线路"
+                  f"（换直链，最多几分钟）—— 不用等它，直接回车就行。{RST}")
+        except Exception as e:
+            warn(f"后台预热没起来（不影响更新）：{_short_err(e)}")
 
 
 def do_uninstall():
@@ -4693,7 +4706,7 @@ def wait_openlist_ready(d, timeout=90):
     return False
 
 
-def warm_links(d, key, limit=10):
+def warm_links(d, key, limit=None):
     """给「继续观看」里的前几部提前接好线路。返回 (成功数, 总数)。
 
     用户定的范围："热这个线路按继续播放里面的前10个，提取进度条记忆播放一秒就可以
@@ -4714,6 +4727,7 @@ def warm_links(d, key, limit=10):
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
         return 0, 0
+    limit = limit or WARM_LIMIT
     cut = resume_items(key, uid, limit)
     if not cut:
         return 0, 0
@@ -4733,63 +4747,80 @@ def warm_links(d, key, limit=10):
         return 0, 0
 
     print()
-    info(f"给「继续观看」里的 {len(cut)} 部提前接好线路...")
+    info(f"给「继续观看」里的前 {limit} 部提前接好线路"
+         f"{f'（当前 {len(cut)} 部）' if len(cut) != limit else ''}...")
     print(f"  {DIM}只换直链、拉 {WARM_BYTES // 1024}KB，不上报播放进度；"
           f"热完回读一遍，被推动了就改回原值。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
     done, dead = 0, []
     t_all = time.monotonic()
-    for iid, name, pos, src in cut:
-        # 【总时长封顶】跨境慢的时候一个能耗掉半分钟。这是后台定时任务，跑太久没意义
-        # —— 下一轮一小时后还会再来，剩下的留给它
-        if time.monotonic() - t_all > WARM_BUDGET:
-            print(f"  {DIM}...已用满 {WARM_BUDGET // 60} 分钟，剩下的交给下一轮{RST}")
-            break
-        t0 = time.monotonic()
-        url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
-               f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
-        loc, why = "", ""
-        try:
-            opener.open(url, timeout=WARM_STEP_T)
-        except urllib.error.HTTPError as e:
-            if e.code in (301, 302, 303, 307, 308):
-                loc = e.headers.get("Location", "")
+    # 【多轮重试】跨境超时绝大多数是偶发的：同一部片这一秒超时、下一秒 0.3 秒就回来。
+    # 一轮打完就走的话，热成率完全看运气 —— 用户实测有一轮 4 部只热上 1 部。
+    # 失败的攒起来再来一遍，中间隔几秒让接口喘口气，比一次性打完靠谱得多。
+    todo_q, attempt = list(cut), 0
+    while todo_q and attempt < WARM_RETRY:
+        attempt += 1
+        if attempt > 1:
+            print(f"  {DIM}...{len(todo_q)} 部没热上，隔 5 秒再试一轮"
+                  f"（第 {attempt}/{WARM_RETRY} 轮）{RST}")
+            time.sleep(5)
+        again = []
+        for iid, name, pos, src in todo_q:
+            # 【总时长封顶】跨境慢的时候一个能耗掉半分钟。这是后台任务，跑太久没意义
+            # —— 一小时后还会再来，剩下的留给那一轮
+            if time.monotonic() - t_all > WARM_BUDGET:
+                print(f"  {DIM}...已用满 {WARM_BUDGET // 60} 分钟，剩下的交给下一轮{RST}")
+                again = []
+                todo_q = []
+                break
+            t0 = time.monotonic()
+            url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
+                   f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
+            loc, why = "", ""
+            try:
+                opener.open(url, timeout=WARM_STEP_T)
+            except urllib.error.HTTPError as e:
+                if e.code in (301, 302, 303, 307, 308):
+                    loc = e.headers.get("Location", "")
+                else:
+                    why = f"HTTP {e.code}"
+            except Exception as e:
+                why = _short_err(e)
+            if not loc and attempt < WARM_RETRY:
+                again.append((iid, name, pos, src))
+                continue
+            if not loc:
+                # 【只报事实，不猜原因】上一版这里写死了"多半是网盘里已经删了"，
+                # 而实测打出来的是 timed out —— 超时只说明接口那几十秒没回话，
+                # 跟文件在不在毫无关系。文件到底还在不在，由每日对齐那步的三态
+                # 判据说了算（明确回答"对象不存在"才算删）。
+                dead.append(name[:24])
+                tip = ("网盘接口一直没回话，线路慢，下一轮再试"
+                       if ("timed out" in why or "timeout" in why.lower() or not why)
+                       else f"{why} —— 下一轮再试；一直这样就跑「5 链路体检」")
+                print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}没热上{RST}"
+                      f"{DIM}（{tip}）{RST}")
+                continue
+            # 按续播点估算字节位置。转码流是 m3u8（整份播放列表），没有位置可言，
+            # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
+            size = src.get("Size") or 0
+            run = src.get("RunTimeTicks") or 0
+            head, at = {}, ""
+            if size and run and pos and (src.get("Container") or "").lower() != "hls":
+                off = min(int(size * pos / run), max(size - WARM_BYTES, 0))
+                head["Range"] = f"bytes={off}-{off + WARM_BYTES - 1}"
+                at = f"  {DIM}（从 {pos / 6e8:.0f} 分处）{RST}"
             else:
-                why = f"HTTP {e.code}"
-        except Exception as e:
-            why = _short_err(e)
-        if not loc:
-            # 【只报事实，不猜原因】上一版这里写死了"多半是网盘里已经删了"，而实测
-            # 打出来的错误是 timed out —— 超时只说明接口那几十秒没回话，跟文件在不在
-            # 毫无关系。用户看到自己没删的片子被说成"已经删了"，只会怀疑别的地方。
-            #
-            # 文件到底还在不在，由每日对齐那步的三态判据说了算（明确回答"对象不存在"
-            # 才算删）。预热这里不重试也不下结论：下一轮一小时后自然会再试一次。
-            dead.append(name[:24])
-            tip = ("网盘接口没在时限内回话，线路慢，下一轮再试"
-                   if ("timed out" in why or "timeout" in why.lower() or not why)
-                   else f"{why} —— 下一轮再试；一直这样就跑「5 链路体检」")
-            print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}这轮没热上{RST}"
-                  f"{DIM}（{tip}）{RST}")
-            continue
-        # 按续播点估算字节位置。转码流是 m3u8（整份播放列表），没有位置可言，
-        # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
-        size = src.get("Size") or 0
-        run = src.get("RunTimeTicks") or 0
-        head, at = {}, ""
-        if size and run and pos and (src.get("Container") or "").lower() != "hls":
-            off = min(int(size * pos / run), max(size - WARM_BYTES, 0))
-            head["Range"] = f"bytes={off}-{off + WARM_BYTES - 1}"
-            at = f"  {DIM}（从 {pos / 6e8:.0f} 分处）{RST}"
-        else:
-            head["Range"] = f"bytes=0-{WARM_BYTES - 1}"
-        try:
-            urllib.request.urlopen(urllib.request.Request(loc, headers=head),
-                                   timeout=WARM_STEP_T).read(4096)
-        except Exception:
-            pass          # 直链已经进缓存了；VPS 到 CDN 那一跳跟播放设备不同路
-        done += 1
-        print(f"  {GREEN}\u2714{RST} {name[:24]}  {time.monotonic() - t0:.1f} 秒{at}")
+                head["Range"] = f"bytes=0-{WARM_BYTES - 1}"
+            try:
+                urllib.request.urlopen(urllib.request.Request(loc, headers=head),
+                                       timeout=WARM_STEP_T).read(4096)
+            except Exception:
+                pass      # 直链已经进缓存了；VPS 到 CDN 那一跳跟播放设备不同路
+            done += 1
+            print(f"  {GREEN}\u2714{RST} {name[:24]}  "
+                  f"{time.monotonic() - t0:.1f} 秒{at}")
+        todo_q = again
 
     # 【自查：续播点有没有被推着走】用户担心的正是这个 —— "热着热着一天下来那个
     # 继续播放进度条都跑完了"。理论上不会：预热只请求流、从不调 Emby 的播放上报
@@ -4986,7 +5017,10 @@ def stack_versions(key=""):
             pass
     try:
         r = _ol_api("/api/public/settings", {}, timeout=15)
-        out["OpenList"] = str((r.get("data") or {}).get("version") or "")
+        # OpenList 把 commit、前端版本、构建时间全塞在这一个字段里，原样打出来
+        # 能顶掉整行。只取开头那个版本号
+        v = str((r.get("data") or {}).get("version") or "")
+        out["OpenList"] = re.split(r"[\s(]", v.strip(), 1)[0]
     except Exception:
         pass
     for name, img in (("MediaWarp", "akimio/mediawarp:latest"),
