@@ -4260,10 +4260,22 @@ def set_link_method():
     finally:
         subprocess.run(["docker", "start", "openlist"], capture_output=True, timeout=120)
         info("OpenList 已重启")
+        # 【MediaWarp 必须跟着重启】它在启动时登录 OpenList 拿一个令牌，之后一直用
+        # 那一个。OpenList 重启之后旧令牌作废，MediaWarp 却毫不知情 —— 换直链时
+        # 拿到 401 token is invalidated，整个请求以 404 收场。
+        #
+        # 最坑的是它【不会立刻暴露】：已经缓存了直链的片子照样能播（命中缓存只要
+        # 3 毫秒，根本不问 OpenList），只有缓存里没有的那些才失败。用户看到的是
+        # "有的能放有的不能放"，完全联想不到是刚才那次切换造成的。实测就是这样：
+        # 播过的两部好好的，没播过的两部直接 load fail。
+        subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
+                       timeout=120)
+        info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
 
     print()
     print(f"  {DIM}strm 文件不用重新生成 —— 里面存的是网盘路径，{RST}")
     print(f"  {DIM}清晰度是播放那一刻才决定的。直接播一次就能看出区别。{RST}")
+    print(f"  {DIM}直链缓存里切换前的地址还会留最多 2 小时，那期间部分片子仍按老方式播。{RST}")
 
 
 def scan_spec_human(spec, paths):
@@ -4887,6 +4899,21 @@ def do_healthcheck():
     _lm = link_method_storages(d) if is_installed(d) else []
     _want = ({"download": "原画", "streaming": "转码流"}.get(_lm[0][3], "")
              if len({c for _s, _m, _d, c in _lm}) == 1 and _lm else "")
+    # MediaWarp 的 OpenList 令牌失效时，302 那一项【测不出来】：它挑到的条目
+    # 只要命中了直链缓存就照样 302 成功（3 毫秒，根本不问 OpenList），而缓存里
+    # 没有的片子全部 404。用户看到的是"有的能放有的不能放"，体检却一片绿。
+    # 所以直接去日志里找那句话 —— 它是这个故障唯一确定的信号。
+    r = sh("docker logs --since 6h mediawarp", timeout=60)
+    mwlog = ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
+    if "token is invalidated" in mwlog or "响应状态码: 401" in mwlog:
+        _hc("MediaWarp 令牌", "bad",
+            f"{YELLOW}对 OpenList 的令牌失效了，没缓存的片子会打不开{RST}")
+        todo.append(("MediaWarp 拿着一个作废的 OpenList 令牌，换直链时被拒（401）。"
+                     "已缓存直链的片子还能放，其余的报错 —— 表现是「有的能放有的不能放」",
+                     "docker restart mediawarp　（它启动时会重新登录换新令牌）"))
+    elif mwlog.strip():
+        _hc("MediaWarp 令牌", "ok", "最近 6 小时没有换直链被拒的记录")
+
     st302, msg302 = probe_302(key, own_host, _want)
     _hc("302 直链", st302, msg302)
     if st302 == "bad":
