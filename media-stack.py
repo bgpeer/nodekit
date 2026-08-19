@@ -5299,17 +5299,54 @@ def do_healthcheck():
                 # 健康的跨境线路永远飘黄 —— 一直报警就等于没报警。
                 # 30 秒这条线的依据是后果:超过它,几十个目录的扫描必然半路超时。
                 st = "ok" if el < 5 else ("warn" if el <= 30 else "bad")
-                extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）")
-                # 慢的时候先查有没有人在同时敲网盘。原来这里无条件写「线路问题，
-                # 服务端改不了」，而实测证明单独跑同一条路径只要 0.5 秒 —— 那句话
-                # 会把用户支去折腾一条没毛病的网络，真凶（后台在扫库）反而没人提。
+                # 慢的时候，紧跟着对【同一条路径】再打一发。这一发是判因用的，
+                # 不是重试 —— 一次的耗时根本区分不了「这条路不通」和「这一下赶上了
+                # 一次性开销」，而这两种情况该做的事完全相反。
+                # 逼出这个设计的实测：体检报 55.2 秒的同一屏上，换直链（同一个夸克
+                # 存储、同一分钟）只用 0.6 秒；用户手工对同一条路径连打 8 次带
+                # refresh 的 fs/list，全部 ≤1.3 秒。线路要是坏的，这两样不可能快。
+                # 所以第二发快 = 第一发那 55 秒是一次性开销（存储要重新初始化、
+                # 目录缓存刚被清、后台正在抢接口），不是线路问题。
+                el2 = None
+                if st != "ok":
+                    _hc_wait(f"列目录 {p}", 60)
+                    t1 = time.monotonic()
+                    try:
+                        r2 = _ol_api("/api/fs/list",
+                                     {"path": p, "password": "", "page": 1,
+                                      "per_page": 1, "refresh": True}, token, timeout=60)
+                        if r2.get("code") == 200:
+                            el2 = time.monotonic() - t1
+                    except Exception:
+                        pass
+                # 第二发就快了，说明路是通的。降级成提醒，别再打红叉 ——
+                # 「列目录 ✖」配上「换直链 ✔ 0.6 秒」同屏出现，是这个体检自己在自相矛盾。
+                if el2 is not None and el2 < 5:
+                    st = "warn"
+                # 还要看有没有人在同时敲网盘。原来这里无条件写「线路问题，服务端
+                # 改不了」，会把用户支去折腾一条没毛病的网络，而真凶（后台在扫库）
+                # 反而没人提，再等几分钟它自己就消失了。
                 load = netdisk_load(d, key) if st != "ok" else ""
-                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {n_items} 项{extra}"
-                                       # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
+                if el2 is None:
+                    extra = "" if st == "ok" else ("  偏慢" if st == "warn" else "  太慢（正常 < 5 秒）")
+                    second = ""
+                else:
+                    extra = ""
+                    second = (f"  →  再打一次 {el2:.1f} 秒"
+                              + ("  第一次是一次性开销，路是通的"
+                                 if el2 < 5 else "  两次都慢，这条路真有问题"))
+                # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
+                _hc(f"列目录 {p}", st, f"{el:.1f} 秒  {n_items} 项{extra}{second}"
                                        + (f"\n{' ' * 27}{DIM}同时在敲网盘：{load}{RST}"
                                           if load else ""))
                 listed_ok.append((p, n_items))
-                if st == "bad" and load:
+                if el2 is not None and el2 < 5:
+                    todo.append((f"列 {p} 第一次用了 {el:.0f} 秒，紧接着再列只要 {el2:.1f} 秒 ——"
+                                 f"线路是通的，慢在第一次的一次性开销"
+                                 + (f"（同一刻 {load}）" if load else ""),
+                                 "不用改网络。「生成媒体库」要是扫到一半停了，"
+                                 "错开后台扫库的时间再点一次"))
+                elif st == "bad" and load:
                     todo.append((f"列 {p} 用了 {el:.0f} 秒 —— 但同一刻 {load}，"
                                  f"这个数字量的是排队，不一定是线路",
                                  "等后台那件事跑完再体检一次。两次都慢才是线路问题"))
