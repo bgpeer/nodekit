@@ -1794,8 +1794,11 @@ def self_update():
     return True
 
 
-def do_update():
-    """更新：脚本自身 + 镜像 + 按新脚本重新生成配置。用户数据和密码都不动。"""
+def do_update(from_menu=False):
+    """更新：脚本自身 + 镜像 + 按新脚本重新生成配置。用户数据和密码都不动。
+
+    from_menu 只影响自我更新之后 re-exec 的走法：菜单里进来的，跑完要回菜单。
+    """
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
@@ -1803,7 +1806,12 @@ def do_update():
 
     if self_update():
         me = os.path.realpath(__file__)
-        os.execv(sys.executable, [sys.executable, me, "update"])
+        # 【把"我是从菜单进来的"这件事带过去】re-exec 会把当前进程整个换掉，调用栈
+        # 连同"跑完该回哪儿"一起没了。用命令行那条 update 参数的话，新进程做完就
+        # 退出 —— 用户按回车直接被弹回外层的 bgpeer 主菜单，而他明明是在
+        # 「15 自建 Emby」里面点的更新，本该回到那个子菜单。
+        os.execv(sys.executable,
+                 [sys.executable, me, "update-menu" if from_menu else "update"])
 
     compose = os.path.join(d, "docker-compose.yml")
     env_file = os.path.join(d, ".env")
@@ -5596,7 +5604,7 @@ def main_menu():
         elif c == "5":
             do_healthcheck()
         elif c == "6":
-            do_update()
+            do_update(from_menu=True)
         elif c == "7":
             do_uninstall()
         else:
@@ -5622,6 +5630,10 @@ if __name__ == "__main__":
             require_root(); do_warm()
         elif arg == "update":
             do_update()
+        elif arg == "update-menu":        # 菜单里点的更新，且中途自我更新过；跑完回菜单
+            do_update(from_menu=True)
+            ask("\n按回车返回菜单...")
+            main_menu()
         elif arg in ("apikey", "key"):
             require_root(); set_emby_api_key()
         elif arg in ("passwd", "password"):
