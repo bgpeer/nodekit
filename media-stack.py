@@ -1084,7 +1084,10 @@ WARM_CRON      = "/etc/cron.d/media-stack-warm"
 # 每几小时热一次「继续观看」的直链。必须【小于】MediaWarp 的 alist_api_ttl(2h)，
 # 否则缓存会在两次预热之间过期，等于白跑。1 小时留了一倍余量。
 WARM_EVERY_H   = 1
-WARM_STEP_T    = 20     # 单步封顶（秒）。超过这个还没换到直链，这一轮就不值得等了
+# 单步的 socket 超时。注意它【不是总时限】：urllib 的 timeout 管的是单次读写等待，
+# 只要对端还在断续地回数据就不会触发 —— 实测有一部花了 100 秒。真正兜底的是
+# WARM_BUDGET 那个整轮预算
+WARM_STEP_T    = 20
 WARM_BUDGET    = 180    # 整轮封顶（秒）。剩下的留给一小时后的下一轮
 WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段准备好，又不占带宽
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
@@ -4756,14 +4759,18 @@ def warm_links(d, key, limit=10):
         except Exception as e:
             why = _short_err(e)
         if not loc:
-            # 换不到直链最常见的原因就是【文件已经从网盘删了】。这里只记账不重试：
-            # 每日对齐会把失效的 strm 连同 Emby 条目一起清掉，届时它自然从
-            # 「继续观看」里消失，也就不会再被热。在那之前每小时白跑一次，成本
-            # 是一个 20 秒封顶的请求 —— 比在这儿反复重试划算得多
+            # 【只报事实，不猜原因】上一版这里写死了"多半是网盘里已经删了"，而实测
+            # 打出来的错误是 timed out —— 超时只说明接口那几十秒没回话，跟文件在不在
+            # 毫无关系。用户看到自己没删的片子被说成"已经删了"，只会怀疑别的地方。
+            #
+            # 文件到底还在不在，由每日对齐那步的三态判据说了算（明确回答"对象不存在"
+            # 才算删）。预热这里不重试也不下结论：下一轮一小时后自然会再试一次。
             dead.append(name[:24])
-            print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}跳过{RST}"
-                  f"{DIM}（换不到直链{'：' + why if why else ''}，"
-                  f"多半是网盘里已经删了）{RST}")
+            tip = ("网盘接口没在时限内回话，线路慢，下一轮再试"
+                   if ("timed out" in why or "timeout" in why.lower() or not why)
+                   else f"{why} —— 下一轮再试；一直这样就跑「5 链路体检」")
+            print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}这轮没热上{RST}"
+                  f"{DIM}（{tip}）{RST}")
             continue
         # 按续播点估算字节位置。转码流是 m3u8（整份播放列表），没有位置可言，
         # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
@@ -4818,7 +4825,8 @@ def warm_links(d, key, limit=10):
     if done:
         ok(f"{done}/{len(cut)} 部已接好，点「继续播放」不用等换直链")
     elif dead:
-        warn(f"{len(dead)} 部换不到直链，一部都没热成 —— 这些文件可能已经不在网盘上了。")
+        warn(f"{len(dead)} 部都没换到直链 —— 网盘接口这会儿多半在抖，"
+             f"下一轮（{WARM_EVERY_H} 小时后）会自动再试。")
     else:
         warn("一个都没接上 —— 网盘接口可能正好在抖，跑「5 链路体检」看看。")
     return done, len(cut)
