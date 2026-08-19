@@ -1091,6 +1091,11 @@ WARM_STEP_T    = 45     # 后台跑，等久点没关系 —— 热不成才是�
 WARM_BUDGET    = 600    # 整轮封顶（秒）。用满就收工，剩下的交给一小时后那轮
 WARM_RETRY     = 2      # 每部最多试几次。跨境超时多是偶发，隔一轮再试往往就成了
 WARM_LIMIT     = 10     # 每轮热几部。「继续观看」里靠前的那几部才是真会被点开的
+# 每部之间歇一下。AutoFilm 的配置里为同一个理由留了 wait_time: 0.2，注释写着
+# "夸克风控较严，别调成 0"。预热连着打十几个换直链请求，不隔开的话很可能被风控
+# 盯上 —— 那会连累列目录、播放一起超时，等于自己把自己的链路搞垮。
+# 预热是后台任务，多花二十秒毫无代价。
+WARM_GAP       = 2
 WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段准备好，又不占带宽
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
@@ -4840,6 +4845,8 @@ def warm_links(d, key, limit=None):
                 todo_q = []
                 break
             t0 = time.monotonic()
+            if done or again:            # 第一个不等，之后每个之间歇一下
+                time.sleep(WARM_GAP)
             url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
                    f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
             loc, why = "", ""
