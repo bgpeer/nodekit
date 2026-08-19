@@ -4714,6 +4714,64 @@ def wait_openlist_ready(d, timeout=90):
     return False
 
 
+def _fetch_text(url, timeout, limit=1 << 20):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(limit).decode("utf-8", "replace")
+
+
+def warm_hls(loc, at_sec, timeout):
+    """转码流的预热：把播放列表读开，去拉【真正的那个分片】。返回一句说明。
+
+    这是之前预热"热了等于没热"的根因。转码流的 302 给的是 .m3u8 —— 那是一份文本
+    播放列表，里面只有一串分片地址。拉它的前 64KB 只是把这份目录读了一遍，网盘
+    完全没被要求去准备任何视频数据。用户那边的表现就是：明明热过了，点开还是先跑
+    几 KB/s，一两分钟后才提速 —— 那一两分钟正是网盘在现做分片。
+
+    所以要顺着列表往下走一层：主列表先挑一路码率，媒体列表按 #EXTINF 累加时长找到
+    续播点落在哪个分片，然后去拉那个分片。拉到了，网盘就把那段准备好了。
+    """
+    try:
+        txt = _fetch_text(loc, timeout)
+    except Exception:
+        return "播放列表没读到"
+    # 主列表（多码率）→ 先下钻到第一路
+    if "#EXT-X-STREAM-INF" in txt:
+        nxt = next((l.strip() for l in txt.splitlines()
+                    if l.strip() and not l.startswith("#")), "")
+        if not nxt:
+            return "主列表里没有可用码率"
+        loc = urllib.parse.urljoin(loc, nxt)
+        try:
+            txt = _fetch_text(loc, timeout)
+        except Exception:
+            return "媒体列表没读到"
+    # 按 #EXTINF 累加，找出续播点落在第几个分片
+    segs, acc, pick, dur = [], 0.0, 0, 0.0
+    for ln in txt.splitlines():
+        ln = ln.strip()
+        if ln.startswith("#EXTINF:"):
+            try:
+                dur = float(ln.split(":", 1)[1].split(",")[0])
+            except ValueError:
+                dur = 0.0
+        elif ln and not ln.startswith("#"):
+            segs.append(ln)
+            if acc < at_sec:
+                pick = len(segs) - 1
+            acc += dur
+    if not segs:
+        return "播放列表里没有分片"
+    pick = min(pick, len(segs) - 1)
+    try:
+        req = urllib.request.Request(urllib.parse.urljoin(loc, segs[pick]),
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        n = len(urllib.request.urlopen(req, timeout=timeout).read(WARM_BYTES))
+        return f"已拉第 {pick + 1}/{len(segs)} 个分片 {n // 1024}KB"
+    except Exception as e:
+        return f"分片没拉到（{_short_err(e)}）"
+
+
 def warm_links(d, key, limit=None):
     """给「继续观看」里的前几部提前接好线路。返回 (成功数, 总数)。
 
@@ -4813,18 +4871,24 @@ def warm_links(d, key, limit=None):
             # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
             size = src.get("Size") or 0
             run = src.get("RunTimeTicks") or 0
-            head, at = {}, ""
-            if size and run and pos and (src.get("Container") or "").lower() != "hls":
-                off = min(int(size * pos / run), max(size - WARM_BYTES, 0))
-                head["Range"] = f"bytes={off}-{off + WARM_BYTES - 1}"
-                at = f"  {DIM}（从 {pos / 6e8:.0f} 分处）{RST}"
+            at = ""
+            if ".m3u8" in loc.lower() or (src.get("Container") or "").lower() == "hls":
+                # 转码流：必须下钻到分片，拉播放列表等于没热（见 warm_hls 的说明）
+                at = f"  {DIM}（{warm_hls(loc, pos / 6e8 * 60, WARM_STEP_T)}）{RST}"
             else:
-                head["Range"] = f"bytes=0-{WARM_BYTES - 1}"
-            try:
-                urllib.request.urlopen(urllib.request.Request(loc, headers=head),
-                                       timeout=WARM_STEP_T).read(4096)
-            except Exception:
-                pass      # 直链已经进缓存了；VPS 到 CDN 那一跳跟播放设备不同路
+                # 原画：完整文件，直接跳到续播点那个字节位置
+                head = {"User-Agent": "Mozilla/5.0"}
+                if size and run and pos:
+                    off = min(int(size * pos / run), max(size - WARM_BYTES, 0))
+                    head["Range"] = f"bytes={off}-{off + WARM_BYTES - 1}"
+                    at = f"  {DIM}（从 {pos / 6e8:.0f} 分处）{RST}"
+                else:
+                    head["Range"] = f"bytes=0-{WARM_BYTES - 1}"
+                try:
+                    urllib.request.urlopen(urllib.request.Request(loc, headers=head),
+                                           timeout=WARM_STEP_T).read(WARM_BYTES)
+                except Exception:
+                    at = f"  {DIM}（字节没拉到，直链已进缓存）{RST}"
             done += 1
             print(f"  {GREEN}\u2714{RST} {name[:24]}  "
                   f"{time.monotonic() - t0:.1f} 秒{at}")
