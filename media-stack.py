@@ -3753,6 +3753,39 @@ def prune_dead_strm(d):
     return n
 
 
+# 补时长最多重试几轮、每轮之间隔多久。
+# 一轮一次机会是不够的：探测这一步要跨境换直链 + 让网盘准备文件头，而实测同一条
+# 路径的耗时能从 0.5 秒飘到 100 秒以上，还夹着彻底失败。单次成败基本是抽签。
+HEAL_ROUNDS = 2
+HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预热同一个理由）
+HEAL_PRE_T  = 40         # 预检超时：只是确认线路此刻通不通，不必等满
+
+
+def _netdisk_head_ok(raw_url, timeout=HEAL_PRE_T):
+    """先自己去网盘拉一小段文件头，确认这条线此刻真的能出数据。
+
+    为什么要多这一步：探测那一发是【发给 Emby】的，Emby 再经 MediaWarp、OpenList
+    去换直链，整条链任何一环卡住都只表现为"等满 200 秒然后没探到"。用户看到的是
+    一句没有信息量的「没探到」，而我们连是谁没响应都不知道。
+
+    自己先拉一次的好处有两个：
+      · 线路此刻不通就别去烧那 200 秒了，直接说清楚是网盘没给数据
+      · 拉过一次之后 OpenList 那边的直链是热的，紧接着的探测更容易在超时内跑完
+
+    返回 (能不能, 说明)。
+    """
+    if not raw_url:
+        return False, "没拿到直链"
+    try:
+        req = urllib.request.Request(
+            raw_url, headers={"User-Agent": "Mozilla/5.0",
+                              "Range": f"bytes=0-{WARM_BYTES - 1}"})
+        n = len(urllib.request.urlopen(req, timeout=timeout).read(WARM_BYTES))
+        return (n > 0), (f"{n // 1024}KB" if n else "网盘返回了 0 字节")
+    except Exception as e:
+        return False, _short_err(e)
+
+
 def heal_media_info(d, key):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
@@ -3806,11 +3839,31 @@ def heal_media_info(d, key):
     cfg = rebuild_cfg_from_disk(d)
     base = openlist_public_url(cfg)
     done = 0
+    todo_items = list(pend)
+    for rnd in range(1, HEAL_ROUNDS + 1):
+        if not todo_items:
+            break
+        if rnd > 1:
+            print(f"  {DIM}...{len(todo_items)} 个没探到，隔 {HEAL_GAP} 秒再试一轮"
+                  f"（第 {rnd}/{HEAL_ROUNDS} 轮）{RST}")
+            time.sleep(HEAL_GAP)
+        again = []
+        done += _heal_round(d, key, todo_items, base, token, again)
+        todo_items = again
+    _heal_summary(done, len(pend))
+
+
+def _heal_round(d, key, pend, base, token, again):
+    """探一轮。探不到的塞进 again 供下一轮再试。返回这一轮成功几个。"""
+    done = 0
     for uid, iid, name in pend:
         try:
             it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
         except Exception:
+            again.append((uid, iid, name))     # 问 Emby 失败可能只是这一下，值得再试
             continue
+        # 下面几种是【问题在本地，重试也没用】：路径对不上、文件读不了、
+        # strm 里没有可用目标。不进 again，免得白跑一轮还刷一屏同样的话
         host = _strm_host_path(d, it.get("Path") or "")
         if not host or not os.path.exists(host):
             continue
@@ -3822,10 +3875,19 @@ def heal_media_info(d, key):
         if not p:
             continue
         try:
-            sign = ((_ol_api("/api/fs/get", {"path": p, "password": ""},
-                             token, timeout=120).get("data") or {}).get("sign", ""))
+            got0 = (_ol_api("/api/fs/get", {"path": p, "password": ""},
+                            token, timeout=120).get("data") or {})
+            sign, raw = got0.get("sign", ""), got0.get("raw_url", "")
         except Exception as e:
-            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}取签名失败：{_short_err(e)}{RST}")
+            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}换直链失败：{_short_err(e)}{RST}")
+            again.append((uid, iid, name))
+            continue
+        # 先自己拉一段文件头。不通就别去烧 Emby 那 200 秒了，而且拉过之后
+        # 直链是热的，紧接着的探测更容易在超时内跑完
+        good, why = _netdisk_head_ok(raw)
+        if not good:
+            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}网盘没给出文件头（{why}）{RST}")
+            again.append((uid, iid, name))
             continue
         url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
         mins = 0
@@ -3865,15 +3927,24 @@ def heal_media_info(d, key):
             done += 1
             print(f"  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟")
         else:
-            print(f"  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}没探到，下次生成媒体库会再试{RST}")
-    if done == len(pend):
+            print(f"  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}")
+            again.append((uid, iid, name))
+    return done
+
+
+def _heal_summary(done, total):
+    if done == total:
         ok(f"{done} 个条目补齐，进度条和续播可用")
     elif done:
-        warn(f"{done}/{len(pend)} 个成功")
-        print(f"  {DIM}没成功的多半是当时网盘那条线在抖。再点一次「4 生成媒体库」")
-        print(f"  会只补没探到的那些，已经好的不重来。{RST}")
+        warn(f"{done}/{total} 个成功")
+        # 【别再让用户去点菜单】每小时的对齐任务本来就会重跑这一步，而且只挑
+        # 没探到的。原来那句"再点一次「4 生成媒体库」"是在让人干本来会自动发生
+        # 的事，还会让他以为不点就永远不修。
+        print(f"  {DIM}没成功的多半是当时网盘那条线在抖。每小时的对齐任务会自动重试，")
+        print(f"  只补没探到的那些，已经好的不重来 —— 不用管它。{RST}")
     else:
-        warn("一个都没探到 —— 网盘接口现在多半不通，跑「5 链路体检」看看。")
+        warn(f"{total} 个都没探到 —— 网盘接口现在多半不通，跑「5 链路体检」看看。")
+        print(f"  {DIM}每小时的对齐任务会自动重试，线路恢复后会自己补上。{RST}")
 
 
 def autofilm_clock():
