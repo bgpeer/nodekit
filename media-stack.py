@@ -2107,7 +2107,7 @@ def do_update(from_menu=False):
     # 用户不会知道这件事，只会发现"上次写过的分流又不管用了"。所以更新时按
     # 记下来的意图重写一次 —— 只在他确实开着的时候，关着的不去碰人家的配置。
     if node_rule_state(d).get("on"):
-        n = apply_node_rule(d, True, quiet=True)
+        n = len(apply_node_rule(d, True, quiet=True))
         if n:
             info(f"节点分流规则已重新写入 {n} 份配置"
                  f"{DIM}（节点脚本重建订阅会冲掉，这里补回来）{RST}")
@@ -5592,6 +5592,34 @@ def node_rule_present(path):
     return (CDN_GROUP in raw) if path.endswith(".json") else (MARK_IN in raw)
 
 
+def sub_url_for(path):
+    """给一份节点配置，反查它的订阅链接。找不到就返回空串。
+
+    直接读订阅目录里的软链：哪个 token 指向哪份配置，软链本身就是答案 ——
+    不用解析 tokens.json，token 换过也不会对不上。
+
+    为什么要有这个：写完只说「改了 3 份配置」，用户根本不知道该去哪儿把它拉下来，
+    而「服务器上写好了」和「手机上生效了」中间隔着一次订阅下载 —— 实测就卡在
+    这一步，人对着客户端点半天刷新，以为是功能没做好。
+    """
+    try:
+        host = open(os.path.join(BGP_DIR, "sub.host")).read().strip()
+        port = open(os.path.join(BGP_DIR, "sub.port")).read().strip()
+        names = os.listdir(os.path.join(BGP_DIR, "sub"))
+    except OSError:
+        return ""
+    if not (host and port):
+        return ""
+    real = os.path.realpath(path)
+    for n in names:
+        f = os.path.join(BGP_DIR, "sub", n)
+        if os.path.islink(f) and os.path.realpath(f) == real:
+            # 只有域名才配得上证书，IP 的订阅是明文
+            scheme = "http" if re.match(r"^[\d.]+$", host) else "https"
+            return f"{scheme}://{host}:{port}/{n}"
+    return ""
+
+
 def apply_node_rule(d, on, quiet=False):
     """把规则写进 / 删出所有能找到的节点配置。返回改动了几份。"""
     cfg = rebuild_cfg_from_disk(d)
@@ -5601,19 +5629,19 @@ def apply_node_rule(d, on, quiet=False):
             warn("这套媒体服务没有配域名（用的是 IP:端口），没法按域名分流。"
                  "先在「1 安装」里配上域名再来。")
         return 0
-    n = 0
+    done = []
     for label, path in NODE_CFGS:
         if not os.path.exists(path):
             continue
         good, msg = _node_write(path, on, hosts)
         if good:
-            n += 1
+            done.append((label, path))
             if not quiet:
                 ok(f"{label}　{os.path.basename(path)}" + (f"（{msg}）" if msg else ""))
         elif not quiet:
             warn(f"{label} 跳过：{msg}")
     set_node_rule_state(d, on, hosts)
-    return n
+    return done
 
 
 def node_rule_menu():
@@ -5657,11 +5685,16 @@ def node_rule_menu():
         if c not in ("1", "2"):
             print("无效选择。")
             continue
-        n = apply_node_rule(d, c == "1")
-        if n:
-            ok(f"改了 {n} 份配置。备份在同目录 *.mediastack.bak")
+        done = apply_node_rule(d, c == "1")
+        if done:
+            ok(f"改了 {len(done)} 份配置。备份在同目录 *.mediastack.bak")
             info("客户端要重新拉一次订阅才会生效"
-                 "（软件里对订阅点「更新」，不用换链接）。")
+                 "（软件里对订阅点「更新」，不用换链接）：")
+            # 把订阅链接直接打出来。服务器上写好了 ≠ 手机上生效了，中间隔着一次
+            # 下载 —— 实测就卡在这一步，人对着客户端点半天刷新，以为功能没做好
+            for lb, pth in done:
+                u = sub_url_for(pth)
+                print(f"    {pad(lb, 14)}{u or DIM + '（这份没挂到订阅目录）' + RST}")
             if c == "1":
                 info(f"生效后播放器那边会多出一个「{CDN_GROUP}」组，"
                      f"里面只有 CDN· 开头的节点。")
