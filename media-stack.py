@@ -5592,34 +5592,6 @@ def node_rule_present(path):
     return (CDN_GROUP in raw) if path.endswith(".json") else (MARK_IN in raw)
 
 
-def sub_url_for(path):
-    """给一份节点配置，反查它的订阅链接。找不到就返回空串。
-
-    直接读订阅目录里的软链：哪个 token 指向哪份配置，软链本身就是答案 ——
-    不用解析 tokens.json，token 换过也不会对不上。
-
-    为什么要有这个：写完只说「改了 3 份配置」，用户根本不知道该去哪儿把它拉下来，
-    而「服务器上写好了」和「手机上生效了」中间隔着一次订阅下载 —— 实测就卡在
-    这一步，人对着客户端点半天刷新，以为是功能没做好。
-    """
-    try:
-        host = open(os.path.join(BGP_DIR, "sub.host")).read().strip()
-        port = open(os.path.join(BGP_DIR, "sub.port")).read().strip()
-        names = os.listdir(os.path.join(BGP_DIR, "sub"))
-    except OSError:
-        return ""
-    if not (host and port):
-        return ""
-    real = os.path.realpath(path)
-    for n in names:
-        f = os.path.join(BGP_DIR, "sub", n)
-        if os.path.islink(f) and os.path.realpath(f) == real:
-            # 只有域名才配得上证书，IP 的订阅是明文
-            scheme = "http" if re.match(r"^[\d.]+$", host) else "https"
-            return f"{scheme}://{host}:{port}/{n}"
-    return ""
-
-
 def apply_node_rule(d, on, quiet=False):
     """把规则写进 / 删出所有能找到的节点配置。返回改动了几份。"""
     cfg = rebuild_cfg_from_disk(d)
@@ -5688,25 +5660,13 @@ def node_rule_menu():
         done = apply_node_rule(d, c == "1")
         if done:
             ok(f"改了 {len(done)} 份配置。备份在同目录 *.mediastack.bak")
-            info("客户端要重新拉一次订阅才会生效"
-                 "（软件里对订阅点「更新」，不用换链接）：")
-            # 把订阅链接直接打出来。服务器上写好了 ≠ 手机上生效了，中间隔着一次
-            # 下载 —— 实测就卡在这一步，人对着客户端点半天刷新，以为功能没做好
-            for lb, pth in done:
-                u = sub_url_for(pth)
-                print(f"    {pad(lb, 14)}{u or DIM + '（这份没挂到订阅目录）' + RST}")
+            info("改的是【本机】的节点配置，客户端要重新拉一次订阅才生效。")
+            # 不再把订阅链接一条条打出来了：多机聚合的时候，手机上用的根本不是
+            # 本机这份订阅（本机只是把节点链接交出去，聚合在另一台上），
+            # 打出来的链接对不上，反而误导。谁的订阅该拉，用户自己清楚。
             if c == "1":
                 info(f"生效后播放器那边会多出一个「{CDN_GROUP}」组，"
                      f"里面只有 CDN· 开头的节点。")
-                # 这句必须在这儿说：用户点这个按钮的时刻，多半 IP 已经被墙了，
-                # 而订阅链接和节点用的是同一个域名、同样走 DIRECT —— 规则写在
-                # 服务器上了，客户端却可能【正好拉不下来】。
-                # 这个没法靠加规则解决：把订阅域名也指向 CDN，就成了「要连节点
-                # 才能拿到节点配置」的环，而节点脚本那条 DOMAIN-SUFFIX,<域名>,
-                # DIRECT 正是拦这个的，不能动它。只能靠客户端自己那个开关。
-                print(f"    {DIM}IP 被墙时订阅链接同样连不上（它也走直连）。"
-                      f"客户端订阅设置里把「通过代理更新」打开，"
-                      f"就能借还活着的 CDN 节点把新订阅拉回来。{RST}")
         ask("\n按回车继续...")
 
 
