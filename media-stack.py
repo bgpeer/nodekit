@@ -5426,6 +5426,27 @@ def _strip_marked(txt):
                   "", txt, flags=re.S)
 
 
+def _seq_indent(lines, i):
+    """看 lines[i] 这个键下面的列表项是怎么缩进的，返回那串空白；不像列表就返回 None。
+
+    为什么不能写死 2 空格：节点脚本支持自定义模板（gist/GitHub），别人的模板
+    完全可能把列表项顶格写。那样插进去就是
+
+        proxy-groups:
+          - {name: "📺媒体走CDN", ...}     ← 我们插的，2 空格
+        - {name: "🌍全球加速", ...}        ← 人家自己的，顶格
+
+    YAML 到这儿直接崩，mihomo 起不来 —— 而用户刚点完「写入」，只会以为是这个
+    功能把他节点搞死了。缩进必须跟着人家走。
+    """
+    for line in lines[i + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = re.match(r"^([ \t]*)-[ \t]", line)
+        return m.group(1) if m else None
+    return None
+
+
 def _mihomo_edit(txt, hosts):
     """mihomo：加一个只含 CDN 节点的 url-test 组，再把本机域名指过去。
 
@@ -5435,35 +5456,52 @@ def _mihomo_edit(txt, hosts):
     txt = _strip_marked(txt)
     if not hosts:
         return txt, "没有域名"
-    grp = (f'  - {{name: "{CDN_GROUP}", type: url-test, lazy: true, '
+    lines = txt.splitlines(keepends=True)
+    # 先把两段的落点和缩进都找齐，全都对得上才动手 —— 只插一半的 YAML 比不插更糟
+    at = {}
+    for i, line in enumerate(lines):
+        key = line.rstrip("\n").rstrip()          # 只认顶格的键，dns 里那个嵌套的
+        if key in ("proxy-groups:", "rules:") and key not in at:   # rules: 不会误伤
+            ind = _seq_indent(lines, i)
+            if ind is None:
+                return txt, f"{key} 下面不是列表，这份模板的结构没见过"
+            at[key] = (i, ind)
+    if len(at) != 2:
+        return txt, "配置里找不到 proxy-groups: / rules: 段"
+    gi, gind = at["proxy-groups:"]
+    ri, rind = at["rules:"]
+    grp = (f'{gind}- {{name: "{CDN_GROUP}", type: url-test, lazy: true, '
            f'include-all: true, exclude-type: direct, filter: "CDN·", '
            f'url: "https://www.gstatic.com/generate_204", interval: 120, '
-           f'tolerance: 30, timeout: 5000}}')
-    blk_g = f"  {MARK_IN}\n{grp}\n  {MARK_OUT}\n"
-    blk_r = ("  " + MARK_IN + "\n"
-             + "".join(f"  - DOMAIN,{h},{CDN_GROUP}\n" for h in hosts)
-             + "  " + MARK_OUT + "\n")
-    out, hit = [], set()
-    for line in txt.splitlines(keepends=True):
+           f'tolerance: 30, timeout: 5000}}\n')
+    blk = {gi: f"{gind}{MARK_IN}\n{grp}{gind}{MARK_OUT}\n",
+           # 插在 rules 第一条 —— 必须排在 geolocation-!cn / MATCH 前面才生效
+           ri: (f"{rind}{MARK_IN}\n"
+                + "".join(f"{rind}- DOMAIN,{h},{CDN_GROUP}\n" for h in hosts)
+                + f"{rind}{MARK_OUT}\n")}
+    # 【原样逐行拷回】不要顺手补行尾换行：文件最后一行可能本来就没有 \n，
+    # 补上之后「移除」就还原不成原文了。插入点底下一定跟着列表项（上面验过），
+    # 所以那些行必然自带 \n，不需要补
+    out = []
+    for i, line in enumerate(lines):
         out.append(line)
-        if line.rstrip("\n").rstrip() == "proxy-groups:" and "g" not in hit:
-            out.append(blk_g); hit.add("g")
-        elif line.rstrip("\n").rstrip() == "rules:" and "r" not in hit:
-            # 插在 rules 第一条 —— 必须排在 geolocation-!cn / MATCH 前面才生效
-            out.append(blk_r); hit.add("r")
-    if hit != {"g", "r"}:
-        return txt, "配置里找不到 proxy-groups: / rules: 段"
+        if i in blk:
+            out.append(blk[i])
     return "".join(out), ""
 
 
 def _sbox_edit(obj, hosts):
     """sing-box：JSON 没有注释，所以拿 tag 当标记，删的时候按 tag 认。"""
-    obs = obj.get("outbounds") or []
-    rt  = obj.get("route") or {}
+    # 自定义模板可能长得完全不一样。结构对不上就【什么都不做】，宁可这份跳过 ——
+    # 往一个我们看不懂的配置里插东西，坏起来是节点整个连不上
+    obs = obj.get("outbounds")
+    rt  = obj.get("route")
+    if not isinstance(obs, list) or not isinstance(rt, dict) \
+            or not isinstance(rt.get("rules"), list):
+        return "这份模板没有 outbounds / route.rules，结构没见过"
     obs[:] = [o for o in obs if not (isinstance(o, dict) and o.get("tag") == CDN_GROUP)]
-    rt["rules"] = [r for r in (rt.get("rules") or [])
-                   if r.get("outbound") != CDN_GROUP]
-    obj["outbounds"], obj["route"] = obs, rt
+    rt["rules"] = [r for r in rt["rules"]
+                   if not (isinstance(r, dict) and r.get("outbound") == CDN_GROUP)]
     if not hosts:
         return "没有域名"
     tags = [o["tag"] for o in obs
@@ -5473,7 +5511,8 @@ def _sbox_edit(obj, hosts):
     obs.append({"tag": CDN_GROUP, "type": "urltest", "outbounds": tags,
                 "url": "https://www.gstatic.com/generate_204", "interval": "2m"})
     # 排在 sniff 之后、其余规则之前。sniff 那条不是路由，跳过它才不会影响域名嗅探
-    i = 1 if rt["rules"] and rt["rules"][0].get("action") == "sniff" else 0
+    i = 1 if (rt["rules"] and isinstance(rt["rules"][0], dict)
+              and rt["rules"][0].get("action") == "sniff") else 0
     rt["rules"].insert(i, {"domain": list(hosts), "outbound": CDN_GROUP})
     return ""
 
