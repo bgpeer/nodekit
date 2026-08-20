@@ -3321,6 +3321,55 @@ def normalize_strm_files(d):
     return n
 
 
+def _under(path, root):
+    """path 在不在 root 底下（含相等）。
+
+    按【路径分段】比，不按字符串前缀 —— /data/strm/cloudX 不能算在
+    /data/strm/cloud 底下。体检里原来那句 `STRM_PATH in p` 就是字符串前缀，
+    它正是让「库只覆盖了一个子目录」被判成合格的原因。
+    """
+    a = [x for x in path.rstrip("/").split("/") if x]
+    b = [x for x in root.rstrip("/").split("/") if x]
+    return a[:len(b)] == b
+
+
+def emby_lib_locations(key):
+    """Emby 各媒体库实际覆盖的路径：[(库名, [路径...])]。"""
+    try:
+        return [(lb.get("Name") or "?", list(lb.get("Locations") or []))
+                for lb in (_emby("/Library/VirtualFolders", key, timeout=20) or [])]
+    except Exception:
+        return []
+
+
+def strm_dirs_uncovered(d, key):
+    """strm 根目录下有哪些文件夹【不在任何媒体库范围内】。返回 [文件夹名]。
+
+    这是「新加的片子死活扫不进来」的头号原因，而且它没有任何症状可循：文件在、
+    权限对、容器里看得见、Emby 日志里一个字都没有 —— 因为 Emby 压根不知道该去
+    扫它。实测那次就是：两个库分别指向 /data/strm/cloud/仙逆 和
+    /data/strm/cloud/美女动作片，新建的「功夫 (2004) …」落在两个库之外。
+
+    体检原来查的是「有没有库和 strm 根目录沾边」，用的还是字符串前缀 ——
+    指向子目录的库照样算通过，于是这个故障从头到尾都是绿灯。
+    """
+    locs = [p for _n, ps in emby_lib_locations(key) for p in ps]
+    if not locs:
+        return []
+    if any(_under(STRM_PATH, L) for L in locs):
+        return []                       # 有库覆盖了根目录，底下全都在范围内
+    data_root = read_env(os.path.join(d, ".env"), "DATA_ROOT") \
+        or os.path.join(d, "media")
+    base = os.path.join(data_root, "strm", STRM_SUBDIR)
+    try:
+        subs = sorted(x for x in os.listdir(base)
+                      if os.path.isdir(os.path.join(base, x)))
+    except OSError:
+        return []
+    return [x for x in subs
+            if not any(_under(f"{STRM_PATH}/{x}", L) for L in locs)]
+
+
 def report_not_in_emby(d, key):
     """把 Emby 没收录的 strm 摆出来，并说清楚该怎么改。
 
@@ -3339,18 +3388,52 @@ def report_not_in_emby(d, key):
     missing = strm_not_in_emby(d, key)
     if not missing:
         return 0
-    # 按「这个 strm 的文件夹里还有没有别的视频」分两拨
+    # 【先问最基本的那个问题】：这个文件在不在任何媒体库的范围内。
+    # 不在的话，后面讲布局规则、讲名字解析全是废话 —— Emby 根本没去看过它。
+    # 实测踩的就是这个：两个库分别指向 /data/strm/cloud/仙逆 和 …/美女动作片，
+    # 新建的「功夫 (2004) …」落在两库之外，于是文件在、权限对、容器里看得见、
+    # 日志里一个字没有，而脚本还在建议人家去拆文件夹。
+    libs = emby_lib_locations(key)
+    locs = [p for _n, ps in libs for p in ps]
+    outside = [p for p in missing
+               if locs and not any(_under(p, L) for L in locs)]
+    rest = [p for p in missing if p not in outside]
+    # 剩下的按「这个 strm 的文件夹里还有没有别的视频」分两拨
     shared, alone = [], []
-    for p in missing:
+    for p in rest:
         sibs = _strm_siblings(d, p)
         (shared if sibs > 1 else alone).append((p, sibs))
     print()
     warn(f"有 {len(missing)} 个 strm 生成了，但 Emby 里没有对应的独立条目：")
+
+    if outside:
+        for p in outside[:8]:
+            print(f"  {DIM}·{RST} {p}")
+        if len(outside) > 8:
+            print(f"  {DIM}...另外 {len(outside) - 8} 个{RST}")
+        print(f"  {YELLOW}这些文件不在任何媒体库的范围内 —— Emby 根本不会去扫，"
+              f"所以既没有条目，日志里也不会有记录。{RST}")
+        print(f"  {DIM}现在的媒体库只覆盖这些路径：{RST}")
+        for name, ps in libs:
+            for lp in ps:
+                print(f"      {pad(name, 14)}{DIM}{lp}{RST}")
+        print(f"  {YELLOW}两种改法：{RST}")
+        print(f"  {DIM}  · 把其中一个库的路径改成 {BOLD}{STRM_PATH}{RST}"
+              f"{DIM}（覆盖全部）—— 以后新加的片子{BOLD}自动进库{RST}"
+              f"{DIM}，代价是所有片子混在一个库里{RST}")
+        print(f"  {DIM}  · 或者给这个文件夹单独加一个媒体库 —— 保持分类，"
+              f"但每加一个新文件夹都要手动加一次{RST}")
+        print(f"  {DIM}Emby → 设置 → 媒体库 → 选中库 → 编辑文件夹。"
+              f"改完回来点一次「4 生成媒体库」。{RST}")
+        if not (shared or alone):
+            return len(missing)
+        print()
+
     for p, sibs in (shared + alone)[:8]:
         print(f"  {DIM}·{RST} {p}"
               + (f"   {DIM}(同目录 {sibs} 个视频){RST}" if sibs > 1 else ""))
-    if len(missing) > 8:
-        print(f"  {DIM}...另外 {len(missing) - 8} 个{RST}")
+    if len(shared) + len(alone) > 8:
+        print(f"  {DIM}...另外 {len(shared) + len(alone) - 8} 个{RST}")
 
     if shared:
         print(f"  {DIM}文件和 strm 都没问题，是 Emby 的电影库布局规则把它吃掉了：{RST}")
@@ -5898,11 +5981,29 @@ def do_healthcheck():
                 libs = json.load(resp)
             paths = [p for lb in libs for p in (lb.get("Locations") or [])]
             hit = any(STRM_PATH in p or p in STRM_PATH for p in paths)
-            _hc("Emby 媒体库", "ok" if hit else "warn",
-                f"{len(libs)} 个库" + ("" if hit else f"  {YELLOW}没有指向 {STRM_PATH}{RST}"))
+            # 【光"沾边"不够】。原来这一行用字符串前缀判"有没有库和 strm 根目录
+            # 沾边"，于是只指向子目录的库照样打勾 —— 实测那台机器两个库分别指向
+            # /data/strm/cloud/仙逆 和 …/美女动作片，新加的「功夫 (2004) …」
+            # 落在两库之外，Emby 从没扫过它，而这一行从头到尾是绿的。
+            # 「看起来正常、实际是废的」，正是这个体检要防的东西。
+            uncov = strm_dirs_uncovered(d, key) if hit else []
             if not hit:
+                _hc("Emby 媒体库", "warn",
+                    f"{len(libs)} 个库  {YELLOW}没有指向 {STRM_PATH}{RST}")
                 todo.append((f"Emby 里没有指向 {STRM_PATH} 的媒体库",
                              f"Emby → 设置 → 媒体库 → 添加，路径填 {STRM_PATH}"))
+            elif uncov:
+                _hc("Emby 媒体库", "bad",
+                    f"{len(libs)} 个库  {RED}{len(uncov)} 个文件夹没被任何库覆盖{RST}"
+                    f"\n{' ' * 27}{DIM}{'、'.join(uncov[:4])}"
+                    f"{'…' if len(uncov) > 4 else ''}{RST}")
+                todo.append((f"strm 根目录下有 {len(uncov)} 个文件夹不在任何媒体库范围内"
+                             f"（{'、'.join(uncov[:3])}）—— 里面的片子 Emby 永远扫不到，"
+                             f"而且不会有任何报错",
+                             f"库的路径指的是子目录。要么把某个库改成 {STRM_PATH} "
+                             f"（以后新片自动进库），要么给这些文件夹各加一个库"))
+            else:
+                _hc("Emby 媒体库", "ok", f"{len(libs)} 个库")
 
             # 元数据语言留空 = 跟服务器默认走(通常是 en)。中文片名拿去 TMDb 的英文
             # 索引里搜是搜不到的,表现为「条目都在、一张海报都没有」,而且这个设置藏在
