@@ -1665,6 +1665,20 @@ def storage_token_days(d):
 
 
 # ============================================================================ 卸载
+def emby_users(key):
+    """Emby 里有哪些账号。返回 [(名字, 是不是管理员)]。
+
+    密码读不出来，也不该读 —— Emby 存的是哈希。这里只列名字，让用户知道
+    该拿哪个账号登客户端；密码是他自己设的，脚本从来没经手过。
+    """
+    try:
+        return [(u.get("Name") or "?",
+                 bool((u.get("Policy") or {}).get("IsAdministrator")))
+                for u in (_emby("/Users", key, timeout=15) or [])]
+    except Exception:
+        return []
+
+
 def show_info():
     """使用信息：把怎么进、用什么账号密码，全部从落盘的配置里读出来打印。
        不写死任何值 —— 用户改过、重跑过，这里显示的都得是当前真正生效的。"""
@@ -1687,13 +1701,46 @@ def show_info():
     print("=" * 60)
 
     print(f"\n  {BOLD}▸ 访问地址{RST}")
+    ip = "" if domain else public_ip()
+    emby_url = emby_port = ""
     for sub, port, container, label in SUBDOMAINS:
         if container == "homepage" and not os.path.isdir(os.path.join(d, "homepage")):
             continue
-        url = f"https://{sub}.{domain}" if domain else f"http://{public_ip()}:{port}"
-        print(f"      {pad(label, 11)}{CYAN}{BOLD}{url}{RST}")
+        # 有域名时对外是 nginx 的 443，容器端口只开在 127.0.0.1，外面连不到 ——
+        # 所以这里要报【外面真正能连的那个端口】，不是 compose 里写的那个
+        url, shown = ((f"https://{sub}.{domain}", "443") if domain
+                      else (f"http://{ip}:{port}", str(port)))
+        print(f"      {pad(label, 11)}{CYAN}{BOLD}{pad(url, 34)}{RST}"
+              f"{DIM}端口 {shown}{RST}")
+        if container == "emby":
+            emby_url, emby_port = url, shown
     if domain:
         print(f"      {DIM}首页入口就是导航面板，所有服务都能从那里点进去。{RST}")
+
+    # 外部播放器（Hills / Infuse / Emby 官方 App…）单独列一段。
+    # 这一段存在的理由是那个【必须填 MediaWarp 的地址】的坑：Emby 自己的 8096
+    # 只绑在 127.0.0.1，外面本来就连不到；但内网里直接连它是连得上的，而那样
+    # 会整个绕过 302 —— 视频改由本机中转，又慢又烧流量，表面上还"能播放"，
+    # 属于这套东西最典型的「看起来正常、实际是废的」。
+    if emby_url:
+        print(f"\n  {BOLD}▸ 外部播放器{RST}"
+              f"{DIM}（Hills / Infuse / Emby 官方 App 等，填这个地址）{RST}")
+        print(f"      服务器地址 {CYAN}{BOLD}{emby_url}{RST}")
+        print(f"      端  口     {CYAN}{BOLD}{emby_port}{RST}"
+              + (f"   {DIM}https，nginx 转到 MediaWarp{RST}" if domain
+                 else f"   {DIM}MediaWarp{RST}"))
+        us = emby_users(read_emby_api_key(d) or "")
+        if us:
+            print("      账  号     " + "、".join(
+                f"{CYAN}{BOLD}{n}{RST}" + (f"{DIM}(管理员){RST}" if a else "")
+                for n, a in us))
+        else:
+            print(f"      账  号     {DIM}第一次打开 Emby 网页时自己创建的那个{RST}")
+        print(f"      密  码     {DIM}你在 Emby 里自己设的，脚本不保存也读不到"
+              f"（Emby 存的是哈希）{RST}")
+        print(f"      {YELLOW}必须填上面这个地址{RST}"
+              f"{DIM} —— Emby 自己的 8096 只开在本机。绕开它直连 8096 会让 302 失效，"
+              f"视频全部改走本机中转{RST}")
 
     if ba_pass:
         print(f"\n  {YELLOW}{BOLD}▸ 浏览器弹框{RST}{DIM}（只有首页入口会弹）{RST}")
