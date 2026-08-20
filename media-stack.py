@@ -1455,13 +1455,25 @@ def install_warm_cron(install_dir):
 
 
 def do_warm():
-    """cron 调的预热，安静跑。"""
+    """cron 调的预热，安静跑。顺带把新建的媒体库调好。
+
+    为什么把调库塞在预热里：媒体库选项（续播门槛、多版本合并）是【每个库】各自
+    一份，Emby 没有"新库默认值"这种东西 —— 用户在 Emby 里新建一个库，它拿的就是
+    Emby 的出厂默认：续播门槛 5 分钟、多版本合并开着。表现就是"新加的库没有进度条
+    记忆"，而用户完全想不到这跟库是新建的有关。
+
+    原来只有「4 生成媒体库」和每日对齐(05:45)会调，最长要等一天。这里每小时跟一次，
+    新建的库一小时内自动跟上，用户不用记得去点哪个菜单。
+
+    只动指向本脚本 strm 目录的库，而且是幂等的 —— 已经对的库一个请求都不会发。
+    """
     d = ms_install_dir()
     if not is_installed(d):
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
     if key:
+        tune_strm_libraries(key)
         warm_links(d, key)
 
 
@@ -2207,6 +2219,11 @@ def do_update(from_menu=False):
     print()
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
     purge_node_rule(d)
+    # 新建的媒体库拿的是 Emby 出厂默认（续播门槛 5 分钟、多版本合并开着），
+    # 表现就是"新加的库没有进度条记忆"。更新时顺手调一次，用户当场能看到结果。
+    _k2 = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if _k2:
+        tune_strm_libraries(_k2)
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
     print(f"  {DIM}想确认网盘通不通：跑「5 链路体检」。{RST}")
     # 上面 docker compose up -d 把容器全重启了，MediaWarp 的直链缓存随之清空。
@@ -2717,8 +2734,7 @@ def shared_identity_items(key):
         return {}
     for lb in libs:
         pid = lb.get("ItemId")
-        if not pid or not any(STRM_PATH in p or p in STRM_PATH
-                              for p in (lb.get("Locations") or [])):
+        if not pid or not is_strm_lib(lb):
             continue
         try:
             r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
@@ -2764,8 +2780,7 @@ def clear_impossible_progress(key):
     n, failed = 0, []
     for lb in libs:
         pid = lb.get("ItemId")
-        if not pid or not any(STRM_PATH in p or p in STRM_PATH
-                              for p in (lb.get("Locations") or [])):
+        if not pid or not is_strm_lib(lb):
             continue
         try:
             r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
@@ -2999,8 +3014,7 @@ def items_without_duration(key):
         # 和其它几处保持一致：只看指向本脚本 strm 目录的媒体库。用户自己建的本地库
         # 不归这个脚本管 —— 本地文件 Emby 自己就能探到时长，报出来只是噪音，而且
         # heal 那边拿到非 strm 路径也只会跳过，等于报了一堆修不了的东西
-        if not pid or not any(STRM_PATH in p or p in STRM_PATH
-                              for p in (lb.get("Locations") or [])):
+        if not pid or not is_strm_lib(lb):
             continue
         try:
             d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
@@ -3070,7 +3084,7 @@ def tune_strm_libraries(key):
     except Exception:
         return
     for lb in libs:
-        if not any(STRM_PATH in p or p in STRM_PATH for p in (lb.get("Locations") or [])):
+        if not is_strm_lib(lb):
             continue
         o = lb.get("LibraryOptions") or {}
         diff = {k: v for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v}
@@ -3146,8 +3160,7 @@ def apply_title_policy(d, key):
     n, seen, failed = 0, 0, []
     for lb in libs:
         pid = lb.get("ItemId")
-        if not pid or not any(STRM_PATH in p or p in STRM_PATH
-                              for p in (lb.get("Locations") or [])):
+        if not pid or not is_strm_lib(lb):
             continue
         try:
             r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
@@ -3251,8 +3264,7 @@ def strm_not_in_emby(d, key):
     known = set()
     for lb in libs:
         pid = lb.get("ItemId")
-        if not pid or not any(STRM_PATH in p or p in STRM_PATH
-                              for p in (lb.get("Locations") or [])):
+        if not pid or not is_strm_lib(lb):
             continue
         try:
             r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
@@ -3331,6 +3343,17 @@ def _under(path, root):
     a = [x for x in path.rstrip("/").split("/") if x]
     b = [x for x in root.rstrip("/").split("/") if x]
     return a[:len(b)] == b
+
+
+def is_strm_lib(lb):
+    """这个媒体库是不是指向本脚本的 strm 目录（含只指向其中某个子目录的）。
+
+    判据统一放这儿，因为原来同一句 `STRM_PATH in p or p in STRM_PATH` 在八个地方
+    各写了一遍 —— 字符串前缀匹配，/data/strm/cloudX 会被误当成 /data/strm/cloud
+    的一部分。八处散着改必然漏，所以收成一个函数，改一次全跟上。
+    """
+    return any(_under(p, STRM_PATH) or _under(STRM_PATH, p)
+               for p in (lb.get("Locations") or []))
 
 
 def emby_lib_locations(key):
@@ -5979,8 +6002,7 @@ def do_healthcheck():
             u = (f"http://127.0.0.1:8096/Library/VirtualFolders?api_key={key}")
             with urllib.request.urlopen(u, timeout=20) as resp:
                 libs = json.load(resp)
-            paths = [p for lb in libs for p in (lb.get("Locations") or [])]
-            hit = any(STRM_PATH in p or p in STRM_PATH for p in paths)
+            hit = any(is_strm_lib(lb) for lb in libs)
             # 【光"沾边"不够】。原来这一行用字符串前缀判"有没有库和 strm 根目录
             # 沾边"，于是只指向子目录的库照样打勾 —— 实测那台机器两个库分别指向
             # /data/strm/cloud/仙逆 和 …/美女动作片，新加的「功夫 (2004) …」
@@ -6031,8 +6053,7 @@ def do_healthcheck():
             # ② 尤其阴险:门槛是【每个媒体库】各自一份的,用户新建一个媒体库,它就是
             # 默认值。之前调好的那次不会自动惠及后来建的库,而用户完全不知道有这回事。
             slibs = [lb for lb in libs
-                     if any(STRM_PATH in p or p in STRM_PATH
-                            for p in (lb.get("Locations") or []))]
+                     if is_strm_lib(lb)]
             stale = {}
             for lb in slibs:
                 o = lb.get("LibraryOptions") or {}
@@ -6052,8 +6073,8 @@ def do_healthcheck():
                 _hc("媒体库选项", "bad", f"{names}  {YELLOW}{'；'.join(what)}{RST}")
                 todo.append((f"媒体库「{names.split('、')[0]}」的选项还是 Emby 默认值，"
                              f"对网盘库不合适",
-                             "点「4 生成媒体库」会自动调好（新建的媒体库要再点一次，"
-                             "或者等第二天的每日对齐）"))
+                             "点「4 生成媒体库」或「6 更新」会立刻调好；"
+                             "不管的话每小时的预热任务也会跟上（最多等 1 小时）"))
             elif slibs:
                 _hc("媒体库选项", "ok",
                     f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、多版本合并已关")
