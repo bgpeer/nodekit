@@ -1993,6 +1993,62 @@ def self_update():
     return True
 
 
+# 一次性善后。v1.1.0 有过一个「节点分流规则」的开关，会往节点脚本的三份成品配置
+# 里插一段（把媒体域名固定到 CDN 节点）。那个功能撤掉了 —— 一般服务器不会被墙，
+# 直连更快；真被墙了要走 CDN，自定义模板更合适，不该由这个脚本去改别人的节点配置。
+#
+# 但撤掉功能【不等于】撤掉它已经写进去的东西：装过那一版的机器，配置里还留着那段，
+# 而移除它的按钮已经没了 —— 用户手上就是一段无人认领、也关不掉的规则。所以这里
+# 按标记清一次。清干净之后 node_rule.json 一删，以后每次更新它就是个空转的 if。
+NODE_RULE_JSON = "node_rule.json"
+_NR_MARK_IN  = "# >>> media-stack 媒体分流 >>>"
+_NR_MARK_OUT = "# <<< media-stack 媒体分流 <<<"
+_NR_GROUP    = "📺媒体走CDN"
+
+
+def purge_node_rule(d):
+    """把上一版写进节点配置的那段清掉。没写过就什么都不做。"""
+    flag = os.path.join(d, NODE_RULE_JSON)
+    if not os.path.exists(flag):
+        return
+    hit = []
+    for path in (BGP_DIR + "/mihomo.yaml", BGP_DIR + "/singbox.json",
+                 BGP_DIR + "/shadowrocket.conf"):
+        if not os.path.exists(path):
+            continue
+        try:
+            raw = open(path, encoding="utf-8").read()
+            if path.endswith(".json"):
+                if _NR_GROUP not in raw:
+                    continue
+                obj = json.loads(raw)
+                obj["outbounds"] = [o for o in obj.get("outbounds", [])
+                                    if not (isinstance(o, dict)
+                                            and o.get("tag") == _NR_GROUP)]
+                rt = obj.get("route") or {}
+                rt["rules"] = [r for r in (rt.get("rules") or [])
+                               if not (isinstance(r, dict)
+                                       and r.get("outbound") == _NR_GROUP)]
+                out = json.dumps(obj, ensure_ascii=False, indent=2)
+            else:
+                if _NR_MARK_IN not in raw:
+                    continue
+                out = re.sub(r"(?ms)^[ \t]*%s\n.*?^[ \t]*%s\n"
+                             % (re.escape(_NR_MARK_IN), re.escape(_NR_MARK_OUT)),
+                             "", raw)
+            open(path, "w", encoding="utf-8").write(out)
+            hit.append(os.path.basename(path))
+        except (OSError, ValueError):
+            continue                        # 清不掉就算了，别把更新搞挂
+    try:
+        os.remove(flag)
+    except OSError:
+        pass
+    if hit:
+        info(f"顺手清掉了旧版「节点分流规则」写进节点配置的那段："
+             f"{'、'.join(hit)}{DIM}（这个功能已撤销）{RST}")
+
+
 def do_update(from_menu=False):
     """更新：脚本自身 + 镜像 + 按新脚本重新生成配置。用户数据和密码都不动。
 
@@ -2103,14 +2159,7 @@ def do_update(from_menu=False):
     # 带耗时和阈值），而且是用户主动去问的时候才跑。
     print()
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）：镜像、nginx 站点、导航面板都已是当前版本")
-    # 节点脚本每次重建订阅都会把三份配置整个重写，我们插进去那段会跟着没。
-    # 用户不会知道这件事，只会发现"上次写过的分流又不管用了"。所以更新时按
-    # 记下来的意图重写一次 —— 只在他确实开着的时候，关着的不去碰人家的配置。
-    if node_rule_state(d).get("on"):
-        n = len(apply_node_rule(d, True, quiet=True))
-        if n:
-            info(f"节点分流规则已重新写入 {n} 份配置"
-                 f"{DIM}（节点脚本重建订阅会冲掉，这里补回来）{RST}")
+    purge_node_rule(d)
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
     print(f"  {DIM}想确认网盘通不通：跑「5 链路体检」。{RST}")
     # 上面 docker compose up -d 把容器全重启了，MediaWarp 的直链缓存随之清空。
@@ -5364,312 +5413,6 @@ def netdisk_load(d, key=""):
     return "；".join(busy[:3])
 
 
-# ============================================================ 节点分流规则
-#
-# 解决的是这么一件事：本机的 IP 被运营商阻断之后，直连协议(reality/vision/hy2/
-# tuic…)全部 Timeout，只有套了 Cloudflare 的 CDN·* 节点还活着。这时候播放器连不上
-# Emby，报「connection closed」—— 可服务器本身好好的，体检一片绿，因为阻断发生在
-# 手机到机器的那一段，服务器这边根本看不见。
-#
-# 【视频本身不走节点】。MediaWarp 给的是 302，播放器拿到直链之后是自己直连网盘取
-# 流的。节点只负责三件小事：开界面、拉海报、拿那个 302。所以 IP 被墙时不是"视频变
-# 卡"，是压根走不到请求视频那一步。
-#
-# 平时不该开这个：直连协议比绕 Cloudflare 快，走 CDN 是被阻断时的退路。所以做成
-# 一写一删的开关，而不是默认打开。
-BGP_DIR   = "/etc/bgpeer"                     # 节点脚本(xy-installer)的家目录
-NODE_CFGS = [("mihomo",       BGP_DIR + "/mihomo.yaml"),
-             ("sing-box",     BGP_DIR + "/singbox.json"),
-             ("Shadowrocket", BGP_DIR + "/shadowrocket.conf")]
-CDN_GROUP = "📺媒体走CDN"
-NODE_MARK = "media-stack 媒体分流"
-MARK_IN   = f"# >>> {NODE_MARK} >>>"
-MARK_OUT  = f"# <<< {NODE_MARK} <<<"
-NODE_RULE_JSON = "node_rule.json"
-# 节点脚本给 CDN 灾备节点起的名字是 f"{prefix}CDN·{proto}"，认这个中缀就行
-CDN_TAG_RE = re.compile(r"CDN·")
-
-
-def media_hosts(cfg):
-    """要走 CDN 的主机名。【只列本机自己的子域名，绝不用 DOMAIN-SUFFIX】。
-
-    这条是安全边界，不是风格问题：媒体服务很可能和节点【共用一个根域名】
-    （安装时就问过「媒体服务也用这个域名？」）。要是写成 DOMAIN-SUFFIX,<根域名>，
-    那节点自己的协议入口也会被这条规则捞进去 —— 客户端把节点流量塞进节点自己，
-    直接成环，人还以为是媒体服务把节点搞坏了。所以只写精确主机名。
-    """
-    dom = (cfg.get("domain") or "").strip().lstrip(".")
-    return [f"{sub}.{dom}" for sub, _p, _c, _l in SUBDOMAINS] if dom else []
-
-
-def node_rule_state(d):
-    try:
-        with open(os.path.join(d, NODE_RULE_JSON)) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def set_node_rule_state(d, on, hosts=()):
-    try:
-        with open(os.path.join(d, NODE_RULE_JSON), "w") as f:
-            json.dump({"on": bool(on), "hosts": list(hosts),
-                       "ts": int(time.time())}, f, ensure_ascii=False)
-    except OSError:
-        pass
-
-
-def _strip_marked(txt):
-    """删掉两个标记之间的内容（含标记行）。写之前先删，所以重复写不会叠加。"""
-    return re.sub(r"(?m)^[ \t]*%s\n.*?^[ \t]*%s\n" % (re.escape(MARK_IN),
-                                                      re.escape(MARK_OUT)),
-                  "", txt, flags=re.S)
-
-
-def _seq_indent(lines, i):
-    """看 lines[i] 这个键下面的列表项是怎么缩进的，返回那串空白；不像列表就返回 None。
-
-    为什么不能写死 2 空格：节点脚本支持自定义模板（gist/GitHub），别人的模板
-    完全可能把列表项顶格写。那样插进去就是
-
-        proxy-groups:
-          - {name: "📺媒体走CDN", ...}     ← 我们插的，2 空格
-        - {name: "🌍全球加速", ...}        ← 人家自己的，顶格
-
-    YAML 到这儿直接崩，mihomo 起不来 —— 而用户刚点完「写入」，只会以为是这个
-    功能把他节点搞死了。缩进必须跟着人家走。
-    """
-    for line in lines[i + 1:]:
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        m = re.match(r"^([ \t]*)-[ \t]", line)
-        return m.group(1) if m else None
-    return None
-
-
-def _mihomo_edit(txt, hosts):
-    """mihomo：加一个只含 CDN 节点的 url-test 组，再把本机域名指过去。
-
-    组用 include-all + filter，跟模板里其它组同一套写法 —— 不用把节点名抄一遍，
-    以后加减 CDN 节点会自动跟上。
-    """
-    txt = _strip_marked(txt)
-    if not hosts:
-        return txt, "没有域名"
-    lines = txt.splitlines(keepends=True)
-    # 先把两段的落点和缩进都找齐，全都对得上才动手 —— 只插一半的 YAML 比不插更糟
-    at = {}
-    for i, line in enumerate(lines):
-        key = line.rstrip("\n").rstrip()          # 只认顶格的键，dns 里那个嵌套的
-        if key in ("proxy-groups:", "rules:") and key not in at:   # rules: 不会误伤
-            ind = _seq_indent(lines, i)
-            if ind is None:
-                return txt, f"{key} 下面不是列表，这份模板的结构没见过"
-            at[key] = (i, ind)
-    if len(at) != 2:
-        return txt, "配置里找不到 proxy-groups: / rules: 段"
-    gi, gind = at["proxy-groups:"]
-    ri, rind = at["rules:"]
-    grp = (f'{gind}- {{name: "{CDN_GROUP}", type: url-test, lazy: true, '
-           f'include-all: true, exclude-type: direct, filter: "CDN·", '
-           f'url: "https://www.gstatic.com/generate_204", interval: 120, '
-           f'tolerance: 30, timeout: 5000}}\n')
-    blk = {gi: f"{gind}{MARK_IN}\n{grp}{gind}{MARK_OUT}\n",
-           # 插在 rules 第一条 —— 必须排在 geolocation-!cn / MATCH 前面才生效
-           ri: (f"{rind}{MARK_IN}\n"
-                + "".join(f"{rind}- DOMAIN,{h},{CDN_GROUP}\n" for h in hosts)
-                + f"{rind}{MARK_OUT}\n")}
-    # 【原样逐行拷回】不要顺手补行尾换行：文件最后一行可能本来就没有 \n，
-    # 补上之后「移除」就还原不成原文了。插入点底下一定跟着列表项（上面验过），
-    # 所以那些行必然自带 \n，不需要补
-    out = []
-    for i, line in enumerate(lines):
-        out.append(line)
-        if i in blk:
-            out.append(blk[i])
-    return "".join(out), ""
-
-
-def _sbox_edit(obj, hosts):
-    """sing-box：JSON 没有注释，所以拿 tag 当标记，删的时候按 tag 认。"""
-    # 自定义模板可能长得完全不一样。结构对不上就【什么都不做】，宁可这份跳过 ——
-    # 往一个我们看不懂的配置里插东西，坏起来是节点整个连不上
-    obs = obj.get("outbounds")
-    rt  = obj.get("route")
-    if not isinstance(obs, list) or not isinstance(rt, dict) \
-            or not isinstance(rt.get("rules"), list):
-        return "这份模板没有 outbounds / route.rules，结构没见过"
-    obs[:] = [o for o in obs if not (isinstance(o, dict) and o.get("tag") == CDN_GROUP)]
-    rt["rules"] = [r for r in rt["rules"]
-                   if not (isinstance(r, dict) and r.get("outbound") == CDN_GROUP)]
-    if not hosts:
-        return "没有域名"
-    tags = [o["tag"] for o in obs
-            if isinstance(o, dict) and CDN_TAG_RE.search(str(o.get("tag") or ""))]
-    if not tags:
-        return "配置里没有 CDN· 节点"
-    obs.append({"tag": CDN_GROUP, "type": "urltest", "outbounds": tags,
-                "url": "https://www.gstatic.com/generate_204", "interval": "2m"})
-    # 排在 sniff 之后、其余规则之前。sniff 那条不是路由，跳过它才不会影响域名嗅探
-    i = 1 if (rt["rules"] and isinstance(rt["rules"][0], dict)
-              and rt["rules"][0].get("action") == "sniff") else 0
-    rt["rules"].insert(i, {"domain": list(hosts), "outbound": CDN_GROUP})
-    return ""
-
-
-def _sr_edit(txt, hosts):
-    """Shadowrocket：组要把节点名一个个列出来，它不支持 filter。"""
-    txt = _strip_marked(txt)
-    if not hosts:
-        return txt, "没有域名"
-    names = [n for n in re.findall(r"(?m)^\s*(\S+?)\s*=", txt) if CDN_TAG_RE.search(n)]
-    if not names:
-        return txt, "配置里没有 CDN· 节点"
-    grp = (f"{CDN_GROUP} = url-test,{','.join(names)},"
-           f"url=http://www.gstatic.com/generate_204,interval=120")
-    blk_g = f"{MARK_IN}\n{grp}\n{MARK_OUT}\n"
-    blk_r = (MARK_IN + "\n"
-             + "".join(f"DOMAIN,{h},{CDN_GROUP}\n" for h in hosts)
-             + MARK_OUT + "\n")
-    out, hit = [], set()
-    for line in txt.splitlines(keepends=True):
-        out.append(line)
-        if line.strip() == "[Proxy Group]" and "g" not in hit:
-            out.append(blk_g); hit.add("g")
-        elif line.strip() == "[Rule]" and "r" not in hit:
-            out.append(blk_r); hit.add("r")
-    if hit != {"g", "r"}:
-        return txt, "配置里找不到 [Proxy Group] / [Rule] 段"
-    return "".join(out), ""
-
-
-def _node_write(path, on, hosts):
-    """改一份节点配置。返回 (成功?, 说明)。改之前留底，坏了能还原。"""
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = f.read()
-    except OSError as e:
-        return False, _short_err(e)
-    if path.endswith(".json"):
-        try:
-            obj = json.loads(raw)
-        except ValueError as e:
-            return False, f"不是合法 JSON（{e}）"
-        err = _sbox_edit(obj, hosts if on else [])
-        if on and err:
-            return False, err
-        new = json.dumps(obj, ensure_ascii=False, indent=2)
-    else:
-        edit = _mihomo_edit if path.endswith(".yaml") else _sr_edit
-        new, err = edit(raw, hosts if on else [])
-        if on and err:
-            return False, err
-    if new == raw:
-        return True, "本来就是这样"
-    # 【必须留底】这是别人的节点配置，不是我们的文件。写坏了用户的节点就全断了，
-    # 而他手上未必有第二条路能连进这台机器去修
-    bak = path + ".mediastack.bak"
-    if not os.path.exists(bak):
-        try:
-            shutil.copy2(path, bak)
-        except OSError:
-            pass
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new)
-    except OSError as e:
-        return False, _short_err(e)
-    return True, ""
-
-
-def node_rule_present(path):
-    """这份配置里现在还有没有我们那段。节点脚本重新生成过就会没有。"""
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = f.read()
-    except OSError:
-        return None                  # 文件不在，不参与判断
-    return (CDN_GROUP in raw) if path.endswith(".json") else (MARK_IN in raw)
-
-
-def apply_node_rule(d, on, quiet=False):
-    """把规则写进 / 删出所有能找到的节点配置。返回改动了几份。"""
-    cfg = rebuild_cfg_from_disk(d)
-    hosts = media_hosts(cfg)
-    if on and not hosts:
-        if not quiet:
-            warn("这套媒体服务没有配域名（用的是 IP:端口），没法按域名分流。"
-                 "先在「1 安装」里配上域名再来。")
-        return 0
-    done = []
-    for label, path in NODE_CFGS:
-        if not os.path.exists(path):
-            continue
-        good, msg = _node_write(path, on, hosts)
-        if good:
-            done.append((label, path))
-            if not quiet:
-                ok(f"{label}　{os.path.basename(path)}" + (f"（{msg}）" if msg else ""))
-        elif not quiet:
-            warn(f"{label} 跳过：{msg}")
-    set_node_rule_state(d, on, hosts)
-    return done
-
-
-def node_rule_menu():
-    """15 → 8：一键写入 / 一键移除。"""
-    d = ms_install_dir()
-    if not is_installed(d):
-        warn("还没安装。先选 1 安装。")
-        return
-    while True:
-        cfg = rebuild_cfg_from_disk(d)
-        hosts = media_hosts(cfg)
-        st = node_rule_state(d)
-        found = [(lb, p) for lb, p in NODE_CFGS if os.path.exists(p)]
-        print("\n" + "=" * 60)
-        print(f"  {BOLD}节点分流规则{RST}   "
-              f"{DIM}本机 IP 被墙时，让播放器改走 CDN 节点{RST}")
-        print("=" * 60)
-        if not found:
-            warn(f"这台机器上没找到节点配置（{BGP_DIR}/ 下）。"
-                 "这个功能要配合 bgpeer 的节点脚本用。")
-            return
-        print(f"  会写进：{'、'.join(lb for lb, _ in found)}")
-        print(f"  会固定的域名：{'、'.join(hosts) if hosts else YELLOW + '没有（没配域名）' + RST}")
-        print(f"  {DIM}只写这几个精确主机名，不写整个根域名 —— 免得把节点自己"
-              f"也捞进去{RST}")
-        for lb, p in found:
-            has = node_rule_present(p)
-            print(f"  {pad(lb, 14)}" + (f"{GREEN}已写入{RST}" if has
-                                        else f"{DIM}未写入{RST}"))
-        if st.get("on") and not all(node_rule_present(p) for _, p in found):
-            warn("写过，但有配置里已经没有了 —— 多半是节点脚本重新生成过。"
-                 "选 1 重写一次。")
-        print("-" * 60)
-        print("  1. 写入（IP 被墙、直连节点全 Timeout 时用）")
-        print("  2. 移除（直连恢复了就删掉，直连比绕 CDN 快）")
-        print("  0. 返回")
-        print("-" * 60)
-        c = ask("请选择").strip()
-        if c in ("0", ""):
-            return
-        if c not in ("1", "2"):
-            print("无效选择。")
-            continue
-        done = apply_node_rule(d, c == "1")
-        if done:
-            ok(f"改了 {len(done)} 份配置。备份在同目录 *.mediastack.bak")
-            info("改的是【本机】的节点配置，客户端要重新拉一次订阅才生效。")
-            # 不再把订阅链接一条条打出来了：多机聚合的时候，手机上用的根本不是
-            # 本机这份订阅（本机只是把节点链接交出去，聚合在另一台上），
-            # 打出来的链接对不上，反而误导。谁的订阅该拉，用户自己清楚。
-            if c == "1":
-                info(f"生效后播放器那边会多出一个「{CDN_GROUP}」组，"
-                     f"里面只有 CDN· 开头的节点。")
-        ask("\n按回车继续...")
-
-
 def do_healthcheck():
     """把整条链路挨个打一遍，每项报耗时和结论。
 
@@ -6221,23 +5964,6 @@ def do_healthcheck():
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
                      "跑一次「6 更新」会自动补上"))
 
-    # 这一项报的是「手机连不上服务器」那类故障的退路，属于链路范畴，但它只在
-    # 用户主动开过之后才有意义，所以不开就不占一行。
-    _nr = node_rule_state(d)
-    _nf = [(lb, p) for lb, p in NODE_CFGS if os.path.exists(p)]
-    if _nr.get("on") and _nf:
-        _miss = [lb for lb, p in _nf if not node_rule_present(p)]
-        if _miss:
-            _hc("节点分流", "warn",
-                f"{YELLOW}{'、'.join(_miss)} 里已经没有了{RST}"
-                f"  {DIM}节点脚本重建过订阅{RST}")
-            todo.append(("节点分流规则被节点脚本冲掉了（重建订阅会整个重写配置）",
-                         "「7 节点分流规则」→ 1 写入，再在客户端更新一次订阅"))
-        else:
-            _hc("节点分流", "ok",
-                f"已写入 {'、'.join(lb for lb, _ in _nf)}"
-                f"  {DIM}播放器走「{CDN_GROUP}」{RST}")
-
     _hc_group("其它", "背景信息和到期提醒")
 
     # 版本必须看得见。全用 :latest 标签，「6 更新」每次都会拉最新的 —— 但用户
@@ -6339,9 +6065,7 @@ def main_menu():
         print("  4. 生成媒体库（网盘挂好、或在网盘里整理过片子之后点这个）")
         print("  5. 链路体检（卡住 / 不出片子时先跑这个）")
         print("  6. 更新（拉最新镜像 + 按新版本刷新配置）")
-        # IP 被墙时才用得上，所以排在体检/更新后面、卸载前面
-        print("  7. 节点分流规则（本机 IP 被墙时，让播放器改走 CDN 节点）")
-        print("  8. 卸载")
+        print("  7. 卸载")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -6361,9 +6085,6 @@ def main_menu():
         elif c == "6":
             do_update(from_menu=True)
         elif c == "7":
-            node_rule_menu()
-            continue          # 子菜单自己管停顿
-        elif c == "8":
             do_uninstall()
         else:
             print("无效选择。")
