@@ -1478,6 +1478,47 @@ def do_warm():
         warm_links(d, key)
 
 
+def follow_new_storages(d):
+    """扫描路径设成「自动」时，把新挂的网盘补进 AutoFilm 的配置。
+
+    补上最后一环。用户的原话：「不管是新开库还是新加影片还是新加网盘里面都要有
+    这些功能」。前两个已经由 align_library 兜住了，第三个原来兜不住 ——
+    auto 模式只在【重新生成配置那一刻】才去读 OpenList 已挂载的存储，
+    而那一刻只发生在装机、改设置、点「4 生成媒体库」的时候。用户在 OpenList 里
+    挂上一个新网盘之后，AutoFilm 的 source_dir 里根本没有它，于是那个盘里的片子
+    永远不会变成 strm —— 而且不会有任何报错，跟这次「功夫扫不进来」是同一类
+    沉默故障。
+
+    只在【集合真的变了】的时候才写配置和重启，所以按小时跑没有代价：
+    没变动的话一个文件都不碰，autofilm 也不会被反复重启。
+
+    固定路径模式不碰 —— 那是用户明确指定的范围，替他扩大不是帮忙。
+    """
+    cfg = rebuild_cfg_from_disk(d)
+    if cfg.get("scan_spec") != SCAN_AUTO:
+        return []
+    af = os.path.join(d, "autofilm", "config", "config.yaml")
+    now = set(cfg.get("scan_paths") or [])
+    old = set(read_yaml_all(af, "source_dir") or [])
+    if not now or now == old:
+        return []
+    try:
+        with open(af, "w") as f:
+            f.write(gen_autofilm_conf(cfg))
+        os.chmod(af, 0o600)
+        sh("docker restart autofilm", timeout=120)
+    except OSError as e:
+        warn(f"更新 AutoFilm 扫描路径失败：{_short_err(e)}")
+        return []
+    added = sorted(now - old)
+    if added:
+        info(f"检测到新挂的网盘，已加入扫描：{'、'.join(added)}")
+    gone = sorted(old - now)
+    if gone:
+        info(f"这些存储在 OpenList 里没有了，已移出扫描：{'、'.join(gone)}")
+    return added
+
+
 def align_library(d, key):
     """把【所有】指向 strm 的媒体库和它们里面的条目，拉到脚本认定的状态。
 
@@ -1499,6 +1540,7 @@ def align_library(d, key):
     【不含 prune 和全库扫描】那两个一个是破坏性的、一个要跨境列目录，代价高，
     留给每日对齐。检测新文件是 Emby 自己的事。
     """
+    follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
     if not key:
         return
     tune_strm_libraries(key)          # 库级：续播门槛、多版本合并
