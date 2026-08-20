@@ -1207,29 +1207,115 @@ def keepalive_history(d, hours=24):
     return out
 
 
-def hist_summary(recs):
-    """把一串探测记录压成一句人话。没有样本就返回空串。
+def hist_stats(recs, recent_h=3):
+    """把一串探测记录压成数字。没有样本返回 None。
 
-    只报成功那些的耗时分布 —— 失败的耗时量的是超时设置，混进中位数会把
-    整条曲线拉歪，得出「一直很慢」这种和事实相反的结论。失败单独计数。
+    耗时分布【只统计成功的那些】—— 失败的耗时量的是超时设置(120 秒封顶)，
+    混进中位数会把整条曲线拉歪，得出「一直很慢」这种和事实相反的结论。
+    失败单独计数。
+
+    另外分出「最近 recent_h 小时」这一段：一次已经过去的故障(比如夸克存储掉线
+    那一晚)会在 24 小时窗口里留下一堆失败，可它已经好了。拿整窗的失败率去报警，
+    等于让一次旧故障连着报一整天 —— 那种警报用户学会忽略之后，真出事那次也会
+    被跳过去。所以要能分辨「还在坏」和「坏过已经好了」。
     """
     if not recs:
-        return ""
+        return None
+    now = time.time()
     ok = sorted(r.get("elapsed", 0) for r in recs if r.get("ok"))
-    bad = len(recs) - len(ok)
-    span = (max(r.get("ts", 0) for r in recs) - min(r.get("ts", 0) for r in recs)) / 3600
-    head = f"{len(recs)} 次探测／{span:.0f} 小时"
-    if not ok:
+    rec_n = [r for r in recs if r.get("ts", 0) >= now - recent_h * 3600]
+    bads = [r for r in recs if not r.get("ok")]
+    ts = [r.get("ts", 0) for r in recs]
+    s = {"n": len(recs), "ok_n": len(ok), "bad": len(recs) - len(ok),
+         "span_h": (max(ts) - min(ts)) / 3600,
+         "recent_n": len(rec_n), "recent_bad": sum(1 for r in rec_n if not r.get("ok")),
+         "last_bad_h": (now - max(r.get("ts", 0) for r in bads)) / 3600 if bads else None,
+         # 失败【连成几段】。一次掉线是一整段(XXXXXXX)，长期抽风是散开的好几段
+         # (.X..X..X.)。这两种情况失败次数可以完全一样，该做的事却完全不同：
+         # 前者已经过去了什么都不用做，后者得去挖。光有总数分不出来。
+         "bad_runs": sum(1 for i, r in enumerate(recs)
+                         if not r.get("ok") and (i == 0 or recs[i - 1].get("ok"))),
+         "med": 0.0, "p90": 0.0, "mx": 0.0, "slow": 0}
+    if ok:
+        s["med"] = ok[len(ok) // 2]
+        s["p90"] = ok[min(len(ok) - 1, int(len(ok) * 0.9))]
+        s["mx"] = ok[-1]
+        s["slow"] = sum(1 for e in ok if e >= 5)
+    return s
+
+
+def hist_line(s):
+    """把 hist_stats 的数字写成一句人话。"""
+    head = f"{s['n']} 次探测／{s['span_h']:.0f} 小时"
+    if not s["ok_n"]:
         return f"{head}　全部失败"
-    med = ok[len(ok) // 2]
-    p90 = ok[min(len(ok) - 1, int(len(ok) * 0.9))]
-    slow = sum(1 for e in ok if e >= 5)
-    out = (f"{head}　中位 {med:.1f} 秒　九成快于 {p90:.1f} 秒　最慢 {ok[-1]:.1f} 秒")
-    if slow:
-        out += f"　{slow} 次 ≥5 秒"
-    if bad:
-        out += f"　{bad} 次失败"
+    out = (f"{head}　中位 {s['med']:.1f} 秒　九成快于 {s['p90']:.1f} 秒"
+           f"　最慢 {s['mx']:.1f} 秒")
+    if s["slow"]:
+        out += f"　{s['slow']} 次 ≥5 秒"
+    if s["bad"]:
+        out += f"　{RED}{s['bad']} 次失败{RST}"
     return out
+
+
+def hist_spark(recs, width=40):
+    """把最近 width 次探测画成一行，让人一眼看出失败是【扎堆】还是【一直在冒】。
+
+    这个区分是有后果的：扎堆 = 一次已经结束的故障，什么都不用做；
+    均匀散布 = 链路在长期抽风，那才要去挖。光给一个「7 次失败」的总数，
+    这两种情况长得一模一样。
+
+    . 快(<5秒)   : 偏慢(5~30秒)   ! 很慢(>30秒)   X 失败      左旧右新
+    """
+    out = []
+    for r in recs[-width:]:
+        if not r.get("ok"):
+            out.append(f"{RED}X{RST}")
+        else:
+            e = r.get("elapsed", 0)
+            out.append(f"{GREEN}.{RST}" if e < 5 else
+                       (f"{YELLOW}:{RST}" if e <= 30 else f"{RED}!{RST}"))
+    return "".join(out)
+
+
+def hist_verdict(s):
+    """历史该不该报警。返回 (图标状态, 待办 或 None)。
+
+    为什么必须报：出过这么一屏 —— 列目录 ✔ 3.2 秒、换直链 ✔ 1.0 秒、302 ✔，
+    结论「全部正常」，而同屏的历史那行写着「31 次探测 … 7 次失败」。
+    四分之一的探测在失败，播放器那边就是「有时候点开打不开」，可体检说一切正常。
+    体检只看得见跑它那一瞬间，而用户过的是那 9 个小时 —— 结论必须把历史算进去，
+    否则又是一个「看起来正常、实际是废的」，正是这个体检本来要防的东西。
+    """
+    if not s or s["n"] < 8:
+        return "ok", None                      # 样本太少，任何比例都是噪声
+    rate = s["bad"] / s["n"]
+    rec_rate = (s["recent_bad"] / s["recent_n"]) if s["recent_n"] >= 4 else None
+    # 最近这几小时还在失败 —— 是【正在坏】
+    if rec_rate is not None and rec_rate >= 0.2:
+        return "bad", (f"网盘列目录最近 {s['recent_n']} 次探测失败了 {s['recent_bad']} 次"
+                       f"（24 小时内共 {s['bad']}/{s['n']}）—— 播放器那边表现为"
+                       f"「有时候点开打不开」",
+                       "这是间歇性故障，不是配置。先在 OpenList 里把这个存储停用再启用"
+                       "重新加载一次；再看下面那行探测图，X 要是均匀散布就是链路长期抽风，"
+                       "扎堆在一段就是那会儿出过一次事、已经过去了")
+    # 失败散成好几段 —— 不是一次掉线，是长期抽风。这个必须报，哪怕此刻是通的：
+    # 它的表现就是「有时候点开打不开、过一会儿又好了」，而每次去体检又都正常。
+    if rate >= 0.1 and s["bad_runs"] >= 3:
+        return "bad", (f"24 小时内列目录失败 {s['bad']}/{s['n']} 次，而且散成 "
+                       f"{s['bad_runs']} 段（不是一次掉线，是长期抽风）",
+                       "看下面那行探测图确认 X 是散开的。这种在播放器那边就是"
+                       "「有时候点开打不开」。先在 OpenList 里把存储停用再启用重新加载；"
+                       "还这样就是网盘接口对这台机器限流，把预热频率调低试试")
+    # 整窗有失败但连成一段、最近也干净 —— 坏过，已经好了，只提醒别报警
+    if rate >= 0.1:
+        ago = f"{s['last_bad_h']:.0f} 小时前" if s["last_bad_h"] is not None else ""
+        return "warn", None if (s["last_bad_h"] or 0) >= 3 else (
+            f"24 小时内列目录失败过 {s['bad']} 次，最近一次 {ago}",
+            "最近几小时没再失败，多半是那会儿出过一次事。留意就行")
+    if s["p90"] >= 30:
+        return "warn", None
+    return "ok", None
 
 
 def install_keepalive(install_dir):
@@ -5729,9 +5815,16 @@ def do_healthcheck():
     # 单次读数说服不了任何人。「列目录 55 秒」到底是这一下赶上了，还是它就没快过？
     # 保活每 KEEPALIVE_MIN 分钟本来就在测同一条路径，把结果攒起来，这个问题就不用
     # 猜了 —— 直接看分布。体检自己的探测也记在同一本账上。
-    hs = hist_summary(keepalive_history(d, 24))
-    if hs:
-        _hc("列目录历史", "ok", f"{DIM}24 小时内{RST}  {hs}")
+    recs = keepalive_history(d, 24)
+    hstat = hist_stats(recs)
+    if hstat:
+        hst, htodo = hist_verdict(hstat)
+        # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
+        _hc("列目录历史", hst, f"{DIM}24 小时内{RST}  {hist_line(hstat)}"
+                               f"\n{' ' * 27}{hist_spark(recs)}"
+                               f"{DIM}  左旧右新　. 快　: 偏慢　! 很慢　X 失败{RST}")
+        if htodo:
+            todo.append(htodo)
     else:
         _hc("列目录历史", "skip", "还没攒够记录（保活每跑一次记一条）")
 
