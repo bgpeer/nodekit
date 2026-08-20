@@ -6239,7 +6239,7 @@ def do_healthcheck():
                 f"{YELLOW}{'、'.join(_miss)} 里已经没有了{RST}"
                 f"  {DIM}节点脚本重建过订阅{RST}")
             todo.append(("节点分流规则被节点脚本冲掉了（重建订阅会整个重写配置）",
-                         "「8 节点分流规则」→ 1 写入，再在客户端更新一次订阅"))
+                         "「7 节点分流规则」→ 1 写入，再在客户端更新一次订阅"))
         else:
             _hc("节点分流", "ok",
                 f"已写入 {'、'.join(lb for lb, _ in _nf)}"
@@ -6347,8 +6347,8 @@ def main_menu():
         print("  5. 链路体检（卡住 / 不出片子时先跑这个）")
         print("  6. 更新（拉最新镜像 + 按新版本刷新配置）")
         # IP 被墙时才用得上，所以排在体检/更新后面、卸载前面
-        print("  8. 节点分流规则（本机 IP 被墙时，让播放器改走 CDN 节点）")
-        print("  7. 卸载")
+        print("  7. 节点分流规则（本机 IP 被墙时，让播放器改走 CDN 节点）")
+        print("  8. 卸载")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -6367,10 +6367,10 @@ def main_menu():
             do_healthcheck()
         elif c == "6":
             do_update(from_menu=True)
-        elif c == "8":
+        elif c == "7":
             node_rule_menu()
             continue          # 子菜单自己管停顿
-        elif c == "7":
+        elif c == "8":
             do_uninstall()
         else:
             print("无效选择。")
