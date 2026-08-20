@@ -1437,10 +1437,17 @@ def install_warm_cron(install_dir):
 
     所以单独一条、每小时一次：这样不管几点想看，缓存里都是热的。成本很低 ——
     每次只热「继续观看」+ 最近新加的，封顶 10 部 —— 那正是最可能被点开的。
+
+    这条任务后来还兼了 align_library()：新内容的库选项/时长/片名/身份也按小时
+    跟上，不必等第二天 05:45。同样是幂等的，没事可做时一个请求都不发。
     """
     try:
-        txt = (f"# media-stack 直链预热：每 {WARM_EVERY_H} 小时给「继续观看」的前几部\n"
-               f"# 提前换好直链，省掉点播放时那几秒到几十秒的跨境等待。\n"
+        txt = (f"# media-stack 每 {WARM_EVERY_H} 小时跟一次新内容：\n"
+               f"#   1. 把所有 strm 媒体库和条目拉到脚本认定的状态（续播门槛、\n"
+               f"#      多版本合并、时长、片名、进度条身份）—— 新建的库/新加的片\n"
+               f"#      最多一小时就和老片一样\n"
+               f"#   2. 给「继续观看」和最近新加的片子提前换好直链，\n"
+               f"#      省掉点播放时那几秒到几十秒的跨境等待\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
                f"0 */{WARM_EVERY_H} * * * root python3 {os.path.realpath(__file__)} "
@@ -1455,17 +1462,11 @@ def install_warm_cron(install_dir):
 
 
 def do_warm():
-    """cron 调的预热，安静跑。顺带把新建的媒体库调好。
+    """cron 每小时调的：先把新内容拉齐，再预热直链。安静跑。
 
-    为什么把调库塞在预热里：媒体库选项（续播门槛、多版本合并）是【每个库】各自
-    一份，Emby 没有"新库默认值"这种东西 —— 用户在 Emby 里新建一个库，它拿的就是
-    Emby 的出厂默认：续播门槛 5 分钟、多版本合并开着。表现就是"新加的库没有进度条
-    记忆"，而用户完全想不到这跟库是新建的有关。
-
-    原来只有「4 生成媒体库」和每日对齐(05:45)会调，最长要等一天。这里每小时跟一次，
-    新建的库一小时内自动跟上，用户不用记得去点哪个菜单。
-
-    只动指向本脚本 strm 目录的库，而且是幂等的 —— 已经对的库一个请求都不会发。
+    这两件事都是冲着同一个问题去的 —— 新加进来的东西不该比老片少任何功能。
+    对齐管「有没有进度条记忆」，预热管「第一次点开快不快」，缺哪个用户都会说
+    "新片不行"。所以放在同一个小时级任务里，一起跟上。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -1473,8 +1474,39 @@ def do_warm():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
     if key:
-        tune_strm_libraries(key)
+        align_library(d, key)
         warm_links(d, key)
+
+
+def align_library(d, key):
+    """把【所有】指向 strm 的媒体库和它们里面的条目，拉到脚本认定的状态。
+
+    这一坨原本散在 do_strm / do_sync 里各抄一遍，而 do_sync 一天只跑一次(05:45)。
+    后果是用户的原话：「新加进来的片全都没有进度条记忆……我不可能一直都是那四个
+    片，新加进来的片无论在哪个库都要和老片一样的功能」。他说的是对的 —— 这些
+    从来就不该是"某几部片子享有的待遇"，而是这套东西对所有 strm 内容的默认行为。
+
+    收成一个函数、按小时跑，新内容不管从哪儿冒出来（手动点 4、凌晨 AutoFilm、
+    用户自己在 Emby 里新建一个库）最多一小时就跟上，而且三个调用点不会再飘。
+
+    每一步都是【幂等 + 无事不发请求】的，所以按小时跑没有代价：
+      · tune      选项已经对的库，一个请求都不发
+      · heal      只挑没探出时长的条目
+      · title     只改和策略不符的片名
+      · identity  只拆真的撞了身份的
+      · impossible 只清位置 > 片长的脏数据
+
+    【不含 prune 和全库扫描】那两个一个是破坏性的、一个要跨境列目录，代价高，
+    留给每日对齐。检测新文件是 Emby 自己的事。
+    """
+    if not key:
+        return
+    tune_strm_libraries(key)          # 库级：续播门槛、多版本合并
+    heal_media_info(d, key)           # 条目级：补时长
+    normalize_strm_files(d)           # heal 中途被打断的兜底
+    apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
+    split_shared_identities(d, key)   # 条目级：进度条身份互相独立
+    clear_impossible_progress(key)    # 条目级：清掉位置 > 片长的脏数据
 
 
 def do_sync():
@@ -1508,13 +1540,9 @@ def do_sync():
             rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
         else:
             rec["nodur_before"] = len(items_without_duration(key))
-            tune_strm_libraries(key)
+            tune_strm_libraries(key)   # 扫描前先调好，新条目一进来就是对的
             emby_scan_wait(key, timeout=900)
-            heal_media_info(d, key)
-            normalize_strm_files(d)    # heal 中途被打断的兜底
-            apply_title_policy(d, key)
-            split_shared_identities(d, key)
-            clear_impossible_progress(key)
+            align_library(d, key)      # 和小时级那轮同一份，不会飘
             rec["nodur_after"] = len(items_without_duration(key))
             rec["missing"] = len(strm_not_in_emby(d, key))
             rec["ok"] = True
@@ -4099,12 +4127,7 @@ def do_strm():
             ok("Emby 已扫完")
         else:
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
-        tune_strm_libraries(key)
-        heal_media_info(d, key)
-        normalize_strm_files(d)      # heal 中途被打断的兜底
-        apply_title_policy(d, key)   # 放在刮削之后：要覆盖的正是刮出来的那个标题
-        split_shared_identities(d, key)
-        clear_impossible_progress(key)
+        align_library(d, key)        # 库选项 + 补时长 + 片名 + 身份 + 脏进度
         report_not_in_emby(d, key)
         # 【后台跑】跟「6 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
