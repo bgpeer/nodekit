@@ -5839,6 +5839,16 @@ def do_healthcheck():
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
 
+    # MetaTube 是按番号刮成人片的。它出现在动画库/电影库的刮削器名单里，几乎肯定
+    # 是装插件时被 Emby 默认加进去的，而不是用户的本意 —— 后果是那些库里冒出
+    # JAV 封面。这种事必须主动报，用户不会想到去每个库翻刮削器名单。
+    # 只陈述当前在哪些库生效，不判断对错 —— 开几个库是用户自己的事，体检的职责
+    # 是让他看得见。真出问题（动画库冒 JAV 封面）时，这一行就是他要的那条线索
+    if metatube_on(d) and key:
+        mt_on = [n for n, _i, on, _o in metatube_libraries(key) if on]
+        _hc("MetaTube 范围", "ok",
+            "、".join(mt_on) if mt_on else f"{DIM}所有媒体库都没启用{RST}")
+
     _hc_group("后台在跑", "这些是定时任务，红了不影响当下播放")
 
     # ---- 保活 ----
@@ -5856,16 +5866,6 @@ def do_healthcheck():
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
-
-    # MetaTube 是按番号刮成人片的。它出现在动画库/电影库的刮削器名单里，几乎肯定
-    # 是装插件时被 Emby 默认加进去的，而不是用户的本意 —— 后果是那些库里冒出
-    # JAV 封面。这种事必须主动报，用户不会想到去每个库翻刮削器名单。
-    # 只陈述当前在哪些库生效，不判断对错 —— 开几个库是用户自己的事，体检的职责
-    # 是让他看得见。真出问题（动画库冒 JAV 封面）时，这一行就是他要的那条线索
-    if metatube_on(d) and key:
-        mt_on = [n for n, _i, on, _o in metatube_libraries(key) if on]
-        _hc("MetaTube 范围", "ok",
-            "、".join(mt_on) if mt_on else f"{DIM}所有媒体库都没启用{RST}")
 
     if os.path.exists(WARM_CRON):
         _hc("直链预热", "ok",
