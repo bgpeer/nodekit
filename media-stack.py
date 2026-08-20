@@ -1436,7 +1436,7 @@ def install_warm_cron(install_dir):
     07:45 就过期了 —— 而用户起床看片多半在那之后。热在错的时间等于没热。
 
     所以单独一条、每小时一次：这样不管几点想看，缓存里都是热的。成本很低 ——
-    每次只热「继续观看」的前 10 部，而那正是最可能被点开的。
+    每次只热「继续观看」+ 最近新加的，封顶 10 部 —— 那正是最可能被点开的。
     """
     try:
         txt = (f"# media-stack 直链预热：每 {WARM_EVERY_H} 小时给「继续观看」的前几部\n"
@@ -2240,7 +2240,7 @@ def do_update(from_menu=False):
                 [sys.executable, os.path.realpath(__file__), "warm"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
-            print(f"  {DIM}已在后台给「继续观看」的前 {WARM_LIMIT} 部预热线路"
+            print(f"  {DIM}已在后台给「继续观看」+ 最近新加的片子预热线路"
                   f"（换直链，最多几分钟）—— 不用等它，直接回车就行。{RST}")
         except Exception as e:
             warn(f"后台预热没起来（不影响更新）：{_short_err(e)}")
@@ -4114,7 +4114,7 @@ def do_strm():
                 [sys.executable, os.path.realpath(__file__), "warm"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
-            print(f"  {DIM}已在后台给「继续观看」的前 {WARM_LIMIT} 部预热线路"
+            print(f"  {DIM}已在后台给「继续观看」+ 最近新加的片子预热线路"
                   f"（换直链，最多几分钟）—— 不用等它。{RST}")
         except Exception as e:
             warn(f"后台预热没起来（不影响本次生成）：{_short_err(e)}")
@@ -5257,8 +5257,37 @@ def warm_hls(loc, at_sec, timeout):
         return f"分片没拉到（{_short_err(e)}）"
 
 
+def latest_items(key, uid, limit=5):
+    """最近加进库的前 N 部（只要 strm）。返回和 resume_items 同样的四元组。
+
+    为什么必须单独取这一批：预热原来只热「继续观看」，而【新片从来没播过，
+    永远进不了那个列表】—— 于是"刚加的片子第一次点开特别慢"成了预热盖不到的
+    真空区，而这恰恰是最常发生的场景（刚往网盘里放完片子，回来就想看）。
+
+    续播点一律给 0：新片没有进度，从头热正是待会儿要播的那一段。
+    """
+    try:
+        r = _emby(f"/Users/{uid}/Items/Latest"
+                  f"?Limit={limit * 3}&MediaTypes=Video"
+                  f"&Fields=Path,MediaSources&IsPlayed=false", key, timeout=30)
+    except Exception:
+        return []
+    # /Items/Latest 直接返回数组，不是 {"Items": [...]}
+    items = r if isinstance(r, list) else (r.get("Items") or [])
+    out = []
+    for i in items:
+        if not str(i.get("Path") or "").endswith(".strm"):
+            continue
+        srcs = i.get("MediaSources") or []
+        out.append((i.get("Id"), str(i.get("Name") or "?"), 0,
+                    srcs[0] if srcs else {}))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def warm_links(d, key, limit=None):
-    """给「继续观看」里的前几部提前接好线路。返回 (成功数, 总数)。
+    """给「继续观看」和最近新加的片子提前接好线路。返回 (成功数, 总数)。
 
     用户定的范围："热这个线路按继续播放里面的前10个，提取进度条记忆播放一秒就可以
     了，搞多了我怕他搞太慢了，其他的就在播放器里面点开"。这个取舍是对的：
@@ -5266,6 +5295,9 @@ def warm_links(d, key, limit=None):
       · 每热一个都要跨境换一次直链（实测 0.3～27 秒）。整库热的话，片子一多就从
         "省时间"变成"耗时间"，而且绝大多数根本不会在缓存有效期内被点开
       · 「继续观看」里的那几部恰恰是最可能被点开的 —— 看了一半的东西
+      · 但只热这一批有个真空区：【新片从没播过，永远进不了「继续观看」】，
+        于是"刚放完片子回来就想看"这个最常见的场景完全没被覆盖，用户的原话是
+        "新加的片刚开始点开打开播放好慢呀"。所以剩下的名额补给最近新加的
 
     热的做法和真实播放【完全一样】：走 MediaWarp 的 /Videos/{id}/stream 拿 302，
     再从【续播点那个位置】拉一小段字节。位置对得上才有意义 —— 用户下次点的是
@@ -5279,7 +5311,15 @@ def warm_links(d, key, limit=None):
     if not uid:
         return 0, 0
     limit = limit or WARM_LIMIT
+    # 「继续观看」优先 —— 看了一半的东西最可能被接着点。剩下的名额给新加的片子：
+    # 它们从没播过，进不了「继续观看」，而"刚放完片子回来就想看"恰恰是最常见的
+    # 场景。两批合起来仍然封顶 limit 部，不会因为多热一类就把整轮拖长。
     cut = resume_items(key, uid, limit)
+    seen = {str(i) for i, _n, _p, _s in cut}
+    for it in latest_items(key, uid, max(0, limit - len(cut))):
+        if str(it[0]) not in seen:
+            cut.append(it)
+            seen.add(str(it[0]))
     if not cut:
         return 0, 0
     # 【正在播的一律不碰】这是用户点出来的区别："机器刷新的应该可以回退……人在
@@ -5298,8 +5338,7 @@ def warm_links(d, key, limit=None):
         return 0, 0
 
     print()
-    info(f"给「继续观看」里的前 {limit} 部提前接好线路"
-         f"{f'（当前 {len(cut)} 部）' if len(cut) != limit else ''}...")
+    info(f"给「继续观看」和新加的片子提前接好线路（共 {len(cut)} 部）...")
     print(f"  {DIM}只换直链、拉 {WARM_BYTES // 1024}KB，不上报播放进度；"
           f"热完回读一遍，被推动了就改回原值。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
@@ -6160,7 +6199,7 @@ def do_healthcheck():
 
     if os.path.exists(WARM_CRON):
         _hc("直链预热", "ok",
-            f"每 {WARM_EVERY_H} 小时热一次「继续观看」的前几部"
+            f"每 {WARM_EVERY_H} 小时热一次「继续观看」和新加的片子"
             f"{DIM}（省掉点播放时的换直链等待）{RST}")
     else:
         _hc("直链预热", "warn", "没装 —— 隔一阵没看，第一次点播放要等换直链")
