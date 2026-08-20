@@ -3326,37 +3326,91 @@ def report_not_in_emby(d, key):
 
     单独一个函数是因为「4 生成媒体库」和「5 链路体检」都要用，而这段话的价值
     全在措辞上 —— 只说"少了 1 个"等于没说，得指名道姓 + 给出可执行的改法。
+
+    【必须先看文件是不是独占一个文件夹】。原来这里无条件按「同一个文件夹里放了
+    多部片子」去讲，可实测撞到的那次恰恰是独占的：
+
+        /data/strm/cloud/功夫 (2004) 4K 60帧 高码/Kung.Fu.Hustle.2004...strm
+
+    人家早就一片一个文件夹了，脚本还在教他"把这几个挪进各自的单独文件夹" ——
+    照着做只会白折腾一遍，然后更不知道该往哪儿查。两种情形的成因和改法完全不同，
+    得分开说。
     """
     missing = strm_not_in_emby(d, key)
     if not missing:
         return 0
+    # 按「这个 strm 的文件夹里还有没有别的视频」分两拨
+    shared, alone = [], []
+    for p in missing:
+        sibs = _strm_siblings(d, p)
+        (shared if sibs > 1 else alone).append((p, sibs))
     print()
     warn(f"有 {len(missing)} 个 strm 生成了，但 Emby 里没有对应的独立条目：")
-    for p in missing[:8]:
-        print(f"  {DIM}·{RST} {p}")
+    for p, sibs in (shared + alone)[:8]:
+        print(f"  {DIM}·{RST} {p}"
+              + (f"   {DIM}(同目录 {sibs} 个视频){RST}" if sibs > 1 else ""))
     if len(missing) > 8:
         print(f"  {DIM}...另外 {len(missing) - 8} 个{RST}")
-    print(f"  {DIM}文件和 strm 都没问题，是 Emby 的电影库布局规则把它吃掉了：{RST}")
-    print(f"  {DIM}同一个文件夹里放了多部片子时，Emby 可能只认其中一部，"
-          f"另一部要么被忽略，要么被并成前一部的一个「版本」。{RST}")
-    print(f"  {DIM}并成「版本」还会连累进度条：那个条目挂着两个源，探测失败的那个"
-          f"时长是 0，续播点就存不下来。{RST}")
-    print(f"  {YELLOW}先看「5 链路体检」的「媒体库选项」那一行。{RST}"
-          f"{DIM} 本脚本会自动关掉多版本合并，"
-          f"关掉之后有几个文件就有几个条目，这一条通常就不会再出现。{RST}")
-    print(f"  {DIM}如果那一行是打勾的、这里还在报，才需要动文件：把这几个挪进"
-          f"各自的单独文件夹。{RST}")
-    # 拆文件夹现在是【下策】，两个代价必须说在前面，否则用户照做完会遇到新的困惑：
-    #   · Emby 的电影库规则是"文件夹里只有一个视频 → 用文件夹名去刮削"。拆完之后
-    #     刮削依据从文件名变成文件夹名，而用户要的往往正是按文件刮
-    #   · 扫描耗时取决于目录个数不是片子个数，无差别拆等于成倍增加跨境列目录次数
-    print(f"  {YELLOW}但拆之前知道两件事：{RST}")
-    print(f"  {DIM}  · 一个文件夹里只剩一个视频时，Emby 会改用{BOLD}文件夹名{RST}"
-          f"{DIM}去刮削，不再看文件名{RST}")
-    print(f"  {DIM}  · 目录越多，每次扫描要跨境列的次数越多；名字差别大的片子"
-          f"平铺在一起本来就没问题，别全拆{RST}")
+
+    if shared:
+        print(f"  {DIM}文件和 strm 都没问题，是 Emby 的电影库布局规则把它吃掉了：{RST}")
+        print(f"  {DIM}同一个文件夹里放了多部片子时，Emby 可能只认其中一部，"
+              f"另一部要么被忽略，要么被并成前一部的一个「版本」。{RST}")
+        print(f"  {DIM}并成「版本」还会连累进度条：那个条目挂着两个源，探测失败的那个"
+              f"时长是 0，续播点就存不下来。{RST}")
+        print(f"  {YELLOW}先看「5 链路体检」的「媒体库选项」那一行。{RST}"
+              f"{DIM} 本脚本会自动关掉多版本合并，"
+              f"关掉之后有几个文件就有几个条目，这一条通常就不会再出现。{RST}")
+        print(f"  {DIM}如果那一行是打勾的、这里还在报，才需要动文件：把这几个挪进"
+              f"各自的单独文件夹。{RST}")
+        # 拆文件夹是【下策】，两个代价必须说在前面，否则用户照做完会遇到新的困惑：
+        #   · Emby 的规则是"文件夹里只有一个视频 → 用文件夹名去刮削"。拆完之后
+        #     刮削依据从文件名变成文件夹名，而用户要的往往正是按文件刮
+        #   · 扫描耗时取决于目录个数不是片子个数，无差别拆等于成倍增加跨境列目录
+        print(f"  {YELLOW}但拆之前知道两件事：{RST}")
+        print(f"  {DIM}  · 一个文件夹里只剩一个视频时，Emby 会改用{BOLD}文件夹名{RST}"
+              f"{DIM}去刮削，不再看文件名{RST}")
+        print(f"  {DIM}  · 目录越多，每次扫描要跨境列的次数越多；名字差别大的片子"
+              f"平铺在一起本来就没问题，别全拆{RST}")
+
+    if alone:
+        print(f"  {YELLOW}上面这些已经是一片一个文件夹了，所以不是布局问题，"
+              f"别去动目录结构。{RST}")
+        print(f"  {DIM}这种情况下 Emby 用【文件夹名】刮削。常见的三个原因：{RST}")
+        print(f"  {DIM}  1. 扫描还没真跑完 —— 触发的是全库扫描，大库可能要几分钟。"
+              f"先去 Emby 后台看「计划任务」里扫描是不是还在跑{RST}")
+        print(f"  {DIM}  2. 文件夹名里的额外标记（4K、60帧、高码、压制组…）"
+              f"让 Emby 解析不出片名。理想是 {BOLD}功夫 (2004){RST}"
+              f"{DIM}，多余的挪到文件名里去{RST}")
+        print(f"  {DIM}  3. Emby 把它当成了「特典/花絮」—— 文件夹或文件名里带"
+              f"trailer、sample、extras 这类词就会{RST}")
+        print(f"  {DIM}想知道到底是哪个，去 Emby 日志里搜这个文件名：{RST}")
+        print(f"      {CYAN}docker logs --tail 400 emby 2>&1 | grep -i "
+              f"'{os.path.basename(alone[0][0])[:28]}'{RST}")
+        print(f"  {DIM}日志里没有它 = Emby 压根没扫到（原因 1）；"
+              f"有它但报解析失败 = 名字问题（原因 2/3）。{RST}")
     print(f"  {DIM}改完回来点一次「4 生成媒体库」。{RST}")
     return len(missing)
+
+
+def _strm_siblings(d, strm_path):
+    """这个 strm 所在的文件夹里一共有几个 strm。1 = 它独占一个文件夹。
+
+    传进来的是 Emby 视角的容器内路径（/data/strm/...），得先换算回宿主机路径
+    才能去数 —— 直接拿容器路径去 listdir 只会数出 0，然后每一条都被误判成
+    「独占」，那这个分支就白加了。
+    """
+    data_root = read_env(os.path.join(d, ".env"), "DATA_ROOT") \
+        or os.path.join(d, "media")
+    host = strm_path
+    if strm_path.startswith(STRM_PATH):
+        host = os.path.join(data_root, "strm", STRM_SUBDIR,
+                            strm_path[len(STRM_PATH):].lstrip("/"))
+    try:
+        folder = os.path.dirname(host)
+        return sum(1 for f in os.listdir(folder) if f.endswith(".strm"))
+    except OSError:
+        return 1                    # 数不出来就当独占，宁可少给一段用不上的建议
 
 
 def strm_inventory(d):
@@ -3946,7 +4000,18 @@ def do_strm():
         split_shared_identities(d, key)
         clear_impossible_progress(key)
         report_not_in_emby(d, key)
-        warm_links(d, key)
+        # 【后台跑】跟「6 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
+        # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
+        # 关系，没道理让用户对着它干等。
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.realpath(__file__), "warm"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            print(f"  {DIM}已在后台给「继续观看」的前 {WARM_LIMIT} 部预热线路"
+                  f"（换直链，最多几分钟）—— 不用等它。{RST}")
+        except Exception as e:
+            warn(f"后台预热没起来（不影响本次生成）：{_short_err(e)}")
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
