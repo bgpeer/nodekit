@@ -1207,6 +1207,19 @@ def keepalive_history(d, hours=24):
     return out
 
 
+def _count_episodes(recs, gap=1):
+    """失败分成几阵。相邻两次失败之间成功不超过 gap 次，就算同一阵。"""
+    eps, since = 0, None                    # since = 距上一次失败过了几次成功
+    for r in recs:
+        if not r.get("ok"):
+            if since is None or since > gap:
+                eps += 1
+            since = 0
+        elif since is not None:
+            since += 1
+    return eps
+
+
 def hist_stats(recs, recent_h=3):
     """把一串探测记录压成数字。没有样本返回 None。
 
@@ -1230,11 +1243,17 @@ def hist_stats(recs, recent_h=3):
          "span_h": (max(ts) - min(ts)) / 3600,
          "recent_n": len(rec_n), "recent_bad": sum(1 for r in rec_n if not r.get("ok")),
          "last_bad_h": (now - max(r.get("ts", 0) for r in bads)) / 3600 if bads else None,
-         # 失败【连成几段】。一次掉线是一整段(XXXXXXX)，长期抽风是散开的好几段
-         # (.X..X..X.)。这两种情况失败次数可以完全一样，该做的事却完全不同：
-         # 前者已经过去了什么都不用做，后者得去挖。光有总数分不出来。
-         "bad_runs": sum(1 for i, r in enumerate(recs)
-                         if not r.get("ok") and (i == 0 or recs[i - 1].get("ok"))),
+         # 失败【分成几阵】。一次掉线是一整阵，长期抽风是散开的好几阵。这两种
+         # 情况失败次数可以完全一样，该做的事却完全相反：前者已经过去了什么都
+         # 不用做，后者得去挖。光有总数分不出来。
+         #
+         # 中间夹着一两次成功【不算断开】。实测踩到的就是这个：
+         #   !.XXXXX!X!X.!......................
+         # 这明明是同一阵掉线（后面二十多次全通），可按「碰到成功就断」去数是
+         # 3 段，于是被判成"长期抽风"报了红叉。一次抽风的存储本来就会时好时坏。
+         # 容差取 1（只有单次成功能把两阵连起来）：容差再大，真正均匀散布的
+         # .X..X..X. 也会被并成一阵，那就把要报的那种情况漏掉了。
+         "bad_runs": _count_episodes(recs, gap=1),
          "med": 0.0, "p90": 0.0, "mx": 0.0, "slow": 0}
     if ok:
         s["med"] = ok[len(ok) // 2]
@@ -1244,38 +1263,55 @@ def hist_stats(recs, recent_h=3):
     return s
 
 
-def hist_line(s):
-    """把 hist_stats 的数字写成一句人话。"""
-    head = f"{s['n']} 次探测／{s['span_h']:.0f} 小时"
+def hist_block(s, recs):
+    """把历史排成几行，一眼能看清。返回 (第一行, [后续行])。
+
+    原来全挤在一行里，实测在手机终端上直接折行折断，图例被劈成两截 ——
+    数据再准，看不清就等于没有。所以拆成「耗时 / 失败 / 探测」三行，
+    每行控制在 ~50 字符内，探测图每 12 个分一组好数。
+    """
     if not s["ok_n"]:
-        return f"{head}　全部失败"
-    out = (f"{head}　中位 {s['med']:.1f} 秒　九成快于 {s['p90']:.1f} 秒"
-           f"　最慢 {s['mx']:.1f} 秒")
-    if s["slow"]:
-        out += f"　{s['slow']} 次 ≥5 秒"
+        return f"{s['n']} 次探测　{RED}全部失败{RST}", []
+    rows = [f"{DIM}耗时{RST}  中位 {s['med']:.1f} 秒　九成 {s['p90']:.1f} 秒"
+            f"　最慢 {s['mx']:.1f} 秒"
+            + (f"　{s['slow']} 次 ≥5 秒" if s["slow"] else "")]
     if s["bad"]:
-        out += f"　{RED}{s['bad']} 次失败{RST}"
-    return out
+        when = (f"　最近一次 {s['last_bad_h']:.0f} 小时前"
+                if s["last_bad_h"] is not None else "")
+        rows.append(f"{DIM}失败{RST}  {RED}{s['bad']} 次{RST}／{s['n']} 次"
+                    f"　分 {s['bad_runs']} 阵{when}")
+    else:
+        rows.append(f"{DIM}失败{RST}  {GREEN}没有{RST}／{s['n']} 次")
+    spark = hist_spark(recs)
+    for i, line in enumerate(spark):
+        rows.append(f"{DIM}探测{RST}  {line}" if i == 0 else f"      {line}")
+    rows.append(f"{DIM}      左旧右新　. 快　: 偏慢　! 很慢　X 失败{RST}")
+    return f"最近 {s['span_h']:.0f} 小时　{s['n']} 次探测", rows
 
 
-def hist_spark(recs, width=40):
-    """把最近 width 次探测画成一行，让人一眼看出失败是【扎堆】还是【一直在冒】。
+def hist_spark(recs, per_row=36, rows=3, group=12):
+    """把最近的探测画成图，让人一眼看出失败是【扎堆】还是【一直在冒】。
 
     这个区分是有后果的：扎堆 = 一次已经结束的故障，什么都不用做；
-    均匀散布 = 链路在长期抽风，那才要去挖。光给一个「7 次失败」的总数，
-    这两种情况长得一模一样。
+    散布 = 链路在长期抽风，那才要去挖。光给一个「7 次失败」的总数，
+    这两种情况长得一模一样 —— 实测就是靠这张图才看出判错了。
 
-    . 快(<5秒)   : 偏慢(5~30秒)   ! 很慢(>30秒)   X 失败      左旧右新
+    每 group 个空一格，方便数。返回若干行（左旧右新，最后一行最新）。
     """
-    out = []
-    for r in recs[-width:]:
+    cells = []
+    for r in recs[-(per_row * rows):]:
         if not r.get("ok"):
-            out.append(f"{RED}X{RST}")
+            cells.append(f"{RED}X{RST}")
         else:
             e = r.get("elapsed", 0)
-            out.append(f"{GREEN}.{RST}" if e < 5 else
-                       (f"{YELLOW}:{RST}" if e <= 30 else f"{RED}!{RST}"))
-    return "".join(out)
+            cells.append(f"{GREEN}.{RST}" if e < 5 else
+                         (f"{YELLOW}:{RST}" if e <= 30 else f"{RED}!{RST}"))
+    out = []
+    for i in range(0, len(cells), per_row):
+        chunk = cells[i:i + per_row]
+        out.append(" ".join("".join(chunk[j:j + group])
+                            for j in range(0, len(chunk), group)))
+    return out
 
 
 def hist_verdict(s):
@@ -1301,10 +1337,13 @@ def hist_verdict(s):
                        "扎堆在一段就是那会儿出过一次事、已经过去了")
     # 失败散成好几段 —— 不是一次掉线，是长期抽风。这个必须报，哪怕此刻是通的：
     # 它的表现就是「有时候点开打不开、过一会儿又好了」，而每次去体检又都正常。
-    if rate >= 0.1 and s["bad_runs"] >= 3:
+    # 【必须带上"最近还在坏"这个条件】。少了它，一次已经过去的抽风会连报一整天：
+    # 实测那次失败全挤在 6 小时前，后面二十多次探测一次没坏，体检照样打红叉。
+    # 一直报警就等于没报警 —— 真出事那次也会被跳过去。
+    if rate >= 0.1 and s["bad_runs"] >= 3 and (s["last_bad_h"] or 99) < 4:
         return "bad", (f"24 小时内列目录失败 {s['bad']}/{s['n']} 次，而且散成 "
-                       f"{s['bad_runs']} 段（不是一次掉线，是长期抽风）",
-                       "看下面那行探测图确认 X 是散开的。这种在播放器那边就是"
+                       f"{s['bad_runs']} 阵（不是一次掉线，是长期抽风）",
+                       "看上面那张探测图确认 X 是散开的。这种在播放器那边就是"
                        "「有时候点开打不开」。先在 OpenList 里把存储停用再启用重新加载；"
                        "还这样就是网盘接口对这台机器限流，把预热频率调低试试")
     # 整窗有失败但连成一段、最近也干净 —— 坏过，已经好了，只提醒别报警
@@ -4738,6 +4777,17 @@ def _hc(label, state, detail=""):
     print(f"\r\x1b[2K    {pad(label, 20)}{icon}  {detail}")
 
 
+def _hc_group(title, why):
+    """体检的分组标题。
+
+    二十多项平铺成一长条，扫到一半就不知道自己在看什么了 —— 而这些项的
+    轻重差得很远：「列目录失败」是片子放不了，「证书还有 79 天」是三个月后的事，
+    它们本来不该并排。分组之后顺序也有了意思：先「能不能放」，再「片子对不对」，
+    最后才是背景信息。出问题时人第一眼看的就是第一组。
+    """
+    print(f"\n  {BOLD}{title}{RST}  {DIM}{why}{RST}")
+
+
 def _hc_wait(label, secs):
     """慢检查开始前先把行占上，让人看得见它在等什么、要等多久。
 
@@ -5329,6 +5379,8 @@ def do_healthcheck():
     print(f"  {BOLD}链路体检{RST}   {DIM}每一项都对应一个真实卡过的地方{RST}")
     print("=" * 60)
 
+    _hc_group("能不能放", "这一组红了，片子就打不开")
+
     # ---- 容器 ----
     # 这份名单必须和 compose 里实际起了哪些服务一致，否则「5/5 在跑」会在
     # 6 个容器的机器上打出来 —— 一个漏掉的容器（metatube 死了）永远不会被报出来，
@@ -5346,14 +5398,6 @@ def do_healthcheck():
         todo.append(("容器没起全", f"docker compose -f {d}/docker-compose.yml up -d"))
     else:
         _hc("容器", "ok", f"{len(want)}/{len(want)} 在跑")
-
-    # 版本必须看得见。全用 :latest 标签，「6 更新」每次都会拉最新的 —— 但用户
-    # 无从知道自己手上是哪一版，也就没法判断某个毛病是不是升级带来的、或者
-    # 已经被上游修掉了。能问出版本号的就报版本号，问不出的报镜像构建日期
-    vers = stack_versions(read_emby_api_key(d) or "")
-    if vers:
-        _hc("版本", "ok", "  ".join(f"{k} {v}" for k, v in vers.items()))
-        print(f"     {DIM}镜像都是 :latest，「6 更新」会拉最新版{RST}")
 
     # ---- OpenList 登录 ----
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
@@ -5528,6 +5572,22 @@ def do_healthcheck():
                              "把扫描路径收窄到具体的媒体目录"
                              "（3 后补参数 → 4 扫描路径），目录少了成功率高很多"))
 
+    # 单次读数说服不了任何人。「列目录 55 秒」到底是这一下赶上了，还是它就没快过？
+    # 保活每 KEEPALIVE_MIN 分钟本来就在测同一条路径，把结果攒起来，这个问题就不用
+    # 猜了 —— 直接看分布。体检自己的探测也记在同一本账上。
+    recs = keepalive_history(d, 24)
+    hstat = hist_stats(recs)
+    if hstat:
+        hst, htodo = hist_verdict(hstat)
+        head, rows = hist_block(hstat, recs)
+        _hc("列目录历史", hst, head)
+        for line in rows:
+            print(f"      {line}")
+        if htodo:
+            todo.append(htodo)
+    else:
+        _hc("列目录历史", "skip", "还没攒够记录（保活每跑一次记一条）")
+
     # 存储 status 是陈旧记录，只有当【实测也失败】时才算真故障
     live_ok = {p for p, _ in listed_ok}
     for mp, brief in stale_status.items():
@@ -5643,11 +5703,19 @@ def do_healthcheck():
         else:
             todo.append(("302 没生成", "多半是上一行的换直链失败，等线路恢复再试"))
 
+    # ---- 直链方式 / 证书 ----
+    lms = link_method_storages(d)
+    if lms:
+        cur = lms[0][3]
+        _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
+                             f"{DIM}（卡顿就去 3 后补参数 → 3 切换）{RST}")
     if key:
         _hc("Emby API Key", "ok", "已填")
     else:
         _hc("Emby API Key", "bad", "空 —— 302 不会生效")
         todo.append(("MediaWarp 没有 Emby API Key", "3 后补参数 → 1 添加 API 密钥"))
+
+    _hc_group("片子对不对", "链路是通的，但库里的东西可能不对")
 
     # ---- strm / 媒体库 ----
     n = strm_count(d)
@@ -5771,31 +5839,8 @@ def do_healthcheck():
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
 
-    # ---- 网盘授权令牌 ----
-    # 看的是【长期凭据 refresh_token】，不是请求 URL 里那个几天就换一次的
-    # access_token（那个驱动自己会续，见 storage_token_days 的注释）。
-    # 实测这个长期凭据的有效期是一年量级，所以 14 天的提前量足够 —— 重新扫码
-    # 需要人拿着手机操作，不能等到当天才说。
-    for mp, days in storage_token_days(d):
-        if days <= 0:
-            _hc(f"授权 {mp}", "bad", f"{RED}已过期 {-days:.0f} 天{RST}")
-            todo.append((f"{mp} 的网盘授权已过期 —— 目录还列得出来（读的是缓存），"
-                         f"但点开任何文件都会转圈",
-                         "OpenList → 存储 → 编辑该存储 → 重新扫码授权"))
-        elif days < 14:
-            _hc(f"授权 {mp}", "warn", f"{YELLOW}还剩 {days:.0f} 天{RST}")
-            todo.append((f"{mp} 的网盘授权 {days:.0f} 天后到期",
-                         "到期当天会突然打不开任何文件，且现象和线路故障一模一样。"
-                         "趁早：OpenList → 存储 → 编辑该存储 → 重新扫码授权"))
-        else:
-            _hc(f"授权 {mp}", "ok", f"还剩 {days:.0f} 天")
+    _hc_group("后台在跑", "这些是定时任务，红了不影响当下播放")
 
-    # ---- 直链方式 / 证书 ----
-    lms = link_method_storages(d)
-    if lms:
-        cur = lms[0][3]
-        _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
-                             f"{DIM}（卡顿就去 3 后补参数 → 3 切换）{RST}")
     # ---- 保活 ----
     ka = keepalive_state(d)
     if not os.path.exists(KEEPALIVE_CRON):
@@ -5811,22 +5856,6 @@ def do_healthcheck():
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
-
-    # 单次读数说服不了任何人。「列目录 55 秒」到底是这一下赶上了，还是它就没快过？
-    # 保活每 KEEPALIVE_MIN 分钟本来就在测同一条路径，把结果攒起来，这个问题就不用
-    # 猜了 —— 直接看分布。体检自己的探测也记在同一本账上。
-    recs = keepalive_history(d, 24)
-    hstat = hist_stats(recs)
-    if hstat:
-        hst, htodo = hist_verdict(hstat)
-        # 27 = 前导 4 空格 + pad(label,20) + 图标 1 + 2 空格
-        _hc("列目录历史", hst, f"{DIM}24 小时内{RST}  {hist_line(hstat)}"
-                               f"\n{' ' * 27}{hist_spark(recs)}"
-                               f"{DIM}  左旧右新　. 快　: 偏慢　! 很慢　X 失败{RST}")
-        if htodo:
-            todo.append(htodo)
-    else:
-        _hc("列目录历史", "skip", "还没攒够记录（保活每跑一次记一条）")
 
     # MetaTube 是按番号刮成人片的。它出现在动画库/电影库的刮削器名单里，几乎肯定
     # 是装插件时被 Emby 默认加进去的，而不是用户的本意 —— 后果是那些库里冒出
@@ -5877,6 +5906,35 @@ def do_healthcheck():
         _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「4 生成媒体库」")
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
                      "跑一次「6 更新」会自动补上"))
+
+    _hc_group("其它", "背景信息和到期提醒")
+
+    # 版本必须看得见。全用 :latest 标签，「6 更新」每次都会拉最新的 —— 但用户
+    # 无从知道自己手上是哪一版，也就没法判断某个毛病是不是升级带来的、或者
+    # 已经被上游修掉了。能问出版本号的就报版本号，问不出的报镜像构建日期
+    vers = stack_versions(read_emby_api_key(d) or "")
+    if vers:
+        _hc("版本", "ok", "  ".join(f"{k} {v}" for k, v in vers.items()))
+        print(f"     {DIM}镜像都是 :latest，「6 更新」会拉最新版{RST}")
+
+    # ---- 网盘授权令牌 ----
+    # 看的是【长期凭据 refresh_token】，不是请求 URL 里那个几天就换一次的
+    # access_token（那个驱动自己会续，见 storage_token_days 的注释）。
+    # 实测这个长期凭据的有效期是一年量级，所以 14 天的提前量足够 —— 重新扫码
+    # 需要人拿着手机操作，不能等到当天才说。
+    for mp, days in storage_token_days(d):
+        if days <= 0:
+            _hc(f"授权 {mp}", "bad", f"{RED}已过期 {-days:.0f} 天{RST}")
+            todo.append((f"{mp} 的网盘授权已过期 —— 目录还列得出来（读的是缓存），"
+                         f"但点开任何文件都会转圈",
+                         "OpenList → 存储 → 编辑该存储 → 重新扫码授权"))
+        elif days < 14:
+            _hc(f"授权 {mp}", "warn", f"{YELLOW}还剩 {days:.0f} 天{RST}")
+            todo.append((f"{mp} 的网盘授权 {days:.0f} 天后到期",
+                         "到期当天会突然打不开任何文件，且现象和线路故障一模一样。"
+                         "趁早：OpenList → 存储 → 编辑该存储 → 重新扫码授权"))
+        else:
+            _hc(f"授权 {mp}", "ok", f"还剩 {days:.0f} 天")
 
     # ---- 公网访问 ----
     if cfg["has_domain"]:
