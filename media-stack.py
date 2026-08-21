@@ -1756,6 +1756,11 @@ def migrate_strm_layout(d, key):
         if want and os.path.abspath(want) != os.path.abspath(host):
             moves.append((host, want))
     if not moves:
+        # 【没得挪也要清一遍】。strm 早就挪好了的话 moves 是空的，可上一轮遗留的
+        # 空壳目录、孤儿 nfo/海报还在 —— 它们不含 .strm，脚本的路径列表看不见，
+        # Emby 的文件夹选择器却照列。用户看到的就是"清扫说做完了，Emby 里还在"，
+        # 而且怎么点刷新都不变。实测卡在这儿好几轮。
+        _sweep_empty_dirs(strm_root(d))
         return 0
     print()
     info(f"扫描路径变了，{len(moves)} 个 strm 要挪到新位置（每个网盘一个主目录）")
@@ -4478,10 +4483,20 @@ def do_strm():
                     slow_warned = True
                     print(f"  {YELLOW}   网盘那边在超时重试，这是跨境线路的老毛病。"
                           f"AutoFilm 会跳过列不出来的目录继续往下走。{RST}")
-        if not done:
-            warn(f"没等到「任务完成」：{give_up}。")
-            print(f"  {DIM}扫描本身还在容器里跑，不会因为这里不等了就停。"
-                  f"已经写出来的 strm 照常生效。{RST}")
+        # 【看 give_up，不看 done】卡住时我们也会把已完成的那几行填进 done，
+        # 于是 `if not done` 永远为假 —— 卡住被报成"✔ 生成完成"，
+        # 正是这套东西最不该有的那种谎报。判据必须是"有没有放弃"。
+        if give_up:
+            if done_lines:
+                got = sorted(re.findall(r"task_id=(\S+)", done))
+                warn(f"{want_tasks} 个网盘只完成了 {len(done_lines)} 个：{give_up}")
+                print(f"  {DIM}完成的：{'、'.join(got) or '?'}{RST}")
+                print(f"  {DIM}没完成的那几个还在容器里跑，不会因为这里不等了就停；"
+                      f"它们的 strm 生成完就有了，下次点「4」会接上后面几步。{RST}")
+            else:
+                warn(f"没等到「任务完成」：{give_up}。")
+                print(f"  {DIM}扫描本身还在容器里跑，不会因为这里不等了就停。"
+                      f"已经写出来的 strm 照常生效。{RST}")
     except KeyboardInterrupt:
         print()
         warn("不等了 —— 扫描在容器里继续跑，strm 会照常生成。")
@@ -4509,7 +4524,9 @@ def do_strm():
         for _k, _v in re.findall(r"([a-z_]+_count)=(\d+)", done):
             nums[_k] = nums.get(_k, 0) + int(_v)
         if nums:
-            ok(f"生成完成：新增 {nums.get('strm_created_count', '?')}，"
+            _tag = ("生成完成" if not give_up
+                    else f"只完成了 {len(done_lines)}/{want_tasks} 个网盘")
+            ok(f"{_tag}：新增 {nums.get('strm_created_count', '?')}，"
                f"已存在跳过 {nums.get('strm_skipped_count', '?')}，"
                f"失败 {nums.get('failed_path_count', '?')}")
             # 扫到的目录数同样关键：网盘目录列不出来时它是 0,而"新增 0"看起来
