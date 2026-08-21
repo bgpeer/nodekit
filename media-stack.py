@@ -1777,6 +1777,16 @@ def _sweep_empty_dirs(root_dir):
     """
     base = os.path.join(root_dir, STRM_SUBDIR)
     gone = 0
+    # 根目录自己不删，但里面的孤儿元数据要清 —— 用户那里就躺着一个 2MB 的
+    # 「…•…4K-poster.png」，是旧布局留下的，没有对应 strm，永远不会被搬走
+    try:
+        for n in os.listdir(base):
+            f = os.path.join(base, n)
+            if os.path.isfile(f) and n.lower().endswith(SIDECAR_EXT):
+                os.remove(f)
+                gone += 1
+    except OSError:
+        pass
     for cur, _dirs, _files in os.walk(base, topdown=False):
         if os.path.abspath(cur) == os.path.abspath(base):
             continue
@@ -1961,7 +1971,7 @@ def do_sync():
         key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                                "auth")
         normalize_strm_files(d)
-        rec["pruned"] = prune_dead_strm(d)
+        rec["pruned"] = prune_dead_strm(d)   # 每日对齐不设预算：凌晨没人等
         if not key:
             rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
         else:
@@ -4009,6 +4019,11 @@ def _strm_sidecars(strm_path):
     return out
 
 
+# 「4 生成媒体库」里核对失效 strm 最多花这么久。超了就记下游标，下次接着走。
+# 每日对齐那次不设限 —— 凌晨跑，没人等。
+PRUNE_BUDGET = 60
+
+
 def _dir_names(path, token):
     """列一个网盘目录，返回 set(文件名)；问不出来返回 None。
 
@@ -4044,7 +4059,7 @@ def _dir_names(path, token):
             if x.get("name")}
 
 
-def prune_dead_strm(d):
+def prune_dead_strm(d, budget=None):
     """删掉网盘上【确认已经不存在】的 strm。返回删了几个。
 
     为什么需要：用户在网盘里整理片子（新建文件夹、分类、改名）之后，AutoFilm
@@ -4088,8 +4103,33 @@ def prune_dead_strm(d):
     print(f"  {DIM}按目录核对：{len(inv)} 个文件分布在 {len(by_dir)} 个目录里，"
           f"一个目录问一次。{RST}")
 
+    # 【时间预算 + 游标】34231 个文件分布在 2716 个目录上，一个目录一次跨境列举，
+    # 全跑完要一小时 —— 而这是在"已经把扫完的盘推给 Emby、用户以为可以走了"之后
+    # 发生的，等于把刚省下的时间又还回去。实测用户就是在这儿 Ctrl-C 的。
+    # 改成每次只花 budget 秒，从上次停下的地方接着走，绕一圈算一遍。
+    # 少删一轮的代价只是废 strm 多留一会儿；而让人干等一小时是实打实的。
+    order = sorted(by_dir)
+    cur = 0
+    mark = os.path.join(d, "prune_cursor.txt")
+    if budget:
+        try:
+            last = open(mark).read().strip()
+            # 【从停下的那个目录本身开始，不是它后面】stopped_at 记的是"没轮到
+            # 就超预算了"的那个目录，+1 会把它永远跳过去 —— 绕多少圈都核对不到。
+            cur = order.index(last) if last in order else 0
+        except (OSError, ValueError):
+            cur = 0
+        order = order[cur:] + order[:cur]        # 从游标处绕一圈
+    t0 = time.monotonic()
+    stopped_at = ""
     dead, unknown, seen = [], 0, 0
-    for i, (dirpath, items) in enumerate(sorted(by_dir.items())):
+    for i, dirpath in enumerate(order):
+        items = by_dir[dirpath]
+        if budget and time.monotonic() - t0 > budget:
+            stopped_at = dirpath
+            print(f"  {DIM}这轮先核对到这儿（{i}/{len(order)} 个目录），"
+                  f"下次从这里接着走 —— 没核对的一律当成还在。{RST}")
+            break
         names = _dir_names(dirpath, token)
         seen += len(items)
         if names is None:
@@ -4098,9 +4138,15 @@ def prune_dead_strm(d):
             for local, tgt in items:
                 if os.path.basename(tgt) not in names:
                     dead.append((local, tgt))
-        if (i + 1) % 20 == 0 and i + 1 < len(by_dir):
+        if (i + 1) % 20 == 0 and i + 1 < len(order):
             print(f"  {DIM}...已核对 {seen}/{len(inv)} 个文件"
-                  f"（{i + 1}/{len(by_dir)} 个目录）{RST}")
+                  f"（{i + 1}/{len(order)} 个目录）{RST}")
+    if budget:
+        try:
+            with open(mark, "w") as f:
+                f.write(stopped_at or "")        # 跑完一圈就清空，下次从头
+        except OSError:
+            pass
 
     hold_path = os.path.join(d, "prune_hold.json")
 
@@ -4709,7 +4755,7 @@ def do_strm():
     # 生成只会【加】不会【减】。用户在网盘里整理过片子的话，旧路径那批 strm
     # 还留在本地，Emby 里就是同一部片子两个条目、一个点不开。放在扫描之前收尾，
     # 让 Emby 这一趟同时看到"新的多了"和"旧的没了"。
-    prune_dead_strm(d)
+    prune_dead_strm(d, budget=PRUNE_BUDGET)
 
     # 生成完顺手让 Emby 扫一遍，省得用户还要再进 Emby 后台找「扫描媒体库」
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
