@@ -3831,11 +3831,67 @@ def is_strm_lib(lb):
 
 def emby_lib_locations(key):
     """Emby 各媒体库实际覆盖的路径：[(库名, [路径...])]。"""
+    return [(n, ps) for n, ps, _t in emby_libs(key)]
+
+
+def emby_libs(key):
+    """[(库名, [路径...], 内容类型)]。内容类型是 movies / tvshows / 空。"""
     try:
-        return [(lb.get("Name") or "?", list(lb.get("Locations") or []))
+        return [(lb.get("Name") or "?", list(lb.get("Locations") or []),
+                 (lb.get("CollectionType") or ""))
                 for lb in (_emby("/Library/VirtualFolders", key, timeout=20) or [])]
     except Exception:
         return []
+
+
+# 「片名 + 集号」的常见写法。中文的「第N集」和西文的 SxxExx 各来一条 ——
+# 只认这两种，认得越杂误报越多，而误报会让用户去动本来没问题的文件。
+EP_PATTERNS = (
+    re.compile(r"^(?P<stem>.+?)[\s\-_.\[（(]*第\s*(?P<n>\d{1,4})\s*[集话話]"),
+    re.compile(r"^(?P<stem>.+?)[\s\-_.]+[Ss](?P<s>\d{1,2})[Ee](?P<n>\d{1,3})\b"),
+)
+
+
+def _ep_key(name):
+    """文件名 → (剧名, 集号)；不像剧集就返回 None。"""
+    base = os.path.splitext(name)[0]
+    for rx in EP_PATTERNS:
+        m = rx.match(base)
+        if m:
+            stem = re.sub(r"[\s\-_.\[（(]+$", "", m.group("stem")).strip()
+            if stem:
+                return stem, int(m.group("n"))
+    return None
+
+
+def episode_like_dirs(d, min_eps=2):
+    """看起来是剧集的文件夹：[(容器内路径, 剧名, 集数)]。
+
+    判据刻意保守：同一个文件夹里至少 min_eps 个文件，能解析出【同一个剧名】和
+    【不同的集号】。名字对不上的一律不算 —— 用户的「美女动作片」里是四部互不相干
+    的片子，那种绝不能被当成剧集。
+
+    【只报不改】。库的内容类型是 Emby 的库级设置，一个库要么全电影要么全剧集，
+    脚本没法按文件夹区分；要"自动"就得替用户新建或改媒体库，那太越界了。
+    而且靠文件名猜身份正是当初坑了好几天的那类启发式 —— 猜错的代价是用户去动
+    本来没问题的文件。所以这里只把观察摆出来，改不改由人定。
+    """
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    out = []
+    for cur, _dirs, files in os.walk(base):
+        eps = {}
+        for f in files:
+            if not f.endswith(".strm"):
+                continue
+            k = _ep_key(f[:-len(".strm")])
+            if k:
+                eps.setdefault(k[0], set()).add(k[1])
+        for stem, nums in eps.items():
+            if len(nums) >= min_eps:
+                rel = os.path.relpath(cur, base)
+                out.append((STRM_PATH if rel == "." else f"{STRM_PATH}/{rel}",
+                            stem, len(nums)))
+    return out
 
 
 def strm_dirs_uncovered(d, key):
@@ -6855,6 +6911,37 @@ def do_healthcheck():
         mt_on = [n for n, _i, on, _o in metatube_libraries(key) if on]
         _hc("MetaTube 范围", "ok",
             "、".join(mt_on) if mt_on else f"{DIM}所有媒体库都没启用{RST}")
+
+    # 【只报不改】看起来是剧集、却待在电影类型的库里。后果很具体：Emby 会把
+    # 每一集当成一部独立电影，季集结构、剧集海报、"看到第几集"全都没有；
+    # 而且同一个文件夹里名字相近的几集还容易被并成一部片的多个"版本"。
+    # 不自动改是因为库的内容类型是【库级】设置，脚本没法按文件夹区分 ——
+    # 要"自动"就得替用户新建或改媒体库，太越界。
+    if key:
+        _eps = episode_like_dirs(d)
+        if _eps:
+            _libs = emby_libs(key)
+            _wrong = []
+            for _p, _stem, _n in _eps:
+                for _nm, _ps, _ct in _libs:
+                    if any(_under(_p, _L) for _L in _ps):
+                        if _ct == "movies":
+                            _wrong.append((_stem, _n, _nm))
+                        break
+            if _wrong:
+                _names = "、".join(f"{a}({b}集)" for a, b, _c in _wrong[:3])
+                _hc("剧集布局", "warn",
+                    f"{len(_wrong)} 组剧集在【电影】类型的库里"
+                    f"\n{' ' * 27}{DIM}{_names}"
+                    f"{'…' if len(_wrong) > 3 else ''}{RST}")
+                todo.append((f"「{_wrong[0][0]}」看着是剧集（{_wrong[0][1]} 集），"
+                             f"却在电影类型的库「{_wrong[0][2]}」里 —— "
+                             f"每一集会变成一部独立电影，没有季集结构",
+                             f"给它单独建一个【电视剧】类型的库指向那个文件夹。"
+                             f"另外文件名要 Emby 解析得出集数才行，"
+                             f"「仙逆 - S01E154.mp4」这种最稳，中文「第154集」它常认不出"))
+            else:
+                _hc("剧集布局", "ok", f"{len(_eps)} 组剧集，都在电视剧库里")
 
     _hc_group("后台在跑", "这些是定时任务，红了不影响当下播放")
 
