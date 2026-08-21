@@ -6762,6 +6762,27 @@ def do_healthcheck():
         _hc("Emby API Key", "bad", "空 —— 302 不会生效")
         todo.append(("MediaWarp 没有 Emby API Key", "3 后补参数 → 1 添加 API 密钥"))
 
+    # 【负载和内存要一起看】实测撞过一次，而我第一时间判断错了：看到"扫库 + 卡死"
+    # 就归因给 Emby 刮削吃内存，可 docker stats 摆出来是 emby 280 MiB、
+    # mediawarp 969 MiB、六个容器合计才 1.6 GB —— 内存不是被 Emby 吃的，
+    # 而 CPU 那会儿是 100%(2 核)。CPU 打满时什么都卡，跟内存够不够无关。
+    # 所以这两个必须并排报，只报一个会把人引向错的方向。
+    try:
+        _la = os.getloadavg()[0]
+        _nc = os.cpu_count() or 1
+        _r = _la / _nc
+        _st = "ok" if _r < 1.0 else ("warn" if _r < 2.0 else "bad")
+        _hc("负载", _st, f"{_la:.2f} / {_nc} 核（每核 {_r:.2f}）"
+                        + ("" if _st == "ok" else
+                           f"   {YELLOW}CPU 打满时播放会卡，和内存无关{RST}"))
+        if _st == "bad":
+            todo.append((f"负载 {_la:.2f}、只有 {_nc} 个核 —— 这时候播放卡顿、"
+                         f"界面转圈都是 CPU 排队造成的，不是链路问题",
+                         "docker stats 看是谁在烧 CPU。刮削和扫描是常见来源，"
+                         "等它跑完就会回落；一直不回落才需要查"))
+    except (OSError, AttributeError):
+        pass
+
     # 【内存要单独报】实测撞过：库涨到 3 万多条目后 Emby 刮削把 3.8 GB 吃到只剩
     # 300 MB，OpenList 和 MediaWarp 跟着挨饿，表现是「视频都看不了」—— 而链路那
     # 一组全是绿的，因为链路本身没坏，是整台机器没内存了。
