@@ -3929,28 +3929,39 @@ def _strm_sidecars(strm_path):
     return out
 
 
-def _ol_exists(path, token):
-    """网盘上还有这个文件吗。True 有 / False 确认没有 / None 问不出来。
+def _dir_names(path, token):
+    """列一个网盘目录，返回 set(文件名)；问不出来返回 None。
 
-    三态是这个函数的全部意义。AutoFilm 自带的同步删除是两态的（不在扫描结果里
-    就算删了），跨境线路上列目录超时是常态，于是"没扫到"被当成"已删除"，整个
-    目录的 strm 被清掉 —— 所以那个开关在 gen_autofilm_conf 里是【关】的。
+    三态是这个函数的全部意义：True 有 / 明确没有 / 问不出来。AutoFilm 自带的
+    同步删除是两态的（不在扫描结果里就算删了），跨境线路上列目录超时是常态，
+    于是"没扫到"被当成"已删除"，整个目录的 strm 被清掉 —— 所以那个开关在
+    gen_autofilm_conf 里是【关】的，改由这里来判。
 
-    这里换成逐个文件问 OpenList，并且只认它明确回答的那一句。除此之外的一切
-    —— 超时、报错、连不上 —— 都归到 None，宁可留一堆废文件也不误删一个。
+    为什么要有这个：核对失效 strm 原来是【一个文件一次 fs/get】。几十个文件时
+    无所谓，用户挂上一个两万文件的网盘之后就是 21509 次跨境请求 —— 而 fs/get
+    还会顺带换直链，是最贵的那种调用。按目录列举则是一个目录一次，同样的判断，
+    调用次数少一到两个数量级。
+
+    【故意不带 refresh】读缓存对"核对存活"来说是安全方向：缓存里还留着已经删掉的
+    文件，最坏结果是这轮没删掉一个废 strm，下轮再说；而 refresh 一次要跨境重列，
+    两万个文件分布在几百个目录上，代价高得离谱。宁可少删，不能误删 —— 和这整个
+    函数的原则一致。
     """
     try:
-        r = _ol_api("/api/fs/get", {"path": path, "password": ""}, token, timeout=30)
+        r = _ol_api("/api/fs/list", {"path": path, "password": "", "page": 1,
+                                     "per_page": 0, "refresh": False},
+                    token, timeout=60)
     except Exception:
         return None
-    if r.get("code") == 200:
-        return True
-    msg = (r.get("message") or "").lower()
-    # 只认 object not found。"storage not found" 是【存储没挂上/掉线】，那一刻
-    # 这个挂载点下面每个文件都会这么回答 —— 认成"已删除"就是清空整个媒体库
-    if "object not found" in msg and "storage not found" not in msg:
-        return False
-    return None
+    if r.get("code") != 200:
+        msg = (r.get("message") or "").lower()
+        # 目录本身没了 = 里面的文件确实都没了。但 storage not found 是存储掉线，
+        # 那一刻整个挂载点每个目录都会这么答 —— 认成"已删除"就是清空整个媒体库
+        if "object not found" in msg and "storage not found" not in msg:
+            return set()
+        return None
+    return {x.get("name") for x in ((r.get("data") or {}).get("content") or [])
+            if x.get("name")}
 
 
 def prune_dead_strm(d):
@@ -3964,7 +3975,7 @@ def prune_dead_strm(d):
     【不问，直接删】。本地就该是网盘的镜像：网盘里改了结构、挪了片子、删了文件，
     本地跟着走。之所以敢不问，是因为判据是逐个文件问 OpenList 要来的【肯定回答】，
     而不是 AutoFilm 那种"不在扫描结果里就算删了"—— 后者在跨境线路上会把超时当成
-    删除，整库清空。三态判断见 _ol_exists。
+    删除，整库清空。三态判断见 _dir_names。
 
     唯一保留的刹车是"整个挂载点全判死"：那更像是存储掉线、根目录ID 填错之类的配置
     问题，而不是用户真把一个盘清空了。这种情况第一轮只记账不删，下一轮结论一样才
@@ -3990,15 +4001,26 @@ def prune_dead_strm(d):
     print(f"  {DIM}只删网盘明确回答「对象不存在」的。超时、报错、存储掉线一律"
           f"当成还在 —— 宁可留废文件，不能误删。{RST}")
 
-    dead, unknown = [], 0
-    for i, (local, tgt) in enumerate(inv):
-        v = _ol_exists(tgt, token)
-        if v is False:
-            dead.append((local, tgt))
-        elif v is None:
-            unknown += 1
-        if (i + 1) % 25 == 0 and i + 1 < len(inv):
-            print(f"  {DIM}...已核对 {i + 1}/{len(inv)}{RST}")
+    # 按目录归拢，一个目录问一次。两万个文件常常只分布在几百个目录上
+    by_dir = {}
+    for local, tgt in inv:
+        by_dir.setdefault(os.path.dirname(tgt), []).append((local, tgt))
+    print(f"  {DIM}按目录核对：{len(inv)} 个文件分布在 {len(by_dir)} 个目录里，"
+          f"一个目录问一次。{RST}")
+
+    dead, unknown, seen = [], 0, 0
+    for i, (dirpath, items) in enumerate(sorted(by_dir.items())):
+        names = _dir_names(dirpath, token)
+        seen += len(items)
+        if names is None:
+            unknown += len(items)            # 这个目录问不出来，里面的一律当还在
+        else:
+            for local, tgt in items:
+                if os.path.basename(tgt) not in names:
+                    dead.append((local, tgt))
+        if (i + 1) % 20 == 0 and i + 1 < len(by_dir):
+            print(f"  {DIM}...已核对 {seen}/{len(inv)} 个文件"
+                  f"（{i + 1}/{len(by_dir)} 个目录）{RST}")
 
     hold_path = os.path.join(d, "prune_hold.json")
 
