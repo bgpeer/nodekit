@@ -492,8 +492,37 @@ def resolve_scan_paths(d, spec):
     新网盘，不用回来改这里的设置，重新生成一次就自动带上。
     """
     if spec == SCAN_AUTO:
-        return [mp for mp, _drv, _st, _root in openlist_storages(d) if mp and mp != "/"]
-    return list(spec or [])
+        paths = [mp for mp, _drv, _st, _root in openlist_storages(d)
+                 if mp and mp != "/"]
+    else:
+        paths = list(spec or [])
+    return order_scan_paths(d, paths)
+
+
+def order_scan_paths(d, paths):
+    """小盘排前面。按每个盘【本地已有多少 strm】升序。
+
+    为什么要排：任务是按配置顺序跑的，一个两万文件的网盘排在前面，后面那几个
+    小盘就得排队等它。用户的原话：「这个扫盘能不能让少的先扫，他这个没扫完就
+    崩溃了我的夸克有永远都扫不到」—— 确实如此，等待循环撑不到那么久就放弃了，
+    而放弃时小盘可能一个都还没轮到。
+
+    排序依据用现成的：strm 树里每个主目录下已经有多少文件。不用去问网盘 ——
+    那本身就是一次昂贵的跨境列举，为了排序去做不划算。新挂的盘还没有 strm，
+    计 0 排最前面，这也正好是用户最想先看到结果的那个。
+    """
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+
+    def weight(p):
+        mnt = os.path.join(base, strm_mount_dir(p))
+        n = 0
+        try:
+            for _r, _ds, fs in os.walk(mnt):
+                n += sum(1 for f in fs if f.endswith(".strm"))
+        except OSError:
+            pass
+        return n
+    return sorted(paths, key=weight)
 
 
 def strm_mount_dir(scan_path):
