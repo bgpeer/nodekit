@@ -1888,8 +1888,11 @@ def align_library(d, key):
       · identity  只拆真的撞了身份的
       · impossible 只清位置 > 片长的脏数据
 
-    【不含 prune 和全库扫描】那两个一个是破坏性的、一个要跨境列目录，代价高，
-    留给每日对齐。检测新文件是 Emby 自己的事。
+    【不含 prune】它是破坏性的、而且要跨境列目录，代价高，留给每日对齐。
+
+    【但要管 Emby 扫描】strm 数一变就通知 Emby 扫一次。因为 do_strm 现在允许
+    "小盘扫完就先走"，剩下的盘在容器里继续生成 —— 那批文件得有人推进 Emby，
+    否则要等到第二天凌晨的对齐才进库。数没变就一个请求都不发。
     """
     follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
     # 【必须在这儿也来一遍】。strm 不是只有点「4 生成媒体库」才会产生 ——
@@ -1906,6 +1909,30 @@ def align_library(d, key):
     apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
     split_shared_identities(d, key)   # 条目级：进度条身份互相独立
     clear_impossible_progress(key)    # 条目级：清掉位置 > 片长的脏数据
+    scan_if_grown(d, key)             # 后台又生成了一批的话，让 Emby 看见
+
+
+def scan_if_grown(d, key):
+    """strm 数和上次记的不一样就让 Emby 扫一次。返回有没有扫。
+
+    只在【变了】的时候扫：全库扫描在两万条目的库上不便宜，按小时无脑扫就是
+    白烧 CPU。而变没变本地就能数出来，不用问任何人。
+    """
+    mark = os.path.join(d, "strm_seen.txt")
+    now = strm_count(d)
+    try:
+        was = int(open(mark).read().strip())
+    except (OSError, ValueError):
+        was = -1
+    if now == was or not key:
+        return False
+    emby_scan_wait(key, timeout=600)
+    try:
+        with open(mark, "w") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+    return True
 
 
 def do_sync():
@@ -4514,6 +4541,13 @@ def do_strm():
         # 固定时限在这里是错的模型：线路好的时候 100 个目录几分钟就完了，线路烂的
         # 时候 3 个目录也能耗掉一刻钟。按"还在不在动"判断才对得上实际 —— 只要日志
         # 还在往前走就一直等，真正卡死（长时间一行不出）才放弃。
+        # 已经有盘扫完、又等了这么久还没等齐，就先把扫完的那些推给 Emby，
+        # 剩下的留给容器继续跑。用户的原话：「可以让先让扫描成功的先推到 emby
+        # 那边去吗？然后影片太多的就让他自己在后面慢慢扫」—— 没道理让 60 个文件
+        # 的盘陪着 2 万个文件的盘一起等。
+        # 后面几步（清失效、迁移、通知扫描、补时长）对"只扫了一部分"是安全的：
+        # 清失效的判据是问网盘要的，不是看这轮扫描结果；其余都是幂等的。
+        SOFT_WAIT = 300
         QUIET_GIVEUP = 360         # 连续这么久没有新日志才认定卡死（单次列目录最长也就两分多钟）
         NOSTART_GIVEUP = 300       # 一直等不到开始：cron 最多 2 分钟就该触发，5 分钟还没动就是没触发
         HARD_CAP = 3600            # 兜底总时限，防止异常情况下无限等下去
@@ -4526,7 +4560,7 @@ def do_strm():
         # 任务数从 AutoFilm 【自己的配置】数，不从脚本的 cfg 猜 —— 那才是它真正
         # 会跑几个任务；而且 do_strm 这个位置根本没有 cfg（我上一版就是这么崩的）
         want_tasks = max(1, len(read_yaml_all(cfg_path, "source_dir")))
-        done_lines = []
+        done_lines, early = [], False
         started, last, shown, quiet_since = False, "", "", time.monotonic()
         slow_warned = False
         t_start = time.monotonic()
@@ -4539,6 +4573,11 @@ def do_strm():
                     done_lines.append(ln)
             if len(done_lines) >= want_tasks:
                 done = "\n".join(done_lines)
+                break
+            # 有盘扫完了、又等够了软截止 —— 先走，别让小盘的片子陪着大盘等
+            if done_lines and time.monotonic() - t_start > SOFT_WAIT:
+                done = "\n".join(done_lines)
+                early = True
                 break
             # 日志行数超过"刚启动"那一刻，就说明任务真的动起来了。用行数而不是认
             # 某句中文：AutoFilm 各版本的措辞不一样，认死了会一直显示"还没开始"
@@ -4595,7 +4634,13 @@ def do_strm():
         # 【看 give_up，不看 done】卡住时我们也会把已完成的那几行填进 done，
         # 于是 `if not done` 永远为假 —— 卡住被报成"✔ 生成完成"，
         # 正是这套东西最不该有的那种谎报。判据必须是"有没有放弃"。
-        if give_up:
+        if early:
+            fin = sorted(set(re.findall(r"task_id=(\S+)", done)))
+            info(f"{len(fin)}/{want_tasks} 个网盘已扫完，先把它们推给 Emby")
+            print(f"  {DIM}完成的：{'、'.join(fin)}{RST}")
+            print(f"  {DIM}还没扫完的在容器里继续跑，不受影响；它们生成出来的 strm "
+                  f"由每小时的对齐任务接手推进 Emby。{RST}")
+        elif give_up:
             if done_lines:
                 got = sorted(re.findall(r"task_id=(\S+)", done))
                 warn(f"{want_tasks} 个网盘只完成了 {len(done_lines)} 个：{give_up}")
@@ -4633,8 +4678,8 @@ def do_strm():
         for _k, _v in re.findall(r"([a-z_]+_count)=(\d+)", done):
             nums[_k] = nums.get(_k, 0) + int(_v)
         if nums:
-            _tag = ("生成完成" if not give_up
-                    else f"只完成了 {len(done_lines)}/{want_tasks} 个网盘")
+            _tag = ("生成完成" if not (give_up or early)
+                    else f"已完成 {len(done_lines)}/{want_tasks} 个网盘")
             ok(f"{_tag}：新增 {nums.get('strm_created_count', '?')}，"
                f"已存在跳过 {nums.get('strm_skipped_count', '?')}，"
                f"失败 {nums.get('failed_path_count', '?')}")
