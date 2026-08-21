@@ -496,6 +496,22 @@ def resolve_scan_paths(d, spec):
     return list(spec or [])
 
 
+def strm_mount_dir(scan_path):
+    """扫描路径 → 它在 strm 树里的主目录名。/quark/电影 → quark；/115 → 115
+
+    每个网盘一条主路径，是这套目录结构唯一能长期站得住的形状：
+      · 挂第 N 个网盘时不用改任何已有配置，它自己长出 cloud/<盘名>/
+      · 两个盘里都有「电影」文件夹也不会混在一起
+      · 扫描路径改深改浅（/quark → /quark/电影）只影响那个盘自己的子树，
+        不会像共用 target_dir 时那样把【所有】盘的 strm 整体挪位
+    最后一条是实测踩出来的：扫描路径从 /quark/电影 改成自动展开的 /quark，
+    7 个 strm 全部换了位置，旧的又不会被 prune 清掉（网盘上还在），
+    结果是每部片在 Emby 里变成两个条目、续播点全丢。
+    """
+    segs = [x for x in (scan_path or "").split("/") if x]
+    return segs[0] if segs else ""
+
+
 def scan_task_id(path):
     """由路径生成任务 id。AutoFilm 用它给状态文件命名，多任务时必须唯一。"""
     t = re.sub(r"[^\w一-鿿]+", "_", path.strip("/")) or "root"
@@ -585,7 +601,7 @@ def _gen_strm_task(cfg, path):
     cron: "{cfg['strm_cron']}"
     alist: openlist
     source_dir: "{path}"
-    target_dir: "{STRM_PATH}"
+    target_dir: "{STRM_PATH}/{strm_mount_dir(path)}"
     mode: AlistPath         # 见 gen_autofilm_conf 的注释，三种取值都实测过
     flatten_mode: false
     overwrite: false
@@ -1517,6 +1533,167 @@ def follow_new_storages(d):
     if gone:
         info(f"这些存储在 OpenList 里没有了，已移出扫描：{'、'.join(gone)}")
     return added
+
+
+def planned_strm_path(d, netdisk_path, scan_paths):
+    """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。"""
+    best = ""
+    for sp in scan_paths:
+        if _under(netdisk_path, sp) and len(sp) > len(best):
+            best = sp                       # 取最深的那条，扫描路径可能嵌套
+    if not best:
+        return ""
+    rel = netdisk_path[len(best.rstrip("/")):].lstrip("/")
+    if not rel:
+        return ""
+    return os.path.join(strm_root(d), STRM_SUBDIR, strm_mount_dir(best),
+                        os.path.splitext(rel)[0] + ".strm")
+
+
+def _progress_by_target(d, key):
+    """{网盘路径: (续播位置, 是否看完)}。
+
+    【按网盘路径归档，不按条目 id】—— 条目 id 是跟着文件路径走的，strm 一挪位
+    Emby 就当成新条目，id 全变；而 strm 指向的那个网盘文件是不变的，
+    迁移前后只有它能把两边对上号。
+    """
+    out = {}
+    try:
+        users = _emby("/Users", key, timeout=20) or []
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return out
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return out
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not is_strm_lib(lb):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video"
+                      f"&Fields=Path,UserData", key, timeout=60)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            ud = i.get("UserData") or {}
+            pos, played = ud.get("PlaybackPositionTicks") or 0, bool(ud.get("Played"))
+            if not pos and not played:
+                continue                    # 没看过的不用记
+            host = _strm_host_path(d, i.get("Path") or "")
+            if not host or not os.path.exists(host):
+                continue
+            try:
+                t = strm_target_path(open(host, encoding="utf-8").read())
+            except OSError:
+                continue
+            if t:
+                out[t] = (pos, played)
+    return out
+
+
+def _restore_progress(d, key, saved):
+    """迁移后把续播点按网盘路径贴回新条目。返回贴回几个。"""
+    if not saved:
+        return 0
+    try:
+        users = _emby("/Users", key, timeout=20) or []
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return 0
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    n = 0
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not is_strm_lib(lb) or not uid:
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path",
+                      key, timeout=60)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            host = _strm_host_path(d, i.get("Path") or "")
+            if not host or not os.path.exists(host):
+                continue
+            try:
+                t = strm_target_path(open(host, encoding="utf-8").read())
+            except OSError:
+                continue
+            if t not in saved:
+                continue
+            pos, played = saved[t]
+            try:
+                _emby(f"/Users/{uid}/Items/{i.get('Id')}/UserData", key,
+                      method="POST",
+                      body={"PlaybackPositionTicks": pos, "Played": played},
+                      timeout=30)
+                n += 1
+            except Exception:
+                pass
+    return n
+
+
+def migrate_strm_layout(d, key):
+    """把已有的 strm 挪到「每个网盘一个主目录」的新布局里。返回挪了几个。
+
+    为什么必须由脚本来挪、而不是让 AutoFilm 在新位置重新生成一遍：旧位置的
+    strm 【不会】被 prune 清掉 —— prune 只删网盘上确认没有的，而这些文件在网盘上
+    好好的。结果就是新旧并存，每部片在 Emby 里两个条目，还可能撞回「刮削身份」
+    那个老问题。
+
+    续播点靠网盘路径搬家（见 _progress_by_target）：条目 id 随路径变，网盘路径不变。
+    """
+    cfg = rebuild_cfg_from_disk(d)
+    sps = cfg.get("scan_paths") or []
+    if not sps:
+        return 0
+    moves = []
+    for host, target in strm_inventory(d):
+        want = planned_strm_path(d, target, sps)
+        if want and os.path.abspath(want) != os.path.abspath(host):
+            moves.append((host, want))
+    if not moves:
+        return 0
+    print()
+    info(f"扫描路径变了，{len(moves)} 个 strm 要挪到新位置（每个网盘一个主目录）")
+    print(f"  {DIM}不挪的话新旧两份并存，每部片在 Emby 里会变成两个条目。{RST}")
+    saved = _progress_by_target(d, key) if key else {}
+    if saved:
+        print(f"  {DIM}已记下 {len(saved)} 个条目的续播点，挪完贴回去。{RST}")
+    n = 0
+    for src, dst in moves:
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            n += 1
+        except OSError as e:
+            warn(f"挪不动 {os.path.basename(src)}：{_short_err(e)}")
+    # 顺手把空掉的旧目录收干净，否则 Emby 里会留一堆空文件夹条目
+    # 【要按磁盘上的实际内容判空，不能用 os.walk 给的 dirs/files】那两个列表是
+    # 进入目录时就抓好的快照：自底向上删的时候，子目录已经在磁盘上没了，
+    # 快照里却还在，于是父目录被当成"还有东西"跳过 —— 实测就留下了一个空的「电影」。
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    for root, _dirs, _files in os.walk(base, topdown=False):
+        if root == base:
+            continue
+        try:
+            if not os.listdir(root):
+                os.rmdir(root)
+        except OSError:
+            pass
+    ok(f"{n} 个 strm 已挪到新布局")
+    if key:
+        emby_scan_wait(key, timeout=900)
+        back = _restore_progress(d, key, saved)
+        if back:
+            ok(f"{back} 个条目的续播点已贴回")
+        elif saved:
+            warn(f"{len(saved)} 个续播点没能贴回 —— 条目可能还没扫出来，"
+                 f"等下一轮对齐或再点一次「4 生成媒体库」")
+    return n
 
 
 def align_library(d, key):
@@ -4234,6 +4411,9 @@ def do_strm():
 
     # 生成完顺手让 Emby 扫一遍，省得用户还要再进 Emby 后台找「扫描媒体库」
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    # 【必须在这儿】：要赶在 AutoFilm 按新配置生成之前把旧的挪好，
+    # 否则新旧两份并存，每部片在 Emby 里变成两个条目
+    migrate_strm_layout(d, key)
     if key:
         info("通知 Emby 扫描媒体库...")
         if emby_scan_wait(key, timeout=900):
