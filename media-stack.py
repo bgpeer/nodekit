@@ -4415,6 +4415,14 @@ def do_strm():
         QUIET_GIVEUP = 360         # 连续这么久没有新日志才认定卡死（单次列目录最长也就两分多钟）
         NOSTART_GIVEUP = 300       # 一直等不到开始：cron 最多 2 分钟就该触发，5 分钟还没动就是没触发
         HARD_CAP = 3600            # 兜底总时限，防止异常情况下无限等下去
+        # 【一个扫描路径 = AutoFilm 的一个任务 = 一行「任务完成」】。
+        # 原来看到第一行就 break，单网盘时没问题；多网盘时会在第一个任务刚完成
+        # 就往下走 —— 统计只是那一个任务的，而 prune / 迁移 / 通知 Emby 扫描
+        # 全在其余任务还在生成的时候执行，Emby 看到的是半成品。
+        # 用户从 1 条路径加到 3 条之后立刻撞上：报「发现文件 1 个」，
+        # 而实际有 8 个，另外两个盘还没轮到。
+        want_tasks = max(1, len(cfg.get("scan_paths") or []))
+        done_lines = []
         started, last, shown, quiet_since = False, "", "", time.monotonic()
         slow_warned = False
         t_start = time.monotonic()
@@ -4423,9 +4431,10 @@ def do_strm():
             out = autofilm_log(since)
             lines = out.splitlines()
             for ln in lines:
-                if "Alist2Strm 任务完成" in ln:
-                    done = ln                      # 不 break：取最后一条，也就是最新那轮
-            if done:
+                if "Alist2Strm 任务完成" in ln and ln not in done_lines:
+                    done_lines.append(ln)
+            if len(done_lines) >= want_tasks:
+                done = "\n".join(done_lines)
                 break
             # 日志行数超过"刚启动"那一刻，就说明任务真的动起来了。用行数而不是认
             # 某句中文：AutoFilm 各版本的措辞不一样，认死了会一直显示"还没开始"
@@ -4438,7 +4447,10 @@ def do_strm():
             el = int(time.monotonic() - t_start)
             quiet = time.monotonic() - quiet_since
             if started and quiet > QUIET_GIVEUP:
-                give_up = f"日志已经 {quiet / 60:.0f} 分钟没动静，判定卡住了"
+                give_up = (f"日志已经 {quiet / 60:.0f} 分钟没动静，判定卡住了"
+                           + (f"（{want_tasks} 个网盘只完成了 {len(done_lines)} 个）"
+                              if want_tasks > 1 else ""))
+                done = "\n".join(done_lines)   # 完成了几个就先按几个报，别当成一个都没跑
                 break
             if not started and el > NOSTART_GIVEUP:
                 give_up = "一直没等到任务开始，AutoFilm 可能没接到这次触发"
@@ -4448,7 +4460,11 @@ def do_strm():
                 break
             if el % 32 < 4:                        # 每 32 秒报一次，别让人以为卡死了
                 phase = "正在扫描网盘" if started else "等 AutoFilm 到点触发"
-                print(f"  {DIM}...{phase}，已等 {el // 60} 分 {el % 60} 秒{RST}")
+                # 多网盘时把进度报出来，否则用户看到"已等 8 分钟"完全不知道
+                # 是卡住了还是第 3 个盘正在扫
+                prog = (f"（已完成 {len(done_lines)}/{want_tasks} 个网盘）"
+                        if want_tasks > 1 else "")
+                print(f"  {DIM}...{phase}{prog}，已等 {el // 60} 分 {el % 60} 秒{RST}")
                 if last and last != shown:
                     print(f"  {DIM}   {last[-88:]}{RST}")
                     shown = last
@@ -4485,7 +4501,11 @@ def do_strm():
     after = strm_count(d)
     print()
     if done:
-        nums = dict(re.findall(r"([a-z_]+_count)=(\d+)", done))
+        # 【累加，不是覆盖】dict(findall) 会让最后一个任务的数字盖掉前面的，
+        # 多网盘时报出来的就只是最后一个盘的量
+        nums = {}
+        for _k, _v in re.findall(r"([a-z_]+_count)=(\d+)", done):
+            nums[_k] = nums.get(_k, 0) + int(_v)
         if nums:
             ok(f"生成完成：新增 {nums.get('strm_created_count', '?')}，"
                f"已存在跳过 {nums.get('strm_skipped_count', '?')}，"
@@ -4495,7 +4515,7 @@ def do_strm():
             print(f"  {DIM}扫描目录 {nums.get('scanned_dir_count', '?')} 个"
                   f"（跳过 {nums.get('skipped_dir_count', '?')} 个），"
                   f"发现文件 {nums.get('discovered_file_count', '?')} 个{RST}")
-            if nums.get("skipped_dir_count", "0") != "0":
+            if nums.get("skipped_dir_count", 0):
                 warn(f"有 {nums['skipped_dir_count']} 个目录没列出来就被跳过了 —— "
                      f"网盘那边超时了，里面的文件这轮不会生成。再跑一次通常能补上。")
         else:
