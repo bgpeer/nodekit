@@ -6388,9 +6388,13 @@ def probe_302(key, own_host="", want_kind=""):
             items = (json.load(resp).get("Items") or [])
     except Exception as e:
         return "skip", f"取不到媒体条目（{_short_err(e)}）"
-    item = next((i for i in items if STRM_PATH in str(i.get("Path", ""))), None)
+    item = next((i for i in items if _under(str(i.get("Path", "")), STRM_PATH)), None)
     if not item:
         return "skip", "媒体库里还没有网盘条目"
+
+    # 这一部属于哪个挂载点。多盘的时候必须报出来 —— 见下面「内部地址」那一支
+    rel = str(item.get("Path", ""))[len(STRM_PATH):].lstrip("/")
+    probed_mount = rel.split("/")[0] if rel else ""
 
     iid = item.get("Id")
     url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
@@ -6406,10 +6410,13 @@ def probe_302(key, own_host="", want_kind=""):
         loc = e.headers.get("Location", "")
         host = loc.split("/")[2] if "://" in loc else loc[:40]
         bare = host.split(":")[0]
-        internal = (bare in ("openlist", "emby", "mediawarp", "localhost")
-                    or _is_private_ip(bare))
-        if internal:
-            return "bad", f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
+        if _is_internal_host(host):
+            # 【必须报是哪个盘】这条以前只说「302 → 内部地址」，用户在多盘环境里
+            # 无从知道是哪一个 —— 而它测的只是媒体库里排在前面的那一部，
+            # 换个盘的片子可能完全正常。实测那次三个盘里只有 WebDAV 那个是坏的，
+            # 光看这行会以为整套 302 都废了。
+            return "bad", (f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
+                           f"{DIM}（测的是 {probed_mount or '?'} 里的片子）{RST}")
 
         # 第一跳落在自己的 OpenList 公网域名上 —— 这是 URL 形式 strm 的正常形态,
         # 但还没到网盘。必须再跟一跳才知道后半段通不通:只看第一跳的话,
@@ -6425,7 +6432,7 @@ def probe_302(key, own_host="", want_kind=""):
                 loc = e2.headers.get("Location", "")
                 host = loc.split("/")[2] if "://" in loc else loc[:40]
                 bare = host.split(":")[0]
-                if bare in ("openlist", "emby", "mediawarp", "localhost") or _is_private_ip(bare):
+                if _is_internal_host(host):
                     return "bad", f"第二跳 → {host}  {RED}内部地址，客户端连不上{RST}"
                 two_hop = True
             except Exception as ex:
@@ -6466,6 +6473,17 @@ def _is_private_ip(ip):
         except (IndexError, ValueError):
             return False
     return False
+
+
+def _is_internal_host(host):
+    """这个 host（可能带端口）是不是「只有本机能连」的地址。
+
+    直链和 302 两处都要判，判法必须一致 —— 曾经各写各的，结果同一个
+    127.0.0.1:5244 在「换直链」那行是绿的、在「302 直链」那行是红的。
+    """
+    bare = host.split(":")[0]
+    return (bare in ("openlist", "emby", "mediawarp", "localhost")
+            or _is_private_ip(bare))
 
 
 def public_visitors(limit=20000):
@@ -6857,6 +6875,21 @@ def do_healthcheck():
                 todo.append((f"{mount} 换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
                              "网盘接口到本机的线路问题，服务端改不了；"
                              "缓存已开 2h，同一部片只慢第一次"))
+            elif _is_internal_host(raw.split("/")[2]):
+                # 【快 ≠ 通】实测撞过：一屏上「换直链 /七米蓝影视 ✔ 0.0 秒 →
+                # 127.0.0.1:5244」和「302 直链 ✖ 内部地址，客户端连不上」并排，
+                # 而红的那行还把锅甩给了 autofilm 的 public_url。0.0 秒恰恰是
+                # 症状 —— 它根本没去网盘换，直接把 OpenList 自己的地址回来了。
+                # 代理型存储（WebDAV、本地盘这些没有 CDN 直链的驱动）就是这样：
+                # 视频要经 OpenList 中转，外网客户端拿到这个地址只会连不上。
+                _hc(label, "bad", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
+                                  f"{RED}本机地址，外网放不了{RST}")
+                todo.append((
+                    f"{mount} 换出来的「直链」是本机地址（{raw.split('/')[2]}）——"
+                    f"这个盘的片子在外网点开会一直连不上",
+                    "这类驱动（WebDAV、本地目录等）在网盘那边没有 CDN 直链，"
+                    "OpenList 只能自己中转，302 也就没法指向外部。"
+                    "和 public_url 无关，其它盘不受影响"))
             elif el > 2:
                 _hc(label, "warn",
                     f"{el:.1f} 秒  偏慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
@@ -6914,9 +6947,16 @@ def do_healthcheck():
                          "检查 mediawarp/config.yaml 的 http_strm.enable 是不是 true、"
                          f"prefix_list 是不是 {STRM_PATH}；「6 更新」会重新生成"))
         elif "内部地址" in msg302:
-            todo.append(("302 指向了容器内部地址，播放器连不上",
-                         "autofilm 的 public_url 要填播放器能访问的地址；"
-                         "「6 更新」会重新生成这份配置"))
+            # 【别一口咬定 public_url】这条以前只有那一个说法，而实测撞到的是
+            # 另一个原因：被测的那部片在 WebDAV 挂载上，那类驱动在网盘侧根本
+            # 没有 CDN 直链，OpenList 只能回自己的地址 —— 改多少次 public_url
+            # 都没用，而其它盘（115、夸克）当时是好的。所以先看上面「换直链」
+            # 那几行：某个盘单独红，就是那个盘的驱动决定的，不是配置错了。
+            todo.append(("302 指向了本机地址，播放器连不上",
+                         "先对照上面「换直链」那几行：如果只有某一个盘的直链是"
+                         "本机地址，那是那个盘的驱动（WebDAV、本地目录这类）没有"
+                         "CDN 直链，改配置没用；如果所有盘都这样，才是 autofilm 的"
+                         "public_url 填成了内部地址，「6 更新」会重新生成"))
         else:
             todo.append(("302 没生成", "多半是上一行的换直链失败，等线路恢复再试"))
 
