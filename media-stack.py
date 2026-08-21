@@ -1776,6 +1776,12 @@ def align_library(d, key):
     留给每日对齐。检测新文件是 Emby 自己的事。
     """
     follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
+    # 【必须在这儿也来一遍】。strm 不是只有点「4 生成媒体库」才会产生 ——
+    # AutoFilm 自己的定时任务也会按新配置生成。实测就是这么翻的车：
+    # 「6 更新」重写了 autofilm 配置，AutoFilm 的 cron 到点按新布局生成了
+    # cloud/quark/…，而旧的 cloud/仙逆、cloud/电影 没人搬，两份并存。
+    # do_strm 里那次只覆盖"用户手动点"这条路，这里覆盖所有路。
+    migrate_strm_layout(d, key)
     if not key:
         return
     tune_strm_libraries(key)          # 库级：续播门槛、多版本合并
@@ -4469,8 +4475,11 @@ def do_strm():
 
     # 生成完顺手让 Emby 扫一遍，省得用户还要再进 Emby 后台找「扫描媒体库」
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
-    # 【必须在这儿】：要赶在 AutoFilm 按新配置生成之前把旧的挪好，
-    # 否则新旧两份并存，每部片在 Emby 里变成两个条目
+    # 放在通知 Emby 扫描【之前】：让 Emby 这一趟同时看到"旧位置没了、新位置有了"，
+    # 不然它会先建一批旧路径的条目，下一轮再删，中间那段时间库里是双份。
+    # （注意这里跑在 AutoFilm 生成【之后】—— 所以新旧可能已经并存，migrate 会把
+    # 旧的覆盖到新位置上去，结果一样，只是多搬一次。真正的兜底在 align_library
+    # 里，那条每小时都跑，不管这批 strm 是谁生成的。）
     migrate_strm_layout(d, key)
     if key:
         info("通知 Emby 扫描媒体库...")
