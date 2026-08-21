@@ -1694,6 +1694,48 @@ def print_library_targets(d, key, max_rows=14):
           f"指向子路径 = 只要那一块，分类清楚但每加一块要建一次库。{RST}")
 
 
+# strm 树里除了 .strm 就只有 AutoFilm 下的这些附属文件，全都是能重新生成的。
+# 这棵树整个由脚本产生，用户的东西不会放在这儿，所以清掉孤儿元数据是安全的。
+SIDECAR_EXT = (".nfo", ".jpg", ".jpeg", ".png", ".webp", ".srt", ".ass", ".ssa", ".sub")
+
+
+def _sweep_empty_dirs(root_dir):
+    """收掉 strm 树里空的、以及只剩孤儿元数据的目录。返回删了几个。
+
+    「只剩孤儿元数据」也得收：迁移之后旧目录里可能留着没有对应 strm 的 nfo/海报
+    （比如目录级的封面）。留着它们目录就非空，Emby 的文件夹选择器里那个旧目录
+    就一直在 —— 而脚本自己的列表只数 .strm，看不见，两边对不上。
+
+    【要按磁盘实际内容判空，不能用 os.walk 给的 dirs/files】那是进目录时抓的快照：
+    自底向上删的时候子目录已经没了、快照里还在，父目录会被当成"还有东西"跳过。
+    """
+    base = os.path.join(root_dir, STRM_SUBDIR)
+    gone = 0
+    for cur, _dirs, _files in os.walk(base, topdown=False):
+        if os.path.abspath(cur) == os.path.abspath(base):
+            continue
+        try:
+            names = os.listdir(cur)
+        except OSError:
+            continue
+        if any(n.endswith(".strm") for n in names):
+            continue                      # 还有正片，留着
+        # 只剩附属文件（或者本来就空）才动手；出现别的东西一律不碰
+        if any(not n.lower().endswith(SIDECAR_EXT)
+               and os.path.isfile(os.path.join(cur, n)) for n in names):
+            continue
+        if any(os.path.isdir(os.path.join(cur, n)) for n in names):
+            continue                      # 底下还有子目录没清完，这轮先放着
+        try:
+            for n in names:
+                os.remove(os.path.join(cur, n))
+            os.rmdir(cur)
+            gone += 1
+        except OSError:
+            pass
+    return gone
+
+
 def migrate_strm_layout(d, key):
     """把已有的 strm 挪到「每个网盘一个主目录」的新布局里。返回挪了几个。
 
@@ -1725,23 +1767,26 @@ def migrate_strm_layout(d, key):
     for src, dst in moves:
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
+            # 【附属文件必须一起搬】AutoFilm 会把 nfo/海报/字幕下到 strm 旁边。
+            # 只搬 .strm 的话它们留在原地，旧目录就【非空】—— 清不掉，于是
+            # Emby 的文件夹选择器里那几个旧目录一直在（我的列表只数 .strm，
+            # 看不见它们，两边对不上，用户还以为迁移没跑）。实测就是这么翻的车。
+            # 必须在 strm 挪走【之前】列，_strm_sidecars 是按同目录同名前缀找的。
+            old_stem = os.path.basename(src)[:-len(".strm")]
+            new_stem = os.path.basename(dst)[:-len(".strm")]
+            for sc in _strm_sidecars(src):
+                tail = os.path.basename(sc)[len(old_stem):]   # 保住 .nfo / .zh.srt
+                try:
+                    shutil.move(sc, os.path.join(os.path.dirname(dst),
+                                                 new_stem + tail))
+                except OSError:
+                    pass
             shutil.move(src, dst)
             n += 1
         except OSError as e:
             warn(f"挪不动 {os.path.basename(src)}：{_short_err(e)}")
     # 顺手把空掉的旧目录收干净，否则 Emby 里会留一堆空文件夹条目
-    # 【要按磁盘上的实际内容判空，不能用 os.walk 给的 dirs/files】那两个列表是
-    # 进入目录时就抓好的快照：自底向上删的时候，子目录已经在磁盘上没了，
-    # 快照里却还在，于是父目录被当成"还有东西"跳过 —— 实测就留下了一个空的「电影」。
-    base = os.path.join(strm_root(d), STRM_SUBDIR)
-    for root, _dirs, _files in os.walk(base, topdown=False):
-        if root == base:
-            continue
-        try:
-            if not os.listdir(root):
-                os.rmdir(root)
-        except OSError:
-            pass
+    _sweep_empty_dirs(strm_root(d))
     ok(f"{n} 个 strm 已挪到新布局")
     if key:
         emby_scan_wait(key, timeout=900)
