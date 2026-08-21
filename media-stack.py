@@ -1636,6 +1636,64 @@ def _restore_progress(d, key, saved):
     return n
 
 
+def library_targets(d, key):
+    """能拿去建 Emby 媒体库的路径清单：[(容器内路径, 层级, strm 个数, 已被库覆盖)]。
+
+    为什么要有这个：结构改成「每个网盘一条主路径」之后，可选的落点不再只有一个根，
+    而生成完只印一句 /data/strm/cloud 等于什么都没说 —— 用户不知道自己有哪些盘、
+    每个盘底下有什么、哪些已经建过库了。正确的用法本来就是「脚本把主路径摆出来，
+    人到 Emby 里挑子路径」，那脚本就得先把菜单端上来。
+
+    只列【直接装着 strm 的目录】和它们的祖先 —— 中间那些空壳目录建库没有意义。
+    """
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    cnt = {}
+    for root, _dirs, files in os.walk(base):
+        n = sum(1 for f in files if f.endswith(".strm"))
+        if not n:
+            continue
+        cur = root                       # 把数量累加到自己和每一层祖先上
+        while True:
+            cnt[cur] = cnt.get(cur, 0) + n
+            if os.path.abspath(cur) == os.path.abspath(base):
+                break
+            cur = os.path.dirname(cur)
+    if not cnt:
+        return []
+    covered = [p for _n, ps in emby_lib_locations(key) for p in ps] if key else []
+    out = []
+    for host in sorted(cnt):
+        rel = os.path.relpath(host, base)
+        cpath = STRM_PATH if rel == "." else f"{STRM_PATH}/{rel}"
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        out.append((cpath, depth, cnt[host],
+                    any(_under(cpath, L) for L in covered)))
+    return out
+
+
+def print_library_targets(d, key, max_rows=14):
+    """把可选路径打成一行一条：几部片、建没建过库、完整路径。
+
+    一行一条而不是画树：用户要做的事是【把路径复制到 Emby 的文件夹框里】，
+    路径本身必须完整可见。之前试过树形 + 单独一行放完整路径，行数翻倍，
+    在手机终端上一屏都装不下。缩进已经足够表达层级了。
+    """
+    rows = [r for r in library_targets(d, key) if r[1] <= 3]
+    if not rows:
+        print(f"  {BOLD}Emby 媒体库要指向的路径{RST}（容器内路径，不是宿主机路径）：")
+        print(f"      {CYAN}{BOLD}{STRM_PATH}{RST}")
+        return
+    print(f"  {BOLD}Emby 媒体库可以指向这些路径{RST}"
+          f"{DIM}（容器内路径，不是宿主机路径）{RST}")
+    for cpath, depth, n, cov in rows[:max_rows]:
+        mark = f"{GREEN}已建库{RST}" if cov else f"{DIM}未建库{RST}"
+        print(f"    {pad(f'{n} 部', 7)}{mark}  {'  ' * depth}{CYAN}{cpath}{RST}")
+    if len(rows) > max_rows:
+        print(f"    {DIM}...另外 {len(rows) - max_rows} 个更深的目录没列{RST}")
+    print(f"  {DIM}指向 {BOLD}{STRM_PATH}{RST}{DIM} = 全都要，以后新挂的网盘自动进；"
+          f"指向子路径 = 只要那一块，分类清楚但每加一块要建一次库。{RST}")
+
+
 def migrate_strm_layout(d, key):
     """把已有的 strm 挪到「每个网盘一个主目录」的新布局里。返回挪了几个。
 
@@ -4439,9 +4497,10 @@ def do_strm():
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
 
     print()
-    print(f"  {BOLD}Emby 媒体库要指向的路径{RST}（容器内路径，不是宿主机路径）：")
-    print(f"      {CYAN}{BOLD}{STRM_PATH}{RST}")
-    print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 → 内容类型选「电影」→ 文件夹填上面这个{RST}")
+    print_library_targets(d, key)
+    print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 → 选内容类型 → 文件夹填上面某一条{RST}")
+    print(f"  {YELLOW}内容类型别选错{RST}{DIM}：剧集要选「电视剧」，"
+          f"用「电影」类型去刮剧集，每一集会变成一部独立电影。{RST}")
     # 刮不出海报的两个高频原因,都在建库那一屏,建完再回头改很麻烦
     print(f"  {YELLOW}同一屏里还要改两处，不然刮不出海报：{RST}")
     # 这里【只是提示】,脚本不碰 Emby 的媒体库设置(体检那段也只读不写)。
