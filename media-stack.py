@@ -1913,16 +1913,22 @@ def align_library(d, key):
     migrate_strm_layout(d, key)
     if not key:
         return
-    tune_strm_libraries(key)          # 库级：续播门槛、多版本合并
+    # 【改了就得让 Emby 重扫】库选项对【已经建好的条目】不会追溯生效 ——
+    # 把多版本合并关掉，已经被并成「版本」的那几个条目还是合的，得重扫才拆开。
+    # 实测：用户新建一个库（Emby 出厂默认是开着合并的），仙逆两个文件当场被并成
+    # 一个条目带两个版本；一小时后 tune 把开关关了，条目却还是合的，
+    # 因为没人触发那次扫描。tune 自己说"下一次扫描会拆开"，可那次扫描没人发起。
+    n_tuned = tune_strm_libraries(key)   # 库级：续播门槛、多版本合并
     heal_media_info(d, key)           # 条目级：补时长
     normalize_strm_files(d)           # heal 中途被打断的兜底
     apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
     split_shared_identities(d, key)   # 条目级：进度条身份互相独立
     clear_impossible_progress(key)    # 条目级：清掉位置 > 片长的脏数据
-    scan_if_grown(d, key)             # 后台又生成了一批的话，让 Emby 看见
+    # 库选项改过就必须重扫（见上），哪怕文件数一个没变
+    scan_if_grown(d, key, force=bool(n_tuned))
 
 
-def scan_if_grown(d, key):
+def scan_if_grown(d, key, force=False):
     """strm 数和上次记的不一样就让 Emby 扫一次。返回有没有扫。
 
     只在【变了】的时候扫：全库扫描在两万条目的库上不便宜，按小时无脑扫就是
@@ -1934,7 +1940,7 @@ def scan_if_grown(d, key):
         was = int(open(mark).read().strip())
     except (OSError, ValueError):
         was = -1
-    if now == was or not key:
+    if not key or (now == was and not force):
         return False
     emby_scan_wait(key, timeout=600)
     try:
@@ -3546,7 +3552,8 @@ def tune_strm_libraries(key):
     try:
         libs = _emby("/Library/VirtualFolders", key)
     except Exception:
-        return
+        return 0
+    n_changed = 0
     for lb in libs:
         if not is_strm_lib(lb):
             continue
@@ -3578,6 +3585,7 @@ def tune_strm_libraries(key):
                  f"{'、'.join(f'{k}={now.get(k)}' for k in bad)}")
             print(f"  {DIM}Emby 收下了请求但没生效，这个版本的接口可能不吃这些字段。{RST}")
             continue
+        n_changed += 1
         name = lb.get("Name")
         if "MinResumeDurationSeconds" in diff or "MinResumePct" in diff:
             ok(f"媒体库「{name}」续播门槛：{was.get('MinResumeDurationSeconds')}秒/"
@@ -3590,6 +3598,7 @@ def tune_strm_libraries(key):
                   f"网盘库里那基本都是误判 —— 少一部片，而且进度条会坏。{RST}")
             print(f"  {DIM}关掉之后有几个文件就有几个条目。已经并在一起的，"
                   f"下一次扫描会拆开。{RST}")
+    return n_changed
 
 
 def title_policy():
