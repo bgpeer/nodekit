@@ -6762,6 +6762,33 @@ def do_healthcheck():
         _hc("Emby API Key", "bad", "空 —— 302 不会生效")
         todo.append(("MediaWarp 没有 Emby API Key", "3 后补参数 → 1 添加 API 密钥"))
 
+    # 【内存要单独报】实测撞过：库涨到 3 万多条目后 Emby 刮削把 3.8 GB 吃到只剩
+    # 300 MB，OpenList 和 MediaWarp 跟着挨饿，表现是「视频都看不了」—— 而链路那
+    # 一组全是绿的，因为链路本身没坏，是整台机器没内存了。
+    # 这正是这个体检要抓的「看起来正常、实际是废的」，而且它只在大库上才出现。
+    try:
+        _mi = {}
+        for _ln in open("/proc/meminfo"):
+            _k, _, _v = _ln.partition(":")
+            _mi[_k] = int(_v.split()[0]) // 1024          # MiB
+        _tot = _mi.get("MemTotal", 0)
+        _av = _mi.get("MemAvailable", 0)
+        if _tot:
+            _pct = _av * 100 // _tot
+            _n_strm = strm_count(d)
+            _st = "ok" if _pct >= 25 else ("warn" if _pct >= 12 else "bad")
+            _hc("内存", _st, f"可用 {_av} MiB / {_tot} MiB（{_pct}%）"
+                             + (f"   {DIM}{_n_strm} 个 strm{RST}" if _n_strm else ""))
+            if _st != "ok":
+                todo.append((f"内存只剩 {_pct}%（{_av} MiB）—— 这时候播放会失败，"
+                             f"而链路各项还是绿的：不是链路坏了，是整台机器没内存了",
+                             f"多半是 Emby 在刮削 {_n_strm} 个条目。"
+                             f"docker restart emby 先止血；"
+                             f"要长期稳，把大库从扫描路径里去掉、"
+                             f"或者在 Emby 里删掉那个媒体库"))
+    except (OSError, ValueError):
+        pass
+
     _hc_group("片子对不对", "链路是通的，但库里的东西可能不对")
 
     # ---- strm / 媒体库 ----
