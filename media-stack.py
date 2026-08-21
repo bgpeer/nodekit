@@ -334,6 +334,18 @@ def ensure_docker():
 
 
 # ============================================================================ 配置生成
+# Docker 默认的 json-file 日志【没有上限】—— 六个容器一直往里写，Emby 扫一次
+# 三万个条目就是三万行访问日志，磁盘和页缓存都会被慢慢吃掉，而且脚本自己也靠
+# docker logs 做诊断，文件越大读得越慢。
+# 实测那台机器上 mediawarp 在 docker stats 里显示 939 MiB —— 而它刚重启 20 秒、
+# CPU 0.11%，一个 Go 反代不可能真占这么多，绝大部分是日志文件的页缓存。
+# 每个容器封顶 3 个 10 MB，六个加起来最多 180 MB，够查问题也不会失控。
+LOG_LIMIT = """    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+"""
+
+
 def gen_compose(cfg):
     """生成 docker-compose.yml。
 
@@ -350,7 +362,7 @@ def gen_compose(cfg):
     image: emby/embyserver:latest
     container_name: emby
     restart: unless-stopped
-    environment:
+{LOG_LIMIT}    environment:
       - UID=${{PUID}}
       - GID=${{PGID}}
       - TZ=${{TZ}}
@@ -366,7 +378,7 @@ def gen_compose(cfg):
     image: openlistteam/openlist:latest
     container_name: openlist
     restart: unless-stopped
-    user: "${{PUID}}:${{PGID}}"
+{LOG_LIMIT}    user: "${{PUID}}:${{PGID}}"
     environment:
       - UMASK=022
       - TZ=${{TZ}}
@@ -380,7 +392,7 @@ def gen_compose(cfg):
     image: akimio/autofilm:latest
     container_name: autofilm
     restart: unless-stopped
-    # AutoFilm 读不到 TZ 环境变量（启动日志里会打印「使用应用时区 timezone=UTC」），
+{LOG_LIMIT}    # AutoFilm 读不到 TZ 环境变量（启动日志里会打印「使用应用时区 timezone=UTC」），
     # 所以定时任务的时刻必须靠 --timezone 显式指定，否则 cron 里写的 05:15 会被当成
     # 05:15 UTC —— 对国内用户就是下午一点多，完全不是想要的"凌晨闲时"。
     # 钉死在北京时间而不是跟随服务器本地时区：网盘在国内，"闲时"是按北京时间定义的，
@@ -399,7 +411,7 @@ def gen_compose(cfg):
     image: akimio/mediawarp:latest
     container_name: mediawarp
     restart: unless-stopped
-    environment:
+{LOG_LIMIT}    environment:
       - TZ=${{TZ}}
     volumes:
       - {d}/mediawarp/config:/config
@@ -416,7 +428,7 @@ def gen_compose(cfg):
     image: ghcr.io/gethomepage/homepage:latest
     container_name: homepage
     restart: unless-stopped
-    environment:
+{LOG_LIMIT}    environment:
       - PUID=${{PUID}}
       - PGID=${{PGID}}
       - TZ=${{TZ}}
@@ -441,7 +453,7 @@ def gen_compose(cfg):
     image: {METATUBE_IMAGE}
     container_name: metatube
     restart: unless-stopped
-    environment:
+{LOG_LIMIT}    environment:
       - TZ=${{TZ}}
     volumes:
       - {d}/metatube:/data
