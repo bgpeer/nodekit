@@ -4569,6 +4569,18 @@ def do_strm():
                 prog = (f"（已完成 {len(done_lines)}/{want_tasks} 个网盘）"
                         if want_tasks > 1 else "")
                 print(f"  {DIM}...{phase}{prog}，已等 {el // 60} 分 {el % 60} 秒{RST}")
+                # 【按盘列出来，不能只给个 2/3】三个任务是并行跑的（AutoFilm 把
+                # 它们排在同一分钟，调度器一次性全启动），而文件最多的那个盘话最密，
+                # 日志里滚的全是它 —— 用户看到的是"一直在扫别人的盘"，
+                # 其实自己的盘早跑完了。把每个盘的状态摊开，这个误会就没了。
+                if want_tasks > 1:
+                    fin = set(re.findall(r"task_id=(\S+)", "\n".join(done_lines)))
+                    run = [t for t in re.findall(r"task_id=(\S+)", out) if t not in fin]
+                    seen_run = list(dict.fromkeys(run))[:4]
+                    bits = [f"{GREEN}✔{RST}{DIM}{t}{RST}" for t in sorted(fin)]
+                    bits += [f"{YELLOW}…{RST}{DIM}{t}{RST}" for t in seen_run]
+                    if bits:
+                        print("       " + "  ".join(bits))
                 if last and last != shown:
                     print(f"  {DIM}   {last[-88:]}{RST}")
                     shown = last
