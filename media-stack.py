@@ -500,29 +500,53 @@ def resolve_scan_paths(d, spec):
 
 
 def order_scan_paths(d, paths):
-    """小盘排前面。按每个盘【本地已有多少 strm】升序。
+    """小盘先扫。分两层排：已经扫过的盘按 strm 数升序，没扫过的一律排在后面。
 
-    为什么要排：任务是按配置顺序跑的，一个两万文件的网盘排在前面，后面那几个
-    小盘就得排队等它。用户的原话：「这个扫盘能不能让少的先扫，他这个没扫完就
-    崩溃了我的夸克有永远都扫不到」—— 确实如此，等待循环撑不到那么久就放弃了，
-    而放弃时小盘可能一个都还没轮到。
+    用户的原话：「这个扫盘能不能让少的先扫，他这个没扫完就崩溃了我的夸克有永远
+    都扫不到」。任务是按配置顺序跑的，一个两万文件的盘排前面，后面的小盘就得等，
+    而等待循环撑不到那么久就放弃了。
 
-    排序依据用现成的：strm 树里每个主目录下已经有多少文件。不用去问网盘 ——
-    那本身就是一次昂贵的跨境列举，为了排序去做不划算。新挂的盘还没有 strm，
-    计 0 排最前面，这也正好是用户最想先看到结果的那个。
+    【为什么"没扫过的排最后"而不是最前】上一版只按本地 strm 数排，新挂的盘计 0，
+    于是排到了最前面 —— 而"新挂的盘"恰恰是唯一不知道有多大的那个。七米蓝第一次
+    扫就是这么把夸克和 115 饿死的：它本地 0 个 strm，排第一，然后跑了两万个文件。
+    改成新盘垫底：已知的小盘先出结果，未知大小的那个再慢也不挡别人的路。
+
+    新盘之间用顶层目录数粗排 —— 一个挂载点一次列举，很便宜，
+    比"什么都不知道"强。列不出来的排在最后。
     """
     base = os.path.join(strm_root(d), STRM_SUBDIR)
 
-    def weight(p):
-        mnt = os.path.join(base, strm_mount_dir(p))
+    def local_strm(p):
         n = 0
         try:
-            for _r, _ds, fs in os.walk(mnt):
+            for _r, _ds, fs in os.walk(os.path.join(base, strm_mount_dir(p))):
                 n += sum(1 for f in fs if f.endswith(".strm"))
         except OSError:
             pass
         return n
-    return sorted(paths, key=weight)
+
+    known = [(local_strm(p), p) for p in paths]
+    scanned = sorted((n, p) for n, p in known if n > 0)
+    fresh = [p for n, p in known if n == 0]
+    if len(fresh) > 1:
+        # 新盘之间才值得花这一次列举；只有一个新盘的话排哪儿都一样
+        tok = ""
+        try:
+            pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                          fallback=os.path.join(d, ".env"))
+            tok = (_ol_api("/api/auth/login",
+                           {"username": "admin", "password": pw},
+                           timeout=20).get("data") or {}).get("token", "")
+        except Exception:
+            tok = ""
+
+        def top_count(p):
+            if not tok:
+                return 1 << 30
+            names = _dir_names(p, tok)
+            return (1 << 30) if names is None else len(names)
+        fresh = [p for _n, p in sorted((top_count(p), p) for p in fresh)]
+    return [p for _n, p in scanned] + fresh
 
 
 def strm_mount_dir(scan_path):
