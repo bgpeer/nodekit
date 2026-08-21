@@ -4421,7 +4421,9 @@ def do_strm():
         # 全在其余任务还在生成的时候执行，Emby 看到的是半成品。
         # 用户从 1 条路径加到 3 条之后立刻撞上：报「发现文件 1 个」，
         # 而实际有 8 个，另外两个盘还没轮到。
-        want_tasks = max(1, len(cfg.get("scan_paths") or []))
+        # 任务数从 AutoFilm 【自己的配置】数，不从脚本的 cfg 猜 —— 那才是它真正
+        # 会跑几个任务；而且 do_strm 这个位置根本没有 cfg（我上一版就是这么崩的）
+        want_tasks = max(1, len(read_yaml_all(cfg_path, "source_dir")))
         done_lines = []
         started, last, shown, quiet_since = False, "", "", time.monotonic()
         slow_warned = False
