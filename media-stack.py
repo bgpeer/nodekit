@@ -4361,9 +4361,13 @@ def do_strm():
     t = (hm[0] * 60 + hm[1] + 2) % 1440
     fire = f"0 {t % 60:02d} {t // 60:02d} * * *"
 
-    patched = re.sub(r'(?m)^(\s*cron:\s*)".*"$', lambda m: f'{m.group(1)}"{fire}"',
-                     original, count=1)
-    if patched == original:
+    # 【每个任务都要改，不能只改第一个】原来这里写死 count=1。单网盘时只有一条
+    # cron，看不出问题；一个网盘一个任务之后，只有排在最前面那个任务被改成
+    # "两分钟后触发"，其余的还是原来的凌晨定时 —— 于是永远停在「已完成 1/3」，
+    # 剩下两个根本没启动，而界面上看着像是它们卡住了。
+    patched, n_fire = re.subn(r'(?m)^(\s*cron:\s*)".*"$',
+                              lambda m: f'{m.group(1)}"{fire}"', original)
+    if not n_fire:
         # 还没动过文件就退出，别进 try —— 否则 finally 会白写一次文件
         err("没能改写 cron 那一行，为安全起见没有继续。")
         return
