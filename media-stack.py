@@ -6011,6 +6011,29 @@ def metatube_libraries(key):
     return out
 
 
+def _borrow_type_options(key, ctype):
+    """从同内容类型的其它媒体库抄一份刮削器名单。抄不到返回 []。
+
+    新建的库 LibraryOptions.TypeOptions 是空的 —— Emby 要扫过一次才填。
+    而空名单的含义是"用默认"，一旦我们写进去一份，含义就变成"只用这几个"。
+    所以要往里加 MetaTube 时，得先有一份真实的名单打底，不能凭空造。
+
+    抄同类型的库是最稳的来源：它是这台 Emby 上真实生效过的配置，
+    版本、插件、默认值全都对得上，比在代码里硬写一串刮削器名字可靠得多。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return []
+    for lb in libs:
+        if (lb.get("CollectionType") or "").lower() != (ctype or "").lower():
+            continue
+        tos = ((lb.get("LibraryOptions") or {}).get("TypeOptions") or [])
+        if any(t.get("MetadataFetchers") or t.get("ImageFetchers") for t in tos):
+            return json.loads(json.dumps(tos))       # 深拷贝，别改到人家的
+    return []
+
+
 def set_metatube_libraries(key, enable_ids):
     """只在 enable_ids 里的媒体库启用 MetaTube，其余一律摘掉。返回改了几个库。
 
@@ -6033,10 +6056,22 @@ def set_metatube_libraries(key, enable_ids):
         # AV影片 标着 metatube: true，库也建出来了，插件却没戴上。
         # 要开的时候自己补一条，按库的内容类型定 Type。
         if want and not tos:
+            # 【造名单时绝不能只放 MetaTube】上一版就是这么写的，等于把
+            # TheMovieDb 那些默认刮削器从这个库里删掉 —— 结果是海报、简介、
+            # 年份全没了，而用户看到的只是"刮不出图"，根本联想不到是这一步。
+            # 空名单在 Emby 那边是"用默认"，一旦写进去就变成"只用我列的这些"。
+            #
+            # 所以从【同类型的其它库】抄一份现成的名单，再往里加 MetaTube。
+            # 抄不到就【不动】—— 宁可 MetaTube 这次没戴上（用户能在 Emby 里
+            # 手动勾一下），也不能把整个库的刮削器清空。
             ct = (o.get("ContentType") or "").lower()
-            tos = [{"Type": "Series" if ct == "tvshows" else "Movie",
-                    "MetadataFetchers": [], "MetadataFetcherOrder": [],
-                    "ImageFetchers": [], "ImageFetcherOrder": []}]
+            tos = _borrow_type_options(key, ct)
+            if not tos:
+                warn(f"「{name}」还没有刮削器名单（Emby 要扫过一次才会生成），"
+                     f"这次跳过 MetaTube")
+                print(f"  {DIM}扫完之后再跑一次「4 生成媒体库」就会戴上；"
+                      f"急的话在 Emby 的媒体库设置里手动勾 MetaTube。{RST}")
+                continue
         for t in tos:
             for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
                             ("ImageFetchers", "ImageFetcherOrder")):
@@ -8154,6 +8189,40 @@ def do_healthcheck():
                     if _ct == "tvshows" else
                     ("文件名 Emby 解析不出片名。改成「片名 (年份).mp4」这种，"
                      "带发布组标记的（[BT]xxx.1080p.WEB-DL-YYY）它认不出来")))
+
+            # ---- 刮削器名单 ----
+            # 【刮不出海报的时候，第一件该看的就是这个】而它藏在 Emby 的
+            # 媒体库设置里，一个库一个页面，用户不会一个个翻。
+            # 实测撞过：脚本建库时给 LibraryOptions 写了一份只有 MetaTube 的
+            # TypeOptions —— 空名单在 Emby 那边是"用默认"，写进去就变成
+            # "只用我列的这些"，等于把 TheMovieDb 从那个库删掉了。
+            # 用户看到的只是"刮不出图"，根本联想不到是建库那一步干的。
+            nofetch, mtwrong = [], []
+            for _lb in libs:
+                if not any(_under(p, STRM_PATH) for p in (_lb.get("Locations") or [])):
+                    continue
+                _nm = _lb.get("Name") or "?"
+                _tos = ((_lb.get("LibraryOptions") or {}).get("TypeOptions") or [])
+                _fs = sorted({f for t in _tos for f in (t.get("MetadataFetchers") or [])})
+                if _tos and not _fs:
+                    nofetch.append(_nm)          # 名单在、但一个刮削器都没有
+                elif _fs and _fs == [METATUBE_FETCHER]:
+                    mtwrong.append(_nm)          # 只剩 MetaTube，默认那些被挤掉了
+            if nofetch or mtwrong:
+                _bad = nofetch + mtwrong
+                _hc("刮削器", "bad",
+                    "、".join(f"{n}（{'一个都没有' if n in nofetch else '只有 MetaTube'}）"
+                              for n in _bad))
+                todo.append((
+                    f"媒体库「{_bad[0]}」的刮削器名单不对 —— "
+                    f"{'一个刮削器都没启用' if _bad[0] in nofetch else '只剩 MetaTube，TheMovieDb 被挤掉了'}，"
+                    f"表现就是「条目都在、一张海报都没有」",
+                    "Emby → 设置 → 媒体库 → 点该库 → 把 TheMovieDb（剧集库是 "
+                    "TheTVDB）勾上；成人库再额外勾 MetaTube。"
+                    "改完在 Emby 里对该库「刷新元数据」"))
+            elif any(any(_under(p, STRM_PATH) for p in (lb.get("Locations") or []))
+                     for lb in libs):
+                _hc("刮削器", "ok", "各库都配了刮削器")
 
             # ---- 空壳媒体库 ----
             # 【删了 strm 不等于删了条目】。Emby 的条目活在它自己的数据库里，
