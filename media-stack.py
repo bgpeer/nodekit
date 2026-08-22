@@ -6018,6 +6018,22 @@ def metatube_libraries(key):
     return out
 
 
+# 自动重刮的条目上限。超过这个数就不自动来了 —— 整库重刮要把每个条目的海报
+# 重新下一遍，几百 KB 一张，几万个条目就是几十 GB。这台机器已经因为一次
+# 无节制的网盘拉取跑掉过 80 GB（见 HEAL_LIMIT），不能再犯同一个错。
+REFRESH_AUTO_MAX = 500
+
+
+def _lib_item_count(key, iid):
+    """这个媒体库里有多少个条目。问不到返回 0（当成小库，允许自动重刮）。"""
+    try:
+        r = _emby(f"/Items?Recursive=true&ParentId={iid}"
+                  f"&IncludeItemTypes=Movie,Episode&Limit=1", key, timeout=20) or {}
+        return int(r.get("TotalRecordCount") or 0)
+    except Exception:
+        return 0
+
+
 def repair_scrapers(key):
     """把刮削器名单坏掉的 strm 媒体库修回来。返回修了几个。
 
@@ -6033,7 +6049,7 @@ def repair_scrapers(key):
 
     只修指向 strm 的库。用户自己的本地库不归这儿管。
     """
-    fixed = []
+    fixed, fixed_ids = [], []
     try:
         libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
     except Exception:
@@ -6065,13 +6081,35 @@ def repair_scrapers(key):
             _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
                   body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
             fixed.append(lb.get("Name") or "?")
+            fixed_ids.append((lb.get("ItemId"), lb.get("Name") or "?"))
         except Exception:
             continue
     if fixed:
         ok(f"修好 {len(fixed)} 个媒体库的刮削器名单：{'、'.join(fixed)}")
         print(f"  {DIM}它们原来一个刮削器都没有（或者只剩 MetaTube），"
               f"所以刮不出海报。已按 Emby 的默认值补回。{RST}")
-        print(f"  {DIM}已有条目要在 Emby 里对该库「刷新元数据」才会重新刮。{RST}")
+        # 【修完必须顺手重刮一次，否则等于没修】刮削器名单是给【下一次刮削】
+        # 用的，已经建好的条目不会因为名单变了就自己重来 —— 用户看到的还是
+        # 一屏没有海报的灰方块，会以为修复根本没生效。
+        #
+        # 但整库重刮对大库是几十 GB 的流量（每张海报几百 KB × 几万个条目），
+        # 那个决定得用户自己下。所以只自动刮小库，大的报出来让他挑时间。
+        for iid, nm in fixed_ids:
+            n_item = _lib_item_count(key, iid)
+            if n_item > REFRESH_AUTO_MAX:
+                warn(f"「{nm}」有 {n_item} 个条目，没有自动重刮 —— "
+                     f"整库重刮要下几万张海报，挑个时间自己来")
+                print(f"  {DIM}Emby → 该库 → ⋯ → 刷新元数据{RST}")
+                continue
+            try:
+                _emby(f"/Items/{iid}/Refresh?Recursive=true"
+                      f"&MetadataRefreshMode=FullRefresh"
+                      f"&ImageRefreshMode=FullRefresh"
+                      f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
+                      key, method="POST", timeout=30)
+                ok(f"「{nm}」已通知重刮（{n_item} 个条目，后台进行）")
+            except Exception as e:
+                warn(f"「{nm}」重刮没通知上：{_short_err(e)}")
     return len(fixed)
 
 
