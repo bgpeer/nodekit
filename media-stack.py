@@ -1221,7 +1221,14 @@ WARM_EVERY_H   = 1
 WARM_STEP_T    = 45     # 后台跑，等久点没关系 —— 热不成才是白跑
 WARM_BUDGET    = 600    # 整轮封顶（秒）。用满就收工，剩下的交给一小时后那轮
 WARM_RETRY     = 2      # 每部最多试几次。跨境超时多是偶发，隔一轮再试往往就成了
-WARM_LIMIT     = 10     # 每轮热几部。「继续观看」里靠前的那几部才是真会被点开的
+WARM_LIMIT     = 10     # 优先批热几部。「继续观看」里靠前的那几部才是真会被点开的
+# 【优先批之外还要轮全库】。原来只热「继续观看」+ 最近新加，剩下的片子第一次
+# 点开永远要现场换直链（实测 0.3～23 秒，赶上线路抖能到 59 秒）。而这两批都盖不到
+# 一类很常见的片：【看完过的老片】—— 它有播放记录所以不在「继续观看」，
+# 又不是新加的所以不在 Latest(IsPlayed=false) 里，于是永远是冷的。
+# 按顺序轮着热，一轮一段，下一轮接着上一轮的位置往后走，转到头再从头开始。
+# 库小的时候（几部到几十部）一两轮就全热了；库大的时候也不会把哪一部长期落下。
+WARM_REST      = 20
 # 每部之间歇一下。AutoFilm 的配置里为同一个理由留了 wait_time: 0.2，注释写着
 # "夸克风控较严，别调成 0"。预热连着打十几个换直链请求，不隔开的话很可能被风控
 # 盯上 —— 那会连累列目录、播放一起超时，等于自己把自己的链路搞垮。
@@ -6366,6 +6373,49 @@ def warm_hls(loc, at_sec, timeout):
         return f"分片没拉到（{_short_err(e)}）"
 
 
+def rest_items(key, uid, limit, cursor):
+    """全库里从 cursor 开始的一段（只要 strm）。返回 (四元组列表, 下一个 cursor)。
+
+    补上预热的最后一块。「继续观看」和「最近新加」两批合起来仍然盖不到
+    【看完过的老片】：它有播放记录，所以不在「继续观看」；又不是新加的，
+    所以不在 Latest(IsPlayed=false) 里。于是那些片子第一次点开永远要现场
+    换直链 —— 而用户问的正是这个："有什么办法让那些没有保活的影片也可以
+    刚开始打开快一点"。
+
+    【必须轮转，不能每轮都热前 N 部】否则库一大，靠后的片子永远轮不到，
+    等于没有。用 StartIndex 取一个窗口、记下位置，下一轮接着往后走，
+    到头了从 0 开始。这样库小的时候一两轮就全热了，库大的时候也不会
+    把哪一部长期落下。
+
+    用 StartIndex 而不是"取全部再切片"：四万条目的库那样取一次就是几十兆
+    JSON，而这个函数每小时跑一次。窗口取多大就传多少回来。
+
+    续播点一律给 0：这批片子要么没看过、要么看完了，从头热就是待会儿要播的那段。
+    """
+    if limit <= 0:
+        return [], cursor
+    try:
+        r = _emby(f"/Users/{uid}/Items?Recursive=true"
+                  f"&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources"
+                  f"&SortBy=SortName&SortOrder=Ascending"
+                  f"&StartIndex={max(0, int(cursor))}&Limit={limit}", key, timeout=30)
+    except Exception:
+        return [], cursor
+    items = r.get("Items") or []
+    total = int(r.get("TotalRecordCount") or 0)
+    nxt = max(0, int(cursor)) + limit
+    if not total or nxt >= total:
+        nxt = 0                         # 转完一圈（或者库是空的），从头再来
+    out = []
+    for i in items:
+        if not str(i.get("Path") or "").endswith(".strm"):
+            continue
+        srcs = i.get("MediaSources") or []
+        out.append((i.get("Id"), str(i.get("Name") or "?"), 0,
+                    srcs[0] if srcs else {}))
+    return out, nxt
+
+
 def latest_items(key, uid, limit=5):
     """最近加进库的前 N 部（只要 strm）。返回和 resume_items 同样的四元组。
 
@@ -6429,6 +6479,19 @@ def warm_links(d, key, limit=None):
         if str(it[0]) not in seen:
             cut.append(it)
             seen.add(str(it[0]))
+    # 第三批：按顺序轮全库。上面两批盖不到「看完过的老片」—— 有播放记录所以不在
+    # 「继续观看」，不是新加的所以不在 Latest 里，于是永远是冷的。
+    # 排在最后是因为优先级最低：真正会被点开的还是前两批，这一批是兜底。
+    # 轮转位置存在状态文件里，下一轮接着走 —— 每轮都热前 N 部的话，库一大
+    # 靠后的永远轮不到，等于没热。
+    cur = int(ms_state().get("warm_cursor") or 0)
+    more, nxt = rest_items(key, uid, WARM_REST, cur)
+    for it in more:
+        if str(it[0]) not in seen:
+            cut.append(it)
+            seen.add(str(it[0]))
+    if nxt != cur:
+        save_ms_state(warm_cursor=nxt)
     if not cut:
         return 0, 0
     # 【正在播的一律不碰】这是用户点出来的区别："机器刷新的应该可以回退……人在
@@ -6447,7 +6510,8 @@ def warm_links(d, key, limit=None):
         return 0, 0
 
     print()
-    info(f"给「继续观看」和新加的片子提前接好线路（共 {len(cut)} 部）...")
+    info(f"提前接好线路（共 {len(cut)} 部）："
+         f"「继续观看」+ 最近新加 + 轮到的老片...")
     print(f"  {DIM}只换直链、拉 {WARM_BYTES // 1024}KB，不上报播放进度；"
           f"热完回读一遍，被推动了就改回原值。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
