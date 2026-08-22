@@ -2225,6 +2225,10 @@ def _emby_add_library(key, name, ctype, paths, lang="zh", country="CN"):
     一张海报都没有"。而这个设置藏在建库那一屏里，建完基本没人会回去看，
     体检为此专门有一行「刮削语言」在报。既然是脚本建的库，就别再留这个坑。
     """
+    # 【建库时就把刮削器带上】不带的话 TypeOptions 是空的，后面任何一次
+    # "往里加 MetaTube" 都会把整份名单坐实成"只用这一个"。一开始就给它一份
+    # 正确的，后面加减都是在正确的基础上改。
+    tos = good_type_options(key, ctype)
     opts = {
         "PreferredMetadataLanguage": lang,
         "MetadataCountryCode": country,
@@ -2232,6 +2236,8 @@ def _emby_add_library(key, name, ctype, paths, lang="zh", country="CN"):
                                           # 让 Emby 在扫库中途反复触发重扫
         "PathInfos": [{"Path": x} for x in paths],
     }
+    if tos:
+        opts["TypeOptions"] = tos
     q = (f"/Library/VirtualFolders?name={urllib.parse.quote(name)}"
          f"&refreshLibrary=false")
     if ctype:
@@ -2758,6 +2764,7 @@ def align_library(d, key, heal=True):
     n_tuned = tune_strm_libraries(key)   # 库级：续播门槛、多版本合并
     # heal=False 是「4 生成媒体库」用的：那条路把补时长扔后台单独跑，
     # 不能在这儿再跑一遍（会撞锁、也会让用户白等一次）
+    repair_scrapers(key)              # 库级：刮削器名单坏了就修回来
     if heal:
         heal_media_info(d, key)       # 条目级：补时长
     normalize_strm_files(d)           # heal 中途被打断的兜底
@@ -6011,6 +6018,105 @@ def metatube_libraries(key):
     return out
 
 
+def repair_scrapers(key):
+    """把刮削器名单坏掉的 strm 媒体库修回来。返回修了几个。
+
+    【这是给上一版的 bug 收尾】那一版为了给 AV 库戴 MetaTube，在名单为空时
+    自己造了一条只有 MetaTube 的写进去 —— 空名单在 Emby 那边是"用默认"，
+    写进去就变成"只用我列的这些"，等于把 TheMovieDb 从库里删了。
+    表现是海报、简介、年份全没，而用户只看到"刮不出图"。
+
+    修的对象只有两种明确坏掉的形态，别的一律不碰：
+      · 名单在、但一个刮削器都没有
+      · 名单里只剩 MetaTube（默认那些被挤掉了）
+    用户自己精简过刮削器的库不会落进这两种 —— 他至少会留一个正经的。
+
+    只修指向 strm 的库。用户自己的本地库不归这儿管。
+    """
+    fixed = []
+    try:
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return 0
+    for lb in libs:
+        if not any(_under(p, STRM_PATH) for p in (lb.get("Locations") or [])):
+            continue
+        o = lb.get("LibraryOptions") or {}
+        tos = o.get("TypeOptions") or []
+        if not tos:
+            continue                    # 空 = 用默认，本来就是对的，别碰
+        fs = sorted({f for t in tos for f in (t.get("MetadataFetchers") or [])})
+        if fs and fs != [METATUBE_FETCHER]:
+            continue                    # 有正经刮削器，不是我们要修的那两种
+        ct = (lb.get("CollectionType") or "").lower()
+        good = good_type_options(key, ct)
+        if not good:
+            continue
+        had_mt = METATUBE_FETCHER in fs
+        if had_mt:                      # 原来戴着 MetaTube 的，修完还得戴着
+            for t in good:
+                for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
+                                ("ImageFetchers", "ImageFetcherOrder")):
+                    if METATUBE_FETCHER not in (t.get(fk) or []):
+                        t[fk] = list(t.get(fk) or []) + [METATUBE_FETCHER]
+                        t[ok_] = list(t.get(ok_) or []) + [METATUBE_FETCHER]
+        o["TypeOptions"] = good
+        try:
+            _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
+                  body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
+            fixed.append(lb.get("Name") or "?")
+        except Exception:
+            continue
+    if fixed:
+        ok(f"修好 {len(fixed)} 个媒体库的刮削器名单：{'、'.join(fixed)}")
+        print(f"  {DIM}它们原来一个刮削器都没有（或者只剩 MetaTube），"
+              f"所以刮不出海报。已按 Emby 的默认值补回。{RST}")
+        print(f"  {DIM}已有条目要在 Emby 里对该库「刷新元数据」才会重新刮。{RST}")
+    return len(fixed)
+
+
+def _emby_default_fetchers(key, ctype):
+    """问 Emby：这个内容类型【默认】该启用哪些刮削器。返回 TypeOptions，问不到返回 []。
+
+    这是 Emby 自己在「添加媒体库」对话框里调的那个接口 —— 它按当前版本、
+    当前装了哪些插件，给出可选项和默认值。所以拿到的名字一定对得上这台机器，
+    比在代码里硬写一串刮削器名字可靠得多（版本一变、插件一换就全错）。
+
+    为什么非要它不可：通过 API 建出来的库，LibraryOptions.TypeOptions 是空的。
+    空名单在 Emby 那边等于"用默认"，看起来没问题；可一旦我们为了加 MetaTube
+    往里写一份，含义就变成"只用我列的这些" —— 上一版就是这么把 TheMovieDb
+    从库里挤掉的，用户看到的是"刮不出海报"。
+    """
+    try:
+        r = _emby(f"/Libraries/AvailableOptions?libraryContentType={ctype or ''}"
+                  f"&isNewLibrary=true", key, timeout=20) or {}
+    except Exception:
+        return []
+    out = []
+    for t in (r.get("TypeOptions") or []):
+        def _pick(field):
+            # DefaultEnabled 就是 Emby 自己勾好的那几个；一个都没标就全要 ——
+            # 全要也比一个都不要强，后者等于这个库没有刮削器
+            items = t.get(field) or []
+            names = [x.get("Name") for x in items
+                     if isinstance(x, dict) and x.get("DefaultEnabled")]
+            if not names:
+                names = [x.get("Name") for x in items if isinstance(x, dict)]
+            return [n for n in names if n]
+        md, im = _pick("MetadataFetchers"), _pick("ImageFetchers")
+        if not md and not im:
+            continue
+        out.append({"Type": t.get("Type") or "",
+                    "MetadataFetchers": md, "MetadataFetcherOrder": list(md),
+                    "ImageFetchers": im, "ImageFetcherOrder": list(im)})
+    return out
+
+
+def good_type_options(key, ctype):
+    """这个内容类型该用的刮削器名单。问不到就从同类型的其它库抄，都不行返回 []。"""
+    return _emby_default_fetchers(key, ctype) or _borrow_type_options(key, ctype)
+
+
 def _borrow_type_options(key, ctype):
     """从同内容类型的其它媒体库抄一份刮削器名单。抄不到返回 []。
 
@@ -6065,7 +6171,7 @@ def set_metatube_libraries(key, enable_ids):
             # 抄不到就【不动】—— 宁可 MetaTube 这次没戴上（用户能在 Emby 里
             # 手动勾一下），也不能把整个库的刮削器清空。
             ct = (o.get("ContentType") or "").lower()
-            tos = _borrow_type_options(key, ct)
+            tos = good_type_options(key, ct)
             if not tos:
                 warn(f"「{name}」还没有刮削器名单（Emby 要扫过一次才会生成），"
                      f"这次跳过 MetaTube")
