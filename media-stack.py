@@ -1764,9 +1764,17 @@ def do_warm():
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
-    if key:
-        align_library(d, key)
-        warm_links(d, key)
+    if not key:
+        return
+    align_library(d, key)
+    warm_links(d, key)
+    # 【跑完必须留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"。
+    # 写在最后：中途炸了就不该留下"跑过了"的痕迹。
+    try:
+        with open(os.path.join(d, "warm.json"), "w") as f:
+            json.dump({"ts": int(time.time())}, f)
+    except OSError:
+        pass
 
 
 def follow_new_storages(d):
@@ -2204,6 +2212,20 @@ def do_sync():
             json.dump(rec, f, ensure_ascii=False)
     except OSError:
         pass
+
+
+def warm_state(d):
+    """上一次直链预热是什么时候。取不到就返回空。
+
+    【这一行原来只查 cron 文件在不在】—— 文件在就打绿勾。可 cron 文件在
+    不等于任务在跑：那次双层锁把三条任务全锁死，保活和每日对齐好歹还有
+    时间戳能看出不对，预热这行是纯粹的"装了"，坏成什么样都是绿的。
+    """
+    try:
+        with open(os.path.join(d, "warm.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
 def sync_state(d):
@@ -6125,7 +6147,7 @@ def _hc_group(title, why):
     print(f"\n  {BOLD}{title}{RST}  {DIM}{why}{RST}")
 
 
-def _stale_note(elapsed_min, every_min, what):
+def _stale_note(elapsed_min, every_min, what, late=3):
     """定时任务「早就该跑了」的判定。返回 (状态, 补充说明)。
 
     【只报"上次几点跑的"是不够的】—— 实测吃过一次大亏：cron 里多套了一层
@@ -6136,10 +6158,15 @@ def _stale_note(elapsed_min, every_min, what):
     绿的。"719 分钟前"这个数字明明摆在那儿，可 ✔ 让人一眼扫过去就跳过了 ——
     每 20 分钟一次的任务停了 12 小时，体检一声不吭。
 
-    阈值取【间隔的 3 倍】：cron 偶尔被负载挤晚一两轮很正常，报了是噪音；
-    连着丢三轮就不是抖动，是真的不跑了。
+    late = 允许迟到几轮，【按任务的性质分别定，不能一刀切】。这是踩出来的：
+    统一用 3 倍时，每日对齐停了 39 小时照样是绿的 —— 因为 24×3 = 72 小时才判。
+    可"一天一次的任务，39 小时没跑"这件事本身就已经是丢了一整轮了。
+      · 高频任务（保活 20 分钟）→ 3 倍。cron 被负载挤晚一两轮很正常，
+        报了是噪音；连丢三轮才是真不跑了。
+      · 每日任务 → 1.5 倍（36 小时）。一天跑一次的东西，迟到半天以上
+        就是丢了一整轮，没有"抖动"这一说。
     """
-    if elapsed_min <= every_min * 3:
+    if elapsed_min <= every_min * late:
         return "ok", ""
     return "bad", (f"　{RED}每 {what} 该跑一次，已经 "
                    f"{elapsed_min // 60} 小时没跑了{RST}")
@@ -7492,9 +7519,27 @@ def do_healthcheck():
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
 
     if os.path.exists(WARM_CRON):
-        _hc("直链预热", "ok",
-            f"每 {WARM_EVERY_H} 小时热一次「继续观看」和新加的片子"
-            f"{DIM}（省掉点播放时的换直链等待）{RST}")
+        wm = warm_state(d)
+        if not wm:
+            # 【装了但从没跑成】和"刚装上还没到点"长得一样，只能说"还没跑过"，
+            # 但至少不能再打绿勾 —— 那次三条任务全被锁死时，就是这一行一直绿着
+            _hc("直链预热", "skip",
+                f"已装，还没跑过（每 {WARM_EVERY_H} 小时一次）")
+        else:
+            wmin = int((time.time() - wm.get("ts", 0)) / 60)
+            st3, note3 = _stale_note(wmin, WARM_EVERY_H * 60,
+                                     f"{WARM_EVERY_H} 小时")
+            when3 = f"{wmin // 60} 小时前" if wmin >= 60 else f"{wmin} 分钟前"
+            _hc("直链预热", st3,
+                f"{when3}热过「继续观看」和新加的片子"
+                f"{DIM}（省掉点播放时的换直链等待）{RST}{note3}")
+            if st3 == "bad":
+                todo.append((
+                    f"直链预热该每 {WARM_EVERY_H} 小时跑一次，实际已经 "
+                    f"{wmin // 60} 小时没跑了 —— 新加的片子第一次点开要等换直链，"
+                    f"新建的库也不会自动补时长和续播门槛",
+                    "和「链路保活」多半是同一个原因（cron 没在工作）。"
+                    "跑一次「6 更新」会重装这三条 cron"))
     else:
         _hc("直链预热", "warn", "没装 —— 隔一阵没看，第一次点播放要等换直链")
         todo.append(("直链预热没装，冷启动时第一次播放要等几秒到几十秒",
@@ -7524,7 +7569,7 @@ def do_healthcheck():
                     did.append(f"{YELLOW}还有 {sy['nodur_after']} 个没时长{RST}")
                 if sy.get("missing"):
                     did.append(f"{YELLOW}{sy['missing']} 个没被 Emby 收录{RST}")
-                st2, note2 = _stale_note(int(hrs * 60), 24 * 60, "天")
+                st2, note2 = _stale_note(int(hrs * 60), 24 * 60, "天", late=1.5)
                 _hc("每日对齐", st2,
                     f"{when}跑过  {'、'.join(did) if did else '没有需要处理的'}{note2}")
                 if st2 == "bad":
