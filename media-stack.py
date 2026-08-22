@@ -1940,6 +1940,292 @@ def _restore_progress(d, key, saved):
     return n
 
 
+# ---- 按关键词自动建媒体库 -----------------------------------------------------
+# 用户的原话：「创建几个关键词，比如中国动漫、电影、电视剧、日韩AV，只要匹配到
+# 这些关键词的文件夹，就把这些文件夹下面的视频整合起来创建一个媒体库，而且
+# 日韩AV自动带上 MetaTube 插件」。
+#
+# 这补的是整套东西里最后一段手工活。以前脚本只能把路径清单印出来，剩下的
+# 「到 Emby → 设置 → 媒体库 → 添加 → 选内容类型 → 填路径 → 选语言 → 再去
+# 另一个页面勾 MetaTube」全靠人记，而且每挂一个新盘、每加一个新文件夹都要重来
+# 一遍。忘一步的后果都不小：内容类型选错，剧集的每一集会变成独立电影；语言留空，
+# 中文片名一张海报都刮不出来；MetaTube 忘了关，它会跑去动画库里配 JAV 封面。
+#
+# 三条设计上的取舍：
+#   · 【按文件夹名匹配，不按路径】。同一个关键词可能出现在好几个盘的好几层里，
+#     全都收进同一个库才是用户要的"整合"。
+#   · 【匹配到就不再往下钻】。/quark/电影/仙逆 命中「电影」之后，仙逆是它的一部分，
+#     不该再单独成库。
+#   · 【只碰自己建的库】。用户手工建的库一律不动 —— 名字撞上了也不动，
+#     因为动它就可能把人家的观看记录连根拔了。
+LIB_RULES_DEFAULT = [
+    {"name": "电影",   "kw": ["电影", "movies", "movie"],           "type": "movies",  "mt": False},
+    {"name": "电视剧", "kw": ["电视剧", "剧集", "连续剧", "tv"],     "type": "tvshows", "mt": False},
+    {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False},
+    {"name": "日韩AV", "kw": ["日韩av", "av", "写真"],               "type": "movies",  "mt": True},
+]
+LIB_TYPES = {"movies": "电影", "tvshows": "电视剧", "homevideos": "家庭影像", "": "混合"}
+
+
+def lib_rules():
+    """当前的关键词规则。用户改过就用改过的，没改过用默认。"""
+    v = ms_state().get("lib_rules")
+    if not isinstance(v, list) or not v:
+        return [dict(r) for r in LIB_RULES_DEFAULT]
+    out = []
+    for r in v:
+        if isinstance(r, dict) and r.get("name") and r.get("kw"):
+            out.append({"name": str(r["name"]), "kw": [str(x) for x in r["kw"]],
+                        "type": str(r.get("type") or ""), "mt": bool(r.get("mt"))})
+    return out or [dict(r) for r in LIB_RULES_DEFAULT]
+
+
+def _kw_hit(dirname, kw):
+    """文件夹名命不命中这个关键词。
+
+    【纯英文关键词要卡词边界】—— 「av」拿去子串匹配会命中 Java、Savage、
+    上海AVI，然后这些文件夹会被塞进成人库、还自动开上 MetaTube。中日文没有
+    这个问题（没有词边界的概念，也不会这么巧地嵌在别的词里），子串就够。
+    """
+    n, k = (dirname or "").lower(), (kw or "").lower()
+    if not k:
+        return False
+    if re.fullmatch(r"[a-z0-9]+", k):
+        return re.search(rf"(?<![a-z0-9]){re.escape(k)}(?![a-z0-9])", n) is not None
+    return k in n
+
+
+def plan_libraries(d, rules=None):
+    """按关键词规则算出每个库该收哪些路径：{库名: (类型, [容器路径...], 要不要 MetaTube)}。
+
+    只收【底下真的有 strm 的】目录 —— 空壳目录建进去只会在 Emby 里多一个空条目。
+    """
+    rules = rules or lib_rules()
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    has_strm = {}
+
+    def _count(path):
+        """这个目录（含子目录）有几个 strm。算过就记下来，别重复走。"""
+        if path in has_strm:
+            return has_strm[path]
+        n = 0
+        for _r, _ds, fs in os.walk(path):
+            n += sum(1 for f in fs if f.endswith(".strm"))
+        has_strm[path] = n
+        return n
+
+    plan = {}
+    stack = [base]
+    while stack:
+        cur = stack.pop()
+        try:
+            subs = sorted(x for x in os.listdir(cur)
+                          if os.path.isdir(os.path.join(cur, x)))
+        except OSError:
+            continue
+        for name in subs:
+            full = os.path.join(cur, name)
+            hit = next((r for r in rules
+                        if any(_kw_hit(name, k) for k in r["kw"])), None)
+            if hit and _count(full):
+                rel = os.path.relpath(full, base).replace(os.sep, "/")
+                plan.setdefault(hit["name"], (hit["type"], [], hit["mt"]))[1].append(
+                    f"{STRM_PATH}/{rel}")
+                continue            # 命中了就不再往下钻 —— 底下都归它
+            stack.append(full)
+        # 【浅的先匹配】用栈会先走到深处，而 /quark/电影/电影 这种嵌套下，
+        # 应该是外层那个「电影」收走整棵子树。所以每层按名字排序压栈、
+        # 命中即停，天然是自顶向下的。
+    return plan
+
+
+def _emby_add_library(key, name, ctype, paths):
+    """在 Emby 里建一个媒体库。成功返回 ""，失败返回错误说明。
+
+    顺手把【首选语言】一起设成中文。这一项建库时留空的话，Emby 按服务器默认
+    （通常是英文）去 TMDb 搜，中文片名一条都搜不到 —— 表现是"条目都在、
+    一张海报都没有"。而这个设置藏在建库那一屏里，建完基本没人会回去看，
+    体检为此专门有一行「刮削语言」在报。既然是脚本建的库，就别再留这个坑。
+    """
+    opts = {
+        "PreferredMetadataLanguage": "zh",
+        "MetadataCountryCode": "CN",
+        "EnableRealtimeMonitor": False,   # strm 是脚本批量增删的，实时监控只会
+                                          # 让 Emby 在扫库中途反复触发重扫
+        "PathInfos": [{"Path": x} for x in paths],
+    }
+    q = (f"/Library/VirtualFolders?name={urllib.parse.quote(name)}"
+         f"&refreshLibrary=false")
+    if ctype:
+        q += f"&collectionType={ctype}"
+    for x in paths:
+        q += f"&paths={urllib.parse.quote(x)}"
+    try:
+        _emby(q, key, method="POST", body=opts, timeout=90)
+        return ""
+    except Exception as e:
+        return _short_err(e)
+
+
+def _emby_add_path(key, name, path):
+    """给已有媒体库加一条路径。成功返回 ""，失败返回错误说明。"""
+    try:
+        _emby(f"/Library/VirtualFolders/Paths?refreshLibrary=false", key,
+              method="POST", timeout=60,
+              body={"Id": name, "Name": name, "PathInfo": {"Path": path}})
+        return ""
+    except Exception as e:
+        return _short_err(e)
+
+
+def apply_libraries(d, key, plan):
+    """把规划落到 Emby 上。返回 (建了几个库, 加了几条路径)。
+
+    【只碰自己建的库】。同名的库如果不是脚本建的，一律不动 —— 只把该加的路径
+    印出来让用户自己决定。动别人的库可能把观看记录连根拔了，而这套东西里
+    最不该出错的就是观看记录。
+    """
+    mine = set(ms_state().get("lib_auto") or [])
+    exist = {n: (ps, t) for n, ps, t in emby_libs(key)}
+    made, added, skipped = [], 0, []
+    for name, (ctype, paths, _mt) in sorted(plan.items()):
+        paths = sorted(set(paths))
+        if name not in exist:
+            err = _emby_add_library(key, name, ctype, paths)
+            if err:
+                warn(f"建媒体库「{name}」失败：{err}")
+                skipped.append((name, paths))
+                continue
+            made.append(name)
+            mine.add(name)
+            continue
+        have = exist[name][0]
+        # 已经被这个库（或它更浅的某条路径）盖住的就不用再加
+        want = [x for x in paths if not any(_under(x, h) for h in have)]
+        if not want:
+            continue
+        if name not in mine:
+            skipped.append((name, want))     # 用户自己建的，不擅自动
+            continue
+        for x in want:
+            err = _emby_add_path(key, name, x)
+            if err:
+                warn(f"往「{name}」加路径失败：{err}")
+                skipped.append((name, [x]))
+            else:
+                added += 1
+    if made:
+        save_ms_state(lib_auto=sorted(mine))
+    if skipped:
+        print()
+        warn("下面这些没有自动处理，需要你到 Emby 里手动加：")
+        for name, paths in skipped:
+            why = "已有同名库，但不是脚本建的" if name in exist else "接口调用失败"
+            print(f"  {DIM}·{RST} {BOLD}{name}{RST}{DIM}（{why}）{RST}")
+            for x in paths:
+                print(f"      {x}")
+        print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 / 编辑文件夹{RST}")
+    return len(made), added
+
+
+def auto_libraries():
+    """按关键词自动建媒体库。菜单项。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if not key:
+        warn("没有 Emby API Key，先填「1 添加 API 密钥」。")
+        return
+    rules = lib_rules()
+    while True:
+        print()
+        print(f"  {BOLD}关键词规则{RST}{DIM}　文件夹名匹配到关键词，"
+              f"就把它整个收进对应的媒体库{RST}")
+        for i, r in enumerate(rules, 1):
+            mt = f"　{CYAN}带 MetaTube{RST}" if r["mt"] else ""
+            print(f"    {i}. {BOLD}{r['name']}{RST}"
+                  f"{DIM}（{LIB_TYPES.get(r['type'], r['type'])}）"
+                  f"　关键词：{'、'.join(r['kw'])}{RST}{mt}")
+        plan = plan_libraries(d, rules)
+        print()
+        if not plan:
+            print(f"  {YELLOW}按这些关键词，一个文件夹都没匹配上。{RST}")
+            print(f"  {DIM}你的文件夹叫什么名字，关键词就得写什么 —— "
+                  f"比如网盘里那个「美女动作片」，"
+                  f"得把「动作片」加进日韩AV的关键词里才收得进去。{RST}")
+        else:
+            print(f"  {BOLD}会这样建{RST}{DIM}（还没动手）{RST}")
+            for name, (ctype, paths, mt) in sorted(plan.items()):
+                mt_s = f"　{CYAN}+MetaTube{RST}" if mt else ""
+                print(f"    {BOLD}{name}{RST}"
+                      f"{DIM}（{LIB_TYPES.get(ctype, ctype)}，"
+                      f"{len(set(paths))} 个文件夹）{RST}{mt_s}")
+                for x in sorted(set(paths)):
+                    print(f"        {DIM}{x}{RST}")
+        print()
+        print(f"  {DIM}a 加一条规则　d 删一条　r 恢复默认　"
+              f"{RST}{BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
+        c = ask("请选择").strip().lower()
+        if c in ("", "0", "q"):
+            return
+        if c == "r":
+            rules = [dict(x) for x in LIB_RULES_DEFAULT]
+            save_ms_state(lib_rules=rules)
+            ok("已恢复默认规则")
+        elif c == "d":
+            i = ask("删第几条").strip()
+            if i.isdigit() and 1 <= int(i) <= len(rules):
+                gone = rules.pop(int(i) - 1)
+                save_ms_state(lib_rules=rules)
+                ok(f"已删掉「{gone['name']}」")
+            else:
+                warn("序号不对。")
+        elif c == "a":
+            nm = ask("媒体库叫什么").strip()
+            kw = [x.strip() for x in
+                  re.split(r"[,，\s]+", ask("匹配哪些关键词（逗号隔开）")) if x.strip()]
+            if not nm or not kw:
+                warn("库名和关键词都不能空。")
+                continue
+            print(f"  {DIM}内容类型：1 电影　2 电视剧　"
+                  f"（剧集选错成电影的话，每一集会变成一部独立电影）{RST}")
+            t = "tvshows" if ask("选", "1").strip() == "2" else "movies"
+            mt = ask_yn("这个库要开 MetaTube（按番号刮成人片）吗？", False)
+            rules.append({"name": nm, "kw": kw, "type": t, "mt": mt})
+            save_ms_state(lib_rules=rules)
+            ok(f"已加「{nm}」")
+        elif c == "y":
+            if not plan:
+                warn("没有可建的，先加关键词。")
+                continue
+            print()
+            print(f"  {DIM}建库不会动你已有的库；同名但不是脚本建的，只会印出来"
+                  f"让你自己加。{RST}")
+            mt_libs = [n for n, (_t, _p, m) in plan.items() if m]
+            if metatube_on(d):
+                print(f"  {DIM}MetaTube 会【只】在 "
+                      f"{('「' + '」「'.join(mt_libs) + '」') if mt_libs else '（无）'}"
+                      f" 生效，其它库一律摘掉 —— 它会把动画认成 JAV。{RST}")
+            if not ask_yn("按上面建？", False):
+                continue
+            made, added = apply_libraries(d, key, plan)
+            ok(f"新建 {made} 个媒体库，补了 {added} 条路径")
+            if metatube_on(d):
+                ids = [i for n, i, _on, _o in metatube_libraries(key)
+                       if n in set(mt_libs)]
+                n_mt = set_metatube_libraries(key, ids)
+                if n_mt:
+                    ok(f"MetaTube 生效范围已调整（{n_mt} 个库有变化）")
+            print(f"  {DIM}回菜单点「4 生成媒体库」让 Emby 扫一次，"
+                  f"新库里的片子才会出来。{RST}")
+            return
+        else:
+            warn("不认识这个选项。")
+
+
 def library_targets(d, key):
     """能拿去建 Emby 媒体库的路径清单：[(容器内路径, 层级, strm 个数, 已被库覆盖)]。
 
@@ -6168,10 +6454,15 @@ def params_menu():
         tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
               else f"{DIM}刮削结果{RST}")
         print(f"  7. 片名用哪个            当前：{tp}")
+        _nrule = len(lib_rules())
+        print(f"  8. 按关键词自动建媒体库{DIM}（文件夹名匹配到就整个收进去，"
+              f"AV 类自动带 MetaTube）{RST}")
+        print(f"     {DIM}当前 {_nrule} 条规则："
+              f"{'、'.join(r['name'] for r in lib_rules())}{RST}")
         if metatube_on(d):
             mtl = [n for n, _i, on, _o in metatube_libraries(
                 read_emby_api_key(d) or "") if on]
-            print(f"  8. MetaTube 在哪些库生效  当前："
+            print(f"  9. MetaTube 在哪些库生效  当前："
                   + (f"{CYAN}{'、'.join(mtl)}{RST}" if mtl else f"{DIM}都不启用{RST}"))
         print("  0. 返回")
         print("-" * 60)
@@ -6193,6 +6484,8 @@ def params_menu():
         elif c == "7":
             set_title_policy()
         elif c == "8":
+            auto_libraries()
+        elif c == "9":
             d0 = ms_install_dir()
             k0 = (read_yaml_scalar(os.path.join(d0, "mediawarp", "config",
                                                 "config.yaml"), "auth")
