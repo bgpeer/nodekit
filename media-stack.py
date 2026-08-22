@@ -23,6 +23,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import string
 import subprocess
@@ -1198,6 +1199,34 @@ SYNC_HOUR_CST  = "05:45"
 # 不相关，理由见 do_keepalive() 的文档字符串。
 KEEPALIVE_MIN  = 20
 
+# ---- 定时任务的互斥和超时 ----------------------------------------------------
+# 【这段是踩出来的，别删】cron 的规矩是"到点就起，不管上一轮跑完没有"。三条任务
+# 原来都是裸命令，于是任何一轮卡住都会开始叠罗汉：
+#
+#   实测那次现场 —— free -m: available 186 MB、swap 1023/1023 吃满、视频放不了。
+#   docker stats 六个容器加起来才 1.8 G，看着人畜无害；真凶在 ps 里：
+#     1300940  EmbyServer
+#      149584  python3   ┐
+#      149364  python3   ├─ 十个宿主机上的 python3，每个 ~145 M，合计 1.35 G
+#      ...              ┘
+#   全是本脚本的 cron 进程。列目录慢的时候实测过 52 秒、还失败过，一旦某轮吊在
+#   网盘上不返回，20 分钟后照样再起一个。每个进程手里攥着几万条路径，堆一天
+#   就把 swap 顶穿 —— 而表现是"看片卡"，没有任何一行日志会说是自己造成的。
+#
+# 两道闸【必须都有】，少一道都不够：
+#   flock -n   同类任务同时只跑一个，后来的直接退出（不排队 —— 排队等于换个
+#              地方叠，而且下一轮的活它自己会做，本来就是幂等的）
+#   timeout    卡死的那个自己会被杀掉。只有 flock 的话，第一个吊死之后锁永远
+#              不放，从此再没有任何一轮能跑 —— 从"叠罗汉"换成"全停摆",一样糟
+CRON_LOCK_DIR  = "/run/lock"
+# 超时都压在【下一次触发之前】：宁可这轮少做点，也不能和下一轮撞上。
+# 三条任务本身都是幂等 + 带预算的，砍掉的部分下一轮会接着做。
+CRON_TIMEOUT   = {
+    "keepalive": KEEPALIVE_MIN * 60 - 120,   # 20 分钟一次 → 18 分钟
+    "warm":      WARM_EVERY_H * 3600 - 300,  # 每小时一次 → 55 分钟
+    "sync":      3 * 3600,                   # 每天一次，给足
+}
+
 
 def keepalive_state(d):
     try:
@@ -1451,6 +1480,132 @@ def hist_verdict(s):
     return "ok", None
 
 
+def cron_cmd(sub):
+    """拼一条 cron 用的命令：互斥 + 超时 + 调本脚本的某个子命令。
+
+    指向 os.path.realpath(__file__)：「更新」是原地替换这个文件的，所以 cron 会
+    一直调到最新版，不用回来改 cron.d。
+
+    flock 和 timeout 都属于 util-linux / coreutils，正常的 Debian、Ubuntu 上一定
+    有。但这脚本是给别人也能用的，容器化的精简系统里真见过缺 flock 的 —— 所以
+    这里【逐个探测】，缺哪个就少加哪层，绝不能因为少个命令让定时任务整个哑掉
+    （cron 里命令不存在是静默失败：没有报错，只是永远不跑）。
+    """
+    cmd = f"python3 {os.path.realpath(__file__)} {sub}"
+    if shutil.which("timeout"):
+        cmd = f"timeout {CRON_TIMEOUT[sub]} {cmd}"
+    lock_dir = CRON_LOCK_DIR
+    try:
+        os.makedirs(lock_dir, exist_ok=True)
+    except OSError:
+        lock_dir = "/tmp"               # 没有 /run/lock 的系统（非 systemd）
+    if shutil.which("flock"):
+        # -n = 拿不到锁就立刻退出（返回 1），不等待。cron 会吞掉这个返回值，
+        # 正是想要的：上一轮还在跑，这一轮什么都不做，安静走人。
+        cmd = f"flock -n {lock_dir}/media-stack-{sub}.lock {cmd}"
+    return cmd
+
+
+_TASK_LOCK_FH = None          # 必须活到进程结束：句柄一关，锁就放了
+
+
+def take_task_lock(sub):
+    """抢这个任务的互斥锁。拿到返回 True，已经有一轮在跑就返回 False。
+
+    和 cron.d 里的 flock 是同一把锁（同一个文件），两层拦一件事。用 fcntl 而不是
+    再 fork 一个 flock：锁跟着进程走，进程无论怎么死（被 timeout 杀、OOM、断电）
+    内核都会自动放锁，不会留下一把没人认领的锁把后面所有轮都挡在门外。
+    """
+    global _TASK_LOCK_FH
+    d = CRON_LOCK_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        d = "/tmp"
+    try:
+        import fcntl
+        fh = open(os.path.join(d, f"media-stack-{sub}.lock"), "w")
+    except (ImportError, OSError):
+        return True                     # 建不了锁文件就别拦 —— 拦错了等于任务全停
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False                    # 锁被占着 —— 上一轮还在跑，安静退出
+    _TASK_LOCK_FH = fh
+    return True
+
+
+def running_tasks():
+    """列出当前在跑的本脚本 cron 进程：[(pid, 子命令, 已跑秒数), ...]。
+
+    不用 psutil（不想为这一个功能加依赖），直接读 /proc。启动时刻取自
+    /proc/<pid>/stat 的第 22 个字段（单位是时钟嘀嗒），配 /proc/uptime 换成秒。
+
+    只认【本脚本 + 那三个 cron 子命令】的进程，并排除自己 —— 用户在菜单里手点
+    的那一份不算"后台任务"，误报成叠罗汉会让人去杀自己正在用的进程。
+    """
+    me, self_path = os.getpid(), os.path.realpath(__file__)
+    try:
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        up = float(open("/proc/uptime").read().split()[0])
+    except (OSError, ValueError):
+        return []
+    out = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) == me:
+            continue
+        try:
+            argv = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")
+            args = [a.decode("utf-8", "replace") for a in argv if a]
+            if len(args) < 3 or self_path not in args:
+                continue
+            sub = args[-1]
+            if sub not in CRON_TIMEOUT:
+                continue
+            # 【只认 python 本体】flock 和 timeout 是它的父进程，它们的 cmdline
+            # 里也带着脚本路径和子命令 —— 不滤掉的话一个任务会被数成三个，
+            # 体检当场报"叠了 3 个"，而实际一个都没叠。
+            if not os.path.basename(args[0]).startswith("python"):
+                continue
+            # stat 的进程名里可能带空格和括号，只能从最后一个 ')' 之后切
+            st = open(f"/proc/{pid}/stat").read()
+            fields = st[st.rindex(")") + 2:].split()
+            age = up - float(fields[19]) / hz          # 第 22 字段 = 下标 19
+            out.append((int(pid), sub, max(0, int(age))))
+        except (OSError, ValueError, IndexError):
+            continue                    # 进程刚好退出了 —— 正常，跳过
+    return sorted(out, key=lambda x: -x[2])
+
+
+def reap_stale_tasks():
+    """把还吊着的旧 cron 进程杀掉，返回杀掉的个数。
+
+    只在「更新」时跑一次。装了 flock 之后新的不会再叠，但【已经堆在内存里的
+    那些不会自己走】—— 它们是在没有 timeout 的年代起来的，会一直吊到重启。
+    用户看到的就是"更新完了内存还是满的"。
+
+    先 TERM 后 KILL：这些任务大多卡在网络读上，TERM 能让 Python 正常收尾
+    （写状态文件、放锁）。给 3 秒，还赖着才 KILL。
+    """
+    pids = [p for p, _s, _a in running_tasks()]
+    found = len(pids)
+    if not found:
+        return 0
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for p in pids:
+            try:
+                os.kill(p, sig)
+            except OSError:
+                pass                    # 已经没了
+        if sig is signal.SIGTERM:
+            time.sleep(3)
+            pids = [p for p, _s, _a in running_tasks()]
+            if not pids:
+                break
+    return found
+
+
 def install_keepalive(install_dir):
     """装保活定时任务。用 cron.d 而不是 crontab -e：这样卸载时删一个文件就干净了。"""
     try:
@@ -1458,10 +1613,8 @@ def install_keepalive(install_dir):
                f"# 把 token 和连接热着，避免第一次播放卡在「换直链」上转圈。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               # 指向当前正在跑的这份脚本：「更新」是原地替换这个文件的，
-               # 所以 cron 会一直调到最新版，不用回来改这条
-               f"*/{KEEPALIVE_MIN} * * * * root python3 {os.path.realpath(__file__)} "
-               "keepalive >/dev/null 2>&1\n")
+               f"*/{KEEPALIVE_MIN} * * * * root {cron_cmd('keepalive')} "
+               ">/dev/null 2>&1\n")
         with open(KEEPALIVE_CRON, "w") as f:
             f.write(txt)
         os.chmod(KEEPALIVE_CRON, 0o644)
@@ -1511,9 +1664,7 @@ def install_sync_cron(install_dir):
                f"（本机 {h:02d}:{m:02d}），在 AutoFilm 生成 strm 之后。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               # 和保活那条一样指向当前这份脚本：「更新」原地替换它，cron 自动跟到最新版
-               f"{m} {h} * * * root python3 {os.path.realpath(__file__)} "
-               "sync >/dev/null 2>&1\n")
+               f"{m} {h} * * * root {cron_cmd('sync')} >/dev/null 2>&1\n")
         with open(SYNC_CRON, "w") as f:
             f.write(txt)
         os.chmod(SYNC_CRON, 0o644)
@@ -1544,8 +1695,8 @@ def install_warm_cron(install_dir):
                f"#      省掉点播放时那几秒到几十秒的跨境等待\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               f"0 */{WARM_EVERY_H} * * * root python3 {os.path.realpath(__file__)} "
-               "warm >/dev/null 2>&1\n")
+               f"0 */{WARM_EVERY_H} * * * root {cron_cmd('warm')} "
+               ">/dev/null 2>&1\n")
         with open(WARM_CRON, "w") as f:
             f.write(txt)
         os.chmod(WARM_CRON, 0o644)
@@ -2651,6 +2802,13 @@ def do_update(from_menu=False):
     # CLI 也要跟着换:它是脚本生成的,里面的命令逻辑会随版本变
     # (比如 strm 从"只重启容器"改成"真的跑一次任务")。不重装一遍就拿不到。
     install_cli(d)
+    # 先收尸再装新的。老版本的 cron 没有 flock/timeout，卡住的那些会一直吊着
+    # 占内存（实测叠到十个、1.35 G、swap 吃满）—— 光把 cron.d 换成带锁的版本
+    # 治不了已经堆在那里的，用户会以为更新没用。
+    stale = reap_stale_tasks()
+    if stale:
+        ok(f"清掉 {stale} 个卡住的后台任务进程{DIM}（老版本没装互斥锁，"
+           f"卡住的那轮会一直吊着占内存）{RST}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
@@ -5669,7 +5827,65 @@ def set_scan_paths():
     save_ms_state(scan_spec=spec)
     subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
     ok(f"已改成 {len(paths)} 条扫描路径，AutoFilm 已重启")
+    drop_orphan_strm_dirs(d, paths)
     print(f"  {DIM}回菜单点「4 生成媒体库」立刻扫一次，或等每天定时任务。{RST}")
+
+
+def drop_orphan_strm_dirs(d, paths):
+    """把不再属于任何扫描路径的主目录清掉（问过之后）。
+
+    【缩小扫描范围原来是个没有效果的按钮】—— 这是实测撞出来的，而且撞得很难看：
+    去掉一个网盘之后，它那两万多个 strm 一个都不会少。prune 也救不了，因为
+    prune 只删「网盘上明确不存在」的文件，而那个盘还好好地挂在 OpenList 上、
+    文件也都还在 —— 它只是不该再进媒体库了。于是：
+
+      · Emby 继续刮削这几万个条目，继续吃内存和 CPU
+      · 体检里「没时长 3 万个」「没收录 700 个」这些数字继续涨
+      · 每轮核对失效 strm 要走 2976 个目录，预算全花在已经不要的盘上
+
+    用户以为自己做了减法，实际什么都没减 —— 这比按钮不存在更坏。
+
+    删之前【必须问】，而且默认否：这是这整个脚本里少数几个真的删用户文件的
+    地方。删的只是本地生成的 strm 和刮削缓存，网盘上的片子一个都不碰。
+    """
+    keep = {m for m in (strm_mount_dir(p) for p in paths) if m}
+    root = strm_root(d)
+    try:
+        orphans = sorted(x for x in os.listdir(root)
+                         if os.path.isdir(os.path.join(root, x)) and x not in keep)
+    except OSError:
+        return
+    if not orphans:
+        return
+    sizes = {}
+    for x in orphans:
+        n = 0
+        for _dp, _dn, fs in os.walk(os.path.join(root, x)):
+            n += sum(1 for f in fs if f.endswith(".strm"))
+        sizes[x] = n
+    print()
+    warn(f"这 {len(orphans)} 个主目录已经不在扫描范围里了，但它们的 strm 还在本地：")
+    for x in orphans:
+        print(f"  {DIM}·{RST} {x}　{BOLD}{sizes[x]}{RST} 个 strm")
+    print(f"  {DIM}留着的话 Emby 会继续刮削它们、继续占内存，体检里那些"
+          f"「没时长」「没收录」的数字也会一直挂着。{RST}")
+    print(f"  {DIM}删掉的只是本机生成的 strm 和刮削缓存，{RST}"
+          f"{BOLD}网盘里的片子一个都不碰{RST}{DIM}。{RST}")
+    if not ask_yn(f"把这 {sum(sizes.values())} 个 strm 从本地删掉？", False):
+        print(f"  {DIM}留着。以后想清，再进这里改一次扫描路径就会再问。{RST}")
+        return
+    gone = 0
+    for x in orphans:
+        try:
+            shutil.rmtree(os.path.join(root, x))
+            gone += sizes[x]
+        except OSError as e:
+            warn(f"{x} 没删干净：{_short_err(e)}")
+    ok(f"删掉 {gone} 个 strm")
+    print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 —— 「4 生成媒体库」"
+          f"最后会通知扫描，每小时的对齐任务也会做。{RST}")
+    print(f"  {YELLOW}媒体库本身还在 Emby 里{RST}{DIM}，路径指向的目录现在是空的。"
+          f"不想要就去 Emby 的「媒体库」里把它删掉。{RST}")
 
 
 def set_title_policy():
@@ -6230,9 +6446,13 @@ def probe_302(key, own_host="", want_kind=""):
             items = (json.load(resp).get("Items") or [])
     except Exception as e:
         return "skip", f"取不到媒体条目（{_short_err(e)}）"
-    item = next((i for i in items if STRM_PATH in str(i.get("Path", ""))), None)
+    item = next((i for i in items if _under(str(i.get("Path", "")), STRM_PATH)), None)
     if not item:
         return "skip", "媒体库里还没有网盘条目"
+
+    # 这一部属于哪个挂载点。多盘的时候必须报出来 —— 见下面「内部地址」那一支
+    rel = str(item.get("Path", ""))[len(STRM_PATH):].lstrip("/")
+    probed_mount = rel.split("/")[0] if rel else ""
 
     iid = item.get("Id")
     url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
@@ -6248,10 +6468,13 @@ def probe_302(key, own_host="", want_kind=""):
         loc = e.headers.get("Location", "")
         host = loc.split("/")[2] if "://" in loc else loc[:40]
         bare = host.split(":")[0]
-        internal = (bare in ("openlist", "emby", "mediawarp", "localhost")
-                    or _is_private_ip(bare))
-        if internal:
-            return "bad", f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
+        if _is_internal_host(host):
+            # 【必须报是哪个盘】这条以前只说「302 → 内部地址」，用户在多盘环境里
+            # 无从知道是哪一个 —— 而它测的只是媒体库里排在前面的那一部，
+            # 换个盘的片子可能完全正常。实测那次三个盘里只有 WebDAV 那个是坏的，
+            # 光看这行会以为整套 302 都废了。
+            return "bad", (f"302 → {host}  {RED}内部地址，客户端连不上{RST}"
+                           f"{DIM}（测的是 {probed_mount or '?'} 里的片子）{RST}")
 
         # 第一跳落在自己的 OpenList 公网域名上 —— 这是 URL 形式 strm 的正常形态,
         # 但还没到网盘。必须再跟一跳才知道后半段通不通:只看第一跳的话,
@@ -6267,7 +6490,7 @@ def probe_302(key, own_host="", want_kind=""):
                 loc = e2.headers.get("Location", "")
                 host = loc.split("/")[2] if "://" in loc else loc[:40]
                 bare = host.split(":")[0]
-                if bare in ("openlist", "emby", "mediawarp", "localhost") or _is_private_ip(bare):
+                if _is_internal_host(host):
                     return "bad", f"第二跳 → {host}  {RED}内部地址，客户端连不上{RST}"
                 two_hop = True
             except Exception as ex:
@@ -6308,6 +6531,17 @@ def _is_private_ip(ip):
         except (IndexError, ValueError):
             return False
     return False
+
+
+def _is_internal_host(host):
+    """这个 host（可能带端口）是不是「只有本机能连」的地址。
+
+    直链和 302 两处都要判，判法必须一致 —— 曾经各写各的，结果同一个
+    127.0.0.1:5244 在「换直链」那行是绿的、在「302 直链」那行是红的。
+    """
+    bare = host.split(":")[0]
+    return (bare in ("openlist", "emby", "mediawarp", "localhost")
+            or _is_private_ip(bare))
 
 
 def public_visitors(limit=20000):
@@ -6699,6 +6933,21 @@ def do_healthcheck():
                 todo.append((f"{mount} 换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
                              "网盘接口到本机的线路问题，服务端改不了；"
                              "缓存已开 2h，同一部片只慢第一次"))
+            elif _is_internal_host(raw.split("/")[2]):
+                # 【快 ≠ 通】实测撞过：一屏上「换直链 /七米蓝影视 ✔ 0.0 秒 →
+                # 127.0.0.1:5244」和「302 直链 ✖ 内部地址，客户端连不上」并排，
+                # 而红的那行还把锅甩给了 autofilm 的 public_url。0.0 秒恰恰是
+                # 症状 —— 它根本没去网盘换，直接把 OpenList 自己的地址回来了。
+                # 代理型存储（WebDAV、本地盘这些没有 CDN 直链的驱动）就是这样：
+                # 视频要经 OpenList 中转，外网客户端拿到这个地址只会连不上。
+                _hc(label, "bad", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
+                                  f"{RED}本机地址，外网放不了{RST}")
+                todo.append((
+                    f"{mount} 换出来的「直链」是本机地址（{raw.split('/')[2]}）——"
+                    f"这个盘的片子在外网点开会一直连不上",
+                    "这类驱动（WebDAV、本地目录等）在网盘那边没有 CDN 直链，"
+                    "OpenList 只能自己中转，302 也就没法指向外部。"
+                    "和 public_url 无关，其它盘不受影响"))
             elif el > 2:
                 _hc(label, "warn",
                     f"{el:.1f} 秒  偏慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
@@ -6756,9 +7005,16 @@ def do_healthcheck():
                          "检查 mediawarp/config.yaml 的 http_strm.enable 是不是 true、"
                          f"prefix_list 是不是 {STRM_PATH}；「6 更新」会重新生成"))
         elif "内部地址" in msg302:
-            todo.append(("302 指向了容器内部地址，播放器连不上",
-                         "autofilm 的 public_url 要填播放器能访问的地址；"
-                         "「6 更新」会重新生成这份配置"))
+            # 【别一口咬定 public_url】这条以前只有那一个说法，而实测撞到的是
+            # 另一个原因：被测的那部片在 WebDAV 挂载上，那类驱动在网盘侧根本
+            # 没有 CDN 直链，OpenList 只能回自己的地址 —— 改多少次 public_url
+            # 都没用，而其它盘（115、夸克）当时是好的。所以先看上面「换直链」
+            # 那几行：某个盘单独红，就是那个盘的驱动决定的，不是配置错了。
+            todo.append(("302 指向了本机地址，播放器连不上",
+                         "先对照上面「换直链」那几行：如果只有某一个盘的直链是"
+                         "本机地址，那是那个盘的驱动（WebDAV、本地目录这类）没有"
+                         "CDN 直链，改配置没用；如果所有盘都这样，才是 autofilm 的"
+                         "public_url 填成了内部地址，「6 更新」会重新生成"))
         else:
             todo.append(("302 没生成", "多半是上一行的换直链失败，等线路恢复再试"))
 
@@ -6806,19 +7062,35 @@ def do_healthcheck():
             _mi[_k] = int(_v.split()[0]) // 1024          # MiB
         _tot = _mi.get("MemTotal", 0)
         _av = _mi.get("MemAvailable", 0)
+        # 【必须报 MemAvailable，不能报 used】面板（GreenCloud 那种）算的是
+        # used，把 buff/cache 也算进去，于是常年显示 80%+ 吓人；反过来也踩过 ——
+        # 我拿"缓存假象"解释过一次真的爆内存，结果 buff/cache 只有 339 MB。
+        # MemAvailable 是内核自己算的"现在还能拿去用多少"，缓存能回收的部分
+        # 已经算在里面了，只认它。
+        _swt, _swf = _mi.get("SwapTotal", 0), _mi.get("SwapFree", 0)
         if _tot:
             _pct = _av * 100 // _tot
             _n_strm = strm_count(d)
             _st = "ok" if _pct >= 25 else ("warn" if _pct >= 12 else "bad")
+            # swap 吃满是个独立的坏信号：真到这一步，机器已经在拿硬盘当内存用，
+            # 播放卡顿是必然的 —— 哪怕 MemAvailable 看着还有一点余量
+            _sw = ""
+            if _swt and _swf * 100 // _swt <= 10:
+                _st = "bad"
+                _sw = f"   {YELLOW}swap 也吃满了（{_swt} MiB）{RST}"
             _hc("内存", _st, f"可用 {_av} MiB / {_tot} MiB（{_pct}%）"
-                             + (f"   {DIM}{_n_strm} 个 strm{RST}" if _n_strm else ""))
+                             + (f"   {DIM}{_n_strm} 个 strm{RST}" if _n_strm else "")
+                             + _sw)
             if _st != "ok":
                 todo.append((f"内存只剩 {_pct}%（{_av} MiB）—— 这时候播放会失败，"
                              f"而链路各项还是绿的：不是链路坏了，是整台机器没内存了",
-                             f"多半是 Emby 在刮削 {_n_strm} 个条目。"
-                             f"docker restart emby 先止血；"
-                             f"要长期稳，把大库从扫描路径里去掉、"
-                             f"或者在 Emby 里删掉那个媒体库"))
+                             # 【别先入为主怪 Emby】实测那次就是这么判断错的：
+                             # 一看"扫库 + 卡死"就归因给刮削，而 ps 摆出来真凶是
+                             # 十个叠在一起的 cron 进程。所以这里给的是分辨的办法，
+                             # 不是结论 —— 容器和宿主机进程都要看一眼。
+                             "先看下面「后台在跑」里那行「任务并发」。然后两条一起跑，"
+                             "谁大谁是凶手：docker stats --no-stream 看容器，"
+                             "ps -eo rss,comm --sort=-rss | head 看宿主机进程"))
     except (OSError, ValueError):
         pass
 
@@ -7004,6 +7276,37 @@ def do_healthcheck():
                 _hc("剧集布局", "ok", f"{len(_eps)} 组剧集，都在电视剧库里")
 
     _hc_group("后台在跑", "这些是定时任务，红了不影响当下播放")
+
+    # ---- 任务有没有叠罗汉 ----
+    # 【这一项优先于下面所有】：它红了的时候，其它几项全是绿的 —— 保活"5 分钟前
+    # 成功"、预热"已装"、对齐"跑过"，看上去无懈可击，而机器已经被自己的定时任务
+    # 吃穿了内存。实测现场：十个进程 1.35 G、swap 满、视频放不了，体检从头绿到尾。
+    # 分组上它属于"后台在跑"，但影响是实打实的播放中断，所以 todo 里按高优先给。
+    tasks = running_tasks()
+    if not tasks:
+        _hc("任务并发", "ok", f"没有正在跑的后台任务{DIM}（都装了互斥锁，"
+                              f"同类任务同时只跑一个）{RST}")
+    else:
+        by_sub = {}
+        for _p, sub, age in tasks:
+            by_sub.setdefault(sub, []).append(age)
+        desc = "、".join(f"{s}×{len(a)}（最久 {a[0] // 60} 分钟）"
+                         for s, a in sorted(by_sub.items()))
+        piled = [s for s, a in by_sub.items() if len(a) > 1]
+        # 超时是按"下一次触发之前"设的，所以跑过头 = timeout 没生效（缺 coreutils，
+        # 或者这进程是装 flock 之前起来的）
+        overdue = [s for s, a in by_sub.items() if a[0] > CRON_TIMEOUT[s]]
+        if piled or overdue:
+            _hc("任务并发", "bad",
+                f"{len(tasks)} 个后台任务同时在跑：{desc}"
+                f"{DIM}（每个要占一百多兆内存）{RST}")
+            todo.insert(0, (
+                f"后台定时任务叠了 {len(tasks)} 个 —— 每个进程要占一百多兆内存，"
+                f"堆多了会把内存和 swap 吃穿，表现就是「视频放不了」",
+                "跑一次「6 更新」：会先杀掉卡住的，再给三条 cron 装上互斥锁和超时。"
+                "急的话先手动清：pkill -f 'media-stack.py (keepalive|warm|sync)'"))
+        else:
+            _hc("任务并发", "ok", f"{desc}{DIM}（各一个，正常）{RST}")
 
     # ---- 保活 ----
     ka = keepalive_state(d)
@@ -7198,12 +7501,20 @@ if __name__ == "__main__":
             show_info()
         elif arg in ("check", "doctor", "healthcheck"):
             do_healthcheck()
+        # 三条 cron 子命令都先抢锁。cron.d 里已经用 flock -n 拦了一层，这里是
+        # 第二层：flock 属于 util-linux，正常系统都有，但少了它就没人拦 ——
+        # 而没人拦的后果实测过，是十个进程叠在一起把内存吃穿。锁在自己手里更稳。
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
-            do_keepalive()
+            if take_task_lock("keepalive"):
+                do_keepalive()
         elif arg == "sync":               # cron 调的每日对齐，同样不交互
-            require_root(); do_sync()
+            require_root()
+            if take_task_lock("sync"):
+                do_sync()
         elif arg == "warm":               # cron 调的直链预热
-            require_root(); do_warm()
+            require_root()
+            if take_task_lock("warm"):
+                do_warm()
         elif arg == "update":
             do_update()
         elif arg == "update-menu":        # 菜单里点的更新，且中途自我更新过；跑完回菜单
