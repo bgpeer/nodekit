@@ -7202,6 +7202,37 @@ def do_healthcheck():
             else:
                 _hc("Emby 媒体库", "ok", f"{len(libs)} 个库")
 
+            # ---- 空壳媒体库 ----
+            # 【删了 strm 不等于删了条目】。Emby 的条目活在它自己的数据库里，
+            # 只有扫描时发现文件没了才会删 —— 而扫描要库还在、路径还在。
+            # 把一个网盘从扫描范围里去掉、strm 清光之后，那个库指着一个空目录
+            # 杵在 Emby 里，首页轮播和「继续观看」照样推它的片，海报缓存也还占着盘。
+            # 实测就是这样：本地只剩 7 个 strm（全是夸克的），Emby 首页最大那张
+            # 却是一场 2026 年的拳赛 —— 早就删掉的那个盘留下的条目。
+            # 用户能看见的只有"垃圾还在"，看不出它在哪儿、为什么清不掉。
+            empty = []
+            for _lb in libs:
+                _ls = [p for p in (_lb.get("Locations") or []) if _under(p, STRM_PATH)]
+                if not _ls:
+                    continue                # 用户自己的本地库，不归这儿管
+                n_strm = 0
+                for p in _ls:
+                    rel = [x for x in p[len(STRM_PATH):].split("/") if x]
+                    for _dp, _dn, _fs in os.walk(
+                            os.path.join(strm_root(d), STRM_SUBDIR, *rel)):
+                        n_strm += sum(1 for f in _fs if f.endswith(".strm"))
+                if not n_strm:
+                    empty.append(_lb.get("Name") or "?")
+            if empty:
+                _hc("空壳媒体库", "warn",
+                    f"{'、'.join(empty)}  {YELLOW}目录里一个 strm 都没有{RST}")
+                todo.append((
+                    f"媒体库「{empty[0]}」指向的目录已经空了，但 Emby 里的条目还在 —— "
+                    f"首页轮播、「继续观看」还会推这些片，点开必然放不了",
+                    f"Emby → 设置 → 媒体库 → 「{empty[0]}」→ 删除。"
+                    f"删库会把条目和刮好的海报一起带走，比等它自己扫干净快。"
+                    f"要是这个库还想留着，就把对应的网盘加回扫描路径"))
+
             # 元数据语言留空 = 跟服务器默认走(通常是 en)。中文片名拿去 TMDb 的英文
             # 索引里搜是搜不到的,表现为「条目都在、一张海报都没有」,而且这个设置藏在
             # 建库那一屏里,建完之后基本没人会回去看,所以单独拎出来报一条。
