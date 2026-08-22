@@ -1517,28 +1517,38 @@ def hist_verdict(s):
 
 
 def cron_cmd(sub):
-    """拼一条 cron 用的命令：互斥 + 超时 + 调本脚本的某个子命令。
+    """拼一条 cron 用的命令：超时 + 调本脚本的某个子命令。
 
     指向 os.path.realpath(__file__)：「更新」是原地替换这个文件的，所以 cron 会
     一直调到最新版，不用回来改 cron.d。
 
-    flock 和 timeout 都属于 util-linux / coreutils，正常的 Debian、Ubuntu 上一定
-    有。但这脚本是给别人也能用的，容器化的精简系统里真见过缺 flock 的 —— 所以
-    这里【逐个探测】，缺哪个就少加哪层，绝不能因为少个命令让定时任务整个哑掉
-    （cron 里命令不存在是静默失败：没有报错，只是永远不跑）。
+    【这里【不能】再套一层 flock(1)】—— 上一版套了，结果把三条定时任务全锁死：
+
+        flock -n /run/lock/media-stack-keepalive.lock timeout 1080 python3 … keepalive
+
+    外层 flock(1) 已经拿着那个文件的独占锁，它 exec 出来的 python 又去
+    take_task_lock() 抢【同一个文件】。flock 锁是跟着 open file description 走的，
+    python 是重新 open 的，属于另一个描述，于是必然冲突 —— LOCK_NB 直接失败，
+    子命令一次都没跑成。实测验证过：
+
+        $ flock -n /tmp/x.lock python3 -c "…fcntl.flock(open('/tmp/x.lock','w'), …)"
+        BlockingIOError
+
+    症状极其隐蔽：cron 每 20 分钟照常起、照常退出，退出码还是 0（flock 吞掉了），
+    日志一个字没有。体检里那行写着「链路保活 ✔ 719 分钟前成功」—— 绿的，
+    因为它只报"上次几点跑的"，不判断"这个间隔是不是早就该跑了"。
+    那条过期判断是同一批补上的，见 _stale_note()。
+
+    互斥交给进程内那把 fcntl 锁（take_task_lock）就够了，而且更好：
+      · 不依赖 util-linux 装没装
+      · 进程无论怎么死（被 timeout 杀、OOM、断电），内核都会自动放锁，
+        不会留下一把没人认领的锁把后面所有轮挡在门外
+
+    timeout 留着：它管的是"卡死的自己会被杀掉"，和互斥是两件事。
     """
     cmd = f"python3 {os.path.realpath(__file__)} {sub}"
     if shutil.which("timeout"):
         cmd = f"timeout {CRON_TIMEOUT[sub]} {cmd}"
-    lock_dir = CRON_LOCK_DIR
-    try:
-        os.makedirs(lock_dir, exist_ok=True)
-    except OSError:
-        lock_dir = "/tmp"               # 没有 /run/lock 的系统（非 systemd）
-    if shutil.which("flock"):
-        # -n = 拿不到锁就立刻退出（返回 1），不等待。cron 会吞掉这个返回值，
-        # 正是想要的：上一轮还在跑，这一轮什么都不做，安静走人。
-        cmd = f"flock -n {lock_dir}/media-stack-{sub}.lock {cmd}"
     return cmd
 
 
@@ -4110,6 +4120,17 @@ def strm_dirs_uncovered(d, key):
 
     体检原来查的是「有没有库和 strm 根目录沾边」，用的还是字符串前缀 ——
     指向子目录的库照样算通过，于是这个故障从头到尾都是绿灯。
+
+    【但反过来也不能只看顶层目录在不在库里】—— 那样会误报，而且是很难堪的
+    误报：同一屏上「Emby 收录 ✔ 7 个 strm 都收进去了」，紧挨着
+    「Emby 媒体库 ✖ 1 个文件夹没被任何库覆盖：quark」。两行直接打架。
+
+    原因是库指向 cloud/quark/电影 而不是 cloud/quark，于是顶层的 quark 判为
+    "没被覆盖" —— 可它底下每一个 strm 都在库里。strm 树改成镜像网盘目录之后，
+    库指向更深的一层是常态，按顶层判必错。
+
+    所以判据只能是【有没有 strm 文件落在所有库范围之外】，再把这些文件归到
+    它所在的顶层目录报出来。没有这种文件就是绿的，和「Emby 收录」那行天然一致。
     """
     locs = [p for _n, ps in emby_lib_locations(key) for p in ps]
     if not locs:
@@ -4124,8 +4145,17 @@ def strm_dirs_uncovered(d, key):
                       if os.path.isdir(os.path.join(base, x)))
     except OSError:
         return []
-    return [x for x in subs
-            if not any(_under(f"{STRM_PATH}/{x}", L) for L in locs)]
+    out = []
+    for top in subs:
+        for dp, _dn, fs in os.walk(os.path.join(base, top)):
+            if not any(f.endswith(".strm") for f in fs):
+                continue                # 空目录不算 —— 里面没有片子会被漏掉
+            rel = os.path.relpath(dp, base).replace(os.sep, "/")
+            cpath = STRM_PATH if rel == "." else f"{STRM_PATH}/{rel}"
+            if not any(_under(cpath, L) for L in locs):
+                out.append(top)
+                break                   # 这个顶层目录已经有片子在库外，够了
+    return out
 
 
 def report_not_in_emby(d, key):
@@ -6095,6 +6125,26 @@ def _hc_group(title, why):
     print(f"\n  {BOLD}{title}{RST}  {DIM}{why}{RST}")
 
 
+def _stale_note(elapsed_min, every_min, what):
+    """定时任务「早就该跑了」的判定。返回 (状态, 补充说明)。
+
+    【只报"上次几点跑的"是不够的】—— 实测吃过一次大亏：cron 里多套了一层
+    flock，三条定时任务全被锁死，一次都没跑成，而体检那行写的是
+
+        链路保活   ✔ 719 分钟前成功，耗时 0.4 秒
+
+    绿的。"719 分钟前"这个数字明明摆在那儿，可 ✔ 让人一眼扫过去就跳过了 ——
+    每 20 分钟一次的任务停了 12 小时，体检一声不吭。
+
+    阈值取【间隔的 3 倍】：cron 偶尔被负载挤晚一两轮很正常，报了是噪音；
+    连着丢三轮就不是抖动，是真的不跑了。
+    """
+    if elapsed_min <= every_min * 3:
+        return "ok", ""
+    return "bad", (f"　{RED}每 {what} 该跑一次，已经 "
+                   f"{elapsed_min // 60} 小时没跑了{RST}")
+
+
 def _hc_wait(label, secs):
     """慢检查开始前先把行占上，让人看得见它在等什么、要等多久。
 
@@ -7425,8 +7475,18 @@ def do_healthcheck():
         _hc("链路保活", "skip", f"已装，还没跑过（每 {KEEPALIVE_MIN} 分钟一次）")
     else:
         mins = int((time.time() - ka.get("ts", 0)) / 60)
+        st, note = _stale_note(mins, KEEPALIVE_MIN, f"{KEEPALIVE_MIN} 分钟")
         if ka.get("ok"):
-            _hc("链路保活", "ok", f"{mins} 分钟前成功，耗时 {ka.get('elapsed', 0)} 秒")
+            _hc("链路保活", st,
+                f"{mins} 分钟前成功，耗时 {ka.get('elapsed', 0)} 秒{note}")
+            if st == "bad":
+                todo.append((
+                    f"链路保活该每 {KEEPALIVE_MIN} 分钟跑一次，实际已经 "
+                    f"{mins // 60} 小时没跑了 —— 定时任务没在工作",
+                    "先看 cron 装没装：cat /etc/cron.d/media-stack-keepalive；"
+                    "手动跑一次看报什么错："
+                    f"python3 {os.path.realpath(__file__)} keepalive；"
+                    "跑一次「6 更新」会按当前版本重装这三条 cron"))
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
@@ -7464,8 +7524,15 @@ def do_healthcheck():
                     did.append(f"{YELLOW}还有 {sy['nodur_after']} 个没时长{RST}")
                 if sy.get("missing"):
                     did.append(f"{YELLOW}{sy['missing']} 个没被 Emby 收录{RST}")
-                _hc("每日对齐", "ok",
-                    f"{when}跑过  {'、'.join(did) if did else '没有需要处理的'}")
+                st2, note2 = _stale_note(int(hrs * 60), 24 * 60, "天")
+                _hc("每日对齐", st2,
+                    f"{when}跑过  {'、'.join(did) if did else '没有需要处理的'}{note2}")
+                if st2 == "bad":
+                    todo.append((
+                        f"每日对齐该一天跑一次，实际已经 {hrs:.0f} 小时没跑了 —— "
+                        f"新建的媒体库、新加的片子不会自动补时长和续播门槛",
+                        "和上面「链路保活」多半是同一个原因（cron 没在工作）。"
+                        "跑一次「6 更新」会重装这三条 cron"))
     else:
         _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「4 生成媒体库」")
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
