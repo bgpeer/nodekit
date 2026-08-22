@@ -2243,9 +2243,18 @@ def apply_libraries(d, key, plan):
     """
     mine = set(ms_state().get("lib_auto") or [])
     exist = {n: (ps, t) for n, ps, t in emby_libs(key)}
-    made, added, skipped = [], 0, []
+    made, added, skipped, overlap = [], 0, [], []
     for name, (ctype, paths, _mt) in sorted(plan.items()):
         paths = sorted(set(paths))
+        # 【已经被别的库盖住的，绝对不能再建一个】否则同一个文件在 Emby 里会变成
+        # 两个条目 —— 而 Emby 的观看记录是按刮削身份存的，两个条目会共用一份
+        # 续播点，一个看过另一个也变成看过。那正是之前花了好几天修的"进度条串台"。
+        # 实测现场：用户手工建了一个「夸克」库指向整棵树，规则又要按分类建三个库。
+        dup = sorted({n for n, (ps, _t) in exist.items() if n != name
+                      for x in paths if any(_under(x, q) for q in ps)})
+        if dup:
+            overlap.append((name, dup, paths))
+            continue
         if name not in exist:
             err = _emby_add_library(key, name, ctype, paths)
             if err:
@@ -2272,6 +2281,17 @@ def apply_libraries(d, key, plan):
                 added += 1
     if made:
         save_ms_state(lib_auto=sorted(mine))
+    if overlap:
+        print()
+        warn("这些库没建 —— 要收的路径已经被别的媒体库盖住了：")
+        for name, dup, paths in overlap:
+            print(f"  {DIM}·{RST} {BOLD}{name}{RST}{DIM} 想收 "
+                  f"{'、'.join(x.split('/')[-1] for x in paths)}，"
+                  f"但已经在「{'」「'.join(dup)}」里了{RST}")
+        print(f"  {YELLOW}硬建的话同一部片会有两个条目，而它们共用一份观看进度"
+              f"{RST}{DIM}（一个看过另一个也变成看过，续播点互相串）。{RST}")
+        print(f"  {DIM}想按规则分类的话，先去 Emby 把上面那个大库删掉，再回来跑一次。"
+              f"删库不影响 strm 文件。{RST}")
     if skipped:
         print()
         warn("下面这些没有自动处理，需要你到 Emby 里手动加：")
@@ -2282,6 +2302,43 @@ def apply_libraries(d, key, plan):
                 print(f"      {x}")
         print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 / 编辑文件夹{RST}")
     return len(made), added
+
+
+def auto_libraries_apply(d, key, quiet=False):
+    """按规则把该建的媒体库建上。不问，不交互 —— 给「4 生成媒体库」用。
+
+    【这一步原来只挂在菜单里，是设计漏了】用户改完网盘文件夹名、点「4」，
+    期待的就是"扫完顺手把库建好"，结果什么都没发生 —— 因为规则只在
+    「3 后补参数 → 8」按 y 的时候才会跑。他的原话："他没有自动建库，
+    我为了让他自动建库我把名称都改了一下，可是他不但没有自动建库"。
+
+    不问是对的：只建【不存在的】库，不动用户已有的任何东西，重叠的直接跳过
+    并说明。没有需要建的时候一个字都不打印。
+    """
+    try:
+        rules, _src = lib_rules(d)
+        plan = plan_libraries(d, rules)
+    except Exception:
+        return
+    if not plan:
+        return
+    exist = {n for n, _ps, _t in emby_libs(key)}
+    if not any(n not in exist for n in plan):
+        return                      # 该建的都在了，安静走人
+    print()
+    info("按关键词规则建媒体库...")
+    made, added = apply_libraries(d, key, plan)
+    if made or added:
+        ok(f"新建 {made} 个媒体库，补了 {added} 条路径")
+        mt_libs = [n for n, (_t, _p, m) in plan.items() if m]
+        if metatube_on(d):
+            ids = [i for n, i, _on, _o in metatube_libraries(key) if n in set(mt_libs)]
+            if set_metatube_libraries(key, ids):
+                ok(f"MetaTube 只在 {'、'.join(mt_libs) or '（无）'} 生效")
+        emby_scan_wait(key, timeout=900)   # 新库要扫一次才有内容
+    if not quiet:
+        print(f"  {DIM}规则文件：{lib_rules_path(d)}"
+              f"（改仓库里那份，「6 更新」会拉下来）{RST}")
 
 
 def auto_libraries():
@@ -5638,6 +5695,7 @@ def do_strm():
         else:
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
         align_library(d, key)        # 库选项 + 补时长 + 片名 + 身份 + 脏进度
+        auto_libraries_apply(d, key)  # 按关键词规则把该建的库建上
         report_not_in_emby(d, key)
         # 【后台跑】跟「6 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
