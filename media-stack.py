@@ -782,7 +782,7 @@ cache:
   # 等于把 9 次赌博串进一次观影。
   # 夸克直链的 auth_key 实测有效期约 30 小时,缓存 2 小时安全余量很足,
   # 一部片子只需要成功换一次。
-  alist_api_ttl: 2h
+  alist_api_ttl: {LINK_TTL_H}h
   image_ttl: 10m
   subtitle_ttl: 2h
 
@@ -1229,6 +1229,20 @@ WARM_LIMIT     = 10     # 优先批热几部。「继续观看」里靠前的那
 # 按顺序轮着热，一轮一段，下一轮接着上一轮的位置往后走，转到头再从头开始。
 # 库小的时候（几部到几十部）一两轮就全热了；库大的时候也不会把哪一部长期落下。
 WARM_REST      = 20
+# MediaWarp 缓存直链的时长（小时）。改这个要同时改 gen_mediawarp_conf 里的
+# alist_api_ttl —— 下面那个门槛就是拿它算的。
+LINK_TTL_H     = 2
+# 【轮转全库只在小库上成立，大库上纯粹是白打接口】用户的直觉，算一下就清楚：
+#
+#   有效覆盖 = 每小时热几部 × 缓存能活几小时 = 20 × 2 = 任何时刻 40 部是热的
+#
+# 一万部的库轮一圈要 500 小时（21 天），等轮回来第一批早凉了 249 次。覆盖率
+# 0.4%，随便点一部命中的概率约等于零 —— 而代价是一天 480 次真实的换直链请求，
+# 全打在夸克那个"风控较严"的接口上。纯成本，零收益，还会把真正想看的那一部挤慢。
+#
+# 所以门槛就是"一圈能不能在缓存过期前跑完"。超了整批不做，只留优先批
+#（继续观看 + 最近新加）—— 那一批是按"最可能被点开"选的，多大的库都成立。
+WARM_ROTATE_MAX = WARM_REST * (LINK_TTL_H // WARM_EVERY_H)
 # 每部之间歇一下。AutoFilm 的配置里为同一个理由留了 wait_time: 0.2，注释写着
 # "夸克风控较严，别调成 0"。预热连着打十几个换直链请求，不隔开的话很可能被风控
 # 盯上 —— 那会连累列目录、播放一起超时，等于自己把自己的链路搞垮。
@@ -4880,6 +4894,28 @@ def do_strm():
     before = strm_count(d)
     print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
 
+    # 【有人在看片就先问一声】扫库和播放抢的是同一个网盘账号，而夸克风控很严。
+    # 实测撞过：AutoFilm 在扫的那两分钟里，同一条路径列目录要 20.5 秒，
+    # 扫描过去之后立刻再打是 0.4 秒 —— 快 50 倍。对正在看片的人来说，
+    # 这就是"好好看着突然卡住转圈"，而且他完全不知道是有人点了「4」。
+    # 定时那轮排在凌晨 05:15 正是为了避开，手动点这一下绕过了那个安排。
+    _k0 = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if _k0:
+        try:
+            if now_playing_ids(_k0):
+                print()
+                warn("现在有人在看片 —— 扫库和播放抢的是同一个网盘账号。")
+                print(f"  {DIM}实测扫描时同一条路径列目录要 20 秒，平时是 0.4 秒；"
+                      f"对方会感觉到卡顿甚至转圈打不开。{RST}")
+                print(f"  {DIM}不急的话等他看完，或者交给每天凌晨那轮自动扫"
+                      f"（新片最多晚一天进库）。{RST}")
+                if not ask_yn("还是现在就扫？", False):
+                    print("没有扫描。")
+                    return
+        except Exception:
+            pass            # 问不到就别拦着，这只是个提醒
+
     original = open(cfg_path, encoding="utf-8").read()
     hm = autofilm_clock()
     if hm is None:
@@ -6430,16 +6466,20 @@ def rest_items(key, uid, limit, cursor):
     续播点一律给 0：这批片子要么没看过、要么看完了，从头热就是待会儿要播的那段。
     """
     if limit <= 0:
-        return [], cursor
+        return [], cursor, 0
     try:
         r = _emby(f"/Users/{uid}/Items?Recursive=true"
                   f"&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources"
                   f"&SortBy=SortName&SortOrder=Ascending"
                   f"&StartIndex={max(0, int(cursor))}&Limit={limit}", key, timeout=30)
     except Exception:
-        return [], cursor
+        return [], cursor, 0
     items = r.get("Items") or []
     total = int(r.get("TotalRecordCount") or 0)
+    # 【库太大就整批不做】理由见 WARM_ROTATE_MAX 那段。这里返回空但把 total 带出去，
+    # 让调用方能说清楚"为什么不热"—— 静悄悄地什么都不做，下次没人知道是设计还是坏了。
+    if total > WARM_ROTATE_MAX:
+        return [], cursor, total
     nxt = max(0, int(cursor)) + limit
     if not total or nxt >= total:
         nxt = 0                         # 转完一圈（或者库是空的），从头再来
@@ -6450,7 +6490,7 @@ def rest_items(key, uid, limit, cursor):
         srcs = i.get("MediaSources") or []
         out.append((i.get("Id"), str(i.get("Name") or "?"), 0,
                     srcs[0] if srcs else {}))
-    return out, nxt
+    return out, nxt, total
 
 
 def latest_items(key, uid, limit=5):
@@ -6535,7 +6575,12 @@ def warm_links(d, key, limit=None):
     # 轮转位置存在状态文件里，下一轮接着走 —— 每轮都热前 N 部的话，库一大
     # 靠后的永远轮不到，等于没热。
     cur = int(ms_state().get("warm_cursor") or 0)
-    more, nxt = rest_items(key, uid, WARM_REST, cur)
+    more, nxt, total = rest_items(key, uid, WARM_REST, cur)
+    if total > WARM_ROTATE_MAX:
+        print(f"  {DIM}库里 {total} 部，超过轮转的意义范围（{WARM_ROTATE_MAX} 部）——"
+              f"只热「继续观看」和新加的。{RST}")
+        print(f"  {DIM}再多热也是白打网盘接口：热一部只能管 {LINK_TTL_H} 小时，"
+              f"轮一圈要 {total // max(1, WARM_REST)} 小时，轮回来早凉了。{RST}")
     for it in more:
         if str(it[0]) not in seen:
             cut.append(it)
