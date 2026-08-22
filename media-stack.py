@@ -5827,7 +5827,65 @@ def set_scan_paths():
     save_ms_state(scan_spec=spec)
     subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
     ok(f"已改成 {len(paths)} 条扫描路径，AutoFilm 已重启")
+    drop_orphan_strm_dirs(d, paths)
     print(f"  {DIM}回菜单点「4 生成媒体库」立刻扫一次，或等每天定时任务。{RST}")
+
+
+def drop_orphan_strm_dirs(d, paths):
+    """把不再属于任何扫描路径的主目录清掉（问过之后）。
+
+    【缩小扫描范围原来是个没有效果的按钮】—— 这是实测撞出来的，而且撞得很难看：
+    去掉一个网盘之后，它那两万多个 strm 一个都不会少。prune 也救不了，因为
+    prune 只删「网盘上明确不存在」的文件，而那个盘还好好地挂在 OpenList 上、
+    文件也都还在 —— 它只是不该再进媒体库了。于是：
+
+      · Emby 继续刮削这几万个条目，继续吃内存和 CPU
+      · 体检里「没时长 3 万个」「没收录 700 个」这些数字继续涨
+      · 每轮核对失效 strm 要走 2976 个目录，预算全花在已经不要的盘上
+
+    用户以为自己做了减法，实际什么都没减 —— 这比按钮不存在更坏。
+
+    删之前【必须问】，而且默认否：这是这整个脚本里少数几个真的删用户文件的
+    地方。删的只是本地生成的 strm 和刮削缓存，网盘上的片子一个都不碰。
+    """
+    keep = {m for m in (strm_mount_dir(p) for p in paths) if m}
+    root = strm_root(d)
+    try:
+        orphans = sorted(x for x in os.listdir(root)
+                         if os.path.isdir(os.path.join(root, x)) and x not in keep)
+    except OSError:
+        return
+    if not orphans:
+        return
+    sizes = {}
+    for x in orphans:
+        n = 0
+        for _dp, _dn, fs in os.walk(os.path.join(root, x)):
+            n += sum(1 for f in fs if f.endswith(".strm"))
+        sizes[x] = n
+    print()
+    warn(f"这 {len(orphans)} 个主目录已经不在扫描范围里了，但它们的 strm 还在本地：")
+    for x in orphans:
+        print(f"  {DIM}·{RST} {x}　{BOLD}{sizes[x]}{RST} 个 strm")
+    print(f"  {DIM}留着的话 Emby 会继续刮削它们、继续占内存，体检里那些"
+          f"「没时长」「没收录」的数字也会一直挂着。{RST}")
+    print(f"  {DIM}删掉的只是本机生成的 strm 和刮削缓存，{RST}"
+          f"{BOLD}网盘里的片子一个都不碰{RST}{DIM}。{RST}")
+    if not ask_yn(f"把这 {sum(sizes.values())} 个 strm 从本地删掉？", False):
+        print(f"  {DIM}留着。以后想清，再进这里改一次扫描路径就会再问。{RST}")
+        return
+    gone = 0
+    for x in orphans:
+        try:
+            shutil.rmtree(os.path.join(root, x))
+            gone += sizes[x]
+        except OSError as e:
+            warn(f"{x} 没删干净：{_short_err(e)}")
+    ok(f"删掉 {gone} 个 strm")
+    print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 —— 「4 生成媒体库」"
+          f"最后会通知扫描，每小时的对齐任务也会做。{RST}")
+    print(f"  {YELLOW}媒体库本身还在 Emby 里{RST}{DIM}，路径指向的目录现在是空的。"
+          f"不想要就去 Emby 的「媒体库」里把它删掉。{RST}")
 
 
 def set_title_policy():
