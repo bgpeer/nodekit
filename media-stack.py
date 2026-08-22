@@ -1962,22 +1962,139 @@ LIB_RULES_DEFAULT = [
     {"name": "电影",   "kw": ["电影", "movies", "movie"],           "type": "movies",  "mt": False},
     {"name": "电视剧", "kw": ["电视剧", "剧集", "连续剧", "tv"],     "type": "tvshows", "mt": False},
     {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False},
-    {"name": "日韩AV", "kw": ["日韩av", "av", "写真"],               "type": "movies",  "mt": True},
+    {"name": "AV影片", "kw": ["av", "写真", "番号"],                 "type": "movies",  "mt": True},
 ]
 LIB_TYPES = {"movies": "电影", "tvshows": "电视剧", "homevideos": "家庭影像", "": "混合"}
 
 
-def lib_rules():
-    """当前的关键词规则。用户改过就用改过的，没改过用默认。"""
-    v = ms_state().get("lib_rules")
-    if not isinstance(v, list) or not v:
-        return [dict(r) for r in LIB_RULES_DEFAULT]
-    out = []
-    for r in v:
-        if isinstance(r, dict) and r.get("name") and r.get("kw"):
-            out.append({"name": str(r["name"]), "kw": [str(x) for x in r["kw"]],
-                        "type": str(r.get("type") or ""), "mt": bool(r.get("mt"))})
-    return out or [dict(r) for r in LIB_RULES_DEFAULT]
+LIB_RULES_FILE = "library-rules.yaml"
+LIB_RULES_HEADER = """\
+# media-stack 媒体库关键词规则
+#
+# 文件夹名匹配到关键词，就把这个文件夹【整个】收进对应的媒体库。
+# 改完回「3 后补参数 → 8」跑一次就生效，不用重启任何东西。
+#
+# 每条规则四个字段：
+#   name      媒体库在 Emby 里显示的名字
+#   type      movies（电影）或 tvshows（电视剧）
+#             ⚠ 剧集用 movies 的话，每一集会变成一部独立电影，没有季集结构
+#   metatube  true 时这个库启用 MetaTube（按番号刮成人片）
+#             ⚠ 只给真的是成人片的库开。它会把动画认成 JAV —— 实测发生过
+#   keywords  逗号隔开，大小写不敏感
+#
+# 关于关键词怎么写：
+#   · 中文按【子串】匹配 —— 写「电影」能命中「我的电影」「电影合集」
+#   · 纯英文按【整词】匹配 —— 写 av 不会命中 Java、Savage、上海AVI
+#     （不卡这一下的话，那些文件夹会被塞进成人库还自动开上 MetaTube）
+#   · 匹配到就【不再往下钻】：/quark/电影/仙逆 命中「电影」之后，
+#     仙逆归它管，不会再单独建一个库
+#   · 从上往下第一个命中的规则赢，所以窄的关键词往前放
+#
+# 想收自己的文件夹，就把文件夹名里的词加进来。比如网盘里叫「美女动作片」，
+# 那就给 AV影片 加一个关键词「美女动作片」。
+# ⚠ 别只加「动作片」—— 那会把成龙、甄子丹那些正经动作片也收进成人库、
+#   还给它们开上 MetaTube。关键词越窄越安全。
+
+"""
+
+
+def lib_rules_path(d):
+    return os.path.join(d, LIB_RULES_FILE)
+
+
+def parse_lib_rules(text):
+    """解析规则文件。返回规则列表；解析不出来就返回空。
+
+    【不用 YAML 库】这脚本一路下来都没有第三方依赖，为了一个配置文件引入
+    PyYAML 不划算 —— 而且用户机器上装没装是个未知数，import 失败的话
+    整个菜单就打不开了。这里只认自己写出来的那个形状（一条规则一个 - 块，
+    底下 key: value），它同时也是合法 YAML，用户拿编辑器高亮着改没问题。
+
+    解析【只跳过看不懂的行，不抛异常】：配置文件是给人手改的，改坏一个字符
+    就让脚本崩掉太脆。少一条规则用户在预览里一眼能看出来。
+    """
+    rules, cur = [], None
+    for raw in (text or "").splitlines():
+        ln = raw.split("#", 1)[0].rstrip()
+        if not ln.strip():
+            continue
+        if ln.lstrip().startswith("- "):
+            if cur and cur.get("name"):
+                rules.append(cur)
+            cur = {"name": "", "kw": [], "type": "movies", "mt": False}
+            ln = ln.lstrip()[2:]
+        if cur is None or ":" not in ln:
+            continue
+        k, _, v = ln.partition(":")
+        k, v = k.strip().lower(), v.strip().strip('"').strip("'")
+        if k == "name":
+            cur["name"] = v
+        elif k == "type":
+            cur["type"] = v if v in ("movies", "tvshows") else "movies"
+        elif k == "metatube":
+            cur["mt"] = v.lower() in ("true", "yes", "y", "on", "1")
+        elif k == "keywords":
+            v = v.strip("[]")
+            cur["kw"] = [x.strip() for x in re.split(r"[,，]", v) if x.strip()]
+    if cur and cur.get("name"):
+        rules.append(cur)
+    return [r for r in rules if r["name"] and r["kw"]]
+
+
+def dump_lib_rules(rules):
+    out = [LIB_RULES_HEADER]
+    for r in rules:
+        out.append(f"- name: {r['name']}\n"
+                   f"  type: {r.get('type') or 'movies'}\n"
+                   f"  metatube: {'true' if r.get('mt') else 'false'}\n"
+                   f"  keywords: {', '.join(r['kw'])}\n")
+    return "\n".join(out)
+
+
+def save_lib_rules(d, rules):
+    try:
+        with open(lib_rules_path(d), "w", encoding="utf-8") as f:
+            f.write(dump_lib_rules(rules))
+        return True
+    except OSError as e:
+        warn(f"规则文件写不进去：{_short_err(e)}")
+        return False
+
+
+def lib_rules(d=None):
+    """当前的关键词规则。以【文件】为准，文件不在就按默认建一份。
+
+    放成文件而不是塞进状态 json，是用户点的名：想像 mihomo 的 yaml 那样
+    自己拿编辑器改。菜单里的增删也写回这个文件，两边是同一份东西，
+    不会出现"菜单显示一套、文件里是另一套"。
+    """
+    d = d or ms_install_dir()
+    path = lib_rules_path(d)
+    try:
+        if os.path.exists(path):
+            got = parse_lib_rules(open(path, encoding="utf-8").read())
+            if got:
+                return got
+            # 文件在但一条都没解析出来：可能是改坏了。这时候【不要】拿默认值
+            # 覆盖回去 —— 那等于把用户辛苦写的东西悄悄删了。报一声，用默认跑。
+            warn(f"{path} 里没解析出规则（格式改坏了？），这次先用默认的。")
+            print(f"  {DIM}原文件没有被改动。{RST}")
+            return [dict(r) for r in LIB_RULES_DEFAULT]
+    except OSError:
+        pass
+    # 从老版本迁移：以前存在状态 json 里
+    old = ms_state().get("lib_rules")
+    rules = [dict(r) for r in LIB_RULES_DEFAULT]
+    if isinstance(old, list) and old:
+        got = [{"name": str(r.get("name") or ""), "kw": [str(x) for x in (r.get("kw") or [])],
+                "type": str(r.get("type") or "movies"), "mt": bool(r.get("mt"))}
+               for r in old if isinstance(r, dict)]
+        got = [r for r in got if r["name"] and r["kw"]]
+        if got:
+            rules = got
+    if os.path.isdir(d):
+        save_lib_rules(d, rules)
+    return rules
 
 
 def _kw_hit(dirname, kw):
@@ -2000,7 +2117,7 @@ def plan_libraries(d, rules=None):
 
     只收【底下真的有 strm 的】目录 —— 空壳目录建进去只会在 Emby 里多一个空条目。
     """
-    rules = rules or lib_rules()
+    rules = rules or lib_rules(d)
     base = os.path.join(strm_root(d), STRM_SUBDIR)
     has_strm = {}
 
@@ -2139,11 +2256,13 @@ def auto_libraries():
     if not key:
         warn("没有 Emby API Key，先填「1 添加 API 密钥」。")
         return
-    rules = lib_rules()
+    rules = lib_rules(d)
     while True:
         print()
         print(f"  {BOLD}关键词规则{RST}{DIM}　文件夹名匹配到关键词，"
               f"就把它整个收进对应的媒体库{RST}")
+        print(f"  {DIM}规则文件 {lib_rules_path(d)}"
+              f"　—— 也可以直接拿编辑器改，改完回来跑一次{RST}")
         for i, r in enumerate(rules, 1):
             mt = f"　{CYAN}带 MetaTube{RST}" if r["mt"] else ""
             print(f"    {i}. {BOLD}{r['name']}{RST}"
@@ -2173,13 +2292,13 @@ def auto_libraries():
             return
         if c == "r":
             rules = [dict(x) for x in LIB_RULES_DEFAULT]
-            save_ms_state(lib_rules=rules)
-            ok("已恢复默认规则")
+            save_lib_rules(d, rules)
+            ok(f"已恢复默认规则（写回 {lib_rules_path(d)}）")
         elif c == "d":
             i = ask("删第几条").strip()
             if i.isdigit() and 1 <= int(i) <= len(rules):
                 gone = rules.pop(int(i) - 1)
-                save_ms_state(lib_rules=rules)
+                save_lib_rules(d, rules)
                 ok(f"已删掉「{gone['name']}」")
             else:
                 warn("序号不对。")
@@ -2195,7 +2314,7 @@ def auto_libraries():
             t = "tvshows" if ask("选", "1").strip() == "2" else "movies"
             mt = ask_yn("这个库要开 MetaTube（按番号刮成人片）吗？", False)
             rules.append({"name": nm, "kw": kw, "type": t, "mt": mt})
-            save_ms_state(lib_rules=rules)
+            save_lib_rules(d, rules)
             ok(f"已加「{nm}」")
         elif c == "y":
             if not plan:
@@ -6454,11 +6573,12 @@ def params_menu():
         tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
               else f"{DIM}刮削结果{RST}")
         print(f"  7. 片名用哪个            当前：{tp}")
-        _nrule = len(lib_rules())
+        _libr = lib_rules(d) if is_installed(d) else []
         print(f"  8. 按关键词自动建媒体库{DIM}（文件夹名匹配到就整个收进去，"
               f"AV 类自动带 MetaTube）{RST}")
-        print(f"     {DIM}当前 {_nrule} 条规则："
-              f"{'、'.join(r['name'] for r in lib_rules())}{RST}")
+        print(f"     {DIM}规则文件：{os.path.join(d, LIB_RULES_FILE)}"
+              + (f"　共 {len(_libr)} 条：{'、'.join(r['name'] for r in _libr)}"
+                 if _libr else "") + f"{RST}")
         if metatube_on(d):
             mtl = [n for n, _i, on, _o in metatube_libraries(
                 read_emby_api_key(d) or "") if on]
