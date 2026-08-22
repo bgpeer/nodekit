@@ -1278,6 +1278,7 @@ KEEPALIVE_MIN  = 20
 #              地方叠，而且下一轮的活它自己会做，本来就是幂等的）
 #   timeout    卡死的那个自己会被杀掉。只有 flock 的话，第一个吊死之后锁永远
 #              不放，从此再没有任何一轮能跑 —— 从"叠罗汉"换成"全停摆",一样糟
+HEAL_BG_BUDGET_T = 1800 + 600   # do_heal 的预算 + 余量，见 CRON_TIMEOUT["heal"]
 CRON_LOCK_DIR  = "/run/lock"
 # 超时都压在【下一次触发之前】：宁可这轮少做点，也不能和下一轮撞上。
 # 三条任务本身都是幂等 + 带预算的，砍掉的部分下一轮会接着做。
@@ -1285,6 +1286,9 @@ CRON_TIMEOUT   = {
     "keepalive": KEEPALIVE_MIN * 60 - 120,   # 20 分钟一次 → 18 分钟
     "warm":      WARM_EVERY_H * 3600 - 300,  # 每小时一次 → 55 分钟
     "sync":      3 * 3600,                   # 每天一次，给足
+    # 后台补时长。比自己的预算多留一截 —— timeout 是防吊死的最后一道，
+    # 不该在任务正常收尾之前把它砍了
+    "heal":      HEAL_BG_BUDGET_T,
 }
 
 
@@ -2652,7 +2656,40 @@ def migrate_strm_layout(d, key):
     return n
 
 
-def align_library(d, key):
+def do_heal():
+    """后台补时长：一轮一轮走，中间歇几分钟，直到没得补或者用满预算。
+
+    单独一个子命令而不是塞进 warm，是因为触发时机不同：warm 是每小时的例行，
+    这个是【用户刚扫完盘】那一下 —— 那时候新条目最多、最需要赶紧补上，
+    而每小时那轮要等最多一小时才轮到。
+
+    失败的隔几分钟再试：实测失败几乎全是当时网盘那条线在抖（SSL 握手超时、
+    换直链超时），同一个条目下一轮往往就成了。heal_media_info 自己带游标，
+    每轮取一批、探到的不会再取，所以直接反复调它就是"只补没探到的"。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if not key:
+        return
+    t0, seen = time.monotonic(), 0
+    while time.monotonic() - t0 < HEAL_BG_BUDGET and seen < HEAL_BG_MAX:
+        pend = items_without_duration(key)
+        if not pend:
+            return                      # 全补齐了
+        heal_media_info(d, key)
+        seen += HEAL_LIMIT
+        if not items_without_duration(key):
+            return
+        # 【歇一下再来】隔太密只会连着撞同一段抽风的线路，还容易被网盘限流
+        if time.monotonic() - t0 + HEAL_RETRY_MIN * 60 >= HEAL_BG_BUDGET:
+            return
+        time.sleep(HEAL_RETRY_MIN * 60)
+
+
+def align_library(d, key, heal=True):
     """把【所有】指向 strm 的媒体库和它们里面的条目，拉到脚本认定的状态。
 
     这一坨原本散在 do_strm / do_sync 里各抄一遍，而 do_sync 一天只跑一次(05:45)。
@@ -2691,7 +2728,10 @@ def align_library(d, key):
     # 一个条目带两个版本；一小时后 tune 把开关关了，条目却还是合的，
     # 因为没人触发那次扫描。tune 自己说"下一次扫描会拆开"，可那次扫描没人发起。
     n_tuned = tune_strm_libraries(key)   # 库级：续播门槛、多版本合并
-    heal_media_info(d, key)           # 条目级：补时长
+    # heal=False 是「4 生成媒体库」用的：那条路把补时长扔后台单独跑，
+    # 不能在这儿再跑一遍（会撞锁、也会让用户白等一次）
+    if heal:
+        heal_media_info(d, key)       # 条目级：补时长
     normalize_strm_files(d)           # heal 中途被打断的兜底
     apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
     split_shared_identities(d, key)   # 条目级：进度条身份互相独立
@@ -5153,6 +5193,17 @@ HEAL_LIMIT  = 50         # 每轮最多探几个条目
 HEAL_BUDGET = 600        # 整轮封顶（秒）。用满就收工，剩下的下一轮接着
 HEAL_ROUNDS = 2
 HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预热同一个理由）
+# 【补时长必须后台跑】用户的话："如果有一万部片要等到什么时候"。他说得对：
+# 这一步天生慢（每个条目要跨境换直链 + 让 Emby 去网盘拉文件头，一个最坏 3 分钟），
+# 而它跟"生成媒体库成没成功"毫无关系 —— 没道理把最慢的一步钉在用户面前。
+# 而且失败的多半是当时线路在抖，隔几分钟再试往往就成了，前台等着重试更荒唐。
+#
+# 所以「4」把它扔后台：一轮一轮走，中间隔 HEAL_RETRY_MIN 分钟，
+# 直到没有待探的、或者用满 HEAL_BG_BUDGET。每轮仍然受 HEAL_LIMIT 约束，
+# 流量上限见 HEAL_LIMIT 那段。
+HEAL_RETRY_MIN = 3       # 后台两轮之间隔几分钟。太密会撞网盘限流，反而更难成
+HEAL_BG_BUDGET = 1800    # 后台整体封顶（秒）。用满收工，剩下的交给每小时那轮
+HEAL_BG_MAX    = 200     # 后台一次最多探几个条目 —— 拉文件头是要走流量的
 HEAL_PRE_T  = 40         # 预检超时：只是确认线路此刻通不通，不必等满
 
 
@@ -5731,21 +5782,30 @@ def do_strm():
             ok("Emby 已扫完")
         else:
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
-        align_library(d, key)        # 库选项 + 补时长 + 片名 + 身份 + 脏进度
+        # 【补时长不在这儿跑】它是整条流程里最慢的一步，而且跟"生成成没成功"
+        # 无关。扔后台之后用户扫完就能走人，缺多少时长看体检那行「条目时长」。
+        align_library(d, key, heal=False)   # 库选项 + 片名 + 身份 + 脏进度
         auto_libraries_apply(d, key)  # 按关键词规则把该建的库建上
         report_not_in_emby(d, key)
         # 【后台跑】跟「6 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
         # 关系，没道理让用户对着它干等。
+        _nodur = len(items_without_duration(key))
         try:
-            subprocess.Popen(
-                [sys.executable, os.path.realpath(__file__), "warm"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
-            print(f"  {DIM}已在后台给「继续观看」+ 最近新加的片子预热线路"
-                  f"（换直链，最多几分钟）—— 不用等它。{RST}")
+            for _sub in ("warm", "heal"):
+                subprocess.Popen(
+                    [sys.executable, os.path.realpath(__file__), _sub],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+            print(f"  {DIM}已在后台预热线路{RST}"
+                  + (f"{DIM}，并给 {RST}{BOLD}{_nodur}{RST}{DIM} 个条目补时长"
+                     f"（每 {HEAL_RETRY_MIN} 分钟一轮，没探到的会自动再试）{RST}"
+                     if _nodur else f"{DIM}（时长都齐了）{RST}"))
+            if _nodur:
+                print(f"  {DIM}不用等：补到哪儿了看「5 链路体检」的"
+                      f"「条目时长」那一行。{RST}")
         except Exception as e:
-            warn(f"后台预热没起来（不影响本次生成）：{_short_err(e)}")
+            warn(f"后台任务没起来（不影响本次生成）：{_short_err(e)}")
     else:
         warn("没有 Emby API Key，没法自动触发扫描。去 Emby 后台手动扫一次媒体库。")
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
@@ -8522,6 +8582,10 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("warm"):
                 do_warm()
+        elif arg == "heal":               # 「4」扔后台的补时长，不交互
+            require_root()
+            if take_task_lock("heal"):
+                do_heal()
         elif arg == "update":
             do_update()
         elif arg == "update-menu":        # 菜单里点的更新，且中途自我更新过；跑完回菜单
