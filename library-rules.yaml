@@ -1,8 +1,19 @@
 # media-stack 媒体库关键词规则
 #
-# 这份文件在仓库里，「6 更新，4成存媒体库」时会自动拉到机器上。想改规则改这里就行
-
-
+# 「6 更新」和「4 生成媒体库」时会自动拉到机器上，改这里就行。
+#
+# 规则拿【文件夹名】去匹配 keywords，命中的文件夹整个收进对应的 Emby 媒体库，
+# 不管它在哪个网盘、藏在第几层；命中之后不再往下钻，从上往下第一个命中的赢。
+#
+#   name      媒体库在 Emby 里显示的名字
+#   type      movies 电影 / tvshows 电视剧
+#             tvshows 要求网盘里是「剧名/Season 01/剧名 - S01E01.mp4」结构
+#   language  刮削语言 zh / ja / en，留空会按英文搜，中文片名搜不到
+#   country   CN / JP / US，跟着 language 走
+#   metatube  true 时额外挂上 MetaTube（按番号刮成人片），只给成人库开
+#   keywords  逗号隔开；中文按子串匹配，纯英文按整词匹配
+#
+# 只想改本机不动仓库：建 /opt/media-stack/library-rules.local.yaml，格式一样。
 
 - name: 电影
   type: movies
@@ -25,6 +36,13 @@
   metatube: false
   keywords: 动漫, 动画, 番剧, anime
 
+- name: 动漫电影
+  type: movies
+  language: zh
+  country: CN
+  metatube: false
+  keywords: 动漫电影, 剧场版
+
 - name: 纪录片
   type: movies
   language: zh
@@ -38,10 +56,3 @@
   country: JP
   metatube: true
   keywords: av, 写真, 番号, AV影片
-
-- name: 动漫电影
-  type: movies
-  language: zh
-  country: CN
-  metatube: false
-  keywords: 动漫电影, 剧场版
