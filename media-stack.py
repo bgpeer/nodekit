@@ -2326,6 +2326,14 @@ def auto_libraries_apply(d, key, quiet=False):
     不问是对的：只建【不存在的】库，不动用户已有的任何东西，重叠的直接跳过
     并说明。没有需要建的时候一个字都不打印。
     """
+    # 【这里也要拉一次仓库版】用户在 GitHub 上改完规则，接着点的多半是
+    # 「4 生成媒体库」而不是「6 更新」—— 他刚整理完网盘，想的是"扫一遍把库建好"。
+    # 只在更新里拉的话，他会看到规则没生效，以为改的地方不对。
+    # fetch 失败不影响后面：用本机现有的那份跑。
+    try:
+        fetch_lib_rules(d)
+    except Exception:
+        pass
     try:
         rules, _src = lib_rules(d)
         plan = plan_libraries(d, rules)
