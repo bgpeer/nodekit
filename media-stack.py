@@ -5259,44 +5259,58 @@ def heal_media_info(d, key):
 
 
 def _heal_round(d, key, pend, base, token, again, t_all=None):
-    """探一轮。探不到的塞进 again 供下一轮再试。返回这一轮成功几个。"""
+    """探一轮。探不到的塞进 again 供下一轮再试。返回这一轮成功几个。
+
+    【每个条目要先把行占上】和体检里 _hc_wait 同一个道理，而且这里更需要：
+    探一个条目最坏要等 3 分钟（要跨境换直链 + 让 Emby 去网盘拉文件头），
+    而结果是【探完才打印】的 —— 等待的那三分钟屏幕上一个字都不动。
+    用户的原话就是"感觉卡住了"。他没说错：从屏幕上看，那和死机没有区别。
+    """
     done = 0
-    for uid, iid, name in pend:
+    total = len(pend)
+    for idx, (uid, iid, name) in enumerate(pend, 1):
         # 预算是【这一轮里也要看】的：一个条目最多等 3 分钟，50 个就是两个多小时，
         # 光靠外层每轮之间那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
         if t_all is not None and time.monotonic() - t_all > HEAL_BUDGET:
-            print(f"  {DIM}这轮时间用完了，剩下的下一轮接着探。{RST}")
+            print(f"\r  {DIM}这轮时间用完了，剩下的下一轮接着探。{RST}\033[K")
             break
+        print(f"\r  {DIM}·{RST} {pad(name[:26], 28)}"
+              f"{DIM}探测中… {idx}/{total}，最多 3 分钟{RST}\033[K",
+              end="", flush=True)
         try:
             it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
         except Exception:
+            print("\r\033[K", end="")
             again.append((uid, iid, name))     # 问 Emby 失败可能只是这一下，值得再试
             continue
         # 下面几种是【问题在本地，重试也没用】：路径对不上、文件读不了、
         # strm 里没有可用目标。不进 again，免得白跑一轮还刷一屏同样的话
         host = _strm_host_path(d, it.get("Path") or "")
         if not host or not os.path.exists(host):
+            print("\r\033[K", end="")      # 占位行要擦掉，不然下一条盖在上面
             continue
         try:
             original = open(host, encoding="utf-8").read()
         except OSError:
+            print("\r\033[K", end="")
             continue
         p = strm_target_path(original)
         if not p:
+            print("\r\033[K", end="")
             continue
         try:
             got0 = (_ol_api("/api/fs/get", {"path": p, "password": ""},
                             token, timeout=120).get("data") or {})
             sign, raw = got0.get("sign", ""), got0.get("raw_url", "")
         except Exception as e:
-            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}换直链失败：{_short_err(e)}{RST}")
+            print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}换直链失败：{_short_err(e)}{RST}\033[K")
             again.append((uid, iid, name))
             continue
         # 先自己拉一段文件头。不通就别去烧 Emby 那 200 秒了，而且拉过之后
         # 直链是热的，紧接着的探测更容易在超时内跑完
         good, why = _netdisk_head_ok(raw)
         if not good:
-            print(f"  {DIM}·{RST} {name[:26]}  {YELLOW}网盘没给出文件头（{why}）{RST}")
+            print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}网盘没给出文件头（{why}）{RST}\033[K")
             again.append((uid, iid, name))
             continue
         url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
@@ -5335,9 +5349,9 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
         if mins:
             done += 1
-            print(f"  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟")
+            print(f"\r  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟\033[K")
         else:
-            print(f"  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}")
+            print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}\033[K")
             again.append((uid, iid, name))
     return done
 
