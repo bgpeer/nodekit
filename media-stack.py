@@ -1962,10 +1962,11 @@ def _restore_progress(d, key, saved):
 #   · 【只碰自己建的库】。用户手工建的库一律不动 —— 名字撞上了也不动，
 #     因为动它就可能把人家的观看记录连根拔了。
 LIB_RULES_DEFAULT = [
-    {"name": "电影",   "kw": ["电影", "movies", "movie"],           "type": "movies",  "mt": False},
-    {"name": "电视剧", "kw": ["电视剧", "剧集", "连续剧", "tv"],     "type": "tvshows", "mt": False},
-    {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False},
-    {"name": "AV影片", "kw": ["av", "写真", "番号"],                 "type": "movies",  "mt": True},
+    {"name": "电影",   "kw": ["电影", "movies", "movie"],           "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
+    {"name": "电视剧", "kw": ["电视剧", "剧集", "连续剧", "tv"],     "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
+    {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
+    {"name": "纪录片", "kw": ["纪录片", "纪录", "documentary"],      "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
+    {"name": "AV影片", "kw": ["av", "写真", "番号"],                 "type": "movies",  "mt": True,  "lang": "ja", "country": "JP"},
 ]
 LIB_TYPES = {"movies": "电影", "tvshows": "电视剧", "homevideos": "家庭影像", "": "混合"}
 
@@ -2094,7 +2095,8 @@ def parse_lib_rules(text):
         if ln.lstrip().startswith("- "):
             if cur and cur.get("name"):
                 rules.append(cur)
-            cur = {"name": "", "kw": [], "type": "movies", "mt": False}
+            cur = {"name": "", "kw": [], "type": "movies", "mt": False,
+                   "lang": "zh", "country": "CN"}
             ln = ln.lstrip()[2:]
         if cur is None or ":" not in ln:
             continue
@@ -2106,6 +2108,10 @@ def parse_lib_rules(text):
             cur["type"] = v if v in ("movies", "tvshows") else "movies"
         elif k == "metatube":
             cur["mt"] = v.lower() in ("true", "yes", "y", "on", "1")
+        elif k in ("language", "lang"):
+            cur["lang"] = v or "zh"
+        elif k == "country":
+            cur["country"] = v or "CN"
         elif k == "keywords":
             v = v.strip("[]")
             cur["kw"] = [x.strip() for x in re.split(r"[,，]", v) if x.strip()]
@@ -2119,6 +2125,8 @@ def dump_lib_rules(rules):
     for r in rules:
         out.append(f"- name: {r['name']}\n"
                    f"  type: {r.get('type') or 'movies'}\n"
+                   f"  language: {r.get('lang') or 'zh'}\n"
+                   f"  country: {r.get('country') or 'CN'}\n"
                    f"  metatube: {'true' if r.get('mt') else 'false'}\n"
                    f"  keywords: {', '.join(r['kw'])}\n")
     return "\n".join(out)
@@ -2185,7 +2193,10 @@ def plan_libraries(d, rules=None):
                         if any(_kw_hit(name, k) for k in r["kw"])), None)
             if hit and _count(full):
                 rel = os.path.relpath(full, base).replace(os.sep, "/")
-                plan.setdefault(hit["name"], (hit["type"], [], hit["mt"]))[1].append(
+                plan.setdefault(hit["name"],
+                                (hit["type"], [], hit["mt"],
+                                 hit.get("lang") or "zh",
+                                 hit.get("country") or "CN"))[1].append(
                     f"{STRM_PATH}/{rel}")
                 continue            # 命中了就不再往下钻 —— 底下都归它
             stack.append(full)
@@ -2195,7 +2206,7 @@ def plan_libraries(d, rules=None):
     return plan
 
 
-def _emby_add_library(key, name, ctype, paths):
+def _emby_add_library(key, name, ctype, paths, lang="zh", country="CN"):
     """在 Emby 里建一个媒体库。成功返回 ""，失败返回错误说明。
 
     顺手把【首选语言】一起设成中文。这一项建库时留空的话，Emby 按服务器默认
@@ -2204,8 +2215,8 @@ def _emby_add_library(key, name, ctype, paths):
     体检为此专门有一行「刮削语言」在报。既然是脚本建的库，就别再留这个坑。
     """
     opts = {
-        "PreferredMetadataLanguage": "zh",
-        "MetadataCountryCode": "CN",
+        "PreferredMetadataLanguage": lang,
+        "MetadataCountryCode": country,
         "EnableRealtimeMonitor": False,   # strm 是脚本批量增删的，实时监控只会
                                           # 让 Emby 在扫库中途反复触发重扫
         "PathInfos": [{"Path": x} for x in paths],
@@ -2244,7 +2255,7 @@ def apply_libraries(d, key, plan):
     mine = set(ms_state().get("lib_auto") or [])
     exist = {n: (ps, t) for n, ps, t in emby_libs(key)}
     made, added, skipped, overlap = [], 0, [], []
-    for name, (ctype, paths, _mt) in sorted(plan.items()):
+    for name, (ctype, paths, _mt, lang, country) in sorted(plan.items()):
         paths = sorted(set(paths))
         # 【已经被别的库盖住的，绝对不能再建一个】否则同一个文件在 Emby 里会变成
         # 两个条目 —— 而 Emby 的观看记录是按刮削身份存的，两个条目会共用一份
@@ -2256,7 +2267,7 @@ def apply_libraries(d, key, plan):
             overlap.append((name, dup, paths))
             continue
         if name not in exist:
-            err = _emby_add_library(key, name, ctype, paths)
+            err = _emby_add_library(key, name, ctype, paths, lang, country)
             if err:
                 warn(f"建媒体库「{name}」失败：{err}")
                 skipped.append((name, paths))
@@ -2330,7 +2341,7 @@ def auto_libraries_apply(d, key, quiet=False):
     made, added = apply_libraries(d, key, plan)
     if made or added:
         ok(f"新建 {made} 个媒体库，补了 {added} 条路径")
-        mt_libs = [n for n, (_t, _p, m) in plan.items() if m]
+        mt_libs = [n for n, (_t, _p, m, _l, _c) in plan.items() if m]
         if metatube_on(d):
             ids = [i for n, i, _on, _o in metatube_libraries(key) if n in set(mt_libs)]
             if set_metatube_libraries(key, ids):
@@ -2367,7 +2378,8 @@ def auto_libraries():
         for i, r in enumerate(rules, 1):
             mt = f"　{CYAN}带 MetaTube{RST}" if r["mt"] else ""
             print(f"    {i}. {BOLD}{r['name']}{RST}"
-                  f"{DIM}（{LIB_TYPES.get(r['type'], r['type'])}）"
+                  f"{DIM}（{LIB_TYPES.get(r['type'], r['type'])}，"
+                  f"{r.get('lang') or 'zh'}）"
                   f"　关键词：{'、'.join(r['kw'])}{RST}{mt}")
         plan = plan_libraries(d, rules)
         print()
@@ -2378,10 +2390,10 @@ def auto_libraries():
                   f"得把「动作片」加进日韩AV的关键词里才收得进去。{RST}")
         else:
             print(f"  {BOLD}会这样建{RST}{DIM}（还没动手）{RST}")
-            for name, (ctype, paths, mt) in sorted(plan.items()):
+            for name, (ctype, paths, mt, lang, _c) in sorted(plan.items()):
                 mt_s = f"　{CYAN}+MetaTube{RST}" if mt else ""
                 print(f"    {BOLD}{name}{RST}"
-                      f"{DIM}（{LIB_TYPES.get(ctype, ctype)}，"
+                      f"{DIM}（{LIB_TYPES.get(ctype, ctype)}，刮削语言 {lang}，"
                       f"{len(set(paths))} 个文件夹）{RST}{mt_s}")
                 for x in sorted(set(paths)):
                     print(f"        {DIM}{x}{RST}")
@@ -2418,7 +2430,10 @@ def auto_libraries():
                   f"（剧集选错成电影的话，每一集会变成一部独立电影）{RST}")
             t = "tvshows" if ask("选", "1").strip() == "2" else "movies"
             mt = ask_yn("这个库要开 MetaTube（按番号刮成人片）吗？", False)
-            rules.append({"name": nm, "kw": kw, "type": t, "mt": mt})
+            lg = ask("刮削语言（zh 中文 / ja 日语 / en 英语）", "zh").strip() or "zh"
+            rules.append({"name": nm, "kw": kw, "type": t, "mt": mt,
+                          "lang": lg,
+                          "country": {"zh": "CN", "ja": "JP", "en": "US"}.get(lg, "CN")})
             save_lib_rules(d, rules)
             rule_src = "本机覆盖 " + lib_rules_path(d, True)
             ok(f"已加「{nm}」")
@@ -2429,7 +2444,7 @@ def auto_libraries():
             print()
             print(f"  {DIM}建库不会动你已有的库；同名但不是脚本建的，只会印出来"
                   f"让你自己加。{RST}")
-            mt_libs = [n for n, (_t, _p, m) in plan.items() if m]
+            mt_libs = [n for n, (_t, _p, m, _l, _c) in plan.items() if m]
             if metatube_on(d):
                 print(f"  {DIM}MetaTube 会【只】在 "
                       f"{('「' + '」「'.join(mt_libs) + '」') if mt_libs else '（无）'}"
@@ -5879,6 +5894,9 @@ def metatube_libraries(key):
         on = any(METATUBE_FETCHER in (t.get("MetadataFetchers") or [])
                  or METATUBE_FETCHER in (t.get("ImageFetchers") or [])
                  for t in (o.get("TypeOptions") or []))
+        # ContentType 在库这一层，而补 TypeOptions 时要按它定 Type，
+        # 所以塞进 LibraryOptions 一起带出去
+        o.setdefault("ContentType", lb.get("CollectionType") or "")
         out.append((lb.get("Name") or "?", lb.get("ItemId"), on, o))
     return out
 
@@ -5899,6 +5917,16 @@ def set_metatube_libraries(key, enable_ids):
         if want == on:
             continue
         tos = o.get("TypeOptions") or []
+        # 【刚建出来的库 TypeOptions 是空的】—— Emby 要等第一次扫描才把它填上。
+        # 空列表进下面那个 for 循环等于什么都不做，于是 set_metatube_libraries
+        # 报"改了 0 个"、MetaTube 一个库都没开上。实测就是这么翻的车：规则里
+        # AV影片 标着 metatube: true，库也建出来了，插件却没戴上。
+        # 要开的时候自己补一条，按库的内容类型定 Type。
+        if want and not tos:
+            ct = (o.get("ContentType") or "").lower()
+            tos = [{"Type": "Series" if ct == "tvshows" else "Movie",
+                    "MetadataFetchers": [], "MetadataFetcherOrder": [],
+                    "ImageFetchers": [], "ImageFetcherOrder": []}]
         for t in tos:
             for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
                             ("ImageFetchers", "ImageFetcherOrder")):
@@ -7966,6 +7994,56 @@ def do_healthcheck():
                              f"（以后新片自动进库），要么给这些文件夹各加一个库"))
             else:
                 _hc("Emby 媒体库", "ok", f"{len(libs)} 个库")
+
+            # ---- 库里有 strm，Emby 却一个条目都没认出来 ----
+            # 【和"空壳库"是相反的两回事】空壳库是目录真空了；这个是目录里
+            # 有片子，但 Emby 按这个库的内容类型解析不出任何条目 —— 库在
+            # 界面上显示「未找到项目」。
+            # 实测撞的就是这一例：动漫库是 tvshows 类型，而网盘里是
+            #   动漫/仙逆 [第154集•4K].mp4
+            #   动漫/仙逆剧场版 [神临之战•4K].mp4
+            # 两个文件散在库根目录。tvshows 要的是「剧名/Season 01/剧名 - S01E01.mp4」，
+            # 散着放它一个都不认，于是库是空的 —— 而 strm 文件、路径、权限全都对，
+            # 体检其它每一项都是绿的。这正是"看起来正常、实际是废的"。
+            noitem = []
+            for _lb in libs:
+                _ls = [p for p in (_lb.get("Locations") or []) if _under(p, STRM_PATH)]
+                if not _ls:
+                    continue
+                n_strm = n_item = 0
+                for p in _ls:
+                    rel = [x for x in p[len(STRM_PATH):].split("/") if x]
+                    for _dp, _dn, _fs in os.walk(
+                            os.path.join(strm_root(d), STRM_SUBDIR, *rel)):
+                        n_strm += sum(1 for f in _fs if f.endswith(".strm"))
+                if not n_strm:
+                    continue                     # 归下面「空壳媒体库」管
+                try:
+                    _r = _emby(f"/Items?Recursive=true&ParentId={_lb.get('ItemId')}"
+                               f"&IncludeItemTypes=Movie,Episode&Limit=1", key,
+                               timeout=20) or {}
+                    n_item = int(_r.get("TotalRecordCount") or 0)
+                except Exception:
+                    continue
+                if not n_item:
+                    noitem.append((_lb.get("Name") or "?",
+                                   (_lb.get("CollectionType") or ""), n_strm))
+            if noitem:
+                _nm, _ct, _ns = noitem[0]
+                _hc("库里认不出片子", "bad",
+                    "、".join(f"{n}（{_ns2} 个 strm）" for n, _c, _ns2 in noitem)
+                    + f"  {RED}Emby 一个条目都没认出来{RST}")
+                todo.append((
+                    f"媒体库「{_nm}」底下有 {_ns} 个 strm，但 Emby 里一个条目都没有 —— "
+                    f"界面上显示「未找到项目」",
+                    ("这个库是【电视剧】类型，而电视剧要求网盘里是"
+                     "「剧名/Season 01/剧名 - S01E01.mp4」这种结构；"
+                     "几个文件散在根目录 Emby 一个都不认。"
+                     "要么在网盘里按这个结构整理，要么把这个库改成【电影】类型"
+                     "（规则文件里把 type 改成 movies）")
+                    if _ct == "tvshows" else
+                    ("文件名 Emby 解析不出片名。改成「片名 (年份).mp4」这种，"
+                     "带发布组标记的（[BT]xxx.1080p.WEB-DL-YYY）它认不出来")))
 
             # ---- 空壳媒体库 ----
             # 【删了 strm 不等于删了条目】。Emby 的条目活在它自己的数据库里，

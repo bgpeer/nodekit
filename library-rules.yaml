@@ -23,9 +23,19 @@
 #   name      媒体库在 Emby 里显示的名字
 #   type      movies（电影）或 tvshows（电视剧）
 #             ⚠ 剧集用 movies 的话，每一集会变成一部独立电影，没有季集结构
+#             ⚠ 反过来也一样：tvshows 类型要求网盘里是「剧名/Season 01/剧名 - S01E01.mp4」
+#               这种结构。散着几个文件放在库根目录，Emby 一个都认不出来，库是空的
+#   language  刮削语言：zh 中文 / ja 日语 / en 英语
+#             ⚠ 留空会按服务器默认（通常英文）去 TMDb 搜，中文片名一条都搜不到 ——
+#               表现是「条目都在、一张海报都没有」
+#   country   国家代码：CN / JP / US，跟着 language 走就行
 #   metatube  true 时这个库启用 MetaTube（按番号刮成人片）
 #             ⚠ 只给真的是成人片的库开。它会把动画认成 JAV —— 实测发生过
 #   keywords  逗号隔开，大小写不敏感
+#
+# 关于刮削器：普通库用 Emby 自带的 TheMovieDb / TheTVDB，不用配。
+# metatube: true 的库会在自带那些之外【additionally】挂上 MetaTube，
+# 它按番号（ONGP-008 这种）去刮，自带刮削器搜不到的日本片才有正确信息。
 #
 # ---------------------------------------------------------------------------
 # 关键词怎么写
@@ -57,25 +67,35 @@
 
 - name: 电影
   type: movies
+  language: zh
+  country: CN
   metatube: false
   keywords: 电影, movies, movie
 
 - name: 电视剧
   type: tvshows
+  language: zh
+  country: CN
   metatube: false
   keywords: 电视剧, 剧集, 连续剧, tv
 
 - name: 动漫
   type: tvshows
+  language: zh
+  country: CN
   metatube: false
   keywords: 动漫, 动画, 番剧, anime
 
 - name: 纪录片
   type: movies
+  language: zh
+  country: CN
   metatube: false
   keywords: 纪录片, 纪录, documentary
 
 - name: AV影片
   type: movies
+  language: ja
+  country: JP
   metatube: true
   keywords: av, 写真, 番号, AV影片
