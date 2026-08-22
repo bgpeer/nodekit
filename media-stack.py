@@ -476,7 +476,17 @@ def parse_scan_spec(s):
     接受三种写法，因为这三种都是用户会自然打出来的：
       · y / Y / auto / 自动        → SCAN_AUTO，跟随 OpenList 里已挂载的存储
       · /quark                     → 单条路径
-      · /quark,/aliyun  或空格分隔  → 多条路径
+      · /quark,/aliyun             → 多条路径，【只认逗号】
+
+    【空格曾经也当分隔符，这是个会毁数据的错】实测：用户想填 /quark/电影，
+    中间多打了一个空格，于是被切成 /quark/电 和 /影 两条 —— 两条都不存在，
+    这个盘从此扫不到任何东西。而目录名里带空格本来就常见
+    （/quark/My Movies、/115/4K REMUX），按空格切等于这类路径永远填不进来。
+
+    切错的代价不止是"扫不到"：扫描路径决定了哪些主目录算孤儿，切歪之后
+    下游那个清理会认为本地所有 strm 都不该留 —— 那次就是这么把 39786 个
+    全删了。所以这里只认逗号，宁可让一条填错的路径原样留着去撞
+    「不在已挂载的存储里」那个警告，也不要自作主张替用户切开。
 
     返回 SCAN_AUTO 或去重后的路径列表；给不出有效内容时返回 None，由调用方决定兜底。
     """
@@ -486,7 +496,7 @@ def parse_scan_spec(s):
     if s.lower() in ("y", "yes", "auto") or s in ("自动", "是"):
         return SCAN_AUTO
     out, seen = [], set()
-    for p in re.split(r"[,，\s]+", s):
+    for p in re.split(r"[,，]+", s):
         p = p.strip().rstrip("/")
         if not p:
             continue
@@ -5795,12 +5805,12 @@ def set_scan_paths():
     print(f"  将扫描：{BOLD}{'、'.join(paths)}{RST}")
     # 提前把「填了但没挂上」挑出来:AutoFilm 扫不存在的目录只会在日志里留一行 WARN,
     # 用户看到的是"点了生成但什么都没多",很难联想到是路径打错了
-    if mounted:
-        unknown = [p for p in paths if not any(p == mp or p.startswith(mp.rstrip("/") + "/")
-                                               for mp in mounted)]
-        if unknown:
-            warn(f"这些路径不在已挂载的存储里：{'、'.join(unknown)}")
-            print(f"  {DIM}拼错了或者还没在 OpenList 里挂上，扫的时候会被跳过。{RST}")
+    unknown = [p for p in paths
+               if not any(p == mp or p.startswith(mp.rstrip("/") + "/")
+                          for mp in mounted)] if mounted else []
+    if unknown:
+        warn(f"这些路径不在已挂载的存储里：{'、'.join(unknown)}")
+        print(f"  {DIM}拼错了或者还没在 OpenList 里挂上，扫的时候会被跳过。{RST}")
 
     # 扫网盘根目录是个大坑,而且是「看起来成功了」的那种坑:
     #   1. 整个盘都会被镜像成 strm —— 手机备份、微信截图、扫描件、壁纸全堆进媒体库,
@@ -5827,11 +5837,11 @@ def set_scan_paths():
     save_ms_state(scan_spec=spec)
     subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
     ok(f"已改成 {len(paths)} 条扫描路径，AutoFilm 已重启")
-    drop_orphan_strm_dirs(d, paths)
+    drop_orphan_strm_dirs(d, paths, unknown)
     print(f"  {DIM}回菜单点「4 生成媒体库」立刻扫一次，或等每天定时任务。{RST}")
 
 
-def drop_orphan_strm_dirs(d, paths):
+def drop_orphan_strm_dirs(d, paths, unknown=()):
     """把不再属于任何扫描路径的主目录清掉（问过之后）。
 
     【缩小扫描范围原来是个没有效果的按钮】—— 这是实测撞出来的，而且撞得很难看：
@@ -5847,13 +5857,44 @@ def drop_orphan_strm_dirs(d, paths):
 
     删之前【必须问】，而且默认否：这是这整个脚本里少数几个真的删用户文件的
     地方。删的只是本地生成的 strm 和刮削缓存，网盘上的片子一个都不碰。
+
+    【这个函数第一版把用户的 39786 个 strm 全删了】，两个错叠在一起：
+
+      1. 挂载目录在 <DATA_ROOT>/strm/cloud/<盘名>，而这里列的是
+         <DATA_ROOT>/strm —— 那一层只有一个子目录 "cloud"。"cloud" 当然不在
+         keep 里，于是它被当成孤儿，一刀下去连 115 和 quark 一起没了。
+         strm_dirs_uncovered() 早就用对了 STRM_SUBDIR，这里漏了。
+      2. 没有下限保护。keep 算出来一个都对不上时，正确的反应是「我算错了，
+         什么都别删」，而不是「那就全是孤儿，删吧」。用户看到的提示是
+         「cloud　39786 个 strm」—— 一个不像盘名的名字、一个大得离谱的数字，
+         而提示本身写得理直气壮，他就按了 y。
+
+    所以下面那道 keep 检查不是冗余：宁可漏删（用户再点一次就是了），
+    也绝不能因为算错就把整棵树端了。
     """
+    # 【有一条路径填歪就整个不删】删除的依据是「这些盘不在扫描范围里了」，
+    # 而这个推理的前提是那几条路径本身是对的。有路径对不上已挂载的存储时，
+    # 前提就已经塌了 —— 那次事故里 /影 就是这么来的，它旁边还立着一行
+    # 「这些路径不在已挂载的存储里」的警告，而清理照删不误。
+    if unknown:
+        print(f"  {DIM}有路径对不上已挂载的存储，本地 strm 一个都不动 ——"
+              f"先把路径填对，再回来改一次就会问。{RST}")
+        return
     keep = {m for m in (strm_mount_dir(p) for p in paths) if m}
-    root = strm_root(d)
+    root = os.path.join(strm_root(d), STRM_SUBDIR)     # 盘名在 cloud/ 这一层
     try:
-        orphans = sorted(x for x in os.listdir(root)
-                         if os.path.isdir(os.path.join(root, x)) and x not in keep)
+        dirs = sorted(x for x in os.listdir(root)
+                      if os.path.isdir(os.path.join(root, x)))
     except OSError:
+        return
+    orphans = [x for x in dirs if x not in keep]
+    if dirs and not (set(dirs) & keep):
+        # 一个都没留下 = keep 算错了（路径填歪了、或者盘名对不上）。这时候
+        # 「全都是孤儿」是推理错误，不是事实 —— 闭嘴，什么都别删。
+        warn(f"扫描路径算出来的主目录（{'、'.join(sorted(keep)) or '空'}）"
+             f"和本地已有的（{'、'.join(dirs)}）一个都对不上。")
+        print(f"  {DIM}不动任何文件 —— 这种情况多半是扫描路径填歪了。"
+              f"确认一下上面那几条路径对不对。{RST}")
         return
     if not orphans:
         return
@@ -5867,6 +5908,10 @@ def drop_orphan_strm_dirs(d, paths):
     warn(f"这 {len(orphans)} 个主目录已经不在扫描范围里了，但它们的 strm 还在本地：")
     for x in orphans:
         print(f"  {DIM}·{RST} {x}　{BOLD}{sizes[x]}{RST} 个 strm")
+    # 【把留下的也列出来】只报要删的，用户没有参照物。第一版就是这样把
+    # 「cloud　39786 个」摆在人面前，看不出那其实是整棵树。
+    kept = [x for x in dirs if x in keep]
+    print(f"  {DIM}会留下：{RST}{'、'.join(kept) if kept else f'{RED}没有{RST}'}")
     print(f"  {DIM}留着的话 Emby 会继续刮削它们、继续占内存，体检里那些"
           f"「没时长」「没收录」的数字也会一直挂着。{RST}")
     print(f"  {DIM}删掉的只是本机生成的 strm 和刮削缓存，{RST}"
