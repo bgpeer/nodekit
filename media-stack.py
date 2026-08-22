@@ -7284,14 +7284,19 @@ def do_healthcheck():
     # 分组上它属于"后台在跑"，但影响是实打实的播放中断，所以 todo 里按高优先给。
     tasks = running_tasks()
     if not tasks:
-        _hc("任务并发", "ok", f"没有正在跑的后台任务{DIM}（都装了互斥锁，"
-                              f"同类任务同时只跑一个）{RST}")
+        _hc("任务并发", "ok", f"没有堆积{DIM}　同类任务同时只跑一个{RST}")
     else:
         by_sub = {}
         for _p, sub, age in tasks:
             by_sub.setdefault(sub, []).append(age)
-        desc = "、".join(f"{s}×{len(a)}（最久 {a[0] // 60} 分钟）"
-                         for s, a in sorted(by_sub.items()))
+        # 【正常和异常要用不同的写法】叠起来的时候「×N」是重点，没叠的时候它
+        # 恒等于 ×1，写出来只是噪音 —— 而这一行挤，实测过长到把下一项顶到同一行。
+        def _one(s, a):
+            mins = a[0] // 60
+            when = f"{mins} 分钟" if mins else f"{a[0]} 秒"
+            return (f"{s}×{len(a)}（最久 {when}）" if len(a) > 1
+                    else f"{s} 在跑 {when}")
+        desc = "、".join(_one(s, a) for s, a in sorted(by_sub.items()))
         piled = [s for s, a in by_sub.items() if len(a) > 1]
         # 超时是按"下一次触发之前"设的，所以跑过头 = timeout 没生效（缺 coreutils，
         # 或者这进程是装 flock 之前起来的）
@@ -7306,7 +7311,7 @@ def do_healthcheck():
                 "跑一次「6 更新」：会先杀掉卡住的，再给三条 cron 装上互斥锁和超时。"
                 "急的话先手动清：pkill -f 'media-stack.py (keepalive|warm|sync)'"))
         else:
-            _hc("任务并发", "ok", f"{desc}{DIM}（各一个，正常）{RST}")
+            _hc("任务并发", "ok", f"{desc}{DIM}　没有堆积{RST}")
 
     # ---- 保活 ----
     ka = keepalive_state(d)
