@@ -4580,6 +4580,20 @@ def prune_dead_strm(d, budget=None):
 # 补时长最多重试几轮、每轮之间隔多久。
 # 一轮一次机会是不够的：探测这一步要跨境换直链 + 让网盘准备文件头，而实测同一条
 # 路径的耗时能从 0.5 秒飘到 100 秒以上，还夹着彻底失败。单次成败基本是抽签。
+# 【这一步是要真的从网盘下载数据的，必须封顶】—— 实测吃过一次大亏：
+# 用户挂上一个两万多文件的网盘之后，有 32599 个条目没有时长。补时长的做法是
+# 让 Emby 去探测，而 Emby 探测就是从网盘拉一段视频文件头（几 MB 一个，具体多少
+# 由容器格式决定，moov 在文件尾的还要再 seek 一次）。
+#
+# 而这个循环原来【没有上限、没有预算】，还挂在每小时一次的 cron 上，一次全量、
+# 跑两轮。当天的账单：VPS 下行 80.4 GB、上行 1.0 GB —— 这个不对称本身就说明
+# 数据是被这台机器自己吃掉的，不是代理流量也不是别人在看片
+#（302 直链的视频是直达网盘的，根本不经过本机）。
+#
+# 所以每轮只探一批，转着来：探不完不要紧，下一轮接着往后走。宁可多花几天
+# 补完，也不能一个晚上把人家的流量包打光。
+HEAL_LIMIT  = 50         # 每轮最多探几个条目
+HEAL_BUDGET = 600        # 整轮封顶（秒）。用满就收工，剩下的下一轮接着
 HEAL_ROUNDS = 2
 HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预热同一个理由）
 HEAL_PRE_T  = 40         # 预检超时：只是确认线路此刻通不通，不必等满
@@ -4640,11 +4654,28 @@ def heal_media_info(d, key):
     副作用是这套东西自带修复能力：以后哪个条目时长丢了（比如手动点了「替换所有
     元数据」），再跑一次「生成媒体库」就会把它挑出来重探，用户不用知道发生过什么。
     """
-    pend = items_without_duration(key)
-    if not pend:
+    allpend = items_without_duration(key)
+    if not allpend:
         return
+    # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
+    # 条目怎么探都探不出来（网盘上是残缺文件、格式 Emby 不认），每轮都从头取
+    # 的话它们会把名额永远占死，后面的条目一辈子轮不到。
+    cur = int(ms_state().get("heal_cursor") or 0) % max(1, len(allpend))
+    # 【取多少要先夹到总数】不夹的话 (allpend+allpend) 在待探数少于 HEAL_LIMIT 时
+    # 会把同一批切出来两遍 —— 7 个待探切成 14 个，每个条目探两次、流量翻倍。
+    # 而这一步的全部意义就是省流量。
+    take = min(HEAL_LIMIT, len(allpend))
+    pend = (allpend + allpend)[cur:cur + take]
+    save_ms_state(heal_cursor=(cur + take) % len(allpend))
     print()
-    info(f"给 {len(pend)} 个条目补媒体信息（时长、编码）...")
+    if len(allpend) > len(pend):
+        info(f"给 {len(pend)} 个条目补媒体信息（时长、编码）"
+             f"{DIM}，这批之外还有 {len(allpend) - len(pend)} 个排队{RST}")
+        print(f"  {DIM}每轮只探一批：探一个要从网盘拉一段文件头，几 MB 起步 ——"
+              f"几万个条目一次全探会把流量打光（实测一天 80 GB）。{RST}")
+        print(f"  {DIM}剩下的每小时那轮接着往后探，不用管它。{RST}")
+    else:
+        info(f"给 {len(pend)} 个条目补媒体信息（时长、编码）...")
     print(f"  {DIM}没有时长的话进度条拖不动、看一半退出会被当成看完。")
     print(f"  每个最多等 3 分钟，慢是正常的 —— 要真的去网盘拉一段文件头。{RST}")
 
@@ -4664,23 +4695,29 @@ def heal_media_info(d, key):
     base = openlist_public_url(cfg)
     done = 0
     todo_items = list(pend)
+    t_all = time.monotonic()
     for rnd in range(1, HEAL_ROUNDS + 1):
-        if not todo_items:
+        if not todo_items or time.monotonic() - t_all > HEAL_BUDGET:
             break
         if rnd > 1:
             print(f"  {DIM}...{len(todo_items)} 个没探到，隔 {HEAL_GAP} 秒再试一轮"
                   f"（第 {rnd}/{HEAL_ROUNDS} 轮）{RST}")
             time.sleep(HEAL_GAP)
         again = []
-        done += _heal_round(d, key, todo_items, base, token, again)
+        done += _heal_round(d, key, todo_items, base, token, again, t_all)
         todo_items = again
     _heal_summary(done, len(pend))
 
 
-def _heal_round(d, key, pend, base, token, again):
+def _heal_round(d, key, pend, base, token, again, t_all=None):
     """探一轮。探不到的塞进 again 供下一轮再试。返回这一轮成功几个。"""
     done = 0
     for uid, iid, name in pend:
+        # 预算是【这一轮里也要看】的：一个条目最多等 3 分钟，50 个就是两个多小时，
+        # 光靠外层每轮之间那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
+        if t_all is not None and time.monotonic() - t_all > HEAL_BUDGET:
+            print(f"  {DIM}这轮时间用完了，剩下的下一轮接着探。{RST}")
+            break
         try:
             it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
         except Exception:
