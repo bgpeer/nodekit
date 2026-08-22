@@ -11,6 +11,12 @@
 #   language  刮削语言 zh / ja / en，留空会按英文搜，中文片名搜不到
 #   country   CN / JP / US，跟着 language 走
 #   metatube  true 时额外挂上 MetaTube（按番号刮成人片），只给成人库开
+#   scrapers  可选。这个库用哪些【元数据】刮削器，逗号隔开、按优先级排。
+#             留空 = 用 Emby 的默认。写了就以这里为准，会覆盖 Emby 里的设置
+#             电影：TheMovieDb, The Open Movie Database
+#             剧集：TheTVDB, TheMovieDb
+#   image_scrapers  同上，管【图像】（海报、背景图）
+#             剧集常用：TheTVDB, FanArt, TheMovieDb
 #   keywords  逗号隔开。【和文件夹名一模一样才算】，不是包含 ——
 #             写「电影」不会命中「4K电影」，想收就把它也写进来。
 #             只忽略首尾空白和大小写
@@ -35,6 +41,8 @@
   type: tvshows
   language: zh
   country: CN
+  scrapers: TheTVDB, TheMovieDb
+  image_scrapers: TheTVDB, FanArt, TheMovieDb
   metatube: false
   keywords: 动漫, 动画, 番剧, anime
 

@@ -2099,7 +2099,7 @@ def parse_lib_rules(text):
             if cur and cur.get("name"):
                 rules.append(cur)
             cur = {"name": "", "kw": [], "type": "movies", "mt": False,
-                   "lang": "zh", "country": "CN"}
+                   "lang": "zh", "country": "CN", "scr": [], "img": []}
             ln = ln.lstrip()[2:]
         if cur is None or ":" not in ln:
             continue
@@ -2111,6 +2111,10 @@ def parse_lib_rules(text):
             cur["type"] = v if v in ("movies", "tvshows") else "movies"
         elif k == "metatube":
             cur["mt"] = v.lower() in ("true", "yes", "y", "on", "1")
+        elif k in ("scrapers", "metadata"):
+            cur["scr"] = [x.strip() for x in re.split(r"[,，]", v.strip("[]")) if x.strip()]
+        elif k in ("image_scrapers", "images"):
+            cur["img"] = [x.strip() for x in re.split(r"[,，]", v.strip("[]")) if x.strip()]
         elif k in ("language", "lang"):
             cur["lang"] = v or "zh"
         elif k == "country":
@@ -2131,7 +2135,9 @@ def dump_lib_rules(rules):
                    f"  language: {r.get('lang') or 'zh'}\n"
                    f"  country: {r.get('country') or 'CN'}\n"
                    f"  metatube: {'true' if r.get('mt') else 'false'}\n"
-                   f"  keywords: {', '.join(r['kw'])}\n")
+                   + (f"  scrapers: {', '.join(r['scr'])}\n" if r.get("scr") else "")
+                   + (f"  image_scrapers: {', '.join(r['img'])}\n" if r.get("img") else "")
+                   + f"  keywords: {', '.join(r['kw'])}\n")
     return "\n".join(out)
 
 
@@ -2764,7 +2770,10 @@ def align_library(d, key, heal=True):
     n_tuned = tune_strm_libraries(key)   # 库级：续播门槛、多版本合并
     # heal=False 是「4 生成媒体库」用的：那条路把补时长扔后台单独跑，
     # 不能在这儿再跑一遍（会撞锁、也会让用户白等一次）
-    repair_scrapers(key)              # 库级：刮削器名单坏了就修回来
+    try:                              # 库级：刮削器/语言按规则文件对齐
+        sync_library_options(d, key, lib_rules(d)[0])
+    except Exception:
+        pass
     if heal:
         heal_media_info(d, key)       # 条目级：补时长
     normalize_strm_files(d)           # heal 中途被打断的兜底
@@ -6034,6 +6043,88 @@ def _lib_item_count(key, iid):
         return 0
 
 
+def sync_library_options(d, key, rules):
+    """把规则文件里的刮削器/语言设置同步到 Emby。返回改了几个库。
+
+    用户的话："我看了一下是好的东西没有被 emby 设置，可以在 yaml 里填写或者
+    开启之后自动映射到 emby 吗"。能，而且这才是这份规则文件该有的样子 ——
+    改一行 yaml、跑一次「4」，Emby 那边跟着变，不用进六个页面挨个勾。
+    （他那台机器上，动漫库的剧集/播出季/集三层、元数据和图像六个列表，
+    一个刮削器都没勾上，只有本地 Nfo 是开的。）
+
+    【写了就照办，没写就只修坏的】这条边界很重要：
+      · 规则里写了 scrapers/image_scrapers → 以 yaml 为准，覆盖 Emby 里的
+      · 没写 → 只在【明确坏掉】时才动手（一个刮削器都没有、或只剩 MetaTube），
+        用户自己在 Emby 里精简过的名单不碰
+    不这样分的话，用户在 Emby 界面上的任何调整都会被下一次「4」抹掉。
+    """
+    by_name = {r["name"]: r for r in rules}
+    try:
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return 0
+    changed, changed_ids = [], []
+    for lb in libs:
+        nm = lb.get("Name") or "?"
+        if nm not in by_name:
+            continue                     # 不是规则管的库，一律不碰
+        if not any(_under(p, STRM_PATH) for p in (lb.get("Locations") or [])):
+            continue
+        rule = by_name[nm]
+        o = lb.get("LibraryOptions") or {}
+        tos = o.get("TypeOptions") or []
+        fs = sorted({f for t in tos for f in (t.get("MetadataFetchers") or [])})
+        broken = bool(tos) and (not fs or fs == [METATUBE_FETCHER])
+        explicit = bool(rule.get("scr") or rule.get("img"))
+        if not explicit and not broken:
+            continue
+        ct = (lb.get("CollectionType") or "").lower()
+        want = desired_type_options(key, ct, rule)
+        if not want:
+            continue
+        if rule.get("mt") and metatube_on(d):
+            for t in want:
+                for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
+                                ("ImageFetchers", "ImageFetcherOrder")):
+                    if METATUBE_FETCHER not in (t.get(fk) or []):
+                        t[fk] = list(t.get(fk) or []) + [METATUBE_FETCHER]
+                        t[ok_] = list(t.get(ok_) or []) + [METATUBE_FETCHER]
+        # 语言也一起对齐 —— 它和刮削器是同一件事的两面，分开同步只会让人困惑
+        lang, country = rule.get("lang") or "zh", rule.get("country") or "CN"
+        same = (o.get("TypeOptions") == want
+                and o.get("PreferredMetadataLanguage") == lang
+                and o.get("MetadataCountryCode") == country)
+        if same:
+            continue
+        o["TypeOptions"] = want
+        o["PreferredMetadataLanguage"] = lang
+        o["MetadataCountryCode"] = country
+        try:
+            _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
+                  body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
+            changed.append(nm)
+            changed_ids.append((lb.get("ItemId"), nm))
+        except Exception as e:
+            warn(f"「{nm}」的刮削器设置写不进去：{_short_err(e)}")
+    if changed:
+        ok(f"{len(changed)} 个媒体库的刮削器/语言已按规则文件设好：{'、'.join(changed)}")
+        for iid, nm in changed_ids:
+            n_item = _lib_item_count(key, iid)
+            if n_item > REFRESH_AUTO_MAX:
+                warn(f"「{nm}」有 {n_item} 个条目，没有自动重刮 —— 挑个时间自己来")
+                continue
+            try:
+                _emby(f"/Items/{iid}/Refresh?Recursive=true"
+                      f"&MetadataRefreshMode=FullRefresh"
+                      f"&ImageRefreshMode=FullRefresh"
+                      f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
+                      key, method="POST", timeout=30)
+                ok(f"「{nm}」已通知重刮（{n_item} 个条目，后台进行）")
+            except Exception:
+                pass
+    return len(changed)
+
+
 def repair_scrapers(key):
     """把刮削器名单坏掉的 strm 媒体库修回来。返回修了几个。
 
@@ -6147,6 +6238,52 @@ def _emby_default_fetchers(key, ctype):
         out.append({"Type": t.get("Type") or "",
                     "MetadataFetchers": md, "MetadataFetcherOrder": list(md),
                     "ImageFetchers": im, "ImageFetcherOrder": list(im)})
+    return out
+
+
+def desired_type_options(key, ctype, rule=None):
+    """这个库【应该】用哪些刮削器。返回 TypeOptions。
+
+    规则里没写 scrapers/image_scrapers 就用 Emby 自己的默认值；写了就按写的来。
+    两点都由 Emby 的 AvailableOptions 兜底：只保留【这台机器上真实存在】的
+    刮削器名字 —— 用户拼错一个、或者写了个没装的插件，不该把整份名单带歪。
+
+    顺序按用户写的来 —— Emby 的名单是有优先级的，排在前面的先用，后面的只
+    补缺。用户特意排了顺序就该照办。
+    """
+    base = _emby_default_fetchers(key, ctype) or _borrow_type_options(key, ctype)
+    if not base:
+        return []
+    want_md = [x.lower() for x in ((rule or {}).get("scr") or [])]
+    want_im = [x.lower() for x in ((rule or {}).get("img") or [])]
+    avail = _emby_avail_names(key, ctype)
+    out = []
+    for t in base:
+        t = dict(t)
+        for names, fk, ok_ in ((want_md, "MetadataFetchers", "MetadataFetcherOrder"),
+                               (want_im, "ImageFetchers", "ImageFetcherOrder")):
+            if not names:
+                continue                 # 没指定 → 保留 Emby 默认那一份
+            pool = avail.get((t.get("Type") or "", fk)) or []
+            picked = [p for n in names for p in pool if p.lower() == n]
+            if picked:                   # 一个都对不上就别动，留默认的
+                t[fk], t[ok_] = picked, list(picked)
+        out.append(t)
+    return out
+
+
+def _emby_avail_names(key, ctype):
+    """{(Type, 字段): [这台机器上真实可选的刮削器名]}。问不到返回空。"""
+    try:
+        r = _emby(f"/Libraries/AvailableOptions?libraryContentType={ctype or ''}"
+                  f"&isNewLibrary=true", key, timeout=20) or {}
+    except Exception:
+        return {}
+    out = {}
+    for t in (r.get("TypeOptions") or []):
+        for fk in ("MetadataFetchers", "ImageFetchers"):
+            out[(t.get("Type") or "", fk)] = [x.get("Name") for x in (t.get(fk) or [])
+                                              if isinstance(x, dict) and x.get("Name")]
     return out
 
 
