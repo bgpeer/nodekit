@@ -1969,6 +1969,7 @@ LIB_RULES_DEFAULT = [
     {"name": "电影",   "kw": ["电影", "movies", "movie"],           "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
     {"name": "电视剧", "kw": ["电视剧", "剧集", "连续剧", "tv"],     "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
     {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
+    {"name": "动漫电影", "kw": ["动漫电影", "剧场版"],               "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
     {"name": "纪录片", "kw": ["纪录片", "纪录", "documentary"],      "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
     {"name": "AV影片", "kw": ["av", "写真", "番号"],                 "type": "movies",  "mt": True,  "lang": "ja", "country": "JP"},
 ]
@@ -2193,8 +2194,21 @@ def plan_libraries(d, rules=None):
             continue
         for name in subs:
             full = os.path.join(cur, name)
-            hit = next((r for r in rules
-                        if any(_kw_hit(name, k) for k in r["kw"])), None)
+            # 【按命中的关键词有多长挑，不是按规则顺序】实测撞的就是这个：
+            # 文件夹叫「动漫电影」，而「电影」规则的关键词就是「电影」——
+            # 中文是子串匹配，「电影」在「动漫电影」里面。规则表里「电影」排在
+            # 「动漫电影」前面，于是整个文件夹被划给了电影库，用户新加的
+            # 「动漫电影」规则怎么跑都不生效，而且一声不吭。
+            #
+            # 靠"窄的往前放"来规避是错的：用户加规则时不会去想自己的关键词是不是
+            # 别人的子串，而这类包含关系（电影/动漫电影、剧集/电视剧集）到处都是。
+            # 命中越长的越具体，让它赢，跟顺序无关。
+            best, blen = None, 0
+            for r in rules:
+                for k in r["kw"]:
+                    if _kw_hit(name, k) and len(k) > blen:
+                        best, blen = r, len(k)
+            hit = best
             if hit and _count(full):
                 rel = os.path.relpath(full, base).replace(os.sep, "/")
                 plan.setdefault(hit["name"],
@@ -2344,13 +2358,34 @@ def auto_libraries_apply(d, key, quiet=False):
     except Exception:
         return
     if not plan:
+        if not quiet:
+            print(f"  {DIM}关键词规则：{len(rules)} 条，没有文件夹匹配上。{RST}")
         return
-    exist = {n for n, _ps, _t in emby_libs(key)}
-    if not any(n not in exist for n in plan):
-        return                      # 该建的都在了，安静走人
+    # 【不能只看"库名在不在"】以前这里是 any(n not in exist)，于是"库都在、
+    # 但某个库少了一条路径"这种情况直接 return —— 而那恰恰是最常见的：
+    # 用户网盘里新加一个文件夹，它归属的库早就建好了，缺的只是一条路径。
+    # 实测那次：新文件夹被划给已有的「电影」库，三个库名都在，整步静默跳过。
+    libs = {n: ps for n, ps, _t in emby_libs(key)}
+    todo_any = False
+    for name, (_ct, paths, _mt, _lg, _co) in plan.items():
+        if name not in libs:
+            todo_any = True
+            break
+        if any(not any(_under(x, h) for h in libs[name]) for x in set(paths)):
+            todo_any = True
+            break
+    if not todo_any:
+        if not quiet:
+            print(f"  {DIM}媒体库和关键词规则已经对齐（{len(plan)} 个库），"
+                  f"没有要建的。{RST}")
+        return
     print()
     info("按关键词规则建媒体库...")
     made, added = apply_libraries(d, key, plan)
+    if not (made or added):
+        # 走到这儿说明确实有事该做，却一件都没做成 —— apply_libraries 里
+        # 已经打印了原因（重叠 / 接口失败），这里补一句结论，别让人以为没跑
+        warn("一个库都没建成，原因见上面几行。")
     if made or added:
         ok(f"新建 {made} 个媒体库，补了 {added} 条路径")
         mt_libs = [n for n, (_t, _p, m, _l, _c) in plan.items() if m]
