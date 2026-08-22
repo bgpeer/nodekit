@@ -542,7 +542,7 @@ def order_scan_paths(d, paths):
     def local_strm(p):
         n = 0
         try:
-            for _r, _ds, fs in os.walk(os.path.join(base, strm_mount_dir(p))):
+            for _r, _ds, fs in os.walk(os.path.join(base, *strm_subpath(p).split("/"))):
                 n += sum(1 for f in fs if f.endswith(".strm"))
         except OSError:
             pass
@@ -572,17 +572,43 @@ def order_scan_paths(d, paths):
     return [p for _n, p in scanned] + fresh
 
 
-def strm_mount_dir(scan_path):
-    """扫描路径 → 它在 strm 树里的主目录名。/quark/电影 → quark；/115 → 115
+def strm_subpath(scan_path):
+    """扫描路径 → strm 树里对应的相对目录。就是网盘全路径去掉开头的斜杠。
 
-    每个网盘一条主路径，是这套目录结构唯一能长期站得住的形状：
+        /quark        → quark
+        /quark/电影   → quark/电影
+
+    【strm 树是网盘树的镜像】。这条规则唯一的要求就是"一一对应"，而它换来的
+    是扫描路径怎么改都不会让已有的 strm 搬家。
+
+    原来的规则是「target = cloud/<盘名>，底下接【相对扫描路径】的部分」——
+    扫描路径自己那几段被吃掉。实测撞出来的样子：
+
+        网盘 /quark/电影/仙逆/x.mp4     → cloud/quark/仙逆/x.strm      「电影」没了
+        网盘 /quark/电影/电影/功夫/…    → cloud/quark/电影/功夫/…      这个「电影」是里层那个
+
+    两个问题：
+      1. cloud/quark/电影 这个路径，在扫 /quark 时指外层「电影」，在扫
+         /quark/电影 时指内层「电影」—— 同一个字符串换了含义。
+      2. 而 Emby 媒体库的路径是用户在 Emby 界面里手填的，脚本改扫描路径时
+         碰不到它。于是用户把扫描路径填深一层，库还指着老字符串，覆盖范围
+         悄悄变了：那次是 7 个 strm 里 6 个掉到库外面，Emby 不报任何错。
+
+    镜像全路径之后，cloud/quark/电影 永远等于网盘的 /quark/电影，跟当时扫的是
+    哪一层无关。已有的 strm 由 migrate_strm_layout() 挪过去，续播点跟着搬。
+    """
+    return "/".join(x for x in (scan_path or "").split("/") if x)
+
+
+def strm_mount_dir(scan_path):
+    """扫描路径 → 它在 strm 树里的【顶层】目录名。/quark/电影 → quark；/115 → 115
+
+    只在"这个网盘还要不要"这种整盘级别的判断里用（比如清理孤儿主目录）。
+    落点用 strm_subpath()，别拿这个去拼路径 —— 那正是上面记的那个坑。
+
+    每个网盘一条主路径这件事本身是对的，保留：
       · 挂第 N 个网盘时不用改任何已有配置，它自己长出 cloud/<盘名>/
       · 两个盘里都有「电影」文件夹也不会混在一起
-      · 扫描路径改深改浅（/quark → /quark/电影）只影响那个盘自己的子树，
-        不会像共用 target_dir 时那样把【所有】盘的 strm 整体挪位
-    最后一条是实测踩出来的：扫描路径从 /quark/电影 改成自动展开的 /quark，
-    7 个 strm 全部换了位置，旧的又不会被 prune 清掉（网盘上还在），
-    结果是每部片在 Emby 里变成两个条目、续播点全丢。
     """
     segs = [x for x in (scan_path or "").split("/") if x]
     return segs[0] if segs else ""
@@ -677,7 +703,7 @@ def _gen_strm_task(cfg, path):
     cron: "{cfg['strm_cron']}"
     alist: openlist
     source_dir: "{path}"
-    target_dir: "{STRM_PATH}/{strm_mount_dir(path)}"
+    target_dir: "{STRM_PATH}/{strm_subpath(path)}"
     mode: AlistPath         # 见 gen_autofilm_conf 的注释，三种取值都实测过
     flatten_mode: false
     overwrite: false
@@ -1785,7 +1811,7 @@ def planned_strm_path(d, netdisk_path, scan_paths):
     rel = netdisk_path[len(best.rstrip("/")):].lstrip("/")
     if not rel:
         return ""
-    return os.path.join(strm_root(d), STRM_SUBDIR, strm_mount_dir(best),
+    return os.path.join(strm_root(d), STRM_SUBDIR, *strm_subpath(best).split("/"),
                         os.path.splitext(rel)[0] + ".strm")
 
 
@@ -1986,7 +2012,7 @@ def _sweep_empty_dirs(root_dir):
 
 
 def migrate_strm_layout(d, key):
-    """把已有的 strm 挪到「每个网盘一个主目录」的新布局里。返回挪了几个。
+    """把已有的 strm 挪到它按当前规则【应该】在的位置。返回挪了几个。
 
     为什么必须由脚本来挪、而不是让 AutoFilm 在新位置重新生成一遍：旧位置的
     strm 【不会】被 prune 清掉 —— prune 只删网盘上确认没有的，而这些文件在网盘上
@@ -2012,7 +2038,7 @@ def migrate_strm_layout(d, key):
         _sweep_empty_dirs(strm_root(d))
         return 0
     print()
-    info(f"扫描路径变了，{len(moves)} 个 strm 要挪到新位置（每个网盘一个主目录）")
+    info(f"{len(moves)} 个 strm 要挪位置（strm 目录树要和网盘目录树对上）")
     print(f"  {DIM}不挪的话新旧两份并存，每部片在 Emby 里会变成两个条目。{RST}")
     saved = _progress_by_target(d, key) if key else {}
     if saved:
@@ -2041,7 +2067,7 @@ def migrate_strm_layout(d, key):
             warn(f"挪不动 {os.path.basename(src)}：{_short_err(e)}")
     # 顺手把空掉的旧目录收干净，否则 Emby 里会留一堆空文件夹条目
     _sweep_empty_dirs(strm_root(d))
-    ok(f"{n} 个 strm 已挪到新布局")
+    ok(f"{n} 个 strm 已挪好，strm 目录树和网盘对上了")
     if key:
         emby_scan_wait(key, timeout=900)
         back = _restore_progress(d, key, saved)
