@@ -38,6 +38,9 @@ SCRIPT_VERSION = "1.1.0"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
+# 媒体库关键词规则也放仓库里，和脚本一起更新。用户点的名：想在 GitHub 上直接改，
+# 不用登服务器 —— 在手机上尤其明显，终端里改 yaml 基本没法用。
+RULES_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/library-rules.yaml"
 
 # 容器日志里的 ANSI 颜色码。解析日志前必须剥掉，否则字段名被转义序列包着，
 # 正则一个都匹配不到（而粘贴出来的文本又是干净的，极难察觉）
@@ -1967,9 +1970,20 @@ LIB_RULES_DEFAULT = [
 LIB_TYPES = {"movies": "电影", "tvshows": "电视剧", "homevideos": "家庭影像", "": "混合"}
 
 
+# 仓库拉下来的那份。【别手改】—— 每次「更新」都会被仓库版覆盖
 LIB_RULES_FILE = "library-rules.yaml"
+# 本机覆盖。存在时完全盖过仓库版，「更新」不碰它。
+# 这个脚本是给别人也能用的，而别人改不了 bgpeer 那个仓库 —— 没有这一份，
+# 他们就只能吃默认规则。菜单里的 a / d 写的也是这一份。
+LIB_RULES_LOCAL = "library-rules.local.yaml"
 LIB_RULES_HEADER = """\
-# media-stack 媒体库关键词规则
+# media-stack 媒体库关键词规则（本机覆盖版）
+#
+# 这份文件存在时，会【完全盖过】仓库里那份 library-rules.yaml，
+# 而且「6 更新」不会碰它。删掉它就回到跟随仓库。
+#
+# 仓库那份（改那边全机器生效，手机上开 GitHub 就能编辑）：
+#   https://github.com/bgpeer/nodekit/blob/main/library-rules.yaml
 #
 # 文件夹名匹配到关键词，就把这个文件夹【整个】收进对应的媒体库。
 # 改完回「3 后补参数 → 8」跑一次就生效，不用重启任何东西。
@@ -1998,8 +2012,67 @@ LIB_RULES_HEADER = """\
 """
 
 
-def lib_rules_path(d):
-    return os.path.join(d, LIB_RULES_FILE)
+def lib_rules_path(d, local=False):
+    return os.path.join(d, LIB_RULES_LOCAL if local else LIB_RULES_FILE)
+
+
+def fetch_lib_rules(d):
+    """把仓库里那份规则拉到本机。返回 True 表示拉到了新内容。
+
+    和 self_update() 同一个道理：规则改在仓库里，不主动拉的话永远到不了机器上。
+    带时间戳绕开 raw.githubusercontent 的 CDN 缓存 —— 不绕的话"刚推的改动"
+    拉下来还是旧的，看起来就像改了没用。
+
+    拉失败【不是错误】：机器上还留着上一次拉到的那份，或者内置默认。
+    规则文件拉不动就让整个更新报红，是本末倒置。
+    """
+    try:
+        req = urllib.request.Request(f"{RULES_URL}?_t={int(time.time())}",
+                                     headers={"User-Agent": "media-stack"})
+        body = urllib.request.urlopen(req, timeout=20).read().decode()
+    except Exception:
+        return False
+    # 只接受解析得出规则的内容 —— 别把一页 404/限流提示写进去，那会让所有库都消失
+    if not parse_lib_rules(body):
+        return False
+    path = lib_rules_path(d)
+    try:
+        if os.path.exists(path) and open(path, encoding="utf-8").read() == body:
+            return False
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return True
+    except OSError:
+        return False
+
+
+def lib_rules(d=None):
+    """当前生效的关键词规则，以及它是从哪来的。返回 (规则列表, 来源说明)。
+
+    优先级【本机覆盖 > 仓库拉下来的 > 内置默认】：
+      · 本机覆盖（library-rules.local.yaml）—— 用户自己建的，更新不碰。
+        这个脚本是给别人也能用的，而别人改不了 bgpeer 那个仓库。
+      · 仓库版（library-rules.yaml）—— 「6 更新」时拉，这是仓库主人改规则的地方。
+      · 内置默认 —— 前两个都没有时兜底，装机第一次就能用。
+
+    【解析不出规则时不覆盖用户的文件】文件在但一条都没读出来，多半是手改坏了。
+    这时候拿默认值写回去等于把人家写的东西悄悄删了。报一声，这次用默认跑。
+    """
+    d = d or ms_install_dir()
+    for local in (True, False):
+        path = lib_rules_path(d, local)
+        try:
+            if not os.path.exists(path):
+                continue
+            got = parse_lib_rules(open(path, encoding="utf-8").read())
+        except OSError:
+            continue
+        if got:
+            return got, ("本机覆盖 " + path if local else "仓库 " + path)
+        warn(f"{path} 里没解析出规则（格式改坏了？），这次先用默认的。")
+        print(f"  {DIM}原文件没有被改动。{RST}")
+        break
+    return [dict(r) for r in LIB_RULES_DEFAULT], "内置默认（还没拉到仓库那份）"
 
 
 def parse_lib_rules(text):
@@ -2052,49 +2125,15 @@ def dump_lib_rules(rules):
 
 
 def save_lib_rules(d, rules):
+    """写【本机覆盖】。菜单里的增删只该影响这一台，不该去动仓库拉下来的那份 ——
+    那份下次更新就被覆盖了，用户会以为自己的修改丢了。"""
     try:
-        with open(lib_rules_path(d), "w", encoding="utf-8") as f:
+        with open(lib_rules_path(d, True), "w", encoding="utf-8") as f:
             f.write(dump_lib_rules(rules))
         return True
     except OSError as e:
         warn(f"规则文件写不进去：{_short_err(e)}")
         return False
-
-
-def lib_rules(d=None):
-    """当前的关键词规则。以【文件】为准，文件不在就按默认建一份。
-
-    放成文件而不是塞进状态 json，是用户点的名：想像 mihomo 的 yaml 那样
-    自己拿编辑器改。菜单里的增删也写回这个文件，两边是同一份东西，
-    不会出现"菜单显示一套、文件里是另一套"。
-    """
-    d = d or ms_install_dir()
-    path = lib_rules_path(d)
-    try:
-        if os.path.exists(path):
-            got = parse_lib_rules(open(path, encoding="utf-8").read())
-            if got:
-                return got
-            # 文件在但一条都没解析出来：可能是改坏了。这时候【不要】拿默认值
-            # 覆盖回去 —— 那等于把用户辛苦写的东西悄悄删了。报一声，用默认跑。
-            warn(f"{path} 里没解析出规则（格式改坏了？），这次先用默认的。")
-            print(f"  {DIM}原文件没有被改动。{RST}")
-            return [dict(r) for r in LIB_RULES_DEFAULT]
-    except OSError:
-        pass
-    # 从老版本迁移：以前存在状态 json 里
-    old = ms_state().get("lib_rules")
-    rules = [dict(r) for r in LIB_RULES_DEFAULT]
-    if isinstance(old, list) and old:
-        got = [{"name": str(r.get("name") or ""), "kw": [str(x) for x in (r.get("kw") or [])],
-                "type": str(r.get("type") or "movies"), "mt": bool(r.get("mt"))}
-               for r in old if isinstance(r, dict)]
-        got = [r for r in got if r["name"] and r["kw"]]
-        if got:
-            rules = got
-    if os.path.isdir(d):
-        save_lib_rules(d, rules)
-    return rules
 
 
 def _kw_hit(dirname, kw):
@@ -2117,7 +2156,7 @@ def plan_libraries(d, rules=None):
 
     只收【底下真的有 strm 的】目录 —— 空壳目录建进去只会在 Emby 里多一个空条目。
     """
-    rules = rules or lib_rules(d)
+    rules = rules or lib_rules(d)[0]
     base = os.path.join(strm_root(d), STRM_SUBDIR)
     has_strm = {}
 
@@ -2256,13 +2295,18 @@ def auto_libraries():
     if not key:
         warn("没有 Emby API Key，先填「1 添加 API 密钥」。")
         return
-    rules = lib_rules(d)
+    rules, rule_src = lib_rules(d)
     while True:
         print()
         print(f"  {BOLD}关键词规则{RST}{DIM}　文件夹名匹配到关键词，"
               f"就把它整个收进对应的媒体库{RST}")
-        print(f"  {DIM}规则文件 {lib_rules_path(d)}"
-              f"　—— 也可以直接拿编辑器改，改完回来跑一次{RST}")
+        print(f"  {DIM}当前规则来自 {rule_src}{RST}")
+        print(f"  {DIM}想改：编辑仓库里那份（手机上开 GitHub 就行），"
+              f"再跑「6 更新」拉下来 ——{RST}")
+        print(f"  {DIM}  https://github.com/bgpeer/nodekit/blob/main/"
+              f"{LIB_RULES_FILE}{RST}")
+        print(f"  {DIM}只想改这一台：下面的 a / d 会写 {lib_rules_path(d, True)}"
+              f"，它盖过仓库版，更新不碰。{RST}")
         for i, r in enumerate(rules, 1):
             mt = f"　{CYAN}带 MetaTube{RST}" if r["mt"] else ""
             print(f"    {i}. {BOLD}{r['name']}{RST}"
@@ -2285,20 +2329,24 @@ def auto_libraries():
                 for x in sorted(set(paths)):
                     print(f"        {DIM}{x}{RST}")
         print()
-        print(f"  {DIM}a 加一条规则　d 删一条　r 恢复默认　"
+        print(f"  {DIM}a 加一条规则　d 删一条　r 删掉本机覆盖　"
               f"{RST}{BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
         c = ask("请选择").strip().lower()
         if c in ("", "0", "q"):
             return
         if c == "r":
-            rules = [dict(x) for x in LIB_RULES_DEFAULT]
-            save_lib_rules(d, rules)
-            ok(f"已恢复默认规则（写回 {lib_rules_path(d)}）")
+            try:
+                os.remove(lib_rules_path(d, True))
+                ok("本机覆盖已删掉，回到跟随仓库那份")
+            except OSError:
+                ok("本来就没有本机覆盖，跟随的就是仓库那份")
+            rules, rule_src = lib_rules(d)
         elif c == "d":
             i = ask("删第几条").strip()
             if i.isdigit() and 1 <= int(i) <= len(rules):
                 gone = rules.pop(int(i) - 1)
                 save_lib_rules(d, rules)
+                rule_src = "本机覆盖 " + lib_rules_path(d, True)
                 ok(f"已删掉「{gone['name']}」")
             else:
                 warn("序号不对。")
@@ -2315,6 +2363,7 @@ def auto_libraries():
             mt = ask_yn("这个库要开 MetaTube（按番号刮成人片）吗？", False)
             rules.append({"name": nm, "kw": kw, "type": t, "mt": mt})
             save_lib_rules(d, rules)
+            rule_src = "本机覆盖 " + lib_rules_path(d, True)
             ok(f"已加「{nm}」")
         elif c == "y":
             if not plan:
@@ -3303,6 +3352,15 @@ def do_update(from_menu=False):
     if stale:
         ok(f"清掉 {stale} 个卡住的后台任务进程{DIM}（老版本没装互斥锁，"
            f"卡住的那轮会一直吊着占内存）{RST}")
+    # 规则文件和脚本一样住在仓库里，不主动拉就永远到不了机器上 —— 用户在
+    # GitHub 上改完，机器这边一点变化都没有，看起来就像改了没用。
+    if fetch_lib_rules(d):
+        _lr, _ = lib_rules(d)
+        ok(f"媒体库关键词规则已更新（{len(_lr)} 条："
+           f"{'、'.join(r['name'] for r in _lr)}）")
+        if os.path.exists(lib_rules_path(d, True)):
+            print(f"  {DIM}注意：本机有覆盖文件 {lib_rules_path(d, True)}，"
+                  f"实际生效的是它，不是刚拉下来的这份。{RST}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
@@ -6573,10 +6631,10 @@ def params_menu():
         tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
               else f"{DIM}刮削结果{RST}")
         print(f"  7. 片名用哪个            当前：{tp}")
-        _libr = lib_rules(d) if is_installed(d) else []
+        _libr, _libsrc = lib_rules(d) if is_installed(d) else ([], "")
         print(f"  8. 按关键词自动建媒体库{DIM}（文件夹名匹配到就整个收进去，"
               f"AV 类自动带 MetaTube）{RST}")
-        print(f"     {DIM}规则文件：{os.path.join(d, LIB_RULES_FILE)}"
+        print(f"     {DIM}规则来自 {_libsrc or '未安装'}"
               + (f"　共 {len(_libr)} 条：{'、'.join(r['name'] for r in _libr)}"
                  if _libr else "") + f"{RST}")
         if metatube_on(d):
