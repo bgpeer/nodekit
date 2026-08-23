@@ -58,14 +58,14 @@
   metatube: false
   keywords: 动漫, 动画, 番剧, anime
 
-- name: 动漫电影
+- name: 动漫剧场版
   type: movies
   language: zh-CN
   country: CN
   scrapers: TheMovieDb, TheTVDB
   image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
-  keywords: 动漫电影, 剧场版
+  keywords: 动漫剧场版, 剧场版
 
 - name: 欧美电影
   type: movies
