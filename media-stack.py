@@ -2238,6 +2238,7 @@ def _emby_add_library(key, name, ctype, paths, lang="zh", country="CN"):
     opts = {
         "PreferredMetadataLanguage": lang,
         "MetadataCountryCode": country,
+        "PreferredImageLanguage": lang,
         "EnableRealtimeMonitor": False,   # strm 是脚本批量增删的，实时监控只会
                                           # 让 Emby 在扫库中途反复触发重扫
         "PathInfos": [{"Path": x} for x in paths],
@@ -6076,13 +6077,25 @@ def sync_library_options(d, key, rules):
         fs = sorted({f for t in tos for f in (t.get("MetadataFetchers") or [])})
         broken = bool(tos) and (not fs or fs == [METATUBE_FETCHER])
         explicit = bool(rule.get("scr") or rule.get("img"))
-        if not explicit and not broken:
-            continue
         ct = (lb.get("CollectionType") or "").lower()
-        want = desired_type_options(key, ct, rule)
-        if not want:
-            continue
-        if rule.get("mt") and metatube_on(d):
+        # 【语言是无条件同步的，不能挂在刮削器那个条件下面】原来这里写的是
+        # "既没写 scrapers、刮削器也没坏 → 直接 continue"，于是没写 scrapers
+        # 的库连语言都不会被设。用户三个库的截图：只有写了 scrapers 的那个
+        # 语言是「Chinese」，另外两个「首选元数据下载语言」和「认证国家」全是空的。
+        #
+        # 语言和刮削器不是一回事：language/country 每条规则都有，是这份 yaml
+        # 最基本的字段；刮削器是可选的、而且要尊重用户在 Emby 里的手动调整。
+        # 两者的写入条件本来就该分开。
+        want = desired_type_options(key, ct, rule) if (explicit or broken) else None
+        # 【metatube: true 也是明确意图，和 language 一样无条件生效】
+        # 名单本来是好的、yaml 里又没写 scrapers 时，want 是 None、整段跳过 ——
+        # 于是 AV 库明明标着 metatube: true，MetaTube 却一直没挂上。
+        # 这时候拿现有名单当底，只往里补一个 MetaTube，别的一律不动。
+        if want is None and rule.get("mt") and metatube_on(d) and tos:
+            if METATUBE_FETCHER not in {f for t in tos
+                                        for f in (t.get("MetadataFetchers") or [])}:
+                want = json.loads(json.dumps(tos))
+        if want and rule.get("mt") and metatube_on(d):
             for t in want:
                 for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
                                 ("ImageFetchers", "ImageFetcherOrder")):
@@ -6091,14 +6104,22 @@ def sync_library_options(d, key, rules):
                         t[ok_] = list(t.get(ok_) or []) + [METATUBE_FETCHER]
         # 语言也一起对齐 —— 它和刮削器是同一件事的两面，分开同步只会让人困惑
         lang, country = rule.get("lang") or "zh", rule.get("country") or "CN"
-        same = (o.get("TypeOptions") == want
+        # 【图像语言也要设】用户截图里「首选图像下载语言」那一栏三个库全是空的 ——
+        # 我只写了元数据语言。空着的后果和元数据语言留空一样：海报按服务器默认
+        # 语言挑，中文片子会拿到英文版海报，或者干脆挑不出来。
+        # 它跟元数据语言用同一个值，没有分开填的道理。
+        img_lang = rule.get("img_lang") or lang
+        same = ((want is None or o.get("TypeOptions") == want)
                 and o.get("PreferredMetadataLanguage") == lang
-                and o.get("MetadataCountryCode") == country)
+                and o.get("MetadataCountryCode") == country
+                and o.get("PreferredImageLanguage") == img_lang)
         if same:
             continue
-        o["TypeOptions"] = want
+        if want is not None:
+            o["TypeOptions"] = want
         o["PreferredMetadataLanguage"] = lang
         o["MetadataCountryCode"] = country
+        o["PreferredImageLanguage"] = img_lang
         try:
             _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
                   body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
@@ -6107,7 +6128,8 @@ def sync_library_options(d, key, rules):
         except Exception as e:
             warn(f"「{nm}」的刮削器设置写不进去：{_short_err(e)}")
     if changed:
-        ok(f"{len(changed)} 个媒体库的刮削器/语言已按规则文件设好：{'、'.join(changed)}")
+        ok(f"{len(changed)} 个媒体库的语言/刮削器已按规则文件设好："
+           f"{'、'.join(changed)}")
         for iid, nm in changed_ids:
             n_item = _lib_item_count(key, iid)
             if n_item > REFRESH_AUTO_MAX:

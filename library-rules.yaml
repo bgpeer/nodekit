@@ -8,7 +8,9 @@
 #   name      媒体库在 Emby 里显示的名字
 #   type      movies 电影 / tvshows 电视剧
 #             tvshows 要求网盘里是「剧名/Season 01/剧名 - S01E01.mp4」结构
-#   language  刮削语言 zh / ja / en，留空会按英文搜，中文片名搜不到
+#   language  刮削语言。元数据和海报都用它，留空会按服务器默认（通常英文）搜，
+#             中文片名一条都搜不到。想要「简体中文」而不是笼统的「中文」，
+#             写 zh-CN；日语写 ja，英语 en
 #   country   CN / JP / US，跟着 language 走
 #   metatube  true 时额外挂上 MetaTube（按番号刮成人片），只给成人库开
 #   scrapers  可选。这个库用哪些【元数据】刮削器，逗号隔开、按优先级排。
@@ -25,21 +27,21 @@
 
 - name: 电影
   type: movies
-  language: zh
+  language: zh-CN
   country: CN
   metatube: false
   keywords: 电影, movies, movie
 
 - name: 电视剧
   type: tvshows
-  language: zh
+  language: zh-CN
   country: CN
   metatube: false
   keywords: 电视剧, 剧集, 连续剧, tv
 
 - name: 动漫
   type: tvshows
-  language: zh
+  language: zh-CN
   country: CN
   scrapers: TheTVDB, TheMovieDb
   image_scrapers: TheTVDB, FanArt, TheMovieDb
@@ -48,14 +50,14 @@
 
 - name: 动漫电影
   type: movies
-  language: zh
+  language: zh-CN
   country: CN
   metatube: false
   keywords: 动漫电影, 剧场版
 
 - name: 纪录片
   type: movies
-  language: zh
+  language: zh-CN
   country: CN
   metatube: false
   keywords: 纪录片, 纪录, documentary
