@@ -6959,6 +6959,136 @@ def link_method_storages(d):
     return out
 
 
+# OpenList 每个存储的目录缓存时长（分钟）。默认 30。
+#
+# 【为什么这个值值得单独摆出来调】实测这台机器上：
+#   列目录 /quark/夸克挂载  第一次 12.7 秒  →  紧接着再列 0.3 秒
+# 差的四十倍就是"走没走真实接口"。而同一时段换直链只要 0.2 秒、一次没失败 ——
+# 坏的只有目录列举这一个接口，夸克对它限流。24 小时 81 次探测失败 20 次，
+# 九成耗时 54.6 秒。
+#
+# 缓存命中的列目录不吃网盘接口，也就不会被限流。把这个值调大，等于把大部分
+# 列目录挡在真实请求之外 —— 这是对着"列目录慢/失败"最直接的一招，比调预热
+# 频率对症得多（预热走的是换直链，那条路本来就没问题）。
+#
+# 代价：网盘里新增或改名的文件，最多要等这么久才被看见。而这个代价在这套
+# 东西里几乎不存在 —— AutoFilm 有自己的定时扫描，而且在网盘里动过目录之后
+# 本来就该去 OpenList 把存储停用再启用（那一下就清缓存）。
+DIR_CACHE_PRESETS = ((30, "OpenList 默认"), (120, "2 小时"),
+                     (720, "12 小时　推荐"), (1440, "24 小时"))
+
+
+def dir_cache_storages(d):
+    """列出各存储的目录缓存时长：(id, 挂载点, 驱动, 分钟)。取不到返回 []。
+
+    cache_expiration 是 x_storages 的一个【列】，不在 addition 里 —— 和
+    link_method 不一样，别照着那边写。列名先查 PRAGMA 确认存在再用：
+    OpenList 换版本改过表结构的话，宁可这一项不显示，也不要整个菜单打不开。
+    """
+    db = os.path.join(d, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(x_storages)")}
+        if "cache_expiration" not in cols:
+            con.close()
+            return []
+        rows = con.execute("select id, mount_path, driver, cache_expiration "
+                           "from x_storages order by mount_path").fetchall()
+        con.close()
+    except Exception:
+        return []
+    return [(sid, mp, drv, int(ce or 0)) for sid, mp, drv, ce in rows]
+
+
+def set_dir_cache():
+    """改各存储的目录缓存时长。见 DIR_CACHE_PRESETS。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    stores = dir_cache_storages(d)
+    if not stores:
+        warn("读不到存储的缓存设置。")
+        print(f"  {DIM}还没在 OpenList 里添加网盘，或者这个版本的表结构变了 ——"
+              f"可以去 OpenList → 存储 → 编辑，那一项叫「缓存过期时间」。{RST}")
+        return
+    print()
+    for _sid, mp, drv, ce in stores:
+        print(f"  {BOLD}{mp}{RST}  {DIM}({drv}){RST}   当前："
+              f"{CYAN}{BOLD}{ce} 分钟{RST}")
+    print()
+    print(f"  {DIM}缓存命中的列目录不走网盘接口（实测 0.3 秒 vs 12.7 秒），"
+          f"也就不会被限流。{RST}")
+    print(f"  {DIM}代价：网盘里新增/改名的文件最多等这么久才被看见 —— "
+          f"改完目录去 OpenList 把存储停用再启用就立刻清掉。{RST}")
+    print()
+    for i, (m, why) in enumerate(DIR_CACHE_PRESETS, 1):
+        print(f"  {i}. {BOLD}{m} 分钟{RST} {DIM}（{why}）{RST}")
+    print()
+    c = ask("选一个，或直接输分钟数（回车取消）").strip()
+    if not c:
+        print("没有改动。")
+        return
+    if c.isdigit() and 1 <= int(c) <= len(DIR_CACHE_PRESETS):
+        want = DIR_CACHE_PRESETS[int(c) - 1][0]
+    elif c.isdigit():
+        want = int(c)
+    else:
+        print("没有改动。")
+        return
+    if want <= 0:
+        warn("得是个正数。没有改动。")
+        return
+    if want < DIR_CACHE_PRESETS[0][0]:
+        # 【序号和分钟数在同一个输入框里，会撞】上面 1-4 当序号，别的当分钟数。
+        # 用户想选第 5 项（没有第 5 项）敲个 5，落下来就是"5 分钟" —— 比默认的
+        # 30 还短，正好和他要的相反。比默认短的值一律先问一句。
+        if not ask_yn(f"{want} 分钟比 OpenList 默认的 "
+                      f"{DIR_CACHE_PRESETS[0][0]} 分钟还短，确定？"
+                      f"（想选第 N 项的话，只有 1-{len(DIR_CACHE_PRESETS)} 项）",
+                      False):
+            print("没有改动。")
+            return
+    # 【和切直链同一套写法】OpenList 把存储缓存在内存里，改完必须重启才生效；
+    # 写库前先停容器，避免和它自己的写入撞锁。
+    info("停止 OpenList...")
+    subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
+    db = os.path.join(d, "openlist", "config", "data.db")
+    bak = db + ".bak"
+    try:
+        shutil.copy2(db, bak)
+        con = sqlite3.connect(db)
+        for sid, mp, _drv, ce in stores:
+            con.execute("update x_storages set cache_expiration=? where id=?",
+                        (want, sid))
+            ok(f"{mp}: {ce} → {want} 分钟")
+        con.commit()
+        con.close()
+    except Exception as e:
+        err(f"写入失败：{e}")
+        if os.path.exists(bak):
+            shutil.copy2(bak, db)
+            warn("已从备份还原。")
+    finally:
+        subprocess.run(["docker", "start", "openlist"], capture_output=True, timeout=120)
+        info("OpenList 已重启")
+        # 【MediaWarp 必须跟着重启，而且要等 OpenList 先就绪】理由和切直链那边
+        # 一模一样：它只在启动时登录一次，OpenList 重启后旧令牌作废，换直链会
+        # 401，而且只有缓存里没有的片子才失败 —— 表现是"有的能放有的不能放"。
+        if wait_openlist_ready(d):
+            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
+                           timeout=120)
+            info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
+        else:
+            warn("OpenList 迟迟没就绪，没有重启 MediaWarp。")
+            print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
+    print()
+    print(f"  {DIM}观察一天，再看「5 链路体检」里「列目录历史」那张探测图，"
+          f"X（失败）应该变少。{RST}")
+
+
 def _compose_up(d):
     compose = os.path.join(d, "docker-compose.yml")
     env_file = os.path.join(d, ".env")
@@ -7657,6 +7787,17 @@ def params_menu():
                 read_emby_api_key(d) or "") if on]
             print(f"  9. MetaTube 在哪些库生效  当前："
                   + (f"{CYAN}{'、'.join(mtl)}{RST}" if mtl else f"{DIM}都不启用{RST}"))
+        # 目录缓存直接决定「列目录」快不快 —— 命中缓存 0.3 秒，走真实接口十几秒
+        # 还会被限流。当前值摆在菜单上，和直链方式一个道理。
+        dcs = dir_cache_storages(d) if is_installed(d) else []
+        if dcs:
+            _vals = {ce for _s, _m, _d2, ce in dcs}
+            dc_state = (f"{CYAN}{dcs[0][3]} 分钟{RST}" if len(_vals) == 1
+                        else f"{YELLOW}各存储不一致{RST}")
+        else:
+            dc_state = f"{DIM}未挂网盘{RST}"
+        print(f" 10. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
+              f"当前：{dc_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -7689,6 +7830,8 @@ def params_menu():
                 warn("没有 Emby API Key，先填「1」。")
             else:
                 choose_metatube_libraries(k0)
+        elif c == "10":
+            set_dir_cache()
         else:
             print("无效选择。")
             continue
@@ -8673,6 +8816,25 @@ def do_healthcheck():
             todo.append(htodo)
     else:
         _hc("列目录历史", "skip", "还没攒够记录（保活每跑一次记一条）")
+
+    # 【紧跟在列目录后面】这一项直接决定上面那两行好不好看：命中缓存的列目录
+    # 不走网盘接口（实测 0.3 秒 vs 12.7 秒），也就不会被限流。列目录老失败的
+    # 时候，这是最对症的一个旋钮，得让人一眼看见现在设的是多少。
+    _dcs = dir_cache_storages(d)
+    if _dcs:
+        _low = [f"{mp} {ce} 分钟" for _s, mp, _dv, ce in _dcs if ce and ce <= 30]
+        _txt = "　".join(f"{mp} {ce} 分钟" for _s, mp, _dv, ce in _dcs)
+        if _low and hstat and hstat.get("bad"):
+            _hc("目录缓存", "warn", f"{_txt}  {YELLOW}偏短{RST}")
+            todo.append((
+                "列目录老超时，而目录缓存只有 30 分钟 —— 大部分列目录都在走"
+                "真实的网盘接口，而夸克恰恰对这个接口限流",
+                "「3 后补参数 → 10 目录缓存时长」调到 720（12 小时）。"
+                "命中缓存的列目录不吃网盘接口。代价是网盘里新增/改名的文件"
+                "最多等这么久才被看见 —— 改完目录去 OpenList 把存储停用再"
+                "启用就立刻清掉"))
+        else:
+            _hc("目录缓存", "ok", _txt)
 
     # 存储 status 是陈旧记录，只有当【实测也失败】时才算真故障
     live_ok = {p for p, _ in listed_ok}
