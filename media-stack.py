@@ -2773,8 +2773,12 @@ def align_library(d, key, heal=True):
     # 不能在这儿再跑一遍（会撞锁、也会让用户白等一次）
     try:                              # 库级：刮削器/语言按规则文件对齐
         sync_library_options(d, key, lib_rules(d)[0])
-    except Exception:
-        pass
+    except Exception as e:
+        # 【别静默吞】原来这里是 except: pass。规则文件解析炸了、Emby 没起来、
+        # 哪个字段对不上，全都一声不吭 —— 用户看到的是"跑完了，Emby 里没变化"，
+        # 根本没法判断是没跑还是跑了没用。这一步失败不该拦住后面的对齐，
+        # 但必须让人知道它失败了。
+        warn(f"按规则文件对齐媒体库的刮削器/语言失败：{_short_err(e)}")
     if heal:
         heal_media_info(d, key)       # 条目级：补时长
     normalize_strm_files(d)           # heal 中途被打断的兜底
@@ -3581,6 +3585,19 @@ def do_update(from_menu=False):
     _k2 = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if _k2:
         tune_strm_libraries(_k2)
+        # 【刮削器/语言也要在这儿对一次】这是个设计漏。库选项的对齐一直分在两处：
+        # 续播门槛和多版本合并（tune_strm_libraries）就在上面这行，更新时会跑；
+        # 刮削器和语言（sync_library_options）只挂在「4 生成媒体库」和定时任务上，
+        # 更新这条路一次都不经过。
+        #
+        # 而用户的预期是"更新 = 新逻辑在我机器上生效"。上一版刚把"空名单也要
+        # 写默认刮削器"这条规则改对，他更新完去 Emby 一看，六个列表还是一个勾
+        # 都没有 —— 因为更新根本不走那段代码。他得再点一次「4」才行，而没人会
+        # 想到要点。同样是库选项，同样是更新时该带上的，没有道理分开。
+        try:
+            sync_library_options(d, _k2, lib_rules(d)[0])
+        except Exception as e:
+            warn(f"按规则文件对齐媒体库的刮削器/语言失败：{_short_err(e)}")
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
     print(f"  {DIM}想确认网盘通不通：跑「5 链路体检」。{RST}")
     # 上面 docker compose up -d 把容器全重启了，MediaWarp 的直链缓存随之清空。
@@ -6030,6 +6047,17 @@ def metatube_on(d):
 METATUBE_FETCHER = "MetaTube"
 
 
+def _fetcher_names(opts):
+    """这个库启用了哪些元数据刮削器，【按优先级】去重返回。
+
+    顺序就是优先级 —— 排前面的先查、查到就赢，后面的只用来填空缺。
+    用 set 去重会把这一点丢掉，所以走 dict.fromkeys。
+    """
+    return list(dict.fromkeys(
+        f for t in ((opts or {}).get("TypeOptions") or [])
+        for f in (t.get("MetadataFetcherOrder") or t.get("MetadataFetchers") or [])))
+
+
 def metatube_libraries(key):
     """每个媒体库有没有启用 MetaTube。返回 [(名字, ItemId, 是否启用, LibraryOptions)]。
 
@@ -6190,9 +6218,38 @@ def sync_library_options(d, key, rules):
                                 want is not None and want != tos))
         except Exception as e:
             warn(f"「{nm}」的刮削器设置写不进去：{_short_err(e)}")
+    # 【必须回读确认】这个接口对不认识的字段是【静默忽略】的：HTTP 200 只说明
+    # 请求收到了，不说明写进去了。tune_strm_libraries 早就吃过这个亏、也加了
+    # 回读，这个函数一直没加 —— 后果是脚本理直气壮地打印"4 个媒体库已按规则
+    # 文件设好"，而用户点进 Emby 的库编辑页，六个列表还是一个勾都没有。
+    # 报成功比不报更糟：用户会照着这行字把这个方向排除掉。
+    # 一次拉回全部库比每个库拉一次省得多。
     if changed:
-        ok(f"{len(changed)} 个媒体库的语言/刮削器已按规则文件设好："
+        try:
+            back = {x.get("ItemId"): (x.get("LibraryOptions") or {})
+                    for x in (_emby("/Library/VirtualFolders", key, timeout=20) or [])}
+        except Exception:
+            back = {}
+        bad = []
+        for iid, nm, _full in list(changed_ids):
+            now = back.get(iid)
+            if now is None:
+                continue                 # 回读本身失败，不当成写失败
+            if not _fetcher_names(now):  # 名单还是空的 = 这次写根本没进去
+                bad.append(nm)
+        if bad:
+            for nm in bad:
+                changed.remove(nm)
+            changed_ids[:] = [x for x in changed_ids if x[1] not in bad]
+            warn(f"{len(bad)} 个媒体库的刮削器名单写完回读还是空的："
+                 f"{'、'.join(bad)}")
+            print(f"  {DIM}Emby 收下了请求但没存 —— 这一项得到界面上手动勾："
+                  f"设置 → 媒体库 → 点该库 → 影片 元数据下载器 / 图像获取器。{RST}")
+    if changed:
+        ok(f"{len(changed)} 个媒体库的语言/刮削器已按规则文件设好（已回读确认）："
            f"{'、'.join(changed)}")
+    else:
+        print(f"  {DIM}媒体库的语言/刮削器已经和规则文件一致，没有要改的。{RST}")
         for iid, nm, _full in changed_ids:
             n_item = _lib_item_count(key, iid)
             if n_item > REFRESH_AUTO_MAX:
@@ -8612,23 +8669,15 @@ def do_healthcheck():
                 if not any(_under(p, STRM_PATH) for p in (_lb.get("Locations") or [])):
                     continue
                 _nm = _lb.get("Name") or "?"
-                _tos = ((_lb.get("LibraryOptions") or {}).get("TypeOptions") or [])
-                # 按名单里的顺序去重 —— 顺序就是优先级，排前面的先查，
-                # 打乱了等于把这一行最有用的信息丢了
-                _fs = list(dict.fromkeys(
-                    f for t in _tos for f in (t.get("MetadataFetcherOrder")
-                                              or t.get("MetadataFetchers") or [])))
-                if _tos and not _fs:
+                # 顺序就是优先级，排前面的先查 —— 去重时不能打乱
+                _fs = _fetcher_names(_lb.get("LibraryOptions"))
+                if not _fs:
+                    # 【别再区分"名单为空"和"名单在但没勾"了】上一版把前者写成
+                    # "跟随 Emby 默认"并报绿。而用户点进 Emby 的库编辑页，两种
+                    # 情况看到的是同一屏：六个列表一个勾都没有。
+                    # 对用户来说它们就是一回事，照实说。
                     nofetch.append(_nm)
                     _rows.append((_nm, f"{RED}一个都没勾{RST}"))
-                elif not _tos:
-                    # 【别再说这是"正常状态"了】上一版这里写的是"跟随 Emby 默认"，
-                    # 报绿。而用户点进 Emby 的库编辑页看到的是六个列表一个都没勾，
-                    # 于是"体检说没问题、界面上什么都没配"两边对不上。
-                    # 名单是空的就是没配好，照实说，并且指出去哪儿改。
-                    nofetch.append(_nm)
-                    _rows.append((_nm, f"{YELLOW}名单是空的{RST}"
-                                       f"{DIM}（Emby 界面上一个勾都没有）{RST}"))
                 else:
                     if _fs == [METATUBE_FETCHER]:
                         mtwrong.append(_nm)
