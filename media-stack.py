@@ -6096,12 +6096,7 @@ def sync_library_options(d, key, rules):
                                         for f in (t.get("MetadataFetchers") or [])}:
                 want = json.loads(json.dumps(tos))
         if want and rule.get("mt") and metatube_on(d):
-            for t in want:
-                for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
-                                ("ImageFetchers", "ImageFetcherOrder")):
-                    if METATUBE_FETCHER not in (t.get(fk) or []):
-                        t[fk] = list(t.get(fk) or []) + [METATUBE_FETCHER]
-                        t[ok_] = list(t.get(ok_) or []) + [METATUBE_FETCHER]
+            _put_metatube_first(want)
         # 语言也一起对齐 —— 它和刮削器是同一件事的两面，分开同步只会让人困惑
         lang, country = rule.get("lang") or "zh", rule.get("country") or "CN"
         # 【图像语言也要设】用户截图里「首选图像下载语言」那一栏三个库全是空的 ——
@@ -6182,13 +6177,8 @@ def repair_scrapers(key):
         if not good:
             continue
         had_mt = METATUBE_FETCHER in fs
-        if had_mt:                      # 原来戴着 MetaTube 的，修完还得戴着
-            for t in good:
-                for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
-                                ("ImageFetchers", "ImageFetcherOrder")):
-                    if METATUBE_FETCHER not in (t.get(fk) or []):
-                        t[fk] = list(t.get(fk) or []) + [METATUBE_FETCHER]
-                        t[ok_] = list(t.get(ok_) or []) + [METATUBE_FETCHER]
+        if had_mt:                      # 原来戴着 MetaTube 的，修完还得戴着，而且排第一
+            _put_metatube_first(good)
         o["TypeOptions"] = good
         try:
             _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
@@ -6312,6 +6302,32 @@ def _emby_avail_names(key, ctype):
 def good_type_options(key, ctype):
     """这个内容类型该用的刮削器名单。问不到就从同类型的其它库抄，都不行返回 []。"""
     return _emby_default_fetchers(key, ctype) or _borrow_type_options(key, ctype)
+
+
+def _put_metatube_first(tos):
+    """把 MetaTube 放到刮削器名单的【最前面】。原地改 tos，返回它。
+
+    【顺序决定谁说了算】Emby 的刮削器名单是有优先级的：排在前面的先查，
+    查到了就用它的结果，后面的只用来填空缺。所以把 MetaTube 追加在末尾
+    等于让它永远排在 TheMovieDb 后面 —— 而 TheMovieDb 对着一个成人片的
+    文件名也会自信地匹配上一部同名的正经片子，一旦它先认领，MetaTube
+    根本没机会插手。
+
+    实测就是这么翻的：AV 库里一个叫「小仙女.mp4」的文件，被 TheMovieDb
+    认成了 2021 年一部同名国产剧情片，简介是玉帝七个女儿的故事。
+
+    用户的话："只要是 AV影片 这个媒体库里面的所有视频，而且我开了 MetaTube
+    插件，不管他叫什么名字都应该把它带上 MetaTube 插件吗？" —— 他要的是
+    "这个库以 MetaTube 为准"，那 MetaTube 就得排第一。
+    """
+    for t in tos:
+        for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
+                        ("ImageFetchers", "ImageFetcherOrder")):
+            lst = [x for x in (t.get(fk) or []) if x != METATUBE_FETCHER]
+            t[fk] = [METATUBE_FETCHER] + lst
+            order = [x for x in (t.get(ok_) or []) if x != METATUBE_FETCHER]
+            t[ok_] = [METATUBE_FETCHER] + order
+    return tos
 
 
 def _borrow_type_options(key, ctype):
