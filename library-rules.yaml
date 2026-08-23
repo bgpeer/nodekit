@@ -36,6 +36,8 @@
   type: tvshows
   language: zh-CN
   country: CN
+  scrapers: TheTVDB, TheMovieDb
+  image_scrapers: TheTVDB, FanArt, TheMovieDb
   metatube: false
   keywords: 电视剧, 剧集, 连续剧, tv
 
