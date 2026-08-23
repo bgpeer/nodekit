@@ -6128,8 +6128,18 @@ def sync_library_options(d, key, rules):
             # 而这正是用户一路在问的："只要是这个媒体库里面的影片该是带什么刮削
             # 就带什么刮削……但是你不赋予是怎么回事"。他说的对，是我这儿漏了。
             # 空名单时从 Emby 的默认值起一份底，再把 MetaTube 放前面。
-            if METATUBE_FETCHER not in {f for t in tos
-                                        for f in (t.get("MetadataFetchers") or [])}:
+            # 【"在名单里"不够，还得在【最前面】】上一版的条件是"MetaTube 不在
+            # 名单里才补"，于是"在、但排在最后"这种情况一次都不会被处理 ——
+            # 而它恰恰是最常见的：set_metatube_libraries 是往名单末尾追加的。
+            #
+            # 实测现场，体检打出来的就是这个：
+            #     AV影片    TheMovieDb、TheTVDB、MetaTube
+            # 挂是挂上了，可 Emby 按顺序查，TheMovieDb 先查到就赢，MetaTube
+            # 永远只是那个"填空缺"的。用户看到的是"配了等于没配"。
+            _cur = [f for t in tos
+                    for f in (t.get("MetadataFetcherOrder")
+                              or t.get("MetadataFetchers") or [])]
+            if not _cur or _cur[0] != METATUBE_FETCHER:
                 want = (json.loads(json.dumps(tos)) if tos
                         else desired_type_options(key, ct, rule))
         if want and rule.get("mt") and metatube_on(d):
