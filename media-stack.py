@@ -2269,6 +2269,116 @@ def _emby_add_path(key, name, path):
         return _short_err(e)
 
 
+# 连续这么多轮"底下一个 strm 都没有"才删库。
+#
+# 【为什么不是发现就删】strm 树是脚本自己批量重写的：AutoFilm 正在按新配置
+# 重新生成、migrate_strm_layout 正在搬家、网盘那一刻列目录超时，都会让某个
+# 目录短暂地空掉。发现即删的话，一次时序上的巧合就能带走一个库连同它的观看
+# 记录 —— 而观看记录是这套东西里最不该出错、也最难恢复的那样东西。
+#
+# 这台机器已经因为"清理逻辑太自信"丢过一次 39786 个 strm。要两轮才动手，
+# 代价只是多等一次「4 生成媒体库」，换的是"瞬时空"永远不会误伤。
+EMPTY_LIB_STRIKES = 2
+
+
+def _lib_strm_count(d, lb):
+    """这个媒体库所有路径底下一共有几个 strm。有路径不在 strm 树里就返回 -1。
+
+    -1 的含义是"不归这儿管"：库里混着本地目录的话，它就不是一个纯粹的网盘库，
+    数出来的数字说明不了问题，更不该拿它当删库的依据。
+    """
+    n = 0
+    for p in (lb.get("Locations") or []):
+        if not _under(p, STRM_PATH):
+            return -1
+        rel = [x for x in p[len(STRM_PATH):].split("/") if x]
+        for _dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR, *rel)):
+            n += sum(1 for f in fs if f.endswith(".strm"))
+    return n
+
+
+def drop_empty_auto_libraries(d, key):
+    """脚本自己建的库，底下 strm 全没了就删掉。返回删了几个。
+
+    补上"能建不能删"这一半。用户在网盘里把「动漫电影」改名成「动漫剧场版」，
+    脚本按新名字建了新库，旧的那个空壳却一直杵在 Emby 里 —— 首页轮播、
+    「继续观看」照样推它的片，点开必然放不了。他的原话："这个可以自动建库
+    不可以自动删库吗？"
+
+    四道闸，缺一不可：
+      · 只删【脚本自己建的】（ms_state 里的 lib_auto）。用户手建的一律不碰 ——
+        动别人的库可能把观看记录连根拔了。
+      · 库的每一条路径都得在 strm 树里。混着本地目录的不算网盘库。
+      · 整棵 strm 树是空的时候【整个不做】。那说明是上游出了问题
+        （网盘掉线、AutoFilm 没跑），不是这个库该没了。
+      · 连续 EMPTY_LIB_STRIKES 轮都空才动手，见那个常量的注释。
+    """
+    mine = set(ms_state().get("lib_auto") or [])
+    if not mine:
+        return 0
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    total = 0
+    for _dp, _dn, fs in os.walk(base):
+        total += sum(1 for f in fs if f.endswith(".strm"))
+    if not total:
+        return 0                       # 整棵树空 = 上游的事，一个库都别动
+    try:
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return 0
+    strikes = {k: int(v) for k, v in (ms_state().get("lib_empty") or {}).items()
+               if isinstance(v, (int, float))}
+    alive, gone, pending = set(), [], []
+    for lb in libs:
+        nm = lb.get("Name") or "?"
+        alive.add(nm)
+        if nm not in mine:
+            continue
+        n = _lib_strm_count(d, lb)
+        if n != 0:                     # 有片子，或者 -1（混了本地目录）
+            strikes.pop(nm, None)
+            continue
+        strikes[nm] = strikes.get(nm, 0) + 1
+        if strikes[nm] < EMPTY_LIB_STRIKES:
+            pending.append(nm)
+            continue
+        try:
+            _emby(f"/Library/VirtualFolders?name={urllib.parse.quote(nm)}"
+                  f"&refreshLibrary=false", key, method="DELETE", timeout=60)
+        except Exception as e:
+            warn(f"删空媒体库「{nm}」失败：{_short_err(e)}")
+            continue
+        gone.append(nm)
+    # 【回读确认】删和写一样，HTTP 200 不代表真没了
+    if gone:
+        try:
+            still = {x.get("Name") for x in
+                     (_emby("/Library/VirtualFolders", key, timeout=20) or [])}
+        except Exception:
+            still = set()
+        stuck = [x for x in gone if x in still]
+        if stuck:
+            warn(f"这些库调了删除但还在：{'、'.join(stuck)} —— 到 Emby 里手动删")
+            gone = [x for x in gone if x not in stuck]
+    for nm in gone:
+        strikes.pop(nm, None)
+        mine.discard(nm)
+    # 库都没了的名字别在状态里留着，否则下次改回同名会带着旧计数
+    strikes = {k: v for k, v in strikes.items() if k in alive}
+    save_ms_state(lib_empty=strikes, lib_auto=sorted(mine))
+    if pending:
+        print(f"  {DIM}这些库底下已经没有 strm 了，再空一轮就自动删："
+              f"{'、'.join(pending)}{RST}")
+    if gone:
+        ok(f"删掉 {len(gone)} 个空媒体库：{'、'.join(gone)}")
+        print(f"  {DIM}它们指向的目录底下一个 strm 都没有了（多半是网盘里改了"
+              f"文件夹名）。留着的话首页轮播和「继续观看」还会推这些片，"
+              f"点开必然放不了。{RST}")
+        print(f"  {DIM}这些条目的观看记录跟着一起没了 —— 文件都不在了，"
+              f"记录也接不回去。只删脚本自己建的库，你手建的不碰。{RST}")
+    return len(gone)
+
+
 def apply_libraries(d, key, plan):
     """把规划落到 Emby 上。返回 (建了几个库, 加了几条路径)。
 
@@ -2363,6 +2473,10 @@ def auto_libraries_apply(d, key, quiet=False):
         plan = plan_libraries(d, rules)
     except Exception:
         return
+    # 【建和删是一件事的两面】放在 plan 之后、那两个提前 return 之前：
+    # 网盘里改完文件夹名，往往【没有】新库要建（新名字还没扫出 strm），
+    # 于是下面那两个 return 会先走掉，旧空壳永远轮不到被清理。
+    drop_empty_auto_libraries(d, key)
     if not plan:
         if not quiet:
             print(f"  {DIM}关键词规则：{len(rules)} 条，没有文件夹匹配上。{RST}")
@@ -8853,8 +8967,9 @@ def do_healthcheck():
                 todo.append((
                     f"媒体库「{empty[0]}」指向的目录已经空了，但 Emby 里的条目还在 —— "
                     f"首页轮播、「继续观看」还会推这些片，点开必然放不了",
-                    f"Emby → 设置 → 媒体库 → 「{empty[0]}」→ 删除。"
-                    f"删库会把条目和刮好的海报一起带走，比等它自己扫干净快。"
+                    f"脚本自己建的库跑两次「4 生成媒体库」会自动删掉（要两次是"
+                    f"为了防 strm 正在重新生成时的瞬时空）；你手建的不碰，"
+                    f"到 Emby → 设置 → 媒体库 → 「{empty[0]}」→ 删除。"
                     f"要是这个库还想留着，就把对应的网盘加回扫描路径"))
 
             # 元数据语言留空 = 跟服务器默认走(通常是 en)。中文片名拿去 TMDb 的英文
