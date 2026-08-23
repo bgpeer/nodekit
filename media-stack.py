@@ -6140,7 +6140,12 @@ def sync_library_options(d, key, rules):
         # 把默认值明写进去，两个问题一起没了：界面上勾是勾着的，行为也确定。
         # 写进去的内容就是 Emby 自己 AvailableOptions 给的 DefaultEnabled，
         # 不多不少 —— 不是我们凭空塞一份名单，只是把隐式的变成显式的。
-        broken = (not fs) or fs == [METATUBE_FETCHER]
+        #
+        # 【图像那半边也要算进来】原来只看 MetadataFetchers。一个库完全可以
+        # 元数据勾了、图像一个没勾 —— 那正好就是"简介年份都有、就是没有海报"，
+        # 而这一项恰恰是用户最先看出来的。两半有一半是空的就算没配好。
+        ims = sorted({f for t in tos for f in (t.get("ImageFetchers") or [])})
+        broken = (not fs) or fs == [METATUBE_FETCHER] or (not ims)
         explicit = bool(rule.get("scr") or rule.get("img"))
         ct = (lb.get("CollectionType") or "").lower()
         # 【语言是无条件同步的，不能挂在刮削器那个条件下面】原来这里写的是
@@ -6151,7 +6156,7 @@ def sync_library_options(d, key, rules):
         # 语言和刮削器不是一回事：language/country 每条规则都有，是这份 yaml
         # 最基本的字段；刮削器是可选的、而且要尊重用户在 Emby 里的手动调整。
         # 两者的写入条件本来就该分开。
-        want = desired_type_options(key, ct, rule) if (explicit or broken) else None
+        want = _wanted_options(key, ct, rule) if (explicit or broken) else None
         # 【metatube: true 也是明确意图，和 language 一样无条件生效】
         # 名单本来是好的、yaml 里又没写 scrapers 时，want 是 None、整段跳过 ——
         # 于是 AV 库明明标着 metatube: true，MetaTube 却一直没挂上。
@@ -6180,14 +6185,23 @@ def sync_library_options(d, key, rules):
                               or t.get("MetadataFetchers") or [])]
             if not _cur or _cur[0] != METATUBE_FETCHER:
                 want = (json.loads(json.dumps(tos)) if tos
-                        else desired_type_options(key, ct, rule))
+                        else _wanted_options(key, ct, rule))
         if want and rule.get("mt") and metatube_on(d):
             _put_metatube_first(want)
         if want is not None and not want:
-            # 【问不出默认值时宁可不动】desired_type_options 拿不到
-            # AvailableOptions（Emby 没起来、超时、版本没这个接口）时返回空。
-            # 把空的写进去就是真的把这个库的刮削器全关掉 —— 比现状糟得多。
-            # 这一轮跳过刮削器、只同步语言，下一轮再说。
+            # 【问不出默认值时宁可不动，但必须出声】_wanted_options 两种内容类型
+            # 都问不出名单时返回空。把空的写进去就是真的把这个库的刮削器全关掉，
+            # 比现状糟得多，所以这轮只同步语言。
+            #
+            # 但【不能像上一版那样闷声跳过】。上一版这里是默默 want = None，
+            # 于是同一份 yaml、同样两条规则，动漫电影 勾上了、电影 没勾上，
+            # 而脚本从头到尾一个字都没说。用户看到的是"一部分能实现一部分
+            # 实现不了"，只能怀疑是 yaml 语法的问题 —— 而 yaml 完全没问题。
+            # 哪个库、什么内容类型、为什么没做，全说出来。
+            warn(f"「{nm}」问不到刮削器默认值，这轮只同步语言 —— "
+                 f"内容类型 {ct or '(空)'}，规则里写的是 {rule.get('type') or '(没写)'}")
+            print(f"  {DIM}Emby 的 /Libraries/AvailableOptions 对这个内容类型"
+                  f"没给出可选项，同类型的其它媒体库也没有现成名单可抄。{RST}")
             want = None
         # 语言也一起对齐 —— 它和刮削器是同一件事的两面，分开同步只会让人困惑
         lang, country = rule.get("lang") or "zh", rule.get("country") or "CN"
@@ -6423,6 +6437,30 @@ def desired_type_options(key, ctype, rule=None):
                 t[fk], t[ok_] = picked, list(picked)
         out.append(t)
     return out
+
+
+def _wanted_options(key, ctype, rule):
+    """这个库该用的刮削器名单。库自己的内容类型问不出来就拿规则里的 type 再问。
+
+    【为什么不能只认库的 CollectionType】它有可能是空的或者对不上：
+    在 Emby 界面上手工建库时选了「混合内容」、或者建的时候压根没选，
+    CollectionType 就是空字符串。拿空串去问 AvailableOptions 什么都问不到，
+    再去别的库抄也抄不着（没有第二个空类型的库），于是这个库永远配不上刮削器。
+
+    实测就是这么翻的：同一份 yaml、两条形状完全一样的规则，
+    动漫电影 勾上了、电影 没勾上 —— 差别只在库的 CollectionType。
+    用户看到的是"同样的代码一部分能实现一部分实现不了"，只能怀疑 yaml 语法。
+
+    规则里的 type 是用户【声明的意图】（movies / tvshows），拿它去问最合适：
+    库是什么类型建出来的可能是历史遗留，yaml 里写的才是他现在想要的。
+    """
+    for ct in (ctype, (rule or {}).get("type") or ""):
+        if not ct:
+            continue
+        got = desired_type_options(key, ct, rule)
+        if got:
+            return got
+    return []
 
 
 def _emby_avail_names(key, ctype):
@@ -8676,8 +8714,15 @@ def do_healthcheck():
                     # "跟随 Emby 默认"并报绿。而用户点进 Emby 的库编辑页，两种
                     # 情况看到的是同一屏：六个列表一个勾都没有。
                     # 对用户来说它们就是一回事，照实说。
+                    #
+                    # 【把内容类型一起打出来】刮削器配不上的头号原因就是它：
+                    # 在 Emby 界面上手工建库选了「混合内容」或者没选，
+                    # CollectionType 是空的，按它问不到任何默认名单。
+                    # 不打出来的话，两个库一个成一个不成，看不出差在哪。
                     nofetch.append(_nm)
-                    _rows.append((_nm, f"{RED}一个都没勾{RST}"))
+                    _ct2 = (_lb.get("CollectionType") or "")
+                    _rows.append((_nm, f"{RED}一个都没勾{RST}"
+                                       f"{DIM}（内容类型 {_ct2 or '空 —— 多半就是它'}）{RST}"))
                 else:
                     if _fs == [METATUBE_FETCHER]:
                         mtwrong.append(_nm)
