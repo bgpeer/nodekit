@@ -2269,16 +2269,40 @@ def _emby_add_path(key, name, path):
         return _short_err(e)
 
 
-# 连续这么多轮"底下一个 strm 都没有"才删库。
-#
-# 【为什么不是发现就删】strm 树是脚本自己批量重写的：AutoFilm 正在按新配置
-# 重新生成、migrate_strm_layout 正在搬家、网盘那一刻列目录超时，都会让某个
-# 目录短暂地空掉。发现即删的话，一次时序上的巧合就能带走一个库连同它的观看
-# 记录 —— 而观看记录是这套东西里最不该出错、也最难恢复的那样东西。
-#
-# 这台机器已经因为"清理逻辑太自信"丢过一次 39786 个 strm。要两轮才动手，
-# 代价只是多等一次「4 生成媒体库」，换的是"瞬时空"永远不会误伤。
-EMPTY_LIB_STRIKES = 2
+def _ol_token(d):
+    """登 OpenList 拿一个 token。拿不到返回 ""。"""
+    try:
+        pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                      fallback=os.path.join(d, ".env"))
+        return (_ol_api("/api/auth/login",
+                        {"username": "admin", "password": pw},
+                        timeout=20).get("data") or {}).get("token", "")
+    except Exception:
+        return ""
+
+
+def _netdisk_empty(d, lb, token):
+    """网盘那边这个媒体库的目录是不是【确认】没东西了。
+
+    三态，和 _dir_names 一脉相承：True 确认空 / False 还有东西 / None 问不出来。
+    strm 树是网盘树的镜像，去掉 STRM_PATH 前缀就是网盘全路径。
+
+    【为什么要问网盘，而不是数几轮 strm】"本地没有 strm"有两种完全不同的原因：
+    网盘里那个目录真没了（改名、删了），或者 AutoFilm 还没扫到、扫失败了。
+    只看本地分不出来，所以上一版靠"连续两轮都空"来赌 —— 而那是在没有证据时
+    才需要的办法。OpenList 能给出肯定回答的时候，赌就没有必要了。
+    """
+    if not token:
+        return None
+    got = []
+    for p in (lb.get("Locations") or []):
+        if not _under(p, STRM_PATH):
+            return None
+        names = _dir_names(p[len(STRM_PATH):] or "/", token)
+        if names is None:
+            return None          # 有一条问不出来，整个不算数
+        got.append(bool(names))
+    return (not any(got)) if got else None
 
 
 def _lib_strm_count(d, lb):
@@ -2305,13 +2329,24 @@ def drop_empty_auto_libraries(d, key):
     「继续观看」照样推它的片，点开必然放不了。他的原话："这个可以自动建库
     不可以自动删库吗？"
 
-    四道闸，缺一不可：
+    删的判据是【网盘的肯定回答】，不是"连着几轮没看见"：
+
+      本地没 strm + 网盘说这儿没东西  → 删。证据齐了，不需要冷静期。
+      本地没 strm + 网盘说还有东西    → 不删。那是 AutoFilm 没扫到，
+                                        库是好的，删了才是错的。
+      本地没 strm + 网盘问不出来      → 不删，留着等下一轮。
+
+    上一版是"连续两轮都空就删"。用户看完日志就指出这不对：那一轮里
+    prune 已经拿到了 OpenList 的明确答复（「对象不存在」）并据此删了 strm，
+    链路通得好好的，改名后的新片也拉过来了 —— 证据都摆在同一屏上，还要
+    再等一轮说不通。他说得对。冷静期是【没有证据时】才需要的东西。
+
+    另外三道闸不变：
       · 只删【脚本自己建的】（ms_state 里的 lib_auto）。用户手建的一律不碰 ——
         动别人的库可能把观看记录连根拔了。
       · 库的每一条路径都得在 strm 树里。混着本地目录的不算网盘库。
       · 整棵 strm 树是空的时候【整个不做】。那说明是上游出了问题
-        （网盘掉线、AutoFilm 没跑），不是这个库该没了。
-      · 连续 EMPTY_LIB_STRIKES 轮都空才动手，见那个常量的注释。
+        （网盘掉线、AutoFilm 没跑），不是这些库该没了。
     """
     mine = set(ms_state().get("lib_auto") or [])
     if not mine:
@@ -2326,21 +2361,22 @@ def drop_empty_auto_libraries(d, key):
         libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
     except Exception:
         return 0
-    strikes = {k: int(v) for k, v in (ms_state().get("lib_empty") or {}).items()
-               if isinstance(v, (int, float))}
-    alive, gone, pending = set(), [], []
+    token, gone, waiting, lagging = "", [], [], []
     for lb in libs:
         nm = lb.get("Name") or "?"
-        alive.add(nm)
         if nm not in mine:
             continue
         n = _lib_strm_count(d, lb)
         if n != 0:                     # 有片子，或者 -1（混了本地目录）
-            strikes.pop(nm, None)
             continue
-        strikes[nm] = strikes.get(nm, 0) + 1
-        if strikes[nm] < EMPTY_LIB_STRIKES:
-            pending.append(nm)
+        # 到这儿才登 OpenList —— 没有空库的时候一个请求都不发
+        token = token or _ol_token(d)
+        empty = _netdisk_empty(d, lb, token)
+        if empty is None:
+            waiting.append(nm)
+            continue
+        if not empty:
+            lagging.append(nm)
             continue
         try:
             _emby(f"/Library/VirtualFolders?name={urllib.parse.quote(nm)}"
@@ -2360,20 +2396,23 @@ def drop_empty_auto_libraries(d, key):
         if stuck:
             warn(f"这些库调了删除但还在：{'、'.join(stuck)} —— 到 Emby 里手动删")
             gone = [x for x in gone if x not in stuck]
-    for nm in gone:
-        strikes.pop(nm, None)
-        mine.discard(nm)
-    # 库都没了的名字别在状态里留着，否则下次改回同名会带着旧计数
-    strikes = {k: v for k, v in strikes.items() if k in alive}
-    save_ms_state(lib_empty=strikes, lib_auto=sorted(mine))
-    if pending:
-        print(f"  {DIM}这些库底下已经没有 strm 了，再空一轮就自动删："
-              f"{'、'.join(pending)}{RST}")
+    if gone:
+        for nm in gone:
+            mine.discard(nm)
+        save_ms_state(lib_auto=sorted(mine))
+    if waiting:
+        print(f"  {DIM}这些库底下没有 strm 了，但网盘那边问不出来"
+              f"（超时 / 存储掉线），先留着：{'、'.join(waiting)}{RST}")
+    if lagging:
+        warn(f"这些库底下一个 strm 都没有，可网盘里还有东西："
+             f"{'、'.join(lagging)}")
+        print(f"  {DIM}不是该删的库，是 strm 没生成出来 —— 多半 AutoFilm 那一轮"
+              f"扫失败了。跑「5 链路体检」看网盘通不通。{RST}")
     if gone:
         ok(f"删掉 {len(gone)} 个空媒体库：{'、'.join(gone)}")
-        print(f"  {DIM}它们指向的目录底下一个 strm 都没有了（多半是网盘里改了"
-              f"文件夹名）。留着的话首页轮播和「继续观看」还会推这些片，"
-              f"点开必然放不了。{RST}")
+        print(f"  {DIM}本地一个 strm 都没有，网盘也明确回答那儿没东西了"
+              f"（多半是在网盘里改了文件夹名）。留着的话首页轮播和"
+              f"「继续观看」还会推这些片，点开必然放不了。{RST}")
         print(f"  {DIM}这些条目的观看记录跟着一起没了 —— 文件都不在了，"
               f"记录也接不回去。只删脚本自己建的库，你手建的不碰。{RST}")
     return len(gone)
@@ -8967,8 +9006,9 @@ def do_healthcheck():
                 todo.append((
                     f"媒体库「{empty[0]}」指向的目录已经空了，但 Emby 里的条目还在 —— "
                     f"首页轮播、「继续观看」还会推这些片，点开必然放不了",
-                    f"脚本自己建的库跑两次「4 生成媒体库」会自动删掉（要两次是"
-                    f"为了防 strm 正在重新生成时的瞬时空）；你手建的不碰，"
+                    f"脚本自己建的库，跑「4 生成媒体库」时会去问网盘 —— "
+                    f"网盘明确回答那儿没东西了就自动删掉，问不出来（超时、"
+                    f"存储掉线）就留着等下一轮。你手建的不碰，"
                     f"到 Emby → 设置 → 媒体库 → 「{empty[0]}」→ 删除。"
                     f"要是这个库还想留着，就把对应的网盘加回扫描路径"))
 
