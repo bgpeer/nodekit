@@ -6081,8 +6081,8 @@ def sync_library_options(d, key, rules):
 
     【写了就照办，没写就只修坏的】这条边界很重要：
       · 规则里写了 scrapers/image_scrapers → 以 yaml 为准，覆盖 Emby 里的
-      · 没写 → 只在【明确坏掉】时才动手（一个刮削器都没有、或只剩 MetaTube），
-        用户自己在 Emby 里精简过的名单不碰
+      · 没写 → 只在【名单没配好】时才动手（一个刮削器都没有、或只剩 MetaTube），
+        用户自己在 Emby 里精简过的名单不碰 —— 只要还留着一个正经刮削器就算数
     不这样分的话，用户在 Emby 界面上的任何调整都会被下一次「4」抹掉。
     """
     by_name = {r["name"]: r for r in rules}
@@ -6101,7 +6101,18 @@ def sync_library_options(d, key, rules):
         o = lb.get("LibraryOptions") or {}
         tos = o.get("TypeOptions") or []
         fs = sorted({f for t in tos for f in (t.get("MetadataFetchers") or [])})
-        broken = bool(tos) and (not fs or fs == [METATUBE_FETCHER])
+        # 【"空名单 = 用默认" 这个说法要作废，空的就得把默认值明写进去】
+        # 上一版这里带着 bool(tos)：TypeOptions 整个为空时不算坏、不去动它，
+        # 理由是"空 = 跟随 Emby 默认"。这个理由站不住：
+        #   · Emby 的库编辑界面是照着 TypeOptions 画勾的，空名单画出来就是
+        #     【六个列表一个都没勾】。用户对着那一屏问的是"我代码该配的都配了，
+        #     为什么在 emby 这些配置没有被勾选" —— 他看到的就是没配。
+        #   · "空到底算不算默认"是 Emby 内部行为，版本一变就可能不一样，
+        #     而且从外面没法验证。押在这上面等于把刮削结果交给运气。
+        # 把默认值明写进去，两个问题一起没了：界面上勾是勾着的，行为也确定。
+        # 写进去的内容就是 Emby 自己 AvailableOptions 给的 DefaultEnabled，
+        # 不多不少 —— 不是我们凭空塞一份名单，只是把隐式的变成显式的。
+        broken = (not fs) or fs == [METATUBE_FETCHER]
         explicit = bool(rule.get("scr") or rule.get("img"))
         ct = (lb.get("CollectionType") or "").lower()
         # 【语言是无条件同步的，不能挂在刮削器那个条件下面】原来这里写的是
@@ -6144,6 +6155,12 @@ def sync_library_options(d, key, rules):
                         else desired_type_options(key, ct, rule))
         if want and rule.get("mt") and metatube_on(d):
             _put_metatube_first(want)
+        if want is not None and not want:
+            # 【问不出默认值时宁可不动】desired_type_options 拿不到
+            # AvailableOptions（Emby 没起来、超时、版本没这个接口）时返回空。
+            # 把空的写进去就是真的把这个库的刮削器全关掉 —— 比现状糟得多。
+            # 这一轮跳过刮削器、只同步语言，下一轮再说。
+            want = None
         # 语言也一起对齐 —— 它和刮削器是同一件事的两面，分开同步只会让人困惑
         lang, country = rule.get("lang") or "zh", rule.get("country") or "CN"
         # 【图像语言也要设】用户截图里「首选图像下载语言」那一栏三个库全是空的 ——
@@ -6233,7 +6250,9 @@ def repair_scrapers(key):
         o = lb.get("LibraryOptions") or {}
         tos = o.get("TypeOptions") or []
         if not tos:
-            continue                    # 空 = 用默认，本来就是对的，别碰
+            # 空名单归 sync_library_options 管 —— 它照着规则文件把默认值明写进去。
+            # 这儿只管规则文件之外的库，那些是用户自己建的，不擅自往里写名单。
+            continue
         fs = sorted({f for t in tos for f in (t.get("MetadataFetchers") or [])})
         if fs and fs != [METATUBE_FETCHER]:
             continue                    # 有正经刮削器，不是我们要修的那两种
@@ -8603,9 +8622,13 @@ def do_healthcheck():
                     nofetch.append(_nm)
                     _rows.append((_nm, f"{RED}一个都没勾{RST}"))
                 elif not _tos:
-                    # 空 TypeOptions 在 Emby 那边是"用默认"，是正常状态，
-                    # 但用户看不到具体是哪几个，说明白比打个勾有用
-                    _rows.append((_nm, f"{DIM}跟随 Emby 默认{RST}"))
+                    # 【别再说这是"正常状态"了】上一版这里写的是"跟随 Emby 默认"，
+                    # 报绿。而用户点进 Emby 的库编辑页看到的是六个列表一个都没勾，
+                    # 于是"体检说没问题、界面上什么都没配"两边对不上。
+                    # 名单是空的就是没配好，照实说，并且指出去哪儿改。
+                    nofetch.append(_nm)
+                    _rows.append((_nm, f"{YELLOW}名单是空的{RST}"
+                                       f"{DIM}（Emby 界面上一个勾都没有）{RST}"))
                 else:
                     if _fs == [METATUBE_FETCHER]:
                         mtwrong.append(_nm)
@@ -8622,8 +8645,9 @@ def do_healthcheck():
                     f"媒体库「{_bad[0]}」的刮削器名单不对 —— "
                     f"{'一个刮削器都没启用' if _bad[0] in nofetch else '只剩 MetaTube，TheMovieDb 被挤掉了'}，"
                     f"表现就是「条目都在、一张海报都没有」",
-                    "跑一次「4 生成媒体库」会按规则文件自动设回来；"
-                    "还不对就 Emby → 设置 → 媒体库 → 点该库 → 手动勾"))
+                    "跑一次「4 生成媒体库」会按规则文件把默认刮削器写进去 —— "
+                    "只对规则文件里有名字的库生效。自己在 Emby 里另建的库归你自己管："
+                    "Emby → 设置 → 媒体库 → 点该库 → 手动勾"))
 
             # ---- 空壳媒体库 ----
             # 【删了 strm 不等于删了条目】。Emby 的条目活在它自己的数据库里，
