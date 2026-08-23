@@ -6117,10 +6117,21 @@ def sync_library_options(d, key, rules):
         # 名单本来是好的、yaml 里又没写 scrapers 时，want 是 None、整段跳过 ——
         # 于是 AV 库明明标着 metatube: true，MetaTube 却一直没挂上。
         # 这时候拿现有名单当底，只往里补一个 MetaTube，别的一律不动。
-        if want is None and rule.get("mt") and metatube_on(d) and tos:
+        if want is None and rule.get("mt") and metatube_on(d):
+            # 【空名单也要处理，这是最常见的情况】上一版这里的条件带着 "and tos"，
+            # 名单为空时直接跳过 —— 而通过 API 建出来的库【默认就是空的】
+            # （空 = 用 Emby 默认，正常状态）。加上判"坏掉"那个条件也是
+            # bool(tos) and ...，空名单同样不算坏，于是：
+            #
+            #     空名单 + metatube: true  =  永远挂不上 MetaTube
+            #
+            # 而这正是用户一路在问的："只要是这个媒体库里面的影片该是带什么刮削
+            # 就带什么刮削……但是你不赋予是怎么回事"。他说的对，是我这儿漏了。
+            # 空名单时从 Emby 的默认值起一份底，再把 MetaTube 放前面。
             if METATUBE_FETCHER not in {f for t in tos
                                         for f in (t.get("MetadataFetchers") or [])}:
-                want = json.loads(json.dumps(tos))
+                want = (json.loads(json.dumps(tos)) if tos
+                        else desired_type_options(key, ct, rule))
         if want and rule.get("mt") and metatube_on(d):
             _put_metatube_first(want)
         # 语言也一起对齐 —— 它和刮削器是同一件事的两面，分开同步只会让人困惑
