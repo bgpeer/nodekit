@@ -6145,24 +6145,42 @@ def sync_library_options(d, key, rules):
             _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
                   body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
             changed.append(nm)
-            changed_ids.append((lb.get("ItemId"), nm))
+            # 【区分"只改了语言"和"换了刮削器"】两者要的重刮强度不一样，
+            # 见下面 _full 那段。语言变了补一遍缺失字段就够；刮削器换了必须
+            # 重新识别，否则等于没换。
+            changed_ids.append((lb.get("ItemId"), nm,
+                                want is not None and want != tos))
         except Exception as e:
             warn(f"「{nm}」的刮削器设置写不进去：{_short_err(e)}")
     if changed:
         ok(f"{len(changed)} 个媒体库的语言/刮削器已按规则文件设好："
            f"{'、'.join(changed)}")
-        for iid, nm in changed_ids:
+        for iid, nm, _full in changed_ids:
             n_item = _lib_item_count(key, iid)
             if n_item > REFRESH_AUTO_MAX:
                 warn(f"「{nm}」有 {n_item} 个条目，没有自动重刮 —— 挑个时间自己来")
                 continue
+            # 【换了刮削器就必须 ReplaceAllMetadata=true】否则改了等于没改。
+            # false 的含义是"只补缺失的字段"，而一个已经刮全了的条目什么都不缺 ——
+            # Emby 扫一眼发现没什么要补的，【根本不会重新做识别】，新的刮削器
+            # 排第几都轮不到它出手。
+            # 实测：AV 库把 MetaTube 提到第一之后重刮，条目的数据库链接里还是
+            # 只有 TheMovieDb —— 因为那次刷新压根没重新识别。
+            #
+            # 只改了语言的库仍然用 false：那种情况要的就是"把缺的补上"，
+            # 没必要把整库的元数据推倒重来（那是几十 GB 的下载）。
+            # Emby 会保留锁定的字段，脚本设的片名不会被冲掉。
             try:
                 _emby(f"/Items/{iid}/Refresh?Recursive=true"
                       f"&MetadataRefreshMode=FullRefresh"
                       f"&ImageRefreshMode=FullRefresh"
-                      f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
+                      f"&ReplaceAllMetadata={'true' if _full else 'false'}"
+                      f"&ReplaceAllImages={'true' if _full else 'false'}",
                       key, method="POST", timeout=30)
-                ok(f"「{nm}」已通知重刮（{n_item} 个条目，后台进行）")
+                ok(f"「{nm}」已通知"
+                   + (f"{BOLD}重新识别{RST}（换了刮削器，"
+                      f"{n_item} 个条目，后台进行）" if _full
+                      else f"重刮（{n_item} 个条目，后台进行）"))
             except Exception:
                 pass
     return len(changed)
