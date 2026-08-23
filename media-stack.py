@@ -8554,38 +8554,55 @@ def do_healthcheck():
                      "带发布组标记的（[BT]xxx.1080p.WEB-DL-YYY）它认不出来")))
 
             # ---- 刮削器名单 ----
-            # 【刮不出海报的时候，第一件该看的就是这个】而它藏在 Emby 的
-            # 媒体库设置里，一个库一个页面，用户不会一个个翻。
-            # 实测撞过：脚本建库时给 LibraryOptions 写了一份只有 MetaTube 的
-            # TypeOptions —— 空名单在 Emby 那边是"用默认"，写进去就变成
-            # "只用我列的这些"，等于把 TheMovieDb 从那个库删掉了。
-            # 用户看到的只是"刮不出图"，根本联想不到是建库那一步干的。
-            nofetch, mtwrong = [], []
+            # 【把每个库勾了什么【列出来】，不要只报"有问题/没问题"】
+            # 这一项原来只在两种明确坏掉的形态下说话，别的时候一句
+            # "各库都配了刮削器" 带过。而用户真正想确认的是"我这个库到底
+            # 挂没挂上 MetaTube" —— 这个问题它答不了。
+            #
+            # 用户的原话："只要是这个媒体库里面的影片该是带什么刮削就带什么刮削，
+            # 如果文件名称不行刮不出来那也认了，但是你不赋予是怎么回事"。
+            # 他分得很清楚：【赋予】是配置，【刮出来】是结果。而我之前一直拿
+            # 条目详情里的「数据库链接」当证据 —— 那是结果，不是配置。
+            # 一个库明明勾了 MetaTube，只要文件名查不到，那一行就不会出现它。
+            # 拿它去反推配置，必然把人绕进去。
+            #
+            # 所以这一行现在直接摊开配置：每个库勾了哪几个，一眼可查。
+            _rows, nofetch, mtwrong = [], [], []
             for _lb in libs:
                 if not any(_under(p, STRM_PATH) for p in (_lb.get("Locations") or [])):
                     continue
                 _nm = _lb.get("Name") or "?"
                 _tos = ((_lb.get("LibraryOptions") or {}).get("TypeOptions") or [])
-                _fs = sorted({f for t in _tos for f in (t.get("MetadataFetchers") or [])})
+                # 按名单里的顺序去重 —— 顺序就是优先级，排前面的先查，
+                # 打乱了等于把这一行最有用的信息丢了
+                _fs = list(dict.fromkeys(
+                    f for t in _tos for f in (t.get("MetadataFetcherOrder")
+                                              or t.get("MetadataFetchers") or [])))
                 if _tos and not _fs:
-                    nofetch.append(_nm)          # 名单在、但一个刮削器都没有
-                elif _fs and _fs == [METATUBE_FETCHER]:
-                    mtwrong.append(_nm)          # 只剩 MetaTube，默认那些被挤掉了
+                    nofetch.append(_nm)
+                    _rows.append((_nm, f"{RED}一个都没勾{RST}"))
+                elif not _tos:
+                    # 空 TypeOptions 在 Emby 那边是"用默认"，是正常状态，
+                    # 但用户看不到具体是哪几个，说明白比打个勾有用
+                    _rows.append((_nm, f"{DIM}跟随 Emby 默认{RST}"))
+                else:
+                    if _fs == [METATUBE_FETCHER]:
+                        mtwrong.append(_nm)
+                    _rows.append((_nm, "、".join(_fs)))
+            if _rows:
+                _st = "bad" if (nofetch or mtwrong) else "ok"
+                _hc("刮削器", _st, f"{len(_rows)} 个库{DIM}（按优先级，"
+                                   f"排前面的先查）{RST}")
+                for _nm, _txt in _rows:
+                    print(f"      {pad(_nm[:12], 14)}{_txt}")
             if nofetch or mtwrong:
                 _bad = nofetch + mtwrong
-                _hc("刮削器", "bad",
-                    "、".join(f"{n}（{'一个都没有' if n in nofetch else '只有 MetaTube'}）"
-                              for n in _bad))
                 todo.append((
                     f"媒体库「{_bad[0]}」的刮削器名单不对 —— "
                     f"{'一个刮削器都没启用' if _bad[0] in nofetch else '只剩 MetaTube，TheMovieDb 被挤掉了'}，"
                     f"表现就是「条目都在、一张海报都没有」",
-                    "Emby → 设置 → 媒体库 → 点该库 → 把 TheMovieDb（剧集库是 "
-                    "TheTVDB）勾上；成人库再额外勾 MetaTube。"
-                    "改完在 Emby 里对该库「刷新元数据」"))
-            elif any(any(_under(p, STRM_PATH) for p in (lb.get("Locations") or []))
-                     for lb in libs):
-                _hc("刮削器", "ok", "各库都配了刮削器")
+                    "跑一次「4 生成媒体库」会按规则文件自动设回来；"
+                    "还不对就 Emby → 设置 → 媒体库 → 点该库 → 手动勾"))
 
             # ---- 空壳媒体库 ----
             # 【删了 strm 不等于删了条目】。Emby 的条目活在它自己的数据库里，
