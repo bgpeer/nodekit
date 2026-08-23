@@ -5664,6 +5664,7 @@ def do_strm():
         want_tasks = max(1, len(read_yaml_all(cfg_path, "source_dir")))
         done_lines, early = [], False
         started, last, shown, quiet_since = False, "", "", time.monotonic()
+        t_started = 0.0                  # AutoFilm 真正动起来那一刻，用来拆时间
         slow_warned = False
         t_start = time.monotonic()
         give_up = ""
@@ -5684,6 +5685,8 @@ def do_strm():
             # 日志行数超过"刚启动"那一刻，就说明任务真的动起来了。用行数而不是认
             # 某句中文：AutoFilm 各版本的措辞不一样，认死了会一直显示"还没开始"
             if len(lines) > base_lines:
+                if not started:
+                    t_started = time.monotonic()
                 started = True
                 newest = next((l.strip() for l in reversed(lines) if l.strip()), "")
                 if newest and newest != last:
@@ -5790,9 +5793,24 @@ def do_strm():
             print(f"  {DIM}扫描目录 {nums.get('scanned_dir_count', '?')} 个"
                   f"（跳过 {nums.get('skipped_dir_count', '?')} 个），"
                   f"发现文件 {nums.get('discovered_file_count', '?')} 个{RST}")
+            # 【把这几分钟花在哪儿说清楚】用户看到"7 个片跑了 7 分钟"会以为脚本慢，
+            # 而实测那次的构成是：2 分钟在等 AutoFilm 的定时触发（固定开销），
+            # 5 分钟里 3 个目录一直在等夸克接口、等到超时被跳过。
+            # 这两件事该做的处理完全不同 —— 前者是设计如此，后者要去 OpenList
+            # 重新加载存储。数字不摊开的话，用户只会得出"这脚本慢"这一个结论。
+            _tot = int(time.monotonic() - t_start)
+            _wait = int((t_started or time.monotonic()) - t_start)
+            def _mmss(n):
+                return f"{n // 60} 分 {n % 60} 秒" if n >= 60 else f"{n} 秒"
+            print(f"  {DIM}用时 {_mmss(_tot)}：等 AutoFilm 到点触发 {_mmss(_wait)}"
+                  f"（固定开销）+ 实际扫描 {_mmss(max(0, _tot - _wait))}{RST}")
             if nums.get("skipped_dir_count", 0):
                 warn(f"有 {nums['skipped_dir_count']} 个目录没列出来就被跳过了 —— "
-                     f"网盘那边超时了，里面的文件这轮不会生成。再跑一次通常能补上。")
+                     f"网盘那边超时了，里面的文件这轮不会生成。")
+                print(f"  {DIM}扫描慢也多半是这个：跳过一个目录之前要先等它超时，"
+                      f"几个目录就是几分钟。{RST}")
+                print(f"  {DIM}刚在网盘里改过目录名的话，先去 OpenList 把这个存储"
+                      f"停用再启用（清掉旧的目录缓存），再点一次「4」。{RST}")
         else:
             # 解析不出来就把原始那行摆出来，别拿一排问号糊弄人
             ok("生成完成，AutoFilm 的统计行：")
