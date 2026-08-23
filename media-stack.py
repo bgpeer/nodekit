@@ -4444,6 +4444,42 @@ STRM_LIB_OPTIONS = {
 RESUME_MIN_SECONDS = STRM_LIB_OPTIONS["MinResumeDurationSeconds"]
 RESUME_MIN_PCT     = STRM_LIB_OPTIONS["MinResumePct"]
 
+# 【会让 Emby 跨境去拉视频文件的那几个开关】，一律关掉。
+#
+# 本地片库上它们都是好东西：章节点、预览缩略图、提前下好的图，代价只是读一遍
+# 本地磁盘。而这里的"文件"是 strm —— 一行指向网盘的路径。Emby 要生成章节点
+# 就得真的把视频拉过来看，一个几 MB 起步。这台机器已经为同一类操作（补时长
+# 去读 MP4 的 moov）跑掉过 80 GB，不能再开第二个口子。
+#
+# 【为什么是候选名而不是一个名字】Emby 各版本里这些字段改过名，而
+# /Library/VirtualFolders/LibraryOptions 对【不认识的字段是静默忽略】的 ——
+# 猜错了不报错，只是什么都不发生，然后脚本照样打印"已设好"。
+# 所以这里只改【库里已经有的键】：候选名里哪个真的出现在 LibraryOptions 里
+# 就用哪个，一个都没出现就跳过并说明。绝不凭空塞一个新键进去。
+STRM_LIB_TOGGLES = (
+    (("EnableChapterImageExtraction", "ExtractChapterImagesDuringLibraryScan",
+      "EnableAutomaticChapters", "EnableChapterExtraction"), False, "章节生成/章节图像"),
+    (("ThumbnailImagesIntervalSeconds", "VideoPreviewThumbnails",
+      "EnableVideoPreviewThumbnails"), 0, "视频预览缩略图"),
+    (("DownloadImagesInAdvance",), False, "预先下载图像"),
+    (("SaveImagesInMediaFolders", "SaveLocalImagesInMediaFolders"), False,
+     "把图片写回媒体文件夹"),
+    (("AutomaticRefreshIntervalDays",), 0, "初次导入后自动联网刷新"),
+)
+
+
+def _pick_opt_key(opts, names):
+    """候选名里挑一个【这个库真的有】的键。一个都没有返回 ""。
+
+    见 STRM_LIB_TOGGLES 的注释：这个接口静默忽略不认识的字段，所以"写了个
+    不存在的键"和"写成功了"从返回值上分不出来。只认已经存在的键，猜错就等于
+    没做，不会留下一个永远不生效却看着像配好了的设置。
+    """
+    for n in names:
+        if n in (opts or {}):
+            return n
+    return ""
+
 # MaxResumePct 不动 —— 那条是按比例算的，长短本来就公平。
 
 
@@ -4463,6 +4499,20 @@ def tune_strm_libraries(key):
             continue
         o = lb.get("LibraryOptions") or {}
         diff = {k: v for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v}
+        # 会跨境拉视频的那几个开关，按【这个库真的有的键名】来关（见 STRM_LIB_TOGGLES）
+        missing = []
+        for names, val, human in STRM_LIB_TOGGLES:
+            k = _pick_opt_key(o, names)
+            if not k:
+                missing.append(human)
+                continue
+            if o.get(k) != val:
+                diff[k] = val
+        if missing:
+            # 说出来而不是闷着。字段名对不上多半是 Emby 版本变了，
+            # 而"没找到"和"设好了"从结果上看是一样的（库里那一项照旧开着）。
+            print(f"  {DIM}「{lb.get('Name')}」里没找到这几项的设置字段，"
+                  f"没动：{'、'.join(missing)}{RST}")
         if not diff:
             continue
         was = {k: o.get(k) for k in diff}
@@ -4483,7 +4533,9 @@ def tune_strm_libraries(key):
                         if x.get("ItemId") == lb.get("ItemId")), {})
         except Exception:
             now = {}
-        bad = [k for k in diff if now.get(k) != STRM_LIB_OPTIONS[k]]
+        # 【拿 diff 比，不是拿 STRM_LIB_OPTIONS 比】diff 里现在还混着
+        # STRM_LIB_TOGGLES 那几个键，去常量表里查会直接 KeyError
+        bad = [k for k in diff if now.get(k) != diff[k]]
         if bad:
             warn(f"「{lb.get('Name')}」有选项没改动成功："
                  f"{'、'.join(f'{k}={now.get(k)}' for k in bad)}")
@@ -4502,6 +4554,12 @@ def tune_strm_libraries(key):
                   f"网盘库里那基本都是误判 —— 少一部片，而且进度条会坏。{RST}")
             print(f"  {DIM}关掉之后有几个文件就有几个条目。已经并在一起的，"
                   f"下一次扫描会拆开。{RST}")
+        _tog = [h for names, _v, h in STRM_LIB_TOGGLES
+                if _pick_opt_key(was, names) in diff]
+        if _tog:
+            ok(f"媒体库「{name}」关掉了会拉视频的选项：{'、'.join(_tog)}")
+            print(f"  {DIM}这些在本地片库上是好东西，代价只是读一遍本地磁盘；"
+                  f"而这里的文件是 strm，Emby 得把视频从网盘拉过来才能做。{RST}")
     return n_changed
 
 
@@ -6118,7 +6176,7 @@ def sync_library_options(d, key, rules):
         libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
     except Exception:
         return 0
-    changed, changed_ids = [], []
+    changed, changed_ids, adult_want = [], [], {}
     for lb in libs:
         nm = lb.get("Name") or "?"
         if nm not in by_name:
@@ -6210,10 +6268,22 @@ def sync_library_options(d, key, rules):
         # 语言挑，中文片子会拿到英文版海报，或者干脆挑不出来。
         # 它跟元数据语言用同一个值，没有分开填的道理。
         img_lang = rule.get("img_lang") or lang
+        # 【成人元数据跟着 metatube 走，不另开一个字段】Emby 的「允许成人元数据」
+        # 默认是关的：关着时联网搜元数据【不匹配成人标题】。而一个标了
+        # metatube: true 的库就是成人库 —— 特意挂了按番号刮成人片的插件，
+        # 却又不许搜成人标题，这两件事是矛盾的，多半就是"MetaTube 排第一了
+        # 还是有片子刮不出来"的一部分原因。
+        #
+        # 让用户在 yaml 里再写一遍 adult: true 是多余的：metatube: true
+        # 已经把意图说完了。和"MetaTube 要排第一"是同一个道理。
+        adult_k = _pick_opt_key(o, ("EnableAdultMetadata", "AllowAdultMetadata",
+                                    "EnableAdultContent"))
+        adult_v = bool(rule.get("mt"))
         same = ((want is None or o.get("TypeOptions") == want)
                 and o.get("PreferredMetadataLanguage") == lang
                 and o.get("MetadataCountryCode") == country
-                and o.get("PreferredImageLanguage") == img_lang)
+                and o.get("PreferredImageLanguage") == img_lang
+                and (not adult_k or o.get(adult_k) == adult_v))
         if same:
             continue
         if want is not None:
@@ -6221,6 +6291,8 @@ def sync_library_options(d, key, rules):
         o["PreferredMetadataLanguage"] = lang
         o["MetadataCountryCode"] = country
         o["PreferredImageLanguage"] = img_lang
+        if adult_k:
+            o[adult_k] = adult_v
         try:
             _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
                   body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
@@ -6230,6 +6302,8 @@ def sync_library_options(d, key, rules):
             # 重新识别，否则等于没换。
             changed_ids.append((lb.get("ItemId"), nm,
                                 want is not None and want != tos))
+            if adult_k:
+                adult_want[lb.get("ItemId")] = (nm, adult_k, adult_v)
         except Exception as e:
             warn(f"「{nm}」的刮削器设置写不进去：{_short_err(e)}")
     # 【必须回读确认】这个接口对不认识的字段是【静默忽略】的：HTTP 200 只说明
@@ -6251,6 +6325,15 @@ def sync_library_options(d, key, rules):
                 continue                 # 回读本身失败，不当成写失败
             if not _fetcher_names(now):  # 名单还是空的 = 这次写根本没进去
                 bad.append(nm)
+        # 成人元数据那一项单独核对：它和刮削器名单是两个独立的写入，
+        # 名单进去了不代表它也进去了
+        for iid, (nm, ak, av) in adult_want.items():
+            now = back.get(iid)
+            if now is not None and now.get(ak) != av and av:
+                warn(f"「{nm}」的「允许成人元数据」没能打开 —— "
+                     f"到 Emby 里手动开一下（媒体库设置 → 合集 底下那一项）")
+                print(f"  {DIM}关着的话联网搜元数据不匹配成人标题，"
+                      f"MetaTube 排第一也可能刮不出来。{RST}")
         if bad:
             for nm in bad:
                 changed.remove(nm)
