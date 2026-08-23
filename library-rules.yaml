@@ -12,16 +12,22 @@
 #             中文片名一条都搜不到。想要「简体中文」而不是笼统的「中文」，
 #             写 zh-CN；日语写 ja，英语 en
 #   country   CN / JP / US，跟着 language 走
-#   metatube  true 时额外挂上 MetaTube（按番号刮成人片），只给成人库开
-#   scrapers  可选。这个库用哪些【元数据】刮削器，逗号隔开、按优先级排。
-#             留空 = 用 Emby 的默认。写了就以这里为准，会覆盖 Emby 里的设置
-#             电影：TheMovieDb, The Open Movie Database
-#             剧集：TheTVDB, TheMovieDb
-#   image_scrapers  同上，管【图像】（海报、背景图）
-#             剧集常用：TheTVDB, FanArt, TheMovieDb
+#   metatube  true 时额外挂上 MetaTube（按番号刮成人片），只给成人库开。
+#             开了就自动排到 scrapers 名单【最前面】，不用在下面手写它
+#   scrapers  这个库用哪些【元数据】刮削器，逗号隔开、【顺序就是优先级】——
+#             排前面的先查、查到就赢，后面的只用来填空缺。
+#             留空 = 用 Emby 的默认；写了就以这里为准，覆盖 Emby 里的设置。
+#             【写了就是"只用这几个"】，没列进来的会被关掉，不是往上追加
+#   image_scrapers  同上，管【图像】（海报、背景图、剧集缩略图）
 #   keywords  逗号隔开。【和文件夹名一模一样才算】，不是包含 ——
 #             写「电影」不会命中「4K电影」，想收就把它也写进来。
 #             只忽略首尾空白和大小写
+#
+# 刮削器的排法按类型分，两套，别串：
+#   电影 movies    TheMovieDb 打头 —— TheTVDB 的电影库薄得多
+#   剧集 tvshows   TheTVDB   打头 —— 分季分集的信息它最全
+# 两套都【不带 Image Capture】：那个是从视频里抓一帧当封面，而这里的片子都在
+# 网盘上，抓一帧等于让 Emby 跨境把视频拉下来，几 MB 一个，片子多了就是几十 GB。
 #
 # 只想改本机不动仓库：建 /opt/media-stack/library-rules.local.yaml，格式一样。
 
@@ -29,6 +35,8 @@
   type: movies
   language: zh-CN
   country: CN
+  scrapers: TheMovieDb, TheTVDB
+  image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
   keywords: 电影, movies, movie
 
@@ -54,6 +62,8 @@
   type: movies
   language: zh-CN
   country: CN
+  scrapers: TheMovieDb, TheTVDB
+  image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
   keywords: 动漫电影, 剧场版
 
@@ -61,13 +71,19 @@
   type: movies
   language: zh-CN
   country: US
+  scrapers: TheMovieDb, TheTVDB
+  image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
   keywords: 欧美电影, 欧美, 外语片
 
+# metatube: true 会把 MetaTube 自动排到下面两行的【最前面】，
+# 所以这里写的是"MetaTube 查不到时退回去用谁"。
 - name: AV影片
   type: movies
   language: ja
   country: JP
+  scrapers: TheMovieDb, TheTVDB
+  image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: true
   keywords: av, 写真, 番号, AV影片
 
@@ -75,5 +91,7 @@
   type: movies
   language: zh-CN
   country: CN
+  scrapers: TheMovieDb, TheTVDB
+  image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
   keywords: 纪录片, 纪录, documentary
