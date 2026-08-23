@@ -2281,6 +2281,65 @@ def _ol_token(d):
         return ""
 
 
+def _emby_err(e):
+    """把 Emby 的报错压成一行，带上它自己给的原因。
+
+    HTTPError 直接 str() 出来只有「HTTP Error 500: Internal Server Error」，
+    对定位一点用没有。Emby 会把真正的原因放在 X-Application-Error-Code 头
+    和响应体里，读出来才知道是"名字不对"还是"这个版本不吃这个参数"。
+    """
+    detail = ""
+    try:
+        detail = (e.headers.get("X-Application-Error-Code") or "").strip()
+    except Exception:
+        pass
+    if not detail:
+        try:
+            detail = (e.read() or b"")[:200].decode("utf-8", "replace").strip()
+        except Exception:
+            detail = ""
+    detail = re.sub(r"\s+", " ", detail)[:120]
+    return f"{_short_err(e)}{('：' + detail) if detail else ''}"
+
+
+def _emby_del_library(key, lb):
+    """删掉一个媒体库。成功返回 ""，失败返回把几种调法都试过之后的错误说明。
+
+    【一种调法不够，而且不能只看返回码】上一版按文档写了一条
+    DELETE /Library/VirtualFolders?name=…，实测直接 HTTP 500。这个接口在
+    Emby 各版本里认的参数不一样（name / id、放 query 还是放 body），而 500
+    不告诉你是哪种原因 —— 和刮削器字段名那次是同一类问题。
+
+    所以挨个试，每试一次【回读确认库是不是真没了】：Emby 这套接口一贯是
+    "收下请求"和"做了这件事"两回事，返回 200 不代表删掉了，返回 500 也不
+    代表没删掉（实测过 500 之后东西其实没了的接口）。以库还在不在为准。
+    """
+    nm, iid = lb.get("Name") or "", lb.get("ItemId")
+    q = urllib.parse.quote(str(nm))
+    tries = (
+        ("DELETE", f"/Library/VirtualFolders?name={q}&refreshLibrary=false", None),
+        ("DELETE", f"/Library/VirtualFolders?id={iid}&refreshLibrary=false", None),
+        ("DELETE", "/Library/VirtualFolders?refreshLibrary=false",
+         {"Name": nm, "Id": iid, "RefreshLibrary": False}),
+        ("POST", "/Library/VirtualFolders/Delete",
+         {"Name": nm, "Id": iid, "RefreshLibrary": False}),
+    )
+    errs = []
+    for method, path, body in tries:
+        try:
+            _emby(path, key, method=method, body=body, timeout=60)
+        except Exception as e:
+            errs.append(_emby_err(e))
+        try:                       # 【以库还在不在为准】，不看上面那次的返回
+            still = {x.get("Name") for x in
+                     (_emby("/Library/VirtualFolders", key, timeout=20) or [])}
+        except Exception:
+            still = {nm}
+        if nm not in still:
+            return ""
+    return "；".join(dict.fromkeys(errs)) or "调用都成功了但库还在"
+
+
 def _netdisk_empty(d, lb, token):
     """网盘那边这个媒体库的目录是不是【确认】没东西了。
 
@@ -2378,24 +2437,15 @@ def drop_empty_auto_libraries(d, key):
         if not empty:
             lagging.append(nm)
             continue
-        try:
-            _emby(f"/Library/VirtualFolders?name={urllib.parse.quote(nm)}"
-                  f"&refreshLibrary=false", key, method="DELETE", timeout=60)
-        except Exception as e:
-            warn(f"删空媒体库「{nm}」失败：{_short_err(e)}")
+        # _emby_del_library 内部已经逐次回读确认了，返回 "" 就是真的没了
+        err = _emby_del_library(key, lb)
+        if err:
+            warn(f"删空媒体库「{nm}」失败：{err}")
+            print(f"  {DIM}几种调法都试过了。到 Emby → 设置 → 媒体库 → "
+                  f"「{nm}」→ 删除，手动删一次就行；这个库本来就是空的，"
+                  f"删掉不影响别的。{RST}")
             continue
         gone.append(nm)
-    # 【回读确认】删和写一样，HTTP 200 不代表真没了
-    if gone:
-        try:
-            still = {x.get("Name") for x in
-                     (_emby("/Library/VirtualFolders", key, timeout=20) or [])}
-        except Exception:
-            still = set()
-        stuck = [x for x in gone if x in still]
-        if stuck:
-            warn(f"这些库调了删除但还在：{'、'.join(stuck)} —— 到 Emby 里手动删")
-            gone = [x for x in gone if x not in stuck]
     if gone:
         for nm in gone:
             mine.discard(nm)
