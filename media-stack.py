@@ -8626,6 +8626,41 @@ def do_healthcheck():
             else:
                 _hc("刮削身份", "ok", "没有条目撞身份")
 
+            # ---- 一个刮削源都没认出来的条目 ----
+            # 【和"撞身份"是相反的一头】那个是认得太狠、几个文件认成同一部；
+            # 这个是谁都不认，条目上一个 ProviderId 都没有 —— 没有海报、没有简介、
+            # 没有年份，界面上就是个灰方块。
+            #
+            # 必须报出来，因为用户看到的现象会把他引到错的地方去：同一个文件夹里
+            # 有的片有封面、有的没有，他自然会怀疑"插件是不是只对一部分生效"。
+            # 实际上刮削器是【整个库共用】的，差别在于文件名能不能被查到 ——
+            # TMDb 靠片名、MetaTube 靠番号，自己起的名字（"某某和某某"）
+            # 两边数据库里都没有对应条目，配多少刮削器都查不出来。
+            try:
+                _r = _emby("/Items?Recursive=true&IncludeItemTypes=Movie,Episode"
+                           "&Fields=ProviderIds,Path&Limit=2000", key, timeout=30) or {}
+                _noid = [i for i in (_r.get("Items") or [])
+                         if _under(str(i.get("Path") or ""), STRM_PATH)
+                         and not {k: v for k, v in (i.get("ProviderIds") or {}).items()
+                                  if v and k.lower() != "trakt"}]
+            except Exception:
+                _noid = []
+            if _noid:
+                _names = [str(i.get("Name") or "?")[:16] for i in _noid[:3]]
+                _hc("刮削结果", "warn",
+                    f"{'、'.join(_names)}{'…' if len(_noid) > 3 else ''} 等 "
+                    f"{len(_noid)} 个  {YELLOW}没有任何刮削源认出来{RST}")
+                todo.append((
+                    f"{len(_noid)} 个条目一个刮削源都没匹配上 —— 没有海报、简介和年份，"
+                    f"界面上是灰方块。刮削器是整个库共用的，所以这跟"
+                    f"「有的片有封面有的没有」不矛盾：差别在文件名能不能被查到",
+                    "TMDb 按片名查、MetaTube 按番号查。自己起的名字两边都没有对应"
+                    "条目，配多少刮削器都查不出来 —— 在网盘里把文件名改成"
+                    "「片名 (年份).mp4」，成人片改成番号（ONGP-008.mp4）最准。"
+                    "改完点「4 生成媒体库」"))
+            elif key:
+                _hc("刮削结果", "ok", "条目都刮到了信息")
+
             nodur = items_without_duration(key)
             if nodur:
                 # 必须把片名列出来。只报个数字的话，用户看到"某个媒体库没有进度条
