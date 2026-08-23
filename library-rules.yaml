@@ -55,12 +55,12 @@
   metatube: false
   keywords: 动漫电影, 剧场版
 
-- name: 纪录片
+- name: 欧美电影
   type: movies
   language: zh-CN
-  country: CN
+  country: US
   metatube: false
-  keywords: 纪录片, 纪录, documentary
+  keywords: 欧美电影, 欧美, 外语片
 
 - name: AV影片
   type: movies
@@ -68,3 +68,10 @@
   country: JP
   metatube: true
   keywords: av, 写真, 番号, AV影片
+
+- name: 纪录片
+  type: movies
+  language: zh-CN
+  country: CN
+  metatube: false
+  keywords: 纪录片, 纪录, documentary
