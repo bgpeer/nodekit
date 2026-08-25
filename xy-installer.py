@@ -4104,7 +4104,7 @@ def _cdn_link(st):
 def _cdn_intro():
     """进 CDN 菜单顶部的简短说明（原理 + 执行前三步）。"""
     print("  防 IP 被墙：域名套 Cloudflare 中转，客户端连的是 CF 的 IP，本机真 IP 被墙也能用。")
-    print("  嫌慢就用【优选地址】（菜单 5）：换更快的 CF 边缘，或筛一批候选交给客户端自己选。")
+    print("  嫌慢就用【优选地址】（菜单 2）：换更快的 CF 边缘，或筛一批候选交给客户端自己选。")
     print("  执行前：① 域名解析绑到本机 IP、开【橙色云】代理（必须橙云）；"
           "② VPS 放行端口 2053/2083/2087/2096/8443（商用 VPS 一般全开放）；"
           "③ CF 的 SSL/TLS 模式选【Full 完全】。")
@@ -4258,18 +4258,8 @@ def cdn_add():
     else:
         prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
 
-    # 优选地址：只换分享链接的地址位（sni/host 仍是上面这个域名），装完也能在菜单 5 随时改
-    exist_pref = next((n.get("pref") for n in nodes if n.get("pref")), "")
-    if exist_pref:
-        pref = _ask(f"  优选地址（回车=沿用已设的「{exist_pref}」，填 0 = 不优选直接用域名）: ").strip().lower()
-        pref = "" if pref == "0" else (pref or exist_pref)
-    else:
-        print("  优选地址：可填第三方优选域名或某个 CF IP，让客户端连更快的 CF 边缘（SNI/Host 仍用你的域名）。")
-        print("  回车跳过即可——装完可在菜单 5 手动填，或让它自动测速挑一个。")
-        pref = _ask("  优选地址（回车跳过）: ").strip().lower()
-    if pref and not _pref_valid(pref):
-        print("  优选地址格式不对（只填域名或 IPv4 本身），这次先不优选，装完可到菜单 5 再设。")
-        pref = ""
+    # 追加时新节点沿用已设的优选地址；首装留空——装完统一问要不要筛一批候选
+    pref = next((n.get("pref") for n in nodes if n.get("pref")), "")
 
     # 需要的核心先各下载一次（避免循环里重复打印下载）
     for cr in {("xray" if p == "vless-xhttp" else core_choice) for p in protos}:
@@ -4294,12 +4284,23 @@ def cdn_add():
     print(f"  记得在 CF 把域名 {created[0]['domain']} 绑到本机 IP、开橙云，VPS 放行端口：{ports}")
     print("  （详细步骤见本菜单顶部说明）。")
     if pref:
-        print(f"  优选地址：{pref}（链接地址位已换成它，SNI/Host 仍是 {created[0]['domain']}）")
-    else:
-        print("  优选地址：未设（客户端直连域名解析到的 CF IP）；想更快可到菜单 5 优选。")
+        print(f"  优选地址：沿用 {pref}（链接地址位已换成它，SNI/Host 仍是 {created[0]['domain']}）")
     print("\n  ▼ 本次新增的备用链接（导入客户端用；平时留着不用即可）:")
     for i, n in enumerate(created, 1):
         print(f"  {i}. {_cdn_link(n)}")
+
+    # 装完顺手筛一批优选候选：CDN 走 CF 任播，默认解析到哪个边缘全看运气，往往又慢又挤。
+    # 先筛一批写进来，让客户端 URLTest 自己挑最快的；以后想换就进菜单 2「优选地址」。
+    cfg = _pref_load()
+    print("\n" + "-" * 60)
+    print("  ▼ 优选候选：现在筛一批更快的 CF 边缘吗？")
+    print("    默认解析到的边缘全看运气，实测常比优选后慢好几倍。筛出来的多条候选一起写进")
+    print("    订阅，最终由客户端自己挑最快的那条——只有客户端测得到你这边到 CF 的真实延迟。")
+    print(f"    代价：下载测速最多耗 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量，约一两分钟。")
+    if (_ask("  回车=筛（推荐） / n=跳过: ").strip().lower() or "y") in ("n", "no"):
+        print("  已跳过。想筛随时进菜单 2「优选地址」→ 1。")
+        return
+    cdn_pref_scan(ask=False)
 
 # --- 把 CDN 节点写入/移出订阅（改 /root/xy-nodes.txt 节点段 + 刷新三格式）---
 def _node_file_parts():
@@ -4587,7 +4588,7 @@ def _cdn_resync(old_links, was_in_sub):
     try:
         _cdn_sub_apply(remove_links=old_links, add_links=add)
     except Exception as e:
-        print("  ⚠ 订阅刷新失败（状态已存下，可回上级菜单 3 重写一次订阅）：", e)
+        print("  ⚠ 订阅刷新失败（状态已存下，可回上级菜单 4 重写一次订阅）：", e)
 
 def _cdn_set_pref(addr):
     """手动优选：把地址写进全部 CDN 节点。传空 = 取消优选、回到用域名。
@@ -4607,8 +4608,9 @@ def _cdn_set_pref(addr):
     _cdn_resync(old, was)
     return True
 
-def cdn_pref_scan():
-    """测速筛候选：粗筛出若干 CF 边缘各写一条节点进订阅，最终由客户端 URLTest 选。"""
+def cdn_pref_scan(ask=True):
+    """测速筛候选：粗筛出若干 CF 边缘各写一条节点进订阅，最终由客户端 URLTest 选。
+       ask=False 供安装流程调用——那边已经问过一次，别再问第二遍。"""
     nodes = _cdn_load()
     if not nodes:
         print("  还没配置 CDN 节点，先回上级菜单选 1 装一条。"); return
@@ -4619,7 +4621,7 @@ def cdn_pref_scan():
           f"[{base.get('proto')}] 节点进订阅。")
     print(f"  它们共用同一个服务端入站，不新建任何服务；最终由客户端 URLTest 挑最快的那条。")
     print(f"  下载测速最多消耗约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量。")
-    if (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
+    if ask and (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
         return
     res = cdn_speedtest(cfg)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -4643,7 +4645,7 @@ def cdn_pref_scan():
     if was:
         print("  订阅已刷新。")
     else:
-        print("  ⚠ 当前 CDN 节点还没写进订阅，候选也不会出现在订阅里——先用上级菜单 3 写入。")
+        print("  ⚠ 当前 CDN 节点还没写进订阅，候选也不会出现在订阅里——先用上级菜单 4 写入。")
     print("\n  接下来：客户端重拉订阅，让它的 URLTest 从这几条里挑最快的。")
     print("  本机测的是 VPS→CF 这一段，只作粗筛；哪条对你的网络最快，只有客户端说了算。")
 
@@ -4759,16 +4761,16 @@ def cdn_pref_menu():
         elif last:
             print(f"  上次测速：{last.get('time','')}  没选出可用地址（已保持原样）")
         print("-" * 60)
-        print("  1 手动填优选域名/IP（直接留空回车=取消优选、回到用域名）")
-        print(f"  2 测速筛候选（写 {cfg.get('n_cand_out', 5)} 条进订阅，让客户端自己选最快的）")
+        print(f"  1 测速筛候选（写 {cfg.get('n_cand_out', 5)} 条进订阅，让客户端自己选最快的）")
+        print("  2 手动填优选域名/IP（直接留空回车=取消优选、回到用域名）")
         print("  3 清空候选节点")
         print("  4 测速参数")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
-            _pref_manual(nodes, cfg)
-        elif c == "2":
             cdn_pref_scan()
+        elif c == "2":
+            _pref_manual(nodes, cfg)
         elif c == "3":
             cdn_cand_clear()
         elif c == "4":
@@ -4844,17 +4846,19 @@ def cdn_menu():
         _cdn_intro()
         print("-" * 60)
         print(f"  1 CDN节点安装{('（已配置 %d 条）' % len(nodes)) if nodes else ''}")
-        print("  2 查看全部备用链接")
-        print("  3 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
-        print("  4 卸载 CDN 节点（可选某条 / 全部）")
         pcur = sorted({(n.get("pref") or "").strip() for n in nodes}) if nodes else [""]
-        print(f"  5 优选地址（手动填 / 测速筛候选给客户端选）"
+        print(f"  2 优选地址（手动填 / 测速筛候选给客户端选）"
               f"{'  当前：' + '、'.join(c for c in pcur if c) if pcur != [''] else ''}")
+        print("  3 查看全部备用链接")
+        print("  4 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
+        print("  5 卸载 CDN 节点（可选某条 / 全部）")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
             cdn_add()
         elif c == "2":
+            cdn_pref_menu()
+        elif c == "3":
             if not nodes:
                 print("  还没配置，先选 1 CDN节点安装。"); continue
             # 上方：已配置节点列表；下方：全部备用链接
@@ -4870,12 +4874,10 @@ def cdn_menu():
             for i, n in enumerate(nodes, 1):
                 print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
                 print(f"     {_cdn_link(n)}")
-        elif c == "3":
-            cdn_write_sub()
         elif c == "4":
-            cdn_remove()
+            cdn_write_sub()
         elif c == "5":
-            cdn_pref_menu()
+            cdn_remove()
         elif c in ("0", ""):
             return
 
