@@ -18,7 +18,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time
+import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
@@ -122,6 +122,36 @@ CDN_KEY   = CDN_DIR + "/cert.key"
 CDN_CONF  = CDN_DIR + "/config.json"
 CDN_SVC   = "xy-cdn"
 CDN_PORTS = [2053, 2083, 2087, 2096, 8443]       # Cloudflare 免费版可代理的 HTTPS 端口
+
+# 优选：客户端不直连域名解析出的那个 CF 任播 IP，改连一个实测更快的 CF 边缘地址。
+# 分享链接里【地址位】填优选地址、【sni/host 仍填真域名】——CF 回源认的是 Host 头，
+# 所以换地址不用动服务端任何配置。自动测速在本机(VPS)跑，测的是 VPS→CF 边缘这一段。
+CDN_PREF_FILE = BGP_DIR + "/cdn-pref.json"       # 优选状态：测速参数 + 上次结果 + cron 开关
+CDN_PREF_CRON = "/etc/cron.d/bgpeer-cdnpref"     # 定时自动优选的 cron
+CDN_PREF_LOG  = "/var/log/bgpeer-cdnpref.log"
+CF_IPS_URL    = "https://www.cloudflare.com/ips-v4"   # CF 官方公布的 IPv4 段（纯文本 CIDR）
+CF_SPEED_HOST = "speed.cloudflare.com"                # CF 官方测速端点，任何 CF 边缘 IP 都能服务
+# 拉不到官方列表时的兜底段（CF 的 IPv4 段多年稳定，少几段不影响优选质量）
+CF_IPV4_FALLBACK = [
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+]
+# 测速默认参数（可在优选菜单里改，存 CDN_PREF_FILE）。
+# ⚠ 下载测速是真的在下数据、走 VPS 流量：一轮最多 n_top × dl_mb MB（默认 6×10=60MB）。
+# 默认值按「小流量包 VPS 也扛得住」定的，流量宽裕可自行调大 n_top / dl_mb 提高准确度。
+CDN_PREF_DEFAULTS = {
+    "n_cand":     500,   # 候选 IP 采样数（从 CF 各段的 /24 里随机取）
+    "n_top":      6,     # 延迟筛出前 N 名才进下载测速
+    "n_thread":   100,   # 延迟测试并发数
+    "timeout":    2.0,   # 单次 TCP 握手超时(秒)
+    "dl_mb":      10.0,  # 单个 IP 下载测速的下载量上限(MB)
+    "dl_time":    8,     # 单个 IP 下载测速最长耗时(秒)，到点截断按均速算
+    "min_mbps":   0.0,   # 最优速度低于它就不改优选(保持现状)；0=不设限
+    "port":       0,     # 测试端口；0=沿用第一条 CDN 节点的 CF 端口
+    "cron_hours": 0,     # 定时自动优选间隔(小时)；0=关闭
+}
 
 NODE_FILE = "/root/xy-nodes.txt"                 # 本机节点分享链接（订阅由它生成）
 
@@ -3031,7 +3061,7 @@ def _uninstall_core():
               "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer", WEBROOT,
               # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
               "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
-              CORE_CRON_FILE, CORE_CRON_LOG):
+              CORE_CRON_FILE, CORE_CRON_LOG, CDN_PREF_CRON, CDN_PREF_LOG):
         sh(f"rm -rf {p}", check=False)
 
 def uninstall_all():
@@ -4023,26 +4053,34 @@ CDN_PROTO_SUB = {
     "vless-xhttp": "仅 mihomo（sing-box/小火箭不支持 xhttp，写入时自动跳过）",
 }
 
+def _cdn_addr(st):
+    """分享链接【地址位】：填了优选地址就用它，否则回落到真域名（老节点/未优选即原行为）。"""
+    return (st.get("pref") or "").strip() or st["domain"]
+
 def _cdn_link(st):
+    """地址位 = 优选地址（或真域名），sni/host 恒为真域名——CF 靠 Host 头回源，
+       所以换成任意 CF 边缘 IP/优选域名都能连回同一个源站，服务端无需改动。"""
     proto = st.get("proto", "vless-ws")
     cred = st.get("cred") or st.get("uuid", "")
     dom, port, path, tag = st["domain"], st["cf_port"], st["path"], st["tag"]
+    addr = _cdn_addr(st)
     if proto == "vless-xhttp":
-        return (f"vless://{cred}@{dom}:{port}?encryption=none&security=tls&sni={dom}"
+        return (f"vless://{cred}@{addr}:{port}?encryption=none&security=tls&sni={dom}"
                 f"&host={dom}&type=xhttp&path={path}&fp=chrome#{tag}")
     if proto == "vmess-ws":
-        return vmess_link({"v": "2", "ps": tag, "add": dom, "port": str(port), "id": cred,
+        return vmess_link({"v": "2", "ps": tag, "add": addr, "port": str(port), "id": cred,
                            "aid": "0", "net": "ws", "type": "none", "host": dom,
                            "path": path, "tls": "tls", "sni": dom})
     if proto == "trojan-ws":
-        return (f"trojan://{cred}@{dom}:{port}?security=tls&sni={dom}"
+        return (f"trojan://{cred}@{addr}:{port}?security=tls&sni={dom}"
                 f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
-    return (f"vless://{cred}@{dom}:{port}?encryption=none&security=tls&sni={dom}"
+    return (f"vless://{cred}@{addr}:{port}?encryption=none&security=tls&sni={dom}"
             f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
 
 def _cdn_intro():
     """进 CDN 菜单顶部的简短说明（原理 + 执行前三步）。"""
     print("  防 IP 被墙：域名套 Cloudflare 中转，客户端连的是 CF 的 IP，本机真 IP 被墙也能用。")
+    print("  嫌慢就用【优选地址】（菜单 5）：换一个更快的 CF 边缘，源站和客户端配置都不用改。")
     print("  执行前：① 域名解析绑到本机 IP、开【橙色云】代理（必须橙云）；"
           "② VPS 放行端口 2053/2083/2087/2096/8443（商用 VPS 一般全开放）；"
           "③ CF 的 SSL/TLS 模式选【Full 完全】。")
@@ -4104,8 +4142,9 @@ def _parse_cdn_protos(raw):
             out.append(CDN_PROTOS[tok])
     return out
 
-def _cdn_build_one(nodes, proto, core, domain, prefix):
-    """建一条 CDN 节点（独立证书/配置/服务/端口），成功返回 node、失败返回 None。"""
+def _cdn_build_one(nodes, proto, core, domain, prefix, pref=""):
+    """建一条 CDN 节点（独立证书/配置/服务/端口），成功返回 node、失败返回 None。
+       pref=优选地址，只影响分享链接的地址位，服务端配置与它无关。"""
     port = _cdn_pick_port({n["cf_port"] for n in nodes})
     if not port:
         return None
@@ -4130,7 +4169,7 @@ def _cdn_build_one(nodes, proto, core, domain, prefix):
         return None
     node = {"id": nid, "proto": proto, "core": core, "domain": domain, "cred": cred,
             "path": path, "cf_port": port, "tag": f"{prefix}CDN·{proto}", "svc": svc,
-            "crt": crt, "key": key, "conf": conf, "in_sub": False}
+            "crt": crt, "key": key, "conf": conf, "in_sub": False, "pref": pref}
     nodes.append(node)                                    # 立即并入，供下一条挑端口/id 避重
     return node
 
@@ -4195,6 +4234,19 @@ def cdn_add():
     else:
         prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
 
+    # 优选地址：只换分享链接的地址位（sni/host 仍是上面这个域名），装完也能在菜单 5 随时改
+    exist_pref = next((n.get("pref") for n in nodes if n.get("pref")), "")
+    if exist_pref:
+        pref = _ask(f"  优选地址（回车=沿用已设的「{exist_pref}」，填 0 = 不优选直接用域名）: ").strip().lower()
+        pref = "" if pref == "0" else (pref or exist_pref)
+    else:
+        print("  优选地址：可填第三方优选域名或某个 CF IP，让客户端连更快的 CF 边缘（SNI/Host 仍用你的域名）。")
+        print("  回车跳过即可——装完可在菜单 5 手动填，或让它自动测速挑一个。")
+        pref = _ask("  优选地址（回车跳过）: ").strip().lower()
+    if pref and not _pref_valid(pref):
+        print("  优选地址格式不对（只填域名或 IPv4 本身），这次先不优选，装完可到菜单 5 再设。")
+        pref = ""
+
     # 需要的核心先各下载一次（避免循环里重复打印下载）
     for cr in {("xray" if p == "vless-xhttp" else core_choice) for p in protos}:
         binp = XRAY_BIN if cr == "xray" else SB_BIN
@@ -4207,7 +4259,7 @@ def cdn_add():
     created = []
     for proto in protos:
         core = "xray" if proto == "vless-xhttp" else core_choice
-        node = _cdn_build_one(nodes, proto, core, domain, prefix)
+        node = _cdn_build_one(nodes, proto, core, domain, prefix, pref)
         if node:
             created.append(node)
     if not created:
@@ -4217,6 +4269,10 @@ def cdn_add():
     print(f"\n  ✓ 新增成功 {len(created)} 条（共 {len(nodes)} 条，各自独立服务、与主节点互不影响）。")
     print(f"  记得在 CF 把域名 {created[0]['domain']} 绑到本机 IP、开橙云，VPS 放行端口：{ports}")
     print("  （详细步骤见本菜单顶部说明）。")
+    if pref:
+        print(f"  优选地址：{pref}（链接地址位已换成它，SNI/Host 仍是 {created[0]['domain']}）")
+    else:
+        print("  优选地址：未设（客户端直连域名解析到的 CF IP）；想更快可到菜单 5 优选。")
     print("\n  ▼ 本次新增的备用链接（导入客户端用；平时留着不用即可）:")
     for i, n in enumerate(created, 1):
         print(f"  {i}. {_cdn_link(n)}")
@@ -4284,6 +4340,359 @@ def cdn_write_sub():
         # 移出后订阅里一个节点都不剩：build_subscription 对空列表不再刷新，托管的旧订阅内容不会自动清空
         print("  ℹ️ 订阅里已无任何节点，之前托管的订阅内容不会再更新；如需彻底清空可到菜单 2「节点/订阅」重置。")
 
+# ---------------------------------------------------------------------------- 优选地址
+# 手动填优选域名/IP，或自动测速（拉 CF IP 段 → 采样 → 延迟筛 → 下载测速 → 择优）。
+# 只改分享链接的地址位，服务端配置一律不动。
+def _pref_load():
+    """读优选设置；缺项用默认补齐（老版本升上来也能直接用）。"""
+    cfg = dict(CDN_PREF_DEFAULTS)
+    try:
+        cfg.update(json.load(open(CDN_PREF_FILE)))
+    except Exception:
+        pass
+    return cfg
+
+def _pref_save(cfg):
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump(cfg, open(CDN_PREF_FILE, "w"), ensure_ascii=False, indent=2)
+
+def _pref_port(nodes, cfg):
+    """测速端口：设了就用设的；否则沿用第一条 CDN 节点的 CF 端口（没节点则 443）。
+       用节点自己的端口测，才能顺带验证这个边缘对该端口确实放行。"""
+    if cfg.get("port"):
+        return int(cfg["port"])
+    return nodes[0]["cf_port"] if nodes else 443
+
+def _cf_cidrs():
+    """拉 CF 官方公布的 IPv4 段，返回 (段列表, 是否官方最新)。拉不到用内置兜底。"""
+    try:
+        req = urllib.request.Request(CF_IPS_URL, headers={"User-Agent": "xy-installer"})
+        txt = urllib.request.urlopen(req, timeout=10).read().decode()
+        out = [l.strip() for l in txt.splitlines() if re.fullmatch(r"[\d.]+/\d+", l.strip())]
+        if out:
+            return out, True
+    except Exception:
+        pass
+    return list(CF_IPV4_FALLBACK), False
+
+def _sample_ips(cidrs, n):
+    """采样候选 IP：先把各段切成 /24、打散，再在 /24 内随机取一个主机地址。
+       按 /24 取而不是整段均分——CF 同一大段内不同 /24 常落在不同机房，这样覆盖面最广。"""
+    blocks = []
+    for c in cidrs:
+        try:
+            net = ipaddress.ip_network(c, strict=False)
+        except ValueError:
+            continue
+        if net.version != 4:
+            continue
+        if net.prefixlen >= 24:
+            blocks.append(net)
+        else:
+            blocks.extend(net.subnets(new_prefix=24))
+    if not blocks:
+        return []
+    random.shuffle(blocks)
+    seen, ips, guard = set(), [], 0
+    while len(ips) < n and guard < n * 5:                 # guard：段数远少于 n 时别死转
+        b = blocks[guard % len(blocks)]
+        guard += 1
+        size = b.num_addresses
+        ip = str(b.network_address + (random.randint(1, size - 2) if size > 2 else 0))
+        if ip not in seen:
+            seen.add(ip); ips.append(ip)
+    return ips
+
+def _tcp_rtt(addr, port, timeout):
+    """TCP 握手往返(ms)；连不上返回 None。域名也能测（connect 自己解析）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    t0 = time.time()
+    try:
+        s.connect((addr, port))
+        return (time.time() - t0) * 1000
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+def _latency_round(ips, port, cfg, on_progress=None):
+    """并发测全部候选的握手延迟，返回 [(ip, ms)] 按延迟升序（连不上的直接丢掉）。"""
+    from concurrent.futures import ThreadPoolExecutor
+    out, done = [], [0]
+    def work(ip):
+        ms = _tcp_rtt(ip, port, float(cfg["timeout"]))
+        done[0] += 1                                      # 仅供进度显示，不精确无所谓
+        if on_progress and done[0] % 25 == 0:
+            on_progress(done[0], len(ips))
+        return ip, ms
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg["n_thread"]))) as ex:
+        for ip, ms in ex.map(work, ips):
+            if ms is not None:
+                out.append((ip, ms))
+    out.sort(key=lambda x: x[1])
+    return out
+
+def _dl_mbps(ip, port, cfg):
+    """经指定 CF 边缘下载 CF 官方测速端点，返回 Mbps；失败返回 0。
+       curl --resolve 把 speed.cloudflare.com 钉到这个 IP：SNI/证书仍是它自己的，
+       所以不碰你的域名也能测出这条边缘线路的真实吞吐。"""
+    nbytes = max(1, int(float(cfg["dl_mb"]) * 1_000_000))
+    url = f"https://{CF_SPEED_HOST}:{port}/__down?bytes={nbytes}"
+    out = sh(f"curl -sS -o /dev/null -w '%{{speed_download}}' "
+             f"--resolve {CF_SPEED_HOST}:{port}:{ip} "
+             f"--max-time {int(cfg['dl_time'])} '{url}'", check=False)
+    try:
+        return float(out.strip().replace(",", ".")) * 8 / 1_000_000    # 字节/秒 → Mbps
+    except ValueError:
+        return 0.0                                        # curl 报错/超时 → 这个 IP 判负
+
+def _dl_probe_top(top, port, cfg, say):
+    """对延迟前几名逐个跑下载测速，返回最快的 {"ip","ms","mbps"}；全失败返回 None。"""
+    best = None
+    for i, (ip, ms) in enumerate(top, 1):
+        mbps = _dl_mbps(ip, port, cfg)
+        say(f"    {i:>2}. {ip:<16}{ms:7.1f} ms {mbps:8.2f} Mbps" + ("" if mbps > 0 else "  (失败)"))
+        if mbps > 0 and (best is None or mbps > best["mbps"]):
+            best = {"ip": ip, "ms": round(ms, 1), "mbps": round(mbps, 2)}
+    return best
+
+def cdn_speedtest(cfg=None, quiet=False):
+    """完整优选流程，返回最优 {"ip","ms","mbps"}；一个可用的都没测出来返回 None。"""
+    nodes = _cdn_load()
+    cfg = cfg or _pref_load()
+    port = _pref_port(nodes, cfg)
+    say = (lambda *a: None) if quiet else (lambda *a: print(*a))
+    cidrs, official = _cf_cidrs()
+    say(f"  · CF IP 段 {len(cidrs)} 段（{'官方最新' if official else '拉取失败·用内置兜底段'}）")
+    ips = _sample_ips(cidrs, int(cfg["n_cand"]))
+    if not ips:
+        say("  ✗ 没采到候选 IP（IP 段异常），本轮放弃。"); return None
+    say(f"  · 候选 {len(ips)} 个，测握手延迟（端口 {port}，并发 {cfg['n_thread']}）...")
+    prog = None if quiet else (lambda a, b: print(f"\r    进度 {a}/{b}", end="", flush=True))
+    ranked = _latency_round(ips, port, cfg, prog)
+    if not quiet:
+        print("\r" + " " * 30 + "\r", end="")
+    if not ranked:
+        say(f"  ✗ 候选 IP 没有一个连得上 {port} 端口——检查本机出网是否被限，或到「测速参数」换个端口。")
+        return None
+    top = ranked[:max(1, int(cfg["n_top"]))]
+    say(f"  · 通了 {len(ranked)} 个，取延迟最优 {len(top)} 个做下载测速"
+        f"（每个最多 {cfg['dl_time']}s / {cfg['dl_mb']}MB）...")
+    best = _dl_probe_top(top, port, cfg, say)
+    if best is None and port != 443:
+        # 少数边缘只对 443 提供测速端点：换 443 再给一次机会（优选地址本身跟端口无关）
+        say("  · 该端口下载测速全挂，改用 443 复测一轮...")
+        best = _dl_probe_top(top, 443, cfg, say)
+    if best is None:
+        say("  ✗ 下载测速全部失败，本轮不动优选地址（保持现状）。")
+        return None
+    if float(cfg["min_mbps"]) > 0 and best["mbps"] < float(cfg["min_mbps"]):
+        say(f"  ✗ 最优只有 {best['mbps']} Mbps，低于下限 {cfg['min_mbps']} Mbps，本轮不动（保持现状）。")
+        return None
+    return best
+
+def _cdn_set_pref(addr):
+    """把优选地址写进全部 CDN 节点，已入订阅的按新链接刷新。
+       addr 传空 = 取消优选、回到直接用域名。返回 True 表示确有改动。"""
+    nodes = _cdn_load()
+    if not nodes:
+        return False
+    addr = (addr or "").strip()
+    old_links = [_cdn_link(n) for n in nodes]             # 必须先算：改完 pref 就还原不出旧链接了
+    if all((n.get("pref") or "") == addr for n in nodes):
+        return False
+    for n in nodes:
+        n["pref"] = addr
+    _cdn_save(nodes)
+    if any(n.get("in_sub") for n in nodes):
+        try:
+            _cdn_sub_apply(remove_links=old_links,
+                           add_links=[_cdn_link(n) for n in nodes if n.get("in_sub")])
+        except Exception as e:
+            # 定时优选时这行是唯一的可见反馈（进 cron 日志），所以不分静默与否都要打
+            print("  ⚠ 订阅刷新失败（优选地址已存下，可回上级菜单 3 重写一次订阅）：", e)
+    return True
+
+def cdn_pref_auto(quiet=False):
+    """自动优选一轮：测速 → 写入全部节点 → 刷订阅。菜单和 cron 共用这一个入口。"""
+    nodes = _cdn_load()
+    if not nodes:
+        if not quiet:
+            print("  还没配置 CDN 节点，先装一条再来优选。")
+        return None
+    cfg = _pref_load()
+    best = cdn_speedtest(cfg, quiet=quiet)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    cfg["last"] = {"time": stamp, "ok": bool(best)}
+    if best:
+        cfg["last"].update(best)
+    _pref_save(cfg)
+    if not best:
+        if quiet:
+            print(f"[{stamp}] cdn-pref: 本轮没选出可用地址，保持原样")
+        return None
+    _cdn_set_pref(best["ip"])
+    if quiet:
+        print(f"[{stamp}] cdn-pref → {best['ip']}  {best['ms']}ms  {best['mbps']}Mbps")
+    else:
+        print(f"\n  ✓ 选定 {best['ip']}（{best['ms']}ms / {best['mbps']} Mbps），已写入全部 CDN 节点。")
+        print("    已入订阅的节点同步刷新完毕，客户端重新拉一次订阅即生效。")
+    return best
+
+def setup_cdn_pref_cron(hours):
+    """装/撤定时自动优选 cron。hours=0 → 撤掉。分钟随机错峰，别整点扎堆打 CF。"""
+    if not hours:
+        sh(f"rm -f {CDN_PREF_CRON}", check=False)
+        return 0
+    try:
+        if os.path.abspath(__file__) != SELF_LOCAL:       # cron 调本地副本，不受网络影响
+            os.makedirs(BGP_DIR, exist_ok=True)
+            shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
+        txt = (f"# bgpeer CDN 优选地址自动更新（每 {hours} 小时一轮）\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"{random.randint(0, 59)} */{hours} * * * root python3 {SELF_LOCAL} "
+               f"cdn-pref-auto >> {CDN_PREF_LOG} 2>&1\n")
+        open(CDN_PREF_CRON, "w").write(txt); os.chmod(CDN_PREF_CRON, 0o644)
+        return hours
+    except OSError as e:
+        print("  安装定时优选 cron 失败（不影响手动优选）:", e)
+        return 0
+
+def _pref_valid(addr):
+    """优选地址合法性：一个 IPv4 或一个域名。带协议头/端口/路径的一律打回。"""
+    if not addr or " " in addr or "/" in addr or ":" in addr:
+        return False                                      # 带端口/路径/IPv6 冒号的一律打回
+    try:
+        ipaddress.ip_address(addr); return True
+    except ValueError:
+        return bool(re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?"
+                                 r"(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+", addr))
+
+# 可调测速参数：键 → (提示, 类型, 下限, 上限, 说明)。范围卡死，免得填出跑不动的组合。
+_PREF_FIELDS = [
+    ("n_cand",   "候选 IP 数",          int,   10,  5000,  "从 CF 各 /24 里随机采多少个来测延迟"),
+    ("n_top",    "进下载测速的名次",      int,   1,   50,    "延迟最优的前几名才下载测速（直接决定流量开销）"),
+    ("n_thread", "延迟测试并发",          int,   1,   500,   "越大越快；小内存机别开太高"),
+    ("timeout",  "握手超时(秒)",         float, 0.2, 10,    "超过就当这个 IP 不通"),
+    ("dl_mb",    "单个下载量上限(MB)",    float, 0.5, 500,   "流量开销 ≈ 名次 × 这个数"),
+    ("dl_time",  "单个下载测速时长(秒)",  int,   2,   60,    "到点截断按均速算；越长越准也越费流量"),
+    ("min_mbps", "采纳下限(Mbps)",       float, 0,   10000, "最优速度低于它就不改优选；0=不设限"),
+    ("port",     "测试端口",             int,   0,   65535, "0=沿用第一条 CDN 节点的 CF 端口"),
+]
+
+def _pref_settings(cfg):
+    """逐项改测速参数，回车=保持不变；超范围的那项跳过、不影响其它项。"""
+    print("\n  测速参数（回车=不改）：")
+    for key, label, cast, lo, hi, note in _PREF_FIELDS:
+        raw = _ask(f"    {label} [当前 {cfg.get(key, CDN_PREF_DEFAULTS[key])}]（{note}）: ").strip()
+        if not raw:
+            continue
+        try:
+            val = cast(raw)
+        except ValueError:
+            print(f"    ⚠ {label} 填的不是数字，这项跳过。"); continue
+        if not lo <= val <= hi:
+            print(f"    ⚠ {label} 需在 {lo}~{hi} 之间，这项跳过。"); continue
+        cfg[key] = val
+    _pref_save(cfg)
+    print(f"  ✓ 已保存。一轮下载测速最多约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量。")
+
+def cdn_pref_menu():
+    """优选地址子菜单：手动填 / 立即测速 / 定时优选 / 参数。"""
+    while True:
+        nodes = _cdn_load()
+        cfg = _pref_load()
+        print("\n" + "=" * 60)
+        print("  优选地址（换客户端连的 CF 边缘，服务端一行都不用改）")
+        print("=" * 60)
+        print("  原理：分享链接里【地址位】换成更快的 CF 地址，【SNI/Host 仍是你的真域名】；")
+        print("        CF 靠 Host 头回源，所以换任意 CF 边缘都能连回同一台 VPS。")
+        if not nodes:
+            print("-" * 60)
+            print("  还没配置 CDN 节点，先回上级菜单选 1 装一条。")
+            return
+        cur = sorted({(n.get("pref") or "").strip() for n in nodes})
+        print("-" * 60)
+        if cur == [""]:
+            print("  当前：未优选（客户端直连域名解析到的 CF IP）")
+        else:
+            print("  当前优选地址：" + "、".join(c or "(未优选·用域名)" for c in cur))
+        last = cfg.get("last") or {}
+        if last.get("ok"):
+            print(f"  上次测速：{last.get('time','')}  {last.get('ip','')}  "
+                  f"{last.get('ms','?')}ms / {last.get('mbps','?')} Mbps")
+        elif last:
+            print(f"  上次测速：{last.get('time','')}  没选出可用地址（已保持原样）")
+        print(f"  定时优选：{('每 %s 小时一轮' % cfg['cron_hours']) if cfg.get('cron_hours') else '关闭'}"
+              f"    单轮流量上限 ≈ {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB")
+        print("-" * 60)
+        print("  1 手动填优选域名/IP（直接留空回车=取消优选、回到用域名）")
+        print("  2 立即自动测速优选（拉 CF IP 段 → 延迟筛 → 下载测速 → 择优）")
+        print("  3 定时自动优选（开关/间隔）")
+        print("  4 测速参数")
+        print("  0 返回")
+        c = _ask("选择: ").strip()
+        if c == "1":
+            _pref_manual(nodes, cfg)
+        elif c == "2":
+            print(f"\n  开始测速——下载环节最多消耗约 "
+                  f"{float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量。")
+            if (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
+                continue
+            cdn_pref_auto()
+        elif c == "3":
+            _pref_cron_menu(cfg)
+        elif c == "4":
+            _pref_settings(cfg)
+        elif c in ("0", ""):
+            return
+
+def _pref_manual(nodes, cfg):
+    """手动填优选地址：先连通性探一下，通了才写（不通给你自己拍板）。"""
+    print("\n  填第三方优选域名（如各家公开的 CF 优选域名）或一个具体的 CF IP。")
+    print("  留空回车 = 取消优选，恢复成直接用你自己的域名。")
+    addr = _ask("  优选地址: ").strip().lower()
+    if not addr:
+        if _cdn_set_pref(""):
+            print("  ✓ 已取消优选，全部 CDN 节点恢复用域名（订阅已同步刷新）。")
+        else:
+            print("  本来就没设优选，未改动。")
+        return
+    if not _pref_valid(addr):
+        print("  ✗ 只填域名或 IPv4 本身，别带 http://、端口和路径；暂不支持 IPv6。已取消。")
+        return
+    port = _pref_port(nodes, cfg)
+    ms = _tcp_rtt(addr, port, 3.0)
+    if ms is None:
+        print(f"  ⚠ 从本机连 {addr}:{port} 不通（也可能只是本机到它的路由差，客户端未必不通）。")
+        if (_ask("  仍然写入? y 确认 / 回车放弃: ") or "n").lower() not in ("y", "yes"):
+            print("  已放弃。"); return
+    else:
+        print(f"  ✓ 连通，握手 {ms:.1f}ms。")
+    if _cdn_set_pref(addr):
+        print(f"  ✓ 已把全部 CDN 节点的地址位换成 {addr}（订阅已同步刷新，客户端重拉即生效）。")
+    else:
+        print("  和当前一样，未改动。")
+
+def _pref_cron_menu(cfg):
+    """定时自动优选的开关与间隔。"""
+    print("\n  定时自动优选：cron 到点自动跑一轮测速并刷订阅（客户端下次拉订阅就换上新地址）。")
+    print(f"  每轮流量上限 ≈ {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB，按你的流量包挑间隔。")
+    print("   1 每 24 小时（推荐）  2 每 12 小时  3 每 6 小时  4 每 3 小时  0 关闭")
+    m = {"1": 24, "2": 12, "3": 6, "4": 3, "0": 0}
+    c = _ask("  选择(回车返回): ").strip()
+    if c not in m:
+        return
+    hours = setup_cdn_pref_cron(m[c])
+    cfg["cron_hours"] = hours
+    _pref_save(cfg)
+    if hours:
+        print(f"  ✓ 已开启：每 {hours} 小时自动优选一轮。日志: tail {CDN_PREF_LOG}")
+    else:
+        print("  ✓ 已关闭定时优选（手动优选不受影响）。")
+
 def _cdn_drop(node):
     """停服务、删单元、删该条的证书/配置。"""
     sh(f"systemctl disable --now {node['svc']}", check=False)
@@ -4341,6 +4750,10 @@ def cdn_remove():
         shutil.rmtree(CDN_DIR, ignore_errors=True)
         try: os.remove(CDN_STATE)
         except OSError: pass
+        if _pref_load().get("cron_hours"):               # 一条都不剩了，定时优选留着只会空跑
+            setup_cdn_pref_cron(0)
+            cfg = _pref_load(); cfg["cron_hours"] = 0; _pref_save(cfg)
+            print("  （已顺带关掉定时优选；测速参数留着，下次装回来还能用）")
     print(f"  ✓ 已卸载 {len(targets)} 条 CDN 节点（Cloudflare 那边的 DNS 记录请自行删除）。")
 
 def cdn_menu():
@@ -4355,6 +4768,9 @@ def cdn_menu():
         print("  2 查看全部备用链接")
         print("  3 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
         print("  4 卸载 CDN 节点（可选某条 / 全部）")
+        pcur = sorted({(n.get("pref") or "").strip() for n in nodes}) if nodes else [""]
+        print(f"  5 优选地址（手动填 / 自动测速 / 定时优选）"
+              f"{'  当前：' + '、'.join(c for c in pcur if c) if pcur != [''] else ''}")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
@@ -4367,8 +4783,10 @@ def cdn_menu():
             for i, n in enumerate(nodes, 1):
                 act = sh(f"systemctl is-active {n['svc']}", check=False) == "active"
                 insub = "已写入订阅" if n.get("in_sub") else "仅备用链接"
+                pf = (n.get("pref") or "").strip()
                 print(f"   {i}. {n['domain']}:{n['cf_port']}（{n.get('proto','vless-ws')}/"
-                      f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}")
+                      f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}"
+                      f"{'  优选→' + pf if pf else ''}")
             print("\n  ▼ 全部 CDN 备用节点链接（导入客户端用；平时留着不用即可）:")
             for i, n in enumerate(nodes, 1):
                 print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
@@ -4377,6 +4795,8 @@ def cdn_menu():
             cdn_write_sub()
         elif c == "4":
             cdn_remove()
+        elif c == "5":
+            cdn_pref_menu()
         elif c in ("0", ""):
             return
 
@@ -4563,6 +4983,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单16 转后台都调这个
         update_cores_auto(sys.argv[2] if len(sys.argv) > 2 else None)   # 可选 sing-box/xray/both
+        sys.exit(0)
+    if sys.argv[1] == "cdn-pref-auto":  # 非交互：定时自动优选 cron 调这个
+        cdn_pref_auto(quiet=True)
         sys.exit(0)
     if sys.argv[1] == "selfdns-toggle":  # adguard 菜单调用：开关"自建DNS写入订阅"
         selfdns_toggle()
