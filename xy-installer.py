@@ -2394,6 +2394,80 @@ def _link_rename(link, newname):
         return vmess_link(j)
     return link.split("#", 1)[0] + "#" + newname
 
+_TAG_MARKS = "¹²³⁴⁵⁶⁷⁸⁹⁰"          # build() 给双核心同名协议加的尾标，改名时要原样留着
+
+def _sep_name(nm):
+    """给老节点名补上「前缀·协议名」之间的分隔点；已经有了、或认不出协议名就原样返回。
+
+       只动【显示名】：名字烤在分享链接的 #fragment(vmess 在 ps)里，纯粹给人看的，
+       uuid / 端口 / 路径 / 服务一律不碰。老节点因此不用重装就能修好——
+       重装会重新生成全部 uuid 和端口，为个分隔点不值当。"""
+    nm = nm or ""
+    i = nm.find("CDN·")
+    if i == 0:
+        return nm                                   # CDN 节点但没设前缀
+    if i > 0:                                       # CDN 节点：CDN· 之前整段都是前缀
+        pfx = nm[:i]
+        return nm if pfx.endswith("·") else pfx + "·" + nm[i:]
+    body, mark = nm, ""
+    while body and body[-1] in _TAG_MARKS:          # 尾标先摘下来，改完再贴回去
+        mark = body[-1] + mark; body = body[:-1]
+    for proto in sorted(set(SB) | set(XRAY), key=len, reverse=True):   # 长的先试，别让 trojan 抢了 vless-ws
+        if body.endswith(proto):
+            pfx = body[:-len(proto)]
+            if not pfx or pfx.endswith("·"):
+                return nm                           # 没前缀 / 已经有分隔点
+            return pfx + "·" + proto + mark
+    return nm                                       # 认不出协议名（自定义名字）→ 不动
+
+def _names_need_sep(links):
+    """返回 [(旧名, 新名)]，只含确实要改的。"""
+    out = []
+    for u in links:
+        old = _link_name(u)
+        new = _sep_name(old)
+        if old and old != new:
+            out.append((old, new))
+    return out
+
+def add_name_sep():
+    """一键把老节点名补上分隔点（前缀直接连着协议名的那些）。"""
+    pending = _names_need_sep(read_saved_links())
+    if not pending:
+        print("\n  节点名都已经是「前缀·协议」的形式了，无需处理。")
+        return
+    print("\n" + "=" * 60)
+    print("  节点改名：给前缀和协议名之间补分隔点")
+    print("=" * 60)
+    print("  这些节点名的前缀和协议名连在一起，面板上读不出来；文字前缀(USA/HK 等)还会")
+    print("  让国家分组的正则匹配不上、分组建不出来：")
+    for old, new in pending:
+        print(f"    {old}  →  {new}")
+    print("-" * 60)
+    print("  只改显示名：uuid / 端口 / 路径 / 服务 / 证书一律不动，不用重装。")
+    print("  ⚠ 客户端里手动选中过的节点会因为改名回到分组默认；")
+    print("     自定义模板里若写死了旧节点名，需要同步改。")
+    if (_ask("  确认改名? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。"); return
+    links, tail = _node_file_parts()
+    renamed = [_link_rename(u, _sep_name(_link_name(u))) for u in links]
+    with open(NODE_FILE, "w") as f:
+        f.write("\n".join(renamed) + ("\n" if renamed else ""))
+        if tail:
+            f.write(tail if tail.startswith("\n") else "\n" + tail)
+    nodes = _cdn_load()                             # cdn.json 的 tag 同步改，否则下次生成链接又变回旧名
+    if nodes:
+        for n in nodes:
+            n["tag"] = _sep_name(n.get("tag", ""))
+        _cdn_save(nodes)
+    G["host"] = _host()
+    try:
+        build_subscription(read_saved_links(), new_token=False)
+    except Exception as e:
+        print("  ⚠ 订阅刷新失败（名字已改，可到配置菜单点『更新配置』重试）:", e); return
+    print(f"  ✓ 已改 {len(pending)} 个节点名并刷新订阅，客户端重拉一次即生效。")
+    print("    多机聚合的话，记得再去主机点一次『更新配置』重新汇总。")
+
 def _dedup_names(links):
     """多机聚合后可能有同名节点（两台同前缀+同协议）→ mihomo/sing-box 不许重名。
        只给『撞名』的加小上标前缀区分（¹²³…），没撞的保持原样、干净。"""
@@ -2706,6 +2780,13 @@ def show_links():
     urls = sub_urls_text()
     if urls:
         print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + urls)
+    if _names_need_sep(links):                      # 老装的节点名前缀和协议连在一起 → 就地给个修法
+        print("=" * 60)
+        print("  ⓘ 检测到节点名的前缀和协议名连在一起（如 🇺🇸2anytls）。文字前缀(USA/HK 等)")
+        print("    还会让「美国随机」这类国家分组匹配不上、建不出来。可一键补分隔点——")
+        print("    只改显示名，uuid/端口/服务都不动，不用重装。")
+        if (_ask("  现在改? y 确认 / 回车跳过: ") or "n").strip().lower() in ("y", "yes"):
+            add_name_sep()
 
 def peers_menu():
     """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
