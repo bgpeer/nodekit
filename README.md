@@ -8,6 +8,8 @@ sing-box + xray 双核心、多协议一键部署，自动生成 **mihomo / sing
 ---
 [视频演示](https://youtu.be/XXuaw14Vpk4?is=WR6nu-35Zj5rvD5n)
 ---
+[飞机](https://t.me/ruleset_bgpeer)
+---
 **执行代码前请先把域名拖管到CF绑定VPS的IP，不开小黄云，用域名安装效果更好**
 ## 👇一键安装代码
 
