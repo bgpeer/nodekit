@@ -80,30 +80,55 @@ jobs:
           echo "file_ver=$file_ver" >> "$GITHUB_OUTPUT"
 
       - name: Bump SCRIPT_VERSION & push
+        id: bump
         if: steps.ver.outputs.skip == 'false' && steps.ver.outputs.bump == 'true'
         run: |
           set -euo pipefail
           new_ver='${{ steps.ver.outputs.new_ver }}'
-          file_ver='${{ steps.ver.outputs.file_ver }}'
-          sed -i "s/^SCRIPT_VERSION = \"$file_ver\"/SCRIPT_VERSION = \"$new_ver\"/" xy-installer.py
-          grep -q "^SCRIPT_VERSION = \"$new_ver\"" xy-installer.py
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add xy-installer.py
-          git commit -m "chore(release): v$new_ver"
-          # 和 SHA256SUMS 工作流可能同时往 main push，带 rebase 重试
+          # 【不能 rebase】：版本号回写改的永远是 SCRIPT_VERSION 那一行，另一个 run 的
+          # 回写改的也是同一行 —— rebase 必然冲突，重试多少次都一样。所以每一轮都
+          # 站到最新的 main 上【重新打这个补丁】，而不是拿旧提交去 rebase。
           for i in 1 2 3 4 5; do
             git fetch origin main
-            git rebase origin/main || { git rebase --abort || true; echo "Rebase failed."; exit 1; }
+            git fetch origin --tags --force || true
+            git reset --hard origin/main
+            # main 就停在最新 tag 上 = 自上次发布以来没有任何新内容。连续合并 PR 时
+            # 会冒出多余的 run（同一个提交被跑两遍），不拦下来就会白发一个空版本。
+            last_tag=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+            if [ -n "$last_tag" ] && \
+               [ "$(git rev-parse "$last_tag^{commit}")" = "$(git rev-parse HEAD)" ]; then
+              echo "main 就停在 $last_tag 上，自上次发布以来没有新内容，本轮跳过。"
+              echo "superseded=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cur=$(grep -Po '^SCRIPT_VERSION\s*=\s*"\K[^"]+' xy-installer.py)
+            # 另一个 run 抢先发布了同等或更高的版本（连续合并 PR 时很常见）：
+            # 那个版本已经包含了本轮要发的全部内容，这里无事可做，干净退出即可。
+            if [ "$cur" = "$new_ver" ] || \
+               [ "$(printf '%s\n' "$cur" "$new_ver" | sort -V | tail -1)" = "$cur" ]; then
+              echo "main 已是 v$cur（≥ v$new_ver），另一个 run 抢先发过了，本轮跳过。"
+              echo "superseded=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sed -i "s/^SCRIPT_VERSION = \"$cur\"/SCRIPT_VERSION = \"$new_ver\"/" xy-installer.py
+            grep -q "^SCRIPT_VERSION = \"$new_ver\"" xy-installer.py
+            git add xy-installer.py
+            git commit -m "chore(release): v$new_ver"
             if git push origin HEAD:main; then
-              echo "Push success."; exit 0
+              echo "Push success."
+              echo "superseded=false" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
             echo "Push rejected (race). retry=${i}"; sleep $((i*2))
           done
           echo "Failed to push after retries."; exit 1
 
       - name: Tag & create GitHub Release
-        if: steps.ver.outputs.skip == 'false'
+        # superseded：回写那步发现另一个 run 已经发了更高的版本 → 这里也别再打 tag，
+        # 否则会给 main 打上一个文件里根本不存在的版本号。
+        if: steps.ver.outputs.skip == 'false' && steps.bump.outputs.superseded != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
