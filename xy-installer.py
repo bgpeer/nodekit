@@ -2420,54 +2420,6 @@ def _sep_name(nm):
             return pfx + "·" + proto + mark
     return nm                                       # 认不出协议名（自定义名字）→ 不动
 
-def _names_need_sep(links):
-    """返回 [(旧名, 新名)]，只含确实要改的。"""
-    out = []
-    for u in links:
-        old = _link_name(u)
-        new = _sep_name(old)
-        if old and old != new:
-            out.append((old, new))
-    return out
-
-def add_name_sep():
-    """一键把老节点名补上分隔点（前缀直接连着协议名的那些）。"""
-    pending = _names_need_sep(read_saved_links())
-    if not pending:
-        print("\n  节点名都已经是「前缀·协议」的形式了，无需处理。")
-        return
-    print("\n" + "=" * 60)
-    print("  节点改名：给前缀和协议名之间补分隔点")
-    print("=" * 60)
-    print("  这些节点名的前缀和协议名连在一起，面板上读不出来；文字前缀(USA/HK 等)还会")
-    print("  让国家分组的正则匹配不上、分组建不出来：")
-    for old, new in pending:
-        print(f"    {old}  →  {new}")
-    print("-" * 60)
-    print("  只改显示名：uuid / 端口 / 路径 / 服务 / 证书一律不动，不用重装。")
-    print("  ⚠ 客户端里手动选中过的节点会因为改名回到分组默认；")
-    print("     自定义模板里若写死了旧节点名，需要同步改。")
-    if (_ask("  确认改名? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
-        print("  已取消。"); return
-    links, tail = _node_file_parts()
-    renamed = [_link_rename(u, _sep_name(_link_name(u))) for u in links]
-    with open(NODE_FILE, "w") as f:
-        f.write("\n".join(renamed) + ("\n" if renamed else ""))
-        if tail:
-            f.write(tail if tail.startswith("\n") else "\n" + tail)
-    nodes = _cdn_load()                             # cdn.json 的 tag 同步改，否则下次生成链接又变回旧名
-    if nodes:
-        for n in nodes:
-            n["tag"] = _sep_name(n.get("tag", ""))
-        _cdn_save(nodes)
-    G["host"] = _host()
-    try:
-        build_subscription(read_saved_links(), new_token=False)
-    except Exception as e:
-        print("  ⚠ 订阅刷新失败（名字已改，可到配置菜单点『更新配置』重试）:", e); return
-    print(f"  ✓ 已改 {len(pending)} 个节点名并刷新订阅，客户端重拉一次即生效。")
-    print("    多机聚合的话，记得再去主机点一次『更新配置』重新汇总。")
-
 def _dedup_names(links):
     """多机聚合后可能有同名节点（两台同前缀+同协议）→ mihomo/sing-box 不许重名。
        只给『撞名』的加小上标前缀区分（¹²³…），没撞的保持原样、干净。"""
@@ -2486,7 +2438,12 @@ def _dedup_names(links):
 
 def aggregated_links(local=None):
     """本机链接 + 各成员机 .links（去重；拉不到的成员直接跳过）。
-       只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。撞名的自动加 ¹²³ 区分。"""
+       只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。撞名的自动加 ¹²³ 区分。
+
+       节点名在这里统一补上「前缀·协议」的分隔点（见 _sep_name）：名字是安装时烤进
+       分享链接的，老节点仍是 🇺🇸2anytls 这种连写，光靠新装才带分隔点救不了它们。
+       放在渲染这一步做，点一次『更新配置』就全好了，而且**聚合的成员机不用一台台去改**
+       ——主机渲染时一并规范化。不回写 NODE_FILE：那是原始凭据，能不动就不动。"""
     links = list(local if local is not None else read_saved_links())
     seen = set(links)
     for u in load_peers():
@@ -2498,6 +2455,7 @@ def aggregated_links(local=None):
             s = line.strip()
             if s.startswith(_NODE_SCHEMES) and s not in seen:
                 seen.add(s); links.append(s)
+    links = [_link_rename(u, _sep_name(_link_name(u))) for u in links]   # 统一补「前缀·协议」
     return _dedup_names(links)
 
 def parse_nodes(all_links):
@@ -2776,17 +2734,11 @@ def show_links():
         except Exception as e:
             print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
     print("\n" + "=" * 60 + "\n分享链接:\n" + "=" * 60)
-    print("\n".join(links))
+    # 和订阅里保持一致：同样补上「前缀·协议」的分隔点（只影响显示，NODE_FILE 不动）
+    print("\n".join(_link_rename(u, _sep_name(_link_name(u))) for u in links))
     urls = sub_urls_text()
     if urls:
         print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + urls)
-    if _names_need_sep(links):                      # 老装的节点名前缀和协议连在一起 → 就地给个修法
-        print("=" * 60)
-        print("  ⓘ 检测到节点名的前缀和协议名连在一起（如 🇺🇸2anytls）。文字前缀(USA/HK 等)")
-        print("    还会让「美国随机」这类国家分组匹配不上、建不出来。可一键补分隔点——")
-        print("    只改显示名，uuid/端口/服务都不动，不用重装。")
-        if (_ask("  现在改? y 确认 / 回车跳过: ") or "n").strip().lower() in ("y", "yes"):
-            add_name_sep()
 
 def peers_menu():
     """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
