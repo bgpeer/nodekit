@@ -1192,6 +1192,16 @@ def pick_reality_443(sb_names, xr_names):
             return n
     return ""
 
+def _tag(prefix, name):
+    """节点名 = 前缀 + 分隔点 + 协议名（没设前缀就只有协议名）。
+
+       分隔点不能省：没有它，USA/HK 这类【文字前缀】会和协议名连成 `USAvless-ws`，
+       国家分组正则里的 `\bUSA\b` 因为右边界不成立而匹配不上，分组直接建不出来
+       （emoji 前缀不受影响——它们直接命中 🇺🇸 那一支，不走 \b）。
+       顺带也解决了面板上前缀和协议糊成一坨、读不出来的问题。"""
+    p = (prefix or "").strip()
+    return (p + "·" if p else "") + name
+
 def build(table, names, pinned=None, dup=None, mark=""):
     """pinned: {协议名: 固定端口}，用于把某个 reality 协议钉在 443；其余走随机端口。
        dup/mark: 两核心同名协议(vless-ws/vmess-ws/trojan)集合 dup 里的，名字尾部加个小上标
@@ -1204,7 +1214,7 @@ def build(table, names, pinned=None, dup=None, mark=""):
     for n in names:
         # 名称 = 用户前缀 + 协议名（默认无前缀，别人部署 US/SG 时自己填 🇺🇸/🇸🇬 等）
         port = pinned.get(n) or next_port()
-        tag = G.get("prefix", "") + n
+        tag = _tag(G.get("prefix", ""), n)
         if n in dup:                             # 两核心都有该协议 → 尾部小上标区分（sb ¹ / xray ²）
             tag += mark
         ib, lk = table[n](port, tag)
@@ -1639,6 +1649,19 @@ OTHER_GROUP = "🎲其他随机"          # 未归入任何国家组的漏网节
 # sing-box 出站里"是节点"的类型（用来从模板抽用户手写的静态节点，排除 selector/urltest/direct 等分组）
 _SB_NODE_TYPES = {"vless", "vmess", "trojan", "hysteria2", "hysteria", "tuic", "anytls",
                   "shadowsocks", "shadowtls", "socks", "http", "naive", "ssh", "wireguard"}
+def _cc(pat):
+    """把国家表里的 `\bXX\b` 放宽成「右边也可以直接跟小写字母或数字」。
+
+       为什么要放宽：节点名现在是 `前缀·协议` 拼的，右边界没问题；但【老版本装的】
+       和【外部聚合进来的】节点可能是 `USAvless-ws` 这种连在一起的写法，
+       `\bUSA\b` 右边界不成立就匹配不上，分组建不出来。放宽后这些老节点
+       下次「更新配置」即可自动归组，不用重装。
+
+       只放宽到小写字母/数字，跟大写字母仍然不算（`USAGE` 不会被当成 US 节点）。
+       只用 RE2 支持的语法——mihomo 的 filter 是 Go 正则，不支持环视。"""
+    return re.sub(r"\\b([A-Z]+)\\b",
+                  lambda m: r"\b" + m.group(1) + r"(?:[a-z0-9]|\b)", pat)
+
 COUNTRY_GROUPS = [                  # [组名, 匹配正则]，顺序即面板展示顺序
     ("🇭🇰香港随机",   r"🇭🇰|\bHK\b|Hong|hong|香港|深港|沪港|京港"),
     ("🇹🇼台湾随机",   r"🇹🇼|\bTW\b|\bTWN\b|Taiwan|Taipei|台湾|台灣|台北"),
@@ -1664,6 +1687,7 @@ COUNTRY_GROUPS = [                  # [组名, 匹配正则]，顺序即面板�
     ("🇧🇷巴西随机",    r"🇧🇷|\bBR\b|Brazil|brazil|Brasil|巴西|圣保罗"),
     ("🇦🇷阿根廷随机",  r"🇦🇷|\bAR\b|Argentina|argentina|阿根廷|布宜诺斯艾利斯"),
 ]
+COUNTRY_GROUPS = [(g, _cc(p)) for g, p in COUNTRY_GROUPS]    # 统一放宽右边界（见 _cc）
 
 def _norm_us_flag(s):
     return (s or "").replace("\U0001F1FA\U0001F1F2", "\U0001F1FA\U0001F1F8")   # 🇺🇲→🇺🇸
@@ -4192,7 +4216,7 @@ def _cdn_build_one(nodes, proto, core, domain, prefix, pref=""):
             except OSError: pass
         return None
     node = {"id": nid, "proto": proto, "core": core, "domain": domain, "cred": cred,
-            "path": path, "cf_port": port, "tag": f"{prefix}CDN·{proto}", "svc": svc,
+            "path": path, "cf_port": port, "tag": _tag(prefix, f"CDN·{proto}"), "svc": svc,
             "crt": crt, "key": key, "conf": conf, "in_sub": False, "pref": pref}
     nodes.append(node)                                    # 立即并入，供下一条挑端口/id 避重
     return node
