@@ -2452,10 +2452,12 @@ def rename_prefix():
     print(f"  当前前缀：{cur or '(无)'}      节点名 = 前缀·协议名")
     print("  例：🇯🇵 / 🇺🇸2 / 东京 / DMIT / 家宽")
     print("  ⓘ 前缀带国旗或国家代码(JP/US/HK…)，客户端才能自动分出「日本随机」这类分组。")
-    new = _ask("  新前缀（回车取消；输 - 表示不要前缀）: ").strip()
+    new = _ask_free("  新前缀（回车取消；输 - 表示不要前缀）：").strip()
     if not new:
         print("  已取消。"); return
     new = "" if new == "-" else new
+    # 明确回显一次：中文/emoji 在终端里删改容易看花，以实际收到的为准
+    print(f"  收到前缀：{('「%s」' % new) if new else '(清空前缀)'}")
     if set(new) & _BAD_PREFIX_CHARS:
         print("  ✗ 前缀里不能有引号、# \\ 和换行/制表符（会把分享链接和配置弄坏）。已取消。"); return
     if len(new) > 24:
@@ -4403,9 +4405,9 @@ def cdn_add():
 
     ipfx = _state_prefix()
     if ipfx:
-        prefix = _ask(f"  节点名称前缀（回车=沿用安装前缀「{ipfx}」，或输入自定义）: ").strip() or ipfx
+        prefix = _ask_free(f"  节点名称前缀（回车=沿用安装前缀「{ipfx}」，或输入自定义）：").strip() or ipfx
     else:
-        prefix = _ask("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）: ").strip()
+        prefix = _ask_free("  节点名称前缀（回车=默认 CDN，自定义如 🇯🇵/家宽）：").strip()
 
     # 追加时新节点沿用已设的优选地址；首装留空——装完统一问要不要筛一批候选
     pref = next((n.get("pref") for n in nodes if n.get("pref")), "")
@@ -5104,6 +5106,16 @@ def _ask(prompt=""):
     except (OSError, EOFError):
         return input(prompt).strip()
 
+def _ask_free(prompt):
+    """要打中文/emoji 的自由文本输入（前缀之类）：提示语单独占一行，输入从下一行的 > 开始。
+
+       为什么不像别处那样提示和输入挤同一行：终端的行编辑按【字符】发退格，而中文和
+       emoji 占【两列】——删一个字只擦掉一列，光标会越删越往前跑，最后啃进提示语里，
+       看着像把界面删坏了（其实输入缓冲区是好的，只是屏幕花了）。让输入独占一行，
+       删过头也只啃到那个 '> '，提示语毁不掉。"""
+    print(prompt)
+    return _ask("  > ")
+
 def _pick(title, options, default=None):
     """列出带编号的协议，返回选中的 key 列表。
        回车 = default（缺省=全选）；0/all 永远=全选；也可逗号分隔编号自选。"""
@@ -5161,7 +5173,7 @@ def install_flow():
                         .lower() in ("y", "yes")) else ""
     _sni_rand = secrets.choice(REALITY_SNI_POOL)         # 回车就用这个随机挑的（不同机器各不同，不扎堆）
     sni = _ask(f"reality 借用目标站 SNI (回车=随机挑，本次随机到 {_sni_rand}): ") or _sni_rand
-    prefix = _ask("节点名称前缀(如 🇺🇸/🇯🇵/家宽，回车=无前缀): ")
+    prefix = _ask_free("节点名称前缀（如 🇺🇸/🇯🇵/家宽，回车=无前缀）：")
     hy2p = ""
     if "hy2" in sb_names:
         hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000，自定义直接输数字，输 n 不用端口跳跃): ")
