@@ -2420,6 +2420,94 @@ def _sep_name(nm):
             return pfx + "·" + proto + mark
     return nm                                       # 认不出协议名（自定义名字）→ 不动
 
+def _split_tag(nm):
+    """把节点名拆成 (前缀, 协议段)。协议段含 CDN·/优选N 和双核心尾标(¹²)，
+       前缀尾部的分隔点会去掉——重新拼的时候由 _tag() 统一加回去。
+       拆不出协议段（用户自己起的名字）返回 (None, 原名)，调用方跳过它。"""
+    nm = nm or ""
+    i = nm.find("CDN·")
+    if i >= 0:                                          # CDN 节点：CDN· 之前整段是前缀
+        return nm[:i].rstrip("·"), nm[i:]
+    body, mark = nm, ""
+    while body and body[-1] in _TAG_MARKS:              # 尾标先摘下来，拼回去时带上
+        mark = body[-1] + mark; body = body[:-1]
+    for proto in sorted(set(SB) | set(XRAY), key=len, reverse=True):
+        if body.endswith(proto):
+            return body[:-len(proto)].rstrip("·"), proto + mark
+    return None, nm
+
+_BAD_PREFIX_CHARS = set('#"\'\\\n\r\t')            # 会把分享链接/YAML/JSON 弄坏的字符
+
+def rename_prefix():
+    """更换节点名称前缀。只改【显示名】：uuid / 端口 / 路径 / 服务 / 证书一律不动，
+       所以不用重装（重装会重新生成全部 uuid 和端口，为改个名字不值当）。
+       只动本机节点——多机聚合时每台机器有自己的前缀，各改各的。"""
+    links = read_saved_links()
+    if not links:
+        print("\n  还没有节点，请先『1.安装』。"); return
+    cur = next((p for p, _ in (_split_tag(_link_name(u)) for u in links) if p), "")
+    print("\n" + "=" * 60)
+    print("  更换节点名称前缀")
+    print("=" * 60)
+    print(f"  当前前缀：{cur or '(无)'}      节点名 = 前缀·协议名")
+    print("  例：🇯🇵 / 🇺🇸2 / 东京 / DMIT / 家宽")
+    print("  ⓘ 前缀带国旗或国家代码(JP/US/HK…)，客户端才能自动分出「日本随机」这类分组。")
+    new = _ask("  新前缀（回车取消；输 - 表示不要前缀）: ").strip()
+    if not new:
+        print("  已取消。"); return
+    new = "" if new == "-" else new
+    if set(new) & _BAD_PREFIX_CHARS:
+        print("  ✗ 前缀里不能有引号、# \\ 和换行/制表符（会把分享链接和配置弄坏）。已取消。"); return
+    if len(new) > 24:
+        print("  ✗ 前缀太长（超过 24 字符），手机上显示不下。已取消。"); return
+    if new == cur:
+        print("  和当前前缀一样，未改动。"); return
+    plan, skipped = [], 0
+    for u in links:
+        old = _link_name(u)
+        pfx, rest = _split_tag(old)
+        if pfx is None:
+            skipped += 1; continue                      # 认不出协议段的自定义名字，不碰
+        plan.append((u, old, _tag(new, rest)))
+    if not plan:
+        print("  没有可改名的节点（名字都认不出协议段）。"); return
+    print("-" * 60)
+    for _, old, nn in plan:
+        print(f"    {old}  →  {nn}")
+    if skipped:
+        print(f"  （另有 {skipped} 个名字认不出协议段，保持不动）")
+    print("-" * 60)
+    print("  只改显示名：uuid / 端口 / 路径 / 服务 / 证书一律不动，不用重装。")
+    print("  ⚠ 客户端里手动选中过的节点会回到分组默认；自定义模板里写死了旧名字的要同步改。")
+    if (_ask("  确认改名? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。"); return
+    newmap = {u: nn for u, _, nn in plan}
+    saved, tail = _node_file_parts()
+    out = [_link_rename(u, newmap[u]) if u in newmap else u for u in saved]
+    with open(NODE_FILE, "w") as f:
+        f.write("\n".join(out) + ("\n" if out else ""))
+        if tail:
+            f.write(tail if tail.startswith("\n") else "\n" + tail)
+    nodes = _cdn_load()                                 # CDN 节点的 tag 也在 cdn.json 里存了一份
+    if nodes:
+        for n in nodes:
+            pfx, rest = _split_tag(n.get("tag", ""))
+            if pfx is not None:
+                n["tag"] = _tag(new, rest)
+        _cdn_save(nodes)
+    try:                                                # 让重装和新增 CDN 节点沿用新前缀
+        st = json.load(open(STATE_FILE)); st["prefix"] = new
+        json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    G["host"] = _host()
+    try:
+        build_subscription(read_saved_links(), new_token=False)
+    except Exception as e:
+        print("  ⚠ 订阅刷新失败（名字已改，可到配置菜单点『更新配置』重试）:", e); return
+    print(f"  ✓ 已把 {len(plan)} 个节点的前缀改成「{new or '(无)'}」并刷新三格式订阅。")
+    print("    客户端重拉一次订阅即生效；多机聚合的话，再去主机点一次『更新配置』重新汇总。")
+
 def _dedup_names(links):
     """多机聚合后可能有同名节点（两台同前缀+同协议）→ mihomo/sing-box 不许重名。
        只给『撞名』的加小上标前缀区分（¹²³…），没撞的保持原样、干净。"""
@@ -2739,6 +2827,10 @@ def show_links():
     urls = sub_urls_text()
     if urls:
         print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + urls)
+    print("-" * 60)
+    print("  1 更换节点名称前缀（只改显示名、不用重装，改完自动刷新三格式订阅）")
+    if _ask("  选择(回车返回): ").strip() == "1":
+        rename_prefix()
 
 def peers_menu():
     """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
