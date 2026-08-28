@@ -1292,6 +1292,54 @@ CRON_TIMEOUT   = {
 }
 
 
+def mediawarp_token_broken():
+    """MediaWarp 手里的 OpenList 令牌是不是已经作废了。返回 (是不是, 日志原文)。
+
+    MediaWarp 只在【启动那一刻】登录 OpenList 拿一个令牌，之后一直用那一个。
+    OpenList 一重启（更新、切直链方式、改目录缓存、宿主机重启、被 OOM 杀掉）
+    旧令牌就作废，而 MediaWarp 毫不知情 —— 换直链时拿到
+    401 token is invalidated，整个请求以 404 收场。
+
+    【它不会立刻暴露，这是最坑的地方】已经缓存了直链的片子照样能放（命中缓存
+    只要 3 毫秒，根本不问 OpenList），只有缓存里没有的才失败。所以刚坏的那几
+    小时看着一切正常，等直链缓存陆续过期（LINK_TTL_H 小时），才慢慢变成"全都
+    打不开"。而这时候 OpenList 自己是好的 —— 用户在挂载页面里点开能播，
+    只有 Emby 不行，最容易怀疑到 Emby 头上去。
+
+    【必须只看本次启动之后的日志】docker restart 不会清掉旧日志，用固定的
+    --since 6h 会把重启【之前】那些 401 一起读进来 —— 于是修好了还报故障，
+    用户照着待办再重启一次，还是报。实测撞上过。
+    """
+    try:
+        r = sh("docker inspect -f '{{.State.StartedAt}}' mediawarp", timeout=30)
+        since = (r.stdout or "").strip().strip("'") or "6h"
+        r = sh(f"docker logs --since {since} mediawarp", timeout=60)
+        log = ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
+    except Exception:
+        return False, ""
+    return ("token is invalidated" in log or "响应状态码: 401" in log), log
+
+
+def heal_mediawarp_token():
+    """发现 MediaWarp 令牌作废就重启它。返回有没有重启。
+
+    【为什么要自动做】这个故障原来只有体检报得出来，而体检是【用户已经发现
+    出事了】才会去跑的东西。它又恰恰是那种"坏了几天才被发现"的故障：坏的
+    那一刻什么都看不出来，等直链缓存全过期，人才发现"Emby 全都放不了、
+    挂载里却能播"。中间那几天没有任何东西会提醒他。
+
+    检测逻辑早就有了（体检里那一行），缺的只是让它自己动手。挂在每小时的
+    保活上，最多坏一小时。重启 MediaWarp 的代价就是清空直链缓存，
+    下面顺手预热一遍补回来。
+    """
+    bad, _log = mediawarp_token_broken()
+    if not bad:
+        return False
+    r = subprocess.run(["docker", "restart", "mediawarp"],
+                       capture_output=True, timeout=120)
+    return r.returncode == 0
+
+
 def keepalive_state(d):
     try:
         with open(os.path.join(d, "keepalive.json")) as f:
@@ -1349,6 +1397,18 @@ def do_keepalive():
     except OSError:
         pass
     append_hist(d, rec)
+    # 【顺手把 MediaWarp 的令牌管了】见 heal_mediawarp_token 的注释：这个故障
+    # 会安静地烂好几天，而检测只要读一次容器日志，挂在这条已经每小时都在跑的
+    # 任务上不多花任何代价。重启会清空直链缓存，紧接着预热一遍补回来。
+    try:
+        if heal_mediawarp_token():
+            key = read_yaml_scalar(os.path.join(d, "mediawarp", "config",
+                                                "config.yaml"), "auth")
+            if key and wait_openlist_ready(d):
+                time.sleep(5)          # 等 MediaWarp 起来并重新登录 OpenList
+                warm_links(d, key)
+    except Exception:
+        pass
 
 
 # 保活每 KEEPALIVE_MIN 分钟就在测同一条路径，可它一直把结果【覆盖】掉 ——
@@ -8939,16 +8999,14 @@ def do_healthcheck():
     # 【必须只看本次启动之后的日志】docker restart 不会清掉旧日志，用固定的
     # --since 6h 会把重启【之前】那些 401 一起读进来 —— 于是修好了还报故障，
     # 用户照着待办再重启一次，还是报。实测就撞上了这个。
-    r = sh("docker inspect -f '{{.State.StartedAt}}' mediawarp", timeout=30)
-    since = (r.stdout or "").strip().strip("'") or "6h"
-    r = sh(f"docker logs --since {since} mediawarp", timeout=60)
-    mwlog = ANSI_RE.sub("", (r.stdout or "") + (r.stderr or ""))
-    if "token is invalidated" in mwlog or "响应状态码: 401" in mwlog:
+    bad_tok, mwlog = mediawarp_token_broken()
+    if bad_tok:
         _hc("MediaWarp 令牌", "bad",
             f"{YELLOW}对 OpenList 的令牌失效了，没缓存的片子会打不开{RST}")
         todo.append(("MediaWarp 拿着一个作废的 OpenList 令牌，换直链时被拒（401）。"
                      "已缓存直链的片子还能放，其余的报错 —— 表现是「有的能放有的不能放」",
-                     "docker restart mediawarp　（它启动时会重新登录换新令牌）"))
+                     "docker restart mediawarp　（它启动时会重新登录换新令牌）。"
+                     "每小时的保活任务现在也会自己发现并重启它"))
     elif mwlog.strip():
         _hc("MediaWarp 令牌", "ok", "本次启动以来没有换直链被拒的记录")
 
