@@ -34,7 +34,10 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-SCRIPT_VERSION = "1.1.0"
+# 【改了代码就要动这个数】它一直停在 1.1.0，于是「6 更新」永远打印
+# "v1.1.0 → v1.1.0"，用户根本没法判断新代码到底到没到机器上 ——
+# 排查时这是最基本的一条信息，缺了它只能靠猜。
+SCRIPT_VERSION = "1.2.0"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3049,19 +3052,35 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     """
     # 【关掉就要还原，不能只是"以后不改"】
     if ep_fix_setting() is False:
+        print(f"  {DIM}剧集改名：开关是【关】的，本轮不改名"
+              f"（要开：3 后补参数 → 11）{RST}")
         _r = restore_strm_names(d)
         if _r:
             ok(f"{_r} 个 strm 已还原成网盘里的原名（改名功能是关着的）")
             print(f"  {DIM}观看进度按网盘文件记着，下一轮同步会自己补回来。{RST}")
         return 0, 0
-    todo = plan_episode_renames(d, rules, misparsed_strm_names(d, key) if key else None)
+    bad = misparsed_strm_names(d, key) if key else None
+    todo = plan_episode_renames(d, rules, bad)
     if not todo:
+        # 【什么都不做的时候更要出声】这一步之前是静默 return，于是"开关开着、
+        # 跑完没反应"这种情况完全没有线索 —— 到底是没挑出来、还是挑出来了没改，
+        # 从外面一点都看不出来。实测为此来回猜了三轮。
+        if bad is None:
+            warn("剧集改名：问不到 Emby 的条目列表，这轮跳过")
+        else:
+            _tv = [r["name"] for r in rules
+                   if (r.get("type") or "movies") == "tvshows"]
+            print(f"  {DIM}剧集改名：Emby 里判定集号不对的有 {len(bad)} 个，"
+                  f"其中需要改名的 0 个"
+                  f"（剧集库：{'、'.join(_tv) or '一个都没有'}）{RST}")
         return 0, 0
     dup = [x for x in todo if x[2]]
     ren = [x for x in todo if not x[2]]
     st = ep_fix_setting()
     if st is None:
         if not (interactive and has_tty()):
+            print(f"  {DIM}剧集改名：有 {len(todo)} 个可以改，但这是后台在跑、"
+                  f"没法问你。到「3 后补参数 → 11」开一下就会做{RST}")
             return 0, 0               # 没人在看就不做，更不替他答
         print()
         info(f"剧集库里有 {len(todo)} 个条目 Emby 一个刮削源都没认出来，"
