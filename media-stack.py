@@ -2246,7 +2246,8 @@ def parse_lib_rules(text):
             if cur and cur.get("name"):
                 rules.append(cur)
             cur = {"name": "", "kw": [], "type": "movies", "mt": False,
-                   "lang": "zh", "country": "CN", "scr": [], "img": []}
+                   "lang": "zh", "country": "CN", "scr": [], "img": [],
+                   "private": False}
             ln = ln.lstrip()[2:]
         if cur is None or ":" not in ln:
             continue
@@ -2258,6 +2259,8 @@ def parse_lib_rules(text):
             cur["type"] = v if v in ("movies", "tvshows") else "movies"
         elif k == "metatube":
             cur["mt"] = v.lower() in ("true", "yes", "y", "on", "1")
+        elif k == "private":
+            cur["private"] = v.lower() in ("true", "yes", "y", "on", "1")
         elif k in ("scrapers", "metadata"):
             cur["scr"] = [x.strip() for x in re.split(r"[,，]", v.strip("[]")) if x.strip()]
         elif k in ("image_scrapers", "images"):
@@ -3122,7 +3125,11 @@ def align_library(d, key, heal=True):
     # heal=False 是「4 生成媒体库」用的：那条路把补时长扔后台单独跑，
     # 不能在这儿再跑一遍（会撞锁、也会让用户白等一次）
     try:                              # 库级：刮削器/语言按规则文件对齐
-        sync_library_options(d, key, lib_rules(d)[0])
+        _r = lib_rules(d)[0]
+        sync_library_options(d, key, _r)
+        # 私密库的权限也一起对 —— 新加的用户、新建的库都得自动跟上，
+        # 否则用户得记着每次回 Emby 后台改一遍勾（而漏一次就是内容暴露在电视上）
+        sync_private_libraries(d, key, _r)
     except Exception as e:
         # 【别静默吞】原来这里是 except: pass。规则文件解析炸了、Emby 没起来、
         # 哪个字段对不上，全都一声不吭 —— 用户看到的是"跑完了，Emby 里没变化"，
@@ -3948,7 +3955,9 @@ def do_update(from_menu=False):
         # 都没有 —— 因为更新根本不走那段代码。他得再点一次「4」才行，而没人会
         # 想到要点。同样是库选项，同样是更新时该带上的，没有道理分开。
         try:
-            sync_library_options(d, _k2, lib_rules(d)[0])
+            _r2 = lib_rules(d)[0]
+            sync_library_options(d, _k2, _r2)
+            sync_private_libraries(d, _k2, _r2)
         except Exception as e:
             warn(f"按规则文件对齐媒体库的刮削器/语言失败：{_short_err(e)}")
     print(f"  {DIM}Emby API Key、网盘挂载路径、cron 这些你填的东西没有被动过。{RST}")
@@ -6516,6 +6525,67 @@ def _lib_item_count(key, iid):
         return int(r.get("TotalRecordCount") or 0)
     except Exception:
         return 0
+
+
+def sync_private_libraries(d, key, rules):
+    """标了 private: true 的媒体库，从【非管理员】用户的可见范围里摘掉。返回改了几个用户。
+
+    用户想要的是"AV影片 只有我能看，电视上登另一个账号看不到"。
+
+    【Emby 没有"给一个库设密码"这回事】它的模型是按用户分权限：每个用户各自
+    有一份"能看哪些库"的名单。所以正确形状是两个账号 —— 你自己的（全都能看）
+    和电视上那个（看不到私密库）。密码是账号的密码，不是库的密码。
+
+    【为什么按"是不是管理员"来分】总得有个办法区分"我"和"别人"，而让用户再去
+    某个配置里写一遍用户名，等于多一处会写错、会过期的东西。管理员标记是 Emby
+    自己就有的、语义正好对得上的东西：管理员本来就能进后台看到一切，对他遮挡
+    没有意义。所以规则是【管理员不动，其余一律摘掉】。
+
+    只在【本来就能看见】的时候才发请求：Emby 的用户策略里 EnableAllFolders=true
+    表示"所有库都能看"，这时候要改成显式名单；已经是显式名单的就只做减法。
+    一个非管理员用户都没有的话，这个函数什么都不做 —— 那是最常见的状态。
+    """
+    priv = {r["name"] for r in rules if r.get("private")}
+    if not priv:
+        return 0
+    try:
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+        users = _emby("/Users", key, timeout=20) or []
+    except Exception:
+        return 0
+    # ItemId 才是策略里认的东西，名字只用来对规则
+    hide = {lb.get("ItemId") for lb in libs if (lb.get("Name") or "") in priv}
+    allids = {lb.get("ItemId") for lb in libs if lb.get("ItemId")}
+    hide = {x for x in hide if x}
+    if not hide:
+        return 0                      # 规则里标了，但 Emby 里还没这个库
+    n, done = 0, []
+    for u in users:
+        pol = u.get("Policy") or {}
+        if pol.get("IsAdministrator"):
+            continue                  # 管理员 = "我"，不动
+        cur = set(pol.get("EnabledFolders") or [])
+        if pol.get("EnableAllFolders"):
+            want = allids - hide      # 原来"全都能看" → 换成显式名单
+        else:
+            want = cur - hide         # 原来就是名单 → 只做减法，别扩权
+        if not pol.get("EnableAllFolders") and want == cur:
+            continue                  # 本来就看不见，不用发请求
+        pol["EnableAllFolders"] = False
+        pol["EnabledFolders"] = sorted(x for x in want if x)
+        try:
+            _emby(f"/Users/{u.get('Id')}/Policy", key, method="POST",
+                  body=pol, timeout=30)
+            n += 1
+            done.append(u.get("Name") or "?")
+        except Exception as e:
+            warn(f"给用户「{u.get('Name')}」收权限失败：{_emby_err(e)}")
+    if done:
+        ok(f"私密媒体库已对 {len(done)} 个非管理员账号隐藏："
+           f"{'、'.join(sorted(priv))}")
+        print(f"  {DIM}受影响的账号：{'、'.join(done)}。管理员账号不受影响 ——"
+              f"电视上登非管理员那个就看不到了。{RST}")
+    return n
 
 
 def sync_library_options(d, key, rules):
@@ -9438,6 +9508,39 @@ def do_healthcheck():
                 _hc("媒体库选项", "ok",
                     f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、"
                     f"多版本合并已关{_tail}")
+
+            # 【私密库要能一眼验证】"以为遮住了、其实没遮"是这个功能唯一会真出事
+            # 的失败方式，而它不会自己冒出来 —— 用户得亲自拿另一个账号登一次才
+            # 知道。所以这里直接把"谁还能看见"摊开。
+            _pr = {r["name"] for r in (lib_rules(d)[0] if is_installed(d) else [])
+                   if r.get("private")}
+            if _pr:
+                _pids = {lb.get("ItemId") for lb in libs
+                         if (lb.get("Name") or "") in _pr}
+                _leak = []
+                try:
+                    for _u in (_emby("/Users", key, timeout=20) or []):
+                        _po = _u.get("Policy") or {}
+                        if _po.get("IsAdministrator"):
+                            continue
+                        if _po.get("EnableAllFolders") or (
+                                set(_po.get("EnabledFolders") or []) & _pids):
+                            _leak.append(_u.get("Name") or "?")
+                except Exception:
+                    _leak = None
+                if _leak is None:
+                    _hc("私密媒体库", "skip", f"{'、'.join(sorted(_pr))}　问不到用户列表")
+                elif _leak:
+                    _hc("私密媒体库", "bad",
+                        f"{'、'.join(sorted(_pr))}  {RED}这些账号还能看见："
+                        f"{'、'.join(_leak)}{RST}")
+                    todo.append((
+                        f"标了 private 的媒体库，非管理员账号「{_leak[0]}」还能看见",
+                        "跑一次「6 更新」或「4 生成媒体库」会自动收权限；"
+                        "还不行就 Emby → 设置 → 用户 → 点该用户 → 取消勾选那个库"))
+                else:
+                    _hc("私密媒体库", "ok",
+                        f"{'、'.join(sorted(_pr))}　只有管理员账号能看见")
 
             # 刮到同一个身份 = 共用观看进度。这个坏的是观看记录，比刮错标题严重得多，
             # 而且现象极具迷惑性（A 的续播点出现在 B 上，甚至超过 B 的总长）
