@@ -2909,17 +2909,68 @@ def sync_progress_map(d, key):
     return n
 
 
+def restore_strm_names(d):
+    """把改过名的 strm 全部还原成网盘里那个文件名。返回还原了几个。
+
+    【不需要记账就能还原】strm 的内容就是网盘全路径，取它的文件名换上 .strm
+    就是原来的名字。改名从来没动过内容，所以这条路一直是通的。
+
+    什么时候用：用户把 ep_fix 关掉的时候。关掉如果只是"以后不改了"，
+    已经改坏的那些还留在那儿，等于关不掉。
+
+    还原之后观看进度会自己回来 —— 进度是按网盘路径记的（见 PROGRESS_MAP），
+    改回原名产生的还是"路径变了的新条目"，下一轮同步就补上了。
+    """
+    n = 0
+    for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
+        for f in fs:
+            if not f.endswith(".strm"):
+                continue
+            src = os.path.join(dp, f)
+            try:
+                with open(src, encoding="utf-8") as fh:
+                    tgt = strm_target_path(fh.read())
+            except OSError:
+                continue
+            if not tgt:
+                continue
+            want = os.path.splitext(os.path.basename(tgt))[0] + ".strm"
+            if want == f or not want.strip():
+                continue
+            dst = os.path.join(dp, want)
+            try:
+                if os.path.exists(dst):
+                    os.remove(src)      # 原名那个已经在了（AutoFilm 重新生成的）
+                else:
+                    os.replace(src, dst)
+                n += 1
+            except OSError:
+                continue
+    return n
+
+
 def fix_episode_strm_names(d, rules, key, interactive=True):
     """把剧集库里认不出集数的 strm 改名成 Emby 认得的样子。返回 (改了几个, 删了几个重复的)。
 
-    第一次问一句，答案记在 ms_state["ep_fix"] 里，以后按那个答案自动做 ——
-    用户要的是"别每次都问我"，但这一步会动文件、而且有代价（见下），
-    所以第一次得让他知情。
+    第一次问一句，答案记在 ms_state["ep_fix"] 里，以后按那个答案自动做。
 
-    【代价说清楚：观看进度会丢】Emby 的观看记录是按【路径】认条目的，
-    strm 一改名就是一个新条目，那一集的进度接不回去。对刮不出来的灰方块
-    通常无所谓（多半还没看），但必须让用户先知道再决定。
+    【这个功能有个硬伤，用之前先知道】它只会写 S01Exxx —— 因为从一个扁平的
+    「剧名/231 4K.mp4」里根本看不出季。而 TheTVDB 上很多长篇是【分季】的
+    （吞噬星空就有五季），硬塞进第 1 季之后 Emby 再按它自己的季映射去对，
+    集号会变成一串对不上的数字。实测现场：「继续观看」里 233 和 237 是对的，
+    而被改过名的几集显示成 24. 26. 28. 31.。
+
+    所以它只适合【真的完全刮不出来】的剧，而且答 n 也是完全合理的选择。
+    答 n 会把已经改过的名字全部还原（见 restore_strm_names），不是"以后不改"
+    而已 —— 那样等于关不掉。
     """
+    # 【关掉就要还原，不能只是"以后不改"】
+    if ms_state().get("ep_fix") is False:
+        _r = restore_strm_names(d)
+        if _r:
+            ok(f"{_r} 个 strm 已还原成网盘里的原名（改名功能是关着的）")
+            print(f"  {DIM}观看进度按网盘文件记着，下一轮同步会自己补回来。{RST}")
+        return 0, 0
     todo = plan_episode_renames(d, rules, unscraped_strm_paths(key) if key else None)
     if not todo:
         return 0, 0
@@ -2941,8 +2992,12 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             print(f"    {DIM}…还有 {len(ren) - 5} 个{RST}")
         print(f"  {DIM}Emby 按路径认条目，改名后这些集算新条目 —— 观看进度由脚本"
               f"按【网盘文件】记着，扫出新条目后会自动补回去。{RST}")
-        st = ask_yn("改吗？（以后不再问，按这次的答案自动做）", True)
+        print(f"  {DIM}答 n 完全合理 —— 这个功能只会写 S01Exxx，而分季的长篇"
+              f"（比如有五季的番）会因此对不上集号。{RST}")
+        st = ask_yn("改吗？（以后不再问；答 n 会把已经改过的还原回去）", False)
         save_ms_state(ep_fix=bool(st))
+        if not st:
+            return fix_episode_strm_names(d, rules, key, interactive=False)
     if not st:
         return 0, 0
     # 【改名之前先把进度记进那张表】改完条目就换了，那时再记已经晚了。
@@ -7601,6 +7656,39 @@ def dir_cache_storages(d):
     return [(sid, mp, drv, int(ce or 0)) for sid, mp, drv, ce in rows]
 
 
+def set_episode_fix():
+    """开/关"给剧集 strm 补季集编号"。关掉会把已经改过的名字还原回去。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        return
+    cur = ms_state().get("ep_fix")
+    print()
+    print(f"  当前：{'开' if cur else ('关' if cur is False else '还没问过')}")
+    print(f"  {DIM}开：Emby 一个刮削源都认不出来的剧集，把它的 strm 改名成"
+          f"「剧名 - S01Exxx.strm」，好让 Emby 认出集数。网盘不动。{RST}")
+    print(f"  {YELLOW}硬伤：只会写 S01Exxx。{RST}"
+          f"{DIM}从扁平的「剧名/231 4K.mp4」里看不出季，而 TheTVDB 上很多长篇"
+          f"是分季的，硬塞进第 1 季之后集号会对不上。{RST}")
+    print(f"  {DIM}关：不再改名，并且把【已经改过的全部还原】成网盘里的原名。"
+          f"观看进度按网盘文件记着，还原后会自己补回来。{RST}")
+    print()
+    c = ask("1 开 / 2 关（回车不改）").strip()
+    want = {"1": True, "2": False}.get(c)
+    if want is None:
+        print("没有改动。")
+        return
+    save_ms_state(ep_fix=want)
+    ok(f"已改成：{'开' if want else '关'}")
+    if not want:
+        n = restore_strm_names(d)
+        if n:
+            ok(f"{n} 个 strm 已还原成网盘里的原名")
+            print(f"  {DIM}下次点「4 生成媒体库」让 Emby 重扫一遍就回到原样了。{RST}")
+        else:
+            print(f"  {DIM}没有需要还原的 —— 现在的 strm 名字和网盘里一致。{RST}")
+
+
 def set_dir_cache():
     """改各存储的目录缓存时长。见 DIR_CACHE_PRESETS。"""
     d = ms_install_dir()
@@ -8428,6 +8516,11 @@ def params_menu():
             dc_state = f"{DIM}未挂网盘{RST}"
         print(f" 10. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
               f"当前：{dc_state}")
+        _ef = ms_state().get("ep_fix")
+        ef_state = (f"{DIM}没问过{RST}" if _ef is None else
+                    (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
+        print(f" 11. 给剧集 strm 补季集编号{DIM}（只会写 S01Exxx，分季的长篇"
+              f"会对不上集号）{RST}  当前：{ef_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -8462,6 +8555,8 @@ def params_menu():
                 choose_metatube_libraries(k0)
         elif c == "10":
             set_dir_cache()
+        elif c == "11":
+            set_episode_fix()
         else:
             print("无效选择。")
             continue
