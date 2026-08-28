@@ -123,6 +123,27 @@ def ask(prompt, default=""):
     return v or default
 
 
+def has_tty():
+    """现在是不是真的有人坐在终端前。
+
+    【为什么不能靠调用方传个 interactive 进来】ask() 在读不到 /dev/tty 时会
+    退回 input()，而 input() 在 cron 下拿到 EOF —— ask 把它兜成空字符串，
+    ask_yn 再把空输入当成"用了默认值"。结果就是：定时任务【替用户答了 Y】，
+    用户一个提示都没看见。
+    实测撞上了：每小时那轮把 8 个 strm 改了名，而问句从来没出现在屏幕上。
+    要问人之前，先确认真的有人。
+    """
+    try:
+        with open("/dev/tty"):
+            return True
+    except OSError:
+        pass
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def ask_yn(prompt, default=True):
     # 不把默认值当 ask 的 default 传进去 —— 那样会显示成
     # 「问题？ [Y/n] [Y]:」，同一个提示叠两遍，看着像要填别的东西。
@@ -2751,8 +2772,8 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     ren = [x for x in todo if not x[2]]
     st = ms_state().get("ep_fix")
     if st is None:
-        if not interactive:
-            return 0, 0               # 后台任务不替用户拿主意
+        if not (interactive and has_tty()):
+            return 0, 0               # 没人在看就不做，更不替他答
         print()
         info(f"剧集库里有 {len(todo)} 个条目 Emby 一个刮削源都没认出来，"
              f"而它们的文件名没有季集编号。")
@@ -3314,7 +3335,11 @@ def align_library(d, key, heal=True):
     # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
     # 路是用户手点「4」在看着的，可以问；cron 那条路不问，用记住的答案。
     try:
-        _nr, _nd = fix_episode_strm_names(d, lib_rules(d)[0], key, interactive=heal)
+        # 【别拿 heal 当"有没有人在看"】它俩没关系，而且正好反了：
+        # 「4 生成媒体库」是用户手点、看着的，传的却是 heal=False；
+        # cron 那轮没人看，传的是 heal=True。真正的判据是 has_tty()。
+        _nr, _nd = fix_episode_strm_names(d, lib_rules(d)[0], key,
+                                          interactive=has_tty())
         if _nr or _nd:
             n_tuned += 1              # 借它触发一次重扫
     except Exception as e:
@@ -8139,10 +8164,41 @@ def set_title_policy():
     d = ms_install_dir()
     key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                             "auth") if is_installed(d) else "")
-    if key:
-        apply_title_policy(d, key)
-    else:
+    if not key:
         print(f"  {DIM}没有 Emby API Key，下次点「4 生成媒体库」时生效。{RST}")
+        return
+    n = apply_title_policy(d, key)
+    # 【解锁不等于会变回去】切到"刮削结果"只是把 Name 从锁定列表里拿掉，
+    # 标题本身还是那串文件名。而 Emby 平时的刷新是"只补缺失字段"——
+    # 一个已经有标题的条目什么都不缺，它根本不会重新去取，于是用户看到的是
+    # "改了设置，屏幕上一点变化都没有"。和换刮削器那次是同一个坑（#339）。
+    # 所以这一步必须主动要一次【完整重新识别】。
+    # 【不能只在"这次解锁了几个"时才刷】用户很可能上一次就已经切过来了，
+    # 解锁生效、标题却没回来（就是下面说的那个坑），这时他会再选一次"刮削结果"
+    # 想重试 —— 而那一轮 n=0。把重试入口堵死，和上面那段注释说的是同一个错。
+    if want == "scrape":
+        info("让 Emby 重新取一遍标题（解锁只是允许覆盖，不会自己覆盖）...")
+        try:
+            for _lb in (_emby("/Library/VirtualFolders", key, timeout=20) or []):
+                if not is_strm_lib(_lb):
+                    continue
+                # 大库不自动重刮 —— 完整重新识别要把每个条目都去网上问一遍，
+                # 和换刮削器那边同一个阈值、同一个理由
+                _cnt = _lib_item_count(key, _lb.get("ItemId"))
+                if _cnt > REFRESH_AUTO_MAX:
+                    warn(f"「{_lb.get('Name')}」有 {_cnt} 个条目，没有自动重新识别 —— "
+                         f"在 Emby 里对该库点「刷新元数据 → 替换所有元数据」")
+                    continue
+                _emby(f"/Items/{_lb.get('ItemId')}/Refresh?Recursive=true"
+                      f"&MetadataRefreshMode=FullRefresh"
+                      f"&ImageRefreshMode=FullRefresh"
+                      f"&ReplaceAllMetadata=true&ReplaceAllImages=false",
+                      key, method="POST", timeout=60)
+            ok("已让 Emby 重新识别，标题会在这一轮刮完之后变过来")
+            print(f"  {DIM}片子多的话要跑一会儿；期间标题还是旧的，属于正常。{RST}")
+        except Exception as e:
+            warn(f"重新识别没起来：{_emby_err(e)}")
+            print(f"  {DIM}可以在 Emby 里对该库点「刷新元数据 → 替换所有元数据」。{RST}")
 
 
 def params_menu():
