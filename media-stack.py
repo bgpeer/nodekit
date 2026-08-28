@@ -4425,6 +4425,12 @@ def do_update(from_menu=False):
         if os.path.exists(lib_rules_path(d, True)):
             print(f"  {DIM}注意：本机有覆盖文件 {lib_rules_path(d, True)}，"
                   f"实际生效的是它，不是刚拉下来的这份。{RST}")
+    # 【目录缓存归脚本管，不再等用户去点】理由见 DIR_CACHE_DEFAULT 的注释。
+    # 放在这里是因为它要停一次 OpenList，而更新本来就在重启容器。
+    try:
+        dir_cache_auto_apply(d)
+    except Exception as e:
+        warn(f"调整目录缓存失败（不影响使用）：{_short_err(e)}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
@@ -7741,6 +7747,85 @@ def link_method_storages(d):
 # 本来就该去 OpenList 把存储停用再启用（那一下就清缓存）。
 DIR_CACHE_PRESETS = ((30, "OpenList 默认"), (120, "2 小时"),
                      (720, "12 小时　推荐"), (1440, "24 小时"))
+# 【这一项脚本自己设，不该等用户去点】判断标准是这套东西一直在用的那条：
+# 每个库答案不一样的进 yaml，所有网盘库答案都一样的写进代码统一设。
+# 30 分钟对【每一个】网盘存储都是错的答案 —— 它不是偏好，是这套架构
+# （跨境 + 网盘按账号限流）下的必备设置。
+#
+# 而且有反证：体检连着五天报"目录缓存偏短"，用户一次都没去点。
+# 一个正确答案唯一的、放在三级菜单里的开关，本身就是错的设计。
+#
+# 用户在菜单里手动改过之后就不再自动动它（ms_state 的 dir_cache_manual）——
+# 他显式做过的选择，脚本不能覆盖。
+DIR_CACHE_DEFAULT = 720
+
+
+def _apply_dir_cache(d, stores, want, quiet=False):
+    """把这些存储的目录缓存写成 want 分钟。返回改了几个。
+
+    OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停容器，
+    避免和它自己的写入撞锁。菜单和自动应用共用这一段。
+    """
+    todo = [(sid, mp, ce) for sid, mp, _drv, ce in stores if ce != want]
+    if not todo:
+        return 0
+    if not quiet:
+        info("停止 OpenList...")
+    subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
+    db = os.path.join(d, "openlist", "config", "data.db")
+    bak = db + ".bak"
+    n = 0
+    try:
+        shutil.copy2(db, bak)
+        con = sqlite3.connect(db)
+        for sid, mp, ce in todo:
+            con.execute("update x_storages set cache_expiration=? where id=?",
+                        (want, sid))
+            ok(f"{mp}: 目录缓存 {ce} → {want} 分钟")
+            n += 1
+        con.commit()
+        con.close()
+    except Exception as e:
+        err(f"写入失败：{e}")
+        if os.path.exists(bak):
+            shutil.copy2(bak, db)
+            warn("已从备份还原。")
+        n = 0
+    finally:
+        subprocess.run(["docker", "start", "openlist"], capture_output=True, timeout=120)
+        # 【MediaWarp 必须跟着重启，而且要等 OpenList 先就绪】它只在启动时登录
+        # 一次，OpenList 重启后旧令牌作废，换直链会 401 —— 而且只有缓存里没有
+        # 的片子才失败，表现是"有的能放有的不能放"，根本联想不到是这一步。
+        if wait_openlist_ready(d):
+            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
+                           timeout=120)
+            if not quiet:
+                info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
+        else:
+            warn("OpenList 迟迟没就绪，没有重启 MediaWarp。")
+            print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
+    return n
+
+
+def dir_cache_auto_apply(d):
+    """把目录缓存太短的存储自动调到 DIR_CACHE_DEFAULT。返回改了几个。
+
+    用户在菜单里手动设过就不碰 —— 那是他明确表达过的选择。
+    只往【长】的方向调：比默认还长说明他自己调过或者有别的用意，别缩回来。
+    """
+    if ms_state().get("dir_cache_manual"):
+        return 0
+    stores = dir_cache_storages(d)
+    low = [x for x in stores if x[3] < DIR_CACHE_DEFAULT]
+    if not low:
+        return 0
+    n = _apply_dir_cache(d, low, DIR_CACHE_DEFAULT)
+    if n:
+        print(f"  {DIM}命中缓存的列目录不吃网盘接口，也就不会被限流。"
+              f"代价：网盘里新增/改名的文件最多等 {DIR_CACHE_DEFAULT // 60} 小时"
+              f"才被看见 —— 改完目录去 OpenList 把存储停用再启用就立刻清掉。{RST}")
+        print(f"  {DIM}想改回去：3 后补参数 → 10。手动设过之后就不再自动调。{RST}")
+    return n
 
 
 def dir_cache_storages(d):
@@ -7876,39 +7961,11 @@ def set_dir_cache():
                       False):
             print("没有改动。")
             return
-    # 【和切直链同一套写法】OpenList 把存储缓存在内存里，改完必须重启才生效；
-    # 写库前先停容器，避免和它自己的写入撞锁。
-    info("停止 OpenList...")
-    subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
-    db = os.path.join(d, "openlist", "config", "data.db")
-    bak = db + ".bak"
-    try:
-        shutil.copy2(db, bak)
-        con = sqlite3.connect(db)
-        for sid, mp, _drv, ce in stores:
-            con.execute("update x_storages set cache_expiration=? where id=?",
-                        (want, sid))
-            ok(f"{mp}: {ce} → {want} 分钟")
-        con.commit()
-        con.close()
-    except Exception as e:
-        err(f"写入失败：{e}")
-        if os.path.exists(bak):
-            shutil.copy2(bak, db)
-            warn("已从备份还原。")
-    finally:
-        subprocess.run(["docker", "start", "openlist"], capture_output=True, timeout=120)
-        info("OpenList 已重启")
-        # 【MediaWarp 必须跟着重启，而且要等 OpenList 先就绪】理由和切直链那边
-        # 一模一样：它只在启动时登录一次，OpenList 重启后旧令牌作废，换直链会
-        # 401，而且只有缓存里没有的片子才失败 —— 表现是"有的能放有的不能放"。
-        if wait_openlist_ready(d):
-            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
-                           timeout=120)
-            info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
-        else:
-            warn("OpenList 迟迟没就绪，没有重启 MediaWarp。")
-            print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
+    # 【记下"用户手动设过"】设过之后自动应用就不再碰它 —— 他明确表达过的
+    # 选择，脚本不能在下一次更新时悄悄改回去。
+    save_ms_state(dir_cache_manual=True)
+    if not _apply_dir_cache(d, stores, want):
+        print(f"  {DIM}没有需要改的 —— 每个存储都已经是 {want} 分钟。{RST}")
     print()
     print(f"  {DIM}观察一天，再看「5 链路体检」里「列目录历史」那张探测图，"
           f"X（失败）应该变少。{RST}")
@@ -8652,8 +8709,9 @@ def params_menu():
                         else f"{YELLOW}各存储不一致{RST}")
         else:
             dc_state = f"{DIM}未挂网盘{RST}"
+        _dcm = "" if ms_state().get("dir_cache_manual") else f"{DIM}　脚本自动维护{RST}"
         print(f" 10. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
-              f"当前：{dc_state}")
+              f"当前：{dc_state}{_dcm}")
         _ef = ep_fix_setting()
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
@@ -9688,14 +9746,21 @@ def do_healthcheck():
         _low = [f"{mp} {ce} 分钟" for _s, mp, _dv, ce in _dcs if ce and ce <= 30]
         _txt = "　".join(f"{mp} {ce} 分钟" for _s, mp, _dv, ce in _dcs)
         if _low and hstat and hstat.get("bad"):
-            _hc("目录缓存", "warn", f"{_txt}  {YELLOW}偏短{RST}")
-            todo.append((
-                "列目录老超时，而目录缓存只有 30 分钟 —— 大部分列目录都在走"
-                "真实的网盘接口，而夸克恰恰对这个接口限流",
-                "「3 后补参数 → 10 目录缓存时长」调到 720（12 小时）。"
-                "命中缓存的列目录不吃网盘接口。代价是网盘里新增/改名的文件"
-                "最多等这么久才被看见 —— 改完目录去 OpenList 把存储停用再"
-                "启用就立刻清掉"))
+            # 【区分"脚本还没来得及设"和"用户自己设成这样"】前者不是待办，
+            # 跑一次更新就好了；后者才需要提醒他这个值和他的线路对不上。
+            if ms_state().get("dir_cache_manual"):
+                _hc("目录缓存", "warn", f"{_txt}  {YELLOW}偏短（你手动设的）{RST}")
+                todo.append((
+                    "列目录老超时，而目录缓存偏短 —— 大部分列目录都在走真实的"
+                    "网盘接口，而网盘恰恰对这个接口限流",
+                    f"「3 后补参数 → 10 目录缓存时长」调到 {DIR_CACHE_DEFAULT}"
+                    f"（{DIR_CACHE_DEFAULT // 60} 小时）。命中缓存的列目录不吃"
+                    "网盘接口。代价是网盘里新增/改名的文件最多等这么久才被看见"
+                    " —— 改完目录去 OpenList 把存储停用再启用就立刻清掉"))
+            else:
+                _hc("目录缓存", "warn",
+                    f"{_txt}  {YELLOW}偏短，跑一次「6 更新」会自动调到"
+                    f" {DIR_CACHE_DEFAULT} 分钟{RST}")
         else:
             _hc("目录缓存", "ok", _txt)
 
