@@ -2623,6 +2623,137 @@ def drop_empty_auto_libraries(d, key):
     return len(gone)
 
 
+# 文件名里已经有季集编号的样子：S01E01 / s1e1 / 1x01。有这个就别动。
+EP_HAS_SE = re.compile(r"(?i)(?:s\d{1,2}[\s._-]*e\d{1,4}|\b\d{1,2}x\d{1,4}\b)")
+# 父目录里的季号：Season 01 / S01 / 第 2 季
+EP_SEASON = re.compile(r"(?i)^(?:season[\s._-]*|s)(\d{1,2})$|^第\s*(\d{1,2})\s*季$")
+
+
+def episode_no(name):
+    """从文件名里抠出集数。抠不出返回 0。
+
+    只认【第一段独立的数字】：「231 4K」→ 231，「第154集」→ 154。
+    分辨率那种数字必须躲开 —— 「4K」「1080p」「2160p」先删掉再找，
+    否则「231 4K」有可能被抠成 4。
+    """
+    s = re.sub(r"(?i)\b\d{3,4}[pi]\b|\b[248]k\b", " ", name)
+    m = re.search(r"\d{1,4}", s)
+    return int(m.group()) if m else 0
+
+
+def plan_episode_renames(d, rules):
+    """给剧集库里【文件名认不出集数】的 strm 想一个 Emby 认得的名字。
+
+    返回 [(旧路径, 新路径, 是不是重复品)]。不改任何东西，只算。
+
+    【为什么改 strm 而不是改网盘】strm 是脚本生成的镜像，网盘是用户的资料。
+    Emby 解析季集靠的是【strm 的文件名】，播放靠的是【strm 的内容】——
+    两者互不相干。所以把 strm 改成「剧名 - S01E231.strm」、内容仍指向网盘里
+    那个「231 4K.mp4」，Emby 认得出集数，播放一点不受影响，网盘一个字不用动。
+    改网盘则相反：那是用户的东西，而且改完 AutoFilm 要重扫、旧 strm 变废、
+    观看记录一起断 —— 代价大得多，还不可逆。
+
+    【重复品】AutoFilm 下一轮会按原名再生成一个 strm（它只跳过同名的）。
+    所以这个函数还要认出"目标名已经存在、源名是刚被重新生成出来的那个"，
+    交给调用方删掉，否则同一集在 Emby 里会有两个条目。
+    """
+    out = []
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    tv = {r["name"] for r in rules if (r.get("type") or "movies") == "tvshows"}
+    if not tv:
+        return out
+    try:
+        plan = plan_libraries(d, rules)
+    except Exception:
+        return out
+    for name, val in plan.items():
+        if name not in tv:
+            continue
+        for cpath in val[1]:
+            rel = [x for x in cpath[len(STRM_PATH):].split("/") if x]
+            for dp, _dn, fs in os.walk(os.path.join(base, *rel)):
+                # 剧名取【strm 所在目录】的名字；在 Season 目录里就再往上一层
+                parts = [x for x in dp.split(os.sep) if x]
+                sea, si = 1, len(parts) - 1
+                m = EP_SEASON.match(parts[si]) if parts else None
+                if m:
+                    sea = int(m.group(1) or m.group(2) or 1)
+                    si -= 1
+                show = parts[si] if si >= 0 else ""
+                if not show:
+                    continue
+                for f in fs:
+                    if not f.endswith(".strm"):
+                        continue
+                    stem = f[:-5]
+                    if EP_HAS_SE.search(stem):
+                        continue          # 已经认得出来了，别动
+                    ep = episode_no(stem)
+                    if not ep:
+                        continue          # 抠不出集数就别猜
+                    new = f"{show} - S{sea:02d}E{ep:02d}.strm"
+                    if new == f:
+                        continue
+                    src, dst = os.path.join(dp, f), os.path.join(dp, new)
+                    out.append((src, dst, os.path.exists(dst)))
+    return out
+
+
+def fix_episode_strm_names(d, rules, interactive=True):
+    """把剧集库里认不出集数的 strm 改名成 Emby 认得的样子。返回 (改了几个, 删了几个重复的)。
+
+    第一次问一句，答案记在 ms_state["ep_fix"] 里，以后按那个答案自动做 ——
+    用户要的是"别每次都问我"，但这一步会动文件、而且有代价（见下），
+    所以第一次得让他知情。
+
+    【代价说清楚：观看进度会丢】Emby 的观看记录是按【路径】认条目的，
+    strm 一改名就是一个新条目，那一集的进度接不回去。对刮不出来的灰方块
+    通常无所谓（多半还没看），但必须让用户先知道再决定。
+    """
+    todo = plan_episode_renames(d, rules)
+    if not todo:
+        return 0, 0
+    dup = [x for x in todo if x[2]]
+    ren = [x for x in todo if not x[2]]
+    st = ms_state().get("ep_fix")
+    if st is None:
+        if not interactive:
+            return 0, 0               # 后台任务不替用户拿主意
+        print()
+        info(f"剧集库里有 {len(todo)} 个 strm 的文件名认不出集数，Emby 刮不了它们。")
+        print(f"  {DIM}可以把 strm 改名成 Emby 认得的样子。【只改本地 strm 的文件名，"
+              f"网盘一个字都不动】—— strm 里存的网盘路径不变，播放不受影响。{RST}")
+        for src, dst, _ in ren[:5]:
+            print(f"    {DIM}{os.path.basename(src)}{RST}  →  "
+                  f"{BOLD}{os.path.basename(dst)}{RST}")
+        if len(ren) > 5:
+            print(f"    {DIM}…还有 {len(ren) - 5} 个{RST}")
+        print(f"  {YELLOW}代价：Emby 按路径认条目，改名后这些集算新条目，"
+              f"已有的观看进度接不回去。{RST}")
+        st = ask_yn("改吗？（以后不再问，按这次的答案自动做）", True)
+        save_ms_state(ep_fix=bool(st))
+    if not st:
+        return 0, 0
+    n_ren = n_dup = 0
+    for src, dst, is_dup in todo:
+        try:
+            if is_dup:
+                # 目标已经在了 = AutoFilm 按原名又生成了一个。删源名那个，
+                # 否则同一集在 Emby 里会有两个条目
+                os.remove(src)
+                n_dup += 1
+            else:
+                os.replace(src, dst)
+                n_ren += 1
+        except OSError as e:
+            warn(f"改 strm 名失败：{os.path.basename(src)} —— {e}")
+    if n_ren:
+        ok(f"{n_ren} 个 strm 改成了带季集编号的名字（网盘没动）")
+    if n_dup:
+        print(f"  {DIM}顺带清掉 {n_dup} 个 AutoFilm 按原名重新生成的重复 strm。{RST}")
+    return n_ren, n_dup
+
+
 def apply_libraries(d, key, plan):
     """把规划落到 Emby 上。返回 (建了几个库, 加了几条路径)。
 
@@ -3144,6 +3275,15 @@ def align_library(d, key, heal=True):
     if heal:
         heal_media_info(d, key)       # 条目级：补时长
     normalize_strm_files(d)           # heal 中途被打断的兜底
+    # 剧集 strm 改名成带季集编号的。【必须排在 scan_if_grown 之前】——
+    # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
+    # 路是用户手点「4」在看着的，可以问；cron 那条路不问，用记住的答案。
+    try:
+        _nr, _nd = fix_episode_strm_names(d, lib_rules(d)[0], interactive=heal)
+        if _nr or _nd:
+            n_tuned += 1              # 借它触发一次重扫
+    except Exception as e:
+        warn(f"给剧集 strm 补季集编号失败：{_short_err(e)}")
     apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
     split_shared_identities(d, key)   # 条目级：进度条身份互相独立
     clear_impossible_progress(key)    # 条目级：清掉位置 > 片长的脏数据
