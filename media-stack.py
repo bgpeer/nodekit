@@ -2118,7 +2118,12 @@ LIB_RULES_DEFAULT = [
     {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
     {"name": "动漫电影", "kw": ["动漫电影", "剧场版"],               "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
     {"name": "纪录片", "kw": ["纪录片", "纪录", "documentary"],      "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
-    {"name": "AV影片", "kw": ["av", "写真", "番号"],                 "type": "movies",  "mt": True,  "lang": "ja", "country": "JP"},
+    # 【兜底要往安全的方向倒】private 默认开着。这份内置名单是拉不到仓库那份
+    # library-rules.yaml 时才用的（刚装完还没跑过「4」、或者机器连不上 GitHub）。
+    # 那种时候如果成人库对所有账号可见，用户多半还不知道有这回事 —— 而这个
+    # 疏忽是当场、当着人暴露的，不像配置错了还能慢慢修。
+    # 想让所有账号都能看，在规则文件里显式写 private: false 就行。
+    {"name": "AV影片", "kw": ["av", "写真", "番号"],                 "type": "movies",  "mt": True,  "lang": "ja", "country": "JP", "private": True},
 ]
 LIB_TYPES = {"movies": "电影", "tvshows": "电视剧", "homevideos": "家庭影像", "": "混合"}
 
