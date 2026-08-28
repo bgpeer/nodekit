@@ -2662,26 +2662,56 @@ def episode_no(name):
     return int(m.group()) if m else 0
 
 
-def unscraped_strm_paths(key):
-    """Emby 里一个刮削源都没认出来的剧集，它们的 strm 路径。问不到返回 None。
+def misparsed_strm_names(key):
+    """Emby 把集号认错了、或者压根没认出来的剧集。返回 set(strm 文件名)；问不到返回 None。
 
-    None 和 set() 差别很大，调用方必须分开处理：None 是"不知道"，
-    这种时候一个文件都不该动；set() 是"确认没有坏的"。
+    【判据是"Emby 认的集号和文件名里的数字对不对得上"】
+
+    上一版只挑"一个刮削源都没认出来"的，太窄了。实测现场：网盘里叫
+    「231 4K.mp4」的一集，Emby 认成了【第 2 季第 31 集】—— 它把三位数当成了
+    NEE 那种写法（首位是季、后两位是集）。条目刮出来了、有海报有简介，
+    只有集号是错的，于是上一版完全不会碰它，而它恰恰是最该改的。
+
+    用网盘文件名里的数字当标准答案：strm 的内容就是网盘全路径，取它的文件名
+    抠出数字，和 Emby 给的 IndexNumber 比。对不上就是认错了。
+
+    改名之后 strm 叫「剧名 - S01E231.strm」，Emby 认出 231，和网盘文件名里的
+    231 对上，下一轮就不会再动它 —— 天然幂等。
+
+    None 和 set() 差别很大：None 是"问不出来"，一个文件都不该动；
+    set() 是"确认没有认错的"。
     """
-    try:
-        r = _emby("/Items?Recursive=true&IncludeItemTypes=Episode"
-                  "&Fields=ProviderIds,Path&Limit=2000", key, timeout=30) or {}
-    except Exception:
-        return None
-    out = set()
-    for i in r.get("Items") or []:
-        p = str(i.get("Path") or "")
-        if not (p.endswith(".strm") and _under(p, STRM_PATH)):
-            continue
-        if not {k: v for k, v in (i.get("ProviderIds") or {}).items()
-                if v and k.lower() != "trakt"}:
-            out.add(os.path.basename(p))
-    return out
+    out, start, page = set(), 0, 500
+    while True:
+        try:
+            r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode"
+                      f"&Fields=ProviderIds,Path,IndexNumber"
+                      f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
+        except Exception:
+            return None
+        items = r.get("Items") or []
+        for i in items:
+            p = str(i.get("Path") or "")
+            if not (p.endswith(".strm") and _under(p, STRM_PATH)):
+                continue
+            base = os.path.basename(p)
+            has_id = bool({k: v for k, v in (i.get("ProviderIds") or {}).items()
+                           if v and k.lower() != "trakt"})
+            try:
+                with open(p, encoding="utf-8") as f:
+                    want = episode_no(os.path.splitext(
+                        os.path.basename(strm_target_path(f.read())))[0])
+            except OSError:
+                continue
+            got = i.get("IndexNumber")
+            if not has_id:
+                out.add(base)               # 谁都没认出来
+            elif want and got is not None and int(got) != want:
+                out.add(base)               # 认出来了，但集号和文件名对不上
+        total = int(r.get("TotalRecordCount") or 0)
+        start += len(items)
+        if not items or start >= total:
+            return out
 
 
 def plan_episode_renames(d, rules, broken=None):
@@ -2739,11 +2769,20 @@ def plan_episode_renames(d, rules, broken=None):
                     if not f.endswith(".strm"):
                         continue
                     if f not in broken:
-                        continue          # Emby 认得出来，别碰
+                        continue          # Emby 认对了，别碰
                     stem = f[:-5]
                     if EP_HAS_SE.search(stem):
-                        continue          # 名字里已经有编号了，改名解决不了
-                    ep = episode_no(stem)
+                        continue          # 名字里已经写着编号，Emby 还认错就不是改名能解决的
+                    # 【集数从网盘文件名抠，不是从 strm 名】strm 可能已经被改成
+                    # 「剧名 - S01E231」，从它抠第一段数字会得到 01。
+                    # 网盘那个名字才是原始事实，而且改名从不动 strm 内容。
+                    try:
+                        with open(src_probe := os.path.join(dp, f),
+                                  encoding="utf-8") as fh:
+                            ep = episode_no(os.path.splitext(os.path.basename(
+                                strm_target_path(fh.read())))[0])
+                    except OSError:
+                        continue
                     if not ep:
                         continue          # 抠不出集数就别猜
                     new = f"{show} - S{sea:02d}E{ep:02d}.strm"
@@ -2954,15 +2993,15 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
 
     第一次问一句，答案记在 ms_state["ep_fix"] 里，以后按那个答案自动做。
 
-    【这个功能有个硬伤，用之前先知道】它只会写 S01Exxx —— 因为从一个扁平的
-    「剧名/231 4K.mp4」里根本看不出季。而 TheTVDB 上很多长篇是【分季】的
-    （吞噬星空就有五季），硬塞进第 1 季之后 Emby 再按它自己的季映射去对，
-    集号会变成一串对不上的数字。实测现场：「继续观看」里 233 和 237 是对的，
-    而被改过名的几集显示成 24. 26. 28. 31.。
+    【为什么必须写死 S01】用户的原话："我只需要你分集不是要你分季"。
+    对，而且这正是它有用的地方：网盘里是一个扁平目录、集号连续到 200 多，
+    而 Emby 会把「231 4K.mp4」里的三位数读成【第 2 季第 31 集】（NEE 那种
+    写法：首位当季、后两位当集）。实测现场就是这么歪的：231→31、232→32。
+    写成 S01E231 之后，季固定在 1、集号是完整的 231，才对得上。
 
-    所以它只适合【真的完全刮不出来】的剧，而且答 n 也是完全合理的选择。
-    答 n 会把已经改过的名字全部还原（见 restore_strm_names），不是"以后不改"
-    而已 —— 那样等于关不掉。
+    答 n 也是合理的选择（比如网盘里本来就按季分了目录）。答 n 会把已经改过的
+    名字【全部还原】（见 restore_strm_names），不是"以后不改"而已 ——
+    那样等于关不掉。
     """
     # 【关掉就要还原，不能只是"以后不改"】
     if ms_state().get("ep_fix") is False:
@@ -2971,7 +3010,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             ok(f"{_r} 个 strm 已还原成网盘里的原名（改名功能是关着的）")
             print(f"  {DIM}观看进度按网盘文件记着，下一轮同步会自己补回来。{RST}")
         return 0, 0
-    todo = plan_episode_renames(d, rules, unscraped_strm_paths(key) if key else None)
+    todo = plan_episode_renames(d, rules, misparsed_strm_names(key) if key else None)
     if not todo:
         return 0, 0
     dup = [x for x in todo if x[2]]
@@ -2992,9 +3031,11 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             print(f"    {DIM}…还有 {len(ren) - 5} 个{RST}")
         print(f"  {DIM}Emby 按路径认条目，改名后这些集算新条目 —— 观看进度由脚本"
               f"按【网盘文件】记着，扫出新条目后会自动补回去。{RST}")
-        print(f"  {DIM}答 n 完全合理 —— 这个功能只会写 S01Exxx，而分季的长篇"
-              f"（比如有五季的番）会因此对不上集号。{RST}")
-        st = ask_yn("改吗？（以后不再问；答 n 会把已经改过的还原回去）", False)
+        print(f"  {DIM}改完季固定在 1、集号是完整的那个数 —— Emby 会把"
+              f"「231 4K」的三位数读成【第 2 季第 31 集】，写死 S01E231 才对得上。{RST}")
+        print(f"  {DIM}网盘里本来就按季分了目录的话，答 n；"
+              f"答 n 会把已经改过的还原回去。{RST}")
+        st = ask_yn("改吗？（以后不再问）", True)
         save_ms_state(ep_fix=bool(st))
         if not st:
             return fix_episode_strm_names(d, rules, key, interactive=False)
@@ -7667,9 +7708,9 @@ def set_episode_fix():
     print(f"  当前：{'开' if cur else ('关' if cur is False else '还没问过')}")
     print(f"  {DIM}开：Emby 一个刮削源都认不出来的剧集，把它的 strm 改名成"
           f"「剧名 - S01Exxx.strm」，好让 Emby 认出集数。网盘不动。{RST}")
-    print(f"  {YELLOW}硬伤：只会写 S01Exxx。{RST}"
-          f"{DIM}从扁平的「剧名/231 4K.mp4」里看不出季，而 TheTVDB 上很多长篇"
-          f"是分季的，硬塞进第 1 季之后集号会对不上。{RST}")
+    print(f"  {DIM}季固定写 1，集号用网盘文件名里那个完整的数 —— Emby 会把"
+          f"「231 4K」读成【第 2 季第 31 集】，写死 S01E231 才对得上。{RST}")
+    print(f"  {DIM}网盘里本来就按季分了目录的话，关掉。{RST}")
     print(f"  {DIM}关：不再改名，并且把【已经改过的全部还原】成网盘里的原名。"
           f"观看进度按网盘文件记着，还原后会自己补回来。{RST}")
     print()
