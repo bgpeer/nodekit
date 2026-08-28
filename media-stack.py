@@ -2662,7 +2662,25 @@ def episode_no(name):
     return int(m.group()) if m else 0
 
 
-def misparsed_strm_names(key):
+def host_strm_path(d, p):
+    """把 Emby 报的【容器内】strm 路径换算成【宿主机】上的路径。换不了返回 ""。
+
+    【这两个路径不是一回事】Emby 在容器里看到的是 /data/strm/cloud/…，
+    而这个脚本跑在宿主机上，同一个文件在 <DATA_ROOT>/strm/cloud/… 。
+    直接拿 Emby 给的路径去 open()，在宿主机上必然 FileNotFoundError ——
+    而如果那个 except 是 continue，整件事就【一个字都不报】地什么都不做。
+
+    实测就是这么翻的：补季集编号的开关明明开着，跑「4」也不报错，
+    就是一个文件都不改 —— 因为每个条目都在 open() 那一步被静默跳过了。
+    体检里数 strm 的那几处早就是这么换算的，这两个新函数漏了。
+    """
+    if not _under(p, STRM_PATH):
+        return ""
+    rel = [x for x in p[len(STRM_PATH):].split("/") if x]
+    return os.path.join(strm_root(d), STRM_SUBDIR, *rel)
+
+
+def misparsed_strm_names(d, key):
     """Emby 把集号认错了、或者压根没认出来的剧集。返回 set(strm 文件名)；问不到返回 None。
 
     【判据是"Emby 认的集号和文件名里的数字对不对得上"】
@@ -2697,8 +2715,11 @@ def misparsed_strm_names(key):
             base = os.path.basename(p)
             has_id = bool({k: v for k, v in (i.get("ProviderIds") or {}).items()
                            if v and k.lower() != "trakt"})
+            hp = host_strm_path(d, p)
+            if not hp:
+                continue
             try:
-                with open(p, encoding="utf-8") as f:
+                with open(hp, encoding="utf-8") as f:
                     want = episode_no(os.path.splitext(
                         os.path.basename(strm_target_path(f.read())))[0])
             except OSError:
@@ -2886,8 +2907,11 @@ def sync_progress_map(d, key):
         if not uid:
             continue
         for path, it in _strm_items(key, uid).items():
+            hp = host_strm_path(d, path)       # Emby 给的是容器路径，得换算
+            if not hp:
+                continue
             try:
-                with open(path, encoding="utf-8") as f:
+                with open(hp, encoding="utf-8") as f:
                     tgt = strm_target_path(f.read())
             except OSError:
                 continue
@@ -3030,7 +3054,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             ok(f"{_r} 个 strm 已还原成网盘里的原名（改名功能是关着的）")
             print(f"  {DIM}观看进度按网盘文件记着，下一轮同步会自己补回来。{RST}")
         return 0, 0
-    todo = plan_episode_renames(d, rules, misparsed_strm_names(key) if key else None)
+    todo = plan_episode_renames(d, rules, misparsed_strm_names(d, key) if key else None)
     if not todo:
         return 0, 0
     dup = [x for x in todo if x[2]]
