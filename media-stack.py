@@ -2948,6 +2948,26 @@ def sync_progress_map(d, key):
     return n
 
 
+# 「补季集编号」这个设置的语义版本。
+#
+# 【为什么要版本号】v1 问的是"要不要按文件名有没有 SxxExx 来改名"，而且我给
+# 它安了个不成立的理由（"分季会对不上"），把用户吓成了答 n。v2 的判据完全不同：
+# 拿【Emby 认的集号】和【网盘文件名里的数字】比，对不上才改，认对了绝不碰。
+#
+# 用户当初回答的是【另一个问题】，那个答案不该原样套到这个问题上 ——
+# 尤其它现在还在每轮把好名字还原回去。版本对不上就当没问过，重新问一次。
+EP_FIX_V = 2
+
+
+def ep_fix_setting():
+    """"补季集编号"的当前设置。没问过、或者问的是老版本的问题，都返回 None。"""
+    st = ms_state()
+    if st.get("ep_fix_v") != EP_FIX_V:
+        return None
+    v = st.get("ep_fix")
+    return bool(v) if v is not None else None
+
+
 def restore_strm_names(d):
     """把改过名的 strm 全部还原成网盘里那个文件名。返回还原了几个。
 
@@ -3004,7 +3024,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     那样等于关不掉。
     """
     # 【关掉就要还原，不能只是"以后不改"】
-    if ms_state().get("ep_fix") is False:
+    if ep_fix_setting() is False:
         _r = restore_strm_names(d)
         if _r:
             ok(f"{_r} 个 strm 已还原成网盘里的原名（改名功能是关着的）")
@@ -3015,7 +3035,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         return 0, 0
     dup = [x for x in todo if x[2]]
     ren = [x for x in todo if not x[2]]
-    st = ms_state().get("ep_fix")
+    st = ep_fix_setting()
     if st is None:
         if not (interactive and has_tty()):
             return 0, 0               # 没人在看就不做，更不替他答
@@ -3036,7 +3056,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         print(f"  {DIM}网盘里本来就按季分了目录的话，答 n；"
               f"答 n 会把已经改过的还原回去。{RST}")
         st = ask_yn("改吗？（以后不再问）", True)
-        save_ms_state(ep_fix=bool(st))
+        save_ms_state(ep_fix=bool(st), ep_fix_v=EP_FIX_V)
         if not st:
             return fix_episode_strm_names(d, rules, key, interactive=False)
     if not st:
@@ -7703,7 +7723,7 @@ def set_episode_fix():
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
-    cur = ms_state().get("ep_fix")
+    cur = ep_fix_setting()
     print()
     print(f"  当前：{'开' if cur else ('关' if cur is False else '还没问过')}")
     print(f"  {DIM}开：Emby 一个刮削源都认不出来的剧集，把它的 strm 改名成"
@@ -7719,7 +7739,7 @@ def set_episode_fix():
     if want is None:
         print("没有改动。")
         return
-    save_ms_state(ep_fix=want)
+    save_ms_state(ep_fix=want, ep_fix_v=EP_FIX_V)
     ok(f"已改成：{'开' if want else '关'}")
     if not want:
         n = restore_strm_names(d)
@@ -8557,7 +8577,7 @@ def params_menu():
             dc_state = f"{DIM}未挂网盘{RST}"
         print(f" 10. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
               f"当前：{dc_state}")
-        _ef = ms_state().get("ep_fix")
+        _ef = ep_fix_setting()
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
         print(f" 11. 给剧集 strm 补季集编号{DIM}（只会写 S01Exxx，分季的长篇"
