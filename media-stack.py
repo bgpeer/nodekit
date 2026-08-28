@@ -1215,6 +1215,7 @@ esac
 KEEPALIVE_CRON = "/etc/cron.d/media-stack-keepalive"
 SYNC_CRON      = "/etc/cron.d/media-stack-sync"
 WARM_CRON      = "/etc/cron.d/media-stack-warm"
+SELFUP_CRON    = "/etc/cron.d/media-stack-selfupdate"
 # 每几小时热一次「继续观看」的直链。必须【小于】MediaWarp 的 alist_api_ttl(2h)，
 # 否则缓存会在两次预热之间过期，等于白跑。1 小时留了一倍余量。
 WARM_EVERY_H   = 1
@@ -1255,6 +1256,9 @@ WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段�
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
 SYNC_HOUR_CST  = "05:45"
+# 自动更新【只换脚本，不动容器、不重生成配置】。放在每日对齐之前一点，
+# 换完那一轮对齐就是新版脚本在跑。见 do_selfupdate 里为什么只换脚本。
+SELFUP_HOUR_CST = "05:15"
 # 每 20 分钟一次 ≈ 72 次/天。别为了"让链路更热"去调小它 —— 实测耗时和空闲时间
 # 不相关，理由见 do_keepalive() 的文档字符串。
 KEEPALIVE_MIN  = 20
@@ -1289,6 +1293,7 @@ CRON_TIMEOUT   = {
     # 后台补时长。比自己的预算多留一截 —— timeout 是防吊死的最后一道，
     # 不该在任务正常收尾之前把它砍了
     "heal":      HEAL_BG_BUDGET_T,
+    "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
 }
 
 
@@ -1774,6 +1779,88 @@ def cst_to_local_cron(hhmm):
     off = time.localtime().tm_gmtoff or 0            # 本机相对 UTC 的偏移（秒）
     total = (h * 60 + m + (off - 8 * 3600) // 60) % 1440
     return total % 60, total // 60
+
+
+def do_selfupdate():
+    """定时任务调的自动更新：【只把脚本换成仓库里的最新版】。结果写 json 给体检读。
+
+    用户的话："我不可能每过几天点更新一次吧，要么做个定时任务让他自动更新"。
+    合理 —— 修好的东西到不了机器上，等于没修。
+
+    【但只换脚本，不碰镜像也不重新生成配置】，这条边界是有理由的：
+
+      · 镜像是 :latest。上游什么时候推、推了什么破坏性改动，我们不知道也
+        管不了。半夜自动拉一个坏版本下来，第二天整套停摆，而没人在场。
+      · 重新生成配置要重启容器 —— 会打断正在看的人，也会作废 MediaWarp 的
+        OpenList 令牌（那个坑刚修完）。为了"可能有的一点修复"付这个代价不值。
+      · 而脚本这一层【本来就不需要重启任何东西】：cron 指向的是这个文件本身，
+        换完之后每小时的保活、对齐自然就是新版在跑，Emby 侧的修复立刻生效。
+
+    所以镜像和配置仍然归手点「6 更新」，只是频率从"每过几天"变成"想起来再说"。
+
+    【自动更新必须有回滚】这个会话里我自己就推过好几次回归。语法层面的坏
+    （下载被截断、拉到一页 HTML）能当场查出来，就一定要查：换上去之前先
+    compile 一遍，不过就整个放弃，一个字节都不动本机这份。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    me = os.path.realpath(__file__)
+    rec = {"ts": int(time.time()), "ok": False, "changed": False,
+           "from": SCRIPT_VERSION, "to": "", "error": ""}
+    try:
+        if not os.access(me, os.W_OK):
+            raise RuntimeError("脚本文件不可写")
+        req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}",
+                                     headers={"User-Agent": "media-stack"})
+        body = urllib.request.urlopen(req, timeout=60).read().decode()
+        # 和 self_update 同一道门槛：别把 404 页面/限流提示写进去，那会废掉文件
+        if "SCRIPT_VERSION" not in body or len(body) < 10000:
+            raise RuntimeError("拉到的内容不像 media-stack.py")
+        cur = open(me, encoding="utf-8").read()
+        if body == cur:
+            rec["ok"] = True                  # 已是最新，什么都不用做
+        else:
+            # 【换上去之前先 compile】语法坏掉的版本换进去，等于把这台机器上
+            # 所有定时任务一起废掉 —— 而且下一轮自动更新也跑不起来，救不回来。
+            compile(body, me, "exec")
+            m = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', body)
+            with open(me + ".prev", "w", encoding="utf-8") as f:
+                f.write(cur)                  # 留一份上一版，出事能手动换回去
+            tmp = me + ".new"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, me)               # 原子替换，中途断电不会留半截脚本
+            rec["ok"] = rec["changed"] = True
+            rec["to"] = m.group(1) if m else "?"
+    except Exception as e:
+        rec["error"] = _short_err(e)
+    try:
+        with open(os.path.join(d, "selfupdate.json"), "w") as f:
+            json.dump(rec, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def install_selfupdate_cron(install_dir):
+    """装每天一次的脚本自动更新。见 do_selfupdate。"""
+    m, h = cst_to_local_cron(SELFUP_HOUR_CST)
+    try:
+        txt = (f"# media-stack 每天自动把脚本换成仓库最新版（只换脚本，\n"
+               f"# 不拉镜像、不重生成配置、不重启任何容器）。\n"
+               f"# 北京时间 {SELFUP_HOUR_CST}（本机 {h:02d}:{m:02d}），"
+               f"排在每日对齐之前，换完那一轮就是新版在跑。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"{m} {h} * * * root {cron_cmd('selfupdate')} >/dev/null 2>&1\n")
+        with open(SELFUP_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(SELFUP_CRON, 0o644)
+        return True
+    except OSError as e:
+        warn(f"装自动更新任务失败（不影响使用）：{e}")
+        return False
 
 
 def install_sync_cron(install_dir):
@@ -3796,6 +3883,9 @@ def do_update(from_menu=False):
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
+    # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
+    # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
+    install_selfupdate_cron(d)
 
     if cfg["homepage"]:
         info("刷新 Homepage 导航配置...")
@@ -3913,7 +4003,7 @@ def do_uninstall():
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
-              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON):
+              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -9590,6 +9680,40 @@ def do_healthcheck():
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
                      "跑一次「6 更新」会自动补上"))
 
+    # 【自动更新只管脚本】这一行要说清楚这个边界，否则用户看到"自动更新 ✔"
+    # 会以为镜像也在自动跟，然后一年不点「6 更新」
+    if os.path.exists(SELFUP_CRON):
+        try:
+            with open(os.path.join(d, "selfupdate.json")) as f:
+                su = json.load(f)
+        except Exception:
+            su = {}
+        if not su:
+            _hc("脚本自动更新", "skip",
+                f"已装，排在北京时间 {SELFUP_HOUR_CST}，还没到点跑过"
+                f"{DIM}（只换脚本，镜像仍归「6 更新」）{RST}")
+        else:
+            _h = (time.time() - su.get("ts", 0)) / 3600
+            _when = f"{_h:.0f} 小时前" if _h >= 1 else f"{_h * 60:.0f} 分钟前"
+            _st, _note = _stale_note(int(_h * 60), 24 * 60, "天", late=1.5)
+            if not su.get("ok"):
+                _hc("脚本自动更新", "warn",
+                    f"{_when}检查失败：{su.get('error', '')[:40]}")
+                todo.append(("脚本自动更新拉不到最新版，仓库里修好的东西到不了这台机器",
+                             "多半是网络问题，能等就等下一轮；急的话手动跑「6 更新」"))
+            elif su.get("changed"):
+                _hc("脚本自动更新", _st,
+                    f"{_when}升到 v{su.get('to', '?')}"
+                    f"{DIM}（只换脚本，镜像仍归「6 更新」）{RST}{_note}")
+            else:
+                _hc("脚本自动更新", _st,
+                    f"{_when}检查过，已是最新"
+                    f"{DIM}（只换脚本，镜像仍归「6 更新」）{RST}{_note}")
+    else:
+        _hc("脚本自动更新", "warn", "没装 —— 仓库里修好的东西要手动点「6 更新」才到")
+        todo.append(("脚本自动更新没装，修复不会自己到这台机器上",
+                     "跑一次「6 更新」会自动补上"))
+
     _hc_group("其它", "背景信息和到期提醒")
 
     # 版本必须看得见。全用 :latest 标签，「6 更新」每次都会拉最新的 —— 但用户
@@ -9745,6 +9869,10 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("heal"):
                 do_heal()
+        elif arg == "selfupdate":         # cron 调的自动更新，只换脚本
+            require_root()
+            if take_task_lock("selfupdate"):
+                do_selfupdate()
         elif arg == "update":
             do_update()
         elif arg == "update-menu":        # 菜单里点的更新，且中途自我更新过；跑完回菜单
