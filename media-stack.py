@@ -4841,12 +4841,15 @@ def tune_strm_libraries(key):
 
     只动指向本脚本 strm 目录的媒体库：用户自己另外建的库(本地电影、音乐之类)
     不该被这个脚本碰。
+
+    这个 Emby 版本没有的那几个选项，名字收进 miss_all 写到状态里给体检读 ——
+    见下面 miss_all 那段注释：不在这里打印。
     """
     try:
         libs = _emby("/Library/VirtualFolders", key)
     except Exception:
         return 0
-    n_changed = 0
+    n_changed, miss_all = 0, set()
     for lb in libs:
         if not is_strm_lib(lb):
             continue
@@ -4861,11 +4864,16 @@ def tune_strm_libraries(key):
                 continue
             if o.get(k) != val:
                 diff[k] = val
-        if missing:
-            # 说出来而不是闷着。字段名对不上多半是 Emby 版本变了，
-            # 而"没找到"和"设好了"从结果上看是一样的（库里那一项照旧开着）。
-            print(f"  {DIM}「{lb.get('Name')}」里没找到这几项的设置字段，"
-                  f"没动：{'、'.join(missing)}{RST}")
+        # 【不在这儿打印】上一版对每个库打一行"没找到这几项的设置字段"，于是
+        # 每次更新都刷四五行一模一样的话。而它【不是故障也没法处理】：这个
+        # Emby 版本就是没有那个选项，用户看了也做不了任何事。
+        #
+        # 更要命的是它把库名（用户自己起的分类名）印在了每一次更新的输出里，
+        # 而那些输出是会被截图发出去的。非要报的东西才值得付这个代价。
+        #
+        # 字段名对不上是【版本属性】，不是某个库的属性 —— 所有库的结果必然
+        # 一样。收集起来交给体检报一行就够了，那儿是专门用来看状态的地方。
+        miss_all.update(missing)
         if not diff:
             continue
         was = {k: o.get(k) for k in diff}
@@ -4913,6 +4921,7 @@ def tune_strm_libraries(key):
             ok(f"媒体库「{name}」关掉了会拉视频的选项：{'、'.join(_tog)}")
             print(f"  {DIM}这些在本地片库上是好东西，代价只是读一遍本地磁盘；"
                   f"而这里的文件是 strm，Emby 得把视频从网盘拉过来才能做。{RST}")
+    save_ms_state(lib_opt_missing=sorted(miss_all))
     return n_changed
 
 
@@ -6928,12 +6937,10 @@ def _put_metatube_first(tos):
     文件名也会自信地匹配上一部同名的正经片子，一旦它先认领，MetaTube
     根本没机会插手。
 
-    实测就是这么翻的：AV 库里一个叫「小仙女.mp4」的文件，被 TheMovieDb
-    认成了 2021 年一部同名国产剧情片，简介是玉帝七个女儿的故事。
+    实测翻过车：成人片库里一个中文名的文件，被 TheMovieDb 认成了一部同名的
+    国产剧情片，海报和简介全是那部片的。
 
-    用户的话："只要是 AV影片 这个媒体库里面的所有视频，而且我开了 MetaTube
-    插件，不管他叫什么名字都应该把它带上 MetaTube 插件吗？" —— 他要的是
-    "这个库以 MetaTube 为准"，那 MetaTube 就得排第一。
+    开了 MetaTube 的库，要的就是"这个库以 MetaTube 为准"，那它就得排第一。
     """
     for t in tos:
         for fk, ok_ in (("MetadataFetchers", "MetadataFetcherOrder"),
@@ -7111,8 +7118,8 @@ def link_method_storages(d):
 
 # OpenList 每个存储的目录缓存时长（分钟）。默认 30。
 #
-# 【为什么这个值值得单独摆出来调】实测这台机器上：
-#   列目录 /quark/夸克挂载  第一次 12.7 秒  →  紧接着再列 0.3 秒
+# 【为什么这个值值得单独摆出来调】实测过一台机器：同一条网盘路径，
+#   第一次列目录 12.7 秒  →  紧接着再列 0.3 秒
 # 差的四十倍就是"走没走真实接口"。而同一时段换直链只要 0.2 秒、一次没失败 ——
 # 坏的只有目录列举这一个接口，夸克对它限流。24 小时 81 次探测失败 20 次，
 # 九成耗时 54.6 秒。
@@ -9421,8 +9428,16 @@ def do_healthcheck():
                              "点「4 生成媒体库」或「6 更新」会立刻调好；"
                              "不管的话每小时的预热任务也会跟上（最多等 1 小时）"))
             elif slibs:
+                # 【这个 Emby 版本没有的选项，在这儿报一次就够】原来是每次更新
+                # 对每个库各打一行，刷四五行一模一样的话，而且把库名印进了会被
+                # 截图的输出里。它不是故障、也没法处理，属于"知道一下"级别的
+                # 信息 —— 体检才是看这种东西的地方，附在已有的行后面，不占篇幅。
+                _miss = ms_state().get("lib_opt_missing") or []
+                _tail = (f"{DIM}　这个 Emby 版本没有：{'、'.join(_miss)}{RST}"
+                         if _miss else "")
                 _hc("媒体库选项", "ok",
-                    f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、多版本合并已关")
+                    f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、"
+                    f"多版本合并已关{_tail}")
 
             # 刮到同一个身份 = 共用观看进度。这个坏的是观看记录，比刮错标题严重得多，
             # 而且现象极具迷惑性（A 的续播点出现在 B 上，甚至超过 B 的总长）
@@ -9470,7 +9485,7 @@ def do_healthcheck():
                     f"「有的片有封面有的没有」不矛盾：差别在文件名能不能被查到",
                     "TMDb 按片名查、MetaTube 按番号查。自己起的名字两边都没有对应"
                     "条目，配多少刮削器都查不出来 —— 在网盘里把文件名改成"
-                    "「片名 (年份).mp4」，成人片改成番号（ONGP-008.mp4）最准。"
+                    "「片名 (年份).mp4」，成人片用番号命名（字母-数字那种）最准。"
                     "改完点「4 生成媒体库」"))
             elif key:
                 _hc("刮削结果", "ok", "条目都刮到了信息")
