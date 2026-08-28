@@ -7741,13 +7741,40 @@ def set_episode_fix():
         return
     save_ms_state(ep_fix=want, ep_fix_v=EP_FIX_V)
     ok(f"已改成：{'开' if want else '关'}")
+    # 【开关一拨就当场做完，别让人再去点「4」】上一版只存了个设置就回菜单，
+    # 改名要等下一次「4 生成媒体库」或者下一轮定时任务。用户开完立刻去 Emby 看，
+    # 看到的还是旧名字，只会以为开关没用 —— 实测就是这么被问回来的。
+    # 「7 片名用哪个」那边早就是当场套用的，这里照它办。
+    key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                            "auth") if is_installed(d) else "")
     if not want:
         n = restore_strm_names(d)
         if n:
             ok(f"{n} 个 strm 已还原成网盘里的原名")
-            print(f"  {DIM}下次点「4 生成媒体库」让 Emby 重扫一遍就回到原样了。{RST}")
         else:
             print(f"  {DIM}没有需要还原的 —— 现在的 strm 名字和网盘里一致。{RST}")
+    else:
+        if not key:
+            warn("没有 Emby API Key，改名要等下次点「4 生成媒体库」。")
+            return
+        try:
+            n, _dup = fix_episode_strm_names(d, lib_rules(d)[0], key,
+                                             interactive=False)
+        except Exception as e:
+            warn(f"改名失败：{_short_err(e)}")
+            return
+        if not n:
+            print(f"  {DIM}没有需要改的 —— Emby 认的集号和网盘文件名都对得上。{RST}")
+            return
+    # 【必须让 Emby 重扫】改的是文件名，Emby 不重扫就还是按旧名字显示的那些条目
+    if key:
+        try:
+            _emby("/Library/Refresh", key, method="POST", timeout=60)
+            ok("已通知 Emby 重扫，集号过一会儿就更新")
+            print(f"  {DIM}扫描在后台跑，片子多的话要等几分钟。{RST}")
+        except Exception as e:
+            warn(f"通知 Emby 扫描失败：{_short_err(e)}")
+            print(f"  {DIM}点一次「4 生成媒体库」也会扫。{RST}")
 
 
 def set_dir_cache():
