@@ -14,6 +14,13 @@
 #   country   CN / JP / US，跟着 language 走
 #   metatube  true 时额外挂上 MetaTube（按番号刮成人片），只给成人库开。
 #             开了就自动排到 scrapers 名单【最前面】，不用在下面手写它
+#   private   true = 这个库只有【管理员账号】能看见，其余账号一律看不到。
+#             用途：电视上登一个非管理员账号，私密库在那台电视上根本不存在
+#             （首页、搜索、继续观看里都不会出现）。
+#             Emby 没有"给一个库设密码"这回事，它是按用户分权限的 ——
+#             所以你得先在 Emby 里建第二个账号（设置 → 用户 → 添加），
+#             建完跑一次「6 更新」，脚本会自动把这个库从它的可见范围里摘掉。
+#             以后新加账号、新建库都会自动跟上，不用回去改勾
 #   scrapers  这个库用哪些【元数据】刮削器，逗号隔开、【顺序就是优先级】——
 #             排前面的先查、查到就赢，后面的只用来填空缺。
 #             留空 = 用 Emby 的默认；写了就以这里为准，覆盖 Emby 里的设置。
@@ -85,6 +92,7 @@
   scrapers: TheMovieDb, TheTVDB
   image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: true
+  private: true
   keywords: av, 写真, 番号, AV影片
 
 - name: 纪录片
