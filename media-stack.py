@@ -2755,23 +2755,35 @@ def plan_episode_renames(d, rules, broken=None):
 
 
 def _strm_items(key, uid):
-    """{strm 文件名: 条目}。用文件名当键，因为改名前后只有它变，条目 id 会换。"""
-    try:
-        r = _emby(f"/Users/{uid}/Items?Recursive=true"
-                  f"&IncludeItemTypes=Movie,Episode,Video"
-                  f"&Fields=Path,UserData&Limit=4000", key, timeout=30) or {}
-    except Exception:
-        return {}
-    out = {}
-    for i in r.get("Items") or []:
-        p = str(i.get("Path") or "")
-        if p.endswith(".strm") and _under(p, STRM_PATH):
-            out[os.path.basename(p)] = i
-    return out
+    """{strm 完整路径: 条目}。覆盖【所有媒体库、所有网盘】，不按库名或类型挑。
 
+    【键必须是完整路径，不能用文件名】剧集的文件名撞车是常态：
+    「动漫/剧A/01.strm」和「动漫/剧B/01.strm」的 basename 都是 01.strm。
+    拿它当键，后一个会把前一个顶掉，那一部剧的进度就静静地漏了 ——
+    正是"只修好个别文件"的典型形状。
 
-
-
+    【必须翻页】这个接口一次只给一批。写死 Limit=4000 的话，片子超过这个数
+    就有一批永远轮不到，而且不会有任何报错 —— 用户看到的是"大部分好了，
+    有几部就是不行"。按 StartIndex 翻到底。
+    """
+    out, start, page = {}, 0, 500
+    while True:
+        try:
+            r = _emby(f"/Users/{uid}/Items?Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video"
+                      f"&Fields=Path,UserData"
+                      f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
+        except Exception:
+            return out                # 半路失败就用已经拿到的，别整批丢掉
+        items = r.get("Items") or []
+        for i in items:
+            p = str(i.get("Path") or "")
+            if p.endswith(".strm") and _under(p, STRM_PATH):
+                out[p] = i
+        total = int(r.get("TotalRecordCount") or 0)
+        start += len(items)
+        if not items or start >= total:
+            return out
 
 
 # 观看进度按【网盘文件路径】存一份。
@@ -2834,8 +2846,7 @@ def sync_progress_map(d, key):
         uid = u.get("Id")
         if not uid:
             continue
-        for base, it in _strm_items(key, uid).items():
-            path = str(it.get("Path") or "")
+        for path, it in _strm_items(key, uid).items():
             try:
                 with open(path, encoding="utf-8") as f:
                     tgt = strm_target_path(f.read())
