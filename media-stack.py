@@ -2716,6 +2716,13 @@ def misparsed_strm_names(d, key):
             if not (p.endswith(".strm") and _under(p, STRM_PATH)):
                 continue
             base = os.path.basename(p)
+            # 【名字里已经写着 SxxExx 的一律不算"认错"】改名帮不上它，而且
+            # 这里的比法对它本来就不成立：写成 S01E238 之后，Emby 会拿 238 去
+            # 刮削器换算成"第 5 季第 30 集"，IndexNumber 变成 30 —— 那是【对的】，
+            # 季是 TheTVDB 分的，不是认错。不排除的话，每轮都会把它算进
+            # "判定集号不对"里，报出来的数字纯属吓人。
+            if EP_HAS_SE.search(os.path.splitext(base)[0]):
+                continue
             has_id = bool({k: v for k, v in (i.get("ProviderIds") or {}).items()
                            if v and k.lower() != "trakt"})
             hp = host_strm_path(d, p)
