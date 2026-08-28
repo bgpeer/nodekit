@@ -2754,6 +2754,103 @@ def plan_episode_renames(d, rules, broken=None):
     return out
 
 
+def _strm_items(key, uid):
+    """{strm 文件名: 条目}。用文件名当键，因为改名前后只有它变，条目 id 会换。"""
+    try:
+        r = _emby(f"/Users/{uid}/Items?Recursive=true"
+                  f"&IncludeItemTypes=Movie,Episode,Video"
+                  f"&Fields=Path,UserData&Limit=4000", key, timeout=30) or {}
+    except Exception:
+        return {}
+    out = {}
+    for i in r.get("Items") or []:
+        p = str(i.get("Path") or "")
+        if p.endswith(".strm") and _under(p, STRM_PATH):
+            out[os.path.basename(p)] = i
+    return out
+
+
+def snapshot_progress(key, pairs):
+    """改名【之前】把这些条目的观看进度记下来。返回要存进状态的列表。
+
+    pairs 是 [(旧文件名, 新文件名)]。键用【新文件名】，因为改完之后要靠它
+    去找那个新生成的条目。
+
+    【为什么必须记】Emby 的观看记录是挂在条目上的，而条目是按【路径】认的 ——
+    strm 一改名，Emby 下次扫描会当成一个全新的条目，旧的进度接不回去。
+    这是改名功能唯一的实质代价，能补上就该补。
+    """
+    out = []
+    try:
+        users = _emby("/Users", key, timeout=20) or []
+    except Exception:
+        return out
+    for u in users:
+        uid = u.get("Id")
+        if not uid:
+            continue
+        have = _strm_items(key, uid)
+        for old, new in pairs:
+            it = have.get(old)
+            ud = (it or {}).get("UserData") or {}
+            # 没看过的不用记 —— 省得状态文件里堆一堆空壳
+            if not (ud.get("PlaybackPositionTicks") or ud.get("Played")
+                    or ud.get("PlayCount")):
+                continue
+            out.append({"to": new, "u": uid, "n": 0, "d": {
+                "PlaybackPositionTicks": int(ud.get("PlaybackPositionTicks") or 0),
+                "PlayCount": int(ud.get("PlayCount") or 0),
+                "Played": bool(ud.get("Played")),
+                "IsFavorite": bool(ud.get("IsFavorite")),
+            }})
+    return out
+
+
+# 改名后的条目要等 Emby 扫出来才存在，扫描是异步的。多给几轮机会，
+# 但不能无限攒着 —— 找不到就是找不到，留在状态文件里只会越积越多。
+CARRY_TRIES = 5
+
+
+def carry_over_progress(d, key):
+    """把改名前记下的观看进度搬到新条目上。返回搬成了几条。
+
+    在【扫描之后】跑：新条目得先被 Emby 扫出来才找得到。找不到就留着下一轮
+    再试，试满 CARRY_TRIES 轮还没有就丢掉。
+    """
+    pend = ms_state().get("ep_carry") or []
+    if not pend or not key:
+        return 0
+    done, keep, byuser = 0, [], {}
+    for e in pend:
+        uid = e.get("u")
+        if uid not in byuser:
+            byuser[uid] = _strm_items(key, uid)
+        it = byuser[uid].get(e.get("to"))
+        if not it:
+            e["n"] = int(e.get("n") or 0) + 1
+            if e["n"] < CARRY_TRIES:
+                keep.append(e)          # 还没扫出来，下一轮再说
+            continue
+        cur = it.get("UserData") or {}
+        if cur.get("PlaybackPositionTicks") or cur.get("Played"):
+            continue                    # 新条目已经有进度了，别覆盖用户新看的
+        try:
+            _emby(f"/Users/{uid}/Items/{it.get('Id')}/UserData", key,
+                  method="POST", body=e.get("d") or {}, timeout=30)
+            done += 1
+        except Exception:
+            e["n"] = int(e.get("n") or 0) + 1
+            if e["n"] < CARRY_TRIES:
+                keep.append(e)
+    # 【无条件写回】ms_state() 返回的是一份拷贝，上面对 e["n"] 的自增只改在
+    # 拷贝上。不写回的话计数永远停在 0，试满丢弃那条路一辈子走不到，
+    # 状态文件里的死条目越攒越多。
+    save_ms_state(ep_carry=keep)
+    if done:
+        ok(f"{done} 条观看进度已经跟着改名搬到新条目上")
+    return done
+
+
 def fix_episode_strm_names(d, rules, key, interactive=True):
     """把剧集库里认不出集数的 strm 改名成 Emby 认得的样子。返回 (改了几个, 删了几个重复的)。
 
@@ -2784,12 +2881,23 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
                   f"{BOLD}{os.path.basename(dst)}{RST}")
         if len(ren) > 5:
             print(f"    {DIM}…还有 {len(ren) - 5} 个{RST}")
-        print(f"  {YELLOW}代价：Emby 按路径认条目，改名后这些集算新条目，"
-              f"已有的观看进度接不回去。{RST}")
+        print(f"  {DIM}Emby 按路径认条目，改名后这些集算新条目 —— 脚本会先把"
+              f"观看进度记下来，等新条目扫出来再搬过去。{RST}")
+        print(f"  {YELLOW}搬不过去的话（Emby 没扫出来）那几集的进度会丢。{RST}")
         st = ask_yn("改吗？（以后不再问，按这次的答案自动做）", True)
         save_ms_state(ep_fix=bool(st))
     if not st:
         return 0, 0
+    # 【改名之前先把进度记下来】改完就找不回来了 —— 条目是按路径认的。
+    # 记完存进状态，等 Emby 扫出新条目之后由 carry_over_progress 搬过去。
+    try:
+        _pairs = [(os.path.basename(a), os.path.basename(b))
+                  for a, b, dup in todo if not dup]
+        _snap = snapshot_progress(key, _pairs) if key else []
+        if _snap:
+            save_ms_state(ep_carry=(ms_state().get("ep_carry") or []) + _snap)
+    except Exception as e:
+        warn(f"记录观看进度失败，改名后这些集的进度会丢：{_short_err(e)}")
     n_ren = n_dup = 0
     for src, dst, is_dup in todo:
         try:
@@ -3349,6 +3457,11 @@ def align_library(d, key, heal=True):
     clear_impossible_progress(key)    # 条目级：清掉位置 > 片长的脏数据
     # 库选项改过就必须重扫（见上），哪怕文件数一个没变
     scan_if_grown(d, key, force=bool(n_tuned))
+    # 【必须排在扫描之后】改名产生的新条目要等 Emby 扫出来才存在
+    try:
+        carry_over_progress(d, key)
+    except Exception as e:
+        warn(f"搬运观看进度失败：{_short_err(e)}")
 
 
 def scan_if_grown(d, key, force=False):
