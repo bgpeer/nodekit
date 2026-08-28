@@ -2641,10 +2641,40 @@ def episode_no(name):
     return int(m.group()) if m else 0
 
 
-def plan_episode_renames(d, rules):
-    """给剧集库里【文件名认不出集数】的 strm 想一个 Emby 认得的名字。
+def unscraped_strm_paths(key):
+    """Emby 里一个刮削源都没认出来的剧集，它们的 strm 路径。问不到返回 None。
+
+    None 和 set() 差别很大，调用方必须分开处理：None 是"不知道"，
+    这种时候一个文件都不该动；set() 是"确认没有坏的"。
+    """
+    try:
+        r = _emby("/Items?Recursive=true&IncludeItemTypes=Episode"
+                  "&Fields=ProviderIds,Path&Limit=2000", key, timeout=30) or {}
+    except Exception:
+        return None
+    out = set()
+    for i in r.get("Items") or []:
+        p = str(i.get("Path") or "")
+        if not (p.endswith(".strm") and _under(p, STRM_PATH)):
+            continue
+        if not {k: v for k, v in (i.get("ProviderIds") or {}).items()
+                if v and k.lower() != "trakt"}:
+            out.add(os.path.basename(p))
+    return out
+
+
+def plan_episode_renames(d, rules, broken=None):
+    """给剧集库里【Emby 认不出来】的 strm 想一个它认得的名字。
 
     返回 [(旧路径, 新路径, 是不是重复品)]。不改任何东西，只算。
+
+    【判据是"Emby 到底认没认出来"，不是"文件名长什么样"】第一版拿"文件名里
+    没有 SxxExx"当条件，太宽了：Emby 本来就能从「236.断东河·吴.mp4」里认出
+    236 是第几集（只要它在剧集文件夹底下），这种根本不用改。而改了是净亏 ——
+    观看进度断掉，标题还变成更难看的「剧名 - S01E236」。
+
+    所以 broken 传进来的是"Emby 确认没认出来的那些"，只动它们。
+    broken 是 None（问不到 Emby）时【一个都不动】—— 分不清好坏就别下手。
 
     【为什么改 strm 而不是改网盘】strm 是脚本生成的镜像，网盘是用户的资料。
     Emby 解析季集靠的是【strm 的文件名】，播放靠的是【strm 的内容】——
@@ -2658,6 +2688,8 @@ def plan_episode_renames(d, rules):
     交给调用方删掉，否则同一集在 Emby 里会有两个条目。
     """
     out = []
+    if not broken:
+        return out                    # None=问不到、set()=没有坏的，都不动
     base = os.path.join(strm_root(d), STRM_SUBDIR)
     tv = {r["name"] for r in rules if (r.get("type") or "movies") == "tvshows"}
     if not tv:
@@ -2685,9 +2717,11 @@ def plan_episode_renames(d, rules):
                 for f in fs:
                     if not f.endswith(".strm"):
                         continue
+                    if f not in broken:
+                        continue          # Emby 认得出来，别碰
                     stem = f[:-5]
                     if EP_HAS_SE.search(stem):
-                        continue          # 已经认得出来了，别动
+                        continue          # 名字里已经有编号了，改名解决不了
                     ep = episode_no(stem)
                     if not ep:
                         continue          # 抠不出集数就别猜
@@ -2699,7 +2733,7 @@ def plan_episode_renames(d, rules):
     return out
 
 
-def fix_episode_strm_names(d, rules, interactive=True):
+def fix_episode_strm_names(d, rules, key, interactive=True):
     """把剧集库里认不出集数的 strm 改名成 Emby 认得的样子。返回 (改了几个, 删了几个重复的)。
 
     第一次问一句，答案记在 ms_state["ep_fix"] 里，以后按那个答案自动做 ——
@@ -2710,7 +2744,7 @@ def fix_episode_strm_names(d, rules, interactive=True):
     strm 一改名就是一个新条目，那一集的进度接不回去。对刮不出来的灰方块
     通常无所谓（多半还没看），但必须让用户先知道再决定。
     """
-    todo = plan_episode_renames(d, rules)
+    todo = plan_episode_renames(d, rules, unscraped_strm_paths(key) if key else None)
     if not todo:
         return 0, 0
     dup = [x for x in todo if x[2]]
@@ -2720,7 +2754,8 @@ def fix_episode_strm_names(d, rules, interactive=True):
         if not interactive:
             return 0, 0               # 后台任务不替用户拿主意
         print()
-        info(f"剧集库里有 {len(todo)} 个 strm 的文件名认不出集数，Emby 刮不了它们。")
+        info(f"剧集库里有 {len(todo)} 个条目 Emby 一个刮削源都没认出来，"
+             f"而它们的文件名没有季集编号。")
         print(f"  {DIM}可以把 strm 改名成 Emby 认得的样子。【只改本地 strm 的文件名，"
               f"网盘一个字都不动】—— strm 里存的网盘路径不变，播放不受影响。{RST}")
         for src, dst, _ in ren[:5]:
@@ -3279,7 +3314,7 @@ def align_library(d, key, heal=True):
     # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
     # 路是用户手点「4」在看着的，可以问；cron 那条路不问，用记住的答案。
     try:
-        _nr, _nd = fix_episode_strm_names(d, lib_rules(d)[0], interactive=heal)
+        _nr, _nd = fix_episode_strm_names(d, lib_rules(d)[0], key, interactive=heal)
         if _nr or _nd:
             n_tuned += 1              # 借它触发一次重扫
     except Exception as e:
