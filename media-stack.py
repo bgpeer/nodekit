@@ -37,7 +37,7 @@ import zipfile
 # 【改了代码就要动这个数】它一直停在 1.1.0，于是「6 更新」永远打印
 # "v1.1.0 → v1.1.0"，用户根本没法判断新代码到底到没到机器上 ——
 # 排查时这是最基本的一条信息，缺了它只能靠猜。
-SCRIPT_VERSION = "1.4.0"
+SCRIPT_VERSION = "1.5.0"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2177,7 +2177,10 @@ LIB_RULES_HEADER = """\
 #   metatube  true 时这个库启用 MetaTube（按番号刮成人片）
 #             ⚠ 只给真的是成人片的库开。它会把动画认成 JAV —— 实测发生过
 #   episode_number  只对 tvshows 有意义。true = Emby 认错集号的剧集，在它的
-#             strm 旁边放一个只写季集编号的 .nfo（文件名和网盘一个字不动）。
+#             strm 旁边放一个写着季集编号和剧集名的 .nfo（文件名和网盘一个字
+#             不动）。名字由脚本按网盘文件名起 —— 编号按网盘连续编号写死之后，
+#             刮削器那边没有对应的那一集，名字它给不出来。
+#             false = 编号和名字都交给刮削器，代价是它会按自己的库分季。
 #             写了就按它办、一句不问；不写才会问一次
 #   keywords  逗号隔开，大小写不敏感
 #
@@ -2725,7 +2728,54 @@ def cloud_name_stem(hp):
     return os.path.splitext(os.path.basename(tgt or ""))[0]
 
 
-def untitled_episodes(d, rules, key):
+# 网盘文件名里除了集数就只剩这些的话，等于没有名字 —— 这些是画质/编码/字幕
+# 标记，不是剧集名。「233 4K」去掉 233 和 4K 就什么都不剩了。
+EP_JUNK = re.compile(
+    r"(?i)^(4k|8k|2160p?|1440p?|1080p?|720p?|480p?|hd|fhd|uhd|sd|hdr10?|dv|"
+    r"x26[45]|h\.?26[45]|hevc|avc|aac\d*|flac|ddp?\d?(\.\d)?|dts(-hd)?|truehd|"
+    r"web-?dl|web-?rip|blu-?ray|bd-?rip|hd-?tv|remux|repack|\d{2,3}fps|"
+    r"国语|日语|粤语|英语|双语|中字|中英|内封|内嵌|简体|繁体|外挂|字幕|无字|"
+    r"高清|超清|蓝光|全集|完结|未删减|v\d)$")
+EP_SPLIT = re.compile(r"[\s._\-\[\]()（）【】]+")
+# 带连字符的成组标记要【先整条去掉】，不能等切开再逐个认 —— WEB-DL 切成
+# WEB 和 DL 之后哪个都不在上面那张表里，结果「初露锋芒」后面挂着个 WEB DL。
+EP_JUNK_RUN = re.compile(r"(?i)\b(web[\s._-]?(dl|rip)|blu[\s._-]?ray|bd[\s._-]?rip|"
+                         r"hd[\s._-]?tv|dvd[\s._-]?rip|h[\s._-]?26[45])\b")
+
+
+def _xml_esc(s):
+    """写进 nfo 之前转义。网盘文件名里出现 & 或 < 的话，不转义会让整个 nfo
+    变成一个语法坏掉的 XML —— Emby 读不出来就当没有，编号和名字一起白写。"""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def episode_title_from_name(stem, ep):
+    """给这一集起个显示用的名字。stem 是网盘文件名（不含扩展名）。
+
+    【为什么要脚本自己起名】把集号按网盘的连续编号写死（S01E237）之后，
+    刮削器那边根本没有"第 1 季第 237 集"这一集 —— 它的库里 237 是第 5 季第 29 集。
+    对不上就给不出名字，标题栏只好一直挂着文件名「237 4K」。
+
+    要真名就得把编号交还给刮削器，那样又会被拆成好几季 —— 用户要的正好相反
+    （原话："我只需要你分集不是要你分季"）。两个不能同时要，所以名字这一半
+    自己来：网盘文件名里除了集数还有内容就用那部分，只剩画质标记就写「第N集」。
+
+        「236.断东河·吴」 → 断东河·吴
+        「237 4K」        → 第237集
+        「238」           → 第238集
+    """
+    rest = stem
+    m = re.match(r"^\s*0*%d\s*" % int(ep), rest)
+    if m:
+        rest = rest[m.end():]
+    rest = EP_JUNK_RUN.sub(" ", rest.lstrip(".、．_-–—:：|/\\ "))
+    words = [w for w in EP_SPLIT.split(rest) if w and not EP_JUNK.match(w)]
+    got = " ".join(words).strip(" -_.")
+    return got or f"第{int(ep)}集"
+
+
+def untitled_episodes(d, rules, key, items=None):
     """标题栏里放的还是文件名、刮削器给的真剧集名一直没进来的条目。
 
     返回 {strm 宿主机路径: 条目 id}；问不到返回 None。
@@ -2737,8 +2787,12 @@ def untitled_episodes(d, rules, key):
 
     只认【和文件名一模一样】的，一个字都不差才算。刮削器给的名字碰巧等于
     文件名的话，重新识别一次也只是拿回同样的结果，不会改坏什么。
+
+    【带着我们自己写的编号 nfo 的条目不算在内】那些的名字由 nfo 给，
+    交给刮削器重新识别只会把季集编号一起换掉 —— 那正是这一版要收拾的事故。
     """
-    items = _episode_items(key)
+    if items is None:
+        items = _episode_items(key)
     if items is None:
         return None
     roots = lib_strm_dirs(d, rules, [r["name"] for r in rules
@@ -2752,6 +2806,8 @@ def untitled_episodes(d, rules, key):
         # roots 为空 = 问不出媒体库的路径，那就不按库筛（宁可多修，别一个不修）
         if not hp or (roots and not any(_under(hp, q) for q in roots)):
             continue
+        if has_episode_nfo(hp):
+            continue                  # 名字由 nfo 给，绝不能交给刮削器重新识别
         name = str(i.get("Name") or "").strip()
         if not name:
             continue
@@ -2762,7 +2818,7 @@ def untitled_episodes(d, rules, key):
     return out
 
 
-def misparsed_strm_names(d, key):
+def misparsed_strm_names(d, key, items=None):
     """Emby 把集号认错了、或者压根没认出来的剧集。
 
     返回 {strm 宿主机路径: 条目 id}；问不到返回 None。
@@ -2787,7 +2843,8 @@ def misparsed_strm_names(d, key):
     None 和 {} 差别很大：None 是"问不出来"，一个文件都不该动；
     {} 是"确认没有认错的"。
     """
-    items = _episode_items(key)
+    if items is None:
+        items = _episode_items(key)
     if items is None:
         return None
     out = {}
@@ -3058,7 +3115,10 @@ def sync_progress_map(d, key):
 # 尤其它现在还在每轮把好名字还原回去。版本对不上就当没问过，重新问一次。
 # v3：机制从"改 strm 文件名"换成"旁挂 .nfo"。做法和代价都变了
 # （不再丢观看进度、不再和 AutoFilm 打架），旧答案不该沿用。
-EP_FIX_V = 3
+# v4：nfo 里多写一个剧集名，而且是【脚本自己起的】。编号写死成网盘的连续
+# 编号之后，刮削器那边根本没有对应的那一集，名字它给不出来 —— 要么名字
+# 自己起，要么把编号交回去让它拆季。这是个新的取舍，得重新问一次。
+EP_FIX_V = 4
 
 
 def ep_fix_setting():
@@ -3079,13 +3139,41 @@ EP_REIDENT_MAX = 120
 EP_TRIED_MAX = 3000
 
 
+def refresh_items(key, ids):
+    """让 Emby 重新读一遍这些条目的【本地文件】。返回成功发出去几个。
+
+    【这里绝对不能用 ReplaceAllMetadata=true】那个的意思是"把本地这份扔了，
+    全部按刮削器来"，季集编号也在其中。实测后果：nfo 写的是 S01E237，
+    重新识别之后被 TheTVDB 按它自己的库改成了 S5:E29，一部剧当场被拆成 2 季 ——
+    而用户要的正相反（原话："我只需要你分集不是要你分季"）。
+
+    false 才是对的：读 nfo、补空着的字段，编号和名字都以 nfo 为准。
+    """
+    n = 0
+    for iid in ids:
+        if not iid:
+            continue
+        try:
+            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
+                  f"&ImageRefreshMode=Default"
+                  f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
+                  key, method="POST", timeout=30)
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
 def reidentify_items(key, ids):
     """让 Emby 对这些条目【重新识别】。返回成功发出去几个。
 
-    【必须 ReplaceAllMetadata=true】false 的含义是"只补缺失的字段"，而这些
-    条目的标题栏里【已经有东西了】—— 就是那个文件名。Emby 一看不缺，
-    根本不会去问刮削器要真正的剧集名。这正是"集号补对了、名字还是 233 4K"的
-    全部原因：简介、海报都刮回来了（那些字段本来是空的），唯独名字不是空的。
+    【只给"编号本来就归刮削器管"的条目用】true 的含义是"把本地这份扔了，
+    全部按刮削器来"，季集编号也算在内。带我们自己写的编号 nfo 的条目一律
+    不能走这条路 —— 走了就会被按刮削器的库重排季集，一部剧当场拆成好几季。
+    untitled_episodes 已经把那些排除掉了，这里只剩编号本来就由刮削器定的。
+
+    为什么这些非得用 true：它们的标题栏里【已经有东西了】—— 就是那个文件名。
+    false 只补缺失的字段，Emby 一看不缺，根本不会去问刮削器要真正的剧集名。
 
     图像不动（ReplaceAllImages=false）：缩略图早刮好了，重下一遍是白花流量。
 
@@ -3106,20 +3194,19 @@ def reidentify_items(key, ids):
     return n
 
 
-def fix_episode_titles(d, rules, key, skip=()):
+def fix_episode_titles(d, rules, key, skip=(), items=None):
     """把标题栏还停在文件名上的剧集，叫 Emby 重新识别一次。返回发出去几个。
 
-    和补季集编号是两件事，故意分开：编号靠 nfo（本地就能定），名字只能问
-    刮削器要。补完编号之后 Emby 才知道这是第几集，这时候重新识别才拿得到
-    对应那一集的名字 —— 所以这一步永远排在写 nfo 后面。
+    【只管没有编号 nfo 的那些】写了 nfo 的条目名字从 nfo 来（见
+    episode_title_from_name），把它们交给刮削器重新识别会连季集编号一起换掉。
 
-    skip 是这一轮刚刚单独发过重新识别的那些，别再发第二遍：Emby 是后台跑的，
+    skip 是这一轮刚刚单独动过的那些，别再发第二遍：Emby 是后台跑的，
     这会儿它们看起来仍然"没名字"。重复发不只是白发 —— 还会把它们记进
     ep_title_tried，等于把一次都还没跑完的尝试当成"试过了"。
     """
     if not key:
         return 0
-    got = untitled_episodes(d, rules, key)
+    got = untitled_episodes(d, rules, key, items)
     if not got:
         return 0
     tried = set(ms_state().get("ep_title_tried") or []) | set(skip)
@@ -3165,15 +3252,18 @@ def write_episode_nfo(strm_path, season, ep):
     nfo 没有这个问题：文件名不动，AutoFilm 认得它、不会重新生成；
     Emby 从 nfo 读季集编号。路径不变 = 条目不变 = 进度不丢。
 
-    【只写编号，不写身份】不写 uniqueid/title/plot 这些。这个仓库为
+    【写编号和名字，不写身份】不写 uniqueid/plot/演员这些。这个仓库为
     「刮削身份从 nfo 里阴魂不散」踩过坑 —— nfo 会成为身份的第二份存档，
-    从数据库里清掉多少次，下次扫描又灌回去。这里只解决"这是第几集"，
-    其余一律留给刮削器。
+    从数据库里清掉多少次，下次扫描又灌回去。名字是个例外，见
+    episode_title_from_name：编号写死成网盘的连续编号之后，刮削器那边
+    根本没有对应的那一集，名字它给不出来，只能自己起。
     """
     nfo = os.path.splitext(strm_path)[0] + ".nfo"
+    title = _xml_esc(episode_title_from_name(cloud_name_stem(strm_path), ep))
     body = (f'<?xml version="1.0" encoding="utf-8"?>\n'
             f"{EP_NFO_MARK}\n"
             f"<episodedetails>\n"
+            f"  <title>{title}</title>\n"
             f"  <season>{int(season)}</season>\n"
             f"  <episode>{int(ep)}</episode>\n"
             f"</episodedetails>\n")
@@ -3190,6 +3280,46 @@ def write_episode_nfo(strm_path, season, ep):
         return True
     except OSError:
         return False
+
+
+def has_episode_nfo(strm_path):
+    """这个 strm 旁边有没有【我们自己写的】那种 nfo。"""
+    try:
+        with open(os.path.splitext(strm_path)[0] + ".nfo",
+                  encoding="utf-8", errors="replace") as f:
+            return EP_NFO_MARK in f.read()
+    except OSError:
+        return False
+
+
+def upgrade_episode_nfo(d):
+    """给早先写下的、只有编号没有名字的 nfo 补上名字。返回补过的 strm 路径。
+
+    【为什么要单独走一趟】这些条目的编号已经补对了，从此不会再被判成
+    "集号认错"，也就再不会进 plan_episode_renames —— 光靠那条路，它们的
+    名字永远补不上。用户看到的就是"新的好了，之前那批还是文件名"。
+    """
+    out = []
+    for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
+        for f in fs:
+            if not f.endswith(".nfo"):
+                continue
+            q = os.path.join(dp, f)
+            try:
+                with open(q, encoding="utf-8", errors="replace") as fh:
+                    cur = fh.read()
+            except OSError:
+                continue
+            if EP_NFO_MARK not in cur or "<title>" in cur:
+                continue
+            strm = os.path.splitext(q)[0] + ".strm"
+            m1 = re.search(r"<season>(\d+)</season>", cur)
+            m2 = re.search(r"<episode>(\d+)</episode>", cur)
+            if not (m1 and m2 and os.path.exists(strm)):
+                continue
+            if write_episode_nfo(strm, int(m1.group(1)), int(m2.group(1))):
+                out.append(strm)
+    return out
 
 
 def drop_episode_nfo(d, roots=None):
@@ -3313,7 +3443,18 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         if _n:
             ok(f"清掉 {_n} 个季集编号文件（{'、'.join(clean)}），恢复成网盘原样")
 
-    bad = misparsed_strm_names(d, key) if key else None
+    # 【一轮只拉一次条目表】下面三处都要用它：判集号、找没名字的、拿条目 id。
+    all_items = _episode_items(key) if key else None
+    bad = misparsed_strm_names(d, key, all_items) if key else None
+    ids = ({host_strm_path(d, str(i.get("Path") or "")): i.get("Id")
+            for i in (all_items or [])} if all_items else {})
+    # 【早先只写了编号、没写名字的那批要补上】它们的编号已经对了，从此不会
+    # 再被判成"集号认错"，光靠下面那条路永远轮不到它们 —— 外面看到的就是
+    # "新加的好了，之前那批还是文件名"。
+    up = upgrade_episode_nfo(d)
+    if up:
+        ok(f"{len(up)} 个条目补上了剧集名{DIM}（早先只写了编号）{RST}")
+        refresh_items(key, [ids.get(p) for p in up])
     todo = plan_episode_renames(d, rules, bad)      # 写了 false 的库不在里面
     on = [t for t in todo if t[3] is True]          # 规则文件说做
     und = [t for t in todo if t[3] is None]         # 规则文件没说，听开关的
@@ -3357,7 +3498,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
                 return fix_episode_strm_names(d, rules, key, interactive=False)
     do = on + (und if st else [])
     if not do:
-        fix_episode_titles(d, rules, key)
+        fix_episode_titles(d, rules, key, skip=up, items=all_items)
         return 0, 0
     n, wrote = 0, []
     for src, sea, ep, _dc in do:
@@ -3365,13 +3506,14 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             n += 1
             wrote.append(src)
     if n:
-        ok(f"{n} 个条目补上了季集编号{DIM}（旁挂 .nfo，文件名和网盘都没动）{RST}")
-        # 【刚写完的这批必须当场叫 Emby 重新识别】不然它读不到 nfo：
-        # 文件是脚本在 Emby 背后放的，Emby 不重新识别就还按旧的来。
-        # 顺带把名字也一起要回来 —— 重新识别一次两件事都办了。
-        reidentify_items(key, [bad.get(p) for p in wrote])
-    # 编号补齐之后 Emby 才知道这是第几集，这时候才要得到对应那一集的名字。
-    fix_episode_titles(d, rules, key, skip=wrote)
+        ok(f"{n} 个条目补上了季集编号和剧集名"
+           f"{DIM}（旁挂 .nfo，文件名和网盘都没动）{RST}")
+        # 【刚写完的这批要当场叫 Emby 重读一遍】文件是脚本在 Emby 背后放的，
+        # 不重读它就还按旧的来。用 refresh_items（ReplaceAllMetadata=false）——
+        # true 会把编号一起交还给刮削器，那正是"一部剧被拆成 2 季"的来源。
+        refresh_items(key, [bad.get(p) for p in wrote])
+    fix_episode_titles(d, rules, key, skip=list(wrote) + list(up),
+                       items=all_items)
     return n, 0
 
 
