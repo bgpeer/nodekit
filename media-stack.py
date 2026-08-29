@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.2"
+SCRIPT_VERSION = "1.5.3"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3330,6 +3330,17 @@ def episode_number_mismatch(d, items):
         if (int(got_s), int(got_e)) != want:
             out.append((hp, i.get("Id"), want[0], want[1], int(got_s), int(got_e)))
     return out
+
+
+def count_episode_nfo(d):
+    """脚本自己写下的季集编号 nfo 有几个。"""
+    n = 0
+    for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
+        for f in fs:
+            if f.endswith(".nfo") and has_episode_nfo(
+                    os.path.join(dp, os.path.splitext(f)[0] + ".strm")):
+                n += 1
+    return n
 
 
 def has_episode_nfo(strm_path):
@@ -9966,7 +9977,11 @@ def stack_versions(key=""):
     AutoFilm 没有版本接口，退而取【镜像的构建日期】：这套东西全用 :latest 标签，
     构建日期就是"你手上这份有多新"最实在的答案，比没有强。
     """
-    out = {}
+    # 【脚本自己排第一】这套东西每次修的都是脚本，可 stack_versions 一直只报
+    # Emby/OpenList/MediaWarp/AutoFilm —— 唯独漏了它。结果是"修好推上去了"和
+    # "这台机器上跑的是哪一版"之间没有任何一条能对上的信息，排查时只能靠猜
+    # 用户到底更新没更新。这一行早就该有。
+    out = {"脚本": f"v{SCRIPT_VERSION}"}
     if key:
         try:
             out["Emby"] = str(_emby("/System/Info", key, timeout=20).get("Version") or "")
@@ -10834,6 +10849,49 @@ def do_healthcheck():
                     + "；".join(_how) + "。改完点「4 生成媒体库」"))
             elif key:
                 _hc("刮削结果", "ok", "条目都刮到了信息")
+
+            # ---- 剧集编号 ----
+            # 【写下 ≠ 生效，必须在体检里看得见】用户几轮回来说"还是没变"，
+            # 而脚本那边一路打印"已补上季集编号" —— 两边对不上话，因为
+            # 核对只在「4 生成媒体库」里做，而用户看的是这里。
+            if key:
+                _eps = _episode_items(key)
+                _nfo = count_episode_nfo(d)
+                if _nfo and _eps is not None:
+                    _off = episode_number_mismatch(d, _eps)
+                    _rd = episode_nfo_reader_on(key, lib_rules(d)[0])
+                    if not _off:
+                        _hc("剧集编号", "ok",
+                            f"{_nfo} 个条目按 nfo 编号，Emby 都认了")
+                    else:
+                        _p, _i, _ws, _we, _gs, _ge = _off[0]
+                        _hc("剧集编号", "bad",
+                            f"{len(_off)}/{_nfo} 个 Emby 没采纳"
+                            f"{DIM}（nfo 写 S{_ws:02d}E{_we:02d}，"
+                            f"Emby 显示第 {_gs} 季第 {_ge} 集）{RST}")
+                        # 【把 Emby 自己给出的可选项打出来】判断"本地读取器被
+                        # 挤掉了"要有依据：这台机器上「元数据下载器（集）」到底
+                        # 有哪些可选，只有 Emby 自己知道。没有这一行，这个结论
+                        # 就永远停在推测上 —— 这一串问题上已经猜错过两次了。
+                        _av = (_emby_avail_names(key, "tvshows")
+                               .get(("Episode", "MetadataFetchers")) or [])
+                        if _av:
+                            print(f"      {DIM}Emby 给出的可选项（集）："
+                                  f"{'、'.join(_av)}{RST}")
+                        print(f"      {DIM}本地 Nfo 读取器："
+                              f"{'开着' if _rd else RED + '没开 —— 就是它' + RST}{RST}")
+                        todo.append((
+                            f"{len(_off)} 个剧集的季集编号 Emby 没有采纳 —— "
+                            f"nfo 里写的是 S{_ws:02d}E{_we:02d}，"
+                            f"界面上显示的是第 {_gs} 季第 {_ge} 集",
+                            ("媒体库的「元数据下载器（集）」里没有 Nfo，本地的 "
+                             ".nfo 根本不会被读 —— 跑一次「6 更新」再点「4 生成"
+                             "媒体库」，脚本会把它补回去并排到最前"
+                             if not _rd else
+                             "Nfo 读取器是开着的，那就是 Emby 没重读本地文件："
+                             "点「4 生成媒体库」会重刮一次；还不行就到 Emby 里"
+                             "点这部剧 → 编辑元数据，手工填一次季号/集号，"
+                             "或者把这个库改成 episode_number: false")))
 
             nodur = items_without_duration(key)
             if nodur:
