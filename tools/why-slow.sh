@@ -66,11 +66,16 @@ def g(k,d2=""): return ms.get(k) or d2
 size=g("Size",0) or 0
 dur=(it.get("RunTimeTicks") or 0)/10_000_000
 br=g("Bitrate",0) or 0
-print(f"  容器      {g('Container','?')}")
-print(f"  文件大小  {size/1024/1024:.0f} MiB" if size else "  文件大小  未知")
+cont=g('Container','?')
+hls = str(cont).lower() in ("hls","m3u8")
+print(f"  容器      {cont}" + ("   ← 转码流：网盘给的是播放列表，不是整文件，"
+                               "所以下面大小/码率是空的（正常）" if hls else ""))
+print(f"  文件大小  {size/1024/1024:.0f} MiB" if size
+      else ("  文件大小  —（HLS 没有单一文件）" if hls else "  文件大小  未知"))
 print(f"  时长      {dur/60:.1f} 分钟" if dur else "  时长      未知（时长为 0 会让续播点存不下来）")
 if br: print(f"  总码率    {br/1_000_000:.2f} Mbps   <<< 两集差得多的话，卡就是它")
 elif size and dur: print(f"  总码率    {size*8/dur/1_000_000:.2f} Mbps（按大小/时长算）  <<< 两集差得多的话，卡就是它")
+elif hls: print("  总码率    —（HLS 的码率看下面「流码率」那行）")
 else: print("  总码率    未知")
 for s in (ms.get("MediaStreams") or []):
     t=s.get("Type")
@@ -86,42 +91,142 @@ for s in (ms.get("MediaStreams") or []):
 PY
 }
 
-# ---- 302 + 实测下载速度 ----
+# ---- 302 + 实测速度（认得出 HLS 和整文件两种）----
 probe() {       # $1=ItemId
-  local iid="$1"
-  local url="$MW/Videos/$iid/stream?MediaSourceId=mediasource_${iid}&Static=true&api_key=$KEY"
-  local t0 t1 code loc
-  t0=$(date +%s.%N)
-  # -D - 拿响应头（要的是 302 的 Location），-o /dev/null 扔掉正文
-  local hdr; hdr="$(curl -s -m 90 -D - -o /dev/null "$url" 2>/dev/null)"
-  t1=$(date +%s.%N)
-  code="$(printf '%s' "$hdr" | sed -nE 's#^HTTP/[0-9.]+ ([0-9]+).*#\1#p' | tail -1)"
-  loc="$(printf '%s' "$hdr" | sed -nE 's/^[Ll]ocation:[[:space:]]*(.*)$/\1/p' | tr -d '\r' | tail -1)"
-  printf "  换直链    %.1f 秒   HTTP %s\n" "$(echo "$t1 - $t0" | bc)" "${code:-?}"
-  if [ -z "$loc" ]; then
-    echo "  ✖ 没拿到 302 —— 视频会经过本机中转，那是必卡的"
-    return
-  fi
-  echo "  直链节点  $(printf '%s' "$loc" | sed -E 's#^[a-z]+://([^/]+).*#\1#')"
-  # 从【中间】拉 16MiB：开头那段网盘往往有缓存，测不出真实持续速度
-  local off=$((80 * 1024 * 1024))
-  local end=$((off + 16 * 1024 * 1024 - 1))
-  local out
-  out="$(curl -s -m 120 -o /dev/null -r "${off}-${end}" \
-         -w '%{speed_download} %{size_download} %{time_starttransfer}' "$loc" 2>/dev/null)"
-  local spd sz ttfb
-  spd="$(printf '%s' "$out" | awk '{print $1}')"
-  sz="$(printf '%s' "$out" | awk '{print $2}')"
-  ttfb="$(printf '%s' "$out" | awk '{print $3}')"
-  if [ -z "${sz:-}" ] || [ "${sz:-0}" = "0" ]; then
-    echo "  ✖ 直链拉不动（拉了 0 字节）—— 这条线就是坏的"
-    return
-  fi
-  printf "  首字节    %.2f 秒\n" "${ttfb:-0}"
-  printf "  实测速度  %.2f MB/s  = %.1f Mbps  （从第 80 MiB 处拉了 %s MiB）\n" \
-    "$(echo "$spd/1048576" | bc -l)" "$(echo "$spd*8/1000000" | bc -l)" \
-    "$(echo "$sz/1048576" | bc -l | cut -c1-4)"
-  echo "  ↑ 这个数要【大于上面那个总码率】才不卡。小于就是卡的直接原因。"
+  python3 - "$MW" "$KEY" "$1" <<'PY'
+import re, sys, time, urllib.request, urllib.error
+mw, key, iid = sys.argv[1], sys.argv[2], sys.argv[3]
+
+class NoRedir(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+
+def get(url, rng=None, timeout=90):
+    req = urllib.request.Request(url, headers={"User-Agent": "why-slow"})
+    if rng:
+        req.add_header("Range", f"bytes={rng[0]}-{rng[1]}")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+url = (f"{mw}/Videos/{iid}/stream?MediaSourceId=mediasource_{iid}"
+       f"&Static=true&api_key={key}")
+op = urllib.request.build_opener(NoRedir)
+t0 = time.time()
+loc = ""
+try:
+    r = op.open(url, timeout=90)
+    print(f"  换直链    {time.time()-t0:.1f} 秒   HTTP {r.status}（不是 302）")
+except urllib.error.HTTPError as e:
+    dt = time.time() - t0
+    if e.code in (301, 302, 303, 307, 308):
+        loc = e.headers.get("Location", "")
+        print(f"  换直链    {dt:.1f} 秒   HTTP {e.code}")
+    else:
+        print(f"  换直链    {dt:.1f} 秒   {'✖ HTTP %d' % e.code}")
+        print(f"  ✖ 没拿到直链：{dt:.1f} 秒之后回了个 {e.code}。"
+              f"这一集【这会儿根本放不了】——")
+        print(f"    换直链是每次播放都要走一遍的，它失败就是点开转圈。"
+              f"多半是网盘接口在限流（跑「5 体检」看「列目录历史」那张图）。")
+        raise SystemExit
+except Exception as e:
+    print(f"  ✖ 换直链失败：{e}"); raise SystemExit
+if not loc:
+    print("  ✖ 没拿到 302 —— 视频会经过本机中转，那是必卡的"); raise SystemExit
+host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
+print(f"  直链节点  {host}")
+
+# --- 这条直链是 HLS 播放列表，还是一个整文件？ ---
+try:
+    r = get(loc, timeout=60)
+    head = r.read(65536)
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    clen = r.headers.get("Content-Length")
+except Exception as e:
+    print(f"  ✖ 直链打不开：{e}"); raise SystemExit
+
+is_hls = head.lstrip().startswith(b"#EXTM3U") or "mpegurl" in ctype
+if not is_hls:
+    # 整文件：从第 80 MiB 处拉 16 MiB —— 开头那段往往有缓存，测不出持续速度
+    size = int(clen or 0)
+    off = 80 * 1024 * 1024 if size > 100 * 1024 * 1024 else 0
+    t = time.time(); got = 0
+    try:
+        rr = get(loc, (off, off + 16 * 1024 * 1024 - 1), timeout=120)
+        ttfb = time.time() - t
+        while got < 16 * 1024 * 1024:
+            b = rr.read(1 << 20)
+            if not b: break
+            got += len(b)
+    except Exception as e:
+        print(f"  ✖ 拉不动：{e}"); raise SystemExit
+    dt = max(time.time() - t, 1e-6)
+    print(f"  类型      整文件（原画直链）{'  %.0f MiB' % (size/1048576) if size else ''}")
+    print(f"  首字节    {ttfb:.2f} 秒")
+    print(f"  实测速度  {got/dt/1048576:.2f} MB/s = {got*8/dt/1e6:.1f} Mbps"
+          f"（从第 {off//1048576} MiB 处拉了 {got/1048576:.1f} MiB）")
+    print("  ↑ 要大于这一集的总码率才不卡。")
+    raise SystemExit
+
+# --- HLS：整个播放列表才几 KB，拿 Range 去测它是【没有意义】的。
+#     要测的是里面的分片（.ts），顺便从 BANDWIDTH 读出这条流的码率。 ---
+print("  类型      HLS 播放列表（转码流）—— 码率由网盘那边定，不是原片码率")
+txt = head.decode("utf-8", "replace")
+try:
+    txt += r.read().decode("utf-8", "replace")
+except Exception:
+    pass
+
+def abso(u):
+    if u.startswith("http"): return u
+    return loc.rsplit("/", 1)[0] + "/" + u.lstrip("/")
+
+bw = 0
+m = re.search(r"BANDWIDTH=(\d+)", txt)
+if m:
+    bw = int(m.group(1))
+    print(f"  流码率    {bw/1e6:.2f} Mbps（播放列表里写的 BANDWIDTH）")
+# master playlist -> 再进一层拿真正的分片列表
+lines = [x.strip() for x in txt.splitlines() if x.strip() and not x.startswith("#")]
+if lines and (".m3u8" in lines[0]):
+    try:
+        loc2 = abso(lines[0])
+        txt = get(loc2, timeout=60).read().decode("utf-8", "replace")
+        loc = loc2
+        lines = [x.strip() for x in txt.splitlines()
+                 if x.strip() and not x.startswith("#")]
+    except Exception as e:
+        print(f"  ✖ 二级播放列表打不开：{e}"); raise SystemExit
+if not lines:
+    print("  ✖ 播放列表里一个分片都没有 —— 这条流是空的"); raise SystemExit
+print(f"  分片数    {len(lines)} 个")
+# 拉【中间】那 3 个分片：开头几个网盘那边常是预热好的，测不出真实情况
+mid = max(0, len(lines) // 2 - 1)
+tot, dt_all, ttfb1, fails = 0, 0.0, None, 0
+for u in lines[mid:mid + 3]:
+    t = time.time()
+    try:
+        rr = get(abso(u), timeout=60)
+        if ttfb1 is None: ttfb1 = time.time() - t
+        n = 0
+        while True:
+            b = rr.read(1 << 20)
+            if not b: break
+            n += len(b)
+        tot += n; dt_all += time.time() - t
+    except Exception:
+        fails += 1
+if fails:
+    print(f"  ✖ {fails}/3 个分片拉失败 —— 播的时候就是卡在这儿")
+if tot and dt_all:
+    spd = tot / dt_all
+    print(f"  首字节    {ttfb1:.2f} 秒")
+    print(f"  实测速度  {spd/1048576:.2f} MB/s = {spd*8/1e6:.1f} Mbps"
+          f"（拉了中间 {3-fails} 个分片，共 {tot/1048576:.1f} MiB）")
+    if bw:
+        r_ = spd * 8 / bw
+        print(f"  余量      {r_:.1f}x   " + (
+            "✔ 够（要 >1.5x 才稳）" if r_ >= 1.5 else
+            "⚠ 勉强，遇到抖动就卡" if r_ >= 1.0 else
+            "✖ 不够 —— 边放边等，这就是卡的直接原因"))
+PY
 }
 
 echo
@@ -190,17 +295,22 @@ echo
 hr
 cat <<'TIP'
   怎么看这份结果
-    · 两集的【总码率】差一倍以上          → 就是片源重，跟脚本无关。
+    · 容器是 hls（转码流）                → 大小/总码率是空的，正常。
+                                            码率看「流码率」那行 —— 那是网盘
+                                            那边定的档位，不是原片码率
+    · 「余量」小于 1.5x                   → 边放边等，这就是卡的直接原因。
                                             去「3 后补参数 → 3」把直链方式
-                                            从「转码流」换成「原画」反而更稳，
-                                            或者反过来试
-    · 卡的那集【实测速度 < 总码率】       → 边放边等，必卡。看是不是落到了
-                                            另一个直链节点（上面那行「直链节点」）
+                                            从「转码流」换成「原画」试试：
+                                            原画是直接拉整文件，不经过网盘的
+                                            转码服务器，通常更稳
+    · 换直链 ✖（404 / 超时）              → 这一集【当下根本放不了】，点开就转圈。
+                                            换直链是每次播放都要走一遍的。
+                                            多半是网盘接口在限流 ——
+                                            跑「5 体检」看「列目录历史」那张图
+    · 有分片拉失败                        → 播的时候就是卡在那几个分片上
     · 播放方式不是 DirectPlay             → Emby 在转码，2 核的机器扛不住。
-                                            多半是那一集的编码客户端不认
+                                            多半是编码客户端不认
                                             （HEVC 10bit / AV1 / 特殊音轨）
-    · 两集各项都差不多、就是卡            → 那就不是这一集的问题，是网盘那会儿
-                                            在限流。跑「5 链路体检」看
-                                            「列目录历史」那张探测图
+    · 两集各项都差不多、就是卡            → 不是这一集的问题，是网盘那会儿在限流
 TIP
 echo
