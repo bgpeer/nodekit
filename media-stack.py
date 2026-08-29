@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.4"
+SCRIPT_VERSION = "1.5.5"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3656,6 +3656,13 @@ def verify_episode_numbers(d, rules, key, items):
         ok(f"{n} 个条目的季集编号已直接写进 Emby"
            f"{DIM}（走的是「编辑元数据」那个接口，不经过刮削器；"
            f"下轮还会再核对一次）{RST}")
+        # 【同一轮里刚发过整库重新识别的话，这次写多半白写】那个是后台跑的，
+        # 跑完会按刮削器重排季集，把刚写进去的盖掉。说清楚，别让用户以为
+        # 是写失败了 —— 上一轮就是这么"写成功了、界面上没变"的。
+        if time.time() - int(ms_state().get("reident_ts") or 0) < 600:
+            warn("这一轮还给整个库发过一次重新识别（后台跑）")
+            print(f"  {DIM}它跑完会把编号按刮削器改回去 —— 下一轮对齐"
+                  f"（一小时内）会再写一次，那次才作数。{RST}")
     if n < len(off):
         warn(f"还有 {len(off) - n} 个没写进去")
         print(f"  {DIM}到 Emby 里点这一集 → 编辑元数据，手工填「季号 / 集号」；"
@@ -7803,7 +7810,7 @@ def sync_library_options(d, key, rules):
         adult_k = _pick_opt_key(o, ("EnableAdultMetadata", "AllowAdultMetadata",
                                     "EnableAdultContent"))
         adult_v = bool(rule.get("mt"))
-        same = ((want is None or o.get("TypeOptions") == want)
+        same = ((want is None or _same_fetchers(o.get("TypeOptions"), want))
                 and o.get("PreferredMetadataLanguage") == lang
                 and o.get("MetadataCountryCode") == country
                 and o.get("PreferredImageLanguage") == img_lang
@@ -7811,7 +7818,7 @@ def sync_library_options(d, key, rules):
         if same:
             continue
         if want is not None:
-            o["TypeOptions"] = want
+            o["TypeOptions"] = _merge_type_options(o.get("TypeOptions"), want)
         o["PreferredMetadataLanguage"] = lang
         o["MetadataCountryCode"] = country
         o["PreferredImageLanguage"] = img_lang
@@ -7825,7 +7832,8 @@ def sync_library_options(d, key, rules):
             # 见下面 _full 那段。语言变了补一遍缺失字段就够；刮削器换了必须
             # 重新识别，否则等于没换。
             changed_ids.append((lb.get("ItemId"), nm,
-                                want is not None and want != tos))
+                                want is not None
+                                and not _same_fetchers(tos, want)))
             if adult_k:
                 adult_want[lb.get("ItemId")] = (nm, adult_k, adult_v)
         except Exception as e:
@@ -8016,6 +8024,54 @@ def _emby_default_fetchers(key, ctype):
         out.append({"Type": t.get("Type") or "",
                     "MetadataFetchers": md, "MetadataFetcherOrder": list(md),
                     "ImageFetchers": im, "ImageFetcherOrder": list(im)})
+    return out
+
+
+def _fetcher_map(tos):
+    """{内容类型: (元数据刮削器顺序, 图像刮削器顺序)}。只取我们管的那几项。"""
+    out = {}
+    for t in (tos or []):
+        out[t.get("Type") or ""] = (
+            list(t.get("MetadataFetcherOrder") or t.get("MetadataFetchers") or []),
+            list(t.get("ImageFetcherOrder") or t.get("ImageFetchers") or []))
+    return out
+
+
+def _same_fetchers(cur, want):
+    """Emby 存的和我们要的，【在我们管的那部分上】是不是已经一样。
+
+    【绝对不能整份 dict 比】Emby 存的 TypeOptions 每一项带一堆我们不认识、
+    也没打算管的字段，而我们构造的只有刮削器那四个键 —— 两边永远不相等。
+    于是每一轮都判成"改了"，每一轮都重写、每一轮都发一次【整库全量重新识别】。
+
+    这个 bug 之前是睡着的：重新识别那段循环缩错了层，一次都没转过。
+    上一版把层级修对，它就醒了 —— 表现是每次「4 生成媒体库」和每小时的
+    对齐都在把整个库重刮一遍：机器被啃住（播放一卡一卡），而且
+    ReplaceAllMetadata=true 会把脚本刚写进去的季集编号又按刮削器改回去。
+    "写进去了却没变"和"突然开始卡"是同一个来源。
+    """
+    c, w = _fetcher_map(cur), _fetcher_map(want)
+    return all(c.get(ty) == v for ty, v in w.items())
+
+
+def _merge_type_options(cur, want):
+    """把要的刮削器名单【并进】Emby 现有的那份，其它字段一个不动。
+
+    整份替换会把 Emby 自己存在里面的其它设置一起抹掉 —— 那些是它的东西，
+    我们既不认识也没理由动。
+    """
+    out = [dict(t) for t in (cur or [])]
+    idx = {(t.get("Type") or ""): t for t in out}
+    for t in (want or []):
+        ty = t.get("Type") or ""
+        if ty not in idx:
+            out.append(dict(t))
+            idx[ty] = out[-1]
+            continue
+        for k in ("MetadataFetchers", "MetadataFetcherOrder",
+                  "ImageFetchers", "ImageFetcherOrder"):
+            if t.get(k) is not None:
+                idx[ty][k] = list(t[k])
     return out
 
 
