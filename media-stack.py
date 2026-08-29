@@ -2816,11 +2816,7 @@ def plan_episode_renames(d, rules, broken=None):
                         continue
                     if not ep:
                         continue          # 抠不出集数就别猜
-                    new = f"{show} - S{sea:02d}E{ep:02d}.strm"
-                    if new == f:
-                        continue
-                    src, dst = os.path.join(dp, f), os.path.join(dp, new)
-                    out.append((src, dst, os.path.exists(dst)))
+                    out.append((os.path.join(dp, f), sea, ep))
     return out
 
 
@@ -2990,7 +2986,9 @@ def sync_progress_map(d, key):
 #
 # 用户当初回答的是【另一个问题】，那个答案不该原样套到这个问题上 ——
 # 尤其它现在还在每轮把好名字还原回去。版本对不上就当没问过，重新问一次。
-EP_FIX_V = 2
+# v3：机制从"改 strm 文件名"换成"旁挂 .nfo"。做法和代价都变了
+# （不再丢观看进度、不再和 AutoFilm 打架），旧答案不该沿用。
+EP_FIX_V = 3
 
 
 def ep_fix_setting():
@@ -3000,6 +2998,74 @@ def ep_fix_setting():
         return None
     v = st.get("ep_fix")
     return bool(v) if v is not None else None
+
+
+# 我们自己写的 .nfo 上的记号。只删带这一行的，绝不碰用户/AutoFilm 从网盘
+# 下下来的那些 nfo。
+EP_NFO_MARK = "<!-- media-stack: 只给 Emby 补季集编号，别的一概不写 -->"
+
+
+def write_episode_nfo(strm_path, season, ep):
+    """在 strm 旁边写一个只含季集编号的 .nfo。成功返回 True。
+
+    【为什么改成写 nfo，不再改 strm 的文件名】改名这条路在跟 AutoFilm 打架，
+    而且每轮都会输一次：
+
+        AutoFilm 每次扫描 → 按网盘原名重新生成 231 4K.strm
+        Emby 扫到         → 建一个新条目
+        脚本下一轮        → 认出是重复品，删掉 231 4K.strm
+        Emby 再扫         → 那个条目没文件了，删掉
+
+    条目就这么反复出现和消失。用户正在放的时候撞上，播放器弹「找不到条目」；
+    观看进度也活不过一轮 —— 这两个症状是同一个来源。
+
+    nfo 没有这个问题：文件名不动，AutoFilm 认得它、不会重新生成；
+    Emby 从 nfo 读季集编号。路径不变 = 条目不变 = 进度不丢。
+
+    【只写编号，不写身份】不写 uniqueid/title/plot 这些。这个仓库为
+    「刮削身份从 nfo 里阴魂不散」踩过坑 —— nfo 会成为身份的第二份存档，
+    从数据库里清掉多少次，下次扫描又灌回去。这里只解决"这是第几集"，
+    其余一律留给刮削器。
+    """
+    nfo = os.path.splitext(strm_path)[0] + ".nfo"
+    body = (f'<?xml version="1.0" encoding="utf-8"?>\n'
+            f"{EP_NFO_MARK}\n"
+            f"<episodedetails>\n"
+            f"  <season>{int(season)}</season>\n"
+            f"  <episode>{int(ep)}</episode>\n"
+            f"</episodedetails>\n")
+    try:
+        if os.path.exists(nfo):
+            with open(nfo, encoding="utf-8", errors="replace") as f:
+                cur = f.read()
+            if EP_NFO_MARK not in cur:
+                return False          # 别人的 nfo，不动
+            if cur == body:
+                return False          # 已经是这样了，别白写
+        with open(nfo, "w", encoding="utf-8") as f:
+            f.write(body)
+        return True
+    except OSError:
+        return False
+
+
+def drop_episode_nfo(d):
+    """删掉所有【我们自己写的】那种 .nfo。返回删了几个。"""
+    n = 0
+    for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
+        for f in fs:
+            if not f.endswith(".nfo"):
+                continue
+            q = os.path.join(dp, f)
+            try:
+                with open(q, encoding="utf-8", errors="replace") as fh:
+                    if EP_NFO_MARK not in fh.read():
+                        continue
+                os.remove(q)
+                n += 1
+            except OSError:
+                continue
+    return n
 
 
 def restore_strm_names(d):
@@ -3057,84 +3123,62 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     名字【全部还原】（见 restore_strm_names），不是"以后不改"而已 ——
     那样等于关不掉。
     """
-    # 【关掉就要还原，不能只是"以后不改"】
+    # 【关掉就要清干净，不能只是"以后不做"】
     if ep_fix_setting() is False:
-        print(f"  {DIM}剧集改名：开关是【关】的，本轮不改名"
-              f"（要开：3 后补参数 → 11）{RST}")
-        _r = restore_strm_names(d)
+        print(f"  {DIM}剧集编号：开关是【关】的（要开：3 后补参数 → 11）{RST}")
+        _r = restore_strm_names(d) + drop_episode_nfo(d)
         if _r:
-            ok(f"{_r} 个 strm 已还原成网盘里的原名（改名功能是关着的）")
-            print(f"  {DIM}观看进度按网盘文件记着，下一轮同步会自己补回来。{RST}")
+            ok(f"清掉 {_r} 处旧的改名/编号文件，恢复成网盘原样")
         return 0, 0
     bad = misparsed_strm_names(d, key) if key else None
     todo = plan_episode_renames(d, rules, bad)
     if not todo:
-        # 【什么都不做的时候更要出声】这一步之前是静默 return，于是"开关开着、
-        # 跑完没反应"这种情况完全没有线索 —— 到底是没挑出来、还是挑出来了没改，
-        # 从外面一点都看不出来。实测为此来回猜了三轮。
         if bad is None:
-            warn("剧集改名：问不到 Emby 的条目列表，这轮跳过")
+            warn("剧集编号：问不到 Emby 的条目列表，这轮跳过")
         else:
             _tv = [r["name"] for r in rules
                    if (r.get("type") or "movies") == "tvshows"]
-            print(f"  {DIM}剧集改名：Emby 里判定集号不对的有 {len(bad)} 个，"
-                  f"其中需要改名的 0 个"
-                  f"（剧集库：{'、'.join(_tv) or '一个都没有'}）{RST}")
+            print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
+                  f"需要处理的 0 个（剧集库：{'、'.join(_tv) or '一个都没有'}）{RST}")
         return 0, 0
-    dup = [x for x in todo if x[2]]
-    ren = [x for x in todo if not x[2]]
     st = ep_fix_setting()
     if st is None:
         if not (interactive and has_tty()):
-            print(f"  {DIM}剧集改名：有 {len(todo)} 个可以改，但这是后台在跑、"
+            print(f"  {DIM}剧集编号：有 {len(todo)} 个可以补，但这是后台在跑、"
                   f"没法问你。到「3 后补参数 → 11」开一下就会做{RST}")
-            return 0, 0               # 没人在看就不做，更不替他答
+            return 0, 0
         print()
-        info(f"剧集库里有 {len(todo)} 个条目 Emby 一个刮削源都没认出来，"
-             f"而它们的文件名没有季集编号。")
-        print(f"  {DIM}可以把 strm 改名成 Emby 认得的样子。【只改本地 strm 的文件名，"
-              f"网盘一个字都不动】—— strm 里存的网盘路径不变，播放不受影响。{RST}")
-        for src, dst, _ in ren[:5]:
+        info(f"剧集库里有 {len(todo)} 个条目，Emby 认错了集号或者没认出来。")
+        print(f"  {DIM}可以在 strm 旁边放一个只写季集编号的 .nfo，让 Emby 认对。"
+              f"【文件名一个字不改，网盘也不动】—— 所以观看进度不会丢。{RST}")
+        for src, sea, ep in todo[:5]:
             print(f"    {DIM}{os.path.basename(src)}{RST}  →  "
-                  f"{BOLD}{os.path.basename(dst)}{RST}")
-        if len(ren) > 5:
-            print(f"    {DIM}…还有 {len(ren) - 5} 个{RST}")
-        print(f"  {DIM}Emby 按路径认条目，改名后这些集算新条目 —— 观看进度由脚本"
-              f"按【网盘文件】记着，扫出新条目后会自动补回去。{RST}")
-        print(f"  {DIM}改完季固定在 1、集号是完整的那个数 —— Emby 会把"
-              f"「231 4K」的三位数读成【第 2 季第 31 集】，写死 S01E231 才对得上。{RST}")
-        print(f"  {DIM}网盘里本来就按季分了目录的话，答 n；"
-              f"答 n 会把已经改过的还原回去。{RST}")
-        st = ask_yn("改吗？（以后不再问）", True)
+                  f"{BOLD}S{sea:02d}E{ep:02d}{RST}")
+        if len(todo) > 5:
+            print(f"    {DIM}…还有 {len(todo) - 5} 个{RST}")
+        print(f"  {DIM}季固定写 1，集号用网盘文件名里那个完整的数 —— Emby 会把"
+              f"「231 4K」的三位数读成【第 2 季第 31 集】，写死 S01E231 才对得上。"
+              f"分几季由刮削器决定，脚本不管。{RST}")
+        st = ask_yn("补吗？（以后不再问）", True)
         save_ms_state(ep_fix=bool(st), ep_fix_v=EP_FIX_V)
         if not st:
             return fix_episode_strm_names(d, rules, key, interactive=False)
     if not st:
         return 0, 0
-    # 【改名之前先把进度记进那张表】改完条目就换了，那时再记已经晚了。
-    # 记的键是 strm 内容里的网盘路径 —— 改名不动内容，所以改完还能对上。
-    try:
-        sync_progress_map(d, key)
-    except Exception as e:
-        warn(f"记录观看进度失败，改名后这些集的进度会丢：{_short_err(e)}")
-    n_ren = n_dup = 0
-    for src, dst, is_dup in todo:
-        try:
-            if is_dup:
-                # 目标已经在了 = AutoFilm 按原名又生成了一个。删源名那个，
-                # 否则同一集在 Emby 里会有两个条目
-                os.remove(src)
-                n_dup += 1
-            else:
-                os.replace(src, dst)
-                n_ren += 1
-        except OSError as e:
-            warn(f"改 strm 名失败：{os.path.basename(src)} —— {e}")
-    if n_ren:
-        ok(f"{n_ren} 个 strm 改成了带季集编号的名字（网盘没动）")
-    if n_dup:
-        print(f"  {DIM}顺带清掉 {n_dup} 个 AutoFilm 按原名重新生成的重复 strm。{RST}")
-    return n_ren, n_dup
+    # 【先把改名那一版留下的烂摊子收掉】旧版把 strm 改成了「剧名 - S01E231」，
+    # 而 AutoFilm 每次扫描都会按原名再生成一个 —— 两边永远在打架。
+    # 换成 nfo 之后文件名要回到网盘那个样子，AutoFilm 才不会重复生成。
+    back = restore_strm_names(d)
+    if back:
+        ok(f"{back} 个 strm 改回网盘原名（改名那套换成 nfo 了，不再和 AutoFilm 打架）")
+        todo = plan_episode_renames(d, rules, bad)
+    n = 0
+    for src, sea, ep in todo:
+        if write_episode_nfo(src, sea, ep):
+            n += 1
+    if n:
+        ok(f"{n} 个条目补上了季集编号{DIM}（旁挂 .nfo，文件名和网盘都没动）{RST}")
+    return n, 0
 
 
 def apply_libraries(d, key, plan):
@@ -7861,13 +7905,13 @@ def set_episode_fix():
     cur = ep_fix_setting()
     print()
     print(f"  当前：{'开' if cur else ('关' if cur is False else '还没问过')}")
-    print(f"  {DIM}开：Emby 一个刮削源都认不出来的剧集，把它的 strm 改名成"
-          f"「剧名 - S01Exxx.strm」，好让 Emby 认出集数。网盘不动。{RST}")
+    print(f"  {DIM}开：Emby 认错集号（或者没认出来）的剧集，在它的 strm 旁边"
+          f"放一个只写季集编号的 .nfo。文件名一个字不改，网盘也不动。{RST}")
     print(f"  {DIM}季固定写 1，集号用网盘文件名里那个完整的数 —— Emby 会把"
           f"「231 4K」读成【第 2 季第 31 集】，写死 S01E231 才对得上。{RST}")
     print(f"  {DIM}网盘里本来就按季分了目录的话，关掉。{RST}")
-    print(f"  {DIM}关：不再改名，并且把【已经改过的全部还原】成网盘里的原名。"
-          f"观看进度按网盘文件记着，还原后会自己补回来。{RST}")
+    print(f"  {DIM}关：不再补，并且把【脚本写过的 .nfo 全部删掉】、"
+          f"被旧版改过名的 strm 也改回网盘原名。{RST}")
     print()
     c = ask("1 开 / 2 关（回车不改）").strip()
     want = {"1": True, "2": False}.get(c)
@@ -7883,11 +7927,11 @@ def set_episode_fix():
     key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                             "auth") if is_installed(d) else "")
     if not want:
-        n = restore_strm_names(d)
+        n = restore_strm_names(d) + drop_episode_nfo(d)
         if n:
-            ok(f"{n} 个 strm 已还原成网盘里的原名")
+            ok(f"清掉 {n} 处旧的改名/编号文件，恢复成网盘原样")
         else:
-            print(f"  {DIM}没有需要还原的 —— 现在的 strm 名字和网盘里一致。{RST}")
+            print(f"  {DIM}没有需要清的 —— 现在就是网盘原样。{RST}")
     else:
         if not key:
             warn("没有 Emby API Key，改名要等下次点「4 生成媒体库」。")
@@ -8715,8 +8759,8 @@ def params_menu():
         _ef = ep_fix_setting()
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
-        print(f" 11. 给剧集 strm 补季集编号{DIM}（只会写 S01Exxx，分季的长篇"
-              f"会对不上集号）{RST}  当前：{ef_state}")
+        print(f" 11. 给剧集补季集编号{DIM}（旁挂 .nfo，不改文件名、不动网盘）"
+              f"{RST}  当前：{ef_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
