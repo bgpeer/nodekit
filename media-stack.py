@@ -37,7 +37,7 @@ import zipfile
 # 【改了代码就要动这个数】它一直停在 1.1.0，于是「6 更新」永远打印
 # "v1.1.0 → v1.1.0"，用户根本没法判断新代码到底到没到机器上 ——
 # 排查时这是最基本的一条信息，缺了它只能靠猜。
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.3.0"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2176,6 +2176,9 @@ LIB_RULES_HEADER = """\
 #             ⚠ 剧集用 movies 的话，每一集会变成一部独立电影，没有季集结构
 #   metatube  true 时这个库启用 MetaTube（按番号刮成人片）
 #             ⚠ 只给真的是成人片的库开。它会把动画认成 JAV —— 实测发生过
+#   episode_number  只对 tvshows 有意义。true = Emby 认错集号的剧集，在它的
+#             strm 旁边放一个只写季集编号的 .nfo（文件名和网盘一个字不动）。
+#             写了就按它办、一句不问；不写才会问一次
 #   keywords  逗号隔开，大小写不敏感
 #
 # 关于关键词怎么写：
@@ -2276,7 +2279,7 @@ def parse_lib_rules(text):
                 rules.append(cur)
             cur = {"name": "", "kw": [], "type": "movies", "mt": False,
                    "lang": "zh", "country": "CN", "scr": [], "img": [],
-                   "private": False}
+                   "private": False, "epnum": None}
             ln = ln.lstrip()[2:]
         if cur is None or ":" not in ln:
             continue
@@ -2290,6 +2293,10 @@ def parse_lib_rules(text):
             cur["mt"] = v.lower() in ("true", "yes", "y", "on", "1")
         elif k == "private":
             cur["private"] = v.lower() in ("true", "yes", "y", "on", "1")
+        elif k in ("episode_number", "episode_numbers", "ep_number"):
+            # 【三态，不是布尔】没写 = None = "按开关问一次"；写了就以规则文件为准，
+            # 一句都不问。写 false 的库还会把脚本写过的编号文件清掉。
+            cur["epnum"] = v.lower() in ("true", "yes", "y", "on", "1")
         elif k in ("scrapers", "metadata"):
             cur["scr"] = [x.strip() for x in re.split(r"[,，]", v.strip("[]")) if x.strip()]
         elif k in ("image_scrapers", "images"):
@@ -2314,6 +2321,8 @@ def dump_lib_rules(rules):
                    f"  language: {r.get('lang') or 'zh'}\n"
                    f"  country: {r.get('country') or 'CN'}\n"
                    f"  metatube: {'true' if r.get('mt') else 'false'}\n"
+                   + ("" if r.get("epnum") is None else
+                      f"  episode_number: {'true' if r['epnum'] else 'false'}\n")
                    + (f"  scrapers: {', '.join(r['scr'])}\n" if r.get("scr") else "")
                    + (f"  image_scrapers: {', '.join(r['img'])}\n" if r.get("img") else "")
                    + f"  keywords: {', '.join(r['kw'])}\n")
@@ -2748,7 +2757,9 @@ def misparsed_strm_names(d, key):
 def plan_episode_renames(d, rules, broken=None):
     """给剧集库里【Emby 认不出来】的 strm 想一个它认得的名字。
 
-    返回 [(旧路径, 新路径, 是不是重复品)]。不改任何东西，只算。
+    返回 [(strm 路径, 季, 集, 这个库在规则文件里是怎么声明的)]。不改任何东西，只算。
+    最后那一项：True = 规则文件写了 episode_number: true（做，不问）；
+    None = 规则文件没写（听全局开关的）。写了 false 的库根本不会出现在结果里。
 
     【判据是"Emby 到底认没认出来"，不是"文件名长什么样"】第一版拿"文件名里
     没有 SxxExx"当条件，太宽了：Emby 本来就能从「236.断东河·吴.mp4」里认出
@@ -2773,7 +2784,10 @@ def plan_episode_renames(d, rules, broken=None):
     if not broken:
         return out                    # None=问不到、set()=没有坏的，都不动
     base = os.path.join(strm_root(d), STRM_SUBDIR)
-    tv = {r["name"] for r in rules if (r.get("type") or "movies") == "tvshows"}
+    # 【三态跟着每一条走】规则文件里 episode_number 写了什么，就带到每个待办上；
+    # 没写是 None，交给全局开关。写 false 的库这里【一个都不收】。
+    tv = {r["name"]: r.get("epnum") for r in rules
+          if (r.get("type") or "movies") == "tvshows" and r.get("epnum") is not False}
     if not tv:
         return out
     try:
@@ -2783,6 +2797,7 @@ def plan_episode_renames(d, rules, broken=None):
     for name, val in plan.items():
         if name not in tv:
             continue
+        decided = tv[name]
         for cpath in val[1]:
             rel = [x for x in cpath[len(STRM_PATH):].split("/") if x]
             for dp, _dn, fs in os.walk(os.path.join(base, *rel)):
@@ -2816,7 +2831,7 @@ def plan_episode_renames(d, rules, broken=None):
                         continue
                     if not ep:
                         continue          # 抠不出集数就别猜
-                    out.append((os.path.join(dp, f), sea, ep))
+                    out.append((os.path.join(dp, f), sea, ep, decided))
     return out
 
 
@@ -3049,23 +3064,46 @@ def write_episode_nfo(strm_path, season, ep):
         return False
 
 
-def drop_episode_nfo(d):
-    """删掉所有【我们自己写的】那种 .nfo。返回删了几个。"""
+def drop_episode_nfo(d, roots=None):
+    """删掉【我们自己写的】那种 .nfo。返回删了几个。
+
+    roots 给了就只清这几棵子树 —— 用在"某个库在规则文件里写了
+    episode_number: false，别的库还开着"的时候。不给就是整棵 strm 树。
+    """
     n = 0
-    for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
-        for f in fs:
-            if not f.endswith(".nfo"):
-                continue
-            q = os.path.join(dp, f)
-            try:
-                with open(q, encoding="utf-8", errors="replace") as fh:
-                    if EP_NFO_MARK not in fh.read():
-                        continue
-                os.remove(q)
-                n += 1
-            except OSError:
-                continue
+    for root in (roots if roots is not None
+                 else [os.path.join(strm_root(d), STRM_SUBDIR)]):
+        for dp, _dn, fs in os.walk(root):
+            for f in fs:
+                if not f.endswith(".nfo"):
+                    continue
+                q = os.path.join(dp, f)
+                try:
+                    with open(q, encoding="utf-8", errors="replace") as fh:
+                        if EP_NFO_MARK not in fh.read():
+                            continue
+                    os.remove(q)
+                    n += 1
+                except OSError:
+                    continue
     return n
+
+
+def lib_strm_dirs(d, rules, names):
+    """这几个媒体库在【宿主机】上对应的 strm 目录。问不出来就返回空。"""
+    if not names:
+        return []
+    try:
+        plan = plan_libraries(d, rules)
+    except Exception:
+        return []
+    out = []
+    for name in names:
+        for cpath in (plan.get(name) or (None, []))[1]:
+            q = host_strm_path(d, cpath)
+            if q and os.path.isdir(q):
+                out.append(q)
+    return out
 
 
 def restore_strm_names(d):
@@ -3109,9 +3147,10 @@ def restore_strm_names(d):
 
 
 def fix_episode_strm_names(d, rules, key, interactive=True):
-    """把剧集库里认不出集数的 strm 改名成 Emby 认得的样子。返回 (改了几个, 删了几个重复的)。
+    """给 Emby 认错集号的剧集旁挂一个只写季集编号的 .nfo。返回 (补了几个, 0)。
 
-    第一次问一句，答案记在 ms_state["ep_fix"] 里，以后按那个答案自动做。
+    每个库先看规则文件里的 episode_number；没写的库才听全局开关的，
+    开关第一次问一句，答案记在 ms_state["ep_fix"] 里。
 
     【为什么必须写死 S01】用户的原话："我只需要你分集不是要你分季"。
     对，而且这正是它有用的地方：网盘里是一个扁平目录、集号连续到 200 多，
@@ -3119,61 +3158,76 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     写法：首位当季、后两位当集）。实测现场就是这么歪的：231→31、232→32。
     写成 S01E231 之后，季固定在 1、集号是完整的 231，才对得上。
 
-    答 n 也是合理的选择（比如网盘里本来就按季分了目录）。答 n 会把已经改过的
-    名字【全部还原】（见 restore_strm_names），不是"以后不改"而已 ——
-    那样等于关不掉。
+    答 n 也是合理的选择（比如网盘里本来就按季分了目录）。答 n 会把已经写下的
+    编号文件【全部删掉】，不是"以后不补"而已 —— 那样等于关不掉。
+
+    【规则文件里写了就不问】库上写 episode_number: true / false，这个库就按
+    它办，一句都不问。剧集库要不要补编号是【库的属性】，跟语言、刮削器一样，
+    本来就该写在规则文件里跟着库走 —— 每台机器、每次重装都要人去答一遍那句
+    「补吗」，才是不对的地方。开关只管【没写的那些库】。
     """
-    # 【关掉就要清干净，不能只是"以后不做"】
-    if ep_fix_setting() is False:
-        print(f"  {DIM}剧集编号：开关是【关】的（要开：3 后补参数 → 11）{RST}")
-        _r = restore_strm_names(d) + drop_episode_nfo(d)
-        if _r:
-            ok(f"清掉 {_r} 处旧的改名/编号文件，恢复成网盘原样")
-        return 0, 0
+    # 【改名那套整个撤了】任何被改过名的 strm 都是旧版残留：AutoFilm 每次扫描
+    # 都会按原名再生成一个，两边永远在打架，条目反复生灭 —— 播放中「找不到条目」
+    # 和进度记不住都是它。不管开关是什么状态，先无条件改回网盘原名。
+    back = restore_strm_names(d)
+    if back:
+        ok(f"{back} 个 strm 改回网盘原名{DIM}（改名换成 nfo 了，不再和 AutoFilm 打架）{RST}")
+
+    st = ep_fix_setting()
+    tv = [r for r in rules if (r.get("type") or "movies") == "tvshows"]
+    # 【关掉就要清干净】规则文件里写了 false 的库，加上"没写、而全局开关是关"的库，
+    # 都要把脚本写过的编号文件删掉。没写 false 的库不受影响 —— 一个库的关不该
+    # 把别的库一起关了，这正是"又只修好个别库"的反面。
+    clean = [r["name"] for r in tv if r.get("epnum") is False
+             or (r.get("epnum") is None and st is False)]
+    if clean:
+        _n = drop_episode_nfo(d, lib_strm_dirs(d, rules, clean))
+        if _n:
+            ok(f"清掉 {_n} 个季集编号文件（{'、'.join(clean)}），恢复成网盘原样")
+
     bad = misparsed_strm_names(d, key) if key else None
-    todo = plan_episode_renames(d, rules, bad)
+    todo = plan_episode_renames(d, rules, bad)      # 写了 false 的库不在里面
+    on = [t for t in todo if t[3] is True]          # 规则文件说做
+    und = [t for t in todo if t[3] is None]         # 规则文件没说，听开关的
     if not todo:
         if bad is None:
             warn("剧集编号：问不到 Emby 的条目列表，这轮跳过")
         else:
-            _tv = [r["name"] for r in rules
-                   if (r.get("type") or "movies") == "tvshows"]
+            _names = [r["name"] for r in tv]
             print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
-                  f"需要处理的 0 个（剧集库：{'、'.join(_tv) or '一个都没有'}）{RST}")
+                  f"需要处理的 0 个（剧集库：{'、'.join(_names) or '一个都没有'}）{RST}")
         return 0, 0
-    st = ep_fix_setting()
-    if st is None:
+    # 【只有"规则文件没写、开关也没答过"的库才问】规则文件里写了 true 的库照做，
+    # 一句都不问 —— 用户已经在配置里明确表过态了，再拦一次是重复要答案。
+    if und and st is None:
         if not (interactive and has_tty()):
-            print(f"  {DIM}剧集编号：有 {len(todo)} 个可以补，但这是后台在跑、"
-                  f"没法问你。到「3 后补参数 → 11」开一下就会做{RST}")
-            return 0, 0
-        print()
-        info(f"剧集库里有 {len(todo)} 个条目，Emby 认错了集号或者没认出来。")
-        print(f"  {DIM}可以在 strm 旁边放一个只写季集编号的 .nfo，让 Emby 认对。"
-              f"【文件名一个字不改，网盘也不动】—— 所以观看进度不会丢。{RST}")
-        for src, sea, ep in todo[:5]:
-            print(f"    {DIM}{os.path.basename(src)}{RST}  →  "
-                  f"{BOLD}S{sea:02d}E{ep:02d}{RST}")
-        if len(todo) > 5:
-            print(f"    {DIM}…还有 {len(todo) - 5} 个{RST}")
-        print(f"  {DIM}季固定写 1，集号用网盘文件名里那个完整的数 —— Emby 会把"
-              f"「231 4K」的三位数读成【第 2 季第 31 集】，写死 S01E231 才对得上。"
-              f"分几季由刮削器决定，脚本不管。{RST}")
-        st = ask_yn("补吗？（以后不再问）", True)
-        save_ms_state(ep_fix=bool(st), ep_fix_v=EP_FIX_V)
-        if not st:
-            return fix_episode_strm_names(d, rules, key, interactive=False)
-    if not st:
+            print(f"  {DIM}剧集编号：有 {len(und)} 个可以补，但这是后台在跑、没法问你。"
+                  f"在规则文件里给这些库写一行 episode_number: true 就不用管了，"
+                  f"或者到「3 后补参数 → 11」开一下{RST}")
+        else:
+            print()
+            info(f"剧集库里有 {len(und)} 个条目，Emby 认错了集号或者没认出来。")
+            print(f"  {DIM}可以在 strm 旁边放一个只写季集编号的 .nfo，让 Emby 认对。"
+                  f"【文件名一个字不改，网盘也不动】—— 所以观看进度不会丢。{RST}")
+            for src, sea, ep, _dc in und[:5]:
+                print(f"    {DIM}{os.path.basename(src)}{RST}  →  "
+                      f"{BOLD}S{sea:02d}E{ep:02d}{RST}")
+            if len(und) > 5:
+                print(f"    {DIM}…还有 {len(und) - 5} 个{RST}")
+            print(f"  {DIM}季固定写 1，集号用网盘文件名里那个完整的数 —— Emby 会把"
+                  f"「231 4K」的三位数读成【第 2 季第 31 集】，写死 S01E231 才对得上。"
+                  f"分几季由刮削器决定，脚本不管。{RST}")
+            print(f"  {DIM}不想每台机器都答一遍：在 library-rules.yaml 的剧集库上"
+                  f"写一行 episode_number: true，以后一句都不问。{RST}")
+            st = ask_yn("补吗？（以后不再问）", True)
+            save_ms_state(ep_fix=bool(st), ep_fix_v=EP_FIX_V)
+            if not st:
+                return fix_episode_strm_names(d, rules, key, interactive=False)
+    do = on + (und if st else [])
+    if not do:
         return 0, 0
-    # 【先把改名那一版留下的烂摊子收掉】旧版把 strm 改成了「剧名 - S01E231」，
-    # 而 AutoFilm 每次扫描都会按原名再生成一个 —— 两边永远在打架。
-    # 换成 nfo 之后文件名要回到网盘那个样子，AutoFilm 才不会重复生成。
-    back = restore_strm_names(d)
-    if back:
-        ok(f"{back} 个 strm 改回网盘原名（改名那套换成 nfo 了，不再和 AutoFilm 打架）")
-        todo = plan_episode_renames(d, rules, bad)
     n = 0
-    for src, sea, ep in todo:
+    for src, sea, ep, _dc in do:
         if write_episode_nfo(src, sea, ep):
             n += 1
     if n:
@@ -7903,15 +7957,26 @@ def set_episode_fix():
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
     cur = ep_fix_setting()
+    _rules = lib_rules(d)[0]
+    _tv = [r for r in _rules if (r.get("type") or "movies") == "tvshows"]
+    _said = [(r["name"], r["epnum"]) for r in _tv if r.get("epnum") is not None]
     print()
     print(f"  当前：{'开' if cur else ('关' if cur is False else '还没问过')}")
+    # 【规则文件写了的库不归这个开关管】不说清楚的话，用户在这里关掉、
+    # 发现某个库照旧在补，只会以为开关坏了。
+    if _said:
+        print(f"  {DIM}下面这几个库在规则文件里写死了，不受这个开关影响："
+              f"{'、'.join(n + ('=开' if v else '=关') for n, v in _said)}{RST}")
+        print(f"  {DIM}这个开关只管没写 episode_number 的库。{RST}")
     print(f"  {DIM}开：Emby 认错集号（或者没认出来）的剧集，在它的 strm 旁边"
           f"放一个只写季集编号的 .nfo。文件名一个字不改，网盘也不动。{RST}")
     print(f"  {DIM}季固定写 1，集号用网盘文件名里那个完整的数 —— Emby 会把"
           f"「231 4K」读成【第 2 季第 31 集】，写死 S01E231 才对得上。{RST}")
     print(f"  {DIM}网盘里本来就按季分了目录的话，关掉。{RST}")
-    print(f"  {DIM}关：不再补，并且把【脚本写过的 .nfo 全部删掉】、"
+    print(f"  {DIM}关：不再补，并且把【脚本写过的 .nfo 删掉】、"
           f"被旧版改过名的 strm 也改回网盘原名。{RST}")
+    print(f"  {DIM}不想每台机器都来点一次：在 library-rules.yaml 的剧集库上写一行"
+          f" episode_number: true，那个库就永远按它办，跟着规则文件走。{RST}")
     print()
     c = ask("1 开 / 2 关（回车不改）").strip()
     want = {"1": True, "2": False}.get(c)
@@ -7926,34 +7991,27 @@ def set_episode_fix():
     # 「7 片名用哪个」那边早就是当场套用的，这里照它办。
     key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                             "auth") if is_installed(d) else "")
-    if not want:
-        n = restore_strm_names(d) + drop_episode_nfo(d)
-        if n:
-            ok(f"清掉 {n} 处旧的改名/编号文件，恢复成网盘原样")
-        else:
-            print(f"  {DIM}没有需要清的 —— 现在就是网盘原样。{RST}")
-    else:
-        if not key:
-            warn("没有 Emby API Key，改名要等下次点「4 生成媒体库」。")
-            return
-        try:
-            n, _dup = fix_episode_strm_names(d, lib_rules(d)[0], key,
-                                             interactive=False)
-        except Exception as e:
-            warn(f"改名失败：{_short_err(e)}")
-            return
-        if not n:
-            print(f"  {DIM}没有需要改的 —— Emby 认的集号和网盘文件名都对得上。{RST}")
-            return
-    # 【必须让 Emby 重扫】改的是文件名，Emby 不重扫就还是按旧名字显示的那些条目
-    if key:
-        try:
-            _emby("/Library/Refresh", key, method="POST", timeout=60)
-            ok("已通知 Emby 重扫，集号过一会儿就更新")
-            print(f"  {DIM}扫描在后台跑，片子多的话要等几分钟。{RST}")
-        except Exception as e:
-            warn(f"通知 Emby 扫描失败：{_short_err(e)}")
-            print(f"  {DIM}点一次「4 生成媒体库」也会扫。{RST}")
+    # 【开也好关也好，都走同一条路】关掉不能一把梭 drop_episode_nfo(d)：那会把
+    # 规则文件里写了 episode_number: true 的库也一起清了。fix_ 里按库分得清清楚楚。
+    if not key:
+        warn("没有 Emby API Key，这次改动要等下次点「4 生成媒体库」才落地。")
+        return
+    try:
+        n, _dup = fix_episode_strm_names(d, _rules, key, interactive=False)
+    except Exception as e:
+        warn(f"处理失败：{_short_err(e)}")
+        return
+    if want and not n:
+        print(f"  {DIM}没有需要补的 —— Emby 认的集号和网盘文件名都对得上。{RST}")
+        return
+    # 【必须让 Emby 重扫】nfo 是扫描的时候才读的，不重扫集号还是旧的
+    try:
+        _emby("/Library/Refresh", key, method="POST", timeout=60)
+        ok("已通知 Emby 重扫，集号过一会儿就更新")
+        print(f"  {DIM}扫描在后台跑，片子多的话要等几分钟。{RST}")
+    except Exception as e:
+        warn(f"通知 Emby 扫描失败：{_short_err(e)}")
+        print(f"  {DIM}点一次「4 生成媒体库」也会扫。{RST}")
 
 
 def set_dir_cache():
