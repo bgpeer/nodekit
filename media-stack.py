@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.6"
+SCRIPT_VERSION = "1.5.7"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2741,7 +2741,12 @@ EP_JUNK = re.compile(
     r"web-?dl|web-?rip|blu-?ray|bd-?rip|hd-?tv|remux|repack|\d{2,3}fps|"
     r"国语|日语|粤语|英语|双语|中字|中英|内封|内嵌|简体|繁体|外挂|字幕|无字|"
     r"高清|超清|蓝光|全集|完结|未删减|v\d)$")
-EP_SPLIT = re.compile(r"[\s._\-\[\]()（）【】]+")
+# 【别把 · 当分隔符】U+00B7 那个点在中文人名/译名里是【名字的一部分】：
+# 「断东河·吴」拆开就毁了。而 U+2022 的 • 是真的当分隔符用的
+# （实测网盘里的「仙逆 [第154集•4K]」）。两个字符长得像，作用相反。
+EP_SPLIT = re.compile(r"[\s._\-\[\]()（）【】•｜|/／]+")
+# 集号本身的各种写法。名字里这一段要整个去掉 —— 留着就成了「仙逆 第154集•4K」
+EP_MARK = re.compile(r"(?i)^(?:第\s*0*%d\s*[集话話]|e?p?0*%d|s\d{1,2}e0*%d)$")
 # 带连字符的成组标记要【先整条去掉】，不能等切开再逐个认 —— WEB-DL 切成
 # WEB 和 DL 之后哪个都不在上面那张表里，结果「初露锋芒」后面挂着个 WEB DL。
 EP_JUNK_RUN = re.compile(r"(?i)\b(web[\s._-]?(dl|rip)|blu[\s._-]?ray|bd[\s._-]?rip|"
@@ -2755,7 +2760,7 @@ def _xml_esc(s):
             .replace(">", "&gt;"))
 
 
-def episode_title_from_name(stem, ep):
+def episode_title_from_name(stem, ep, show=""):
     """给这一集起个显示用的名字。stem 是网盘文件名（不含扩展名）。
 
     【为什么要脚本自己起名】把集号按网盘的连续编号写死（S01E237）之后，
@@ -2766,16 +2771,25 @@ def episode_title_from_name(stem, ep):
     （原话："我只需要你分集不是要你分季"）。两个不能同时要，所以名字这一半
     自己来：网盘文件名里除了集数还有内容就用那部分，只剩画质标记就写「第N集」。
 
-        「236.断东河·吴」 → 断东河·吴
-        「237 4K」        → 第237集
-        「238」           → 第238集
+        「236.断东河·吴」        → 断东河·吴
+        「237 4K」               → 第237集
+        「238」                  → 第238集
+        「仙逆 [第154集•4K]」     → 第154集   （剧名和画质标记都去掉）
+
+    show 传剧名的话，名字里重复的剧名也去掉 —— Emby 本来就在剧集页里显示，
+    每一集标题再挂一遍是纯噪音。
     """
-    rest = stem
-    m = re.match(r"^\s*0*%d\s*" % int(ep), rest)
-    if m:
-        rest = rest[m.end():]
-    rest = EP_JUNK_RUN.sub(" ", rest.lstrip(".、．_-–—:：|/\\ "))
-    words = [w for w in EP_SPLIT.split(rest) if w and not EP_JUNK.match(w)]
+    rest = EP_JUNK_RUN.sub(" ", stem)
+    mark = re.compile(EP_MARK.pattern % (int(ep), int(ep), int(ep)), re.I)
+    sh = (show or "").strip().lower()
+    words = []
+    for w in EP_SPLIT.split(rest):
+        w = w.strip(" .、．_-–—:：")
+        if not w or EP_JUNK.match(w) or mark.match(w):
+            continue
+        if sh and w.lower() == sh:
+            continue                  # 剧名重复，去掉
+        words.append(w)
     got = " ".join(words).strip(" -_.")
     return got or f"第{int(ep)}集"
 
@@ -3311,7 +3325,21 @@ def fix_episode_titles(d, rules, key, skip=(), items=None):
 EP_NFO_MARK = "<!-- media-stack: 只给 Emby 补季集编号，别的一概不写 -->"
 
 
-def write_episode_nfo(strm_path, season, ep):
+def _show_of(strm_path):
+    """这个 strm 属于哪部剧 —— 取它所在目录名；在 Season 目录里就再往上一层。
+
+    只用来把标题里重复的剧名去掉，取错了最多是没去掉，不会写错编号。
+    """
+    parts = [x for x in os.path.dirname(strm_path).split(os.sep) if x]
+    if not parts:
+        return ""
+    i = len(parts) - 1
+    if EP_SEASON.match(parts[i]):
+        i -= 1
+    return parts[i] if i >= 0 else ""
+
+
+def write_episode_nfo(strm_path, season, ep, show=""):
     """在 strm 旁边写一个只含季集编号的 .nfo。成功返回 True。
 
     【为什么改成写 nfo，不再改 strm 的文件名】改名这条路在跟 AutoFilm 打架，
@@ -3335,7 +3363,8 @@ def write_episode_nfo(strm_path, season, ep):
     根本没有对应的那一集，名字它给不出来，只能自己起。
     """
     nfo = os.path.splitext(strm_path)[0] + ".nfo"
-    title = _xml_esc(episode_title_from_name(cloud_name_stem(strm_path), ep))
+    title = _xml_esc(episode_title_from_name(
+        cloud_name_stem(strm_path), ep, show or _show_of(strm_path)))
     body = (f'<?xml version="1.0" encoding="utf-8"?>\n'
             f"{EP_NFO_MARK}\n"
             f"<episodedetails>\n"
