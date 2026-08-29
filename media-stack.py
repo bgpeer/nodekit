@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.10"
+SCRIPT_VERSION = "1.5.11"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4734,6 +4734,19 @@ def show_info():
     print(f"\n  {GREEN}{BOLD}▸ 各服务自己的账号{RST}")
     print(f"      Emby       {DIM}首次打开自己设；不走弹框（App 客户端处理不了 Basic Auth）{RST}")
     print(f"      OpenList   {CYAN}{BOLD}admin{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
+
+    # 【挂网盘要的令牌不在这套东西里，得去外面取】而"去哪取"是最容易卡住的一步：
+    # OpenList 的驱动表单里【没有】这个链接，文档也在另一个域名下，
+    # 不写在这儿的话每次挂新盘都要重新去搜一遍。
+    print(f"\n  {BOLD}▸ 挂网盘要的令牌去哪取{RST}"
+          f"{DIM}（OpenList 表单里没有这个链接）{RST}")
+    print(f"      {CYAN}{BOLD}https://api.oplist.org/{RST}")
+    print(f"      {DIM}阿里云盘（Oauth2）：选「阿里云盘扫码登录」，"
+          f"不是页面上那个「应用登录」{RST}")
+    print(f"      {DIM}授权时把「备份盘」的勾去掉 —— 那里面是手机相册，"
+          f"挂进来会变成一堆刮不出海报的条目{RST}")
+    print(f"      {DIM}只要{RST}刷新令牌{DIM}，访问令牌不用填"
+          f"（那是几小时就过期的短期票据，OpenList 自己会换）{RST}")
 
     print(f"\n  {BOLD}▸ 常用命令{RST}")
     print(f"      {GREEN}{BOLD}emby{RST}                甩出面板地址")
