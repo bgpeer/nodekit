@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.8"
+SCRIPT_VERSION = "1.5.9"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9461,14 +9461,12 @@ def params_menu():
         tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
               else f"{DIM}刮削结果{RST}")
         print(f"  7. 片名用哪个            当前：{tp}")
-        _libr, _libsrc = lib_rules(d) if is_installed(d) else ([], "")
-        _rsrc = (f"{CYAN}自定义链接{RST}" if rules_source() == "custom"
+        # 【这里只报"用哪份"，一个字都不多】规则文件路径、几条、哪几个库名 ——
+        # 这些进到菜单里会随库数一起长，7 条就要折两行，几十条整屏都是它。
+        # 点进第 8 项那一屏本来就全列着，重复一遍只是把菜单撑丑。
+        _rsrc = (f"{CYAN}自定义{RST}" if rules_source() == "custom"
                  else f"{DIM}作者的{RST}") if is_installed(d) else ""
         print(f"  8. 按关键词自动建媒体库（规则用哪份链接）  当前：{_rsrc}")
-        print(f"     {DIM}文件夹名匹配到就整个收进去，AV 类自动带 MetaTube{RST}")
-        print(f"     {DIM}{_libsrc or '未安装'}"
-              + (f"　共 {len(_libr)} 条：{'、'.join(r['name'] for r in _libr)}"
-                 if _libr else "") + f"{RST}")
         if metatube_on(d):
             mtl = [n for n, _i, on, _o in metatube_libraries(
                 read_emby_api_key(d) or "") if on]
