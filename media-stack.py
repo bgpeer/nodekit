@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.5"
+SCRIPT_VERSION = "1.5.6"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3199,6 +3199,77 @@ def reidentify_items(key, ids):
     return n
 
 
+def episodes_without_image(d, rules, key, items=None):
+    """自己没有缩略图的剧集。返回 {strm 宿主机路径: 条目 id}；问不到返回 None。
+
+    【Emby 会拿剧集海报顶上，所以"看起来有图"】没有自己那张图的一集，界面上
+    显示的是整部剧的封面 —— 一眼看过去每集都有图，只有挨着比才发现是同一张。
+    实测现场：238 集里只有最后两集是真的分集图（图上印着「第237話」「第238話」），
+    前面几集全是同一张群像海报。
+
+    ImageTags.Primary 有没有，就是"这一集有没有自己的图"。
+    """
+    if items is None:
+        items = _episode_items(key)
+    if items is None:
+        return None
+    roots = lib_strm_dirs(d, rules, [r["name"] for r in rules
+                                     if (r.get("type") or "movies") == "tvshows"])
+    out = {}
+    for i in items:
+        p = str(i.get("Path") or "")
+        if not (p.endswith(".strm") and _under(p, STRM_PATH)):
+            continue
+        hp = host_strm_path(d, p)
+        if not hp or (roots and not any(_under(hp, q) for q in roots)):
+            continue
+        if not (i.get("ImageTags") or {}).get("Primary"):
+            out[hp] = i.get("Id")
+    return out
+
+
+def fix_episode_images(d, rules, key, items=None):
+    """给没有自己缩略图的剧集补图。返回发出去几个。
+
+    【只碰图，一个元数据字段都不动】MetadataRefreshMode=None —— 这一步绝对
+    不能顺带刷元数据：季集编号是脚本直接写进条目的，刷元数据有把它按刮削器
+    改回去的风险，而那个坑刚填上。ReplaceAllImages=false 也是同理，
+    已经有图的一集一个字节都不重下。
+
+    【发过就记账】有些剧的分集图刮削源那边本来就没有，那是要不到的。
+    不记账就会每小时对着同一批再发一轮，永远停不下来。
+    """
+    if not key:
+        return 0
+    got = episodes_without_image(d, rules, key, items)
+    if not got:
+        return 0
+    tried = set(ms_state().get("ep_img_tried") or [])
+    todo = [(hp, iid) for hp, iid in got.items() if hp not in tried][:EP_REIDENT_MAX]
+    if not todo:
+        return 0
+    n = 0
+    for _hp, iid in todo:
+        if not iid:
+            continue
+        try:
+            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=None"
+                  f"&ImageRefreshMode=FullRefresh&ReplaceAllImages=false",
+                  key, method="POST", timeout=30)
+            n += 1
+        except Exception:
+            continue
+    if not n:
+        return 0
+    tried.update(hp for hp, _i in todo)
+    save_ms_state(ep_img_tried=sorted(tried)[-EP_TRIED_MAX:])
+    ok(f"{n} 个剧集没有自己的缩略图（界面上顶着剧集海报），已去刮"
+       f"{DIM}（只刮图，不碰编号和片名；后台跑）{RST}")
+    if len(got) > len(todo):
+        print(f"  {DIM}还有 {len(got) - len(todo)} 个排下一轮。{RST}")
+    return n
+
+
 def fix_episode_titles(d, rules, key, skip=(), items=None):
     """把标题栏还停在文件名上的剧集，叫 Emby 重新识别一次。返回发出去几个。
 
@@ -3528,6 +3599,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             # return，于是"写了没生效"这种失败从外面一点都看不见。
             verify_episode_numbers(d, rules, key, all_items)
             fix_episode_titles(d, rules, key, skip=up, items=all_items)
+            fix_episode_images(d, rules, key, all_items)
             _names = [r["name"] for r in tv]
             print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
                   f"需要处理的 0 个（剧集库：{'、'.join(_names) or '一个都没有'}）{RST}")
@@ -3574,6 +3646,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     verify_episode_numbers(d, rules, key, all_items)
     fix_episode_titles(d, rules, key, skip=list(wrote) + list(up),
                        items=all_items)
+    fix_episode_images(d, rules, key, all_items)
     return n, 0
 
 
@@ -10971,7 +11044,7 @@ def do_healthcheck():
                     _rd = episode_nfo_reader_on(key, lib_rules(d)[0])
                     if not _off:
                         _hc("剧集编号", "ok",
-                            f"{_nfo} 个条目按 nfo 编号，Emby 都认了")
+                            f"{_nfo} 个条目的季集编号和应有的一致")
                     else:
                         _p, _i, _ws, _we, _gs, _ge = _off[0]
                         _hc("剧集编号", "bad",
@@ -11001,6 +11074,26 @@ def do_healthcheck():
                             "写完还是不对就到 Emby 里点这一集 → 编辑元数据手工填，"
                             "或者把这个库改成 episode_number: false"
                             "（编号交回刮削器，代价是按它的库分季）"))
+
+            # ---- 剧集缩略图 ----
+            # 【看起来"每集都有图"是假象】没有自己那张图的一集，Emby 拿整部剧
+            # 的封面顶上 —— 不挨着比根本看不出来。所以这一行必须数出来。
+            if key and _eps:
+                _noimg = episodes_without_image(d, lib_rules(d)[0], key, _eps)
+                _tot = sum(1 for i in _eps
+                           if str(i.get("Path") or "").endswith(".strm"))
+                if _noimg and _tot:
+                    _hc("剧集缩略图", "warn",
+                        f"{len(_noimg)}/{_tot} 个没有自己的图"
+                        f"{DIM}（界面上顶着剧集海报，看着像有图）{RST}")
+                    todo.append((
+                        f"{len(_noimg)} 个剧集没有自己的缩略图 —— "
+                        f"界面上显示的是整部剧的封面",
+                        "点一次「4 生成媒体库」会去刮分集图（只刮图，"
+                        "不碰编号和片名）。刮削源那边本来就没有分集图的剧，"
+                        "刮不回来也正常"))
+                elif _tot:
+                    _hc("剧集缩略图", "ok", f"{_tot} 个都有自己的图")
 
             nodur = items_without_duration(key)
             # 【留给「每日对齐」那一行用】那一行印的是上次跑完时记下的数字，
