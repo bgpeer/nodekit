@@ -115,16 +115,53 @@ PY
 probe() {       # $1=ItemId
   python3 - "$MW" "$KEY" "$1" <<'PY'
 import re, sys, time, urllib.request, urllib.error
+BOLD, RST = "\033[1m", "\033[0m"
 mw, key, iid = sys.argv[1], sys.argv[2], sys.argv[3]
 
 class NoRedir(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k): return None
 
-def get(url, rng=None, timeout=90):
-    req = urllib.request.Request(url, headers={"User-Agent": "why-slow"})
+UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+# 【403 不一定是"放不了"，也可能是我这个脚本没带对头】网盘的直链常有防盗链：
+# 认 Referer、认 User-Agent。用一个光秃秃的 UA 去拉必然 403，而真正的播放器
+# 带着浏览器 UA 就能拉动 —— 这种情况下报"放不了"是误判，会把人带偏。
+# 所以挨个换头再试，并且【说清楚是哪一组头才拉得动】：那正是要去 OpenList
+# 里补的东西。
+HEADSETS = (
+    ("脚本默认（无 Referer）", {"User-Agent": "why-slow"}),
+    ("浏览器 UA", {"User-Agent": UA_BROWSER}),
+    ("浏览器 UA + Referer 阿里云盘",
+     {"User-Agent": UA_BROWSER, "Referer": "https://www.alipan.com/"}),
+    ("浏览器 UA + Referer 阿里云盘（旧域名）",
+     {"User-Agent": UA_BROWSER, "Referer": "https://www.aliyundrive.com/"}),
+)
+GOOD_HEAD = dict(HEADSETS[0][1])          # 试出来能用的那组，后面测速沿用
+
+
+def get(url, rng=None, timeout=90, head=None):
+    req = urllib.request.Request(url, headers=dict(head or GOOD_HEAD))
     if rng:
         req.add_header("Range", f"bytes={rng[0]}-{rng[1]}")
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def open_direct(url):
+    """打开直链，必要时换几组请求头再试。返回 (响应, 用的是哪组头) 或 (None, "")。"""
+    first = None
+    for label, head in HEADSETS:
+        try:
+            r = get(url, timeout=60, head=head)
+            GOOD_HEAD.clear(); GOOD_HEAD.update(head)
+            return r, label
+        except Exception as e:
+            first = first or f"{label} → {e}"
+            continue
+    print(f"  ✖ 直链打不开：{first}")
+    print(f"    {len(HEADSETS)} 组请求头都试过了（空 UA / 浏览器 UA / 带 Referer），"
+          f"全都不行。")
+    print(f"    这条直链是网盘刚给的，所以不是过期 —— 是网盘那边拒绝了这次下载。")
+    return None, ""
 
 url = (f"{mw}/Videos/{iid}/stream?MediaSourceId=mediasource_{iid}"
        f"&Static=true&api_key={key}")
@@ -154,13 +191,22 @@ host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
 print(f"  直链节点  {host}")
 
 # --- 这条直链是 HLS 播放列表，还是一个整文件？ ---
+r, used = open_direct(loc)
+if r is None:
+    raise SystemExit
 try:
-    r = get(loc, timeout=60)
     head = r.read(65536)
     ctype = (r.headers.get("Content-Type") or "").lower()
     clen = r.headers.get("Content-Length")
 except Exception as e:
-    print(f"  ✖ 直链打不开：{e}"); raise SystemExit
+    print(f"  ✖ 直链读不动：{e}"); raise SystemExit
+if used != HEADSETS[0][0]:
+    # 【这一条是结论，不是过程】播放器要是不带这组头，一样 403。
+    print(f"  ⚠ 直链要带请求头才拉得动：{BOLD}{used}{RST}")
+    print(f"    空手拉是 403。播放器不带这组头也会 403 —— 那就是"
+          f"「Emby 里放不了、挂载页面能放」的原因（挂载页面是浏览器，天然带着）。")
+    print(f"    修法：OpenList → 存储 → 这个盘 → 打开{BOLD}「Web 代理」{RST}，"
+          f"让 OpenList 代拉（代价是流量过一次本机）。")
 
 is_hls = head.lstrip().startswith(b"#EXTM3U") or "mpegurl" in ctype
 if not is_hls:
