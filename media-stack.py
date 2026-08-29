@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.3"
+SCRIPT_VERSION = "1.5.4"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3577,12 +3577,64 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
     return n, 0
 
 
-def verify_episode_numbers(d, rules, key, items):
-    """核对 nfo 写的编号 Emby 到底认没认。对不上就说出来，并且重刮一次。
+def _admin_uid(key):
+    """随便一个管理员账号的 id。问不到返回 ""。"""
+    try:
+        for u in (_emby("/Users", key, timeout=20) or []):
+            if (u.get("Policy") or {}).get("IsAdministrator"):
+                return str(u.get("Id") or "")
+    except Exception:
+        pass
+    return ""
 
-    【写下 ≠ 生效】这一版之前，脚本每轮都理直气壮地打印"已补上季集编号"，
-    而 Emby 那边纹丝不动 —— 用户连着几轮回来说"还是没变"，脚本的输出里
-    却没有任何一行能对上他看到的东西。核对这一步就是补这个洞。
+
+def set_episode_number(key, uid, iid, season, ep):
+    """直接把季集编号写进 Emby 的条目里。成功返回 True。
+
+    【为什么不能靠 .nfo】实测在 Emby 4.9 上，「元数据下载器（集）」的可选项
+    只有 TheTVDB、TheMovieDb、The Open Movie Database —— 【没有 Nfo】。
+    也就是说这个版本压根不提供 nfo 读取器，脚本写在片子旁边的 .nfo
+    从头到尾没有任何人读过。之前几版一直在改"怎么写 nfo"，方向就是错的。
+
+    这条路和用户在 Emby 界面上「编辑元数据 → 填季号/集号」是同一个接口，
+    不依赖任何刮削器、也不依赖本地文件读不读得到。
+
+    【不锁定条目】锁了以后简介、海报也不再更新了，代价太大。改用"每轮核对、
+    对不上就再写一次"来兜底 —— 刮削器哪天又把它改回去，下一轮自己就修回来。
+    """
+    try:
+        it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=20) if uid else None
+    except Exception:
+        it = None
+    if not isinstance(it, dict) or not it.get("Id"):
+        return False
+    it["ParentIndexNumber"] = int(season)
+    it["IndexNumber"] = int(ep)
+    try:
+        _emby(f"/Items/{iid}", key, method="POST", body=it, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def verify_episode_numbers(d, rules, key, items):
+    """核对编号 Emby 到底是不是那个数，不是就直接写进去。返回改了几个。
+
+    【写下 ≠ 生效】早几版脚本每轮都理直气壮地打印"已补上季集编号"，而 Emby
+    那边纹丝不动 —— 用户连着几轮回来说"还是没变"，脚本的输出里却没有任何
+    一行能对上他看到的东西。核对这一步就是补这个洞。
+
+    【为什么改成直接写】体检把 Emby 自己给出的可选项打出来之后才看清：
+    「元数据下载器（集）」里只有 TheTVDB、TheMovieDb、The Open Movie Database，
+    【没有 Nfo】—— 这个 Emby 版本不提供 nfo 读取器，写在片子旁边的 .nfo
+    从头到尾没人读。所以不能再指望"写文件 + 重刮"，得走编辑条目那个接口，
+    也就是用户在界面上手工填季号集号走的同一条路。
+
+    .nfo 仍然写：它是【这一集该是第几集】的落盘记录，核对时拿它当标准答案，
+    换机器、重装、Emby 数据库重建都还在。Emby 读不读它是另一回事。
+
+    【每轮都核对、对不上就再写】不锁定条目 —— 锁了简介和海报也不再更新。
+    刮削器哪天又把编号改回去，下一轮自己修回来。
     """
     if not key:
         return 0
@@ -3590,29 +3642,26 @@ def verify_episode_numbers(d, rules, key, items):
     if not off:
         return 0
     _s, _i, ws, we, gs, ge = off[0]
-    warn(f"{len(off)} 个条目的季集编号 Emby 没有采纳 —— "
-         f"nfo 写的是 S{ws:02d}E{we:02d}，Emby 显示的是第 {gs} 季第 {ge} 集")
-    # 【最常见的原因就一个】库的「元数据下载器（集）」名单里没有 Nfo：
-    # 规则文件里的 scrapers 写了就等于"只用这几个"，本地读取器被挤出去了。
-    if not episode_nfo_reader_on(key, rules):
-        print(f"  {DIM}原因：媒体库的「元数据下载器（集）」里没有 {BOLD}Nfo{RST}"
-              f"{DIM} —— 本地的 .nfo 根本不会被读。这一版已经会自动把它补回去"
-              f"并排到最前，跑完这次「4 生成媒体库」就好了。{RST}")
+    warn(f"{len(off)} 个条目的季集编号和应有的对不上 —— "
+         f"该是 S{ws:02d}E{we:02d}，Emby 显示的是第 {gs} 季第 {ge} 集")
+    uid = _admin_uid(key)
+    if not uid:
+        print(f"  {DIM}问不到管理员账号，这轮改不了。{RST}")
         return 0
-    tried = set(ms_state().get("ep_num_tried") or [])
-    todo = [x for x in off if x[0] not in tried][:EP_REIDENT_MAX]
-    if not todo:
-        print(f"  {DIM}重刮过一轮还是没采纳。到 Emby 里点这部剧 → 编辑元数据，"
-              f"把「季号 / 集号」手工填一次；或者把这个库改成 "
-              f"episode_number: false，编号交回给刮削器。{RST}")
-        return 0
-    m = reidentify_items(key, [x[1] for x in todo])
-    tried.update(x[0] for x in todo)
-    save_ms_state(ep_num_tried=sorted(tried)[-EP_TRIED_MAX:])
-    if m:
-        ok(f"已叫 Emby 重读这 {m} 个条目的本地 .nfo{DIM}（后台跑，"
-           f"编号过一会儿变；下轮会再核对一次）{RST}")
-    return m
+    n = 0
+    for hp, iid, wsx, wex, _gs, _ge in off[:EP_REIDENT_MAX]:
+        if set_episode_number(key, uid, iid, wsx, wex):
+            n += 1
+    if n:
+        ok(f"{n} 个条目的季集编号已直接写进 Emby"
+           f"{DIM}（走的是「编辑元数据」那个接口，不经过刮削器；"
+           f"下轮还会再核对一次）{RST}")
+    if n < len(off):
+        warn(f"还有 {len(off) - n} 个没写进去")
+        print(f"  {DIM}到 Emby 里点这一集 → 编辑元数据，手工填「季号 / 集号」；"
+              f"或者把这个库改成 episode_number: false，编号交回给刮削器"
+              f"（那样会按刮削器的库分季）。{RST}")
+    return n
 
 
 def episode_nfo_reader_on(key, rules):
@@ -10054,6 +10103,10 @@ def do_healthcheck():
 
     这里的每一项都对应一个真实踩过的坑,不是凭空设计的检查表。
     """
+    # 体检当场数出来的"没时长"个数。下面「每日对齐」那一行要拿它跟
+    # 上次跑完时记下的数字对一下 —— 不对一下就会出现「条目时长 ✔ 都有」
+    # 和「还有 8 个没时长」同屏打架，用户没法判断该信哪个。
+    live_nodur = None
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
@@ -10879,21 +10932,25 @@ def do_healthcheck():
                             print(f"      {DIM}Emby 给出的可选项（集）："
                                   f"{'、'.join(_av)}{RST}")
                         print(f"      {DIM}本地 Nfo 读取器："
-                              f"{'开着' if _rd else RED + '没开 —— 就是它' + RST}{RST}")
+                              + ("开着" if _rd else
+                                 "这个 Emby 版本不提供 —— 所以编号改成由脚本"
+                                 "直接写进条目，不走 .nfo")
+                              + f"{RST}")
                         todo.append((
-                            f"{len(_off)} 个剧集的季集编号 Emby 没有采纳 —— "
-                            f"nfo 里写的是 S{_ws:02d}E{_we:02d}，"
+                            f"{len(_off)} 个剧集的季集编号不对 —— "
+                            f"该是 S{_ws:02d}E{_we:02d}，"
                             f"界面上显示的是第 {_gs} 季第 {_ge} 集",
-                            ("媒体库的「元数据下载器（集）」里没有 Nfo，本地的 "
-                             ".nfo 根本不会被读 —— 跑一次「6 更新」再点「4 生成"
-                             "媒体库」，脚本会把它补回去并排到最前"
-                             if not _rd else
-                             "Nfo 读取器是开着的，那就是 Emby 没重读本地文件："
-                             "点「4 生成媒体库」会重刮一次；还不行就到 Emby 里"
-                             "点这部剧 → 编辑元数据，手工填一次季号/集号，"
-                             "或者把这个库改成 episode_number: false")))
+                            "点一次「4 生成媒体库」：脚本会走「编辑元数据」那个"
+                            "接口把编号直接写进 Emby，不经过刮削器。"
+                            "写完还是不对就到 Emby 里点这一集 → 编辑元数据手工填，"
+                            "或者把这个库改成 episode_number: false"
+                            "（编号交回刮削器，代价是按它的库分季）"))
 
             nodur = items_without_duration(key)
+            # 【留给「每日对齐」那一行用】那一行印的是上次跑完时记下的数字，
+            # 印之前得先跟现在的实际情况对一下 —— 不然会出现「条目时长 ✔ 都有」
+            # 和「还有 8 个没时长」同屏打架，用户没法判断该信哪个。
+            live_nodur = len(nodur)
             if nodur:
                 # 必须把片名列出来。只报个数字的话，用户看到"某个媒体库没有进度条
                 # 记忆"会以为是那个库的设置没生效 —— 而实际上门槛早就调好了，
@@ -11081,7 +11138,13 @@ def do_healthcheck():
                 if fixed > 0:
                     did.append(f"补了 {fixed} 个时长")
                 if sy.get("nodur_after"):
-                    did.append(f"{YELLOW}还有 {sy['nodur_after']} 个没时长{RST}")
+                    # live_nodur 是这次体检【当场数】出来的。上次跑完还差几个，
+                    # 不代表现在还差 —— 中间每小时的对齐任务一直在补。
+                    if live_nodur == 0:
+                        did.append(f"{DIM}（那次跑完还差 {sy['nodur_after']} 个"
+                                   f"时长，现在都齐了）{RST}")
+                    else:
+                        did.append(f"{YELLOW}还有 {live_nodur} 个没时长{RST}")
                 if sy.get("missing"):
                     did.append(f"{YELLOW}{sy['missing']} 个没被 Emby 收录{RST}")
                 st2, note2 = _stale_note(int(hrs * 60), 24 * 60, "天", late=1.5)
