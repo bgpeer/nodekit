@@ -75,6 +75,11 @@ sudo python3 /tmp/xy.py
 > 一并规范化。原始的 `xy-nodes.txt` 保持不动（那是凭据本体，能不碰就不碰）。
 > 代价：客户端里手动选中过的节点会因为改名回到分组默认（URLTest 分组不受影响）。
 
+> **协议名都是两段**（`reality-xhttp`、`vless-ws`、`vmess-httpupgrade`…）：三段名在手机客户端里
+> 显示不下、后半截会被截掉。xray 的 reality 三兄弟原叫 `vless-reality-*`，`vless-` 是冗余的
+> （它们本来就都是 vless，sing-box 那边同样的东西就叫 `reality-vision`），已统一砍成两段。
+> 老节点点一次 `更新配置` 就跟着变短，命令行沿用 `--xray vless-reality-xhttp` 这种旧写法也仍然认。
+
 > **想换名字**：进 **`2 节点链接 / 订阅`** → `1 更换节点名称前缀`，输入新前缀即可
 > （输 `-` 表示不要前缀）。**只改显示名，uuid / 端口 / 路径 / 服务 / 证书一律不动，不用重装**——
 > 重装会重新生成全部 uuid 和端口，为改个名字不值当。改完自动刷新三格式订阅，并把新前缀
@@ -87,11 +92,11 @@ sudo python3 /tmp/xy.py
 | 核心 | 协议 |
 |------|------|
 | **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、reality-grpc、tuic、vmess-httpupgrade、anytls |
-| **xray** | vless-reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、vless-reality-vision、vless-reality-grpc、vless-ws、vmess-ws、trojan |
+| **xray** | reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、reality-vision、reality-grpc、vless-ws、vmess-ws、trojan |
 
 可以只装 sing-box、只装 xray，或两个一起装。**端口/服务/配置都互不冲突**（两核心是独立进程、各绑各的随机端口、各写各的 config）。
 
-> 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`），sing-box 已能做且做得一样，xray 独有价值的只有 `vless-reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `vless-reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
+> 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`），sing-box 已能做且做得一样，xray 独有价值的只有 `reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
 >
 > 万一你让两核心装了同名协议（`vless-ws`/`vmess-ws`/`trojan`），为避免客户端订阅**重名报错**，会给它们**尾部各加一个小上标区分**：sing-box 那份加 `¹`、xray 那份加 `²`（如 `trojan¹` / `trojan²`）。只标撞名的这几个，其余不动；上标短，手机上也显示得下。端口/服务/配置本来就互不冲突。
 
@@ -640,7 +645,7 @@ sing-box  FATAL decode config: duplicate outbound/endpoint tag  → 配置解析
 sudo python3 xy-installer.py --sb all --xray all
 
 # 指定协议 + 域名真证书
-sudo python3 xy-installer.py --sb reality-vision,hy2,tuic --xray vless-reality-xhttp \
+sudo python3 xy-installer.py --sb reality-vision,hy2,tuic --xray reality-xhttp \
      --domain a.example.com --email me@example.com
 
 # nginx 前置（443 伪装站 + webroot 证书，ws 类藏 443），需域名
