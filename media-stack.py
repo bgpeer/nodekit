@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.1"
+SCRIPT_VERSION = "1.5.2"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2711,7 +2711,7 @@ def _episode_items(key):
     while True:
         try:
             r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode"
-                      f"&Fields=ProviderIds,Path,IndexNumber,Name"
+                      f"&Fields=ProviderIds,Path,IndexNumber,ParentIndexNumber,Name"
                       f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
         except Exception:
             return None
@@ -3287,6 +3287,51 @@ def write_episode_nfo(strm_path, season, ep):
         return False
 
 
+def read_episode_nfo(strm_path):
+    """读我们自己写的那个 nfo，返回 (季, 集)。不是我们的、或读不出来返回 None。"""
+    try:
+        with open(os.path.splitext(strm_path)[0] + ".nfo",
+                  encoding="utf-8", errors="replace") as f:
+            cur = f.read()
+    except OSError:
+        return None
+    if EP_NFO_MARK not in cur:
+        return None
+    m1 = re.search(r"<season>(\d+)</season>", cur)
+    m2 = re.search(r"<episode>(\d+)</episode>", cur)
+    return (int(m1.group(1)), int(m2.group(1))) if m1 and m2 else None
+
+
+def episode_number_mismatch(d, items):
+    """nfo 里写的季集编号和 Emby 实际显示的对不上的那些。
+
+    返回 [(strm 路径, 条目 id, 该是第几季, 该是第几集, 现在是第几季, 现在是第几集)]。
+
+    【为什么必须有这一步】写下 nfo ≠ Emby 采纳了它。实测踩过：库的
+    「元数据下载器（集）」名单被规则文件里的 scrapers 覆盖成了只有
+    TheTVDB/TheMovieDb，本地的 Nfo 读取器【被挤了出去】，于是脚本写的
+    S01E231 一眼都没被看过，Emby 照旧按网站的来 —— 第 5 季第 23 集。
+    脚本那边一路打印"已补上编号"，外面看到的却是"还是没变"。
+
+    对不上就得说出来，并且拿去重刮。不核对的话，这种失败从外面完全看不见。
+    """
+    out = []
+    for i in (items or []):
+        p = str(i.get("Path") or "")
+        if not (p.endswith(".strm") and _under(p, STRM_PATH)):
+            continue
+        hp = host_strm_path(d, p)
+        want = read_episode_nfo(hp) if hp else None
+        if not want:
+            continue
+        got_s, got_e = i.get("ParentIndexNumber"), i.get("IndexNumber")
+        if got_s is None or got_e is None:
+            continue                      # 还没扫出来，不算对不上
+        if (int(got_s), int(got_e)) != want:
+            out.append((hp, i.get("Id"), want[0], want[1], int(got_s), int(got_e)))
+    return out
+
+
 def has_episode_nfo(strm_path):
     """这个 strm 旁边有没有【我们自己写的】那种 nfo。"""
     try:
@@ -3467,10 +3512,11 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         if bad is None:
             warn("剧集编号：问不到 Emby 的条目列表，这轮跳过")
         else:
-            # 【编号没得补，名字还可能欠着】这两件事是分开的：编号已经补齐、
-            # 从此不再进 todo 的条目，名字仍然停在文件名上。早一版就是在这里
-            # 直接 return，于是那批条目的名字永远没人管。
-            fix_episode_titles(d, rules, key)
+            # 【编号没得补，不代表已经生效】这两件事是分开的：写下 nfo 之后
+            # 条目就不再进 todo，可 Emby 认没认是另一回事 —— 早一版在这里直接
+            # return，于是"写了没生效"这种失败从外面一点都看不见。
+            verify_episode_numbers(d, rules, key, all_items)
+            fix_episode_titles(d, rules, key, skip=up, items=all_items)
             _names = [r["name"] for r in tv]
             print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
                   f"需要处理的 0 个（剧集库：{'、'.join(_names) or '一个都没有'}）{RST}")
@@ -3502,9 +3548,6 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             if not st:
                 return fix_episode_strm_names(d, rules, key, interactive=False)
     do = on + (und if st else [])
-    if not do:
-        fix_episode_titles(d, rules, key, skip=up, items=all_items)
-        return 0, 0
     n, wrote = 0, []
     for src, sea, ep, _dc in do:
         if write_episode_nfo(src, sea, ep):
@@ -3517,9 +3560,69 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         # 不重读它就还按旧的来。用 refresh_items（ReplaceAllMetadata=false）——
         # true 会把编号一起交还给刮削器，那正是"一部剧被拆成 2 季"的来源。
         refresh_items(key, [bad.get(p) for p in wrote])
+    verify_episode_numbers(d, rules, key, all_items)
     fix_episode_titles(d, rules, key, skip=list(wrote) + list(up),
                        items=all_items)
     return n, 0
+
+
+def verify_episode_numbers(d, rules, key, items):
+    """核对 nfo 写的编号 Emby 到底认没认。对不上就说出来，并且重刮一次。
+
+    【写下 ≠ 生效】这一版之前，脚本每轮都理直气壮地打印"已补上季集编号"，
+    而 Emby 那边纹丝不动 —— 用户连着几轮回来说"还是没变"，脚本的输出里
+    却没有任何一行能对上他看到的东西。核对这一步就是补这个洞。
+    """
+    if not key:
+        return 0
+    off = episode_number_mismatch(d, items)
+    if not off:
+        return 0
+    _s, _i, ws, we, gs, ge = off[0]
+    warn(f"{len(off)} 个条目的季集编号 Emby 没有采纳 —— "
+         f"nfo 写的是 S{ws:02d}E{we:02d}，Emby 显示的是第 {gs} 季第 {ge} 集")
+    # 【最常见的原因就一个】库的「元数据下载器（集）」名单里没有 Nfo：
+    # 规则文件里的 scrapers 写了就等于"只用这几个"，本地读取器被挤出去了。
+    if not episode_nfo_reader_on(key, rules):
+        print(f"  {DIM}原因：媒体库的「元数据下载器（集）」里没有 {BOLD}Nfo{RST}"
+              f"{DIM} —— 本地的 .nfo 根本不会被读。这一版已经会自动把它补回去"
+              f"并排到最前，跑完这次「4 生成媒体库」就好了。{RST}")
+        return 0
+    tried = set(ms_state().get("ep_num_tried") or [])
+    todo = [x for x in off if x[0] not in tried][:EP_REIDENT_MAX]
+    if not todo:
+        print(f"  {DIM}重刮过一轮还是没采纳。到 Emby 里点这部剧 → 编辑元数据，"
+              f"把「季号 / 集号」手工填一次；或者把这个库改成 "
+              f"episode_number: false，编号交回给刮削器。{RST}")
+        return 0
+    m = reidentify_items(key, [x[1] for x in todo])
+    tried.update(x[0] for x in todo)
+    save_ms_state(ep_num_tried=sorted(tried)[-EP_TRIED_MAX:])
+    if m:
+        ok(f"已叫 Emby 重读这 {m} 个条目的本地 .nfo{DIM}（后台跑，"
+           f"编号过一会儿变；下轮会再核对一次）{RST}")
+    return m
+
+
+def episode_nfo_reader_on(key, rules):
+    """剧集库的「元数据下载器（集）」里有没有 Nfo。问不到就当有（不误报）。"""
+    tv = {r["name"] for r in rules if (r.get("type") or "movies") == "tvshows"}
+    try:
+        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
+    except Exception:
+        return True
+    seen = False
+    for lb in libs:
+        if lb.get("Name") not in tv:
+            continue
+        for t in ((lb.get("LibraryOptions") or {}).get("TypeOptions") or []):
+            if (t.get("Type") or "") != "Episode":
+                continue
+            seen = True
+            names = t.get("MetadataFetcherOrder") or t.get("MetadataFetchers") or []
+            if not any(_is_local_fetcher(x, "MetadataFetchers") for x in names):
+                return False
+    return True if seen else True
 
 
 def apply_libraries(d, key, plan):
@@ -7881,10 +7984,37 @@ def desired_type_options(key, ctype, rule=None):
                 continue                 # 没指定 → 保留 Emby 默认那一份
             pool = avail.get((t.get("Type") or "", fk)) or []
             picked = [p for n in names for p in pool if p.lower() == n]
-            if picked:                   # 一个都对不上就别动，留默认的
-                t[fk], t[ok_] = picked, list(picked)
+            if not picked:               # 一个都对不上就别动，留默认的
+                continue
+            # 【本地读取器绝对不能被挤掉，而且要排在最前】用户在 scrapers 里写的
+            # 是"上哪个网站刮"，他不会想到这一行还管着"读不读本地的 .nfo"。
+            # 而这份名单的含义是"只用我列的这些" —— 没列 Nfo 就等于把它关了，
+            # 于是脚本辛辛苦苦写下的季集编号 Emby 一眼都不看，全按网站的来。
+            # 症状：补了 S01E231，Emby 照旧显示第 5 季第 23 集。
+            # 排最前是因为本地那份是我们【确知正确】的，网站只该拿来填空缺。
+            local = [p for p in pool
+                     if p not in picked and _is_local_fetcher(p, fk)]
+            t[fk] = local + picked
+            t[ok_] = list(t[fk])
         out.append(t)
     return out
+
+
+# 本地元数据/图片读取器：读的是文件旁边的 .nfo、poster.jpg 这些，不联网。
+# 【不含 Image Capture / Screen Grabber 那类】那个是从视频里抓一帧当封面，
+# 而这套东西的片子都在网盘上，抓一帧等于跨境把视频拉下来 —— 规则文件的
+# 注释里专门交代过不要它，这里更不能偷偷替用户加回去。
+_LOCAL_MD = ("nfo",)
+_LOCAL_IM = ("local", "embedded", "folder")
+_NOT_LOCAL_IM = ("capture", "grab", "extract", "screen", "thumb")
+
+
+def _is_local_fetcher(name, field):
+    n = (name or "").lower()
+    if field == "MetadataFetchers":
+        return any(k in n for k in _LOCAL_MD)
+    return (any(k in n for k in _LOCAL_IM)
+            and not any(k in n for k in _NOT_LOCAL_IM))
 
 
 def _wanted_options(key, ctype, rule):
