@@ -37,7 +37,7 @@ import zipfile
 # 【改了代码就要动这个数】它一直停在 1.1.0，于是「6 更新」永远打印
 # "v1.1.0 → v1.1.0"，用户根本没法判断新代码到底到没到机器上 ——
 # 排查时这是最基本的一条信息，缺了它只能靠猜。
-SCRIPT_VERSION = "1.3.0"
+SCRIPT_VERSION = "1.4.0"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2692,8 +2692,84 @@ def host_strm_path(d, p):
     return os.path.join(strm_root(d), STRM_SUBDIR, *rel)
 
 
+def _episode_items(key):
+    """Emby 里所有剧集条目（翻页拉完）。问不到返回 None。
+
+    None 和 [] 差别很大：None 是"问不出来"，一个文件都不该动；[] 是"确实没有"。
+    半路失败也返回 None —— 拿半份名单去判断"哪些没认出来"，会把还没拉到的
+    那半份全当成不存在。
+    """
+    out, start, page = [], 0, 500
+    while True:
+        try:
+            r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode"
+                      f"&Fields=ProviderIds,Path,IndexNumber,Name"
+                      f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
+        except Exception:
+            return None
+        items = r.get("Items") or []
+        out.extend(items)
+        total = int(r.get("TotalRecordCount") or 0)
+        start += len(items)
+        if not items or start >= total:
+            return out
+
+
+def cloud_name_stem(hp):
+    """这个 strm 指向的网盘文件，去掉扩展名的那个名字。读不出来返回 ""。"""
+    try:
+        with open(hp, encoding="utf-8") as f:
+            tgt = strm_target_path(f.read())
+    except OSError:
+        return ""
+    return os.path.splitext(os.path.basename(tgt or ""))[0]
+
+
+def untitled_episodes(d, rules, key):
+    """标题栏里放的还是文件名、刮削器给的真剧集名一直没进来的条目。
+
+    返回 {strm 宿主机路径: 条目 id}；问不到返回 None。
+
+    【为什么会卡在这儿】Emby 建条目时没有标题就拿文件名顶上，于是标题栏
+    【不是空的】。后面再刮，ReplaceAllMetadata=false 的含义是"只补缺失的字段"
+    —— 标题栏有东西 = 不缺 = 不去问刮削器要。简介、海报都刮回来了，
+    唯独名字永远停在「233 4K」。补完季集编号之后尤其明显：集号对了，名字没对。
+
+    只认【和文件名一模一样】的，一个字都不差才算。刮削器给的名字碰巧等于
+    文件名的话，重新识别一次也只是拿回同样的结果，不会改坏什么。
+    """
+    items = _episode_items(key)
+    if items is None:
+        return None
+    roots = lib_strm_dirs(d, rules, [r["name"] for r in rules
+                                     if (r.get("type") or "movies") == "tvshows"])
+    out = {}
+    for i in items:
+        p = str(i.get("Path") or "")
+        if not (p.endswith(".strm") and _under(p, STRM_PATH)):
+            continue
+        hp = host_strm_path(d, p)
+        # roots 为空 = 问不出媒体库的路径，那就不按库筛（宁可多修，别一个不修）
+        if not hp or (roots and not any(_under(hp, q) for q in roots)):
+            continue
+        name = str(i.get("Name") or "").strip()
+        if not name:
+            continue
+        stems = {os.path.splitext(os.path.basename(p))[0].strip(),
+                 cloud_name_stem(hp).strip()}
+        if name in stems:
+            out[hp] = i.get("Id")
+    return out
+
+
 def misparsed_strm_names(d, key):
-    """Emby 把集号认错了、或者压根没认出来的剧集。返回 set(strm 文件名)；问不到返回 None。
+    """Emby 把集号认错了、或者压根没认出来的剧集。
+
+    返回 {strm 宿主机路径: 条目 id}；问不到返回 None。
+
+    【键是完整路径，不是文件名】剧集的文件名撞车是常态：「剧A/01.strm」和
+    「剧B/01.strm」的 basename 一模一样。拿文件名当键，一部剧认错了会让
+    另一部剧也被当成认错的 —— 判据一失准，改的就是不该改的那些。
 
     【判据是"Emby 认的集号和文件名里的数字对不对得上"】
 
@@ -2708,50 +2784,35 @@ def misparsed_strm_names(d, key):
     改名之后 strm 叫「剧名 - S01E231.strm」，Emby 认出 231，和网盘文件名里的
     231 对上，下一轮就不会再动它 —— 天然幂等。
 
-    None 和 set() 差别很大：None 是"问不出来"，一个文件都不该动；
-    set() 是"确认没有认错的"。
+    None 和 {} 差别很大：None 是"问不出来"，一个文件都不该动；
+    {} 是"确认没有认错的"。
     """
-    out, start, page = set(), 0, 500
-    while True:
-        try:
-            r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode"
-                      f"&Fields=ProviderIds,Path,IndexNumber"
-                      f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
-        except Exception:
-            return None
-        items = r.get("Items") or []
-        for i in items:
-            p = str(i.get("Path") or "")
-            if not (p.endswith(".strm") and _under(p, STRM_PATH)):
-                continue
-            base = os.path.basename(p)
-            # 【名字里已经写着 SxxExx 的一律不算"认错"】改名帮不上它，而且
-            # 这里的比法对它本来就不成立：写成 S01E238 之后，Emby 会拿 238 去
-            # 刮削器换算成"第 5 季第 30 集"，IndexNumber 变成 30 —— 那是【对的】，
-            # 季是 TheTVDB 分的，不是认错。不排除的话，每轮都会把它算进
-            # "判定集号不对"里，报出来的数字纯属吓人。
-            if EP_HAS_SE.search(os.path.splitext(base)[0]):
-                continue
-            has_id = bool({k: v for k, v in (i.get("ProviderIds") or {}).items()
-                           if v and k.lower() != "trakt"})
-            hp = host_strm_path(d, p)
-            if not hp:
-                continue
-            try:
-                with open(hp, encoding="utf-8") as f:
-                    want = episode_no(os.path.splitext(
-                        os.path.basename(strm_target_path(f.read())))[0])
-            except OSError:
-                continue
-            got = i.get("IndexNumber")
-            if not has_id:
-                out.add(base)               # 谁都没认出来
-            elif want and got is not None and int(got) != want:
-                out.add(base)               # 认出来了，但集号和文件名对不上
-        total = int(r.get("TotalRecordCount") or 0)
-        start += len(items)
-        if not items or start >= total:
-            return out
+    items = _episode_items(key)
+    if items is None:
+        return None
+    out = {}
+    for i in items:
+        p = str(i.get("Path") or "")
+        if not (p.endswith(".strm") and _under(p, STRM_PATH)):
+            continue
+        # 【名字里已经写着 SxxExx 的一律不算"认错"】这里的比法对它本来就不成立：
+        # 写成 S01E238 之后，Emby 会拿 238 去刮削器换算成"第 5 季第 30 集"，
+        # IndexNumber 变成 30 —— 那是【对的】，季是 TheTVDB 分的，不是认错。
+        # 不排除的话，每轮都会把它算进"判定集号不对"里，报出来的数字纯属吓人。
+        if EP_HAS_SE.search(os.path.splitext(os.path.basename(p))[0]):
+            continue
+        has_id = bool({k: v for k, v in (i.get("ProviderIds") or {}).items()
+                       if v and k.lower() != "trakt"})
+        hp = host_strm_path(d, p)
+        if not hp:
+            continue
+        want = episode_no(cloud_name_stem(hp))
+        got = i.get("IndexNumber")
+        if not has_id:
+            out[hp] = i.get("Id")           # 谁都没认出来
+        elif want and got is not None and int(got) != want:
+            out[hp] = i.get("Id")           # 认出来了，但集号和文件名对不上
+    return out
 
 
 def plan_episode_renames(d, rules, broken=None):
@@ -2814,21 +2875,15 @@ def plan_episode_renames(d, rules, broken=None):
                 for f in fs:
                     if not f.endswith(".strm"):
                         continue
-                    if f not in broken:
+                    if os.path.join(dp, f) not in broken:
                         continue          # Emby 认对了，别碰
                     stem = f[:-5]
                     if EP_HAS_SE.search(stem):
                         continue          # 名字里已经写着编号，Emby 还认错就不是改名能解决的
-                    # 【集数从网盘文件名抠，不是从 strm 名】strm 可能已经被改成
+                    # 【集数从网盘文件名抠，不是从 strm 名】strm 可能被旧版改成过
                     # 「剧名 - S01E231」，从它抠第一段数字会得到 01。
-                    # 网盘那个名字才是原始事实，而且改名从不动 strm 内容。
-                    try:
-                        with open(src_probe := os.path.join(dp, f),
-                                  encoding="utf-8") as fh:
-                            ep = episode_no(os.path.splitext(os.path.basename(
-                                strm_target_path(fh.read())))[0])
-                    except OSError:
-                        continue
+                    # 网盘那个名字才是原始事实，而这条路从不动 strm 的内容。
+                    ep = episode_no(cloud_name_stem(os.path.join(dp, f)))
                     if not ep:
                         continue          # 抠不出集数就别猜
                     out.append((os.path.join(dp, f), sea, ep, decided))
@@ -3015,6 +3070,79 @@ def ep_fix_setting():
     return bool(v) if v is not None else None
 
 
+# 一轮最多叫 Emby 重新识别多少个条目。每一个都是一次联网刮削，
+# 整库几千集一次性发出去，Emby 会排队排到天亮，还可能被刮削源限流。
+EP_REIDENT_MAX = 120
+# 已经叫它重新识别过、刮削器还是没给出真名字的那些。记下来别再重复要 ——
+# 有些片子的剧集名在 TheTVDB/TMDB 里本来就是空的，那是要不到的，
+# 不记账就会每小时对着同一批条目再发一轮，永远停不下来。
+EP_TRIED_MAX = 3000
+
+
+def reidentify_items(key, ids):
+    """让 Emby 对这些条目【重新识别】。返回成功发出去几个。
+
+    【必须 ReplaceAllMetadata=true】false 的含义是"只补缺失的字段"，而这些
+    条目的标题栏里【已经有东西了】—— 就是那个文件名。Emby 一看不缺，
+    根本不会去问刮削器要真正的剧集名。这正是"集号补对了、名字还是 233 4K"的
+    全部原因：简介、海报都刮回来了（那些字段本来是空的），唯独名字不是空的。
+
+    图像不动（ReplaceAllImages=false）：缩略图早刮好了，重下一遍是白花流量。
+
+    观看进度不受影响 —— 那是 UserData，跟元数据是两套东西。
+    """
+    n = 0
+    for iid in ids:
+        if not iid:
+            continue
+        try:
+            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
+                  f"&ImageRefreshMode=Default"
+                  f"&ReplaceAllMetadata=true&ReplaceAllImages=false",
+                  key, method="POST", timeout=30)
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+def fix_episode_titles(d, rules, key, skip=()):
+    """把标题栏还停在文件名上的剧集，叫 Emby 重新识别一次。返回发出去几个。
+
+    和补季集编号是两件事，故意分开：编号靠 nfo（本地就能定），名字只能问
+    刮削器要。补完编号之后 Emby 才知道这是第几集，这时候重新识别才拿得到
+    对应那一集的名字 —— 所以这一步永远排在写 nfo 后面。
+
+    skip 是这一轮刚刚单独发过重新识别的那些，别再发第二遍：Emby 是后台跑的，
+    这会儿它们看起来仍然"没名字"。重复发不只是白发 —— 还会把它们记进
+    ep_title_tried，等于把一次都还没跑完的尝试当成"试过了"。
+    """
+    if not key:
+        return 0
+    got = untitled_episodes(d, rules, key)
+    if not got:
+        return 0
+    tried = set(ms_state().get("ep_title_tried") or []) | set(skip)
+    todo = [(hp, iid) for hp, iid in got.items() if hp not in tried]
+    if not todo:
+        return 0
+    todo = todo[:EP_REIDENT_MAX]
+    n = reidentify_items(key, [iid for _hp, iid in todo])
+    if not n:
+        return 0
+    # 【发出去就记账，不等结果】重新识别是后台跑的，这里拿不到结论。
+    # 只发一次就够：真有名字的下一轮自然就不在 untitled 里了；
+    # 要不到名字的那些，记了账才不会每小时再来一遍。
+    tried.update(hp for hp, _i in todo)
+    save_ms_state(ep_title_tried=sorted(tried)[-EP_TRIED_MAX:])
+    ok(f"{n} 个剧集的名字还是文件名，已叫 Emby {BOLD}重新识别{RST}"
+       f"{DIM}（后台跑，名字过一会儿变）{RST}")
+    if len(got) > len(todo):
+        print(f"  {DIM}还有 {len(got) - len(todo)} 个排下一轮 —— "
+              f"一次发太多会把 Emby 和刮削源都堵住。{RST}")
+    return n
+
+
 # 我们自己写的 .nfo 上的记号。只删带这一行的，绝不碰用户/AutoFilm 从网盘
 # 下下来的那些 nfo。
 EP_NFO_MARK = "<!-- media-stack: 只给 Emby 补季集编号，别的一概不写 -->"
@@ -3193,6 +3321,10 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         if bad is None:
             warn("剧集编号：问不到 Emby 的条目列表，这轮跳过")
         else:
+            # 【编号没得补，名字还可能欠着】这两件事是分开的：编号已经补齐、
+            # 从此不再进 todo 的条目，名字仍然停在文件名上。早一版就是在这里
+            # 直接 return，于是那批条目的名字永远没人管。
+            fix_episode_titles(d, rules, key)
             _names = [r["name"] for r in tv]
             print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
                   f"需要处理的 0 个（剧集库：{'、'.join(_names) or '一个都没有'}）{RST}")
@@ -3225,13 +3357,21 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
                 return fix_episode_strm_names(d, rules, key, interactive=False)
     do = on + (und if st else [])
     if not do:
+        fix_episode_titles(d, rules, key)
         return 0, 0
-    n = 0
+    n, wrote = 0, []
     for src, sea, ep, _dc in do:
         if write_episode_nfo(src, sea, ep):
             n += 1
+            wrote.append(src)
     if n:
         ok(f"{n} 个条目补上了季集编号{DIM}（旁挂 .nfo，文件名和网盘都没动）{RST}")
+        # 【刚写完的这批必须当场叫 Emby 重新识别】不然它读不到 nfo：
+        # 文件是脚本在 Emby 背后放的，Emby 不重新识别就还按旧的来。
+        # 顺带把名字也一起要回来 —— 重新识别一次两件事都办了。
+        reidentify_items(key, [bad.get(p) for p in wrote])
+    # 编号补齐之后 Emby 才知道这是第几集，这时候才要得到对应那一集的名字。
+    fix_episode_titles(d, rules, key, skip=wrote)
     return n, 0
 
 
@@ -7421,34 +7561,38 @@ def sync_library_options(d, key, rules):
            f"{'、'.join(changed)}")
     else:
         print(f"  {DIM}媒体库的语言/刮削器已经和规则文件一致，没有要改的。{RST}")
-        for iid, nm, _full in changed_ids:
-            n_item = _lib_item_count(key, iid)
-            if n_item > REFRESH_AUTO_MAX:
-                warn(f"「{nm}」有 {n_item} 个条目，没有自动重刮 —— 挑个时间自己来")
-                continue
-            # 【换了刮削器就必须 ReplaceAllMetadata=true】否则改了等于没改。
-            # false 的含义是"只补缺失的字段"，而一个已经刮全了的条目什么都不缺 ——
-            # Emby 扫一眼发现没什么要补的，【根本不会重新做识别】，新的刮削器
-            # 排第几都轮不到它出手。
-            # 实测：AV 库把 MetaTube 提到第一之后重刮，条目的数据库链接里还是
-            # 只有 TheMovieDb —— 因为那次刷新压根没重新识别。
-            #
-            # 只改了语言的库仍然用 false：那种情况要的就是"把缺的补上"，
-            # 没必要把整库的元数据推倒重来（那是几十 GB 的下载）。
-            # Emby 会保留锁定的字段，脚本设的片名不会被冲掉。
-            try:
-                _emby(f"/Items/{iid}/Refresh?Recursive=true"
-                      f"&MetadataRefreshMode=FullRefresh"
-                      f"&ImageRefreshMode=FullRefresh"
-                      f"&ReplaceAllMetadata={'true' if _full else 'false'}"
-                      f"&ReplaceAllImages={'true' if _full else 'false'}",
-                      key, method="POST", timeout=30)
-                ok(f"「{nm}」已通知"
-                   + (f"{BOLD}重新识别{RST}（换了刮削器，"
-                      f"{n_item} 个条目，后台进行）" if _full
-                      else f"重刮（{n_item} 个条目，后台进行）"))
-            except Exception:
-                pass
+    # 【这一段原来缩在上面那个 else 里】也就是"一个库都没改"的时候才跑，
+    # 而那时 changed_ids 必然是空的 —— 循环一次都不会转。真正改了刮削器的时候
+    # 反而不重刮，于是名单写进去了、条目一个都没按新刮削器重新识别过。
+    # 外面看到的就是"脚本说设好了，Emby 里还是老样子"。
+    for iid, nm, _full in changed_ids:
+        n_item = _lib_item_count(key, iid)
+        if n_item > REFRESH_AUTO_MAX:
+            warn(f"「{nm}」有 {n_item} 个条目，没有自动重刮 —— 挑个时间自己来")
+            continue
+        # 【换了刮削器就必须 ReplaceAllMetadata=true】否则改了等于没改。
+        # false 的含义是"只补缺失的字段"，而一个已经刮全了的条目什么都不缺 ——
+        # Emby 扫一眼发现没什么要补的，【根本不会重新做识别】，新的刮削器
+        # 排第几都轮不到它出手。
+        # 实测：AV 库把 MetaTube 提到第一之后重刮，条目的数据库链接里还是
+        # 只有 TheMovieDb —— 因为那次刷新压根没重新识别。
+        #
+        # 只改了语言的库仍然用 false：那种情况要的就是"把缺的补上"，
+        # 没必要把整库的元数据推倒重来（那是几十 GB 的下载）。
+        # Emby 会保留锁定的字段，脚本设的片名不会被冲掉。
+        try:
+            _emby(f"/Items/{iid}/Refresh?Recursive=true"
+                  f"&MetadataRefreshMode=FullRefresh"
+                  f"&ImageRefreshMode=FullRefresh"
+                  f"&ReplaceAllMetadata={'true' if _full else 'false'}"
+                  f"&ReplaceAllImages={'true' if _full else 'false'}",
+                  key, method="POST", timeout=30)
+            ok(f"「{nm}」已通知"
+               + (f"{BOLD}重新识别{RST}（换了刮削器，"
+                  f"{n_item} 个条目，后台进行）" if _full
+                  else f"重刮（{n_item} 个条目，后台进行）"))
+        except Exception:
+            pass
     return len(changed)
 
 
