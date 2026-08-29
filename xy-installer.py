@@ -665,8 +665,7 @@ def _reality_sni_ok(sni):
 
 def precheck_sni(sb_names, xr_names):
     """选了 reality 类协议时，装前探测借用的 SNI 目标是否合格；不合格只警告不阻断。"""
-    reality_sel = (any(n in ("reality-vision", "reality-grpc") for n in sb_names)
-                   or any(n.startswith("vless-reality") for n in xr_names))
+    reality_sel = any(n.startswith("reality-") for n in list(sb_names) + list(xr_names))
     if not reality_sel:
         return
     ok, detail = _reality_sni_ok(G["sni"])
@@ -1171,26 +1170,39 @@ def xr_trojan(port, tag):
           f"&type=tcp&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
-XRAY = {"vless-reality-vision": xr_reality_vision,
-        "vless-reality-grpc": xr_reality_grpc,
-        "vless-reality-xhttp": xr_reality_xhttp,
+# xray 的 reality 三兄弟原来叫 vless-reality-*，三段名在手机客户端里显示不下、
+# 后半截被截掉（vless-reality-x…）。vless- 是冗余的——这几个本来就都是 vless，
+# sing-box 那边同样的东西就叫 reality-vision/grpc。统一砍成两段。
+XRAY = {"reality-vision": xr_reality_vision,
+        "reality-grpc": xr_reality_grpc,
+        "reality-xhttp": xr_reality_xhttp,
         "vless-ws": xr_vless_ws, "vmess-ws": xr_vmess_ws,
         "trojan": xr_trojan}
 # 已移除 ss2022：纯全加密无伪装，易被 GFW 全加密流量探测识别；有 reality 完全无需它。
 
+# 历史旧名 → 现名。老节点的名字烤在分享链接里，命令行也可能还写着旧名，都得认。
+# 老节点点一次『更新配置』就会跟着变短（规范化在渲染时做，见 _sep_name）。
+_PROTO_ALIASES = {"vless-reality-vision": "reality-vision",
+                  "vless-reality-grpc":   "reality-grpc",
+                  "vless-reality-xhttp":  "reality-xhttp"}
+
 # ============================================================================ 组装
 # reality 绑 443 的优先级：优先 sing-box reality-vision（Vision flow 最稳），依次往下。
 # 只能有一个 reality 上 443（443/TCP 独占），其余 reality 留在随机端口。
-REALITY_443_PRIORITY = ["reality-vision", "reality-grpc",
-                        "vless-reality-vision", "vless-reality-xhttp", "vless-reality-grpc"]
+REALITY_443_PRIORITY = ["reality-vision", "reality-grpc", "reality-xhttp"]
 
 def pick_reality_443(sb_names, xr_names):
-    """选出要绑到 443 的那个 reality 协议名；没有 reality 被选则返回 ''。"""
-    selected = set(sb_names) | set(xr_names)
+    """返回 (要绑 443 的 reality 协议名, 归属核心)；没有 reality 被选则返回 ('', '')。
+
+       必须带上归属核心：reality-vision / reality-grpc 两个核心【同名】，
+       而 443/TCP 只能给一个入站。不区分核心的话 pin 会同时命中两边，
+       两个入站一起抢 443，起不来。按优先级表 sing-box 先到先得。"""
     for n in REALITY_443_PRIORITY:
-        if n in selected:
-            return n
-    return ""
+        if n in sb_names:
+            return n, "sb"
+        if n in xr_names:
+            return n, "xray"
+    return "", ""
 
 def _tag(prefix, name):
     """节点名 = 前缀 + 分隔点 + 协议名（没设前缀就只有协议名）。
@@ -2396,6 +2408,17 @@ def _link_rename(link, newname):
 
 _TAG_MARKS = "¹²³⁴⁵⁶⁷⁸⁹⁰"          # build() 给双核心同名协议加的尾标，改名时要原样留着
 
+def _match_proto(body):
+    """从节点名尾部认出协议段，返回 (前面那截, 规范化后的协议名)；认不出返回 (None, "")。
+
+       长的先试——不然 trojan 会把 vless-ws 抢了、reality-vision 会把
+       vless-reality-vision 抢了。历史旧名(vless-reality-*)也在匹配集里，
+       认出来之后顺手换成现在的短名：老节点点一次『更新配置』就跟着变短，不用重装。"""
+    for proto in sorted(set(SB) | set(XRAY) | set(_PROTO_ALIASES), key=len, reverse=True):
+        if body.endswith(proto):
+            return body[:-len(proto)], _PROTO_ALIASES.get(proto, proto)
+    return None, ""
+
 def _sep_name(nm):
     """给老节点名补上「前缀·协议名」之间的分隔点；已经有了、或认不出协议名就原样返回。
 
@@ -2412,13 +2435,10 @@ def _sep_name(nm):
     body, mark = nm, ""
     while body and body[-1] in _TAG_MARKS:          # 尾标先摘下来，改完再贴回去
         mark = body[-1] + mark; body = body[:-1]
-    for proto in sorted(set(SB) | set(XRAY), key=len, reverse=True):   # 长的先试，别让 trojan 抢了 vless-ws
-        if body.endswith(proto):
-            pfx = body[:-len(proto)]
-            if not pfx or pfx.endswith("·"):
-                return nm                           # 没前缀 / 已经有分隔点
-            return pfx + "·" + proto + mark
-    return nm                                       # 认不出协议名（自定义名字）→ 不动
+    head, proto = _match_proto(body)
+    if head is None:
+        return nm                                   # 认不出协议名（自定义名字）→ 不动
+    return _tag(head.rstrip("·"), proto + mark)
 
 def _split_tag(nm):
     """把节点名拆成 (前缀, 协议段)。协议段含 CDN·/优选N 和双核心尾标(¹²)，
@@ -2431,10 +2451,10 @@ def _split_tag(nm):
     body, mark = nm, ""
     while body and body[-1] in _TAG_MARKS:              # 尾标先摘下来，拼回去时带上
         mark = body[-1] + mark; body = body[:-1]
-    for proto in sorted(set(SB) | set(XRAY), key=len, reverse=True):
-        if body.endswith(proto):
-            return body[:-len(proto)].rstrip("·"), proto + mark
-    return None, nm
+    head, proto = _match_proto(body)
+    if head is None:
+        return None, nm
+    return head.rstrip("·"), proto + mark
 
 _BAD_PREFIX_CHARS = set('#"\'\\\n\r\t')            # 会把分享链接/YAML/JSON 弄坏的字符
 
@@ -2665,7 +2685,7 @@ def run(sb_names, xr_names):
     # reality 绑 443（直连模式，与 sni-split 互斥）：把主力 reality 协议钉在 443，
     # 主动探测回落到借用的真站，消掉「reality 在非 443 易被 GFW 封 IP」的风险。
     pin = {}
-    r443 = pick_reality_443(sb_names, xr_names) if G.get("reality443") else ""
+    r443, r443_core = pick_reality_443(sb_names, xr_names) if G.get("reality443") else ("", "")
     if r443:
         pin[r443] = 443
         if G.get("nginx"):
@@ -2683,7 +2703,9 @@ def run(sb_names, xr_names):
 
     if sb_names:
         install_singbox()
-        ins, lks = build(SB, sb_names, pin, dup=dup_protos, mark="¹"); all_links += lks
+        # pin 只给归属核心：同名协议两边都 pin 会一起抢 443
+        ins, lks = build(SB, sb_names, pin if r443_core == "sb" else {},
+                         dup=dup_protos, mark="¹"); all_links += lks
         if G.get("sni_split"):
             ensure_acme()                               # 确保证书就绪（本地 https server 要用）
             if not write_nginx_sni_split():             # 写 http(本地https)+stream(443分流)，失败已回滚
@@ -2700,7 +2722,8 @@ def run(sb_names, xr_names):
 
     if xr_names:
         install_xray()
-        ins, lks = build(XRAY, xr_names, pin, dup=dup_protos, mark="²"); all_links += lks
+        ins, lks = build(XRAY, xr_names, pin if r443_core == "xray" else {},
+                         dup=dup_protos, mark="²"); all_links += lks
         cfg = f"{XRAY_DIR}/config.json"
         json.dump({"log": {"loglevel": "warning"}, "inbounds": ins,
                    "outbounds": [{"protocol": "freedom", "tag": "direct"},
@@ -3885,7 +3908,7 @@ def change_sni_menu():
         print("  更换伪装域名（reality 借用的 SNI 目标站）")
         print("=" * 60)
         if not cur:
-            print("  本机没有 reality 类节点（vless-reality-*），没有伪装域名可换。")
+            print("  本机没有 reality 类节点（reality-*），没有伪装域名可换。")
             return
         print(f"  当前伪装域名: {G_}{cur}{N_}")
         ok, detail = _reality_sni_ok(cur)                 # 从本机实连一下：连通 + TLS1.3 + h2
@@ -5158,9 +5181,9 @@ def install_flow():
     if core in ("1", "3"):
         sb_names = _pick("【sing-box 协议】", list(SB))
     if core in ("2", "3"):
-        # 两个都装时，xray 默认只装它独有的 vless-reality-xhttp（其余协议 sing-box 已有，避免重复）；
+        # 两个都装时，xray 默认只装它独有的 reality-xhttp（其余协议 sing-box 已有，避免重复）；
         # 只装 xray(core=2) 时回车仍全装。想全装 xray 就输 0/all 或点编号。
-        xr_default = ["vless-reality-xhttp"] if core == "3" else None
+        xr_default = ["reality-xhttp"] if core == "3" else None
         xr_names = _pick("【xray 协议】", list(XRAY), default=xr_default)
     if not sb_names and not xr_names:
         print("没选任何协议，退出。"); return
@@ -5188,13 +5211,13 @@ def install_flow():
     if domain and "reality-vision" in sb_names:
         ans = _ask("用 nginx SNI 分流把 reality+网站全放到 443?(最强抗封锁, 会装 stream 模块) [Y/n]: ")
         split = "" if ans.lower() in ("n", "no") else "1"
-    if not split and pick_reality_443(sb_names, xr_names):
+    if not split and pick_reality_443(sb_names, xr_names)[0]:
         ans = _ask("把主力 reality 绑到 443 抗封锁?(推荐；会关闭 nginx 前置) [Y/n]: ")
         r443 = "" if ans.lower() in ("n", "no") else "1"
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"] = domain, email, sni, prefix, hy2p
     G["nginx"], G["reality443"], G["sni_split"], G["smux"] = nginx, r443, split, smux
 
-    reality443_proto = pick_reality_443(sb_names, xr_names) if r443 else ""
+    reality443_proto = pick_reality_443(sb_names, xr_names)[0] if r443 else ""
     print("\n" + "-" * 60)
     if sb_names: print("  sing-box:", ", ".join(sb_names))
     if xr_names: print("  xray:    ", ", ".join(xr_names))
@@ -5236,7 +5259,7 @@ if __name__ == "__main__":
         description="sing-box + xray 双核心多协议安装器",
         epilog=("示例:\n"
                 "  全装(自签,无域名):  sudo python3 %(prog)s --sb all --xray all\n"
-                "  指定协议:           --sb reality-vision,hy2,tuic --xray vless-reality-xhttp\n"
+                "  指定协议:           --sb reality-vision,hy2,tuic --xray reality-xhttp\n"
                 "  带域名走真证书:     --sb all --xray all --domain a.com --email me@a.com\n"
                 f"  sing-box 可选: {','.join(SB)}\n"
                 f"  xray 可选:     {','.join(XRAY)}"),
@@ -5267,6 +5290,8 @@ if __name__ == "__main__":
     G["smux"] = "1" if a.smux else ""                   # ws 类多路复用，默认关
     sb = list(SB) if a.sb == "all" else [x for x in a.sb.split(",") if x]
     xr = list(XRAY) if a.xray == "all" else [x for x in a.xray.split(",") if x]
+    sb = [_PROTO_ALIASES.get(x, x) for x in sb]      # 老写法 vless-reality-* 仍然认
+    xr = [_PROTO_ALIASES.get(x, x) for x in xr]
     if not sb and not xr:
         ap.error("至少用 --sb 或 --xray 指定要装的协议")
     # 协议名校验：拼错的名字必须在这里挡下——run() 会先卸载别人的安装(takeover)再 build，
