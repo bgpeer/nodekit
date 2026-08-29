@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.7"
+SCRIPT_VERSION = "1.5.8"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2159,56 +2159,62 @@ LIB_TYPES = {"movies": "电影", "tvshows": "电视剧", "homevideos": "家庭�
 
 # 仓库拉下来的那份。【别手改】—— 每次「更新」都会被仓库版覆盖
 LIB_RULES_FILE = "library-rules.yaml"
-# 本机覆盖。存在时完全盖过仓库版，「更新」不碰它。
-# 这个脚本是给别人也能用的，而别人改不了 bgpeer 那个仓库 —— 没有这一份，
-# 他们就只能吃默认规则。菜单里的 a / d 写的也是这一份。
+# 老版本菜单里 a / d 写下的本机覆盖。【现在的脚本不再写它】——
+# 在 SSH 里编辑 yaml 本来就难用，想自定义就填链接，在仓库/gist 里改。
+# 但装过老版本的机器上可能有这个文件，还认它（否则人家的规则会突然消失），
+# 而且会在菜单和体检里明写出来 + 给删除命令，不让它继续当一层看不见的东西。
 LIB_RULES_LOCAL = "library-rules.local.yaml"
-LIB_RULES_HEADER = """\
-# media-stack 媒体库关键词规则（本机覆盖版）
-#
-# 这份文件存在时，会【完全盖过】仓库里那份 library-rules.yaml，
-# 而且「6 更新」不会碰它。删掉它就回到跟随仓库。
-#
-# 仓库那份（改那边全机器生效，手机上开 GitHub 就能编辑）：
-#   https://github.com/bgpeer/nodekit/blob/main/library-rules.yaml
-#
-# 文件夹名匹配到关键词，就把这个文件夹【整个】收进对应的媒体库。
-# 改完回「3 后补参数 → 8」跑一次就生效，不用重启任何东西。
-#
-# 每条规则四个字段：
-#   name      媒体库在 Emby 里显示的名字
-#   type      movies（电影）或 tvshows（电视剧）
-#             ⚠ 剧集用 movies 的话，每一集会变成一部独立电影，没有季集结构
-#   metatube  true 时这个库启用 MetaTube（按番号刮成人片）
-#             ⚠ 只给真的是成人片的库开。它会把动画认成 JAV —— 实测发生过
-#   episode_number  只对 tvshows 有意义。true = Emby 认错集号的剧集，在它的
-#             strm 旁边放一个写着季集编号和剧集名的 .nfo（文件名和网盘一个字
-#             不动）。名字由脚本按网盘文件名起 —— 编号按网盘连续编号写死之后，
-#             刮削器那边没有对应的那一集，名字它给不出来。
-#             false = 编号和名字都交给刮削器，代价是它会按自己的库分季。
-#             写了就按它办、一句不问；不写才会问一次
-#   keywords  逗号隔开，大小写不敏感
-#
-# 关于关键词怎么写：
-#   · 【一模一样才算】，不是包含。写「电影」只命中叫「电影」的文件夹，
-#     「4K电影」「我的电影」都不算 —— 想收就把它们也写进 keywords
-#   · 只忽略首尾空白和大小写（AV影片 == av影片）
-#   · 匹配到就【不再往下钻】：/<盘>/电影/<某剧> 命中「电影」之后，
-#     子目录归它管，不会再单独建一个库
-#
-# 想收自己的文件夹，就把文件夹名【原样】加进 keywords。
-# ⚠ 别只加「动作片」—— 那会把成龙、甄子丹那些正经动作片也收进成人库、
-#   还给它们开上 MetaTube。关键词越窄越安全。
-
-"""
+LIB_RULES_CUSTOM = "library-rules.custom.yaml"
 
 
-def lib_rules_path(d, local=False):
+def lib_rules_path(d, local=False, custom=False):
+    """规则文件在本机的落点。
+
+    【作者的和自定义的各存一份，互不覆盖】切回作者时不用重新联网，断网也切得回去。
+    只留一份的话，切一次就得联网拉一次，网盘那边一抽风就切不回去了。
+    """
+    if custom:
+        return os.path.join(d, LIB_RULES_CUSTOM)
     return os.path.join(d, LIB_RULES_LOCAL if local else LIB_RULES_FILE)
 
 
-def fetch_lib_rules(d):
-    """把仓库里那份规则拉到本机。返回 True 表示拉到了新内容。
+def rules_source():
+    """当前用哪一套规则："author"（作者的）或 "custom"（自定义链接）。
+
+    【没填链接就一律算作者的】只记了 custom 却把链接删了，等于没有来源 ——
+    那种状态下"生效的是哪份"没有答案，不如明确回到作者那份。
+    照抄节点脚本 tpl_src_of 的兜底，那边同一个坑已经踩平了。
+    """
+    st = ms_state()
+    if st.get("rules_src") == "custom" and (st.get("rules_url") or "").strip():
+        return "custom"
+    return "author"
+
+
+def rules_url_of(src=None):
+    src = src or rules_source()
+    return (ms_state().get("rules_url") or "").strip() if src == "custom" else RULES_URL
+
+
+def set_rules_source(src):
+    save_ms_state(rules_src="custom" if src == "custom" else "author")
+
+
+def set_rules_url(url):
+    """存自定义链接。传空串 = 删掉，并且【同步切回作者的】。
+
+    链接没了还留在 custom 上，就成了"选了一个不存在的来源"。
+    节点脚本删自定义模板时也是顺手 set_tplsrc(ext, "author")。
+    """
+    url = (url or "").strip()
+    if url:
+        save_ms_state(rules_url=url)
+    else:
+        save_ms_state(rules_url="", rules_src="author")
+
+
+def fetch_lib_rules(d, src=None, url=None):
+    """把【当前这套】规则拉到本机。返回 True 表示拉到了新内容。
 
     和 self_update() 同一个道理：规则改在仓库里，不主动拉的话永远到不了机器上。
     带时间戳绕开 raw.githubusercontent 的 CDN 缓存 —— 不绕的话"刚推的改动"
@@ -2216,17 +2222,24 @@ def fetch_lib_rules(d):
 
     拉失败【不是错误】：机器上还留着上一次拉到的那份，或者内置默认。
     规则文件拉不动就让整个更新报红，是本末倒置。
+
+    【解析不出规则就一个字都不写】拉到一页 404 或者限流提示，照写进去的话
+    下一轮所有媒体库会当场消失。自定义链接是手填的，填错的机会比作者那条大得多，
+    这一关更要紧。
     """
+    src = src or rules_source()
+    u = url if url is not None else rules_url_of(src)
+    if not u:
+        return False
     try:
-        req = urllib.request.Request(f"{RULES_URL}?_t={int(time.time())}",
+        req = urllib.request.Request(f"{u}{'&' if '?' in u else '?'}_t={int(time.time())}",
                                      headers={"User-Agent": "media-stack"})
         body = urllib.request.urlopen(req, timeout=20).read().decode()
     except Exception:
         return False
-    # 只接受解析得出规则的内容 —— 别把一页 404/限流提示写进去，那会让所有库都消失
     if not parse_lib_rules(body):
         return False
-    path = lib_rules_path(d)
+    path = lib_rules_path(d, custom=(src == "custom"))
     try:
         if os.path.exists(path) and open(path, encoding="utf-8").read() == body:
             return False
@@ -2240,18 +2253,26 @@ def fetch_lib_rules(d):
 def lib_rules(d=None):
     """当前生效的关键词规则，以及它是从哪来的。返回 (规则列表, 来源说明)。
 
-    优先级【本机覆盖 > 仓库拉下来的 > 内置默认】：
-      · 本机覆盖（library-rules.local.yaml）—— 用户自己建的，更新不碰。
-        这个脚本是给别人也能用的，而别人改不了 bgpeer 那个仓库。
-      · 仓库版（library-rules.yaml）—— 「6 更新」时拉，这是仓库主人改规则的地方。
-      · 内置默认 —— 前两个都没有时兜底，装机第一次就能用。
+    【来源是一个显式的单选，不再是隐式优先级】以前是
+    本机覆盖 > 仓库 > 内置默认 三层压着，菜单上只印一行"来自哪儿"，
+    既看不出还有哪几层、也没法切、更没法退回去。现在只有一个开关：
+    作者的 / 自定义链接，选哪个用哪个，「4 生成媒体库」「每小时对齐」
+    「体检」「6 更新」全部走这个函数，所以自动跟着走。
+
+    本机覆盖文件还认 —— 老版本的 a/d 菜单写过它，装过老版本的机器上可能有。
+    它仍然盖过链接，但会在菜单和体检里【明写出来】并给出删除命令，
+    不再是一层看不见的东西。（a/d 那套已经去掉：SSH 里编辑 yaml 本来就难用，
+    要自定义就填链接，在仓库/gist 里编辑。）
 
     【解析不出规则时不覆盖用户的文件】文件在但一条都没读出来，多半是手改坏了。
     这时候拿默认值写回去等于把人家写的东西悄悄删了。报一声，这次用默认跑。
     """
     d = d or ms_install_dir()
-    for local in (True, False):
-        path = lib_rules_path(d, local)
+    src = rules_source()
+    tries = [(lib_rules_path(d, local=True), "本机覆盖文件（盖过链接）"),
+             (lib_rules_path(d, custom=(src == "custom")),
+              "自定义链接" if src == "custom" else "作者的")]
+    for path, label in tries:
         try:
             if not os.path.exists(path):
                 continue
@@ -2259,11 +2280,12 @@ def lib_rules(d=None):
         except OSError:
             continue
         if got:
-            return got, ("本机覆盖 " + path if local else "仓库 " + path)
+            return got, f"{label} {path}"
         warn(f"{path} 里没解析出规则（格式改坏了？），这次先用默认的。")
         print(f"  {DIM}原文件没有被改动。{RST}")
         break
-    return [dict(r) for r in LIB_RULES_DEFAULT], "内置默认（还没拉到仓库那份）"
+    return ([dict(r) for r in LIB_RULES_DEFAULT],
+            "内置默认（还没拉到" + ("自定义那份）" if src == "custom" else "仓库那份）"))
 
 
 def parse_lib_rules(text):
@@ -2319,34 +2341,6 @@ def parse_lib_rules(text):
     if cur and cur.get("name"):
         rules.append(cur)
     return [r for r in rules if r["name"] and r["kw"]]
-
-
-def dump_lib_rules(rules):
-    out = [LIB_RULES_HEADER]
-    for r in rules:
-        out.append(f"- name: {r['name']}\n"
-                   f"  type: {r.get('type') or 'movies'}\n"
-                   f"  language: {r.get('lang') or 'zh'}\n"
-                   f"  country: {r.get('country') or 'CN'}\n"
-                   f"  metatube: {'true' if r.get('mt') else 'false'}\n"
-                   + ("" if r.get("epnum") is None else
-                      f"  episode_number: {'true' if r['epnum'] else 'false'}\n")
-                   + (f"  scrapers: {', '.join(r['scr'])}\n" if r.get("scr") else "")
-                   + (f"  image_scrapers: {', '.join(r['img'])}\n" if r.get("img") else "")
-                   + f"  keywords: {', '.join(r['kw'])}\n")
-    return "\n".join(out)
-
-
-def save_lib_rules(d, rules):
-    """写【本机覆盖】。菜单里的增删只该影响这一台，不该去动仓库拉下来的那份 ——
-    那份下次更新就被覆盖了，用户会以为自己的修改丢了。"""
-    try:
-        with open(lib_rules_path(d, True), "w", encoding="utf-8") as f:
-            f.write(dump_lib_rules(rules))
-        return True
-    except OSError as e:
-        warn(f"规则文件写不进去：{_short_err(e)}")
-        return False
 
 
 def _kw_hit(dirname, kw):
@@ -3945,31 +3939,37 @@ def auto_libraries():
     if not key:
         warn("没有 Emby API Key，先填「1 添加 API 密钥」。")
         return
-    rules, rule_src = lib_rules(d)
     while True:
+        rules, rule_src = lib_rules(d)
+        src = rules_source()
+        cust = (ms_state().get("rules_url") or "").strip()
+        local = lib_rules_path(d, local=True)
         print()
         print(f"  {BOLD}关键词规则{RST}{DIM}　文件夹名匹配到关键词，"
               f"就把它整个收进对应的媒体库{RST}")
-        print(f"  {DIM}当前规则来自 {rule_src}{RST}")
-        print(f"  {DIM}想改：编辑仓库里那份（手机上开 GitHub 就行），"
-              f"再跑「6 更新」拉下来 ——{RST}")
-        print(f"  {DIM}  https://github.com/bgpeer/nodekit/blob/main/"
-              f"{LIB_RULES_FILE}{RST}")
-        print(f"  {DIM}只想改这一台：下面的 a / d 会写 {lib_rules_path(d, True)}"
-              f"，它盖过仓库版，更新不碰。{RST}")
-        for i, r in enumerate(rules, 1):
-            mt = f"　{CYAN}带 MetaTube{RST}" if r["mt"] else ""
-            print(f"    {i}. {BOLD}{r['name']}{RST}"
-                  f"{DIM}（{LIB_TYPES.get(r['type'], r['type'])}，"
-                  f"{r.get('lang') or 'zh'}）"
-                  f"　关键词：{'、'.join(r['kw'])}{RST}{mt}")
+        print()
+        # 【当前用哪套必须一眼看见】以前只印一行"来自哪个文件"，看不出还有别的
+        # 选择、也看不出怎么切。这三行照节点脚本那个「▸ 当前生效」排的。
+        print(f"  ▸ {BOLD}当前生效{RST}　"
+              + (f"{CYAN}【自定义链接】{RST}" if src == "custom"
+                 else f"{GREEN}【作者的】{RST}"))
+        print(f"    作者链接　{DIM}{RULES_URL}{RST}")
+        print(f"    自定义　　{(CYAN + cust + RST) if cust else DIM + '(未设置)' + RST}")
+        print(f"    共 {len(rules)} 条　{DIM}{'、'.join(r['name'] for r in rules)}{RST}")
+        print(f"    {DIM}规则文件 {rule_src}{RST}")
+        # 老版本 a/d 菜单写下的覆盖文件还认，但绝不让它继续藏着
+        if os.path.exists(local):
+            warn(f"本机有覆盖文件，它【盖过】上面选的链接：{local}")
+            print(f"  {DIM}要让链接生效就删掉它：{BOLD}rm {local}{RST}")
+        print(f"  {DIM}想改规则：到链接指向的文件里改（手机上开 GitHub 就能编辑），"
+              f"改完回来按 4 重新拉。{RST}")
         plan = plan_libraries(d, rules)
         print()
         if not plan:
             print(f"  {YELLOW}按这些关键词，一个文件夹都没匹配上。{RST}")
             print(f"  {DIM}你的文件夹叫什么名字，关键词就得写什么 —— "
                   f"比如网盘里那个「某个分类目录」，"
-                  f"得把「动作片」加进日韩AV的关键词里才收得进去。{RST}")
+                  f"得把它的名字加进对应那条的 keywords 里才收得进去。{RST}")
         else:
             print(f"  {BOLD}会这样建{RST}{DIM}（还没动手）{RST}")
             for name, (ctype, paths, mt, lang, _c) in sorted(plan.items()):
@@ -3980,45 +3980,73 @@ def auto_libraries():
                 for x in sorted(set(paths)):
                     print(f"        {DIM}{x}{RST}")
         print()
-        print(f"  {DIM}a 加一条规则　d 删一条　r 删掉本机覆盖　"
-              f"{RST}{BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
+        print(f"  {DIM}1 用作者的　2 用自定义　3 自定义链接（填/换/删）　"
+              f"4 重新拉一次　{RST}{BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
         c = ask("请选择").strip().lower()
         if c in ("", "0", "q"):
             return
-        if c == "r":
-            try:
-                os.remove(lib_rules_path(d, True))
-                ok("本机覆盖已删掉，回到跟随仓库那份")
-            except OSError:
-                ok("本来就没有本机覆盖，跟随的就是仓库那份")
-            rules, rule_src = lib_rules(d)
-        elif c == "d":
-            i = ask("删第几条").strip()
-            if i.isdigit() and 1 <= int(i) <= len(rules):
-                gone = rules.pop(int(i) - 1)
-                save_lib_rules(d, rules)
-                rule_src = "本机覆盖 " + lib_rules_path(d, True)
-                ok(f"已删掉「{gone['name']}」")
-            else:
-                warn("序号不对。")
-        elif c == "a":
-            nm = ask("媒体库叫什么").strip()
-            kw = [x.strip() for x in
-                  re.split(r"[,，\s]+", ask("匹配哪些关键词（逗号隔开）")) if x.strip()]
-            if not nm or not kw:
-                warn("库名和关键词都不能空。")
+        if c == "1":
+            if src == "author":
+                print(f"  {DIM}本来就是作者的。{RST}")
                 continue
-            print(f"  {DIM}内容类型：1 电影　2 电视剧　"
-                  f"（剧集选错成电影的话，每一集会变成一部独立电影）{RST}")
-            t = "tvshows" if ask("选", "1").strip() == "2" else "movies"
-            mt = ask_yn("这个库要开 MetaTube（按番号刮成人片）吗？", False)
-            lg = ask("刮削语言（zh 中文 / ja 日语 / en 英语）", "zh").strip() or "zh"
-            rules.append({"name": nm, "kw": kw, "type": t, "mt": mt,
-                          "lang": lg,
-                          "country": {"zh": "CN", "ja": "JP", "en": "US"}.get(lg, "CN")})
-            save_lib_rules(d, rules)
-            rule_src = "本机覆盖 " + lib_rules_path(d, True)
-            ok(f"已加「{nm}」")
+            set_rules_source("author")
+            ok("已切到【作者的】")
+            # 缓存还在就不联网 —— 断网也切得回去，这正是各存一份的用处
+            if not os.path.exists(lib_rules_path(d)):
+                fetch_lib_rules(d, "author")
+            print(f"  {DIM}「4 生成媒体库」和每小时的对齐任务从现在起都用它。{RST}")
+        elif c == "2":
+            if not cust:
+                warn("还没填自定义链接（先按 3 填）")
+                continue
+            if src == "custom":
+                print(f"  {DIM}本来就是自定义的。{RST}")
+                continue
+            set_rules_source("custom")
+            ok("已切到【自定义链接】")
+            if not os.path.exists(lib_rules_path(d, custom=True)):
+                if not fetch_lib_rules(d, "custom"):
+                    warn("这条链接拉不下来、或者内容里解析不出规则")
+                    print(f"  {DIM}先按 4 重试；一直不行就按 3 换一条。"
+                          f"在切回作者的之前，用的是内置默认那份。{RST}")
+            print(f"  {DIM}「4 生成媒体库」和每小时的对齐任务从现在起都用它。{RST}")
+        elif c == "3":
+            if cust:
+                print()
+                print(f"  当前自定义链接：{CYAN}{cust}{RST}")
+                print(f"  {DIM}1 更换　2 删除（并切回作者的）　0 返回{RST}")
+                t = ask("请选择").strip()
+                if t == "2":
+                    set_rules_url("")
+                    ok("已删掉自定义链接，切回【作者的】")
+                    continue
+                if t != "1":
+                    continue
+            print(f"  {DIM}填 raw 链接（GitHub raw / gist raw 都行），"
+                  f"格式和作者那份一样。回车放弃。{RST}")
+            u = ask("自定义链接").strip()
+            if not u:
+                continue
+            if not u.lower().startswith(("http://", "https://")):
+                warn("要 http:// 或 https:// 开头的链接")
+                continue
+            # 【先验再存】存一条拉不动的链接，等于把用户切到一个空来源上
+            if not fetch_lib_rules(d, "custom", u):
+                warn("这条链接拉不下来、或者内容里解析不出规则 —— 没有保存")
+                print(f"  {DIM}检查一下：是不是 raw 链接（不是网页那个地址）、"
+                      f"仓库是不是私有的、格式对不对。{RST}")
+                continue
+            set_rules_url(u)
+            set_rules_source("custom")
+            _n = len(parse_lib_rules(
+                open(lib_rules_path(d, custom=True), encoding="utf-8").read()))
+            ok(f"已保存并切到【自定义链接】（解析出 {_n} 条）")
+        elif c == "4":
+            if fetch_lib_rules(d):
+                ok(f"已重新拉取（{'自定义' if src == 'custom' else '作者的'}）")
+            else:
+                print(f"  {DIM}没有变化，或者这次没拉到"
+                      f"（拉不动时保留机器上原来那份，不会把规则弄没）。{RST}")
         elif c == "y":
             if not plan:
                 warn("没有可建的，先加关键词。")
@@ -5075,13 +5103,16 @@ def do_update(from_menu=False):
            f"卡住的那轮会一直吊着占内存）{RST}")
     # 规则文件和脚本一样住在仓库里，不主动拉就永远到不了机器上 —— 用户在
     # GitHub 上改完，机器这边一点变化都没有，看起来就像改了没用。
+    _src = rules_source()
     if fetch_lib_rules(d):
         _lr, _ = lib_rules(d)
-        ok(f"媒体库关键词规则已更新（{len(_lr)} 条："
-           f"{'、'.join(r['name'] for r in _lr)}）")
+        ok(f"媒体库关键词规则已更新"
+           f"{DIM}（{'自定义链接' if _src == 'custom' else '作者的'}）{RST}"
+           f"（{len(_lr)} 条：{'、'.join(r['name'] for r in _lr)}）")
         if os.path.exists(lib_rules_path(d, True)):
             print(f"  {DIM}注意：本机有覆盖文件 {lib_rules_path(d, True)}，"
-                  f"实际生效的是它，不是刚拉下来的这份。{RST}")
+                  f"实际生效的是它，不是刚拉下来的这份。"
+                  f"要用链接就删掉它。{RST}")
     # 【目录缓存归脚本管，不再等用户去点】理由见 DIR_CACHE_DEFAULT 的注释。
     # 放在这里是因为它要停一次 OpenList，而更新本来就在重启容器。
     try:
@@ -9431,9 +9462,11 @@ def params_menu():
               else f"{DIM}刮削结果{RST}")
         print(f"  7. 片名用哪个            当前：{tp}")
         _libr, _libsrc = lib_rules(d) if is_installed(d) else ([], "")
-        print(f"  8. 按关键词自动建媒体库{DIM}（文件夹名匹配到就整个收进去，"
-              f"AV 类自动带 MetaTube）{RST}")
-        print(f"     {DIM}规则来自 {_libsrc or '未安装'}"
+        _rsrc = (f"{CYAN}自定义链接{RST}" if rules_source() == "custom"
+                 else f"{DIM}作者的{RST}") if is_installed(d) else ""
+        print(f"  8. 按关键词自动建媒体库（规则用哪份链接）  当前：{_rsrc}")
+        print(f"     {DIM}文件夹名匹配到就整个收进去，AV 类自动带 MetaTube{RST}")
+        print(f"     {DIM}{_libsrc or '未安装'}"
               + (f"　共 {len(_libr)} 条：{'、'.join(r['name'] for r in _libr)}"
                  if _libr else "") + f"{RST}")
         if metatube_on(d):
@@ -11103,6 +11136,27 @@ def do_healthcheck():
                             "写完还是不对就到 Emby 里点这一集 → 编辑元数据手工填，"
                             "或者把这个库改成 episode_number: false"
                             "（编号交回刮削器，代价是按它的库分季）"))
+
+            # ---- 关键词规则 ----
+            # 【来源必须看得见】这一串问题上反复吃亏的就是"设置在哪、有没有
+            # 生效"看不见。规则决定了建哪些库、用什么刮削器、什么语言，
+            # 用错一份是全局性的，而从 Emby 界面上一点都看不出来。
+            _rs = rules_source()
+            _ru = rules_url_of(_rs)
+            _rl, _rsrc = lib_rules(d)
+            _lov = lib_rules_path(d, local=True)
+            if os.path.exists(_lov):
+                _hc("关键词规则", "warn",
+                    f"本机覆盖文件盖过了链接{DIM}（{len(_rl)} 条）{RST}")
+                print(f"      {DIM}{_lov}{RST}")
+                todo.append((
+                    "媒体库关键词规则用的是本机覆盖文件，不是「3 → 8」里选的链接",
+                    f"老版本的 a/d 菜单写下的。要让链接生效就删掉它：rm {_lov}"))
+            else:
+                _hc("关键词规则", "ok",
+                    ("自定义链接" if _rs == "custom" else "作者的")
+                    + f"　{len(_rl)} 条")
+                print(f"      {DIM}{_ru}{RST}")
 
             # ---- 剧集缩略图 ----
             # 【看起来"每集都有图"是假象】没有自己那张图的一集，Emby 拿整部剧
