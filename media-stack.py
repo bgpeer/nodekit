@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.9"
+SCRIPT_VERSION = "1.5.10"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2448,15 +2448,55 @@ def _emby_add_library(key, name, ctype, paths, lang="zh", country="CN"):
         return _short_err(e)
 
 
-def _emby_add_path(key, name, path):
-    """给已有媒体库加一条路径。成功返回 ""，失败返回错误说明。"""
-    try:
-        _emby(f"/Library/VirtualFolders/Paths?refreshLibrary=false", key,
-              method="POST", timeout=60,
-              body={"Id": name, "Name": name, "PathInfo": {"Path": path}})
+def _emby_add_path(key, name, path, lib_id=""):
+    """给已有媒体库加一条路径。成功返回 ""，失败返回把几种调法都试过之后的说明。
+
+    【一种调法不够，而且不能只看返回码】和 _emby_del_library 是同一类坑：
+    这个接口在 Emby 各版本里认的字段不一样，而 500 不告诉你是哪种原因。
+    实测现场：新挂了阿里云盘，往已有的「电影」库加那条路径，直接 HTTP 500。
+
+    上一版只发一次、只看返回码，500 就当失败 —— 而且失败之后走进
+    "需要手动加"那条分支，理由还印成了【已有同名库，但不是脚本建的】，
+    把人往完全错误的方向引（那个库明明就是脚本建的）。
+
+    所以挨个试，每试一次【回读确认路径在不在库里】。Emby 这套接口一贯是
+    "收下请求"和"做了这件事"两回事：200 不代表加上了，500 也不代表没加上。
+    """
+    def _has():
+        try:
+            for lb in (_emby("/Library/VirtualFolders", key, timeout=20) or []):
+                if (lb.get("Name") or "") == name:
+                    return path in (lb.get("Locations") or [])
+        except Exception:
+            pass
+        return False
+    if _has():
         return ""
-    except Exception as e:
-        return _short_err(e)
+    q = urllib.parse.quote(str(name))
+    qp = urllib.parse.quote(str(path))
+    tries = (
+        # Emby 4.9 的形状：只要 Name + PathInfo，不要 Id
+        ("POST", "/Library/VirtualFolders/Paths?refreshLibrary=false",
+         {"Name": name, "PathInfo": {"Path": path}}),
+        # 带库 id 的形状（老版本认这个）
+        ("POST", "/Library/VirtualFolders/Paths?refreshLibrary=false",
+         {"Id": lib_id or name, "Name": name, "PathInfo": {"Path": path}}),
+        # 更老的扁平写法
+        ("POST", "/Library/VirtualFolders/Paths?refreshLibrary=false",
+         {"Name": name, "Path": path}),
+        # 全部塞 query
+        ("POST", f"/Library/VirtualFolders/Paths?name={q}&path={qp}"
+                 f"&refreshLibrary=false", None),
+    )
+    errs = []
+    for method, ep, body in tries:
+        try:
+            _emby(ep, key, method=method, body=body, timeout=60)
+        except Exception as e:
+            errs.append(_emby_err(e))
+        if _has():                 # 【以路径在不在库里为准】，不看上面那次的返回
+            return ""
+    return "；".join(dict.fromkeys(errs)) or "调用都成功了但路径没加上"
 
 
 def _ol_token(d):
@@ -3797,6 +3837,12 @@ def apply_libraries(d, key, plan):
     """
     mine = set(ms_state().get("lib_auto") or [])
     exist = {n: (ps, t) for n, ps, t in emby_libs(key)}
+    # 库的 ItemId：加路径那个接口有的版本按 id 认，光有名字不够
+    try:
+        ids = {(lb.get("Name") or ""): lb.get("ItemId")
+               for lb in (_emby("/Library/VirtualFolders", key, timeout=20) or [])}
+    except Exception:
+        ids = {}
     made, added, skipped, overlap = [], 0, [], []
     for name, (ctype, paths, _mt, lang, country) in sorted(plan.items()):
         paths = sorted(set(paths))
@@ -3813,7 +3859,7 @@ def apply_libraries(d, key, plan):
             err = _emby_add_library(key, name, ctype, paths, lang, country)
             if err:
                 warn(f"建媒体库「{name}」失败：{err}")
-                skipped.append((name, paths))
+                skipped.append((name, paths, f"建库失败：{err}"))
                 continue
             made.append(name)
             mine.add(name)
@@ -3824,13 +3870,14 @@ def apply_libraries(d, key, plan):
         if not want:
             continue
         if name not in mine:
-            skipped.append((name, want))     # 用户自己建的，不擅自动
+            # 用户自己建的，不擅自动
+            skipped.append((name, want, "已有同名库，但不是脚本建的"))
             continue
         for x in want:
-            err = _emby_add_path(key, name, x)
+            err = _emby_add_path(key, name, x, ids.get(name) or "")
             if err:
                 warn(f"往「{name}」加路径失败：{err}")
-                skipped.append((name, [x]))
+                skipped.append((name, [x], f"加路径失败：{err}"))
             else:
                 added += 1
     if made:
@@ -3849,8 +3896,7 @@ def apply_libraries(d, key, plan):
     if skipped:
         print()
         warn("下面这些没有自动处理，需要你到 Emby 里手动加：")
-        for name, paths in skipped:
-            why = "已有同名库，但不是脚本建的" if name in exist else "接口调用失败"
+        for name, paths, why in skipped:
             print(f"  {DIM}·{RST} {BOLD}{name}{RST}{DIM}（{why}）{RST}")
             for x in paths:
                 print(f"      {x}")
