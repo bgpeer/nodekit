@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.22"
+SCRIPT_VERSION = "1.5.23"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8695,6 +8695,54 @@ def choose_metatube_libraries(key):
         print(f"  {DIM}刮削器名单本来就是这样，没有改动。{RST}")
 
 
+# OpenList 的驱动名 → 中文名。菜单第一列显示的是它，不是挂载路径。
+#
+# 【为什么不用挂载路径当名字】挂载路径是给机器看的（/aliyun、/115），
+# 一屏全是斜杠开头的短词，扫一眼分不出哪个是哪个盘。用户要的是「阿里云盘」
+# 这种一眼就认得的名字 —— 他的原话："我要的是这样的名称"。
+# 挂载路径仍然跟在后面显示：同一种网盘可以挂两个账号（/aliyun1、/aliyun2），
+# 光有中文名就分不清了，而下面配路径用的又正是它。
+DRIVER_CN = {
+    "115 cloud":        "115 网盘",
+    "115 open":         "115 网盘（Open）",
+    "115share":         "115 分享",
+    "aliyundriveopen":  "阿里云盘（Oauth2）",
+    "aliyundrive":      "阿里云盘",
+    "aliyundriveshare": "阿里云盘分享",
+    "quarktv":          "Quark TV",
+    "quark":            "夸克网盘",
+    "quarkopen":        "夸克网盘（Open）",
+    "uctv":             "UC TV",
+    "uc":               "UC 网盘",
+    "baidunetdisk":     "百度网盘",
+    "baiduphoto":       "百度相册",
+    "thunder":          "迅雷云盘",
+    "thunderbrowser":   "迅雷浏览器",
+    "pikpak":           "PikPak",
+    "webdav":           "WebDAV",
+    "local":            "本地目录",
+    "onedrive":         "OneDrive",
+    "onedrive app":     "OneDrive（应用）",
+    "googledrive":      "Google Drive",
+    "s3":               "S3 对象存储",
+    "ftp":              "FTP",
+    "sftp":             "SFTP",
+    "smb":              "SMB 共享",
+    "teambition":       "Teambition",
+    "lanzou":           "蓝奏云",
+    "189cloud":         "天翼云盘",
+    "189cloudpc":       "天翼云盘（PC）",
+    "mopan":            "移动云盘",
+    "chaoxing":         "超星",
+    "crypt":            "加密层",
+}
+
+
+def driver_cn(drv):
+    """驱动的中文名。没收录的就原样返回驱动名 —— 认不出来也不能显示成空白。"""
+    return DRIVER_CN.get(str(drv or "").strip().lower(), str(drv or "?"))
+
+
 LINK_METHODS = {
     "download":  ("原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                             "跨境线路上 4K 原盘经常拉不动"),
@@ -9491,62 +9539,94 @@ def _drive_paths_menu(d, mp):
         _apply_scan_paths(d, f"加了 {'、'.join(got)}，")
 
 
-def _drive_link_method_menu(d, mp):
-    """一个盘的直链方式。不支持这个开关的盘直接说清楚，不给个死按钮。"""
-    stores = [x for x in link_method_storages(d) if x[1] == mp]
-    if not stores:
-        print()
-        warn(f"{mp} 没有「直链方式」这个开关。")
-        print(f"  {DIM}只有夸克 / UC 的 TV 版驱动（QuarkTV、UCTV）有 —— "
-              f"这是驱动自己的字段，不是脚本能加的。{RST}")
-        print(f"  {DIM}阿里、115 这些盘播放慢是限速，换不了接口，"
-              f"看 tools/ali-403.sh 量一下就知道。{RST}")
-        return
-    cur = stores[0][3]
-    print()
-    for k, (name, why) in LINK_METHODS.items():
-        star = f"{GREEN}←现在{RST}" if k == cur else ""
-        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why} {star}")
-    target = "streaming" if cur == "download" else "download"
-    print()
-    if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
-        print("没有改动。")
-        return
-    _write_link_method(d, stores, target)
 
 
-def _drive_title_menu(d, mp):
-    """一个盘的片名来源。多一个「跟默认走」的选项 —— 不然就没法退回默认。"""
-    by = ms_state().get("title_by_drive") or {}
-    own = by.get(mp)
-    dflt = title_policy()
+def _title_menu(d, mp=None):
+    """片名用哪个。mp=None 时改的是【默认值】（「剩余网盘」那一屏用）。
+
+    合成一个函数：单盘和"剩余"要问的是同一件事，只是落到哪个键上不一样。
+    """
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
+    dflt = title_policy()
     print()
-    print(f"  {mp} 当前："
-          + (f"{CYAN}{BOLD}{names.get(own, own)}{RST}{DIM}（单独设的）{RST}" if own
-             else f"{DIM}跟默认走 → {names.get(dflt, dflt)}{RST}"))
+    if mp:
+        own = (ms_state().get("title_by_drive") or {}).get(mp)
+        print(f"  {mp} 当前："
+              + (f"{CYAN}{BOLD}{names.get(own, own)}{RST}{DIM}（单独设的）{RST}" if own
+                 else f"{DIM}跟默认走 → {names.get(dflt, dflt)}{RST}"))
+    else:
+        print(f"  默认（没单独设过的盘都用它）当前："
+              f"{CYAN}{BOLD}{names.get(dflt, dflt)}{RST}")
     print(f"  {DIM}文件名带「[第154集•4K]」这类标记的盘用文件名更准；"
           f"规规矩矩「片名 (年份).mkv」的盘用刮削结果。{RST}")
     print(f"  1. 刮削结果")
     print(f"  2. 网盘文件名{DIM}（并锁定标题，海报简介照常跟刮削更新）{RST}")
-    print(f"  3. 跟默认走{DIM}（默认现在是{names.get(dflt, dflt)}）{RST}")
+    if mp:
+        print(f"  3. 跟默认走{DIM}（默认现在是{names.get(dflt, dflt)}）{RST}")
     print(f"  0. 返回")
     c = ask("请选择").strip()
     if c in ("0", "", "q"):
         return
-    val = {"1": "scrape", "2": "filename", "3": None}.get(c, "x")
+    val = {"1": "scrape", "2": "filename"}.get(c, "x")
+    if c == "3" and mp:
+        val = None
     if val == "x":
         print("无效选择。")
         return
-    set_title_policy_of(mp, val)
-    ok(f"{mp} 的片名来源："
-       + (f"跟默认走（{names.get(dflt, dflt)}）" if val is None else names[val]))
+    if mp:
+        set_title_policy_of(mp, val)
+        ok(f"{mp} 的片名来源："
+           + (f"跟默认走（{names.get(dflt, dflt)}）" if val is None else names[val]))
+    else:
+        save_ms_state(title_policy=val)
+        ok(f"默认片名来源：{names[val]}")
     key = read_emby_api_key(d)
     if key:
         apply_title_policy(d, key)
     else:
         print(f"  {DIM}没有 Emby API Key，改不到已有条目上 —— "
               f"先去「3 后补参数 → 1」填上。{RST}")
+
+
+def _link_method_menu(d, mounts, who):
+    """直链方式。mounts 是要一起改的挂载点；who 只用于打印。
+
+    单盘传一个，「剩余网盘」传它管的那一批 —— 两边共用这一段，
+    免得同一个开关有两套行为。
+    """
+    stores = [x for x in link_method_storages(d) if x[1] in mounts]
+    if not stores:
+        print()
+        warn(f"{who} 没有「直链方式」这个开关。")
+        print(f"  {DIM}只有夸克 / UC 的 TV 版驱动（QuarkTV、UCTV）有 —— "
+              f"这是驱动自己的字段，不是脚本能加的。{RST}")
+        print(f"  {DIM}阿里、115 这些盘播放慢是限速，换不了接口，"
+              f"用 tools/ali-403.sh 量一下就知道。{RST}")
+        return
+    curs = {c for _s, _m, _d, c in stores}
+    print()
+    for _sid, mp2, drv2, cur2 in stores:
+        print(f"  {DIM}{mp2}（{driver_cn(drv2)}）当前：{RST}"
+              f"{CYAN}{LINK_METHODS.get(cur2, (cur2 or '未知',))[0]}{RST}")
+    print()
+    for k, (name, why) in LINK_METHODS.items():
+        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why}")
+    print()
+    if len(curs) == 1:
+        cur = stores[0][3]
+        target = "streaming" if cur == "download" else "download"
+        if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
+            print("没有改动。")
+            return
+    else:
+        print("  1. 原画直链（download）")
+        print("  2. 转码流（streaming）")
+        c = ask("要切换成哪个？（回车取消）").strip()
+        target = {"1": "download", "2": "streaming"}.get(c, "")
+        if not target:
+            print("没有改动。")
+            return
+    _write_link_method(d, stores, target)
 
 
 def _drive_menu(d, mp, drv):
@@ -9558,11 +9638,11 @@ def _drive_menu(d, mp, drv):
         if mine:
             where = ("整个盘" if any(p.rstrip("/") == mp.rstrip("/") for p in mine)
                      else "、".join(mine))
-            st = f"{GREEN}扫{RST}  {DIM}{where}{RST}"
+            st = f"{GREEN}✔ 扫{RST}  {DIM}{where}{RST}"
         elif auto:
-            st = f"{GREEN}扫{RST}  {DIM}整个盘（跟着「剩余网盘」走）{RST}"
+            st = f"{GREEN}✔ 扫{RST}  {DIM}整个盘（跟着「剩余网盘」走）{RST}"
         else:
-            st = f"{DIM}不扫{RST}"
+            st = f"{DIM}✖ 不扫{RST}"
         lm = [x for x in link_method_storages(d) if x[1] == mp]
         lm_s = (f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}" if lm
                 else f"{DIM}这个盘没有{RST}")
@@ -9571,15 +9651,14 @@ def _drive_menu(d, mp, drv):
         tp_s = (f"{CYAN}{names.get(by[mp], by[mp])}{RST}" if mp in by
                 else f"{DIM}跟默认（{names.get(title_policy())}）{RST}")
         print("\n" + "=" * 60)
-        print(f"  {BOLD}{mp}{RST}   {DIM}{drv}{RST}   {st}")
+        print(f"  {BOLD}{driver_cn(drv)}{RST}  {DIM}{mp}　{drv}{RST}   {st}")
         print("=" * 60)
-        print(f"  1. 路径{DIM}（加 / 删，决定这个盘扫哪些目录）{RST}")
+        print(f"  1. 路径{DIM}　里面可以添加、更换、删除路径{RST}")
         print(f"  2. 直链方式          当前：{lm_s}")
         print(f"  3. 片名用哪个        当前：{tp_s}")
-        n = 3
-        if "115" in str(drv):
-            n = 4
-            print(f"  4. 网盘扫码登录{DIM}（重新拿二维码令牌）{RST}")
+        has115 = "115" in str(drv)
+        if has115:
+            print(f"  4. 网盘扫码登录{DIM}　重新拿二维码令牌{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -9588,29 +9667,37 @@ def _drive_menu(d, mp, drv):
         if c == "1":
             _drive_paths_menu(d, mp)
         elif c == "2":
-            _drive_link_method_menu(d, mp)
+            _link_method_menu(d, [mp], driver_cn(drv))
         elif c == "3":
-            _drive_title_menu(d, mp)
-        elif c == "4" and n == 4:
+            _title_menu(d, mp)
+        elif c == "4" and has115:
             qr115_login()
         else:
             print("无效选择。")
 
 
 def _rest_menu(d):
-    """「剩余网盘（自动）」：没被单独设过的盘归它管。"""
+    """「剩余网盘（自动）」：没被单独设过的盘归它管。
+
+    这一屏和单盘那一屏长一样（路径开关 / 直链方式 / 片名），因为它管的就是
+    "其余那些盘"的那一份设置 —— 用户的原话就是把它当第四个盘来排。
+    """
     while True:
         exp = explicit_scan_paths()
         rest = [mp for mp, _drv, _st, _r, _m in openlist_storages(d)
                 if mp and mp != "/" and not _paths_under(exp, mp)]
         on = auto_rest_on()
+        names = {"scrape": "刮削结果", "filename": "网盘文件名"}
+        lm = [x for x in link_method_storages(d) if x[1] in rest]
+        lm_s = (f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}" if lm
+                else f"{DIM}这些盘都没有{RST}")
         print("\n" + "=" * 60)
-        print(f"  {BOLD}剩余网盘（自动）{RST}   当前："
+        print(f"  {BOLD}♻ 剩余网盘（自动）{RST}   当前："
               + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}"))
         print("=" * 60)
         # 【说清楚"剩余"是哪些】不然这个开关就是个黑箱：开了到底多扫了什么，
         # 只能去 autofilm 配置里翻。它还会随着别处的设置变，更得当场列出来。
-        print(f"  {DIM}管的是【没有单独设过路径】的盘。单独设过的不受影响 ——"
+        print(f"  {DIM}管的是【没有单独设过路径】的盘。单独设过的不受影响 —— "
               f"这个开关永远排在它们后面。{RST}")
         if rest:
             print(f"  现在归它管：{CYAN}{'、'.join(rest)}{RST}"
@@ -9619,12 +9706,23 @@ def _rest_menu(d):
         else:
             print(f"  {DIM}现在没有「剩余」的盘 —— 每个盘都单独设过了。{RST}")
         print("-" * 60)
-        print(f"  1. {'关掉' if on else '打开'}自动{DIM}（新挂的网盘会不会自动进 Emby）{RST}")
+        print(f"  1. 自动路径开关      当前："
+              + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}")
+              + f"{DIM}　每次生成配置时重新看一遍，新挂的盘会自动跟上{RST}")
+        print(f"  2. 直链方式          当前：{lm_s}")
+        print(f"  3. 片名用哪个        当前："
+              f"{CYAN}{names.get(title_policy())}{RST}{DIM}（默认值）{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
+        if c == "2":
+            _link_method_menu(d, rest, "这些剩余的盘")
+            continue
+        if c == "3":
+            _title_menu(d, None)
+            continue
         if c != "1":
             print("无效选择。")
             continue
@@ -9678,10 +9776,13 @@ def mount_paths_menu():
             else:
                 mark = f"{DIM}✖ 不扫{RST}"
             bad = f"  {YELLOW}存储没挂上{RST}" if st != "work" else ""
-            print(f"  {i:>2}. {pad(mp, 16)} {DIM}{pad(drv, 16)}{RST} {mark}{bad}")
-        print(f"  {len(stores) + 1:>2}. {pad('剩余网盘（自动）', 16)} "
-              f"{DIM}{pad('', 16)}{RST} "
-              + (f"{GREEN}开{RST}" if auto else f"{DIM}关{RST}")
+            # 中文名打头（一眼认得是哪个盘），挂载路径跟在后面 ——
+            # 同一种网盘挂两个账号时，只有它能把两行分开
+            print(f"  {i:>2}. {pad(driver_cn(drv), 20)}{DIM}{pad(mp, 14)}"
+                  f"{pad(drv, 17)}{RST}{mark}{bad}")
+        print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 20)}"
+              f"{DIM}{pad('', 31)}{RST}"
+              + (f"{GREEN}当前：开{RST}" if auto else f"{DIM}当前：关{RST}")
               + f"  {DIM}没单独设过的盘归它管{RST}")
         print("-" * 60)
         print(f"  {DIM}输编号进那个盘的设置　0 = 返回{RST}")
