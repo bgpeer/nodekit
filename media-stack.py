@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.28"
+SCRIPT_VERSION = "1.5.29"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7561,6 +7561,13 @@ def do_strm():
         except Exception:
             pass            # 问不到就别拦着，这只是个提醒
 
+    # 先清缓存再扫。放在"有人在看片"那一问之后 —— 那一问可能直接退出，
+    # 没必要为一次被取消的扫描去重启两个容器。
+    try:
+        clear_dir_cache(d)
+    except Exception as e:
+        warn(f"清目录缓存失败（不影响扫描，但刚加的片子可能看不见）：{_short_err(e)}")
+
     original = open(cfg_path, encoding="utf-8").read()
     hm = autofilm_clock()
     if hm is None:
@@ -8853,6 +8860,29 @@ def _apply_dir_cache(d, stores, want, quiet=False):
             warn("等了 90 秒 OpenList 还没起来，没有重启 MediaWarp（后面的照常跑）。")
             print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
     return n
+
+
+def clear_dir_cache(d):
+    """把 OpenList 的目录缓存清掉（重启它），然后重启 MediaWarp。返回成没成。
+
+    【为什么"生成媒体库"必须先做这一步】目录缓存是 12 小时。用户刚往网盘里丢了
+    一集，OpenList 手里还是几小时前那份目录，AutoFilm 去列目录当然看不见新文件 ——
+    于是点了「生成媒体库」，跑得好好的，一个新片子都没多。而这正是那个按钮唯一的
+    用途（"在网盘里整理过片子之后点这个"）。缓存是内存里的，重启就没了。
+
+    MediaWarp 得跟着重启：它只在启动时登录一次 OpenList，OpenList 一重启旧令牌
+    作废，换直链会 401 —— 而且只有缓存里没有的片子才失败，表现是"有的能放有的
+    不能放"，最难联想到的一种。
+    """
+    info("清一次目录缓存（不然刚加的片子要等缓存过期才看得见）...")
+    subprocess.run(["docker", "restart", "openlist"], capture_output=True, timeout=120)
+    if not wait_openlist_ready(d):
+        warn("等了 90 秒 OpenList 还没起来，缓存清掉了但没重启 MediaWarp。")
+        print(f"  {DIM}等它好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
+        return False
+    subprocess.run(["docker", "restart", "mediawarp"], capture_output=True, timeout=120)
+    ok("目录缓存已清，OpenList 和 MediaWarp 都已重启")
+    return True
 
 
 def dir_cache_auto_apply(d):
