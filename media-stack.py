@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.35"
+SCRIPT_VERSION = "1.5.36"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9761,6 +9761,15 @@ def _alipan_channel_menu(d, mp):
             print(f"  {DIM}开放平台发的直链里 ap= 就是这个值 —— 同一个应用，"
                   f"也就是说这串是「{ALIPAN_TYPES['default'][2]}」那条路取的{RST}")
         print(f"  {YELLOW}配错的表现很骗人：现在能用，一小时内令牌一续期就整个盘掉线{RST}")
+        # 【多半不是你选错了】看过 api.oplist.org 的前端源码（public/static/login.js）：
+        # 扫完码去兑换令牌那一步调的是 /alicloud/callback，参数里【没有 driver_txt】——
+        # 扫 TV 码和扫 OAuth2 码走的是同一个兑换接口。所以扫了 TV 的二维码、
+        # 拿回来的照样可能是开放平台的令牌。实测就是这样。
+        # 不写这一句，人会以为是自己选错了下拉框，反复重扫、甚至把存储删掉重建。
+        if other == "alipanTV":
+            print(f"  {DIM}顺带：那个站扫完码去兑换的那一步（/alicloud/callback）"
+                  f"参数里不带类型，扫 TV 码也可能拿回开放平台的令牌 —— "
+                  f"多半不是你选错了。重扫、删存储重建都改不了这一点{RST}")
         if not ask_yn("仍然用它？", False):
             print("已取消，一个字都没改。")
             return
