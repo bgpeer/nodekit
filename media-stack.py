@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.30"
+SCRIPT_VERSION = "1.5.31"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5257,12 +5257,22 @@ def do_update(from_menu=False):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
 
-    if self_update():
+    # 【换过脚本之后别再查一次】更新是这么走的：老脚本发现有新版 → 换掉自己 →
+    # re-exec，新脚本从头再跑一遍 do_update。于是 self_update 会被调用两次，
+    # 屏幕上就是
+    #     ✔ 脚本已更新：v1.5.29 → v1.5.30，用新版继续...
+    #     ✔ 脚本 v1.5.30 → v1.5.30（已是最新，仓库里没有更新的版本）
+    # 两行连着出现，看着像更新了两次。第二行是刚加的"没得升也说一声"，本意是
+    # 让人知道查过了，结果在这条路上成了噪音。
+    # 用环境变量把"我是被 re-exec 起来的"带过去（execv 继承当前 environ），
+    # 顺手也省掉第二次那趟没用的网络请求。
+    if not os.environ.get("MS_SELF_UPDATED") and self_update():
         me = os.path.realpath(__file__)
         # 【把"我是从菜单进来的"这件事带过去】re-exec 会把当前进程整个换掉，调用栈
         # 连同"跑完该回哪儿"一起没了。用命令行那条 update 参数的话，新进程做完就
         # 退出 —— 用户按回车直接被弹回外层的 bgpeer 主菜单，而他明明是在
         # 「15 自建 Emby」里面点的更新，本该回到那个子菜单。
+        os.environ["MS_SELF_UPDATED"] = "1"
         os.execv(sys.executable,
                  [sys.executable, me, "update-menu" if from_menu else "update"])
 
