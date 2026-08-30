@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.19"
+SCRIPT_VERSION = "1.5.20"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5092,6 +5092,9 @@ def self_update():
     """
     me = os.path.realpath(__file__)
     if not os.access(me, os.W_OK):
+        # 同上：静默返回会让人以为"检查过了、是最新的"，而实际上根本没检查
+        warn(f"脚本文件不可写（{me}），这次跳过检查更新。")
+        print(f"  {DIM}继续用本机这份 v{SCRIPT_VERSION} 刷新配置。{RST}")
         return False
     try:
         req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}",
@@ -5107,6 +5110,13 @@ def self_update():
         return False
     try:
         if body == open(me, encoding="utf-8").read():
+            # 【没得升也要说一声】原来这里是静默 return —— 有更新时跳一行
+            # 「v1.5.15 → v1.5.18」，没更新时一个字都不打。于是同一个操作有两种
+            # 长相，而"没打那行"同时意味着三件事：已是最新、拉取失败、脚本不可写。
+            # 用户没法从屏幕上分辨，只会以为"更新功能不见了"。实测被问到。
+            # 所以照着有更新时的形状打，只是箭头两头一样。
+            ok(f"脚本 v{SCRIPT_VERSION} → v{SCRIPT_VERSION}"
+               f"{DIM}（已是最新，仓库里没有更新的版本）{RST}")
             return False
     except OSError:
         return False
