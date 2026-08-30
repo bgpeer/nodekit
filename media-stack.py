@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.24"
+SCRIPT_VERSION = "1.5.25"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9352,11 +9352,19 @@ def toggle_metatube():
 
 
 def _write_link_method(d, stores, target):
-    """把这些存储的 link_method 写成 target，然后重启 OpenList 和 MediaWarp。
+    """把这些存储的 link_method 写成 target。"""
+    _write_addition(d, [(sid, mp) for sid, mp, _drv, _cur in stores],
+                    {"link_method": target})
 
-    「挂载路径」那边是一个盘一个盘地设，这段写入逻辑给它和别处共用，
-    要用同一段写入逻辑（备份、还原、重启顺序）。这段每一步都是踩出来的，
-    不能让第二个入口再照抄一遍。
+
+def _write_addition(d, targets, updates, quiet_keys=()):
+    """把 updates 合进这些存储的 addition，然后重启 OpenList 和 MediaWarp。
+
+    targets 是 [(存储 id, 挂载点)]。这段（停容器、备份、写、还原、重启顺序）
+    每一步都是踩出来的，所有要动 addition 的入口都走这里，不能各抄一份。
+
+    quiet_keys 里的键只报"已更新"，不打值 —— 令牌这种东西不能进屏幕，
+    而这些输出是会被截图的。
     """
     # OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停，避免锁冲突
     info("停止 OpenList...")
@@ -9366,13 +9374,17 @@ def _write_link_method(d, stores, target):
     try:
         shutil.copy2(db, bak)
         con = sqlite3.connect(db)
-        for sid, mp, _drv, cur in stores:
+        for sid, mp in targets:
             row = con.execute("select addition from x_storages where id=?", (sid,)).fetchone()
             a = json.loads(row[0])
-            a["link_method"] = target
+            shown = []
+            for k, v in updates.items():
+                shown.append(f"{k}: {a.get(k) or '空'} → "
+                             + ("（已更新）" if k in quiet_keys else str(v)))
+                a[k] = v
             con.execute("update x_storages set addition=? where id=?",
                         (json.dumps(a, ensure_ascii=False), sid))
-            ok(f"{mp}: {cur or '空'} → {target}")
+            ok(f"{mp}  " + "　".join(shown))
         con.commit()
         con.close()
     except Exception as e:
@@ -9588,45 +9600,182 @@ def _title_menu(d, mp=None):
               f"先去「3 后补参数 → 1」填上。{RST}")
 
 
-def _link_method_menu(d, mounts, who):
-    """直链方式。mounts 是要一起改的挂载点；who 只用于打印。
+# 阿里云盘的「接口通道」。它没有 link_method（那是夸克/UC 的字段），
+# 但有一个作用类似、而且决定播放快慢的开关：alipan_type。
+# 取值和取令牌页面上的入口一一对应，两边必须配对，见 gen 使用信息那段。
+ALIPAN_TYPES = {
+    "default":  ("开放平台接口", "第三方 Open API。阿里对它限速 —— 实测约 0.8 Mbps，"
+                                "大码率的片子放不动",
+                 "阿里云盘 (OAuth2) 扫码登录"),
+    "alipanTV": ("TV 客户端接口", "走 TV 版客户端那条通道，不吃上面那个限速；"
+                                 "但要另外扫 TV 版二维码取令牌",
+                 "阿里云盘 (Client) TV版扫码"),
+}
 
-    单盘传一个，「剩余网盘」传它管的那一批 —— 两边共用这一段，
-    免得同一个开关有两套行为。
+
+def drive_channel(d, mp, drv):
+    """这个盘的「直链走哪条路」：(当前值显示名, 能不能在这里切)。
+
+    【别把"没有 link_method"说成"这个盘没有直链方式"】上一版就是这么写的，
+    用户当场问"这个没302直链吗" —— 阿里当然有 302 直链，MediaWarp 照样把
+    播放器重定向到 dl1-v6.aliyundrive.cloud。没有的只是"原画/转码流"这个
+    【选择】：那是夸克/UC 的 TV 驱动特有的字段，别的驱动只发原画直链。
+    说"没有开关"和说"没有直链"，差得远。
+    """
+    dl = str(drv or "").lower()
+    lm = [x for x in link_method_storages(d) if x[1] == mp]
+    if lm:
+        cur = lm[0][3]
+        return LINK_METHODS.get(cur, (cur or "未知",))[0], True
+    if dl == "aliyundriveopen":
+        cur = ""
+        for m2, _drv2, _st, _root, mode in openlist_storages(d):
+            if m2 == mp:
+                cur = mode or "default"
+        return f"原画直链 · {ALIPAN_TYPES.get(cur, (cur,))[0]}", True
+    return "原画直链", False
+
+
+def _alipan_channel_menu(d, mp):
+    """阿里的接口通道：default（开放平台，被限速）↔ alipanTV（TV 客户端）。
+
+    【类型和令牌必须一起换】OpenList 拿 alipan_type 决定向官方 API 报哪个驱动
+    标识（default→alicloud_qr，alipanTV→alicloud_tv），拿一种流程取的令牌去另一种
+    那边换，只会得到 empty token returned from official API。这个坑实测踩过：
+    在 OpenList 表单里只把类型改了，令牌忘了换，整个盘挂不上。
+    所以这里【不给只翻类型的按钮】—— 要换就当场把新令牌一起收了再写。
+    """
+    sid = cur = None
+    for s2, m2, _drv2, _st2 in _ali_storages(d):
+        if m2 == mp:
+            sid, cur = s2, _st2 or "default"
+    if sid is None:
+        warn(f"读不到 {mp} 的存储记录。")
+        return
+    other = "alipanTV" if cur == "default" else "default"
+    print()
+    for k, (name, why, page) in ALIPAN_TYPES.items():
+        star = f"  {GREEN}← 现在{RST}" if k == cur else ""
+        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}{star}")
+        print(f"      {DIM}{why}{RST}")
+    print()
+    print(f"  {DIM}阿里发的永远是{RST}原画直链{DIM}（原始文件地址），"
+          f"没有「转码流」那个选项 —— 那是夸克/UC 的 TV 驱动才有的。"
+          f"这里能调的是【走哪条接口】，它决定被不被限速。{RST}")
+    print()
+    print(f"  1. 换成「{ALIPAN_TYPES[other][0]}」")
+    print("  0. 返回")
+    if ask("请选择").strip() != "1":
+        print("没有改动。")
+        return
+
+    # 【先把令牌要到手，再动类型】只翻类型 = 必定挂不上，见函数开头
+    print()
+    warn("换通道必须【连令牌一起换】—— 只改类型的话这个盘会直接挂不上。")
+    print(f"  {DIM}报错长这样：failed init storage: "
+          f"empty token returned from official API{RST}")
+    print()
+    print(f"  取令牌：浏览器打开 {CYAN}{BOLD}https://api.oplist.org/{RST}"
+          f"{DIM}（打不开换 https://api.oplist.org.cn/）{RST}")
+    print(f"  下拉框选 {BOLD}{ALIPAN_TYPES[other][2]}{RST}，扫码，"
+          f"只抄{BOLD}刷新令牌{RST}那一栏")
+    print(f"  {DIM}授权时把「备份盘」的勾去掉 —— 那里面是手机相册{RST}")
+    print()
+    tok = ask("把刷新令牌粘在这里（留空取消）").strip()
+    if not tok:
+        print("已取消，一个字都没改。")
+        return
+    # JWT 形态 = OAuth2 扫码那条路取的；TV 客户端那条给的不是 JWT。
+    # 形态和要换的通道对不上就是刚才那个坑，当场拦住比事后报错强。
+    looks_jwt = tok.count(".") == 2 and tok.startswith("ey")
+    if (other == "alipanTV" and looks_jwt) or (other == "default" and not looks_jwt):
+        warn(f"这串看着不像「{ALIPAN_TYPES[other][2]}」取的令牌。")
+        print(f"  {DIM}OAuth2 扫码给的是 JWT（ey 开头、两个点）；"
+              f"TV 版给的不是。粘错了的话这个盘会挂不上。{RST}")
+        if not ask_yn("仍然用它？", False):
+            print("已取消，一个字都没改。")
+            return
+    _write_addition(d, [(sid, mp)],
+                    {"alipan_type": other, "refresh_token": tok},
+                    quiet_keys=("refresh_token",))
+    print(f"  {DIM}挂上没有：跑「6 链路体检」，或者 bash tools/ali-token.sh{RST}")
+
+
+def _ali_storages(d):
+    """阿里云盘存储：(id, 挂载点, 驱动, alipan_type)。取不到返回 []。"""
+    db = os.path.join(d, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        rows = con.execute("select id, mount_path, driver, addition "
+                           "from x_storages order by mount_path").fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for sid, mp, drv, add in rows:
+        if str(drv or "").lower() != "aliyundriveopen":
+            continue
+        try:
+            cur = str(json.loads(add).get("alipan_type") or "default")
+        except Exception:
+            cur = "default"
+        out.append((sid, mp, drv, cur))
+    return out
+
+
+def _link_method_menu(d, mounts, who):
+    """直链方式 / 接口通道。按驱动给它真正有的那个开关。
+
+    mounts 是要一起改的挂载点；who 只用于打印。单盘传一个，
+    「剩余网盘」传它管的那一批 —— 两边共用这一段，免得同一个开关有两套行为。
     """
     stores = [x for x in link_method_storages(d) if x[1] in mounts]
-    if not stores:
+    if stores:
+        curs = {c for _s, _m, _d, c in stores}
         print()
-        warn(f"{who} 没有「直链方式」这个开关。")
-        print(f"  {DIM}只有夸克 / UC 的 TV 版驱动（QuarkTV、UCTV）有 —— "
-              f"这是驱动自己的字段，不是脚本能加的。{RST}")
-        print(f"  {DIM}阿里、115 这些盘播放慢是限速，换不了接口，"
-              f"用 tools/ali-403.sh 量一下就知道。{RST}")
+        for _sid, mp2, drv2, cur2 in stores:
+            print(f"  {DIM}{mp2}（{driver_cn(drv2)}）当前：{RST}"
+                  f"{CYAN}{LINK_METHODS.get(cur2, (cur2 or '未知',))[0]}{RST}")
+        print()
+        for k, (name, why) in LINK_METHODS.items():
+            print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why}")
+        print()
+        if len(curs) == 1:
+            cur = stores[0][3]
+            target = "streaming" if cur == "download" else "download"
+            if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
+                print("没有改动。")
+                return
+        else:
+            print("  1. 原画直链（download）")
+            print("  2. 转码流（streaming）")
+            c = ask("要切换成哪个？（回车取消）").strip()
+            target = {"1": "download", "2": "streaming"}.get(c, "")
+            if not target:
+                print("没有改动。")
+                return
+        _write_link_method(d, stores, target)
         return
-    curs = {c for _s, _m, _d, c in stores}
+
+    # 没有 link_method 的盘：阿里有它自己的通道开关，别的就是只有原画一种
+    ali = [x for x in _ali_storages(d) if x[1] in mounts]
+    if len(ali) == 1:
+        _alipan_channel_menu(d, ali[0][1])
+        return
+    if len(ali) > 1:
+        print()
+        print(f"  {DIM}这批里有 {len(ali)} 个阿里盘，接口通道要一个一个换"
+              f"（每个盘的令牌不一样）：{'、'.join(x[1] for x in ali)}{RST}")
+        return
     print()
-    for _sid, mp2, drv2, cur2 in stores:
-        print(f"  {DIM}{mp2}（{driver_cn(drv2)}）当前：{RST}"
-              f"{CYAN}{LINK_METHODS.get(cur2, (cur2 or '未知',))[0]}{RST}")
-    print()
-    for k, (name, why) in LINK_METHODS.items():
-        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why}")
-    print()
-    if len(curs) == 1:
-        cur = stores[0][3]
-        target = "streaming" if cur == "download" else "download"
-        if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
-            print("没有改动。")
-            return
-    else:
-        print("  1. 原画直链（download）")
-        print("  2. 转码流（streaming）")
-        c = ask("要切换成哪个？（回车取消）").strip()
-        target = {"1": "download", "2": "streaming"}.get(c, "")
-        if not target:
-            print("没有改动。")
-            return
-    _write_link_method(d, stores, target)
+    print(f"  {who} 发的是{BOLD}原画直链{RST}"
+          f"{DIM}（网盘原始文件的地址），302 照常生效。{RST}")
+    print(f"  {DIM}它没有「原画 / 转码流」这个【选择】—— 那是夸克 / UC 的 TV 版"
+          f"驱动（QuarkTV、UCTV）特有的字段，不是脚本能给别的驱动加的。{RST}")
+    print(f"  {DIM}这类盘播放慢一般是网盘那边限速，换不了接口。"
+          f"想量一下到底多少：bash tools/ali-403.sh <片名>{RST}")
 
 
 def _drive_menu(d, mp, drv):
@@ -9643,9 +9792,11 @@ def _drive_menu(d, mp, drv):
             st = f"{GREEN}✔ 扫{RST}  {DIM}整个盘（跟着「剩余网盘」走）{RST}"
         else:
             st = f"{DIM}✖ 不扫{RST}"
-        lm = [x for x in link_method_storages(d) if x[1] == mp]
-        lm_s = (f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}" if lm
-                else f"{DIM}这个盘没有{RST}")
+        # 【显示它实际走什么，不是"有没有开关"】见 drive_channel 的注释：
+        # 写"这个盘没有"会被读成"这个盘没有直链"，而阿里明明有 302 直链。
+        _ch, _switchable = drive_channel(d, mp, drv)
+        lm_s = (f"{CYAN}{_ch}{RST}" if _switchable
+                else f"{CYAN}{_ch}{RST}{DIM}（只有这一种）{RST}")
         by = ms_state().get("title_by_drive") or {}
         names = {"scrape": "刮削结果", "filename": "网盘文件名"}
         tp_s = (f"{CYAN}{names.get(by[mp], by[mp])}{RST}" if mp in by
@@ -9689,8 +9840,13 @@ def _rest_menu(d):
         on = auto_rest_on()
         names = {"scrape": "刮削结果", "filename": "网盘文件名"}
         lm = [x for x in link_method_storages(d) if x[1] in rest]
-        lm_s = (f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}" if lm
-                else f"{DIM}这些盘都没有{RST}")
+        _ali_rest = [x for x in _ali_storages(d) if x[1] in rest]
+        if lm:
+            lm_s = f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}"
+        elif _ali_rest:
+            lm_s = f"{CYAN}原画直链 · 接口通道{RST}"
+        else:
+            lm_s = f"{CYAN}原画直链{RST}{DIM}（只有这一种）{RST}"
         print("\n" + "=" * 60)
         print(f"  {BOLD}♻ 剩余网盘（自动）{RST}   当前："
               + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}"))
