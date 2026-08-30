@@ -245,20 +245,31 @@ print()
 hr(); print(f"  {B}结论{X}"); hr()
 if need:
     print(f"  原片要 {B}{need:.1f} Mbps{X} 才能边放边看。")
-for lbl, v in (("A  Emby 这条", a_mbps), ("B  挂载页面这条", b_mbps)):
-    if v <= 0:
-        continue
+# 【只有 A 能拿原片码率当尺子】B 放的是转码流，码率比原片低一个量级
+# （SD 通常 1～2 Mbps）。拿 17 Mbps 去衡量它，会把一条明明很流畅的路
+# 判成"不够" —— 实测就出过这个错：B 报 12 Mbps「不够 0.7x」，
+# 而用户在挂载页面拖进度条根本不卡。尺子用错比不量还糟。
+if a_mbps > 0:
     if need:
-        ok_ = v >= need * 1.5
-        print(f"  {lbl:16} {v:6.1f} Mbps   "
-              + (f"{G}够（{v/need:.1f}x）{X}" if ok_ else
-                 f"{R}不够（{v/need:.1f}x，要 >1.5x 才稳）{X}"))
+        print(f"  {'A  Emby 这条':16} {a_mbps:6.1f} Mbps   "
+              + (f"{G}够（{a_mbps/need:.1f}x）{X}" if a_mbps >= need * 1.5 else
+                 f"{R}不够（{a_mbps/need:.1f}x，要 >1.5x 才稳）{X}"))
     else:
-        print(f"  {lbl:16} {v:6.1f} Mbps")
+        print(f"  {'A  Emby 这条':16} {a_mbps:6.1f} Mbps")
+if b_mbps > 0:
+    print(f"  {'B  挂载页面这条':15} {b_mbps:6.1f} Mbps   "
+          f"{D}放的是 {best} 转码流，码率比原片低一个量级，"
+          f"不能拿原片那个数衡量{X}")
 print()
 if a_mbps and b_mbps and b_mbps > a_mbps * 1.5:
-    print(f"  {Y}挂载页面快，是因为它放的是转码流（{best}），码率比原片低得多。{X}")
-    print(f"  {D}Emby 要的是原片，所以两边体感完全不同 —— 不是脚本的问题。{X}")
+    print(f"  {Y}两条路差 {b_mbps/a_mbps:.0f} 倍。挂载页面流畅是【两个原因叠加】：{X}")
+    print(f"    {D}1. 它放的是转码流（{best}），码率比原片低一个量级{X}")
+    print(f"    {D}2. 网盘对这两条是【分开限速】的 —— 下载接口掐得狠，"
+          f"播放接口放行{X}")
+    print(f"  {D}Emby 要的是原片、走的是下载接口，两头都吃亏。不是脚本的问题。{X}")
+    print(f"  {B}想让 Emby 也走转码流{X}{D}：夸克那边是 link_method=streaming；"
+          f"阿里要试 alipan_type 改成 alipanTV（TV 接口），或者买第三方权益包"
+          f"解掉下载限速。{X}")
 elif a_mbps and need and a_mbps < need:
     print(f"  {Y}Emby 这条路的速度撑不住原片码率 —— 卡就是这么来的。{X}")
     print(f"  {D}网盘对第三方限速的话，换个盘放大片、或者放码率低的版本。{X}")
