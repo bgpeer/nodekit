@@ -147,19 +147,39 @@ def get(url, rng=None, timeout=90, head=None):
 
 
 def open_direct(url):
-    """打开直链，必要时换几组请求头再试。返回 (响应, 用的是哪组头) 或 (None, "")。"""
+    """打开直链，必要时换几组请求头再试。返回 (响应, 用的是哪组头) 或 (None, "")。
+
+    【必须带 Range，不然测的不是播放器走的那条路】实测阿里云盘：同一条直链，
+    带 Range 拿到 206、2 秒 1 MiB；不带 Range 直接 403。而播放器【永远带
+    Range】—— 要 seek、要分段拉。不带 Range 去探，探到的 403 是自己造出来的，
+    据此报"这个片子放不了"是彻头彻尾的误判。
+
+    这个坑我踩过一次：先报了防盗链（403），又拿另一个带 -r 的脚本去测，
+    五种请求头全部 206 —— 两份结果打架，差别只在这一个头上。
+    """
     first = None
+    # 播放器开头就是这么拉的：要前 1 MiB
+    probe_rng = (0, 1024 * 1024 - 1)
     for label, head in HEADSETS:
         try:
-            r = get(url, timeout=60, head=head)
+            r = get(url, rng=probe_rng, timeout=60, head=head)
             GOOD_HEAD.clear(); GOOD_HEAD.update(head)
             return r, label
         except Exception as e:
             first = first or f"{label} → {e}"
             continue
+    # 带 Range 都不行，再试一次不带的 —— 万一是这个源不认 Range
+    try:
+        r = get(url, timeout=60, head=HEADSETS[1][1])
+        GOOD_HEAD.clear(); GOOD_HEAD.update(HEADSETS[1][1])
+        print(f"  ⚠ 这条直链【不认 Range】：带 Range 全被拒，不带反而行")
+        print(f"    播放器基本都带 Range，所以这种源在播放器里多半也放不了。")
+        return r, HEADSETS[1][0] + "（不带 Range）"
+    except Exception:
+        pass
     print(f"  ✖ 直链打不开：{first}")
     print(f"    {len(HEADSETS)} 组请求头都试过了（空 UA / 浏览器 UA / 带 Referer），"
-          f"全都不行。")
+          f"带不带 Range 也都试了，全都不行。")
     print(f"    这条直链是网盘刚给的，所以不是过期 —— 是网盘那边拒绝了这次下载。")
     return None, ""
 
@@ -211,7 +231,14 @@ if used != HEADSETS[0][0]:
 is_hls = head.lstrip().startswith(b"#EXTM3U") or "mpegurl" in ctype
 if not is_hls:
     # 整文件：从第 80 MiB 处拉 16 MiB —— 开头那段往往有缓存，测不出持续速度
-    size = int(clen or 0)
+    # Content-Range: bytes 0-1048575/11727000000 —— 总大小取斜杠后面那个，
+    # Content-Length 在 206 里只是这一段的长度，拿它当总大小会把 off 算成 0
+    size = 0
+    cr = r.headers.get("Content-Range") or ""
+    if "/" in cr:
+        try: size = int(cr.rsplit("/", 1)[1])
+        except ValueError: size = 0
+    size = size or int(clen or 0)
     off = 80 * 1024 * 1024 if size > 100 * 1024 * 1024 else 0
     t = time.time(); got = 0
     try:
