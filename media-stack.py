@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.13"
+SCRIPT_VERSION = "1.5.14"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8635,7 +8635,7 @@ def _apply_dir_cache(d, stores, want, quiet=False):
             if not quiet:
                 info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
         else:
-            warn("OpenList 迟迟没就绪，没有重启 MediaWarp。")
+            warn("等了 90 秒 OpenList 还没起来，没有重启 MediaWarp（后面的照常跑）。")
             print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
     return n
 
@@ -9225,7 +9225,7 @@ def set_link_method():
                            timeout=120)
             info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
         else:
-            warn("OpenList 迟迟没就绪，没有重启 MediaWarp。")
+            warn("等了 90 秒 OpenList 还没起来，没有重启 MediaWarp。")
             print(f"  {DIM}它手里还是切换前的旧令牌，换直链会被拒。等 OpenList 好了敲："
                   f"{RST}{BOLD}docker restart mediawarp{RST}")
 
@@ -9752,12 +9752,19 @@ def wait_openlist_ready(d, timeout=90):
 
     存在的理由是 MediaWarp 只在启动那一刻登录一次 —— 必须等 OpenList 能接受登录了
     再去重启它，否则那一次登录失败，之后它一直握着废令牌。
+
+    【为什么要把秒数打出来】等的时候屏幕上如果只有一句"等 OpenList 起好..."，
+    那么"正在正常地等"和"卡死了"长得一模一样 —— 只能干瞪眼猜。所以这里滚动
+    刷新已用秒数和上限，看得见在走、也看得见还要多久，到点了必然返回。
     """
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                   fallback=os.path.join(d, ".env"))
     t0 = time.monotonic()
     said = False
-    while time.monotonic() - t0 < timeout:
+    while True:
+        el = time.monotonic() - t0
+        if el >= timeout:
+            break
         try:
             tok = (_ol_api("/api/auth/login",
                            {"username": "admin", "password": pw},
@@ -9765,14 +9772,16 @@ def wait_openlist_ready(d, timeout=90):
             if tok:
                 el = time.monotonic() - t0
                 if said:
-                    print(f"  {DIM}OpenList 就绪（等了 {el:.0f} 秒）{RST}")
+                    print(f"\r\x1b[2K  {DIM}OpenList 就绪（等了 {el:.0f} 秒）{RST}")
                 return True
         except Exception:
             pass
-        if not said:
-            print(f"  {DIM}等 OpenList 起好再重启 MediaWarp...{RST}")
-            said = True
+        said = True
+        print(f"\r\x1b[2K  {DIM}等 OpenList 起好再重启 MediaWarp…"
+              f"{el:.0f}/{timeout} 秒{RST}", end="", flush=True)
         time.sleep(2)
+    if said:
+        print("\r\x1b[2K", end="")      # 占位行擦掉，让调用方的 ⚠ 从行首开始
     return False
 
 
