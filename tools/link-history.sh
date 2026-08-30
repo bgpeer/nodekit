@@ -23,7 +23,7 @@ LINES="${2:-20000}"
 # 【把版本打出来】这些脚本是 curl 下来跑的，而 raw 有 CDN 缓存：改完立刻拉，
 # 拿到的可能还是几分钟前那份。跑出来的结果对不上，人只会以为"改了没用"。
 # 屏幕上有个版本号，一眼就能分清是"没改对"还是"拿的是旧的"。
-TOOL_VER="2026-08-30d"
+TOOL_VER="2026-08-30e"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 command -v docker >/dev/null 2>&1 || { echo "✖ 没有 docker"; exit 1; }
@@ -293,7 +293,24 @@ if hpath and os.path.isfile(hpath):
         print(f"  {D}strm 路径形式 ✔  {body[:70]}{X}")
 elif hpath:
     print(f"  {R}✖ 宿主机上找不到这个 strm{X}  {D}{hpath}{X}")
-    print(f"  {D}Emby 库里有条目、磁盘上没文件 —— 点「5 生成媒体库」重建{X}")
+    print(f"  {D}Emby 库里有条目、磁盘上没文件 —— 播放器点开当然什么都拿不到。{X}")
+    # 【是整个盘没了还是就这一个】差别很大：整盘没了多半是那个盘没被扫、
+    # 或者被当成孤儿目录清掉了；只少一个文件更像是网盘里那个文件被删/改名了。
+    # 两种都靠「5 生成媒体库」重建，但知道是哪种才知道要不要回头看挂载路径。
+    parts = cpath[len("/data/strm/"):].split("/")
+    drive_dir = (DATA_ROOT.rstrip("/") + "/strm/" + "/".join(parts[:2])
+                 if len(parts) >= 2 else "")
+    if drive_dir and os.path.isdir(drive_dir):
+        n = sum(1 for _r, _d, fs in os.walk(drive_dir)
+                for f in fs if f.endswith(".strm"))
+        print(f"  {D}这个盘的 strm 目录还在，里面有 {n} 个 strm —— "
+              f"少的只是这一个（网盘里那个文件被删了或改名了？）{X}")
+    elif drive_dir:
+        print(f"  {Y}这个盘的 strm 目录整个都不在{X}"
+              f"  {D}{drive_dir}{X}")
+        print(f"  {D}整盘的 strm 都没了 —— 回「4 挂载路径」确认这个盘有没有被扫，"
+              f"再点「5 生成媒体库」{X}")
+    print(f"  {B}修：点一次「5 生成媒体库」{X}")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -321,7 +338,12 @@ el = time.time() - t0
 if not loc:
     print(f"  {R}✖ 没拿到 302{X}（HTTP {code}，用了 {el:.1f} 秒）")
     print(f"  {D}换不到直链，点开就一直转圈。这不是快慢的问题。{X}")
-    if body.lower().startswith(("http://", "https://")):
+    # 【strm 本身有问题时就别再指向体检了】体检查的是网盘那头，
+    # 而这几种的原因已经在上面写明了 —— 再让人跑一遍体检只会兜圈子，
+    # 而且体检那边一切正常，反而把他往错的方向带。
+    if not body:
+        print(f"  {D}原因上面已经写了 —— 先把 strm 补回来再说。{X}")
+    elif body.lower().startswith(("http://", "https://")):
         print(f"  {D}上面已经指出原因了：strm 是 URL 形式。{X}")
     else:
         print(f"  {D}下一步：跑「6 链路体检」看那个存储的实测结果；"
