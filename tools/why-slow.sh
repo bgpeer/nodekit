@@ -16,6 +16,9 @@
 #   4. 网盘对这个文件单独限速                 → 同上，速度差一个量级就是它
 set -u
 
+TOOL_VER="2026-08-30c"          # 见 link-history.sh 里的说明：CDN 会缓存
+echo "  ${0##*/}  版本 $TOOL_VER"
+
 SLOW="${1:-}"
 GOOD="${2:-}"
 if [ -z "$SLOW" ]; then
