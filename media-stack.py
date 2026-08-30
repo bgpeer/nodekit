@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.36"
+SCRIPT_VERSION = "1.5.37"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8861,14 +8861,7 @@ def _apply_dir_cache(d, stores, want, quiet=False):
         # 【MediaWarp 必须跟着重启，而且要等 OpenList 先就绪】它只在启动时登录
         # 一次，OpenList 重启后旧令牌作废，换直链会 401 —— 而且只有缓存里没有
         # 的片子才失败，表现是"有的能放有的不能放"，根本联想不到是这一步。
-        if wait_openlist_ready(d):
-            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
-                           timeout=120)
-            if not quiet:
-                info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
-        else:
-            warn("等了 90 秒 OpenList 还没起来，没有重启 MediaWarp（后面的照常跑）。")
-            print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
+        restart_mediawarp_when_ready(d, quiet=quiet)
     return n
 
 
@@ -8886,11 +8879,9 @@ def clear_dir_cache(d):
     """
     info("清一次目录缓存（不然刚加的片子要等缓存过期才看得见）...")
     subprocess.run(["docker", "restart", "openlist"], capture_output=True, timeout=120)
-    if not wait_openlist_ready(d):
-        warn("等了 90 秒 OpenList 还没起来，缓存清掉了但没重启 MediaWarp。")
-        print(f"  {DIM}等它好了敲：{RST}{BOLD}docker restart mediawarp{RST}")
+    if not restart_mediawarp_when_ready(d, quiet=True):
+        warn("缓存是清掉了，但 MediaWarp 没重启 —— 见上一行。")
         return False
-    subprocess.run(["docker", "restart", "mediawarp"], capture_output=True, timeout=120)
     ok("目录缓存已清，OpenList 和 MediaWarp 都已重启")
     return True
 
@@ -9413,6 +9404,7 @@ def _write_addition(d, targets, updates, quiet_keys=()):
     subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
     db = os.path.join(d, "openlist", "config", "data.db")
     bak = db + ".bak"
+    mw_ok = False
     try:
         shutil.copy2(db, bak)
         con = sqlite3.connect(db)
@@ -9450,14 +9442,7 @@ def _write_addition(d, targets, updates, quiet_keys=()):
         # 【但顺序不能反】MediaWarp 是在启动那一刻登录的，只登一次。OpenList 还没
         # 起好就重启它，那次登录直接失败，它照样握着一个没用的令牌 —— 和不重启一样
         # 糟，而且更难想到。实测就栽在这里：重启完立刻预热，四部片子全部"没换到直链"。
-        if wait_openlist_ready(d):
-            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
-                           timeout=120)
-            info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
-        else:
-            warn("等了 90 秒 OpenList 还没起来，没有重启 MediaWarp。")
-            print(f"  {DIM}它手里还是切换前的旧令牌，换直链会被拒。等 OpenList 好了敲："
-                  f"{RST}{BOLD}docker restart mediawarp{RST}")
+        mw_ok = restart_mediawarp_when_ready(d)
 
     print()
     print(f"  {DIM}strm 文件不用重新生成 —— 里面存的是网盘路径，{RST}")
@@ -9467,9 +9452,26 @@ def _write_addition(d, targets, updates, quiet_keys=()):
     # 趁这里替他热一遍，切完就能直接看
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
-    if key:
-        time.sleep(5)          # 等 MediaWarp 起来并登录 OpenList
-        warm_links(d, key)
+    if not mw_ok:
+        # 【MediaWarp 没重启成就别热】它手里是废令牌，这十几部一定【全部】404 ——
+        # 白等十分钟、白打一轮网盘接口，末尾还会打出"网盘接口多半在抖"，
+        # 把人往完全错的方向带。实测就是这么发生的。
+        print(f"  {DIM}这次不预热了：MediaWarp 还握着旧令牌，现在热必定一部都热不上。{RST}")
+        print(f"  {DIM}按上面那条命令重启完，下一轮（{WARM_EVERY_H} 小时内）会自动补热；"
+              f"想马上热就再进一次这个菜单。{RST}")
+    elif key:
+        # 【放后台】预热要一部一部跨境换直链，慢的时候整轮要几分钟。通道已经切完、
+        # 配置已经落盘，热不热跟这次切换成没成功毫无关系 —— 没道理让人对着它干等。
+        # 更新那条路早就是后台跑的，这里跟上。
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.realpath(__file__), "warm"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            print(f"  {DIM}已在后台给「继续观看」+ 最近新加的片子预热线路"
+                  f"（换直链，最多几分钟）—— 不用等它，直接回车就行。{RST}")
+        except Exception as e:
+            warn(f"后台预热没起来（不影响切换）：{_short_err(e)}")
     else:
         print(f"  {DIM}没有 Emby API Key，没法提前接线路 —— "
               f"第一次播放会等一会儿换直链。{RST}")
@@ -10372,6 +10374,31 @@ def wait_openlist_ready(d, timeout=90):
     return False
 
 
+def restart_mediawarp_when_ready(d, quiet=False):
+    """等 OpenList 起好，再重启 MediaWarp。返回【有没有真的重启成】。
+
+    MediaWarp 只在启动那一刻登录 OpenList，之后一直用那一个令牌。OpenList 一
+    重启旧令牌就作废，所以它必须跟着重启；而且顺序不能反 —— OpenList 还没起好
+    就重启它，那次登录直接失败，它照样握着一个废令牌。
+
+    【返回值不是给日志看的】没重启成，就意味着此后每一次换直链都会被拒（对 Emby
+    表现为 404、点开一直转圈）。拿到 False 的调用方必须【停下所有还要换直链的
+    后续动作】—— 尤其是预热：明知每一部都会 404 还照跑十分钟，既白打了网盘接口，
+    最后还会得出"网盘接口在抖"这种完全相反的结论。
+    """
+    if wait_openlist_ready(d):
+        subprocess.run(["docker", "restart", "mediawarp"], capture_output=True,
+                       timeout=120)
+        if not quiet:
+            info("MediaWarp 已重启（换新令牌，否则换直链会 401）")
+        return True
+    warn("等了 90 秒 OpenList 还没起来，没有重启 MediaWarp。")
+    print(f"  {DIM}它手里还是旧令牌，换直链会被拒 —— Emby 里表现为点开一直转圈。{RST}")
+    print(f"  {DIM}等 OpenList 好了敲：{RST}{BOLD}docker restart mediawarp{RST}"
+          f"{DIM}，再去播一部片子。{RST}")
+    return False
+
+
 def _fetch_text(url, timeout, limit=1 << 20):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -10605,9 +10632,20 @@ def warm_links(d, key, limit=None):
     # 一轮打完就走的话，热成率完全看运气 —— 用户实测有一轮 4 部只热上 1 部。
     # 失败的攒起来再来一遍，中间隔几秒让接口喘口气，比一次性打完靠谱得多。
     todo_q, attempt = list(cut), 0
+
+    def wipe():
+        """把"接线中…"那行占位擦掉，再打别的。
+
+        占位行是用 \\r 顶着的、没有换行。后面凡是【不以 \\r 开头】的输出直接打，
+        就会接在它屁股后面，两句话糊成一行（"…接线中… 最多 45 秒...3 部没热上"）。
+        所以每一处多行提示前面都先擦一次。
+        """
+        print("\r\033[K", end="", flush=True)
+
     while todo_q and attempt < WARM_RETRY:
         attempt += 1
         if attempt > 1:
+            wipe()
             print(f"  {DIM}...{len(todo_q)} 部没热上，隔 5 秒再试一轮"
                   f"（第 {attempt}/{WARM_RETRY} 轮）{RST}")
             time.sleep(5)
@@ -10616,6 +10654,7 @@ def warm_links(d, key, limit=None):
             # 【总时长封顶】跨境慢的时候一个能耗掉半分钟。这是后台任务，跑太久没意义
             # —— 一小时后还会再来，剩下的留给那一轮
             if time.monotonic() - t_all > WARM_BUDGET:
+                wipe()
                 print(f"  {DIM}...已用满 {WARM_BUDGET // 60} 分钟，剩下的交给下一轮{RST}")
                 again = []
                 todo_q = []
@@ -10648,7 +10687,7 @@ def warm_links(d, key, limit=None):
                 # 而实测打出来的是 timed out —— 超时只说明接口那几十秒没回话，
                 # 跟文件在不在毫无关系。文件到底还在不在，由每日对齐那步的三态
                 # 判据说了算（明确回答"对象不存在"才算删）。
-                dead.append(name[:24])
+                dead.append((name[:24], why))
                 tip = ("网盘接口一直没回话，线路慢，下一轮再试"
                        if ("timed out" in why or "timeout" in why.lower() or not why)
                        else f"{why} —— 下一轮再试；一直这样就跑「6 链路体检」")
@@ -10681,6 +10720,7 @@ def warm_links(d, key, limit=None):
             print(f"\r  {GREEN}\u2714{RST} {name[:24]}  "
                   f"{time.monotonic() - t0:.1f} 秒{at}\033[K")
         todo_q = again
+    wipe()      # 最后一部要是进了重试队列，占位行还顶在屏幕上，下面的总结会糊上去
 
     # 【自查：续播点有没有被推着走】用户担心的正是这个 —— "热着热着一天下来那个
     # 继续播放进度条都跑完了"。理论上不会：预热只请求流、从不调 Emby 的播放上报
@@ -10716,8 +10756,23 @@ def warm_links(d, key, limit=None):
     if done:
         ok(f"{done}/{len(cut)} 部已接好，点「继续播放」不用等换直链")
     elif dead:
-        warn(f"{len(dead)} 部都没换到直链 —— 网盘接口这会儿多半在抖，"
-             f"下一轮（{WARM_EVERY_H} 小时后）会自动再试。")
+        # 【全军覆没要按报错原文分岔，不能一律说"网盘在抖"】这两种的处置完全相反：
+        #   · 一部一部超时  = 真的是线路/接口在抖，等下一轮就行，人什么都不用做
+        #   · 齐刷刷 404    = MediaWarp 换直链被拒，十有八九是它手里的 OpenList
+        #                     令牌废了（OpenList 刚重启过就会这样）。这个不会自愈，
+        #                     下一轮照样全 404 —— 得重启 MediaWarp
+        # 说反了的代价是实打实的：用户等了一小时，回来还是一部都放不了。
+        four = [w for _n, w in dead if w.startswith("HTTP 4")]
+        warn(f"{len(dead)} 部都没换到直链。")
+        if len(four) >= max(2, len(dead) - 1):
+            code = max(set(four), key=four.count)      # 取占多数的那个码，别拿第一条顶
+            print(f"  {DIM}全是 {code} —— 这不是网盘慢，是 MediaWarp 换直链被拒了。"
+                  f"最常见的原因：OpenList 重启过，它手里的令牌作废了。{RST}")
+            print(f"  {DIM}敲这一条再试：{RST}{BOLD}docker restart mediawarp{RST}")
+            print(f"  {DIM}还是不行就跑「6 链路体检」。{RST}")
+        else:
+            print(f"  {DIM}网盘接口这会儿多半在抖，下一轮（{WARM_EVERY_H} 小时后）"
+                  f"会自动再试 —— 你什么都不用做。{RST}")
     else:
         warn("一个都没接上 —— 网盘接口可能正好在抖，跑「6 链路体检」看看。")
     return done, len(cut)
