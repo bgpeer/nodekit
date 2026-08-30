@@ -4,9 +4,13 @@
 #     bash link-history.sh 龙虎门
 #     bash link-history.sh 龙虎门 2000     翻更多行（默认 20000 行日志）
 #
-# 只读，不改任何东西。
+# 只读（实测那一步只是发一次播放请求、拉 1 MiB，和点一次播放走的路一样）。
 #
-# 【为什么要有这个】"昨天很流畅、过了一晚上就卡了" —— 这种问题靠当下测一次
+# 两段：先翻历史（去过哪），再【当场实测一次】（现在还行不行）。
+# 用户的原话："我现在都播放不了，为什么不直接测" —— 对的。光看日志只能说
+# "过去怎样"，而"现在能不能播"必须当场问一次才算数。
+#
+# 【为什么还留着历史那一段】"昨天很流畅、过了一晚上就卡了" —— 这种问题靠当下测一次
 # 是答不上来的，当下的状态只有一个。而 MediaWarp 每换一次直链都会把完整地址
 # 打进日志，历史全在里面：哪一次指向哪个网盘、是整文件还是 HLS 分片流、
 # 中间有没有换过节点。把这些按时间列出来，"什么时候变的"就自己浮出来了。
@@ -209,3 +213,103 @@ else:
     if stalled:
         print(f"  {B}另外：当下换不到直链{X}{D} —— 先把这个解决，再谈快慢{X}")
 PY
+
+# ------------------------------------------------------------------ 当场实测
+# 历史只说明"去过哪"，说明不了"现在还行不行"。这一段就发一次真实的播放请求，
+# 和用户在客户端点一下播放走的是同一条路。
+KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
+        "${MS_DIR:-/opt/media-stack}/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
+
+echo
+echo "================================================================"
+echo "  现在实测一次（和点播放走同一条路）"
+echo "================================================================"
+if [ -z "$KEY" ]; then
+  echo "  读不到 Emby API Key，测不了。先跑「3 后补参数 → 1」"
+  exit 0
+fi
+
+python3 - "$KEY" "$Q" <<'PY2'
+import json, re, sys, time, urllib.request, urllib.error
+KEY, Q = sys.argv[1], sys.argv[2]
+EMBY, MW = "http://127.0.0.1:8096", "http://127.0.0.1:9000"
+B, D, R, G, Y, C, X = ("\033[1m", "\033[2m", "\033[31m", "\033[32m",
+                       "\033[33m", "\033[36m", "\033[0m")
+
+try:
+    u = (f"{EMBY}/Items?Recursive=true&IncludeItemTypes=Movie,Episode,Video"
+         f"&Fields=Path&Limit=3000&api_key={KEY}")
+    items = json.load(urllib.request.urlopen(u, timeout=60)).get("Items") or []
+except Exception as e:
+    print(f"  {R}问不到 Emby：{e}{X}")
+    raise SystemExit
+
+hit = [i for i in items
+       if str(i.get("Path") or "").endswith(".strm")
+       and (Q.lower() in str(i.get("Name") or "").lower()
+            or Q.lower() in str(i.get("Path") or "").lower())]
+if not hit:
+    print(f"  {Y}Emby 里没有匹配「{Q}」的 strm 条目{X}")
+    raise SystemExit
+if len(hit) > 1:
+    print(f"  {Y}匹配到 {len(hit)} 个，测第一个：{hit[0].get('Name')}{X}")
+it = hit[0]
+iid = it.get("Id")
+print(f"  {B}{it.get('Name')}{X}  {D}条目 {iid}{X}")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随重定向 —— 要的就是那个 302 本身和它的 Location。"""
+    def redirect_request(self, *_a, **_k):
+        return None
+
+
+op = urllib.request.build_opener(NoRedirect)
+url = (f"{MW}/Videos/{iid}/stream?MediaSourceId=mediasource_{iid}"
+       f"&Static=true&api_key={KEY}")
+t0 = time.time()
+loc, code = "", 0
+try:
+    r = op.open(url, timeout=90)
+    code = r.status
+except urllib.error.HTTPError as e:
+    code = e.code
+    loc = e.headers.get("Location", "") or ""
+except Exception as e:
+    print(f"  {R}✖ 请求 MediaWarp 失败：{e}{X}")
+    raise SystemExit
+el = time.time() - t0
+
+if not loc:
+    print(f"  {R}✖ 没拿到 302{X}（HTTP {code}，用了 {el:.1f} 秒）")
+    print(f"  {D}换不到直链，点开就一直转圈。这不是快慢的问题。{X}")
+    print(f"  {D}下一步：跑「6 链路体检」看那个存储的实测结果；"
+          f"存储是好的就 docker restart mediawarp{X}")
+    raise SystemExit
+
+host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
+kind = "HLS 分片流" if ".m3u8" in loc.lower() else "整文件"
+print(f"  {G}✔ 302{X}  {D}{el:.1f} 秒{X}  →  {C}{host}{X}  {kind}")
+
+# 【必须带 Range】阿里的直链不带 Range 直接 403，那是自己造出来的假故障
+req = urllib.request.Request(loc, headers={
+    "Range": "bytes=0-1048575",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")})
+t0 = time.time()
+try:
+    with urllib.request.urlopen(req, timeout=60) as rr:
+        n = len(rr.read(1 << 20))
+    el = time.time() - t0
+    mbps = n * 8 / el / 1e6 if el > 0 else 0
+    col = G if mbps >= 8 else (Y if mbps >= 3 else R)
+    print(f"  实测速度  {col}{mbps:.2f} Mbps{X}  {D}（{n/1024/el:.0f} KB/s，"
+          f"拉了 {n/1024/1024:.1f} MiB）{X}")
+    print(f"  {D}够不够看要跟片子的码率比 —— Emby 条目页上写着（比如 16.6 Mbps）。"
+          f"拉不到那个数就会边放边等。{X}")
+except urllib.error.HTTPError as e:
+    print(f"  {R}✖ 这条直链拉不动：HTTP {e.code}{X}")
+    print(f"  {D}地址换到了但下不动 —— 用 tools/ali-403.sh 换几种方式再试{X}")
+except Exception as e:
+    print(f"  {R}✖ 这条直链拉不动：{e}{X}")
+PY2
