@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.12"
+SCRIPT_VERSION = "1.5.13"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10436,6 +10436,20 @@ def do_healthcheck():
             _hc(f"存储 {mp}", "skip", f"{drv}  {DIM}上次初始化时：{brief}"
                                       f"（当前状态看下面的实测）{RST}")
             stale_status[mp] = brief
+            # 【类型和令牌必须配对】阿里的 alipan_type 决定向官方 API 报的驱动
+            # 标识：default → alicloud_qr，alipanTV → alicloud_tv。拿一种流程
+            # 取的令牌去另一种那边换，官方 API 返回空，就是这句报错。
+            # 只改了类型没换令牌是最容易踩的 —— 那个下拉框就在表单里，
+            # 而令牌要去另一个网站重取，两件事离得远。
+            if "empty token" in str(st).lower() and drv.lower() == "aliyundriveopen":
+                todo.append((
+                    f"{mp} 挂不上：类型（alipan_type={mode or 'default'}）和"
+                    f"刷新令牌不配对 —— 令牌是按另一种流程取的",
+                    "两条路二选一：① 把「阿里盘账户类型」改回 default，"
+                    "原来的令牌立刻就能用（速度还是被限）；"
+                    "② 保持 alipanTV，去 https://api.oplist.org/ 用"
+                    "【阿里云盘TV】那个入口重新扫码取一个新令牌，"
+                    "把类型和令牌【一起】换掉"))
         elif bad_root and (not root or "/" in root):
             _hc(f"存储 {mp}", "bad", f"{drv}  work  {RED}根文件夹ID={root or '空'}{RST}")
             todo.append((f"{mp} 的根文件夹ID 是 {root or '空'}，夸克要的是文件夹 ID",
