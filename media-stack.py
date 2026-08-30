@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.29"
+SCRIPT_VERSION = "1.5.30"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9665,13 +9665,20 @@ def _alipan_channel_menu(d, mp):
     所以这里【不给只翻类型的按钮】—— 要换就当场把新令牌一起收了再写。
     """
     sid = cur = None
-    for s2, m2, _drv2, _st2 in _ali_storages(d):
+    shape = ""
+    for s2, m2, _drv2, t2, sh2 in _ali_storages(d):
         if m2 == mp:
-            sid, cur = s2, _st2 or "default"
+            sid, cur, shape = s2, t2 or "default", sh2
     if sid is None:
         warn(f"读不到 {mp} 的存储记录。")
         return
     other = "alipanTV" if cur == "default" else "default"
+    # 【库里这份令牌配不配得上要换的那个类型】配得上就不用重新扫码 ——
+    # 最常见的一次就是这样：类型被改成了 alipanTV、令牌还是 OAuth2 的那份，
+    # 结果整个盘挂不上。这时要做的只是把类型改回 default，令牌一个字都不用动。
+    # 上一版不管三七二十一都要人贴一份新令牌，等于让他为了修一个手误再去扫一次码。
+    tok_fits = ((shape == "jwt" and other == "default")
+                or (shape == "other" and other == "alipanTV"))
     print()
     for k, (name, why, page) in ALIPAN_TYPES.items():
         star = f"  {GREEN}← 现在{RST}" if k == cur else ""
@@ -9682,6 +9689,17 @@ def _alipan_channel_menu(d, mp):
     print("  0. 返回")
     if ask("请选择").strip() != "1":
         print("没有改动。")
+        return
+
+    if tok_fits:
+        print()
+        print(f"  {DIM}库里现有的令牌正好是「{ALIPAN_TYPES[other][2]}」那条路取的，"
+              f"不用重新扫码。{RST}")
+        if not ask_yn(f"直接换成「{ALIPAN_TYPES[other][0]}」？", True):
+            print("没有改动。")
+            return
+        _write_addition(d, [(sid, mp)], {"alipan_type": other})
+        print(f"  {DIM}挂上没有：跑「6 链路体检」，或者 bash tools/ali-token.sh{RST}")
         return
 
     # 【先把令牌要到手，再动类型】只翻类型 = 必定挂不上，见函数开头
@@ -9697,7 +9715,7 @@ def _alipan_channel_menu(d, mp):
     # JWT 形态 = OAuth2 扫码那条路取的；TV 客户端那条给的不是 JWT。
     # 形态和要换的通道对不上就是刚才那个坑，当场拦住比事后报错强。
     looks_jwt = tok.count(".") == 2 and tok.startswith("ey")
-    if (other == "alipanTV" and looks_jwt) or (other == "default" and not looks_jwt):
+    if (other == "alipanTV") == looks_jwt:
         warn(f"这串看着不像「{ALIPAN_TYPES[other][2]}」取的令牌。")
         if not ask_yn("仍然用它？", False):
             print("已取消，一个字都没改。")
@@ -9709,7 +9727,14 @@ def _alipan_channel_menu(d, mp):
 
 
 def _ali_storages(d):
-    """阿里云盘存储：(id, 挂载点, 驱动, alipan_type)。取不到返回 []。"""
+    """阿里云盘存储：(id, 挂载点, 驱动, alipan_type, 令牌是不是 JWT 形态)。
+
+    最后那个是【形态】，不是令牌本身："jwt" = OAuth2 扫码那条路发的（ey 开头、
+    两个点），"other" = TV 客户端那条发的，"" = 根本没有令牌。靠它就能知道库里
+    现有的令牌配不配得上某个类型 —— 而这决定了换通道时用不用重新扫码。
+    【空串必须和两种形态都区分开】没有令牌时不管换成哪个类型都得重新取，
+    把它当成"另一种形态"就会漏掉这一步，直接写一个必然挂不上的配置。
+    """
     db = os.path.join(d, "openlist", "config", "data.db")
     if not os.path.exists(db):
         return []
@@ -9725,10 +9750,14 @@ def _ali_storages(d):
         if str(drv or "").lower() != "aliyundriveopen":
             continue
         try:
-            cur = str(json.loads(add).get("alipan_type") or "default")
+            a = json.loads(add)
+            cur = str(a.get("alipan_type") or "default")
+            tok = str(a.get("refresh_token") or "")
         except Exception:
-            cur = "default"
-        out.append((sid, mp, drv, cur))
+            cur, tok = "default", ""
+        shape = ("" if not tok else
+                 "jwt" if (tok.count(".") == 2 and tok.startswith("ey")) else "other")
+        out.append((sid, mp, drv, cur, shape))
     return out
 
 
