@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.33"
+SCRIPT_VERSION = "1.5.34"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9403,8 +9403,10 @@ def _write_addition(d, targets, updates, quiet_keys=()):
     targets 是 [(存储 id, 挂载点)]。这段（停容器、备份、写、还原、重启顺序）
     每一步都是踩出来的，所有要动 addition 的入口都走这里，不能各抄一份。
 
-    quiet_keys 里的键只报"已更新"，不打值 —— 令牌这种东西不能进屏幕，
-    而这些输出是会被截图的。
+    quiet_keys 里的键【新旧两个值都不打】，只报"已更新"。
+    【旧值也是令牌】第一版只把新值挡住了，旧值照样 a.get(k) 原样打出来 ——
+    于是屏幕上是一整串还在有效期内的刷新令牌，而这一屏正是用户会截图发出来的。
+    换令牌这件事，前后两个都是秘密。
     """
     # OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停，避免锁冲突
     info("停止 OpenList...")
@@ -9419,8 +9421,10 @@ def _write_addition(d, targets, updates, quiet_keys=()):
             a = json.loads(row[0])
             shown = []
             for k, v in updates.items():
-                shown.append(f"{k}: {a.get(k) or '空'} → "
-                             + ("（已更新）" if k in quiet_keys else str(v)))
+                if k in quiet_keys:
+                    shown.append(f"{k}: {'（原来的）' if a.get(k) else '空'} → （已更新）")
+                else:
+                    shown.append(f"{k}: {a.get(k) or '空'} → {v}")
                 a[k] = v
             con.execute("update x_storages set addition=? where id=?",
                         (json.dumps(a, ensure_ascii=False), sid))
@@ -10555,6 +10559,11 @@ def warm_links(d, key, limit=None):
          f"「继续观看」+ 最近新加 + 轮到的老片...")
     print(f"  {DIM}只换直链、拉 {WARM_BYTES // 1024}KB，不上报播放进度；"
           f"热完回读一遍，被推动了就改回原值。{RST}")
+    # 【把上限和"能不能中途走"说出来】每部片子跑完才打一行，而单部最多要等
+    # WARM_STEP_T 秒 —— 于是第一行出来之前屏幕是死的，看着就是卡住了。
+    # 配置在进这个函数之前就已经写完落盘了，Ctrl-C 走人不会留下半截状态。
+    print(f"  {DIM}最多跑 {WARM_BUDGET // 60} 分钟；不想等就 Ctrl-C，"
+          f"配置已经改好了，热不热只影响第一次点开快不快。{RST}")
     opener = urllib.request.build_opener(_NoRedirect)
     done, dead = 0, []
     t_all = time.monotonic()
@@ -10580,6 +10589,11 @@ def warm_links(d, key, limit=None):
             t0 = time.monotonic()
             if done or again:            # 第一个不等，之后每个之间歇一下
                 time.sleep(WARM_GAP)
+            # 【先打一行占位再去等】不然这一部跑完之前屏幕一动不动（单部最多
+            # WARM_STEP_T 秒），和卡死长得一样。下面成功/失败那行用 \r 盖掉它。
+            print(f"\r  {DIM}·{RST} {pad(name[:24], 26)}"
+                  f"{DIM}接线中… 最多 {WARM_STEP_T} 秒{RST}\033[K",
+                  end="", flush=True)
             url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
                    f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
             loc, why = "", ""
@@ -10604,8 +10618,8 @@ def warm_links(d, key, limit=None):
                 tip = ("网盘接口一直没回话，线路慢，下一轮再试"
                        if ("timed out" in why or "timeout" in why.lower() or not why)
                        else f"{why} —— 下一轮再试；一直这样就跑「6 链路体检」")
-                print(f"  {DIM}·{RST} {name[:24]}  {YELLOW}没热上{RST}"
-                      f"{DIM}（{tip}）{RST}")
+                print(f"\r  {DIM}·{RST} {name[:24]}  {YELLOW}没热上{RST}"
+                      f"{DIM}（{tip}）{RST}\033[K")
                 continue
             # 按续播点估算字节位置。转码流是 m3u8（整份播放列表），没有位置可言，
             # 直接拉开头就行；原画是完整文件，才需要跳到那一段去
@@ -10630,8 +10644,8 @@ def warm_links(d, key, limit=None):
                 except Exception:
                     at = f"  {DIM}（字节没拉到，直链已进缓存）{RST}"
             done += 1
-            print(f"  {GREEN}\u2714{RST} {name[:24]}  "
-                  f"{time.monotonic() - t0:.1f} 秒{at}")
+            print(f"\r  {GREEN}\u2714{RST} {name[:24]}  "
+                  f"{time.monotonic() - t0:.1f} 秒{at}\033[K")
         todo_q = again
 
     # 【自查：续播点有没有被推着走】用户担心的正是这个 —— "热着热着一天下来那个
