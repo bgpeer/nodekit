@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.27"
+SCRIPT_VERSION = "1.5.28"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9876,6 +9876,10 @@ def mount_paths_menu():
             print(f"  {i:>2}. {pad(driver_cn(drv), 24)}{col}{where}{RST}")
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
+        # 返回也要占一行。这一屏原来只在提示里写「0 = 返回」，而别的每一屏
+        # 都是列成 "0. 返回" —— 同一套菜单里两种写法，回车能不能退出还得试。
+        # 编号宽度跟上面的条目对齐（上面用的是 {i:>2}）。
+        print(f"  {0:>2}. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
