@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.15"
+SCRIPT_VERSION = "1.5.16"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -814,7 +814,14 @@ cache:
   # 等于把 9 次赌博串进一次观影。
   # 夸克直链的 auth_key 实测有效期约 30 小时,缓存 2 小时安全余量很足,
   # 一部片子只需要成功换一次。
-  alist_api_ttl: {LINK_TTL_H}h
+  #
+  # 【但这条只对夸克成立 —— 阿里的直链只活 15 分钟】阿里发的地址里带
+  # x-oss-expires=900,过期后阿里直接拒。缓存比直链本身还长,后果是
+  # MediaWarp 把一条【已经死掉】的地址 302 给播放器,播放器报"load fail",
+  # 而日志里照样是一次漂亮的 302、体检也全绿 —— 因为体检每次都现换一条新的。
+  # 表现就是"刚挂好能放,过一会儿就放不了了","有的片能放有的不能放"。
+  # 所以这个值不是常数,要按【挂了哪些盘】取最短的那家,见 link_ttl_of()。
+  alist_api_ttl: {cfg['link_ttl']}
   image_ttl: 10m
   subtitle_ttl: 2h
 
@@ -1265,6 +1272,14 @@ WARM_REST      = 20
 # MediaWarp 缓存直链的时长（小时）。改这个要同时改 gen_mediawarp_conf 里的
 # alist_api_ttl —— 下面那个门槛就是拿它算的。
 LINK_TTL_H     = 2
+# 【各家直链自己能活多久】—— 缓存【绝对不能】比这个长，长了就是把死地址
+# 302 给播放器。数字都是从直链地址本身读出来的，不是猜的：
+#   阿里  URL 里明写 x-oss-expires=900 → 15 分钟
+#   夸克  auth_key 实测约 30 小时
+# 没列进来的驱动按夸克那档算（沿用原来的 2 小时，这是这套东西一直在跑的值）。
+LINK_LIFE_MIN = {"aliyundriveopen": 15}
+# 取最短那家之后还要再打个折 —— 缓存正好等于有效期的话，边界上那一次必死。
+LINK_TTL_SAFE = 0.6
 # 【轮转全库只在小库上成立，大库上纯粹是白打接口】用户的直觉，算一下就清楚：
 #
 #   有效覆盖 = 每小时热几部 × 缓存能活几小时 = 20 × 2 = 任何时刻 40 部是热的
@@ -4604,6 +4619,27 @@ def openlist_storages(d):
     return out
 
 
+def link_ttl_of(d):
+    """MediaWarp 该把直链缓存多久。返回 ("10m", 10) 这样的 (写进配置的值, 分钟)。
+
+    规矩只有一条：【缓存不能比直链本身活得长】。长了，MediaWarp 就会把一条已经
+    过期的地址 302 给播放器 —— 播放器报 load fail，而这边日志里是一次正常的 302、
+    体检也全绿（体检每次都现换一条新的，永远碰不到这个坑）。
+
+    所以按【当前挂了哪些盘】取最短的那家。挂了阿里就得跟着阿里的 15 分钟走，
+    哪怕别的盘能撑 30 小时 —— MediaWarp 这个值是全局的，没法一盘一个。
+    读不到存储（没装好 / 库还没建）就沿用原来的 2 小时。
+    """
+    mins = LINK_TTL_H * 60
+    for _mp, drv, _st, _root, _mode in openlist_storages(d):
+        life = LINK_LIFE_MIN.get(str(drv).lower())
+        if life:
+            mins = min(mins, int(life * LINK_TTL_SAFE))
+    if mins >= 60 and mins % 60 == 0:
+        return f"{mins // 60}h", mins
+    return f"{mins}m", mins
+
+
 def storage_token_days(d):
     """各网盘授权令牌还剩几天 [(挂载点, 天数), ...]。取不到就不返回那一条。
 
@@ -5494,6 +5530,9 @@ DOMAIN={cfg['domain']}
         f.write(gen_compose(cfg))
     with open(os.path.join(cfg["install_dir"], "autofilm/config/config.yaml"), "w") as f:
         f.write(gen_autofilm_conf(cfg))
+    # 直链缓存时长要按【已经挂上的盘】算，所以在写配置的这一刻现取一次 ——
+    # 装机时还没有存储，取到的就是默认值；等挂完盘跑「6 更新」会重算。
+    cfg["link_ttl"] = link_ttl_of(cfg["install_dir"])[0]
     with open(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), "w") as f:
         f.write(gen_mediawarp_conf(cfg))
     os.chmod(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), 0o600)
@@ -10778,6 +10817,33 @@ def do_healthcheck():
                      "每小时的保活任务现在也会自己发现并重启它"))
     elif mwlog.strip():
         _hc("MediaWarp 令牌", "ok", "本次启动以来没有换直链被拒的记录")
+
+    # ---- 直链缓存时长 vs 直链自己能活多久 ----
+    # 【这一项体检以前测不出来，正因为体检自己碰不到它】302 那一项每次都现换一条
+    # 新地址，新地址当然是好的；坏的是【放了一阵子的那条】。缓存比直链活得长，
+    # MediaWarp 就会把死地址 302 出去，播放器报 load fail，而这边日志里是一次
+    # 正常的 302。所以只能靠比对配置值，测是测不出来的。
+    _ttl_want, _ttl_min = link_ttl_of(d)
+    _ttl_cur = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                                "alist_api_ttl")
+    _short = {drv: LINK_LIFE_MIN[str(drv).lower()]
+              for _mp, drv, _s, _r, _m in openlist_storages(d)
+              if str(drv).lower() in LINK_LIFE_MIN}
+    _shortest = sorted(_short, key=lambda k: _short[k])
+    if _ttl_cur and _ttl_cur != _ttl_want:
+        _hc("直链缓存", "bad",
+            f"{RED}缓存 {_ttl_cur}，但{'、'.join(_shortest) or '已挂的盘'}的直链"
+            f"只活 {min(_short.values()) if _short else '?'} 分钟{RST}")
+        todo.append((
+            f"直链缓存（{_ttl_cur}）比直链本身的有效期还长 —— MediaWarp 会把"
+            f"【已经过期】的地址 302 给播放器，播放器报 load fail / 打不开。"
+            f"刚放过的片子能再放（地址还新），搁一阵子的就不行 —— "
+            f"表现正是「刚挂好能放，过一会儿又放不了」",
+            f"跑一次「6 更新」，它会按已挂的盘把这个值重算成 {_ttl_want}"))
+    elif _ttl_cur:
+        _hc("直链缓存", "ok", f"{_ttl_cur}"
+            + (f"  {DIM}按 {'、'.join(_shortest)} 的直链有效期定的{RST}"
+               if _shortest else f"  {DIM}没有短命直链的盘{RST}"))
 
     st302, msg302 = probe_302(key, own_host, _want)
     _hc("302 直链", st302, msg302)
