@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.18"
+SCRIPT_VERSION = "1.5.19"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4979,7 +4979,11 @@ def rebuild_cfg_from_disk(d):
     # 「更新」才能重新生成 autofilm / mediawarp 的配置而不丢用户的输入。
     af = os.path.join(d, "autofilm", "config", "config.yaml")
     mw = os.path.join(d, "mediawarp", "config", "config.yaml")
-    cfg["emby_api_key"] = read_yaml_scalar(mw, "auth")
+    # 【别只信 mediawarp 那一份】它是「更新」自己重写的文件，坏了/被写空了的话，
+    # 从它读回来的就是空值，然后更新会拿这个空值把配置再生成一遍 —— Key 就此丢掉。
+    # .secrets 里的备份就是为这一刻留的。见 save_emby_api_key。
+    cfg["emby_api_key"] = (read_yaml_scalar(mw, "auth")
+                           or read_env(sec_file, "EMBY_API_KEY"))
     # 扫描路径：auto 这种「意图」从生成出来的 yaml 里读不回来（里面只有展开后的结果），
     # 所以存在状态文件里。老机器没有这个键，就退回去读 yaml 里已有的 source_dir。
     spec = ms_state().get("scan_spec")
@@ -5560,6 +5564,9 @@ DOMAIN={cfg['domain']}
                 f"BA_USER={cfg['ba_user']}\n"
                 f"BA_PASS={cfg['ba_pass']}\n")
     os.chmod(secret_file, 0o600)
+    # 【这一句必须在整份重写 .secrets 之后】上面是 "w"，会把备份的 Key 一起冲掉；
+    # 重跑安装的人本来就有 Key，冲掉就等于让他再去 Emby 里翻一次。
+    save_emby_api_key(cfg["install_dir"], cfg.get("emby_api_key", ""))
 
     with open(os.path.join(cfg["install_dir"], "docker-compose.yml"), "w") as f:
         f.write(gen_compose(cfg))
@@ -5670,14 +5677,46 @@ def mediawarp_conf_path(install_dir=None):
     return os.path.join(install_dir or ms_install_dir(), "mediawarp/config/config.yaml")
 
 
+def save_emby_api_key(install_dir, key):
+    """把 API Key 另存一份到 .secrets。
+
+    【为什么要存两份】这个 Key 以前只活在 mediawarp 的配置文件里，而那份配置
+    是「6 更新」每次整份重写的 —— 重写用的值又是从它自己上一版里读回来的。
+    这就成了一条自己咬自己的链：那个文件一旦损坏或被写空，Key 就【没了】，
+    而更新还会理直气壮地拿一个空值把配置再生成一遍。实测发生过。
+    密码走 .secrets 早就是这个道理，Key 是装完才拿得到的，当初漏掉了。
+    """
+    if not key:
+        return
+    sec = os.path.join(install_dir, ".secrets")
+    try:
+        lines = [ln for ln in (open(sec, encoding="utf-8").read().splitlines()
+                               if os.path.exists(sec) else [])
+                 if not ln.startswith("EMBY_API_KEY=")]
+        lines.append(f"EMBY_API_KEY={key}")
+        with open(sec, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(sec, 0o600)
+    except OSError:
+        pass          # 存不下就算了，主存储仍然是 mediawarp 的配置
+
+
 def read_emby_api_key(install_dir=None):
-    """从 MediaWarp 配置里读当前的 API Key，读不到或为空都返回空串。"""
+    """当前的 API Key，读不到或为空都返回空串。
+
+    先读 mediawarp 配置（那是真正生效的那一份），空了再退回 .secrets 的备份。
+    """
+    key = ""
     try:
         with open(mediawarp_conf_path(install_dir)) as f:
             m = re.search(r"^\s*auth:[ \t]*(\S*)", f.read(), re.M)
-            return m.group(1) if m and not m.group(1).startswith("#") else ""
+            key = m.group(1) if m and not m.group(1).startswith("#") else ""
     except OSError:
-        return ""
+        key = ""
+    if key:
+        return key
+    d = install_dir or ms_install_dir()
+    return read_env(os.path.join(d, ".secrets"), "EMBY_API_KEY")
 
 
 def set_emby_api_key():
@@ -5740,6 +5779,7 @@ def set_emby_api_key():
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
     os.chmod(path, 0o600)
+    save_emby_api_key(d, key)      # 另存一份，配置文件出事时还能捞回来
     ok("API Key 已写入 MediaWarp 配置")
 
     info("重启 MediaWarp...")
