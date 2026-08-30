@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.26"
+SCRIPT_VERSION = "1.5.27"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9868,11 +9868,12 @@ def mount_paths_menu():
             print(f"  {YELLOW}OpenList 里还没挂任何网盘。{RST}")
             ask("\n按回车返回...")
             return
-        for i, (mp, drv, st) in enumerate(stores, 1):
+        # 【这一屏只管设置，不报状态】存储通不通归「6 链路体检」——
+        # 那边是真去列一次目录、换一次直链，比这里读一个陈年字段准得多。
+        for i, (mp, drv, _st) in enumerate(stores, 1):
             where = _scan_of(mp)
             col = CYAN if where != "未加路径" else DIM
-            bad = f"  {DIM}上次初始化报过错{RST}" if st != "work" else ""
-            print(f"  {i:>2}. {pad(driver_cn(drv), 24)}{col}{where}{RST}{bad}")
+            print(f"  {i:>2}. {pad(driver_cn(drv), 24)}{col}{where}{RST}")
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
         print("-" * 60)
