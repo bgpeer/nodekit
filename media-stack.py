@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.32"
+SCRIPT_VERSION = "1.5.33"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9717,6 +9717,11 @@ def _alipan_channel_menu(d, mp):
     warn("类型和令牌必须一起换，只改类型这个盘会挂不上。")
     print(f"  取令牌：{CYAN}{BOLD}https://api.oplist.org/{RST}"
           f"　选 {BOLD}{ALIPAN_TYPES[other][2]}{RST}　只要{BOLD}刷新令牌{RST}")
+    # 【那个网站是第三方的，会挂】实测点「获取 Token」直接弹「获取秘钥失败」——
+    # 那是它自己的接口返回了非 200，跟这边的配置无关，重试或换国内站有时就好了。
+    # 不写这一句的话，人会以为是自己哪一步做错了，在配置里反复折腾。
+    print(f"  {DIM}它弹「获取秘钥失败」= 那个网站自己的接口没通，不是你填错了。"
+          f"换 https://api.oplist.org.cn/ 或者过一会儿再试{RST}")
     print()
     tok = ask("把刷新令牌粘在这里（留空取消）").strip()
     if not tok:
