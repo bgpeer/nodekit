@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.31"
+SCRIPT_VERSION = "1.5.32"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11201,8 +11201,20 @@ def do_healthcheck():
     for mp, brief in stale_status.items():
         if any(p == mp or p.startswith(mp.rstrip("/") + "/") for p in live_ok):
             continue                                   # 实际能列出来，那条记录已经过期了
+        # 【别一律说成"线路问题"】这句原来是无条件加的，于是同一个故障会同时
+        # 出现两条互相打架的待办：上面刚说完"类型和令牌不配对，去改配置"，
+        # 这里紧接着说"线路问题，不是配置错了，等几分钟"。用户照后面那条等，
+        # 等多久都不会好。能从报错原文认出来的，就别猜。
+        _b = brief.lower()
+        if "empty token" in _b or "refresh token" in _b:
+            continue          # 令牌/类型的事，上面已经给过确切的修法
+        if "not init" in _b or "storage not found" in _b:
+            todo.append((f"{mp} 这个存储没初始化成功（{brief}）",
+                         "OpenList → 存储 → 找到它 → 先停用再启用；"
+                         "还不行就看它的令牌是不是过期或者填错了"))
+            continue
         todo.append((f"{mp} 连不上网盘接口（{brief}）",
-                     "线路问题，不是配置错了。等几分钟再跑一次体检；"
+                     "多半是线路，不是配置。等几分钟再跑一次体检；"
                      "已生成的 strm 不受影响"))
 
     # ---- 换直链：整套东西最关键的一项 ----
@@ -11269,10 +11281,21 @@ def do_healthcheck():
             else:
                 _hc(label, "ok", f"{el:.1f} 秒  →  {raw.split('/')[2]}")
         except Exception as e:
-            _hc(label, "bad", _short_err(e))
-            todo.append((f"{mount} 换直链失败，此刻这个盘的片子会卡在开头",
-                         "网盘接口不通（线路问题，不是配置错了）。"
-                         "已生成的 strm 不受影响，等几分钟再跑一次体检"))
+            _msg = _short_err(e)
+            _hc(label, "bad", _msg)
+            # 同上：能从报错原文认出是配置的，别说成线路 —— 说错了用户就会去等，
+            # 而配置问题等多久都不会自己好。
+            _m = _msg.lower()
+            if "empty token" in _m or "refresh token" in _m:
+                _fix = ("令牌和「阿里盘账户类型」不配对。"
+                        "4 挂载路径 → 选那个盘 → 2 直链方式，按提示换")
+            elif "not init" in _m or "storage not found" in _m:
+                _fix = ("这个存储没初始化成功。OpenList → 存储 → 找到它 → "
+                        "先停用再启用；还不行就查它的令牌")
+            else:
+                _fix = ("多半是网盘接口不通，不是配置。"
+                        "已生成的 strm 不受影响，等几分钟再跑一次体检")
+            todo.append((f"{mount} 换直链失败，此刻这个盘的片子会卡在开头", _fix))
 
     # ---- MediaWarp ----（key 在函数开头就读好了，列目录那一项要用）
     t0 = time.monotonic()
