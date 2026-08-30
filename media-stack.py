@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.23"
+SCRIPT_VERSION = "1.5.24"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9775,7 +9775,14 @@ def mount_paths_menu():
                 mark = f"{GREEN}✔ 扫{RST}  {DIM}整个盘（自动）{RST}"
             else:
                 mark = f"{DIM}✖ 不扫{RST}"
-            bad = f"  {YELLOW}存储没挂上{RST}" if st != "work" else ""
+            # 【别把 status 当实时状态】它是【存储初始化那一刻】写进去的，
+            # 之后网盘恢复了也不会自己改回 work。写成"存储没挂上"就是拿一条
+            # 陈年记录冒充当前故障 —— 实测那个盘列目录 0.4 秒、换直链 0.2 秒，
+            # 好得很，这一行却红着说它没挂上。「2 使用信息」和体检早就按
+            # "上次初始化时报过错" 措辞了，这里当初没跟上。
+            # 也不打印 status 原文：那是整条 Go 错误，里面带着 access_token，
+            # 而这一屏是会被截图的。要看细节去「6 链路体检」。
+            bad = (f"  {DIM}上次初始化报过错{RST}" if st != "work" else "")
             # 中文名打头（一眼认得是哪个盘），挂载路径跟在后面 ——
             # 同一种网盘挂两个账号时，只有它能把两行分开
             print(f"  {i:>2}. {pad(driver_cn(drv), 20)}{DIM}{pad(mp, 14)}"
