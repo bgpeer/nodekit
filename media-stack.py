@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.16"
+SCRIPT_VERSION = "1.5.17"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -784,7 +784,15 @@ def _gen_strm_task(cfg, path):
 
 
 def gen_mediawarp_conf(cfg):
-    """MediaWarp：反代在 Emby 前面，拦截播放请求并 302 到网盘直链。"""
+    """MediaWarp：反代在 Emby 前面，拦截播放请求并 302 到网盘直链。
+
+    【直链缓存时长自己算，不要求调用方传】cfg 是好几条路各自拼出来的
+    （安装、rebuild_cfg_from_disk、以后可能还有别的），每加一个键就得每条路
+    都记得填 —— 漏一条就是 KeyError，而这个函数一炸，整个「6 更新」就断在
+    半路。实测就这么断过一次。所以在函数里现算。
+    """
+    ttl = cfg.get("link_ttl") or link_ttl_of(cfg.get("install_dir")
+                                             or ms_install_dir())[0]
     return f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
 port: 9000
 
@@ -821,7 +829,7 @@ cache:
   # 而日志里照样是一次漂亮的 302、体检也全绿 —— 因为体检每次都现换一条新的。
   # 表现就是"刚挂好能放,过一会儿就放不了了","有的片能放有的不能放"。
   # 所以这个值不是常数,要按【挂了哪些盘】取最短的那家,见 link_ttl_of()。
-  alist_api_ttl: {cfg['link_ttl']}
+  alist_api_ttl: {ttl}
   image_ttl: 10m
   subtitle_ttl: 2h
 
@@ -5198,8 +5206,18 @@ def do_update(from_menu=False):
         if not os.path.exists(path):
             continue
         info(f"按当前版本重新生成 {svc} 配置...")
+        # 【先生成，再开文件】open(path,"w") 是【立刻清空】的：如果 gen() 在这之后
+        # 抛异常，磁盘上留下的是一份【空配置】—— 容器这次没重启所以还看不出来，
+        # 等下次重启才整个起不来，而那时候早忘了是哪一步弄的。实测栽过一次
+        # （cfg 少一个键 → KeyError），所以顺序必须是这个。
+        try:
+            text = gen(cfg)
+        except Exception as e:
+            err(f"生成 {svc} 配置失败：{e}")
+            warn(f"{path} 保持原样没动，更新继续往下走。")
+            continue
         with open(path, "w") as f:
-            f.write(gen(cfg))
+            f.write(text)
         subprocess.run(["docker", "restart", svc], capture_output=True)
     if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
         warn("MediaWarp 的 Emby API Key 是空的，302 直链不会生效。")
@@ -5530,9 +5548,6 @@ DOMAIN={cfg['domain']}
         f.write(gen_compose(cfg))
     with open(os.path.join(cfg["install_dir"], "autofilm/config/config.yaml"), "w") as f:
         f.write(gen_autofilm_conf(cfg))
-    # 直链缓存时长要按【已经挂上的盘】算，所以在写配置的这一刻现取一次 ——
-    # 装机时还没有存储，取到的就是默认值；等挂完盘跑「6 更新」会重算。
-    cfg["link_ttl"] = link_ttl_of(cfg["install_dir"])[0]
     with open(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), "w") as f:
         f.write(gen_mediawarp_conf(cfg))
     os.chmod(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), 0o600)
@@ -10824,8 +10839,18 @@ def do_healthcheck():
     # MediaWarp 就会把死地址 302 出去，播放器报 load fail，而这边日志里是一次
     # 正常的 302。所以只能靠比对配置值，测是测不出来的。
     _ttl_want, _ttl_min = link_ttl_of(d)
-    _ttl_cur = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
-                                "alist_api_ttl")
+    _mw_yaml = os.path.join(d, "mediawarp", "config", "config.yaml")
+    _ttl_cur = read_yaml_scalar(_mw_yaml, "alist_api_ttl")
+    # 【空配置要单独报】容器是启动时读配置的，文件被清空之后它照常跑（内存里
+    # 还是老的一份），要等下一次重启才整个起不来 —— 那时候没人会联想到是几天前
+    # 某次更新写坏的。所以文件本身先看一眼，别只看某个值读没读到。
+    if os.path.exists(_mw_yaml) and os.path.getsize(_mw_yaml) < 200:
+        _hc("MediaWarp 配置", "bad",
+            f"{RED}文件是空的（{os.path.getsize(_mw_yaml)} 字节）{RST}")
+        todo.append((
+            "mediawarp 的配置文件被写空了 —— 容器现在还在跑（配置在内存里），"
+            "但只要它重启一次就整个起不来，表现是所有片子都放不了",
+            "跑一次「6 更新」重新生成。生成失败的话看那一步的报错"))
     _short = {drv: LINK_LIFE_MIN[str(drv).lower()]
               for _mp, drv, _s, _r, _m in openlist_storages(d)
               if str(drv).lower() in LINK_LIFE_MIN}
