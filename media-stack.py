@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.21"
+SCRIPT_VERSION = "1.5.22"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -538,6 +538,50 @@ def parse_scan_spec(s):
             seen.add(p)
             out.append(p)
     return out or None
+
+
+def _paths_under(paths, mp):
+    """paths 里属于挂载点 mp 的那些。/aliyun2 不算 /aliyun 底下的。"""
+    root = (mp or "").rstrip("/")
+    if not root:
+        return []
+    return [p for p in paths if p == root or p.startswith(root + "/")]
+
+
+def explicit_scan_paths():
+    """用户在「挂载路径」里给某个盘明确指定的那些路径。"""
+    sp = ms_state().get("scan_spec")
+    return [] if sp == SCAN_AUTO else list(sp or [])
+
+
+def auto_rest_on():
+    """「剩余网盘（自动）」开着没有。
+
+    老配置里 scan_spec == SCAN_AUTO 就是"全部跟随已挂载存储"，语义上等同于
+    "没有任何盘单独设过 + 剩余自动全开"，所以直接认成开。
+    """
+    st = ms_state()
+    if "auto_rest" in st:
+        return bool(st.get("auto_rest"))
+    return st.get("scan_spec") == SCAN_AUTO
+
+
+def effective_scan_paths(d):
+    """真正要交给 AutoFilm 去扫的路径。
+
+    【单独设过的盘优先，剩余的才归"自动"管】用户的原话："如果剩余网盘开着他这个
+    路径要低于上面几个独立网盘填了路径的，除非上面几个网盘没有填路径"。
+    也就是说"自动"只负责【没人管的那些盘】：某个盘一旦被单独指了目录，自动就不
+    再往它身上加整盘 —— 否则用户明明只想扫 /aliyun/电影，却因为开了自动
+    又把整个 /aliyun 塞回去，等于那个设置白做。
+    """
+    exp = explicit_scan_paths()
+    out = list(exp)
+    if auto_rest_on():
+        for mp, _drv, _st, _root, _m in openlist_storages(d):
+            if mp and mp != "/" and not _paths_under(exp, mp):
+                out.append(mp)
+    return order_scan_paths(d, out)
 
 
 def resolve_scan_paths(d, spec):
@@ -3715,7 +3759,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         if not (interactive and has_tty()):
             print(f"  {DIM}剧集编号：有 {len(und)} 个可以补，但这是后台在跑、没法问你。"
                   f"在规则文件里给这些库写一行 episode_number: true 就不用管了，"
-                  f"或者到「3 后补参数 → 10」开一下{RST}")
+                  f"或者到「3 后补参数 → 7」开一下{RST}")
         else:
             print()
             info(f"剧集库里有 {len(und)} 个条目，Emby 认错了集号或者没认出来。")
@@ -3951,7 +3995,7 @@ def auto_libraries_apply(d, key, quiet=False):
 
     【这一步原来只挂在菜单里，是设计漏了】用户改完网盘文件夹名、点「4」，
     期待的就是"扫完顺手把库建好"，结果什么都没发生 —— 因为规则只在
-    「3 后补参数 → 7」按 y 的时候才会跑。他的原话："他没有自动建库，
+    「3 后补参数 → 4」按 y 的时候才会跑。他的原话："他没有自动建库，
     我为了让他自动建库我把名称都改了一下，可是他不但没有自动建库"。
 
     不问是对的：只建【不存在的】库，不动用户已有的任何东西，重叠的直接跳过
@@ -4901,7 +4945,7 @@ def show_info():
         print(f"        2. 要用它的媒体库 → 编辑 → 刮削器勾上 {BOLD}MetaTube{RST} → 再扫一次")
         print(f"      {DIM}只对文件名是番号（ABC-123 这种）的片子有效；")
         print(f"      普通电影电视剧交给 Emby 自带的 TMDb，别在同一个库里混着开。{RST}")
-        print(f"      {DIM}装/卸：3 后补参数 → 5{RST}")
+        print(f"      {DIM}装/卸：3 后补参数 → 3{RST}")
 
     # 容器只报「几个在跑」。以前这里直接贴 docker compose ps 的原始输出,在手机上
     # 每行都折成三四行,IMAGE/COMMAND/PORTS 糊成一片,而真正要看的只有"跑没跑"。
@@ -5008,7 +5052,9 @@ def rebuild_cfg_from_disk(d):
         cfg["scan_spec"] = spec
     else:
         cfg["scan_spec"] = read_yaml_all(af, "source_dir") or ["/quark"]
-    cfg["scan_paths"] = resolve_scan_paths(d, cfg["scan_spec"])
+    # 【用 effective 而不是 resolve】单独设过的盘 + 剩余自动，见 effective_scan_paths。
+    # 生成 autofilm 配置的就是这个值，所以"剩余网盘"开关必须在这里生效。
+    cfg["scan_paths"] = effective_scan_paths(d)
     cfg["strm_cron"]    = read_yaml_scalar(af, "cron", DEFAULT_STRM_CRON)
     # 只迁移「没被动过的旧默认值」：以前默认 0 0 5 * * *，而 AutoFilm 当时按 UTC 解释，
     # 对国内用户等于下午一点多在跑。现在调度器钉在北京时间、默认值改成 05:15，
@@ -6381,8 +6427,46 @@ def tune_strm_libraries(key):
 
 
 def title_policy():
-    """片名用哪个来源。"filename" = 网盘文件名，"scrape" = 刮削结果（默认）。"""
+    """片名用哪个来源的【默认值】。"filename" = 网盘文件名，"scrape" = 刮削结果。"""
     return ms_state().get("title_policy") or "scrape"
+
+
+def title_policy_of(mount):
+    """某个网盘的片名来源。没单独设过就跟默认值走。
+
+    【为什么要分盘设】同一台机器上，夸克里是规规矩矩的「片名 (年份).mkv」，
+    刮削结果更好；而另一个盘里全是「仙逆 [第154集•4K]」这种，刮削器只会乱撞，
+    文件名反而准。一个全局开关按不住这两种情况。
+    """
+    if not mount:
+        return title_policy()
+    return (ms_state().get("title_by_drive") or {}).get(mount) or title_policy()
+
+
+def set_title_policy_of(mount, val):
+    """给某个盘单独定片名来源；val 传 None 表示"跟默认值走"。"""
+    by = dict(ms_state().get("title_by_drive") or {})
+    if val is None:
+        by.pop(mount, None)
+    else:
+        by[mount] = val
+    save_ms_state(title_by_drive=by)
+
+
+def drive_of_strm(path):
+    """从 strm 文件路径反推它属于哪个网盘挂载点。取不到返回空串。
+
+        /data/strm/cloud/quark/电影/x.strm  →  /quark
+
+    靠得住的原因见 strm_subpath()：strm 树是网盘树的【镜像】，cloud/ 底下第一层
+    就是挂载点名。容器路径和宿主机路径都能吃，因为只找 /strm/cloud/ 这个标记。
+    """
+    marker = f"/strm/{STRM_SUBDIR}/"
+    i = (path or "").find(marker)
+    if i < 0:
+        return ""
+    rest = path[i + len(marker):].split("/")
+    return "/" + rest[0] if rest and rest[0] else ""
 
 
 def apply_title_policy(d, key):
@@ -6400,7 +6484,8 @@ def apply_title_policy(d, key):
     切回 scrape 时把 Name 从锁定列表里去掉就行，不去动标题本身：下一次刮削会自然
     把它覆盖回去，而在那之前保持现状总比立刻变成一串文件名强。
     """
-    want_filename = title_policy() == "filename"
+    # 【按盘决定，不是一刀切】want_filename 挪到循环里按条目所属的盘算，
+    # 见 title_policy_of()。夸克用刮削结果、另一个盘用文件名，这两件事要能并存。
     try:
         libs = _emby("/Library/VirtualFolders", key)
         users = _emby("/Users", key)
@@ -6409,7 +6494,10 @@ def apply_title_policy(d, key):
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
         return 0
-    n, seen, failed = 0, 0, []
+    # 【两个方向要分开数】片名来源现在是按盘设的，一轮里可能既有"改成文件名"
+    # 又有"交回刮削"。原来只有一个 n，末尾拿循环变量 want_filename 去决定怎么报，
+    # 报的是【最后一个条目】的方向 —— 分盘之后那就是错的。
+    n, n_file, n_scrape, seen, failed = 0, 0, 0, 0, []
     for lb in libs:
         pid = lb.get("ItemId")
         if not pid or not is_strm_lib(lb):
@@ -6436,6 +6524,7 @@ def apply_title_policy(d, key):
                 continue
             locked = list(full.get("LockedFields") or [])
             stem = os.path.splitext(os.path.basename(path))[0]
+            want_filename = title_policy_of(drive_of_strm(path)) == "filename"
             if want_filename:
                 if full.get("Name") == stem and "Name" in locked:
                     continue
@@ -6451,20 +6540,23 @@ def apply_title_policy(d, key):
             try:
                 _emby(f"/Items/{iid}", key, method="POST", body=full, timeout=30)
                 n += 1
+                if want_filename:
+                    n_file += 1
+                else:
+                    n_scrape += 1
             except Exception as e:
                 failed.append((str(i.get("Name") or "?")[:20], _short_err(e)))
     if failed:
         warn(f"{len(failed)} 个条目的片名没改成：")
         for nm, why in failed[:5]:
             print(f"  {DIM}·{RST} {nm}  {why}")
-    if n:
-        if want_filename:
-            ok(f"{n} 个条目的片名已改成网盘文件名（并锁定，刮削不再覆盖）")
-            print(f"  {DIM}只锁了标题这一个字段，海报和简介照常跟着刮削更新。{RST}")
-        else:
-            ok(f"{n} 个条目的片名解锁，交回给刮削")
-            print(f"  {DIM}标题会在下一次刮削时被覆盖回去。{RST}")
-    elif seen and not failed:
+    if n_file:
+        ok(f"{n_file} 个条目的片名已改成网盘文件名（并锁定，刮削不再覆盖）")
+        print(f"  {DIM}只锁了标题这一个字段，海报和简介照常跟着刮削更新。{RST}")
+    if n_scrape:
+        ok(f"{n_scrape} 个条目的片名解锁，交回给刮削")
+        print(f"  {DIM}标题会在下一次刮削时被覆盖回去。{RST}")
+    if not n and seen and not failed:
         ok(f"{seen} 个条目的片名已经是想要的样子，没有需要改的")
     elif not seen:
         warn("没找到 strm 条目 —— Emby 媒体库可能还没建或还没扫。")
@@ -8261,80 +8353,6 @@ def sync_library_options(d, key, rules):
     return len(changed)
 
 
-def repair_scrapers(key):
-    """把刮削器名单坏掉的 strm 媒体库修回来。返回修了几个。
-
-    【这是给上一版的 bug 收尾】那一版为了给 AV 库戴 MetaTube，在名单为空时
-    自己造了一条只有 MetaTube 的写进去 —— 空名单在 Emby 那边是"用默认"，
-    写进去就变成"只用我列的这些"，等于把 TheMovieDb 从库里删了。
-    表现是海报、简介、年份全没，而用户只看到"刮不出图"。
-
-    修的对象只有两种明确坏掉的形态，别的一律不碰：
-      · 名单在、但一个刮削器都没有
-      · 名单里只剩 MetaTube（默认那些被挤掉了）
-    用户自己精简过刮削器的库不会落进这两种 —— 他至少会留一个正经的。
-
-    只修指向 strm 的库。用户自己的本地库不归这儿管。
-    """
-    fixed, fixed_ids = [], []
-    try:
-        libs = _emby("/Library/VirtualFolders", key, timeout=20) or []
-    except Exception:
-        return 0
-    for lb in libs:
-        if not any(_under(p, STRM_PATH) for p in (lb.get("Locations") or [])):
-            continue
-        o = lb.get("LibraryOptions") or {}
-        tos = o.get("TypeOptions") or []
-        if not tos:
-            # 空名单归 sync_library_options 管 —— 它照着规则文件把默认值明写进去。
-            # 这儿只管规则文件之外的库，那些是用户自己建的，不擅自往里写名单。
-            continue
-        fs = sorted({f for t in tos for f in (t.get("MetadataFetchers") or [])})
-        if fs and fs != [METATUBE_FETCHER]:
-            continue                    # 有正经刮削器，不是我们要修的那两种
-        ct = (lb.get("CollectionType") or "").lower()
-        good = good_type_options(key, ct)
-        if not good:
-            continue
-        had_mt = METATUBE_FETCHER in fs
-        if had_mt:                      # 原来戴着 MetaTube 的，修完还得戴着，而且排第一
-            _put_metatube_first(good)
-        o["TypeOptions"] = good
-        try:
-            _emby("/Library/VirtualFolders/LibraryOptions", key, method="POST",
-                  body={"Id": lb.get("ItemId"), "LibraryOptions": o}, timeout=30)
-            fixed.append(lb.get("Name") or "?")
-            fixed_ids.append((lb.get("ItemId"), lb.get("Name") or "?"))
-        except Exception:
-            continue
-    if fixed:
-        ok(f"修好 {len(fixed)} 个媒体库的刮削器名单：{'、'.join(fixed)}")
-        print(f"  {DIM}它们原来一个刮削器都没有（或者只剩 MetaTube），"
-              f"所以刮不出海报。已按 Emby 的默认值补回。{RST}")
-        # 【修完必须顺手重刮一次，否则等于没修】刮削器名单是给【下一次刮削】
-        # 用的，已经建好的条目不会因为名单变了就自己重来 —— 用户看到的还是
-        # 一屏没有海报的灰方块，会以为修复根本没生效。
-        #
-        # 但整库重刮对大库是几十 GB 的流量（每张海报几百 KB × 几万个条目），
-        # 那个决定得用户自己下。所以只自动刮小库，大的报出来让他挑时间。
-        for iid, nm in fixed_ids:
-            n_item = _lib_item_count(key, iid)
-            if n_item > REFRESH_AUTO_MAX:
-                warn(f"「{nm}」有 {n_item} 个条目，没有自动重刮 —— "
-                     f"整库重刮要下几万张海报，挑个时间自己来")
-                print(f"  {DIM}Emby → 该库 → ⋯ → 刷新元数据{RST}")
-                continue
-            try:
-                _emby(f"/Items/{iid}/Refresh?Recursive=true"
-                      f"&MetadataRefreshMode=FullRefresh"
-                      f"&ImageRefreshMode=FullRefresh"
-                      f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
-                      key, method="POST", timeout=30)
-                ok(f"「{nm}」已通知重刮（{n_item} 个条目，后台进行）")
-            except Exception as e:
-                warn(f"「{nm}」重刮没通知上：{_short_err(e)}")
-    return len(fixed)
 
 
 def _emby_default_fetchers(key, ctype):
@@ -8806,7 +8824,7 @@ def dir_cache_auto_apply(d):
         print(f"  {DIM}命中缓存的列目录不吃网盘接口，也就不会被限流。"
               f"代价：网盘里新增/改名的文件最多等 {DIR_CACHE_DEFAULT // 60} 小时"
               f"才被看见 —— 改完目录去 OpenList 把存储停用再启用就立刻清掉。{RST}")
-        print(f"  {DIM}想改回去：3 后补参数 → 9。手动设过之后就不再自动调。{RST}")
+        print(f"  {DIM}想改回去：3 后补参数 → 6。手动设过之后就不再自动调。{RST}")
     return n
 
 
@@ -9283,56 +9301,15 @@ def toggle_metatube():
     print(f"  {DIM}插件没出现的话，Emby 可能还没加载完，等一会儿刷新设置页。{RST}")
 
 
-def set_link_method():
-    """切换网盘直链的获取方式：原画直链 ↔ 转码流。
 
-    这个开关在跨境线路上是决定性的：同一个 4K 文件，原画直链只能跑几百 KB/s、
-    每两秒卡一次，换成转码流立刻 5 MB/s 流畅。而两者的差别只是 OpenList 存储里
-    的一个字段。以前只能自己去改 sqlite 或者在网页表单里翻，所以做成按钮。
 
-    先显示当前值再问要不要换，和「添加 API 密钥」那个按钮一个路子 —— 点进来
-    先告诉你现在是什么状态，而不是上来就改。
+def _write_link_method(d, stores, target):
+    """把这些存储的 link_method 写成 target，然后重启 OpenList 和 MediaWarp。
+
+    「挂载路径」那边是一个盘一个盘地设，这段写入逻辑给它和别处共用，
+    要用同一段写入逻辑（备份、还原、重启顺序）。这段每一步都是踩出来的，
+    不能让第二个入口再照抄一遍。
     """
-    d = ms_install_dir()
-    if not is_installed(d):
-        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
-        return
-    stores = link_method_storages(d)
-    if not stores:
-        warn("没有找到支持切换的网盘存储。")
-        print(f"  {DIM}只有夸克 / UC 的 TV 版驱动（QuarkTV、UCTV）有这个选项。{RST}")
-        print(f"  {DIM}还没在 OpenList 里添加网盘的话，先去加一个。{RST}")
-        return
-
-    print()
-    for _sid, mp, drv, cur in stores:
-        name, why = LINK_METHODS.get(cur, (cur or "未知", ""))
-        print(f"  {BOLD}{mp}{RST}  {DIM}({drv}){RST}   当前：{CYAN}{BOLD}{name}{RST} "
-              f"{DIM}[{cur}]{RST}")
-        if why:
-            print(f"      {DIM}{why}{RST}")
-    print()
-    for k, (name, why) in LINK_METHODS.items():
-        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why}")
-    print()
-
-    # 全部存储当前值一致时直接给出"换到另一个"，否则让用户明确选一个
-    curs = {c for _s, _m, _d, c in stores}
-    if len(curs) == 1 and curs.pop() in LINK_METHODS:
-        cur = stores[0][3]
-        target = "streaming" if cur == "download" else "download"
-        if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
-            print("没有改动。")
-            return
-    else:
-        print("  1. 原画直链（download）")
-        print("  2. 转码流（streaming）")
-        c = ask("要切换成哪个？（回车取消）").strip()
-        target = {"1": "download", "2": "streaming"}.get(c, "")
-        if not target:
-            print("没有改动。")
-            return
-
     # OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停，避免锁冲突
     info("停止 OpenList...")
     subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
@@ -9394,14 +9371,6 @@ def set_link_method():
               f"第一次播放会等一会儿换直链。{RST}")
 
 
-def scan_spec_human(spec, paths):
-    """把扫描路径的设置说成人话，auto 要把当前展开的结果一起显示出来 ——
-       只说「自动」看不出实际在扫什么，加了网盘没生效也发现不了。"""
-    if spec == SCAN_AUTO:
-        return (f"自动（跟随 OpenList 已挂载的存储）" +
-                (f"　→ 当前 {len(paths)} 条：{'、'.join(paths)}" if paths
-                 else "　→ 当前还没挂任何网盘"))
-    return "、".join(paths) if paths else "未设置"
 
 
 def _ol_subdirs(path, token=None):
@@ -9422,227 +9391,311 @@ def _ol_subdirs(path, token=None):
                   if x.get("is_dir") and x.get("name"))
 
 
-def _paths_under(paths, mp):
-    """paths 里属于挂载点 mp 的那些。"""
-    root = mp.rstrip("/")
-    return [p for p in paths if p == root or p.startswith(root + "/")]
+def _apply_scan_paths(d, why=""):
+    """把当前设置（各盘的路径 + 剩余自动）落到 AutoFilm 配置上并重启它。
+
+    每次改完立刻应用，不再攒一批最后统一保存 —— 一屏里能改的东西多了之后，
+    "改了但没保存"就成了新的坑：退出去以为设好了，其实一个字没写。
+    """
+    cfg = rebuild_cfg_from_disk(d)
+    paths = cfg["scan_paths"]
+    af = os.path.join(d, "autofilm", "config", "config.yaml")
+    with open(af, "w", encoding="utf-8") as f:
+        f.write(gen_autofilm_conf(cfg))
+    subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
+    ok(f"{why}已应用：现在扫 {len(paths)} 个目录，AutoFilm 已重启")
+    drop_orphan_strm_dirs(d, paths, [])
+    return paths
+
+
+def _drive_paths_menu(d, mp):
+    """一个盘的「路径」子菜单：加 / 换 / 删。"""
+    while True:
+        exp = explicit_scan_paths()
+        mine = _paths_under(exp, mp)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{mp}{RST} 的扫描路径")
+        print("-" * 60)
+        if mine:
+            for i, p in enumerate(mine, 1):
+                tag = f"  {YELLOW}整个盘{RST}" if p.rstrip("/") == mp.rstrip("/") else ""
+                print(f"  {i:>2}. {p}{tag}")
+        else:
+            auto = auto_rest_on()
+            print(f"  {DIM}还没单独设过。{RST}"
+                  + (f"{DIM}「剩余网盘（自动）」开着，所以现在按整个盘扫。{RST}"
+                     if auto else f"{DIM}这个盘现在不进 Emby。{RST}"))
+        print("-" * 60)
+        print(f"  {DIM}a = 添加一条　d = 删一条　0 = 返回{RST}")
+        c = ask("请选择").strip().lower()
+        if c in ("0", "", "q"):
+            return
+        if c == "d":
+            if not mine:
+                print("没有可删的。")
+                continue
+            t = ask("删第几条？（回车取消）").strip()
+            if not (t.isdigit() and 1 <= int(t) <= len(mine)):
+                print("没有改动。")
+                continue
+            gone = mine[int(t) - 1]
+            save_ms_state(scan_spec=[p for p in exp if p != gone])
+            _apply_scan_paths(d, f"删掉 {gone}，")
+            continue
+        if c != "a":
+            print("无效选择。")
+            continue
+
+        # 添加：把这个盘下面的目录列出来点编号，别逼人在手机上手打长路径
+        print(f"\n  {DIM}正在列 {mp} 下面的目录...{RST}")
+        subs = _ol_subdirs(mp)
+        if subs:
+            for j, name in enumerate(subs, 1):
+                print(f"    {j:>2}. {name}")
+            print(f"  {DIM}输编号（多个用逗号隔开）；a = 整个盘；"
+                  f"m = 手打一条更深的路径；回车取消{RST}")
+        else:
+            print(f"  {DIM}列不出子目录（网盘慢或者本来就没有）。{RST}")
+            print(f"  {DIM}a = 整个盘；m = 手打一条；回车取消{RST}")
+        pick = ask("要扫哪个").strip().lower()
+        if not pick:
+            continue
+        got = []
+        if pick == "a":
+            got = [mp.rstrip("/")]
+        elif pick == "m":
+            raw = ask(f"路径（以 {mp} 开头）").strip().rstrip("/")
+            if not raw:
+                continue
+            if not raw.startswith(mp.rstrip("/") + "/") and raw != mp.rstrip("/"):
+                warn(f"这条不在 {mp} 底下，没有加。")
+                continue
+            got = [raw]
+        else:
+            for tok in pick.replace("，", ",").split(","):
+                tok = tok.strip()
+                if tok.isdigit() and subs and 1 <= int(tok) <= len(subs):
+                    got.append(f"{mp.rstrip('/')}/{subs[int(tok) - 1]}")
+        if not got:
+            print("没认出有效的编号，没有改动。")
+            continue
+        bare = [p for p in got if p.strip("/").count("/") == 0]
+        if bare:
+            # 扫整个盘是这套东西里最容易踩、又最像"成功了"的坑
+            warn(f"{'、'.join(bare)} 是{BOLD}整个盘{RST} —— 里面所有东西都会被扫进来")
+            print(f"  {DIM}手机备份、截图、扫描件都会变成条目堆在媒体库里，"
+                  f"刮削搜不到，表现就是「一堆条目全都没有海报」。{RST}")
+            if not ask_yn("仍然要整个盘？", False):
+                continue
+        save_ms_state(scan_spec=exp + [p for p in got if p not in exp])
+        _apply_scan_paths(d, f"加了 {'、'.join(got)}，")
+
+
+def _drive_link_method_menu(d, mp):
+    """一个盘的直链方式。不支持这个开关的盘直接说清楚，不给个死按钮。"""
+    stores = [x for x in link_method_storages(d) if x[1] == mp]
+    if not stores:
+        print()
+        warn(f"{mp} 没有「直链方式」这个开关。")
+        print(f"  {DIM}只有夸克 / UC 的 TV 版驱动（QuarkTV、UCTV）有 —— "
+              f"这是驱动自己的字段，不是脚本能加的。{RST}")
+        print(f"  {DIM}阿里、115 这些盘播放慢是限速，换不了接口，"
+              f"看 tools/ali-403.sh 量一下就知道。{RST}")
+        return
+    cur = stores[0][3]
+    print()
+    for k, (name, why) in LINK_METHODS.items():
+        star = f"{GREEN}←现在{RST}" if k == cur else ""
+        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why} {star}")
+    target = "streaming" if cur == "download" else "download"
+    print()
+    if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
+        print("没有改动。")
+        return
+    _write_link_method(d, stores, target)
+
+
+def _drive_title_menu(d, mp):
+    """一个盘的片名来源。多一个「跟默认走」的选项 —— 不然就没法退回默认。"""
+    by = ms_state().get("title_by_drive") or {}
+    own = by.get(mp)
+    dflt = title_policy()
+    names = {"scrape": "刮削结果", "filename": "网盘文件名"}
+    print()
+    print(f"  {mp} 当前："
+          + (f"{CYAN}{BOLD}{names.get(own, own)}{RST}{DIM}（单独设的）{RST}" if own
+             else f"{DIM}跟默认走 → {names.get(dflt, dflt)}{RST}"))
+    print(f"  {DIM}文件名带「[第154集•4K]」这类标记的盘用文件名更准；"
+          f"规规矩矩「片名 (年份).mkv」的盘用刮削结果。{RST}")
+    print(f"  1. 刮削结果")
+    print(f"  2. 网盘文件名{DIM}（并锁定标题，海报简介照常跟刮削更新）{RST}")
+    print(f"  3. 跟默认走{DIM}（默认现在是{names.get(dflt, dflt)}）{RST}")
+    print(f"  0. 返回")
+    c = ask("请选择").strip()
+    if c in ("0", "", "q"):
+        return
+    val = {"1": "scrape", "2": "filename", "3": None}.get(c, "x")
+    if val == "x":
+        print("无效选择。")
+        return
+    set_title_policy_of(mp, val)
+    ok(f"{mp} 的片名来源："
+       + (f"跟默认走（{names.get(dflt, dflt)}）" if val is None else names[val]))
+    key = read_emby_api_key(d)
+    if key:
+        apply_title_policy(d, key)
+    else:
+        print(f"  {DIM}没有 Emby API Key，改不到已有条目上 —— "
+              f"先去「3 后补参数 → 1」填上。{RST}")
+
+
+def _drive_menu(d, mp, drv):
+    """单个网盘的设置。每个盘一屏，各管各的。"""
+    while True:
+        exp = explicit_scan_paths()
+        mine = _paths_under(exp, mp)
+        auto = auto_rest_on()
+        if mine:
+            where = ("整个盘" if any(p.rstrip("/") == mp.rstrip("/") for p in mine)
+                     else "、".join(mine))
+            st = f"{GREEN}扫{RST}  {DIM}{where}{RST}"
+        elif auto:
+            st = f"{GREEN}扫{RST}  {DIM}整个盘（跟着「剩余网盘」走）{RST}"
+        else:
+            st = f"{DIM}不扫{RST}"
+        lm = [x for x in link_method_storages(d) if x[1] == mp]
+        lm_s = (f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}" if lm
+                else f"{DIM}这个盘没有{RST}")
+        by = ms_state().get("title_by_drive") or {}
+        names = {"scrape": "刮削结果", "filename": "网盘文件名"}
+        tp_s = (f"{CYAN}{names.get(by[mp], by[mp])}{RST}" if mp in by
+                else f"{DIM}跟默认（{names.get(title_policy())}）{RST}")
+        print("\n" + "=" * 60)
+        print(f"  {BOLD}{mp}{RST}   {DIM}{drv}{RST}   {st}")
+        print("=" * 60)
+        print(f"  1. 路径{DIM}（加 / 删，决定这个盘扫哪些目录）{RST}")
+        print(f"  2. 直链方式          当前：{lm_s}")
+        print(f"  3. 片名用哪个        当前：{tp_s}")
+        n = 3
+        if "115" in str(drv):
+            n = 4
+            print(f"  4. 网盘扫码登录{DIM}（重新拿二维码令牌）{RST}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "1":
+            _drive_paths_menu(d, mp)
+        elif c == "2":
+            _drive_link_method_menu(d, mp)
+        elif c == "3":
+            _drive_title_menu(d, mp)
+        elif c == "4" and n == 4:
+            qr115_login()
+        else:
+            print("无效选择。")
+
+
+def _rest_menu(d):
+    """「剩余网盘（自动）」：没被单独设过的盘归它管。"""
+    while True:
+        exp = explicit_scan_paths()
+        rest = [mp for mp, _drv, _st, _r, _m in openlist_storages(d)
+                if mp and mp != "/" and not _paths_under(exp, mp)]
+        on = auto_rest_on()
+        print("\n" + "=" * 60)
+        print(f"  {BOLD}剩余网盘（自动）{RST}   当前："
+              + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}"))
+        print("=" * 60)
+        # 【说清楚"剩余"是哪些】不然这个开关就是个黑箱：开了到底多扫了什么，
+        # 只能去 autofilm 配置里翻。它还会随着别处的设置变，更得当场列出来。
+        print(f"  {DIM}管的是【没有单独设过路径】的盘。单独设过的不受影响 ——"
+              f"这个开关永远排在它们后面。{RST}")
+        if rest:
+            print(f"  现在归它管：{CYAN}{'、'.join(rest)}{RST}"
+                  + (f"  {DIM}（开着，按整个盘扫）{RST}" if on
+                     else f"  {DIM}（关着，这些盘都不进 Emby）{RST}"))
+        else:
+            print(f"  {DIM}现在没有「剩余」的盘 —— 每个盘都单独设过了。{RST}")
+        print("-" * 60)
+        print(f"  1. {'关掉' if on else '打开'}自动{DIM}（新挂的网盘会不会自动进 Emby）{RST}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c != "1":
+            print("无效选择。")
+            continue
+        if not on and rest:
+            warn(f"打开之后这些盘会按{BOLD}整个盘{RST}扫进来：{'、'.join(rest)}")
+            print(f"  {DIM}整个盘意味着手机备份、截图也会变成条目。"
+                  f"想只扫影视目录，就回上一层给那个盘单独设路径。{RST}")
+            if not ask_yn("确定打开？", False):
+                continue
+        save_ms_state(auto_rest=(not on))
+        _apply_scan_paths(d, "自动" + ("打开" if not on else "关掉") + "，")
 
 
 def mount_paths_menu():
-    """挂载路径：每个网盘一个开关，决定它进不进 Emby。
+    """挂载路径：一个盘一屏，各管各的。
 
-    【为什么把它从「后补参数」里拿出来单开一屏】原来是一个输入框，要把所有要扫的
-    路径用逗号连成一串手打进去 —— 加一个盘得把已有的全部重打一遍，在手机 ssh 上
-    根本没法编辑。用户的原话："在ssh里不好编辑"。
-    而这件事的真实形态是【每个盘一个开关】：哪个盘要进 Emby、扫它下面哪个目录。
-    所以改成一屏列表，输编号开关一个盘，要扫哪个目录也是从列出来的目录里点编号。
-    手打路径仍然留着（m），只是不再是唯一的路。
+    【为什么不是一个输入框】原来扫描路径埋在「后补参数」里，要把所有路径用逗号
+    连成一串手打进去 —— 加一个盘得把已有的全部重打一遍，在手机 ssh 上根本没法
+    编辑（用户原话："在ssh里不好编辑"）。
+    【为什么不是一排开关，而是一个盘一个子菜单】开关只够表达"扫不扫"，可是每个
+    盘要管的其实有四件事：扫哪些目录、直链方式、片名用哪个、115 还要扫码登录。
+    这些本来散在「后补参数」里，是【全局】的 —— 而它们全都是【一个盘一个样】的
+    东西：夸克该用刮削结果、另一个盘该用文件名；直链方式更是只有夸克/UC 才有。
+    按盘分屏之后，每个设置都落在它真正属于的地方。
     """
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
-    cfg = rebuild_cfg_from_disk(d)
-    paths = list(cfg["scan_paths"])
-    auto = cfg["scan_spec"] == SCAN_AUTO
-    dirty = False
-
     while True:
         stores = [(mp, drv, st) for mp, drv, st, _r, _m in openlist_storages(d)
                   if mp and mp != "/"]
+        exp = explicit_scan_paths()
+        auto = auto_rest_on()
         print("\n" + "=" * 60)
-        print(f"  {BOLD}挂载路径{RST}{DIM}（哪些网盘要进 Emby，扫它下面哪个目录）{RST}")
+        print(f"  {BOLD}挂载路径{RST}{DIM}（哪些网盘要进 Emby，各自扫哪些目录）{RST}")
         print("=" * 60)
         if not stores:
             print(f"  {YELLOW}OpenList 里还没挂任何网盘。{RST}")
             print(f"  {DIM}先去 OpenList 网页里挂上，再回来这里选。{RST}")
             ask("\n按回车返回...")
             return
-        if auto:
-            print(f"  {DIM}当前是「自动跟随已挂载的存储」—— 下面每个盘都是开的。"
-                  f"动任何一个开关就会转成手选。{RST}")
         for i, (mp, drv, st) in enumerate(stores, 1):
-            mine = _paths_under(paths, mp)
-            on = bool(mine)
-            mark = f"{GREEN}✔ 扫{RST}" if on else f"{DIM}✖ 不扫{RST}"
-            bad = "" if st == "work" else f"  {YELLOW}存储没挂上{RST}"
-            # 扫的是整个盘还是某个子目录，直接写出来 —— 扫根目录是这套东西里
-            # 最容易踩的坑（手机备份、截图全进媒体库），得让它一眼可见
-            where = ""
-            if on:
-                if any(p.rstrip("/") == mp.rstrip("/") for p in mine):
-                    where = f"  {YELLOW}整个盘{RST}"
-                else:
-                    where = f"  {DIM}{'、'.join(mine)}{RST}"
-            print(f"  {i:>2}. {pad(mp, 18)} {DIM}{pad(drv, 16)}{RST} {mark}{where}{bad}")
+            mine = _paths_under(exp, mp)
+            if mine:
+                where = ("整个盘" if any(p.rstrip("/") == mp.rstrip("/") for p in mine)
+                         else "、".join(mine))
+                mark = f"{GREEN}✔ 扫{RST}  {DIM}{where}{RST}"
+            elif auto:
+                mark = f"{GREEN}✔ 扫{RST}  {DIM}整个盘（自动）{RST}"
+            else:
+                mark = f"{DIM}✖ 不扫{RST}"
+            bad = f"  {YELLOW}存储没挂上{RST}" if st != "work" else ""
+            print(f"  {i:>2}. {pad(mp, 16)} {DIM}{pad(drv, 16)}{RST} {mark}{bad}")
+        print(f"  {len(stores) + 1:>2}. {pad('剩余网盘（自动）', 16)} "
+              f"{DIM}{pad('', 16)}{RST} "
+              + (f"{GREEN}开{RST}" if auto else f"{DIM}关{RST}")
+              + f"  {DIM}没单独设过的盘归它管{RST}")
         print("-" * 60)
-        print(f"  {DIM}输编号 = 开/关一个盘　m = 手打路径　"
-              f"0 = 保存并应用　q = 不保存退出{RST}")
-        c = ask("请选择").strip().lower()
-
-        if c in ("q", ""):
-            if dirty and not ask_yn("改动还没保存，真的退出吗？", False):
-                continue
-            print("没有改动。" if not dirty else "已放弃改动。")
+        print(f"  {DIM}输编号进那个盘的设置　0 = 返回{RST}")
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
             return
-        if c == "0":
-            break
-        if c == "m":
-            set_scan_paths()          # 老的手打入口原样保留
-            cfg = rebuild_cfg_from_disk(d)
-            paths, auto, dirty = list(cfg["scan_paths"]), \
-                cfg["scan_spec"] == SCAN_AUTO, False
-            continue
-        if not c.isdigit() or not 1 <= int(c) <= len(stores):
+        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 1:
             print("无效选择。")
             continue
-
-        mp = stores[int(c) - 1][0]
-        mine = _paths_under(paths, mp)
-        if mine:
-            paths = [p for p in paths if p not in mine]
-            auto, dirty = False, True
-            print(f"  {DIM}已关掉 {mp}{RST}")
-            continue
-
-        # 打开一个盘：先把它下面的目录列出来让人点，别逼人手打
-        print(f"\n  {DIM}正在列 {mp} 下面的目录...{RST}")
-        subs = _ol_subdirs(mp)
-        if not subs:
-            print(f"  {DIM}列不出子目录（网盘慢或者本来就没有），按整个盘算。{RST}")
-            paths.append(mp)
-            auto, dirty = False, True
-            continue
-        print(f"  {BOLD}{mp}{RST} 下面有这些目录：")
-        for j, name in enumerate(subs, 1):
-            print(f"    {j:>2}. {name}")
-        print(f"  {DIM}输编号（多个用逗号隔开）选要扫的目录；"
-              f"a = 整个盘；回车 = 取消{RST}")
-        print(f"  {YELLOW}选到影视目录那一层{RST}"
-              f"{DIM} —— 整个盘会把手机备份、截图也扫进媒体库{RST}")
-        pick = ask("要扫哪个").strip().lower()
-        if not pick:
-            continue
-        if pick == "a":
-            paths.append(mp)
-            auto, dirty = False, True
-            continue
-        got = []
-        for tok in pick.replace("，", ",").split(","):
-            tok = tok.strip()
-            if tok.isdigit() and 1 <= int(tok) <= len(subs):
-                got.append(f"{mp.rstrip('/')}/{subs[int(tok) - 1]}")
-        if not got:
-            print("没认出有效的编号，没有改动。")
-            continue
-        paths.extend(p for p in got if p not in paths)
-        auto, dirty = False, True
-        print(f"  {DIM}已加：{'、'.join(got)}{RST}")
-
-    if not dirty:
-        print("没有改动。")
-        return
-    if not paths:
-        warn("一个盘都没开 —— 那样 Emby 里会是空的。")
-        if not ask_yn("确定要这样？", False):
-            return
-    print()
-    print(f"  将扫描：{BOLD}{'、'.join(paths) or '（空）'}{RST}")
-    # 【扫网盘根目录要在存之前再说一次】选的时候提示过一遍，但那是好几步之前的事，
-    # 而这一步是最后一道门。手机备份、截图、扫描件全变成 strm 堆进媒体库，
-    # 而且图片会真的下载到本机占硬盘 —— 实测扫 /quark 生成 61 个 strm，
-    # 只有 3 个跟影视沾边。看着还"成功了"，所以必须在按下确认前把话说完。
-    bare = [p for p in paths if p.strip("/").count("/") == 0]
-    if bare:
-        warn(f"{'、'.join(bare)} 是{BOLD}整个盘{RST} —— 里面所有东西都会被扫进来")
-        print(f"  {DIM}手机备份、截图、扫描件都会变成条目堆在媒体库里，"
-              f"刮削当然搜不到，表现就是「一堆条目全都没有海报」。{RST}")
-        print(f"  {DIM}而且图片会{RST}真的下载到本机{DIM}占硬盘，不只是影视封面。{RST}")
-        print(f"  {DIM}建议回去选到影视目录那一层。{RST}")
-    if not ask_yn("保存并应用？", not bare):
-        print("没有改动。")
-        return
-    cfg["scan_spec"], cfg["scan_paths"] = list(paths), list(paths)
-    af = os.path.join(d, "autofilm", "config", "config.yaml")
-    with open(af, "w", encoding="utf-8") as f:
-        f.write(gen_autofilm_conf(cfg))
-    save_ms_state(scan_spec=list(paths))
-    subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
-    ok(f"已保存 {len(paths)} 条扫描路径，AutoFilm 已重启")
-    drop_orphan_strm_dirs(d, paths, [])
-    print(f"  {DIM}接着点「5 生成媒体库」把 strm 生成出来。{RST}")
-
-
-def set_scan_paths():
-    """改 AutoFilm 要扫哪些路径，改完立刻重新生成配置并重启。
-
-    做成按钮而不是「重跑安装」：加一个网盘就要把整轮安装问答再走一遍太重，
-    而且重跑安装还会顺带碰 nginx、证书、密码这些完全无关的东西。
-    """
-    d = ms_install_dir()
-    if not is_installed(d):
-        warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
-        return
-    cfg = rebuild_cfg_from_disk(d)
-    print()
-    print(f"  当前：{CYAN}{BOLD}{scan_spec_human(cfg['scan_spec'], cfg['scan_paths'])}{RST}")
-
-    mounted = [mp for mp, _drv, _st, _root, _m in openlist_storages(d)
-           if mp and mp != "/"]
-    if mounted:
-        print(f"  {DIM}OpenList 里已挂载：{'、'.join(mounted)}{RST}")
-    else:
-        print(f"  {DIM}OpenList 里还没挂任何网盘。{RST}")
-    print()
-    print(f"  {DIM}填一条（/quark/电影）、多条逗号隔开（/quark/电影,/quark/剧集）、"
-          f"或 {RST}{BOLD}y{RST}{DIM} 自动跟随已挂载的存储。回车不改。{RST}")
-    print(f"  {YELLOW}填到影视目录那一层，别填网盘根目录{RST}{DIM} —— 原因见确认前的提示。{RST}")
-    spec = parse_scan_spec(ask("扫描路径", ""))
-    if not spec:
-        print("没有改动。")
-        return
-
-    paths = resolve_scan_paths(d, spec)
-    if not paths:
-        warn("展开后一条路径都没有（OpenList 里还没挂网盘？），没有改动。")
-        return
-    print(f"  将扫描：{BOLD}{'、'.join(paths)}{RST}")
-    # 提前把「填了但没挂上」挑出来:AutoFilm 扫不存在的目录只会在日志里留一行 WARN,
-    # 用户看到的是"点了生成但什么都没多",很难联想到是路径打错了
-    unknown = [p for p in paths
-               if not any(p == mp or p.startswith(mp.rstrip("/") + "/")
-                          for mp in mounted)] if mounted else []
-    if unknown:
-        warn(f"这些路径不在已挂载的存储里：{'、'.join(unknown)}")
-        print(f"  {DIM}拼错了或者还没在 OpenList 里挂上，扫的时候会被跳过。{RST}")
-
-    # 扫网盘根目录是个大坑,而且是「看起来成功了」的那种坑:
-    #   1. 整个盘都会被镜像成 strm —— 手机备份、微信截图、扫描件、壁纸全堆进媒体库,
-    #      Emby 把每个目录当成一部电影去 TMDb 搜,搜不到,于是"有条目没海报"
-    #   2. download.image 会把网盘里【所有】图片真的下载到 VPS 本地(不只是影视封面),
-    #      小盘 VPS 会被自己的相册备份撑爆
-    # 实测扫 /quark 生成 61 个 strm,其中只有 3 个跟影视沾边。
-    bare = [p for p in paths if p.strip("/").count("/") == 0]
-    if bare:
-        warn(f"{'、'.join(bare)} 是网盘根目录 —— 整个盘都会被扫进来")
-        print(f"  {DIM}手机备份、截图、扫描件都会变成 strm 堆在媒体库里，Emby 拿这些去")
-        print(f"  刮削当然搜不到，表现就是「有一堆条目、全都没有海报」。{RST}")
-        print(f"  {DIM}而且图片会{RST}真的下载到 VPS 本地{DIM}占硬盘，不只是影视封面。{RST}")
-        print(f"  {DIM}建议填到影视目录那一层，比如 {RST}{BOLD}{bare[0]}/电影{RST}")
-
-    if not ask_yn("确认改成上面这些？", True):
-        print("没有改动。")
-        return
-
-    cfg["scan_spec"], cfg["scan_paths"] = spec, paths
-    af = os.path.join(d, "autofilm", "config", "config.yaml")
-    with open(af, "w", encoding="utf-8") as f:
-        f.write(gen_autofilm_conf(cfg))
-    save_ms_state(scan_spec=spec)
-    subprocess.run(["docker", "restart", "autofilm"], capture_output=True)
-    ok(f"已改成 {len(paths)} 条扫描路径，AutoFilm 已重启")
-    drop_orphan_strm_dirs(d, paths, unknown)
-    print(f"  {DIM}回菜单点「5 生成媒体库」立刻扫一次，或等每天定时任务。{RST}")
+        if int(c) == len(stores) + 1:
+            _rest_menu(d)
+        else:
+            mp, drv, _st = stores[int(c) - 1]
+            _drive_menu(d, mp, drv)
 
 
 def drop_orphan_strm_dirs(d, paths, unknown=()):
@@ -9737,74 +9790,6 @@ def drop_orphan_strm_dirs(d, paths, unknown=()):
           f"不想要就去 Emby 的「媒体库」里把它删掉。{RST}")
 
 
-def set_title_policy():
-    """选片名用网盘文件名还是刮削结果。"""
-    cur = title_policy()
-    print("\n" + "-" * 60)
-    print(f"  {BOLD}片名用哪个{RST}")
-    print("-" * 60)
-    print(f"  当前：{CYAN}{'网盘文件名' if cur == 'filename' else '刮削结果'}{RST}\n")
-    print(f"  {BOLD}1) 刮削结果{RST}{DIM}（Emby 默认）{RST}")
-    print(f"     {DIM}文件名规整（流浪地球 (2019).mkv）时最好看，能拿到正式译名。{RST}")
-    print(f"     {DIM}但文件名带 [第154集•4K] 这类标记时 Emby 解析不出片名，"
-          f"去 TMDb 就是乱撞。{RST}")
-    print(f"  {BOLD}2) 网盘文件名{RST}")
-    print(f"     {DIM}片名 = 你在网盘里看到的文件名，不会认错。{RST}")
-    print(f"     {DIM}只锁标题这一个字段 —— {RST}{BOLD}海报和简介照常跟着刮削走{RST}"
-          f"{DIM}，不受影响。{RST}")
-    print("-" * 60)
-    c = ask("选 1 或 2（回车不改）").strip()
-    want = {"1": "scrape", "2": "filename"}.get(c)
-    if not want:
-        print("没有改动。")
-        return
-    # 【选了同一个也要套用一遍】设置存在本地，条目改在 Emby 上，两边可能不一致 ——
-    # 上一版套用失败时就是这样：设置显示"网盘文件名"，Emby 里一个没改。这时候用户
-    # 再选一次同样的值，本意是"再来一次"，而旧代码答"没有改动"然后什么都不做，
-    # 把唯一的重试入口堵死了。
-    if want != cur:
-        save_ms_state(title_policy=want)
-        ok(f"已改成：{'网盘文件名' if want == 'filename' else '刮削结果'}")
-    else:
-        print(f"  {DIM}选的还是当前这个，按它重新套用一遍。{RST}")
-    d = ms_install_dir()
-    key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
-                            "auth") if is_installed(d) else "")
-    if not key:
-        print(f"  {DIM}没有 Emby API Key，下次点「5 生成媒体库」时生效。{RST}")
-        return
-    n = apply_title_policy(d, key)
-    # 【解锁不等于会变回去】切到"刮削结果"只是把 Name 从锁定列表里拿掉，
-    # 标题本身还是那串文件名。而 Emby 平时的刷新是"只补缺失字段"——
-    # 一个已经有标题的条目什么都不缺，它根本不会重新去取，于是用户看到的是
-    # "改了设置，屏幕上一点变化都没有"。和换刮削器那次是同一个坑（#339）。
-    # 所以这一步必须主动要一次【完整重新识别】。
-    # 【不能只在"这次解锁了几个"时才刷】用户很可能上一次就已经切过来了，
-    # 解锁生效、标题却没回来（就是下面说的那个坑），这时他会再选一次"刮削结果"
-    # 想重试 —— 而那一轮 n=0。把重试入口堵死，和上面那段注释说的是同一个错。
-    if want == "scrape":
-        info("让 Emby 重新取一遍标题（解锁只是允许覆盖，不会自己覆盖）...")
-        try:
-            for _lb in (_emby("/Library/VirtualFolders", key, timeout=20) or []):
-                if not is_strm_lib(_lb):
-                    continue
-                # 大库不自动重刮 —— 完整重新识别要把每个条目都去网上问一遍，
-                # 和换刮削器那边同一个阈值、同一个理由
-                _cnt = _lib_item_count(key, _lb.get("ItemId"))
-                if _cnt > REFRESH_AUTO_MAX:
-                    warn(f"「{_lb.get('Name')}」有 {_cnt} 个条目，没有自动重新识别 —— "
-                         f"在 Emby 里对该库点「刷新元数据 → 替换所有元数据」")
-                    continue
-                _emby(f"/Items/{_lb.get('ItemId')}/Refresh?Recursive=true"
-                      f"&MetadataRefreshMode=FullRefresh"
-                      f"&ImageRefreshMode=FullRefresh"
-                      f"&ReplaceAllMetadata=true&ReplaceAllImages=false",
-                      key, method="POST", timeout=60)
-            ok("已让 Emby 重新识别，标题会在这一轮刮完之后变过来")
-            print(f"  {DIM}片子多的话要跑一会儿；期间标题还是旧的，属于正常。{RST}")
-        except Exception as e:
-            warn(f"重新识别没起来：{_emby_err(e)}")
-            print(f"  {DIM}可以在 Emby 里对该库点「刷新元数据 → 替换所有元数据」。{RST}")
 
 
 def params_menu():
@@ -9820,36 +9805,25 @@ def params_menu():
         sec = os.path.join(d, ".secrets")
         has_ba = bool(read_env(sec, "BA_PASS", fallback=os.path.join(d, ".env")))
         ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
-        # 直链方式在跨境线路上是决定成败的开关，当前值直接摆在菜单上
-        lms = link_method_storages(d) if is_installed(d) else []
-        if lms:
-            vals = {c for _s, _m, _d, c in lms}
-            lm_state = (f"{CYAN}{LINK_METHODS.get(lms[0][3], (lms[0][3],))[0]}{RST}"
-                        if len(vals) == 1 else f"{YELLOW}各存储不一致{RST}")
-        else:
-            lm_state = f"{DIM}未挂网盘{RST}"
         print(f"  1. 添加 API 密钥（Emby API Key）   当前：{state}")
         print(f"  2. 修改用户名 / 密码（浏览器弹框那层）  当前：{ba_state}")
-        print(f"  3. 直链方式：原画 / 转码流（卡就换这个）  当前：{lm_state}")
-        # 扫描路径搬去主菜单的「4 挂载路径」了 —— 那件事的形态是每个盘一个开关，
-        # 不是一个要手打整串路径的输入框。这里不留空位、直接往上顶。
+        # 【直链方式 / 片名用哪个 / 115 扫码登录 都搬去「4 挂载路径」了】
+        # 它们全是【一个盘一个样】的东西：直链方式只有夸克/UC 的驱动才有，
+        # 片名该跟文件名还是跟刮削也是每个盘各不相同 —— 放在这里当全局开关，
+        # 本身就是把它们摆错了地方。扫描路径同理。
         mt_state = ((f"{GREEN}已安装{RST}" if metatube_on(d) else f"{DIM}未安装{RST}")
                     if is_installed(d) else f"{DIM}未安装{RST}")
-        print(f"  4. MetaTube 刮削插件（番号识别）  当前：{mt_state}")
-        print(f"  5. 115 网盘扫码登录{DIM}（拿「二维码令牌」，挂 115 用）{RST}")
-        tp = (f"{CYAN}网盘文件名{RST}" if title_policy() == "filename"
-              else f"{DIM}刮削结果{RST}")
-        print(f"  6. 片名用哪个            当前：{tp}")
+        print(f"  3. MetaTube 刮削插件（番号识别）  当前：{mt_state}")
         # 【这里只报"用哪份"，一个字都不多】规则文件路径、几条、哪几个库名 ——
         # 这些进到菜单里会随库数一起长，7 条就要折两行，几十条整屏都是它。
-        # 点进第 7 项那一屏本来就全列着，重复一遍只是把菜单撑丑。
+        # 点进第 4 项那一屏本来就全列着，重复一遍只是把菜单撑丑。
         _rsrc = (f"{CYAN}自定义{RST}" if rules_source() == "custom"
                  else f"{DIM}作者的{RST}") if is_installed(d) else ""
-        print(f"  7. 按关键词自动建媒体库（规则用哪份链接）  当前：{_rsrc}")
+        print(f"  4. 按关键词自动建媒体库（规则用哪份链接）  当前：{_rsrc}")
         if metatube_on(d):
             mtl = [n for n, _i, on, _o in metatube_libraries(
                 read_emby_api_key(d) or "") if on]
-            print(f"  8. MetaTube 在哪些库生效  当前："
+            print(f"  5. MetaTube 在哪些库生效  当前："
                   + (f"{CYAN}{'、'.join(mtl)}{RST}" if mtl else f"{DIM}都不启用{RST}"))
         # 目录缓存直接决定「列目录」快不快 —— 命中缓存 0.3 秒，走真实接口十几秒
         # 还会被限流。当前值摆在菜单上，和直链方式一个道理。
@@ -9861,12 +9835,12 @@ def params_menu():
         else:
             dc_state = f"{DIM}未挂网盘{RST}"
         _dcm = "" if ms_state().get("dir_cache_manual") else f"{DIM}　脚本自动维护{RST}"
-        print(f"  9. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
+        print(f"  6. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
               f"当前：{dc_state}{_dcm}")
         _ef = ep_fix_setting()
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
-        print(f" 10. 给剧集补季集编号{DIM}（旁挂 .nfo，不改文件名、不动网盘）"
+        print(f"  7. 给剧集补季集编号{DIM}（旁挂 .nfo，不改文件名、不动网盘）"
               f"{RST}  当前：{ef_state}")
         print("  0. 返回")
         print("-" * 60)
@@ -9878,16 +9852,10 @@ def params_menu():
         elif c == "2":
             set_web_credentials()
         elif c == "3":
-            set_link_method()
-        elif c == "4":
             toggle_metatube()
-        elif c == "5":
-            qr115_login()
-        elif c == "6":
-            set_title_policy()
-        elif c == "7":
+        elif c == "4":
             auto_libraries()
-        elif c == "8":
+        elif c == "5":
             d0 = ms_install_dir()
             k0 = (read_yaml_scalar(os.path.join(d0, "mediawarp", "config",
                                                 "config.yaml"), "auth")
@@ -9898,9 +9866,9 @@ def params_menu():
                 warn("没有 Emby API Key，先填「1」。")
             else:
                 choose_metatube_libraries(k0)
-        elif c == "9":
+        elif c == "6":
             set_dir_cache()
-        elif c == "10":
+        elif c == "7":
             set_episode_fix()
         else:
             print("无效选择。")
@@ -10952,7 +10920,7 @@ def do_healthcheck():
                 todo.append((
                     "列目录老超时，而目录缓存偏短 —— 大部分列目录都在走真实的"
                     "网盘接口，而网盘恰恰对这个接口限流",
-                    f"「3 后补参数 → 9 目录缓存时长」调到 {DIR_CACHE_DEFAULT}"
+                    f"「3 后补参数 → 6 目录缓存时长」调到 {DIR_CACHE_DEFAULT}"
                     f"（{DIR_CACHE_DEFAULT // 60} 小时）。命中缓存的列目录不吃"
                     "网盘接口。代价是网盘里新增/改名的文件最多等这么久才被看见"
                     " —— 改完目录去 OpenList 把存储停用再启用就立刻清掉"))
@@ -11140,7 +11108,7 @@ def do_healthcheck():
     if lms:
         cur = lms[0][3]
         _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
-                             f"{DIM}（卡顿就去 3 后补参数 → 3 切换）{RST}")
+                             f"{DIM}（卡顿就去 4 挂载路径 → 选那个盘 → 2 切换）{RST}")
     if key:
         _hc("Emby API Key", "ok", "已填")
     else:
