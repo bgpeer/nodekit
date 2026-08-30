@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.14"
+SCRIPT_VERSION = "1.5.15"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4745,9 +4745,22 @@ def show_info():
     # 不写在这儿的话每次挂新盘都要重新去搜一遍。
     print(f"\n  {BOLD}▸ 挂网盘要的令牌去哪取{RST}"
           f"{DIM}（OpenList 表单里没有这个链接）{RST}")
-    print(f"      {CYAN}{BOLD}https://api.oplist.org/{RST}")
-    print(f"      {DIM}阿里云盘（Oauth2）：选「阿里云盘扫码登录」，"
-          f"不是页面上那个「应用登录」{RST}")
+    print(f"      {CYAN}{BOLD}https://api.oplist.org/{RST}"
+          f"{DIM}   打不开就换 https://api.oplist.org.cn/（同一个工具的国内站）{RST}")
+    print(f"      {DIM}页面顶上那个下拉框选哪一项，要和 OpenList 里的"
+          f"「阿里盘账户类型」{RST}对上{DIM}：{RST}")
+    print(f"        {DIM}alipan_type = {RST}default{DIM}   → 选"
+          f"{RST}阿里云盘 (OAuth2) 扫码登录")
+    print(f"        {DIM}alipan_type = {RST}alipanTV{DIM}  → 选"
+          f"{RST}阿里云盘 (Client) TV版扫码")
+    # 【为什么要把这条配对关系写在取令牌这里】OpenList 拿 alipan_type 决定向官方
+    # API 报哪个驱动标识（default→alicloud_qr，alipanTV→alicloud_tv），拿一种流程
+    # 取的令牌去另一种那边换，只会得到一句 empty token returned from official API。
+    # 类型那个下拉框就在表单里，令牌却要去另一个网站取 —— 两件事离得远，
+    # 改了一个忘了另一个是这套东西最容易踩的坑，所以在取令牌的当口就说清楚。
+    print(f"      {YELLOW}两边不配对就挂不上{RST}"
+          f"{DIM}，报 empty token returned from official API。"
+          f"换类型 = 连令牌一起换{RST}")
     print(f"      {DIM}授权时把「备份盘」的勾去掉 —— 那里面是手机相册，"
           f"挂进来会变成一堆刮不出海报的条目{RST}")
     print(f"      {DIM}只要{RST}刷新令牌{DIM}，访问令牌不用填"
@@ -10456,8 +10469,8 @@ def do_healthcheck():
                     f"刷新令牌不配对 —— 令牌是按另一种流程取的",
                     "两条路二选一：① 把「阿里盘账户类型」改回 default，"
                     "原来的令牌立刻就能用（速度还是被限）；"
-                    "② 保持 alipanTV，去 https://api.oplist.org/ 用"
-                    "【阿里云盘TV】那个入口重新扫码取一个新令牌，"
+                    "② 保持 alipanTV，去 https://api.oplist.org/ 选下拉框里的"
+                    "【阿里云盘 (Client) TV版扫码】重新扫码取一个新令牌，"
                     "把类型和令牌【一起】换掉"))
         elif bad_root and (not root or "/" in root):
             _hc(f"存储 {mp}", "bad", f"{drv}  work  {RED}根文件夹ID={root or '空'}{RST}")
