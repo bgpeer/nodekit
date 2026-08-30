@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.11"
+SCRIPT_VERSION = "1.5.12"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -547,7 +547,7 @@ def resolve_scan_paths(d, spec):
     新网盘，不用回来改这里的设置，重新生成一次就自动带上。
     """
     if spec == SCAN_AUTO:
-        paths = [mp for mp, _drv, _st, _root in openlist_storages(d)
+        paths = [mp for mp, _drv, _st, _root, _m in openlist_storages(d)
                  if mp and mp != "/"]
     else:
         paths = list(spec or [])
@@ -4574,7 +4574,8 @@ def cron_human(cron):
 def openlist_storages(d):
     """读 OpenList 的库，把挂好的网盘和几个关键参数列出来。
 
-    只取挂载点、驱动、状态、根文件夹ID —— refresh_token / cookie 这些一概不碰，
+    取挂载点、驱动、状态、根文件夹ID，外加"走哪套接口"那个开关
+    （阿里的 alipan_type / 夸克的 link_method）—— refresh_token / cookie 一概不碰，
     「使用信息」这段输出是会被截图发出来的。库不在、表名对不上就静默返回空，
     这只是锦上添花，不该让整个使用信息因为它报错。
     """
@@ -4592,10 +4593,14 @@ def openlist_storages(d):
     out = []
     for mp, drv, status, add in rows:
         try:
-            root = str(json.loads(add).get("root_folder_id", ""))
+            a = json.loads(add)
+            root = str(a.get("root_folder_id", ""))
+            # 【只取这一个开关，不碰任何凭据】refresh_token / cookie 一概不读 ——
+            # 这些值会进体检输出，而体检是会被截图发出去的
+            mode = str(a.get("alipan_type") or a.get("link_method") or "")
         except Exception:
-            root = ""
-        out.append((mp, drv, status, root))
+            root, mode = "", ""
+        out.append((mp, drv, status, root, mode))
     return out
 
 
@@ -4773,10 +4778,11 @@ def show_info():
     stores = openlist_storages(d)
     if stores:
         print(f"\n  {BOLD}▸ 网盘挂载{RST}")
-        for mp, drv, status, root in stores:
+        for mp, drv, status, root, mode in stores:
             print(f"      {pad(mp, 14)}{pad(drv, 12)}"
-                  + (f"{DIM}根文件夹ID={root}{RST}" if root else ""))
-        if any(s != "work" for _m, _d, s, _r in stores):
+                  + (f"{DIM}根文件夹ID={root}{RST}" if root else "")
+                  + (f"{DIM}　接口 {mode}{RST}" if mode else ""))
+        if any(s != "work" for _m, _d, s, _r, _x in stores):
             print(f"      {YELLOW}有存储上次初始化时报过错{RST}"
                   f"{DIM} —— 跑「5 链路体检」看现在通不通、怎么修{RST}")
 
@@ -9263,7 +9269,8 @@ def set_scan_paths():
     print()
     print(f"  当前：{CYAN}{BOLD}{scan_spec_human(cfg['scan_spec'], cfg['scan_paths'])}{RST}")
 
-    mounted = [mp for mp, _drv, _st, _root in openlist_storages(d) if mp and mp != "/"]
+    mounted = [mp for mp, _drv, _st, _root, _m in openlist_storages(d)
+           if mp and mp != "/"]
     if mounted:
         print(f"  {DIM}OpenList 里已挂载：{'、'.join(mounted)}{RST}")
     else:
@@ -10411,7 +10418,7 @@ def do_healthcheck():
         _hc("网盘存储", "bad", "一个都没有")
         todo.append(("OpenList 里还没挂网盘",
                      "浏览器打开 OpenList → 存储 → 添加"))
-    for mp, drv, st, root in stores:
+    for mp, drv, st, root, mode in stores:
         bad_root = drv.lower().startswith("quark") or drv.lower().startswith("uc")
         if st != "work":
             # status 是【存储初始化那一刻】写进去的,之后成功了也不会自动改回 work。
@@ -10434,7 +10441,26 @@ def do_healthcheck():
             todo.append((f"{mp} 的根文件夹ID 是 {root or '空'}，夸克要的是文件夹 ID",
                          "OpenList → 存储 → 编辑 → 根文件夹ID 填 0 → 全部重新加载"))
         else:
-            _hc(f"存储 {mp}", "ok", f"{drv}  work" + (f"  根目录ID={root}" if root else ""))
+            _hc(f"存储 {mp}", "ok", f"{drv}  work"
+                + (f"  根目录ID={root}" if root else "")
+                + (f"  {DIM}接口 {mode}{RST}" if mode else ""))
+        # 【走哪套接口，决定的是速度，不是通不通】—— 而"通不通"上面已经报绿了，
+        # 所以这一条不看状态、单独判。实测：阿里云盘 alipan_type=default 走的是
+        # 开放平台的【下载】接口，被限到 0.5 MB/s（≈4 Mbps）；而挂载页面放的是
+        # 阿里的转码流（SD，1 Mbps 上下），所以"挂载能放、Emby 卡死"——
+        # 两边根本不是同一路流。17 Mbps 的原盘在 4 Mbps 上必卡。
+        # 这正是这套东西最典型的坏法：每一项都绿，片子就是放不了。
+        if drv.lower() == "aliyundriveopen" and (mode or "default") == "default":
+            _hc(f"接口 {mp}", "warn",
+                f"alipan_type=default{DIM}　开放平台的下载接口，"
+                f"阿里限速到 0.5 MB/s 左右{RST}")
+            todo.append((
+                f"{mp} 走的是阿里开放平台【下载】接口，被限速到 0.5 MB/s 上下 —— "
+                f"码率高的片子必卡（挂载页面不卡是因为那边放的是转码流，不是原片）",
+                "OpenList → 存储 → 这个盘 → 编辑 → 「阿里盘账户类型」改成 "
+                "alipanTV（TV 接口，和夸克必须选 QuarkTV 是一个道理）。"
+                "多半要按新类型重新取一次刷新令牌，不限速通常还要超级会员。"
+                "不想折腾就把大码率的片子放夸克，阿里放压过的"))
 
     # ---- 列目录 ----
     listed_ok = []
