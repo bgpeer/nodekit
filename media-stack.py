@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.17"
+SCRIPT_VERSION = "1.5.18"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1142,6 +1142,7 @@ case "${1:-info}" in
   strm            立刻跑一次 strm 生成并跟日志
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
+  selfupdate      只把脚本换成仓库里的最新版(不动镜像、不重启容器)
   stop / start    停止 / 启动全部
 H
     exit 0 ;;
@@ -1174,6 +1175,22 @@ case "${1:-info}" in
     # 否则从这里更新的人拿不到配置修复，只会以为"更新过了还是老样子"
     S=/etc/bgpeer/media-stack.py
     if [[ -f "$S" ]]; then python3 "$S" update; else dc pull && dc up -d; fi ;;
+  selfupdate)
+    # 【必须有一个手动入口】脚本自动更新本来只有每天一次的 cron。可是最需要
+    # 换新脚本的时刻,恰恰是"刚发现一个 bug、修好了、想马上拿到"—— 那时候
+    # 让人等到明天凌晨,或者去背 python3 /etc/bgpeer/media-stack.py selfupdate,
+    # 都不合理。实测就撞上了:我让用户敲 media-stack selfupdate,而它根本不存在。
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    V0="$(grep -m1 '^SCRIPT_VERSION' "$S" | cut -d'"' -f2)"
+    python3 "$S" selfupdate
+    V1="$(grep -m1 '^SCRIPT_VERSION' "$S" | cut -d'"' -f2)"
+    if [[ "$V0" == "$V1" ]]; then
+      echo "脚本已是 v${V1}(没有变化)"
+    else
+      echo "脚本 v${V0} → ${b}v${V1}${r}"
+      echo "上一版留在 ${S}.prev,出事可以换回去"
+    fi ;;
   strm)
     # AutoFilm v2 没有手动触发的入口:./autofilm --help 只有 --config/--log/--timezone
     # 这些开关,启动时也只注册 cron、不跑任务。所以这里临时把 cron 改成
