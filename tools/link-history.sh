@@ -85,9 +85,20 @@ def title(u):
     return segs[-1] if segs else u
 
 
-# 【按整条地址匹配，不只按抠出来的名字】名字抠得再准也总有抠不到的形态，
-# 而片名那几个字一定在地址里的某个地方。宁可宽一点，也别漏掉半段历史。
-hit = [(t, u) for t, u in rows if Q.lower() in unquote(u).lower()]
+def haystack(u):
+    """拿来和片名比对的那一大坨文本。
+
+    【必须解码两次】网盘的下载头参数是【双重编码】的：地址里写的是
+    %25E9%25BE%2599，解一次只得到 %E9%BE%99，解两次才是「龙虎门」。
+    只解一次就会出现"说没找到、底下却列着它"这种自相矛盾的输出 ——
+    因为列名字那段（title）恰好解了两次。实测被这个坑到过。
+    把一次、两次、以及抠出来的名字全拼进去比，宁可宽一点也别漏。
+    """
+    one = unquote(u)
+    return (one + "\n" + unquote(one) + "\n" + title(u)).lower()
+
+
+hit = [(t, u) for t, u in rows if Q.lower() in haystack(u)]
 if not hit:
     names = []
     for _t, u in rows:
