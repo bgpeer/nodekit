@@ -220,11 +220,14 @@ for sid, mp, drv, status, add in ali:
               f"两个存储要各扫各的{X}")
 
     print()
-    if guess == typ:
+    # 【状态是 work 就先把这句说死】不然一屏"形态对得上"加几行红色的历史日志，
+    # 看的人还是不知道到底好了没有 —— 这一版之前就是这样，等于白查。
+    if st == "work" and guess == typ:
+        print(f"  {G}▸ 没问题{X}：类型和令牌配对，存储是 {G}work{X}，现在挂着的。")
+    elif guess == typ:
         print(f"  {D}形态和类型对得上。{X}"
-              + ("" if st == "work" else
-                 f"{Y}但它还是挂不上{X}{D} —— 那多半是令牌本身废了"
-                 f"（过期 / 被别处轮换掉 / 只复制了一半），要重新扫码{X}"))
+              f"{Y}但它还是挂不上{X}{D} —— 那多半是令牌本身废了"
+              f"（过期 / 被别处轮换掉 / 只复制了一半），要重新扫码{X}")
     else:
         print(f"  {R}▸ 对不上{X}：类型 {C}{typ}{X} 要的是「{want_page}」取的令牌，"
               f"库里这份像是「{guess_page}」取的")
@@ -235,13 +238,30 @@ for sid, mp, drv, status, add in ali:
 
     errs = ol_errors()
     if errs:
+        # 【日志是流水账，不是现状】存储已经 work 了，日志里那几行红字多半是修好
+        # 之前留下的。不说这一句的话，一堆 ERROR 摆在"没问题"下面，等于把刚下的
+        # 结论又推翻一次。每行都带时间戳，对一下就知道是不是刚才的事。
         print(f"\n  {B}OpenList 日志里的原话{X}{D}（令牌已抹去）{X}")
+        if st == "work":
+            print(f"  {D}这是流水账、不是现状 —— 存储现在是 work 的，"
+                  f"下面这些多半是修好之前留下的。看行首的时间{X}")
         for e in errs:
             print(f"    {D}{e}{X}")
+        # openFile/list 超时是【列目录慢】，和令牌一点关系都没有 —— 挂在这里
+        # 只会让人以为是同一件事，所以单独点破它是什么、以及已经在治它了。
+        if any("openfile/list" in e.lower() and "deadline" in e.lower()
+               for e in errs):
+            print(f"  {D}其中 openFile/list ... deadline exceeded 是"
+                  f"{X}列目录跨境超时{D}，不是令牌的事。"
+                  f"目录缓存拉长到 12 小时就是在少问几次{X}")
 
     if not PROBE:
-        print(f"\n  {D}以上是按形态推断的。想让官方 API 自己说，加 --probe —— "
-              f"它会真的换一次令牌，换到了自动写回。{X}")
+        if st == "work":
+            # 存储好好的还去 --probe，等于平白烧掉一次轮换。别提这个选项。
+            print(f"\n  {D}挂着的存储没必要 --probe，那会平白换掉一次令牌。{X}")
+        else:
+            print(f"\n  {D}以上是按形态推断的。想让官方 API 自己说，加 --probe —— "
+                  f"它会真的换一次令牌，换到了自动写回。{X}")
         continue
 
     # ---------------------------------------------------------------- 真换一次
