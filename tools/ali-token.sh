@@ -15,6 +15,9 @@
 # 【全程不打印令牌本身】只报长度、开头几位和形态。这份输出是会被截图发出去的。
 set -u
 
+TOOL_VER="2026-08-30c"          # 见 link-history.sh 里的说明：CDN 会缓存
+echo "  ${0##*/}  版本 $TOOL_VER"
+
 DIR="${MS_DIR:-/opt/media-stack}"
 MP=""
 PROBE=0

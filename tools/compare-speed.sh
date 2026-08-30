@@ -12,6 +12,9 @@
 # 「挂载里随便拖、Emby 卡死」十有八九就是这个差别，而不是脚本或线路的问题。
 set -u
 
+TOOL_VER="2026-08-30c"          # 见 link-history.sh 里的说明：CDN 会缓存
+echo "  ${0##*/}  版本 $TOOL_VER"
+
 Q="${1:-}"
 [ -n "$Q" ] || { echo "用法：bash compare-speed.sh <片名的一部分 或 集号>"; exit 1; }
 DIR="${MS_DIR:-/opt/media-stack}"
