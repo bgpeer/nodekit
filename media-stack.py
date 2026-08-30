@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.34"
+SCRIPT_VERSION = "1.5.35"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9669,6 +9669,19 @@ def drive_channel(d, mp, drv):
     return "原画直链", False
 
 
+def _jwt_field(tok, name):
+    """从 JWT 的 payload 里取一个字段。不是 JWT 或取不到就返回空串。
+
+    只读 payload，不验签 —— 这里要的只是"这串是谁发的"，不是"这串有效吗"。
+    """
+    try:
+        seg = tok.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(seg)).get(name) or "")
+    except Exception:
+        return ""
+
+
 def _alipan_channel_menu(d, mp):
     """阿里的接口通道：default（开放平台，被限速）↔ alipanTV（TV 客户端）。
 
@@ -9736,6 +9749,18 @@ def _alipan_channel_menu(d, mp):
     looks_jwt = tok.count(".") == 2 and tok.startswith("ey")
     if (other == "alipanTV") == looks_jwt:
         warn(f"这串看着不像「{ALIPAN_TYPES[other][2]}」取的令牌。")
+        # 【把证据摆出来，别只说"看着不像"】JWT 里的 aud 就是发它的那个应用 id，
+        # 而开放平台发的直链里那个 ap= 参数是同一个值。两边一样，就说明这串还是
+        # 开放平台那条路取的 —— 不管页面上选的是哪一项。
+        # 【为什么必须拦住】实测这种配错【当场是好的】：刚换完能换直链、能播，
+        # 一小时内访问令牌到期、拿它去续，官方 API 回空，整个盘掉线。
+        # 只说"看着不像"，人会按 y 过去，然后以为问题出在别处 —— 已经发生过两次。
+        aud = _jwt_field(tok, "aud")
+        if aud:
+            print(f"  {DIM}它的 aud（发证应用）= {aud}{RST}")
+            print(f"  {DIM}开放平台发的直链里 ap= 就是这个值 —— 同一个应用，"
+                  f"也就是说这串是「{ALIPAN_TYPES['default'][2]}」那条路取的{RST}")
+        print(f"  {YELLOW}配错的表现很骗人：现在能用，一小时内令牌一续期就整个盘掉线{RST}")
         if not ask_yn("仍然用它？", False):
             print("已取消，一个字都没改。")
             return
