@@ -25,21 +25,55 @@ LOC="$(curl -s -o /dev/null -w '%{redirect_url}' -m 60 \
 echo "直链主机  $(printf '%s' "$LOC" | sed -E 's#^[a-z]+://([^/]+).*#\1#')"
 echo
 
+# 【把秒数换算成速度，不要让人自己去除】原来这里只打 "10.041734s"，
+# 一屏五行秒数，得自己拿 1 MiB 去除才知道快慢 —— 而这一步恰恰是全场最关键的
+# 结论所在，不该留给人心算。
+RES="$(mktemp)"
+trap 'rm -f "$RES"' EXIT
+
 t() {  # $1=说明  剩下的=curl 参数
   local lbl="$1"; shift
-  local out
+  local out code size tt ip spd
   out="$(curl -s -o /dev/null -m 45 -r 0-1048575 \
-         -w '%{http_code} %{size_download}B %{time_total}s %{remote_ip}' \
+         -w '%{http_code} %{size_download} %{time_total} %{remote_ip}' \
          "$@" "$LOC" 2>&1)"
-  printf '  %-26s %s\n' "$lbl" "$out"
+  set -- $out
+  code="${1:-?}"; size="${2:-0}"; tt="${3:-0}"; ip="${4:-}"
+  spd="$(awk -v s="$size" -v t="$tt" 'BEGIN{
+      if (t+0>0 && s+0>0) printf "%6.0f KB/s  %5.2f Mbps", s/t/1024, s*8/t/1000000
+      else printf "%-24s", "—" }')"
+  printf '  %-22s %s  %s  %s\n' "$lbl" "$code" "$spd" "$ip"
+  # 只有真拉下来的才进统计 —— 403 那种 0 字节 0 秒会把平均值带歪
+  case "$code" in 200|206) echo "$tt $size" >> "$RES" ;; esac
 }
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'
-echo "  说明：200/206 = 拉得动；403 = 被拒。最后一列是实际连到的 IP"
-t "默认（系统自选 v4/v6）"
+echo "  说明：200/206 = 拉得动；403 = 被拒。每条都拉 1 MiB。最后一列是实际连到的 IP"
+echo "  ⚠ 测的时候【别同时播放同一部片子】—— 会和它抢同一份带宽，数字不作数"
+echo
+t "默认（自选 v4/v6）"
 t "强制 IPv4"                 -4
 t "强制 IPv6"                 -6
 t "IPv4 + 浏览器UA"           -4 -A "$UA"
 t "IPv4 + UA + Referer"       -4 -A "$UA" -e "https://www.alipan.com/"
+echo
+
+# 【几条不同的路速度几乎一样 = 限速，不是线路】线路慢是随机的：换 IP、换协议、
+# 换 CDN 节点，快慢一定会散开。而令牌桶限速是按秒发牌的，走哪条路都发一样多，
+# 于是几次测下来齐刷刷落在同一个数上 —— 这个"齐"本身就是证据。
+awk '{ if ($1+0>0 && $2+0>0) { v=$2/$1/1024; n++; s+=v
+         if (n==1||v<mn) mn=v; if (v>mx) mx=v } }
+     END {
+       if (n < 3) exit
+       printf "  五条路里成功 %d 条，%.0f ~ %.0f KB/s（平均 %.0f）\n", n, mn, mx, s/n
+       if (mn > 0 && (mx-mn)/mn < 0.30) {
+         printf "  ▸ 走哪条路都是这个数（差 %.0f%%）—— 这是【限速】，不是线路问题。\n",
+                (mx-mn)/mn*100
+         printf "    换机房、换 IP、走 IPv4 还是 IPv6 都改不了它。\n"
+       } else {
+         printf "  ▸ 各条路差得比较开（%.0f%%）—— 更像线路/节点的事，不像固定限速。\n",
+                (mx-mn)/mn*100
+       }
+     }' "$RES"
 echo
 echo "  ---- 把下面这条链接复制到【手机浏览器】打开（手机是国内 IP）----"
 echo "  这条就是 MediaWarp 302 给播放器的那一条，手机上看两件事："
