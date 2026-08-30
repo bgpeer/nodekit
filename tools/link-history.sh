@@ -23,7 +23,7 @@ LINES="${2:-20000}"
 # 【把版本打出来】这些脚本是 curl 下来跑的，而 raw 有 CDN 缓存：改完立刻拉，
 # 拿到的可能还是几分钟前那份。跑出来的结果对不上，人只会以为"改了没用"。
 # 屏幕上有个版本号，一眼就能分清是"没改对"还是"拿的是旧的"。
-TOOL_VER="2026-08-30e"
+TOOL_VER="2026-08-30f"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 command -v docker >/dev/null 2>&1 || { echo "✖ 没有 docker"; exit 1; }
@@ -246,10 +246,15 @@ EMBY, MW = "http://127.0.0.1:8096", "http://127.0.0.1:9000"
 B, D, R, G, Y, C, X = ("\033[1m", "\033[2m", "\033[31m", "\033[32m",
                        "\033[33m", "\033[36m", "\033[0m")
 
+def jget(u, timeout=60):
+    with urllib.request.urlopen(u, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
 try:
     u = (f"{EMBY}/Items?Recursive=true&IncludeItemTypes=Movie,Episode,Video"
          f"&Fields=Path&Limit=3000&api_key={KEY}")
-    items = json.load(urllib.request.urlopen(u, timeout=60)).get("Items") or []
+    items = jget(u).get("Items") or []
 except Exception as e:
     print(f"  {R}问不到 Emby：{e}{X}")
     raise SystemExit
@@ -258,6 +263,27 @@ hit = [i for i in items
        if str(i.get("Path") or "").endswith(".strm")
        and (Q.lower() in str(i.get("Name") or "").lower()
             or Q.lower() in str(i.get("Path") or "").lower())]
+
+
+def need_mbps(iid):
+    """这部片要多少码率才播得动。取不到返回 0。
+
+    【这一步必须脚本自己做】原来末尾写的是"够不够看要跟片子的码率比 ——
+    Emby 条目页上写着"。可这两个数就差一次除法，而它们分处两个屏幕，
+    人得自己去翻、自己去比 —— 那正是最容易得出错误结论的地方。
+    """
+    try:
+        det = (jget(f"{EMBY}/Items?Ids={iid}&Fields=MediaSources&api_key={KEY}")
+               .get("Items") or [{}])[0]
+        src = (det.get("MediaSources") or [{}])[0]
+        bit = src.get("Bitrate") or 0
+        if not bit:
+            size = src.get("Size") or 0
+            secs = (src.get("RunTimeTicks") or 0) / 1e7
+            bit = size * 8 / secs if size and secs else 0
+        return bit / 1e6
+    except Exception:
+        return 0.0
 if not hit:
     print(f"  {Y}Emby 里没有匹配「{Q}」的 strm 条目{X}")
     raise SystemExit
@@ -365,11 +391,29 @@ try:
         n = len(rr.read(1 << 20))
     el = time.time() - t0
     mbps = n * 8 / el / 1e6 if el > 0 else 0
-    col = G if mbps >= 8 else (Y if mbps >= 3 else R)
-    print(f"  实测速度  {col}{mbps:.2f} Mbps{X}  {D}（{n/1024/el:.0f} KB/s，"
+    need = need_mbps(iid)
+    print(f"  实测速度  {C}{mbps:.2f} Mbps{X}  {D}（{n/1024/el:.0f} KB/s，"
           f"拉了 {n/1024/1024:.1f} MiB）{X}")
-    print(f"  {D}够不够看要跟片子的码率比 —— Emby 条目页上写着（比如 16.6 Mbps）。"
-          f"拉不到那个数就会边放边等。{X}")
+    if not need:
+        print(f"  {D}读不到这部片的码率，比不了 —— Emby 条目页上写着{X}")
+    else:
+        r = mbps / need
+        print(f"  片子要    {C}{need:.1f} Mbps{X}   "
+              f"{D}实测是它的 {r*100:.0f}%{X}")
+        # 【0.3 倍以下不是"卡"，是"打不开"】播放器要先攒够一小段缓冲才起播。
+        # 只有一两成的速度时，缓冲永远攒不满 —— 表现就是一直转圈、根本进不去。
+        # 用户报的"点开一直转圈"和"播起来卡"是同一个原因的两个程度，
+        # 分开说清楚，他才不会以为是两件事。
+        if r >= 1.5:
+            print(f"  {G}▸ 够{X}{D}（余量 {r:.1f} 倍）—— 卡的话不是速度的事{X}")
+        elif r >= 1.0:
+            print(f"  {Y}▸ 勉强够{X}{D}（余量 {r:.1f} 倍）—— 线路一抖就要缓冲{X}")
+        elif r >= 0.3:
+            print(f"  {R}▸ 不够{X}{D} —— 能起播，但边放边等，会反复转圈{X}")
+        else:
+            print(f"  {R}▸ 差得太远{X}{D} —— 播放器攒不出起播缓冲，"
+                  f"表现是【点开一直转圈、根本进不去】，不是「播起来卡」{X}")
+            print(f"  {D}按这个速度，缓冲 1 秒的画面要花 {need/mbps:.0f} 秒{X}")
 except urllib.error.HTTPError as e:
     print(f"  {R}✖ 这条直链拉不动：HTTP {e.code}{X}")
     print(f"  {D}地址换到了但下不动 —— 用 tools/ali-403.sh 换几种方式再试{X}")
