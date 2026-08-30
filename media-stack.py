@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.25"
+SCRIPT_VERSION = "1.5.26"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9478,15 +9478,12 @@ def _drive_paths_menu(d, mp):
         print("-" * 60)
         if mine:
             for i, p in enumerate(mine, 1):
-                tag = f"  {YELLOW}整个盘{RST}" if p.rstrip("/") == mp.rstrip("/") else ""
+                tag = f"  {DIM}整个盘{RST}" if p.rstrip("/") == mp.rstrip("/") else ""
                 print(f"  {i:>2}. {p}{tag}")
         else:
-            auto = auto_rest_on()
-            print(f"  {DIM}还没单独设过。{RST}"
-                  + (f"{DIM}「剩余网盘（自动）」开着，所以现在按整个盘扫。{RST}"
-                     if auto else f"{DIM}这个盘现在不进 Emby。{RST}"))
+            print(f"  {DIM}{'整个盘（自动）' if auto_rest_on() else '未加路径'}{RST}")
         print("-" * 60)
-        print(f"  {DIM}a = 添加一条　d = 删一条　0 = 返回{RST}")
+        print(f"  {DIM}a 添加　d 删除　0 返回{RST}")
         c = ask("请选择").strip().lower()
         if c in ("0", "", "q"):
             return
@@ -9509,14 +9506,9 @@ def _drive_paths_menu(d, mp):
         # 添加：把这个盘下面的目录列出来点编号，别逼人在手机上手打长路径
         print(f"\n  {DIM}正在列 {mp} 下面的目录...{RST}")
         subs = _ol_subdirs(mp)
-        if subs:
-            for j, name in enumerate(subs, 1):
-                print(f"    {j:>2}. {name}")
-            print(f"  {DIM}输编号（多个用逗号隔开）；a = 整个盘；"
-                  f"m = 手打一条更深的路径；回车取消{RST}")
-        else:
-            print(f"  {DIM}列不出子目录（网盘慢或者本来就没有）。{RST}")
-            print(f"  {DIM}a = 整个盘；m = 手打一条；回车取消{RST}")
+        for j, name in enumerate(subs, 1):
+            print(f"    {j:>2}. {name}")
+        print(f"  {DIM}编号（逗号隔开多个）　a 整个盘　m 手打路径　回车取消{RST}")
         pick = ask("要扫哪个").strip().lower()
         if not pick:
             continue
@@ -9541,10 +9533,9 @@ def _drive_paths_menu(d, mp):
             continue
         bare = [p for p in got if p.strip("/").count("/") == 0]
         if bare:
-            # 扫整个盘是这套东西里最容易踩、又最像"成功了"的坑
-            warn(f"{'、'.join(bare)} 是{BOLD}整个盘{RST} —— 里面所有东西都会被扫进来")
-            print(f"  {DIM}手机备份、截图、扫描件都会变成条目堆在媒体库里，"
-                  f"刮削搜不到，表现就是「一堆条目全都没有海报」。{RST}")
+            # 扫整个盘是这套东西里最容易踩、又最像"成功了"的坑：手机备份、截图
+            # 全变成条目，刮削搜不到，表现是"一堆条目全都没有海报"。详见 README。
+            warn(f"整个盘会把手机备份、截图也扫进来")
             if not ask_yn("仍然要整个盘？", False):
                 continue
         save_ms_state(scan_spec=exp + [p for p in got if p not in exp])
@@ -9569,12 +9560,10 @@ def _title_menu(d, mp=None):
     else:
         print(f"  默认（没单独设过的盘都用它）当前："
               f"{CYAN}{BOLD}{names.get(dflt, dflt)}{RST}")
-    print(f"  {DIM}文件名带「[第154集•4K]」这类标记的盘用文件名更准；"
-          f"规规矩矩「片名 (年份).mkv」的盘用刮削结果。{RST}")
     print(f"  1. 刮削结果")
-    print(f"  2. 网盘文件名{DIM}（并锁定标题，海报简介照常跟刮削更新）{RST}")
+    print(f"  2. 网盘文件名")
     if mp:
-        print(f"  3. 跟默认走{DIM}（默认现在是{names.get(dflt, dflt)}）{RST}")
+        print(f"  3. 跟默认走{DIM}（{names.get(dflt, dflt)}）{RST}")
     print(f"  0. 返回")
     c = ask("请选择").strip()
     if c in ("0", "", "q"):
@@ -9659,10 +9648,6 @@ def _alipan_channel_menu(d, mp):
         print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}{star}")
         print(f"      {DIM}{why}{RST}")
     print()
-    print(f"  {DIM}阿里发的永远是{RST}原画直链{DIM}（原始文件地址），"
-          f"没有「转码流」那个选项 —— 那是夸克/UC 的 TV 驱动才有的。"
-          f"这里能调的是【走哪条接口】，它决定被不被限速。{RST}")
-    print()
     print(f"  1. 换成「{ALIPAN_TYPES[other][0]}」")
     print("  0. 返回")
     if ask("请选择").strip() != "1":
@@ -9671,15 +9656,9 @@ def _alipan_channel_menu(d, mp):
 
     # 【先把令牌要到手，再动类型】只翻类型 = 必定挂不上，见函数开头
     print()
-    warn("换通道必须【连令牌一起换】—— 只改类型的话这个盘会直接挂不上。")
-    print(f"  {DIM}报错长这样：failed init storage: "
-          f"empty token returned from official API{RST}")
-    print()
-    print(f"  取令牌：浏览器打开 {CYAN}{BOLD}https://api.oplist.org/{RST}"
-          f"{DIM}（打不开换 https://api.oplist.org.cn/）{RST}")
-    print(f"  下拉框选 {BOLD}{ALIPAN_TYPES[other][2]}{RST}，扫码，"
-          f"只抄{BOLD}刷新令牌{RST}那一栏")
-    print(f"  {DIM}授权时把「备份盘」的勾去掉 —— 那里面是手机相册{RST}")
+    warn("类型和令牌必须一起换，只改类型这个盘会挂不上。")
+    print(f"  取令牌：{CYAN}{BOLD}https://api.oplist.org/{RST}"
+          f"　选 {BOLD}{ALIPAN_TYPES[other][2]}{RST}　只要{BOLD}刷新令牌{RST}")
     print()
     tok = ask("把刷新令牌粘在这里（留空取消）").strip()
     if not tok:
@@ -9690,8 +9669,6 @@ def _alipan_channel_menu(d, mp):
     looks_jwt = tok.count(".") == 2 and tok.startswith("ey")
     if (other == "alipanTV" and looks_jwt) or (other == "default" and not looks_jwt):
         warn(f"这串看着不像「{ALIPAN_TYPES[other][2]}」取的令牌。")
-        print(f"  {DIM}OAuth2 扫码给的是 JWT（ey 开头、两个点）；"
-              f"TV 版给的不是。粘错了的话这个盘会挂不上。{RST}")
         if not ask_yn("仍然用它？", False):
             print("已取消，一个字都没改。")
             return
@@ -9770,46 +9747,34 @@ def _link_method_menu(d, mounts, who):
               f"（每个盘的令牌不一样）：{'、'.join(x[1] for x in ali)}{RST}")
         return
     print()
-    print(f"  {who} 发的是{BOLD}原画直链{RST}"
-          f"{DIM}（网盘原始文件的地址），302 照常生效。{RST}")
-    print(f"  {DIM}它没有「原画 / 转码流」这个【选择】—— 那是夸克 / UC 的 TV 版"
-          f"驱动（QuarkTV、UCTV）特有的字段，不是脚本能给别的驱动加的。{RST}")
-    print(f"  {DIM}这类盘播放慢一般是网盘那边限速，换不了接口。"
-          f"想量一下到底多少：bash tools/ali-403.sh <片名>{RST}")
+    print(f"  {who} 只有{BOLD}原画直链{RST}一种"
+          f"{DIM}（302 照常生效；「转码流」是夸克 / UC 的 TV 驱动才有的）{RST}")
+
+
+def _scan_of(mp):
+    """这个盘现在扫什么，一句话。给菜单那一列用。"""
+    mine = _paths_under(explicit_scan_paths(), mp)
+    if mine:
+        return "、".join(mine)
+    return "整个盘（自动）" if auto_rest_on() else "未加路径"
 
 
 def _drive_menu(d, mp, drv):
-    """单个网盘的设置。每个盘一屏，各管各的。"""
+    """单个网盘的设置。"""
+    names = {"scrape": "刮削结果", "filename": "网盘文件名"}
     while True:
-        exp = explicit_scan_paths()
-        mine = _paths_under(exp, mp)
-        auto = auto_rest_on()
-        if mine:
-            where = ("整个盘" if any(p.rstrip("/") == mp.rstrip("/") for p in mine)
-                     else "、".join(mine))
-            st = f"{GREEN}✔ 扫{RST}  {DIM}{where}{RST}"
-        elif auto:
-            st = f"{GREEN}✔ 扫{RST}  {DIM}整个盘（跟着「剩余网盘」走）{RST}"
-        else:
-            st = f"{DIM}✖ 不扫{RST}"
-        # 【显示它实际走什么，不是"有没有开关"】见 drive_channel 的注释：
-        # 写"这个盘没有"会被读成"这个盘没有直链"，而阿里明明有 302 直链。
-        _ch, _switchable = drive_channel(d, mp, drv)
-        lm_s = (f"{CYAN}{_ch}{RST}" if _switchable
-                else f"{CYAN}{_ch}{RST}{DIM}（只有这一种）{RST}")
-        by = ms_state().get("title_by_drive") or {}
-        names = {"scrape": "刮削结果", "filename": "网盘文件名"}
-        tp_s = (f"{CYAN}{names.get(by[mp], by[mp])}{RST}" if mp in by
-                else f"{DIM}跟默认（{names.get(title_policy())}）{RST}")
+        ch, switchable = drive_channel(d, mp, drv)
+        tp = title_policy_of(mp)
         print("\n" + "=" * 60)
-        print(f"  {BOLD}{driver_cn(drv)}{RST}  {DIM}{mp}　{drv}{RST}   {st}")
+        print(f"  {BOLD}{driver_cn(drv)}{RST}   {CYAN}{_scan_of(mp)}{RST}")
         print("=" * 60)
-        print(f"  1. 路径{DIM}　里面可以添加、更换、删除路径{RST}")
-        print(f"  2. 直链方式          当前：{lm_s}")
-        print(f"  3. 片名用哪个        当前：{tp_s}")
+        print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
+        print(f"  2. 直链方式          当前：{CYAN}{ch}{RST}"
+              + ("" if switchable else f"{DIM}（只有这一种）{RST}"))
+        print(f"  3. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
         has115 = "115" in str(drv)
         if has115:
-            print(f"  4. 网盘扫码登录{DIM}　重新拿二维码令牌{RST}")
+            print(f"  4. 网盘扫码登录")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -9828,46 +9793,32 @@ def _drive_menu(d, mp, drv):
 
 
 def _rest_menu(d):
-    """「剩余网盘（自动）」：没被单独设过的盘归它管。
-
-    这一屏和单盘那一屏长一样（路径开关 / 直链方式 / 片名），因为它管的就是
-    "其余那些盘"的那一份设置 —— 用户的原话就是把它当第四个盘来排。
-    """
+    """「剩余网盘（自动）」：没被单独设过的盘归它管。"""
+    names = {"scrape": "刮削结果", "filename": "网盘文件名"}
     while True:
         exp = explicit_scan_paths()
         rest = [mp for mp, _drv, _st, _r, _m in openlist_storages(d)
                 if mp and mp != "/" and not _paths_under(exp, mp)]
         on = auto_rest_on()
-        names = {"scrape": "刮削结果", "filename": "网盘文件名"}
         lm = [x for x in link_method_storages(d) if x[1] in rest]
-        _ali_rest = [x for x in _ali_storages(d) if x[1] in rest]
+        ali = [x for x in _ali_storages(d) if x[1] in rest]
         if lm:
-            lm_s = f"{CYAN}{LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]}{RST}"
-        elif _ali_rest:
-            lm_s = f"{CYAN}原画直链 · 接口通道{RST}"
+            ch = LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]
+        elif ali:
+            ch = "原画直链 · 接口通道"
         else:
-            lm_s = f"{CYAN}原画直链{RST}{DIM}（只有这一种）{RST}"
+            ch = "原画直链"
         print("\n" + "=" * 60)
-        print(f"  {BOLD}♻ 剩余网盘（自动）{RST}   当前："
-              + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}"))
-        print("=" * 60)
-        # 【说清楚"剩余"是哪些】不然这个开关就是个黑箱：开了到底多扫了什么，
-        # 只能去 autofilm 配置里翻。它还会随着别处的设置变，更得当场列出来。
-        print(f"  {DIM}管的是【没有单独设过路径】的盘。单独设过的不受影响 —— "
-              f"这个开关永远排在它们后面。{RST}")
-        if rest:
-            print(f"  现在归它管：{CYAN}{'、'.join(rest)}{RST}"
-                  + (f"  {DIM}（开着，按整个盘扫）{RST}" if on
-                     else f"  {DIM}（关着，这些盘都不进 Emby）{RST}"))
-        else:
-            print(f"  {DIM}现在没有「剩余」的盘 —— 每个盘都单独设过了。{RST}")
-        print("-" * 60)
-        print(f"  1. 自动路径开关      当前："
+        print(f"  {BOLD}♻ 剩余网盘（自动）{RST}   "
               + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}")
-              + f"{DIM}　每次生成配置时重新看一遍，新挂的盘会自动跟上{RST}")
-        print(f"  2. 直链方式          当前：{lm_s}")
+              + (f"   {DIM}{'、'.join(rest)}{RST}" if rest else
+                 f"   {DIM}没有剩余的盘{RST}"))
+        print("=" * 60)
+        print(f"  1. 自动路径开关      当前："
+              + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}"))
+        print(f"  2. 直链方式          当前：{CYAN}{ch}{RST}")
         print(f"  3. 片名用哪个        当前："
-              f"{CYAN}{names.get(title_policy())}{RST}{DIM}（默认值）{RST}")
+              f"{CYAN}{names.get(title_policy())}{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -9883,9 +9834,7 @@ def _rest_menu(d):
             print("无效选择。")
             continue
         if not on and rest:
-            warn(f"打开之后这些盘会按{BOLD}整个盘{RST}扫进来：{'、'.join(rest)}")
-            print(f"  {DIM}整个盘意味着手机备份、截图也会变成条目。"
-                  f"想只扫影视目录，就回上一层给那个盘单独设路径。{RST}")
+            warn(f"这些盘会按整个盘扫进来：{'、'.join(rest)}")
             if not ask_yn("确定打开？", False):
                 continue
         save_ms_state(auto_rest=(not on))
@@ -9898,11 +9847,12 @@ def mount_paths_menu():
     【为什么不是一个输入框】原来扫描路径埋在「后补参数」里，要把所有路径用逗号
     连成一串手打进去 —— 加一个盘得把已有的全部重打一遍，在手机 ssh 上根本没法
     编辑（用户原话："在ssh里不好编辑"）。
-    【为什么不是一排开关，而是一个盘一个子菜单】开关只够表达"扫不扫"，可是每个
-    盘要管的其实有四件事：扫哪些目录、直链方式、片名用哪个、115 还要扫码登录。
-    这些本来散在「后补参数」里，是【全局】的 —— 而它们全都是【一个盘一个样】的
-    东西：夸克该用刮削结果、另一个盘该用文件名；直链方式更是只有夸克/UC 才有。
-    按盘分屏之后，每个设置都落在它真正属于的地方。
+    【为什么一个盘一个子菜单】每个盘要管的有四件事：扫哪些目录、直链方式、
+    片名用哪个、115 还要扫码登录。它们原来散在「后补参数」里当全局开关，
+    而全都是一个盘一个样的东西 —— 直链方式更是只有夸克/UC 才有。
+    【屏上不写解释】用户原话："解释不应该是精简的写在仓库主页吗，你解释写的这上面
+    不懂的人始终不懂，懂得人不需要写也看得懂"。所以这些原委只留在注释和 README，
+    菜单上只放：叫什么、现在是什么。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -9911,44 +9861,21 @@ def mount_paths_menu():
     while True:
         stores = [(mp, drv, st) for mp, drv, st, _r, _m in openlist_storages(d)
                   if mp and mp != "/"]
-        exp = explicit_scan_paths()
-        auto = auto_rest_on()
         print("\n" + "=" * 60)
         print(f"  {BOLD}挂载路径{RST}{DIM}（哪些网盘要进 Emby，各自扫哪些目录）{RST}")
         print("=" * 60)
         if not stores:
             print(f"  {YELLOW}OpenList 里还没挂任何网盘。{RST}")
-            print(f"  {DIM}先去 OpenList 网页里挂上，再回来这里选。{RST}")
             ask("\n按回车返回...")
             return
         for i, (mp, drv, st) in enumerate(stores, 1):
-            mine = _paths_under(exp, mp)
-            if mine:
-                where = ("整个盘" if any(p.rstrip("/") == mp.rstrip("/") for p in mine)
-                         else "、".join(mine))
-                mark = f"{GREEN}✔ 扫{RST}  {DIM}{where}{RST}"
-            elif auto:
-                mark = f"{GREEN}✔ 扫{RST}  {DIM}整个盘（自动）{RST}"
-            else:
-                mark = f"{DIM}✖ 不扫{RST}"
-            # 【别把 status 当实时状态】它是【存储初始化那一刻】写进去的，
-            # 之后网盘恢复了也不会自己改回 work。写成"存储没挂上"就是拿一条
-            # 陈年记录冒充当前故障 —— 实测那个盘列目录 0.4 秒、换直链 0.2 秒，
-            # 好得很，这一行却红着说它没挂上。「2 使用信息」和体检早就按
-            # "上次初始化时报过错" 措辞了，这里当初没跟上。
-            # 也不打印 status 原文：那是整条 Go 错误，里面带着 access_token，
-            # 而这一屏是会被截图的。要看细节去「6 链路体检」。
-            bad = (f"  {DIM}上次初始化报过错{RST}" if st != "work" else "")
-            # 中文名打头（一眼认得是哪个盘），挂载路径跟在后面 ——
-            # 同一种网盘挂两个账号时，只有它能把两行分开
-            print(f"  {i:>2}. {pad(driver_cn(drv), 20)}{DIM}{pad(mp, 14)}"
-                  f"{pad(drv, 17)}{RST}{mark}{bad}")
-        print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 20)}"
-              f"{DIM}{pad('', 31)}{RST}"
-              + (f"{GREEN}当前：开{RST}" if auto else f"{DIM}当前：关{RST}")
-              + f"  {DIM}没单独设过的盘归它管{RST}")
+            where = _scan_of(mp)
+            col = CYAN if where != "未加路径" else DIM
+            bad = f"  {DIM}上次初始化报过错{RST}" if st != "work" else ""
+            print(f"  {i:>2}. {pad(driver_cn(drv), 24)}{col}{where}{RST}{bad}")
+        print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
+              + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
         print("-" * 60)
-        print(f"  {DIM}输编号进那个盘的设置　0 = 返回{RST}")
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
