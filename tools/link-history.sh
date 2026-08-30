@@ -23,7 +23,7 @@ LINES="${2:-20000}"
 # 【把版本打出来】这些脚本是 curl 下来跑的，而 raw 有 CDN 缓存：改完立刻拉，
 # 拿到的可能还是几分钟前那份。跑出来的结果对不上，人只会以为"改了没用"。
 # 屏幕上有个版本号，一眼就能分清是"没改对"还是"拿的是旧的"。
-TOOL_VER="2026-08-30c"
+TOOL_VER="2026-08-30d"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 command -v docker >/dev/null 2>&1 || { echo "✖ 没有 docker"; exit 1; }
@@ -235,9 +235,13 @@ if [ -z "$KEY" ]; then
   exit 0
 fi
 
-python3 - "$KEY" "$Q" <<'PY2'
-import json, re, sys, time, urllib.request, urllib.error
-KEY, Q = sys.argv[1], sys.argv[2]
+DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' \
+             "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"
+[ -n "$DATA_ROOT" ] || DATA_ROOT="${MS_DIR:-/opt/media-stack}/media"
+
+python3 - "$KEY" "$Q" "$DATA_ROOT" <<'PY2'
+import json, os, re, sys, time, urllib.request, urllib.error
+KEY, Q, DATA_ROOT = sys.argv[1], sys.argv[2], sys.argv[3]
 EMBY, MW = "http://127.0.0.1:8096", "http://127.0.0.1:9000"
 B, D, R, G, Y, C, X = ("\033[1m", "\033[2m", "\033[31m", "\033[32m",
                        "\033[33m", "\033[36m", "\033[0m")
@@ -262,6 +266,34 @@ if len(hit) > 1:
 it = hit[0]
 iid = it.get("Id")
 print(f"  {B}{it.get('Name')}{X}  {D}条目 {iid}{X}")
+
+# 【先看 strm 文件本身】MediaWarp 走的是 alist_strm，而它【只认路径形式】。
+# strm 里要是留着 URL 形式（老版本生成的、或者补时长那几秒被打断留下的残留），
+# MediaWarp 会把整条 URL 当成网盘路径去查，查不到就不 302 —— 播放器一直转圈，
+# 而挂载页面照样能播，因为那条路根本不经过 MediaWarp。
+# 这个组合极具迷惑性，所以在量速度之前先把它排掉。
+cpath = str(it.get("Path") or "")
+hpath = (DATA_ROOT.rstrip("/") + "/strm/" + cpath[len("/data/strm/"):]
+         if cpath.startswith("/data/strm/") else "")
+body = ""
+if hpath and os.path.isfile(hpath):
+    try:
+        body = open(hpath, encoding="utf-8", errors="replace").read().strip()
+    except OSError:
+        body = ""
+    if not body:
+        print(f"  {R}✖ strm 文件是空的{X}  {D}{hpath}{X}")
+    elif body.lower().startswith(("http://", "https://")):
+        print(f"  {R}✖ strm 是 URL 形式{X}  {D}{body[:70]}…{X}")
+        print(f"  {D}MediaWarp 的 alist_strm 只认路径形式，拿到 URL 会当成网盘路径"
+              f"去查，查不到就不 302 —— 正好是「挂载能播、Emby 转圈」。{X}")
+        print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，它开头会把所有 strm "
+              f"统一回路径形式{X}")
+    else:
+        print(f"  {D}strm 路径形式 ✔  {body[:70]}{X}")
+elif hpath:
+    print(f"  {R}✖ 宿主机上找不到这个 strm{X}  {D}{hpath}{X}")
+    print(f"  {D}Emby 库里有条目、磁盘上没文件 —— 点「5 生成媒体库」重建{X}")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -289,8 +321,11 @@ el = time.time() - t0
 if not loc:
     print(f"  {R}✖ 没拿到 302{X}（HTTP {code}，用了 {el:.1f} 秒）")
     print(f"  {D}换不到直链，点开就一直转圈。这不是快慢的问题。{X}")
-    print(f"  {D}下一步：跑「6 链路体检」看那个存储的实测结果；"
-          f"存储是好的就 docker restart mediawarp{X}")
+    if body.lower().startswith(("http://", "https://")):
+        print(f"  {D}上面已经指出原因了：strm 是 URL 形式。{X}")
+    else:
+        print(f"  {D}下一步：跑「6 链路体检」看那个存储的实测结果；"
+              f"存储是好的就 docker restart mediawarp{X}")
     raise SystemExit
 
 host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
