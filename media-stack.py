@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.42"
+SCRIPT_VERSION = "1.5.43"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7123,7 +7123,10 @@ def do_strm():
     # 先清缓存再扫。放在"有人在看片"那一问之后 —— 那一问可能直接退出，
     # 没必要为一次被取消的扫描去重启两个容器。
     try:
-        clear_dir_cache(d)
+        # 只清【这次真要扫的那几个盘】。别的盘的缓存没有理由跟着遭殃 ——
+        # 缓存命中的列目录不碰网盘接口，而列目录正是被限流的那一个。
+        clear_dir_cache(d, {"/" + m for m in
+                            (strm_mount_dir(p) for p in effective_scan_paths(d)) if m})
     except Exception as e:
         warn(f"清目录缓存失败（不影响扫描，但刚加的片子可能看不见）：{_short_err(e)}")
 
@@ -8318,16 +8321,63 @@ def _apply_dir_cache(d, stores, want, quiet=False):
     return n
 
 
-def clear_dir_cache(d):
-    """把 OpenList 的目录缓存清掉（重启它），然后重启 MediaWarp。返回成没成。
+def reload_storages(d, mounts):
+    """把这几个挂载点的存储【停用再启用】—— 等于只清掉它们的目录缓存。返回清了几个。
+
+    这是 OpenList 网页上「重新加载存储」那个操作的接口版。比 docker restart openlist
+    好在三处：
+      · 不重启容器，MediaWarp 手里的 OpenList 令牌照样有效 —— 也就不用跟着重启它，
+        更不会再出现"等了 90 秒没等到 → 一整批片子全 404"那种连锁
+      · 只动指定的盘。别的盘缓存留着，而缓存命中的列目录根本不碰网盘接口，
+        列目录恰恰是被限流的那一个
+      · 快：两个 HTTP 请求，不用等容器起来
+
+    接口路径各版本不一定一样，所以任何一步不成就返回 0，让调用方退回重启那条路。
+    """
+    want = {m for m in mounts if m}
+    if not want:
+        return 0
+    ids = [(sid, mp) for sid, mp, _drv, _min in dir_cache_storages(d) if mp in want]
+    if not ids:
+        return 0
+    pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
+                  fallback=os.path.join(d, ".env"))
+    try:
+        tok = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+                       timeout=15).get("data") or {}).get("token", "")
+    except Exception:
+        return 0
+    if not tok:
+        return 0
+    n = 0
+    for sid, mp in ids:
+        try:
+            for act in ("disable", "enable"):
+                r = _ol_api(f"/api/admin/storage/{act}?id={sid}", {}, tok, timeout=60)
+                if r.get("code") != 200:
+                    raise RuntimeError(r.get("message", act)[:60])
+            n += 1
+        except Exception as e:
+            warn(f"重新加载 {mp} 失败：{_short_err(e)}")
+    return n
+
+
+def clear_dir_cache(d, mounts=()):
+    """把目录缓存清掉，让刚加的片子当场看得见。返回成没成。
 
     【为什么"生成媒体库"必须先做这一步】目录缓存是 12 小时。用户刚往网盘里丢了一集，
     OpenList 手里还是几小时前那份目录，AutoFilm 去列目录当然看不见新文件 —— 于是点了
-    「生成媒体库」，跑得好好的，一个新片子都没多。缓存是内存里的，重启就没了。
+    「生成媒体库」，跑得好好的，一个新片子都没多。缓存是内存里的，清掉才看得见。
 
-    MediaWarp 得跟着重启，理由见 restart_mediawarp_when_ready()。
+    优先只重新加载【要扫的那几个盘】（见 reload_storages）。整个重启 OpenList 是退路：
+    它会把所有盘的缓存一起清掉，还会作废 MediaWarp 的登录令牌、逼它跟着重启。
     """
     info("清一次目录缓存（不然刚加的片子要等缓存过期才看得见）...")
+    n = reload_storages(d, mounts)
+    if n:
+        ok(f"{n} 个网盘的目录缓存已清{DIM}（只重新加载了这几个盘，"
+           f"没重启容器，别的盘不受影响）{RST}")
+        return True
     subprocess.run(["docker", "restart", "openlist"], capture_output=True, timeout=120)
     if not restart_mediawarp_when_ready(d, quiet=True):
         warn("缓存是清掉了，但 MediaWarp 没重启 —— 见上一行。")
@@ -11634,6 +11684,29 @@ def do_healthcheck():
         _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「5 生成媒体库」")
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
                      "跑一次「7 更新」会自动补上"))
+
+    # ---- 网盘扫描（AutoFilm 自己的定时任务）----
+    # 【这一行以前没有，而它才是"新片子会不会自己进来"的答案】上面那些定时任务都是
+    # 脚本自己的 cron，唯独"去网盘里找新文件、生成 strm"这件事是 AutoFilm 按【它自己
+    # 配置里的 cron】跑的，脚本这边一行都没报过。于是"我记得设过凌晨自动扫描，还在不在"
+    # 这种问题，体检答不上来 —— 而这恰恰是最常被问到的一条。
+    _af = os.path.join(d, "autofilm", "config", "config.yaml")
+    _afc = ""
+    try:
+        _m = re.search(r"^\s*cron:\s*[\"']?([^\"'#\n]+)", open(_af, encoding="utf-8").read(),
+                       re.M)
+        _afc = (_m.group(1).strip() if _m else "")
+    except OSError:
+        pass
+    if not _afc:
+        _hc("网盘扫描", "warn", "读不到 AutoFilm 的定时配置 —— 新片子可能不会自己进来")
+        todo.append(("AutoFilm 的定时扫描读不到，新加的片子不会自动进 Emby",
+                     "跑一次「7 更新」会按当前版本重新生成它的配置"))
+    else:
+        _hc("网盘扫描", "ok" if "autofilm" in running else "bad",
+            f"AutoFilm {cron_human(_afc)}"
+            + ("" if "autofilm" in running else f"　{RED}容器没在跑{RST}")
+            + f"　{DIM}新片子靠它变成 strm；等不及就点「5 生成媒体库」{RST}")
 
     # 【自动更新只管脚本】这一行要说清楚这个边界，否则用户看到"自动更新 ✔"
     # 会以为镜像也在自动跟，然后一年不点「7 更新」
