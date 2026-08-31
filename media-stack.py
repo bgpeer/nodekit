@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.40"
+SCRIPT_VERSION = "1.5.41"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -219,8 +219,7 @@ def save_ms_state(install_dir=None, **extra):
     cur.update(extra)
     try:
         os.makedirs(BGP_DIR, exist_ok=True)
-        with open(MS_STATE, "w") as f:
-            json.dump(cur, f, ensure_ascii=False, indent=2)
+        write_atomic(MS_STATE, json.dumps(cur, ensure_ascii=False, indent=2) + "\n")
     except OSError:
         pass
 
@@ -308,6 +307,35 @@ def acme_has_cf_creds():
 
 
 # ============================================================================ .env 读写
+def write_atomic(path, text, mode=0o644):
+    """写文件：先写同目录的临时文件、落盘，再原子改名顶上去。
+
+    直接 open(path, "w") 的毛病是它【先把文件清成 0 字节】再写 —— 中间那一瞬间进程要是
+    没了（cron 的 timeout 杀、被 OOM 杀、断电、磁盘满），磁盘上留下的就是一个空文件。
+    而读它的那一方多半会把"读不出来"当成"本来就没有"，于是安静地按默认值继续跑。
+    这个仓库为这一条踩过两次：mediawarp 的配置被写空、观看进度的备份表被清掉。
+
+    改名是原子的：要么还是旧的那份，要么是完整的新的，没有中间态。
+    fsync 也不能省 —— 只 write 不 flush 的话，改名可能先于数据落盘，断电后同样是空文件。
+    mode 在【打开的时候】就定死：.secrets 里是密码和 API Key，不能先落地成 0644 再 chmod，
+    那个时间窗里谁都读得到。
+    """
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode),
+                       "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def read_env(path, key, fallback=""):
     """先读 path，没有就读 fallback（老版本把密码写在 .env 里，要能迁移过来）。"""
     for p in (path, fallback):
@@ -2877,8 +2905,7 @@ def _progress_map(d):
 
 def _save_progress_map(d, m):
     try:
-        with open(os.path.join(d, PROGRESS_MAP), "w", encoding="utf-8") as f:
-            json.dump(m, f, ensure_ascii=False)
+        write_atomic(os.path.join(d, PROGRESS_MAP), json.dumps(m, ensure_ascii=False))
     except OSError:
         pass
 
@@ -4984,8 +5011,7 @@ def do_update(from_menu=False):
             err(f"生成 {svc} 配置失败：{e}")
             warn(f"{path} 保持原样没动，更新继续往下走。")
             continue
-        with open(path, "w") as f:
-            f.write(text)
+        write_atomic(path, text)
         subprocess.run(["docker", "restart", svc], capture_output=True)
     if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
         warn("MediaWarp 的 Emby API Key 是空的，302 直链不会生效。")
@@ -5281,28 +5307,25 @@ def main():
     ok(f"目录就绪：配置在 {cfg['install_dir']}，媒体在 {cfg['data_root']}")
 
     # ---- 写 .env / compose / 各服务配置 ----
-    with open(env_file, "w") as f:
-        f.write(f"""PUID={cfg['puid']}
+    write_atomic(env_file, f"""PUID={cfg['puid']}
 PGID={cfg['pgid']}
 TZ={cfg['tz']}
 DATA_ROOT={cfg['data_root']}
 DOMAIN={cfg['domain']}
-""")
-    os.chmod(env_file, 0o600)
+""", 0o600)
 
     # 密码写进独立的 .secrets（不给 docker compose 读），重跑时靠它沿用
-    with open(secret_file, "w") as f:
-        f.write("# 由 media-stack.py 生成，供重跑时沿用已有密码。别手改。\n"
-                f"OPENLIST_PASS={cfg['ol_pass']}\n"
-                f"BA_USER={cfg['ba_user']}\n"
-                f"BA_PASS={cfg['ba_pass']}\n")
-    os.chmod(secret_file, 0o600)
+    write_atomic(secret_file,
+                 "# 由 media-stack.py 生成，供重跑时沿用已有密码。别手改。\n"
+                 f"OPENLIST_PASS={cfg['ol_pass']}\n"
+                 f"BA_USER={cfg['ba_user']}\n"
+                 f"BA_PASS={cfg['ba_pass']}\n", 0o600)
     # 【这一句必须在整份重写 .secrets 之后】上面是 "w"，会把备份的 Key 一起冲掉；
     # 重跑安装的人本来就有 Key，冲掉就等于让他再去 Emby 里翻一次。
     save_emby_api_key(cfg["install_dir"], cfg.get("emby_api_key", ""))
 
-    with open(os.path.join(cfg["install_dir"], "docker-compose.yml"), "w") as f:
-        f.write(gen_compose(cfg))
+    write_atomic(os.path.join(cfg["install_dir"], "docker-compose.yml"),
+                 gen_compose(cfg))
     with open(os.path.join(cfg["install_dir"], "autofilm/config/config.yaml"), "w") as f:
         f.write(gen_autofilm_conf(cfg))
     with open(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), "w") as f:
@@ -5425,9 +5448,7 @@ def save_emby_api_key(install_dir, key):
                                if os.path.exists(sec) else [])
                  if not ln.startswith("EMBY_API_KEY=")]
         lines.append(f"EMBY_API_KEY={key}")
-        with open(sec, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        os.chmod(sec, 0o600)
+        write_atomic(sec, "\n".join(lines) + "\n", 0o600)
     except OSError:
         pass          # 存不下就算了，主存储仍然是 mediawarp 的配置
 
@@ -8743,8 +8764,7 @@ def toggle_metatube():
                 pass
         cfg = rebuild_cfg_from_disk(d)
         cfg["metatube"] = False
-        with open(os.path.join(d, "docker-compose.yml"), "w") as f:
-            f.write(gen_compose(cfg))
+        write_atomic(os.path.join(d, "docker-compose.yml"), gen_compose(cfg))
         subprocess.run(["docker", "rm", "-f", "metatube"], capture_output=True)
         _compose_up(d)
         subprocess.run(["docker", "restart", "emby"], capture_output=True)
@@ -8769,8 +8789,7 @@ def toggle_metatube():
     cfg = rebuild_cfg_from_disk(d)
     cfg["metatube"] = True
     os.makedirs(metatube_dir(d), exist_ok=True)
-    with open(os.path.join(d, "docker-compose.yml"), "w") as f:
-        f.write(gen_compose(cfg))
+    write_atomic(os.path.join(d, "docker-compose.yml"), gen_compose(cfg))
     info("启动 MetaTube 服务端...")
     if not _compose_up(d):
         err("容器启动失败，看上面的报错。")
