@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.43"
+SCRIPT_VERSION = "1.5.44"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5043,7 +5043,7 @@ def do_update(from_menu=False):
             print(f"  {DIM}注意：本机有覆盖文件 {lib_rules_path(d, True)}，"
                   f"实际生效的是它，不是刚拉下来的这份。"
                   f"要用链接就删掉它。{RST}")
-    # 【目录缓存归脚本管，不再等用户去点】理由见 DIR_CACHE_DEFAULT 的注释。
+    # 一次性把早先版本自动设的 720 分钟迁回默认。见 dir_cache_auto_apply。
     # 放在这里是因为它要停一次 OpenList，而更新本来就在重启容器。
     try:
         dir_cache_auto_apply(d)
@@ -8270,15 +8270,21 @@ def link_method_storages(d):
 # 缓存命中的列目录不吃网盘接口，也就不会被限流 —— 这是对着"列目录慢/失败"最直接的一招，
 # 比调预热频率对症得多（预热走的是换直链，那条路本来就没问题）。
 # 代价：网盘里新增或改名的文件最多要等这么久才被看见，而 AutoFilm 有自己的定时扫描。
-DIR_CACHE_PRESETS = ((30, "OpenList 默认"), (120, "2 小时"),
-                     (720, "12 小时　推荐"), (1440, "24 小时"))
-# 【这一项脚本自己设，不该等用户去点】判断标准是这套东西一直在用的那条：每个库答案不一样
-# 的进 yaml，所有网盘库答案都一样的写进代码统一设。30 分钟对【每一个】网盘存储都是错的
-# 答案 —— 它不是偏好，是这套架构（跨境 + 网盘按账号限流）下的必备设置。
-# 而且有反证：体检连着五天报"目录缓存偏短"，用户一次都没去点。一个正确答案唯一的、放在
-# 三级菜单里的开关，本身就是错的设计。
-# 用户在菜单里手动改过之后就不再自动动它（ms_state 的 dir_cache_manual）。
-DIR_CACHE_DEFAULT = 720
+DIR_CACHE_PRESETS = ((1, "基本实时　新片点进去就看得见"), (30, "OpenList 默认"),
+                     (120, "2 小时"), (720, "12 小时　少打网盘接口"))
+# 【这一项脚本【不再】替用户拿主意】曾经自动把所有存储调到 720 分钟，理由是"少打被限流
+# 的列目录接口"。那个理由本身没错，但它把代价算漏了：网盘里刚加的片子，OpenList 自己
+# 【整整半天看不见】—— 点进去没有、刷新也没有，而用户记忆里这套东西一直是"点进去就能看到
+# 新片"的。用户的原话：「实在不行就不要了，让他实时连着」。
+#
+# 这不是一个"正确答案唯一"的设置，是个取舍，而且两头都很实在：
+#   短 → 新片马上看得见，代价是列目录多走真实接口，赶上限流就慢/失败
+#   长 → 列目录几乎不碰网盘接口，代价是新片要等缓存过期才看得见
+# 取舍归用户，脚本只把两头的代价说清楚。默认跟 OpenList 自己的 30 分钟走。
+DIR_CACHE_DEFAULT = 30
+# 我曾经自动写下去的那个值。只用来认出"这台机器上的 720 是脚本设的、不是用户设的"，
+# 好把它迁回默认 —— 用户自己选的 720 不会被碰（他一选就有 dir_cache_manual）。
+DIR_CACHE_WAS_AUTO = 720
 
 
 def _apply_dir_cache(d, stores, want, quiet=False):
@@ -8365,9 +8371,9 @@ def reload_storages(d, mounts):
 def clear_dir_cache(d, mounts=()):
     """把目录缓存清掉，让刚加的片子当场看得见。返回成没成。
 
-    【为什么"生成媒体库"必须先做这一步】目录缓存是 12 小时。用户刚往网盘里丢了一集，
-    OpenList 手里还是几小时前那份目录，AutoFilm 去列目录当然看不见新文件 —— 于是点了
-    「生成媒体库」，跑得好好的，一个新片子都没多。缓存是内存里的，清掉才看得见。
+    【为什么"生成媒体库"必须先做这一步】缓存没过期之前，OpenList 手里还是旧那份目录，
+    AutoFilm 去列目录当然看不见新文件 —— 于是点了「生成媒体库」，跑得好好的，一个新片子
+    都没多。缓存设得越长这一步越要紧。
 
     优先只重新加载【要扫的那几个盘】（见 reload_storages）。整个重启 OpenList 是退路：
     它会把所有盘的缓存一起清掉，还会作废 MediaWarp 的登录令牌、逼它跟着重启。
@@ -8387,23 +8393,31 @@ def clear_dir_cache(d, mounts=()):
 
 
 def dir_cache_auto_apply(d):
-    """把目录缓存太短的存储自动调到 DIR_CACHE_DEFAULT。返回改了几个。
+    """把【脚本当初自动写下的】720 分钟迁回默认值。返回改了几个。
 
-    用户在菜单里手动设过就不碰 —— 那是他明确表达过的选择。
-    只往【长】的方向调：比默认还长说明他自己调过或者有别的用意，别缩回来。
+    只做这一次迁移，做完就记账，以后再不碰这个值 —— 它是个取舍，归用户。
+    条件卡得很紧，宁可不做也不能改掉用户自己的选择：
+      · 手动设过（dir_cache_manual）→ 不碰
+      · 迁移过一次（dir_cache_migrated）→ 不碰
+      · 当前值不是 720 → 不碰。720 才是我当初写下去的那个数
     """
-    if ms_state().get("dir_cache_manual"):
+    st = ms_state()
+    if st.get("dir_cache_manual") or st.get("dir_cache_migrated"):
         return 0
     stores = dir_cache_storages(d)
-    low = [x for x in stores if x[3] < DIR_CACHE_DEFAULT]
-    if not low:
+    auto = [x for x in stores if x[3] == DIR_CACHE_WAS_AUTO]
+    if not auto:
+        save_ms_state(dir_cache_migrated=True)   # 没什么可迁的，也别年年再看一遍
         return 0
-    n = _apply_dir_cache(d, low, DIR_CACHE_DEFAULT)
+    warn(f"目录缓存从 {DIR_CACHE_WAS_AUTO} 分钟改回 {DIR_CACHE_DEFAULT} 分钟。")
+    print(f"  {DIM}{DIR_CACHE_WAS_AUTO} 分钟是早先版本自动设的，为的是少打被限流的"
+          f"列目录接口 —— 但代价是网盘里刚加的片子要等半天才看得见，而这一条"
+          f"当时没跟你说。{RST}")
+    n = _apply_dir_cache(d, auto, DIR_CACHE_DEFAULT)
+    save_ms_state(dir_cache_migrated=True)
     if n:
-        print(f"  {DIM}命中缓存的列目录不吃网盘接口，也就不会被限流。"
-              f"代价：网盘里新增/改名的文件最多等 {DIR_CACHE_DEFAULT // 60} 小时"
-              f"才被看见 —— 改完目录去 OpenList 把存储停用再启用就立刻清掉。{RST}")
-        print(f"  {DIM}想改回去：3 后补参数 → 6。手动设过之后就不再自动调。{RST}")
+        print(f"  {DIM}想调回长的（列目录老超时的话有用）：3 后补参数 → 6。"
+              f"手动设过之后脚本就再也不碰它。{RST}")
     return n
 
 
@@ -10790,19 +10804,16 @@ def do_healthcheck():
         if _low and hstat and hstat.get("bad"):
             # 【区分"脚本还没来得及设"和"用户自己设成这样"】前者不是待办，
             # 跑一次更新就好了；后者才需要提醒他这个值和他的线路对不上。
-            if ms_state().get("dir_cache_manual"):
-                _hc("目录缓存", "warn", f"{_txt}  {YELLOW}偏短（你手动设的）{RST}")
-                todo.append((
-                    "列目录老超时，而目录缓存偏短 —— 大部分列目录都在走真实的"
-                    "网盘接口，而网盘恰恰对这个接口限流",
-                    f"「3 后补参数 → 6 目录缓存时长」调到 {DIR_CACHE_DEFAULT}"
-                    f"（{DIR_CACHE_DEFAULT // 60} 小时）。命中缓存的列目录不吃"
-                    "网盘接口。代价是网盘里新增/改名的文件最多等这么久才被看见"
-                    " —— 改完目录去 OpenList 把存储停用再启用就立刻清掉"))
-            else:
-                _hc("目录缓存", "warn",
-                    f"{_txt}  {YELLOW}偏短，跑一次「7 更新」会自动调到"
-                    f" {DIR_CACHE_DEFAULT} 分钟{RST}")
+            # 【这里只摆事实，不再劝人调长】缓存调长确实能让列目录少碰网盘接口，
+            # 但代价是网盘里刚加的片子要等这么久才看得见 —— 而"点进去就能看到新片"
+            # 恰恰是用户对这套东西最基本的预期。两头都是实实在在的代价，
+            # 该由他自己选，体检的活是把两头说清楚，不是替他决定。
+            _hc("目录缓存", "warn",
+                f"{_txt}  {YELLOW}短缓存 + 列目录老超时{RST}"
+                f"{DIM}（大部分列目录都在走真实接口，而网盘对它限流）{RST}")
+            print(f"      {DIM}调长能少碰这个接口（3 后补参数 → 6），"
+                  f"代价是网盘里新加的片子要等这么久才看得见。{RST}")
+            print(f"      {DIM}想两头都要：缓存留短，别在凌晨扫库那会儿翻挂载。{RST}")
         else:
             _hc("目录缓存", "ok", _txt)
 
