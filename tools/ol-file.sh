@@ -14,7 +14,7 @@
 #   ③ 拉 1 MiB     慢 = 地址拿到了但拉不动，那是限速/线路
 set -u
 
-TOOL_VER="2026-08-31a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-08-31b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"
@@ -60,18 +60,51 @@ print()
 print(f"  {B}{path}{X}")
 print("=" * 58)
 
-# ---- ① 列父目录。带 refresh，问的是"网盘此刻答不答得动"，不是缓存 ----
+# ---- ① 列目录。带 refresh 才是问网盘，不带就是读缓存 ----
+#
+# 【名字要打出来，不能只报个数】"新加的文件夹刷不出来"这种问题，只有把强制刷新之后
+# 网盘【真正返回】的那份名单摆在眼前，才分得清是"缓存旧了"还是"网盘自己就没给"。
+# 报一个总数等于什么都没说。
+#
+# 给的路径是文件夹就列它自己，是文件就列它所在的那一层 —— 不靠扩展名猜，
+# 先按文件夹试一次，OpenList 说不是文件夹再退回上一层。
+target, is_file = path, False
 try:
-    r, t = api("/api/fs/list", {"path": parent, "password": "", "page": 1,
-                                "per_page": 1, "refresh": True})
-    n = (r.get("data") or {}).get("total", 0) if r.get("code") == 200 else 0
+    r, t = api("/api/fs/list", {"path": target, "password": "", "page": 1,
+                                "per_page": 100, "refresh": True})
+    if r.get("code") != 200:
+        target, is_file = parent, True
+        r, t = api("/api/fs/list", {"path": target, "password": "", "page": 1,
+                                    "per_page": 100, "refresh": True})
     if r.get("code") == 200:
+        data = r.get("data") or {}
+        items = data.get("content") or []
         c = G if t < 5 else (Y if t < 20 else R)
-        print(f"  ① 列父目录    {c}{t:6.1f} 秒{X}  {n} 项")
+        print(f"  ① 列目录      {c}{t:6.1f} 秒{X}  {data.get('total', len(items))} 项"
+              f"  {D}{target}{X}")
+        want = path.rsplit("/", 1)[-1] if is_file else ""
+        for it in items[:40]:
+            nm = str(it.get("name") or "")
+            mark = f"  {G}← 就是它{X}" if nm == want else ""
+            kind = "📁" if it.get("is_dir") else "  "
+            print(f"       {kind} {nm}{mark}")
+        if len(items) > 40:
+            print(f"       {D}…另外 {len(items) - 40} 个{X}")
+        if want and not any(str(i.get('name') or '') == want for i in items):
+            print(f"       {R}✖ 刷新之后网盘也没给出「{want}」{X}")
     else:
-        print(f"  ① 列父目录    {R}失败{X}  {str(r.get('message'))[:60]}  ({t:.1f} 秒)")
+        print(f"  ① 列目录      {R}失败{X}  {str(r.get('message'))[:60]}  ({t:.1f} 秒)")
+        is_file = True
 except Exception as e:
-    print(f"  ① 列父目录    {R}没回话{X}  {type(e).__name__}")
+    print(f"  ① 列目录      {R}没回话{X}  {type(e).__name__}")
+    is_file = True
+
+if not is_file:
+    print()
+    print(f"  {D}上面这份是【强制刷新后网盘真正返回的】名单。{X}")
+    print(f"  {D}要找的文件夹不在里面 = 网盘那边就没有（分享目录的自动更新还没同步、{X}")
+    print(f"  {D}或者转存进的是另一个目录），跟本机的缓存无关，清缓存也变不出来。{X}")
+    raise SystemExit(0)
 
 # ---- ② fs/get：网页点开文件卡住的就是这一下 ----
 raw = ""
