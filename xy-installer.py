@@ -3307,10 +3307,18 @@ def ensure_remote_script(url, local):
         sep = "&" if "?" in url else "?"
         body = fetch_url(f"{url}{sep}_t={int(time.time())}")
         if body.strip():
+            # 【换上去之前先编译一遍】拉到的可能是半截文件、一页 404、或者限流提示，
+            # 而"非空"拦不住这些。四个远程脚本都是 .py，语法层面的坏当场就能查出来 ——
+            # 查出来就整个放弃，本地那份一个字节都不动，菜单照常能用旧版进去。
+            # media-stack 自己的 selfupdate 早就是这么做的，这条路一直漏着。
+            compile(body, local, "exec")
             tmp = local + ".new"
             with open(tmp, "w") as f:
                 f.write(body)
             os.replace(tmp, local)
+    except SyntaxError as e:
+        print(f"  \033[33m⚠\033[0m 拉到的 {os.path.basename(local)} 语法不对"
+              f"（第 {e.lineno} 行），没有替换本地那份，继续用现有版本。")
     except Exception:
         pass
     return os.path.exists(local) and os.path.getsize(local) > 0
