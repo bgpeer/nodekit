@@ -14,7 +14,7 @@
 #   ③ 拉 1 MiB     慢 = 地址拿到了但拉不动，那是限速/线路
 set -u
 
-TOOL_VER="2026-08-31c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-08-31d"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"
@@ -35,14 +35,30 @@ path = os.environ["OL_PATH"]
 parent = path.rsplit("/", 1)[0] or "/"
 
 
-def api(p, body, tok=None, timeout=180):
+# 【令牌从全局取，不靠调用方记得传】上一版把 tok 做成了可选参数，然后 fs/list 和
+# fs/get 两处都忘了传 —— 请求以游客身份发出去，OpenList 当场回
+# "Guest user is disabled, login please"，耗时 0.0 秒。于是那几行看着像"网盘拒绝了"，
+# 其实一步都没走到网盘。这种"测了个寂寞还打印得像模像样"的输出比不测更坏。
+TOKEN = ""
+
+
+def api(p, body=None, timeout=180, method="POST"):
+    """调 OpenList 的接口。GET 的参数拼在 p 里，POST 的放 body。"""
+    data = json.dumps(body or {}).encode() if method == "POST" else None
     req = urllib.request.Request(
-        BASE + p, data=json.dumps(body).encode(), method="POST",
+        BASE + p, data=data, method=method,
         headers={"Content-Type": "application/json",
-                 **({"Authorization": tok} if tok else {})})
+                 **({"Authorization": TOKEN} if TOKEN else {})})
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace")), time.monotonic() - t0
+        raw = r.read().decode("utf-8", "replace")
+    el = time.monotonic() - t0
+    try:
+        return json.loads(raw), el
+    except ValueError:
+        # 【别把非 JSON 一句 JSONDecodeError 带过】接口路径或方法用错时返回的是一页
+        # HTML，而"问不到状态"这四个字完全看不出是哪种错。原样给回前几十个字符。
+        return {"code": -1, "message": f"返回的不是 JSON：{raw[:80]}"}, el
 
 
 # ---- OpenList 自己说了什么。上面那几行是"卡在哪"，这一段才是"为什么" ----
@@ -88,7 +104,13 @@ def show_logs():
         if not bad:
             print(f"  {G}✔{X} 最近 10 分钟没有报错 —— 那就不是 OpenList 这一层的问题")
         for ln in bad[-12:]:
-            print(f"  {D}·{X} {clean(ln)[:200]}")
+            # 【长行要留头也留尾】RESTY 那种行把整条 URL 铺在中间，而【失败的原因】
+            # 在最末尾。上一版直接砍前 200 字，砍掉的正好是唯一有用的那半句 ——
+            # 屏幕上剩一堆 access_token=***&app_ver=… 什么都说明不了。
+            ln = clean(ln)
+            if len(ln) > 190:
+                ln = ln[:110] + f" {D}…{X} " + ln[-80:]
+            print(f"  {D}·{X} {ln}")
         if len(bad) > 12:
             print(f"  {D}…另外 {len(bad) - 12} 行：docker logs --since 10m openlist{X}")
     except FileNotFoundError:
@@ -106,11 +128,11 @@ def show_logs():
 try:
     r, _ = api("/api/auth/login", {"username": "admin", "password": os.environ["OL_PW"]},
                timeout=20)
-    tok = (r.get("data") or {}).get("token", "")
+    TOKEN = (r.get("data") or {}).get("token", "")
 except Exception as e:
     print(f"{R}✖{X} 连不上 OpenList：{e}")
     raise SystemExit(1)
-if not tok:
+if not TOKEN:
     print(f"{R}✖{X} OpenList 登录失败（密码对不上？）")
     raise SystemExit(1)
 
@@ -124,7 +146,9 @@ print("=" * 58)
 # 拿它当实时状态用会把陈年记录报成当前故障。接口给的这份才是此刻的。
 mount = ""
 try:
-    r, _ = api("/api/admin/storage/list", {"page": 1, "per_page": 100}, tok, timeout=30)
+    # 这个接口是 GET，参数拼在 URL 上。上一版 POST 过去拿回一页 HTML，
+    # 于是只报了一句没头没脑的 JSONDecodeError。
+    r, _ = api("/api/admin/storage/list?page=1&per_page=100", timeout=30, method="GET")
     for st in ((r.get("data") or {}).get("content") or []):
         mp = str(st.get("mount_path") or "")
         if path == mp or path.startswith(mp.rstrip("/") + "/"):
@@ -154,6 +178,13 @@ target, is_file = path, False
 try:
     r, t = api("/api/fs/list", {"path": target, "password": "", "page": 1,
                                 "per_page": 100, "refresh": True})
+    if r.get("code") not in (200, 500):
+        # 【认证类的错要当场停】不然后面每一步都拿同一句拒绝当"网盘的回答"，
+        # 还配上耗时和结论，越看越像网盘出了问题。
+        print(f"  ① 列目录      {R}{r.get('message')}{X}")
+        print(f"\n  {Y}这不是网盘的问题 —— 请求没被 OpenList 认下来。{X}")
+        show_logs()
+        raise SystemExit(1)
     if r.get("code") != 200:
         target, is_file = parent, True
         r, t = api("/api/fs/list", {"path": target, "password": "", "page": 1,
