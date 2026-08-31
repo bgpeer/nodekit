@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.39"
+SCRIPT_VERSION = "1.5.40"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10317,6 +10317,69 @@ def stack_versions(key=""):
     return {k: v for k, v in out.items() if v}
 
 
+def _up_minutes(status):
+    """把 docker 的「Up 12 minutes」换成分钟。不在跑返回 -1。"""
+    s = status or ""
+    if not s.startswith("Up"):
+        return -1
+    m = re.search(r"(\d+)\s*(second|minute|hour|day|week|month)", s)
+    if not m:
+        return 60 if "hour" in s else 1440      # 「Up About an hour」这种没有数字
+    return int(m.group(1)) * {"second": 0, "minute": 1, "hour": 60,
+                              "day": 1440, "week": 10080, "month": 43200}[m.group(2)]
+
+
+def container_health(names):
+    """每个容器：(名字, 起来多少分钟, 重启过几次, 是不是被 OOM 杀过)。取不到就不返回那条。
+
+    RestartCount 和 OOMKilled 是【累计】的，容器不重建就一直留着 —— 正好是"经常断开"
+    这种间歇故障需要的证据：事后去看，进程是好好跑着的，只有这两个数字记得发生过什么。
+    """
+    if not names:
+        return []
+    st = {}
+    r = sh("docker ps --format '{{.Names}}\t{{.Status}}'", timeout=30)
+    for line in (r.stdout or "").splitlines():
+        p = line.split("\t")
+        if len(p) == 2:
+            st[p[0].strip()] = p[1].strip()
+    out = []
+    r = sh("docker inspect --format '{{.Name}} {{.RestartCount}} {{.State.OOMKilled}}' "
+           + " ".join(names), timeout=30)
+    for line in (r.stdout or "").splitlines():
+        p = line.split()
+        if len(p) != 3:
+            continue
+        nm = p[0].lstrip("/")
+        try:
+            cnt = int(p[1])
+        except ValueError:
+            cnt = 0
+        out.append((nm, _up_minutes(st.get(nm, "")), cnt, p[2].lower() == "true"))
+    return out
+
+
+def mem_pressure():
+    """(可用内存 MB, swap 已用 MB, swap 总量 MB)。读不到返回 (0, 0, 0)。
+
+    看 MemAvailable 不看 MemFree：Linux 会把空闲内存全拿去当页缓存，MemFree 常年很小，
+    拿它判断"够不够"必然误报。MemAvailable 才是"还能给新进程用多少"。
+    """
+    v = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, rest = line.partition(":")
+                try:
+                    v[k] = int(rest.split()[0])          # kB
+                except (ValueError, IndexError):
+                    continue
+    except OSError:
+        return 0, 0, 0
+    total = v.get("SwapTotal", 0) // 1024
+    return v.get("MemAvailable", 0) // 1024, total - v.get("SwapFree", 0) // 1024, total
+
+
 def netdisk_load(d, key=""):
     """此刻还有谁在同时敲网盘。列目录慢的时候，先看这个再去怪线路。
 
@@ -10395,6 +10458,47 @@ def do_healthcheck():
         todo.append(("容器没起全", f"docker compose -f {d}/docker-compose.yml up -d"))
     else:
         _hc("容器", "ok", f"{len(want)}/{len(want)} 在跑")
+
+    # ---- 容器稳定性 ----
+    # 【"在跑"和"一直在跑"是两回事】上面那行只看此刻有没有进程。而"挂载页面经常连不上、
+    # 过一会儿又好"最典型的成因恰恰是【容器被反复重启】—— 尤其是内存不够被系统 OOM 杀掉。
+    # 每被杀一次，OpenList 的存储要重新初始化、MediaWarp 手里的登录令牌作废，表现就是
+    # 时好时坏；而等用户想起来去体检，进程早就又跑起来了，上面那行是绿的。
+    # RestartCount / OOMKilled 是累计值，是这种间歇故障事后唯一还留着的证据。
+    ch = container_health([c for c in want if c in running])
+    avail, sw_used, sw_total = mem_pressure()
+    oom = [c[0] for c in ch if c[3]]
+    many = [(c[0], c[2]) for c in ch if c[2] >= 3]
+    fresh = [(c[0], c[1]) for c in ch if 0 <= c[1] < 15]
+    mem = ""
+    if avail:
+        mem = f"内存可用 {avail} MB"
+        if sw_total:
+            mem += f"，swap {sw_used}/{sw_total} MB"
+    tight = avail and avail < 200 and sw_total and sw_used > sw_total * 0.9
+    if oom:
+        _hc("容器稳定性", "bad",
+            f"{RED}{'、'.join(oom)} 被系统 OOM 杀过{RST}"
+            + (f"　{DIM}{mem}{RST}" if mem else ""))
+        todo.append(("内存不够，容器被系统杀过（挂载时好时坏就是它）",
+                     "加 swap，或把不用的容器停掉：docker stop metatube"))
+    elif many:
+        _hc("容器稳定性", "warn",
+            "　".join(f"{n} 重启过 {c} 次" for n, c in many)
+            + (f"　{DIM}{mem}{RST}" if mem else ""))
+        todo.append(("容器反复重启 —— 挂载时断时续多半是它",
+                     f"看它为什么退出：docker logs --tail 100 {many[0][0]}"))
+    elif tight:
+        _hc("容器稳定性", "warn",
+            f"{YELLOW}内存吃紧{RST}{DIM}（{mem}）—— 还没被杀，但快了{RST}")
+        todo.append(("内存快用完了", "加 swap，或把不用的容器停掉"))
+    elif fresh:
+        _hc("容器稳定性", "warn",
+            "　".join(f"{n} {m} 分钟前刚起来" for n, m in fresh)
+            + f"　{DIM}刚重启过的话是正常的{RST}")
+    else:
+        _hc("容器稳定性", "ok",
+            "没有重启记录，也没被 OOM 杀过" + (f"　{DIM}{mem}{RST}" if mem else ""))
 
     # ---- OpenList 登录 ----
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
