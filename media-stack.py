@@ -42,7 +42,7 @@ import zipfile
 #   1.5.0 → 1.5.1 → 1.5.2 → … → 1.5.999
 # 中间那位（5）和最前面那位（1）不要自己动 —— 要动也是他说了算。
 # 加满 999 之前，任何改动都只是最后一位 +1，不管改的是一行注释还是一个模块。
-SCRIPT_VERSION = "1.5.37"
+SCRIPT_VERSION = "1.5.38"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3154,7 +3154,7 @@ def _has_progress(ud):
                 or ud.get("PlayCount"))
 
 
-def sync_progress_map(d, key):
+def sync_progress_map(d, key, just_zeroed=()):
     """记录 + 补回观看进度，按网盘路径认。返回补回了几条。
 
     一趟过，两个方向：
@@ -3166,7 +3166,11 @@ def sync_progress_map(d, key):
       · id 和记录里的【一样】 = 同一个条目，进度从有变没 = 用户自己标了未播放。
         这时候要把记录删掉，否则下一轮又给他补回去，他怎么清都清不掉。
       · id 【不一样】 = 路径变了、Emby 重新建的条目。这才是要补的。
+
+    just_zeroed 是【本轮脚本自己刚清零的条目 id】。它们看起来和"用户标了未播放"
+    一模一样，但绝不能按那条走 —— 见下面那段注释。
     """
+    just_zeroed = {str(x) for x in (just_zeroed or ())}
     if not key:
         return 0
     try:
@@ -3205,6 +3209,15 @@ def sync_progress_map(d, key):
             if not slot:
                 continue
             if slot.get("id") == iid:
+                if str(iid) in just_zeroed:
+                    # 【这个零是脚本自己刚打上去的，不是用户清的】同一轮里
+                    # clear_impossible_progress 把"位置比片长还大"的条目清了零，
+                    # 而那种脏数据几乎全是身份串台串过来的 —— 串台最爱找剧集下手
+                    # （一集 17 分钟的动画和一部 93 分钟的剧场版刮成同一个 id）。
+                    # 要是把这个零当成"用户标了未播放"，连备份记录一起删掉，
+                    # 这一集就【连底稿都没了】：眼前的进度没了，能救回来的那份也没了。
+                    # 留着记录不会造成"清不掉"—— 补回只在条目 id 变了时才发生。
+                    continue
                 # 同一个条目、进度没了 = 用户自己清的，尊重他
                 m[tgt].pop(uid, None)
                 if not m[tgt]:
@@ -3220,23 +3233,42 @@ def sync_progress_map(d, key):
                 n += 1
             except Exception:
                 pass
-    # 网盘上已经没有的文件，记录也该跟着走 —— 否则这个文件只会越长越大
+    # 网盘上已经没有的文件，记录也该跟着走 —— 否则这个文件只会越长越大。
+    #
+    # 【但"这次没扫到"绝不能当成"文件没了"】判据是本地 strm 目录，而它恰恰在
+    # 最需要备份的那一刻最不可信：AutoFilm 正在按新配置重新生成（旧的删了、新的
+    # 还没写回）、目录没挂上、权限不对、磁盘满了 —— 每一种都会让这趟只数到零星
+    # 几个，于是整张表被判成"全没了"，一次清空。
+    # 而这张表是【进度丢了之后唯一能补回来的东西】，清空它等于把底稿一起烧了。
+    # 两边的代价根本不对等：多留几条废记录只是 json 大一点；删错一条是用户
+    # 几百集的观看记录再也回不来。所以只在【确实数清楚了】的时候才删。
     if len(m) > 200:
+        root = os.path.join(strm_root(d), STRM_SUBDIR)
+        counted = os.path.isdir(root)
         alive = set()
-        for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
-            for f in fs:
-                if not f.endswith(".strm"):
-                    continue
-                try:
-                    with open(os.path.join(dp, f), encoding="utf-8") as fh:
-                        alive.add(strm_target_path(fh.read()))
-                except OSError:
-                    pass
-        gone = [k for k in m if k not in alive]
-        if gone:
-            for k in gone:
-                m.pop(k, None)
-            dirty = True
+        if counted:
+            def _walk_failed(_e):
+                # os.walk 默认把出错的目录【静悄悄跳过】—— 那正是最危险的形状：
+                # 少数了一批，却看不出少数过。出一次错这趟就整个不算数。
+                nonlocal counted
+                counted = False
+            for dp, _dn, fs in os.walk(root, onerror=_walk_failed):
+                for f in fs:
+                    if not f.endswith(".strm"):
+                        continue
+                    try:
+                        with open(os.path.join(dp, f), encoding="utf-8") as fh:
+                            alive.add(strm_target_path(fh.read()))
+                    except OSError:
+                        counted = False      # 读不出来的那份，不能算它"没了"
+        # alive 是【所有】strm 的目标，m 只装看过的那些，正常情况下 alive 远大于 m。
+        # 反过来说明这趟数得不对（目录空了一半、正在重建），宁可不删。
+        if counted and len(alive) >= len(m):
+            gone = [k for k in m if k not in alive]
+            if gone:
+                for k in gone:
+                    m.pop(k, None)
+                dirty = True
     if dirty:
         _save_progress_map(d, m)
     if n:
@@ -4490,13 +4522,15 @@ def align_library(d, key, heal=True):
         warn(f"给剧集 strm 补季集编号失败：{_short_err(e)}")
     apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
     split_shared_identities(d, key)   # 条目级：进度条身份互相独立
-    clear_impossible_progress(key)    # 条目级：清掉位置 > 片长的脏数据
+    # 条目级：清掉位置 > 片长的脏数据。清了哪些要往下传 —— 下面那步得知道
+    # 这些"没进度"是脚本自己刚打的零，不是用户标的未播放
+    zeroed = clear_impossible_progress(key)
     # 库选项改过就必须重扫（见上），哪怕文件数一个没变
     scan_if_grown(d, key, force=bool(n_tuned))
     # 【必须排在扫描之后】路径变过的条目要等 Emby 重新扫出来才找得到。
     # 这一趟同时做两件事：把现有进度记下来，把新条目缺的补回去。
     try:
-        sync_progress_map(d, key)
+        sync_progress_map(d, key, just_zeroed=zeroed)
     except Exception as e:
         warn(f"同步观看进度失败：{_short_err(e)}")
 
@@ -5994,7 +6028,11 @@ def shared_identity_items(key):
 
 
 def clear_impossible_progress(key):
-    """把「续播点比片长还大」的记录清零。返回清了几个。
+    """把「续播点比片长还大」的记录清零。返回被清零的条目 id 集合。
+
+    【返回 id 而不是个数】清零之后，这些条目在 Emby 眼里就成了"没有进度"，和
+    用户自己标未播放长得一模一样。紧跟着跑的 sync_progress_map 必须能把两者分开，
+    否则它会把备份记录也一起删掉 —— 见那边 just_zeroed 那段。
 
     这种记录在物理上不可能，一定是别的条目串过来的（见 split_shared_identities：
     两个文件刮到同一个身份时 Emby 让它们共用一份观看进度）。界面上的表现是
@@ -6011,11 +6049,11 @@ def clear_impossible_progress(key):
         libs = _emby("/Library/VirtualFolders", key)
         users = _emby("/Users", key)
     except Exception:
-        return 0
+        return set()
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
-        return 0
-    n, failed = 0, []
+        return set()
+    n, failed, zeroed = 0, [], set()
     for lb in libs:
         pid = lb.get("ItemId")
         if not pid or not is_strm_lib(lb):
@@ -6050,6 +6088,7 @@ def clear_impossible_progress(key):
                 failed.append((nm[:22], f"清了但回读还是 {still / 6e8:.1f} 分"))
                 continue
             n += 1
+            zeroed.add(str(iid))
             print(f"  {DIM}·{RST} {nm[:26]}  续播点 {pos / 6e8:.1f} 分 → 0"
                   f"{DIM}（片长只有 {run / 6e8:.1f} 分）{RST}")
     if failed:
@@ -6060,7 +6099,7 @@ def clear_impossible_progress(key):
               f"多数版本会连带把位置清掉。{RST}")
     if n:
         ok(f"清掉 {n} 个不可能的续播点（位置比片长还大）")
-    return n
+    return zeroed
 
 
 # 三种写法都要认。只写成对标签的话，自闭合和空标签会漏网 —— 实测漏掉一行之后
