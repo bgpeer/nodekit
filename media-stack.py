@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.44"
+SCRIPT_VERSION = "1.5.45"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1319,6 +1319,9 @@ WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段�
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
 SYNC_HOUR_CST  = "05:45"
+# 刷目录缓存的时刻。必须【早于】AutoFilm 生成 strm 的 05:15（见 DEFAULT_STRM_CRON），
+# 又不必太早 —— 刷完到开扫之间隔得越久，这中间新加的片子越可能又赶不上。5 分钟够。
+PRECACHE_HOUR_CST = "05:10"
 # 自动更新【只换脚本，不动容器、不重生成配置】。放在每日对齐之前一点，
 # 换完那一轮对齐就是新版脚本在跑。见 do_selfupdate 里为什么只换脚本。
 SELFUP_HOUR_CST = "05:15"
@@ -1347,6 +1350,7 @@ CRON_TIMEOUT   = {
     # 不该在任务正常收尾之前把它砍了
     "heal":      HEAL_BG_BUDGET_T,
     "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
+    "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
 }
 
 
@@ -1873,12 +1877,17 @@ def install_sync_cron(install_dir):
         各自一份的，而加库的动作在 Emby 里做，脚本这边毫无感知
     """
     m, h = cst_to_local_cron(SYNC_HOUR_CST)
+    pm, ph = cst_to_local_cron(PRECACHE_HOUR_CST)
     try:
-        txt = (f"# media-stack 每天自动对齐：清失效 strm、给新媒体库调续播门槛、\n"
-               f"# 补时长、通知 Emby 扫描。北京时间 {SYNC_HOUR_CST}"
-               f"（本机 {h:02d}:{m:02d}），在 AutoFilm 生成 strm 之后。\n"
+        txt = (f"# media-stack 每天两件事，顺序不能反：\n"
+               f"# 北京时间 {PRECACHE_HOUR_CST}（本机 {ph:02d}:{pm:02d}）"
+               f"刷目录缓存 —— 必须排在 AutoFilm 生成 strm【之前】，否则它列到的\n"
+               f"# 是一份旧目录，新片一个都扫不进来，而任务照样报完成。\n"
+               f"# 北京时间 {SYNC_HOUR_CST}（本机 {h:02d}:{m:02d}）对齐：清失效 strm、\n"
+               f"# 给新媒体库调续播门槛、补时长、通知 Emby 扫描 —— 排在生成【之后】。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"{pm} {ph} * * * root {cron_cmd('precache')} >/dev/null 2>&1\n"
                f"{m} {h} * * * root {cron_cmd('sync')} >/dev/null 2>&1\n")
         with open(SYNC_CRON, "w") as f:
             f.write(txt)
@@ -1887,6 +1896,28 @@ def install_sync_cron(install_dir):
     except OSError as e:
         warn(f"装每日对齐任务失败（不影响使用）：{e}")
         return False
+
+
+def do_precache():
+    """AutoFilm 开扫【之前】几分钟，把要扫的那几个盘的目录缓存刷掉。安静跑。
+
+    【补的是自动那条路上的一个洞】手点「5 生成媒体库」第一步就清缓存，所以点了就能
+    把新片扫进来；而每天凌晨那条自动的路【从来不清】—— AutoFilm 到点就去列目录，
+    OpenList 手里要是还压着一份旧的，它当然一个新文件都看不见，任务照样报"完成"。
+    用户看到的就是"我记得设过每天自动扫描，怎么新片没进来"，而且查不出所以然：
+    定时任务跑了、日志干净、strm 数没变，每一环看着都对。
+
+    缓存设得越长这个洞越大：12 小时的话，凌晨 5 点那次看到的是前一天下午的目录。
+    现在默认 30 分钟，洞小了但没堵上 —— 而且用户随时可以把它调回长的。
+
+    代价几乎为零：每个盘两个 HTTP 请求（停用再启用），不重启容器，也不动别的盘。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    mounts = {"/" + m for m in
+              (strm_mount_dir(p) for p in effective_scan_paths(d)) if m}
+    reload_storages(d, mounts)
 
 
 def install_warm_cron(install_dir):
@@ -11907,6 +11938,10 @@ if __name__ == "__main__":
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
                 do_keepalive()
+        elif arg == "precache":           # cron 调的：开扫前刷一次目录缓存
+            require_root()
+            if take_task_lock("precache"):
+                do_precache()
         elif arg == "sync":               # cron 调的每日对齐，同样不交互
             require_root()
             if take_task_lock("sync"):
