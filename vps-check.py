@@ -180,7 +180,7 @@ def classify_hop(ip):
         lab, lvl, car, scope = BACKBONE_AS[asn]
         return f"{lab} (AS{asn})", lvl, car, scope
     if asn:
-        return f"AS{asn} {name[:34]}", "", "", ""
+        return f"AS{asn} {_asn_short(name)}", "", "", ""
     return "", "", "", ""
 
 # ---------------------------------------------------------------- 回程路由
@@ -367,6 +367,23 @@ def report_ip(ip, num="一", local=True):
         if v and k == "proxy": worst = max(worst, 2)
         elif v and k == "hosting": worst = max(worst, 1)
     return worst
+
+def print_hops(hops, line, indent="  "):
+    """逐跳打印，连续无响应的跳折成一行——30 跳全是 * 的路径很常见，
+       一行一个星号能刷掉半屏，把真正有信息的那几跳挤没。
+       line(n, ip, ms) 返回该跳要打的内容，各处格式不同所以传进来。"""
+    gap = []
+    def flush():
+        if gap:
+            span = str(gap[0]) if len(gap) == 1 else f"{gap[0]}-{gap[-1]}"
+            print(f"{indent}{C['d']}{span:>5}  * 无响应 {len(gap)} 跳{C['n']}")
+            gap.clear()
+    for n, hip, ms in hops:
+        if not hip:
+            gap.append(n); continue
+        flush()
+        print(line(n, hip, ms))
+    flush()
 
 def _short(lab):
     """备注里用短名，"电信 CN2 (59.43)" → "电信 CN2"。手机上一行放不下会折行。"""
@@ -636,20 +653,12 @@ def report_link(ip, num="二"):
         print(f"  逐跳       : {C['y']}无响应（ICMP/UDP 被拦）{C['n']}"); return
     end = [m for _, h, m in hops if h and m is not None]
     print(f"  逐跳       : {len(hops)} 跳" + (f"，末跳 {end[-1]:.0f} ms" if end else ""))
-    gap = []                                  # 连续无响应的跳折成一行，别刷 20 行 *
-    def flush():
-        if gap:
-            span = f"{gap[0]}" if len(gap) == 1 else f"{gap[0]}-{gap[-1]}"
-            print(f"    {C['d']}{span:>5}  * 无响应 {len(gap)} 跳{C['n']}")
-            gap.clear()
-    for n, hip, hms in hops:
-        if not hip:
-            gap.append(n); continue
-        flush()
+    def line(n, hip, hms):
         asn, _pfx, cc, name = asn_of(hip)
-        who = f"AS{asn} {name[:30]}" if asn else "查不到 AS"
-        print(f"    {C['d']}{n:>2}  {hip:<16}{(f'{hms:.1f} ms' if hms else ''):>10}  {who} {cc}{C['n']}")
-    flush()
+        who = f"AS{asn} {_asn_short(name)}" if asn else "查不到 AS"
+        return (f"    {C['d']}{n:>2}  {hip:<16}{(f'{hms:.1f} ms' if hms else ''):>10}"
+                f"  {who} {cc}{C['n']}")
+    print_hops(hops, line, indent="  ")
 
 def check_external(ip):
     """外部 IP 检测：这个 IP 自身的属性（画像、黑名单）+ 本机到它的链路。
@@ -669,8 +678,13 @@ def check_external(ip):
     print(f"  IP 标记   : {_flag_line(flag)}")
     print(f"  黑名单     : " + (f"命中 {len(listed)} 个：{', '.join(listed)}" if listed else "未命中"))
     hr("·")
-    print(f"  {C['b']}要测它的三网回程，SSH 上去跑这一行{C['n']}（纯 stdlib，不装任何东西）：")
+    print(f"  {C['b']}要测它的三网回程{C['n']}——SSH 上【那台机】跑（纯 stdlib，不装任何东西）：")
     print(f"    {C['c']}curl -fsSL {SELF_URL} | python3{C['n']}")
+    print(f"  {C['b']}登录不了？那就测去程{C['n']}——在【你国内的电脑】上跑（不是在这台 VPS 上）：")
+    print(f"    {C['c']}curl -fsSL {SELF_URL} | python3 - --hops {ip}{C['n']}")
+    print(f"    {C['d']}Windows 没 python 就用 {C['c']}tracert {ip}{C['n']}{C['d']}，自己看有没有 59.43 段。{C['n']}")
+    print(f"    {C['d']}CN2 GIA 是双向的，去程见到 59.43 就是很强的证据；只有回程 GIA 的"
+          f"（GT/单向优化）\n    去程可能是 163，所以这条只能作参考，不能反证。{C['n']}")
     hr()
     print(f"{C['b']}局限{C['n']}")
     print(f"  1. {C['y']}三网回程只能在那台机器本机上测{C['n']}——traceroute 是从【发起方】"
@@ -693,10 +707,14 @@ def check_external(ip):
     return 0
 
 def show_hops(ip):
-    """把到某个 IP 的逐跳连同分类打出来。判定不对时先看这个，别猜。
+    """把【当前这台机器】到某个 IP 的逐跳连同骨干分类打出来。
 
-       加它的由头：判定接连改错了三版，每次都是靠截图里的蛛丝马迹反推路径长什么样
-       ——而路径本来是可以直接打出来的。有这个口子，下次一条命令就看清了。"""
+       两个用途：
+       1. 判定不对时先看这个，别猜。判定接连改错了三版，每次都是靠截图里的蛛丝
+          马迹反推路径长什么样——而路径本来是可以直接打出来的。
+       2. 在【你国内的电脑上】跑，量的就是「国内 → 那台机器」的去程走哪条骨干。
+          这是不登录目标机时唯一能自己量到的东西，而且 CN2 GIA 是双向的，
+          去程见到 59.43 就是很强的证据。用法见 README。"""
     if not ensure_traceroute():
         print(f"{C['r']}没有 traceroute/mtr 且装不上{C['n']}"); return 1
     print(f"\n{C['b']}逐跳 → {ip}{C['n']}")
@@ -704,22 +722,42 @@ def show_hops(ip):
     hops = traceroute(ip)
     if not hops:
         print(f"  {C['r']}无响应{C['n']}"); return 1
-    for n, hip, ms in hops:
-        if not hip:
-            print(f"  {C['d']}{n:>2}  *{C['n']}"); continue
+    def line(n, hip, ms):
         lab, lvl, hcar, scope = classify_hop(hip)
         col, sym = _mark(lvl)
         asn, pfx, cc, name = asn_of(hip)
-        tag = f"{col}{sym} {lab}{C['n']}" if lab else f"{C['d']}· {('AS'+asn+' '+name[:30]) if asn else '查不到 AS'}{C['n']}"
+        tag = (f"{col}{sym} {lab}{C['n']}" if lab else
+               f"{C['d']}· {('AS'+asn+' '+_asn_short(name)) if asn else '查不到 AS'}{C['n']}")
         meta = f"{C['d']}[{lvl or '-'}/{hcar or '-'}/{scope or '-'}] {pfx or ''} {cc or ''}{C['n']}"
-        print(f"  {n:>2}  {hip:<16}{(f'{ms:.1f} ms' if ms else ''):>10}  {tag}  {meta}")
+        return f"  {n:>2}  {hip:<16}{(f'{ms:.1f} ms' if ms else ''):>10}  {tag}  {meta}"
+    print_hops(hops, line, indent="")
     hr()
-    for car in CARRIERS:
-        lab, lvl, ms, land = route_verdict(hops, car)
-        col, sym = _mark(lvl)
-        print(f"  按【{car}】判定 → {col}{sym} {lab}{C['n']}"
-              f"{('　落地 ' + land) if land else ''}"
-              f"{C['d']}　{f'{ms:.0f} ms' if ms else ''}{C['n']}")
+    # 路径上出现过的骨干，按出现顺序去重。这个总结跟方向、跟目标在哪都无关，
+    # 所以放在最前面——在国内机器上跑时，它就是「本地出境走了哪条骨干」。
+    seq, seen = [], set()
+    for _, hip, _ms in hops:
+        if not hip: continue
+        lab, lvl, _c, _s = classify_hop(hip)
+        if lvl in ("premium", "normal") and lab not in seen:
+            seen.add(lab); seq.append((lab, lvl))
+    if seq:
+        print("  路径上的骨干：" + " → ".join(
+            f"{_mark(lvl)[0]}{_mark(lvl)[1]} {lab}{C['n']}" for lab, lvl in seq))
+        best = "premium" if any(l == "premium" for _, l in seq) else "normal"
+        print(f"  {C['d']}整条路的档次按最优的那段算 → {_mark(best)[0]}"
+              f"{'优质' if best == 'premium' else '普通'}{C['n']}")
+    else:
+        print(f"  {C['d']}路径上没认出任何中国骨干（目标不在中国，或逐跳被拦）{C['n']}")
+    # 三网判定只在【目标是中国 IP】时才有意义：那时才谈得上「回程走哪条骨干」。
+    _a, _p, cc, _n2 = asn_of(ip)
+    if cc == "CN":
+        hr("·")
+        for car in CARRIERS:
+            lab, lvl, ms, land = route_verdict(hops, car)
+            col, sym = _mark(lvl)
+            print(f"  按【{car}】判定 → {col}{sym} {lab}{C['n']}"
+                  f"{('　落地 ' + land) if land else ''}"
+                  f"{C['d']}　{f'{ms:.0f} ms' if ms else ''}{C['n']}")
     return 0
 
 def main():
