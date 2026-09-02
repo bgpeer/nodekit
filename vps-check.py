@@ -76,20 +76,32 @@ def _rev(ip):                     return ".".join(reversed(ip.split(".")))
 
 _ASN_CACHE = {}
 def asn_of(ip):
-    """(asn, 前缀, 国家, AS名)。查不到返回 (None,"","","")。"""
+    """(asn, 前缀, 国家, AS名)。查不到返回 (None,"","","")。
+
+       一个 IP 可能落在【多条】origin 记录里（同一段被不同 AS 以不同掩码宣告），
+       Cymru 每条一个 TXT，顺序还不固定——取第一条会导致同一个 IP 两次查出不同
+       结果（实测 202.103.24.68 一会儿 AS4134/18、一会儿 AS137266/20）。
+       按 BGP 语义取【最长前缀】那条：最具体的宣告才是实际生效的。"""
     if ip in _ASN_CACHE: return _ASN_CACHE[ip]
-    r = dns_txt(f"{_rev(ip)}.origin.asn.cymru.com")
+    recs = dns_txt(f"{_rev(ip)}.origin.asn.cymru.com") or []
+    best, best_len = None, -1
+    for rec in recs:
+        f = [x.strip() for x in rec.split("|")]
+        if len(f) < 3: continue
+        try: plen = int(f[1].split("/")[1])
+        except (IndexError, ValueError): plen = 0
+        if plen > best_len:
+            best, best_len = f, plen
     res = (None, "", "", "")
-    if r:
-        f = [x.strip() for x in r[0].split("|")]
-        asn = f[0].split()[0] if f and f[0].split() else None
+    if best:
+        asn = best[0].split()[0] if best[0].split() else None
         name = ""
         if asn:
             r2 = dns_txt(f"AS{asn}.asn.cymru.com")
             if r2:
                 g = [x.strip() for x in r2[0].split("|")]
                 name = g[4] if len(g) > 4 else ""
-        res = (asn, f[1] if len(f) > 1 else "", f[2] if len(f) > 2 else "", name)
+        res = (asn, best[1], best[2], name)
     _ASN_CACHE[ip] = res
     return res
 
@@ -124,14 +136,31 @@ def classify_hop(ip):
 # ---------------------------------------------------------------- 回程路由
 # 三网常用测试点。⚠ 不盲信：跑之前先查每个目标的真实 ASN/国家，
 #    对不上就标成「目标存疑」并跳过，宁可少测也不给错结论。
+# 归属校验：按 Cymru 返回的 AS【名称】判，不枚举 ASN——省级子 AS 太多列不全，
+# 而且实测同一家会冒出 CHINANET-BACKBONE / CHINATELECOM-HUBEI-… / CHINA TELECOM
+# 好几种写法。\s* 是为了同时吃 "CHINA TELECOM" 和 "CHINATELECOM"。
+CARRIER_PAT = {
+    "电信": r"CHINANET|CHINA\s*TELECOM|CNIX",
+    "联通": r"CHINA169|CNCGROUP|CHINA\s*UNICOM|CUII|UNICOM",
+    "移动": r"CMNET|CHINA\s*MOBILE",
+}
+# 8 城 × 三网 = 24 个点。每个都用上面的模式实测校验过归属（见 README）。
 TARGETS = [
-    ("电信", "北京", "219.141.136.12"), ("电信", "上海", "202.96.209.133"),
-    ("电信", "广州", "58.60.188.222"),
-    ("联通", "北京", "202.106.50.1"),   ("联通", "上海", "210.22.97.1"),
-    ("联通", "广州", "210.21.196.6"),
-    ("移动", "北京", "221.179.155.161"),("移动", "上海", "211.136.112.200"),
-    ("移动", "广州", "120.196.165.24"),
+    ("电信", "北京", "219.141.136.12"),  ("电信", "上海", "202.96.209.133"),
+    ("电信", "莆田", "218.85.152.99"),   ("电信", "深圳", "202.96.134.133"),
+    ("电信", "南宁", "202.103.224.68"),  ("电信", "成都", "61.139.2.69"),
+    ("电信", "西安", "218.30.19.40"),    ("电信", "武汉", "202.103.24.68"),
+    ("联通", "北京", "202.106.50.1"),    ("联通", "上海", "210.22.97.1"),
+    ("联通", "莆田", "218.104.128.106"), ("联通", "深圳", "221.5.88.88"),
+    ("联通", "南宁", "221.7.128.68"),    ("联通", "成都", "119.6.6.6"),
+    ("联通", "西安", "221.11.1.67"),     ("联通", "武汉", "218.104.111.114"),
+    ("移动", "北京", "221.179.155.161"), ("移动", "上海", "211.136.112.200"),
+    ("移动", "莆田", "211.138.151.161"), ("移动", "深圳", "120.196.212.25"),
+    ("移动", "南宁", "211.138.245.180"), ("移动", "成都", "211.137.96.205"),
+    ("移动", "西安", "211.137.130.3"),   ("移动", "武汉", "211.137.58.20"),
 ]
+CITIES   = ["北京", "上海", "莆田", "深圳", "南宁", "成都", "西安", "武汉"]
+CARRIERS = ["电信", "联通", "移动"]
 
 def have(b): 
     from shutil import which; return which(b) is not None
@@ -285,36 +314,95 @@ def report_ip(ip):
         elif v and k == "hosting": worst = max(worst, 1)
     return worst
 
+def route_verdict(hops):
+    """从逐跳里提炼线路判定。优质骨干优先——只要路径上出现过 59.43/9929/CMIN2，
+       这条就是走的优质网；否则取最后一个能识别的骨干。
+       返回 (标签, 等级, 该跳延迟)。"""
+    best = last = None
+    for _, hip, ms in hops:
+        if not hip:
+            continue
+        lab, lvl = classify_hop(hip)
+        # 只认已知骨干（premium/normal）。classify_hop 对认不出的 AS 会回一个
+        # "AS#### 名字"、等级为空——那多半是【目的地自己的省级接入网】
+        # （如 AS4835 CHINANET-IDC-SN），把它当结论会把骨干判定盖掉。
+        if lvl not in ("premium", "normal"):
+            continue
+        last = (lab, lvl, ms)
+        if lvl == "premium" and best is None:
+            best = (lab, lvl, ms)
+    return best or last or ("未识别", "", None)
+
+def _mark(lvl):
+    """判定行的符号+颜色：一眼扫过去就知道好坏。"""
+    return {"premium": (C["g"] + C["b"], "●"),
+            "normal":  (C["y"], "○")}.get(lvl, (C["d"], "·"))
+
+def run_targets(targets, workers=6):
+    """并发跑，边跑边报进度。24 个点串行要七八分钟，并发压到一两分钟。
+       返回 {(carrier,city,ip): ("ok", hops, (asn,name)) | ("suspect", asn, name)}"""
+    out, done = {}, [0]
+    def job(t):
+        car, city, ip = t
+        asn, _, cc, name = asn_of(ip)
+        # 测试点先验归属：注册地必须是 CN、AS 名字必须对得上这家运营商。
+        # 对不上就标『存疑』跳过——宁可少测，也不拿一个其实不属于该运营商的
+        # 目标去下结论（219.141.136.12 就归在 AS4847 CNIX 而不是 AS4134）。
+        if cc != "CN" or not re.search(CARRIER_PAT[car], name or "", re.I):
+            r = ("suspect", asn, name)
+        else:
+            r = ("ok", traceroute(ip), (asn, name))
+        done[0] += 1
+        if sys.stdout.isatty():                 # 非 tty 下 \r 不生效，会刷出一堆行
+            print(f"\r  进度 {done[0]}/{len(targets)}  ", end="", flush=True)
+        return t, r
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        for t, r in ex.map(job, targets):
+            out[t] = r
+    if sys.stdout.isatty():
+        print("\r" + " " * 40 + "\r", end="")
+    return out
+
 def report_routes(full=False):
     title("二、三网回程路由（VPS → 中国）")
     if not ensure_traceroute():
         print(f"  {C['r']}没有 traceroute/mtr 且装不上，跳过本节{C['n']}"); return None
     targets = TARGETS if full else [t for t in TARGETS if t[1] == "北京"]
-    print(f"  {C['d']}测试点先校验归属，对不上的会标『存疑』并跳过；"
-          f"共 {len(targets)} 条{'（--full 可测全部 9 条）' if not full else ''}{C['n']}")
-    verdict = {}
-    for carrier, city, ip in targets:
-        asn, _, cc, name = asn_of(ip)
+    print(f"  {C['d']}{len(targets)} 个测试点，并发跑。测试点先校验归属，对不上的标『存疑』跳过。{C['n']}")
+    if not full:
+        print(f"  {C['d']}（快速模式只测北京、并列出逐跳；完整模式测 8 城 24 点、只出判定）{C['n']}")
+    res = run_targets(targets)
+
+    verdicts = {}
+    for car in CARRIERS:
+        rows = [(t[1], t[2], res[t]) for t in targets if t[0] == car]
+        if not rows: continue
+        print(f"\n  {C['b']}{C['c']}{car}{C['n']}")
         hr("·")
-        head = f"  {C['b']}{carrier} · {city}{C['n']}  {ip}"
-        if cc != "CN":
-            print(head + f"  {C['y']}[目标存疑：注册地 {cc or '未知'}，跳过]{C['n']}"); continue
-        print(head + f"  {C['d']}(AS{asn} {name[:30]}){C['n']}")
-        hops = traceroute(ip)
-        if not hops:
-            print(f"    {C['y']}无响应（ICMP/UDP 被拦或目标不可达）{C['n']}"); continue
-        seen = []
-        for n, hip, ms in hops:
-            if not hip:
+        for city, ip, r in rows:
+            if r[0] == "suspect":
+                print(f"    {C['y']}? {city:<4} 目标存疑（AS{r[1] or '?'} {(r[2] or '')[:24]}），已跳过{C['n']}")
+                verdicts.setdefault(car, []).append((city, "目标存疑", "skip"))
                 continue
-            lab, lvl = classify_hop(hip)
-            col = C["g"] if lvl == "premium" else (C["y"] if lvl == "normal" else C["d"])
-            tail = f"  {col}{lab}{C['n']}" if lab else ""
-            print(f"    {n:>2}  {hip:<16}{(str(ms)+' ms') if ms else '':>10}{tail}")
-            if lvl: seen.append((lab, lvl))
-        prem = [l for l, v in seen if v == "premium"]
-        verdict[f"{carrier}·{city}"] = prem[0] if prem else (seen[-1][0] if seen else "未识别")
-    return verdict
+            hops, (asn, name) = r[1], r[2]
+            if not hops:
+                print(f"    {C['r']}✗ {city:<4} 无响应（ICMP/UDP 被拦或不可达）{C['n']}")
+                verdicts.setdefault(car, []).append((city, "无响应", "fail"))
+                continue
+            lab, lvl, ms = route_verdict(hops)
+            col, sym = _mark(lvl)
+            lat = f"{ms:.0f} ms" if ms else ""
+            print(f"    {col}{sym} {city:<4} {lab:<22}{C['n']}{C['d']}{lat:>9}{C['n']}")
+            verdicts.setdefault(car, []).append((city, lab, lvl))
+            if not full:                                  # 快速模式才列逐跳，24 点全列刷屏
+                for n, hip, hms in hops:
+                    if not hip:
+                        continue
+                    hl, hv = classify_hop(hip)
+                    hc, _ = _mark(hv)
+                    tail = f"  {hc}{hl}{C['n']}" if hl else ""
+                    print(f"      {C['d']}{n:>2}  {hip:<16}{(f'{hms:.1f} ms' if hms else ''):>10}{C['n']}{tail}")
+    return verdicts
 
 def report_bl(ip):
     title("三、IP 黑名单（DNSBL）")
@@ -359,9 +447,23 @@ def main():
 
     title("五、结论")
     if v:
-        for k, val in v.items():
-            prem = "CN2" in val or "9929" in val or "CMIN2" in val
-            print(f"  {k:<10} → {(C['g'] if prem else C['y'])}{val}{C['n']}")
+        for car in CARRIERS:
+            rows = v.get(car)
+            if not rows: continue
+            prem = [c for c, l, lv in rows if lv == "premium"]
+            norm = [c for c, l, lv in rows if lv == "normal"]
+            miss = [c for c, l, lv in rows if lv in ("fail", "skip")]
+            labs = sorted({l for _, l, lv in rows if lv == "premium"}) or \
+                   sorted({l for _, l, lv in rows if lv == "normal"})
+            col = C["g"] + C["b"] if prem else C["y"]
+            sym = "●" if prem else "○"
+            tail = f"优质 {len(prem)} / 普通 {len(norm)}"
+            if miss: tail += f" / 没测到 {len(miss)}"
+            print(f"  {col}{sym} {car}{C['n']}  {col}{'、'.join(labs) or '未识别'}{C['n']}"
+                  f"   {C['d']}{tail}（共 {len(rows)} 个点）{C['n']}")
+            if prem and norm:      # 同一家里既有优质又有普通 → 分城列出来，看得见差异
+                print(f"      {C['g']}优质：{'、'.join(prem)}{C['n']}")
+                print(f"      {C['y']}普通：{'、'.join(norm)}{C['n']}")
     print()
     print(f"  IP 标记   : " + ("有 proxy 标记，纯净度差" if flag == 2 else
                                "机房 IP（正常现象，流媒体可能受限）" if flag == 1 else "无异常标记"))
