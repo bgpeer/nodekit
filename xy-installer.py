@@ -109,6 +109,7 @@ NETOPT_LOCAL = BGP_DIR + "/net-optimize.py"      # 本地缓存的网络优化�
 NETOPT_URL   = _RAW + "net-optimize.py"
 # VPS 线路检测（三网回程骨干 + IP 纯净度），同样是拉本仓库脚本来跑
 VPSCHK_LOCAL = BGP_DIR + "/vps-check.py"
+VPSCHK_LAST  = BGP_DIR + "/vps-check.last.json"   # 上次本机检测结果，菜单里回显
 VPSCHK_URL   = _RAW + "vps-check.py"
 # 网络优化的落盘状态（net-optimize.py 写的，卸载时 rmtree 整个目录）：
 #   config           KEY=VAL，含 ADAPTIVE_QOS_MODE（adaptive / fixed_cake）
@@ -3553,30 +3554,74 @@ def _run_net_optimize(args="", env_extra=None):
     subprocess.run(f"python3 {NETOPT_LOCAL} {args}".strip(), shell=True,
                    env=dict(os.environ, **(env_extra or {})))
 
+def _ago(ts):
+    """把时间戳说成人话：刚刚 / 3 小时前 / 2 天前。"""
+    d = int(time.time()) - int(ts)
+    if d < 60:      return "刚刚"
+    if d < 3600:    return f"{d // 60} 分钟前"
+    if d < 86400:   return f"{d // 3600} 小时前"
+    return f"{d // 86400} 天前"
+
+def _vpschk_last():
+    """打印上次【本机】检测的结果。没测过就说没测过。
+
+       为什么只显示本机：外部 IP 检测查的是别人的 IP，跟这台机器的线路无关，
+       混在一起显示会让人以为那是本机的结论。"""
+    G, Y, R, D, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[2m", "\033[0m"
+    try:
+        with open(VPSCHK_LAST, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        print(f"  上次检测：{Y}还未检测过{N}")
+        return
+    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.get("ts", 0)))
+    print(f"  上次检测：{ts}（{_ago(d.get('ts', 0))}）　IP {G}{d.get('ip', '-')}{N}")
+    routes = d.get("routes") or {}
+    for car in ("电信", "联通", "移动"):
+        r = routes.get(car)
+        if not r:
+            continue
+        col, sym = (G, "●") if r.get("prem") else ((Y, "○") if r.get("norm") else (D, "·"))
+        tail = f"优质 {r.get('prem', 0)} / 普通 {r.get('norm', 0)}"
+        if r.get("unk"):  tail += f" / 未探到 {r['unk']}"
+        if r.get("miss"): tail += f" / 没测到 {r['miss']}"
+        labs = "、".join(r.get("labs") or []) or "未识别"
+        print(f"    {col}{sym} {car}{N}  {col}{labs}{N}　{D}{tail}（共 {r.get('total', 0)} 点）{N}")
+    if not routes:
+        print(f"    {D}（上次没测到路由）{N}")
+    flag = d.get("flag")
+    fl = ("画像未取到" if flag is None else
+          f"{R}有 proxy 标记{N}" if flag == 2 else
+          f"{Y}机房 IP{N}" if flag == 1 else f"{G}无异常标记{N}")
+    listed = d.get("bl_listed") or []
+    bl = f"{R}命中 {len(listed)}：{'、'.join(listed)}{N}" if listed else f"{G}未命中{N}"
+    if d.get("bl_unknown"):
+        bl += f"{D}（{d['bl_unknown']} 项未知）{N}"
+    print(f"  IP 标记：{fl}　黑名单：{bl}")
+
 def vps_check_menu():
     """VPS 线路检测：三网回程走哪条骨干 + IP 纯净度。脚本在本仓库 vps-check.py。
        纯 stdlib、无第三方依赖；traceroute 缺了它自己 apt/yum/apk 装。"""
     print("\n" + "=" * 60)
     print("  VPS 线路检测（三网回程 + IP 纯净度）")
     print("=" * 60)
-    print("  查四样：本机 IP 画像（机房/代理标记）、三网回程走哪条骨干、")
-    print("          IP 黑名单（10 个 DNSBL）、常用服务可达性。")
+    _vpschk_last()
     print("-" * 60)
-    print("  ⓘ 只测【回程】(VPS→中国)。去程(中国→VPS)本机测不到，要在国内侧测——")
-    print("     三网的去程和回程经常走【不同】骨干，别拿回程结论推去程。")
-    print("  ⓘ 不区分 CN2 GIA / GT：两者都走 59.43 段，而 59.43 不在 BGP 全局路由表")
-    print("     里（查不到 AS），细分规则无从核实。与其给个「自信但可能错」的结论，")
-    print("     不如把证据摆出来。要定性用 nexttrace。")
-    print("-" * 60)
-    print("  1 快速（三网各测北京一点，列出逐跳，约 1 分钟）")
-    print("  2 完整（三网 × 京沪莆深宁蓉西汉 8 城 = 24 点，只出判定，约 2 分钟）")
+    print("  1 本机IP检测（约 2 分钟）")
+    print("  2 外部IP检测（输入任意 IP，查画像 + 黑名单）")
     print("  0 返回")
     c = _ask("选择: ").strip()
     if c not in ("1", "2"):
         return
+    arg = ""
+    if c == "2":
+        ip = _ask("要检测的 IP: ").strip()
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip) or any(int(x) > 255 for x in ip.split(".")):
+            print("  不是合法的 IPv4 地址。"); return
+        arg = " " + ip
     if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
         print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {VPSCHK_LOCAL}" + (" --full" if c == "2" else ""), shell=True)
+    subprocess.run(f"python3 {VPSCHK_LOCAL}{arg}", shell=True)
 
 def _netopt_state():
     """读网络优化当前档位。返回 (mode, mb)：
