@@ -335,42 +335,45 @@ def _short(lab):
     return lab.split(" (")[0]
 
 def route_verdict(hops, car):
-    """从逐跳里提炼【目标运营商国际段】的骨干判定 → (标签, 等级, 该跳延迟, 备注)。
+    """→ (长途段标签, 等级, 该跳延迟, 落地标签)。
 
-       两条都是踩过坑才加的：
+       决定一条回程好坏的是【长途段】——把流量从境外拉回中国的那一段骨干。
+       所以判定取【路径上第一个能认出的骨干跳】，不管它属于哪家：一台三网回程
+       CN2 GIA 的机器，去联通、去移动的长途段也是 59.43，这正是它卖的东西，
+       不是 bug。落地进了哪家的网另外列（`→ 联通 169`），两件事分开说。
 
-       1. 必须按运营商挑。从一台 CN2 机器出去，无论目的地是电信、联通还是移动，
-          路径【头几跳都是 59.43】——按「第一个 premium」取就会把联通、移动也
-          判成「电信 CN2」（实测 24 个点全标 CN2）。所以只认归属 == 目标运营商的跳。
-       2. 必须只认国际段。到移动的路径末尾必然进 CMNET(AS9808，移动国内网)，
-          按「最后一个本网骨干」取就永远是 CMNET，把该看的国际段（CMIN2 还是 CMI）
-          盖掉（实测 8 个点全标 CMNET）。所以国内落地网只作备注，不当结论。
+       踩过的两个坑，都是把这两件事混成一件造成的：
+       1. 早先直接把长途段安到目标运营商头上，输出成「联通 → 电信 CN2」，
+          读起来像「联通的骨干是 CN2」，是胡话。
+       2. 后来矫枉过正，改成只认目标运营商自己的骨干，结果三网回程 GIA 的机器
+          联通被判成「联通 169 普通」——把人家真正的卖点判没了。
 
-       本网国际段一跳都没探到时如实说没探到，把路上经过的他网骨干和落地网
-       作为备注附上，而不是拿它们冒充结论。"""
-    own_best = own_last = own_dom = via = None
+       落地取【目标运营商自己的最后一跳】：移动是 CMNET(AS9808，国内网)，
+       联通是 169/9929，电信是 163/CNIX。它只说进了谁家的网，不参与档次判定。
+
+       延迟取【最后一个有响应的跳】而不是长途段入口那跳：入口跳只是刚进骨干，
+       拿它比三家等于比谁家入口近，没意义；最后一跳约等于到目的地的 RTT，
+       三家之间才可比。路径被截断时它是个下限。"""
+    haul = land = end_ms = None
     for _, hip, ms in hops:
         if not hip:
             continue
-        lab, lvl, hcar, scope = classify_hop(hip)
+        if ms is not None:
+            end_ms = ms                        # 一路刷到最后一个有响应的跳
+        lab, lvl, hcar, _scope = classify_hop(hip)
         # 只认已知骨干（premium/normal）。classify_hop 对认不出的 AS 会回一个
         # "AS#### 名字"、等级为空——那多半是【目的地自己的省级接入网】
-        # （如 AS4835 CHINANET-IDC-SN），把它当结论会把骨干判定盖掉。
+        # （如 AS4835 CHINANET-IDC-SN），把它当骨干会把判定带偏。
         if lvl not in ("premium", "normal"):
             continue
-        if hcar != car:
-            if via is None or lvl == "premium":
-                via = _short(lab)                     # 他网转接段，只作备注
-        elif scope == "domestic":
-            own_dom = _short(lab)                     # 本网国内落地，只作备注
-        else:
-            own_last = (lab, lvl, ms)
-            if lvl == "premium" and own_best is None:
-                own_best = (lab, lvl, ms)
-    note = "、".join(x for x in (f"经 {via}" if via else "",
-                                 f"落地 {own_dom}" if own_dom else "") if x)
-    pick = own_best or own_last
-    return (pick + (note,)) if pick else ("未探到国际段", "", None, note)
+        if haul is None:
+            haul = (lab, lvl)                  # 第一个骨干跳 = 长途段
+        if hcar == car:
+            land = _short(lab)                 # 目标本网，取最后一跳 = 落地
+    note = "" if (land and haul and land == _short(haul[0])) else (land or "")
+    if haul is None:
+        return ("未识别", "", end_ms, note)
+    return haul + (end_ms, note)
 
 def _mark(lvl):
     """判定行的符号+颜色：一眼扫过去就知道好坏。"""
@@ -408,7 +411,8 @@ def report_routes(num="二"):
         print(f"  {C['r']}没有 traceroute/mtr 且装不上，跳过本节{C['n']}"); return None
     targets = TARGETS
     print(f"  {C['d']}{len(targets)} 个测试点（{len(CITIES)} 城 × 三网），并发跑，约 2 分钟。{C['n']}")
-    print(f"  {C['d']}测试点先校验归属，对不上的标『存疑』跳过；只认【目标本网】骨干。{C['n']}")
+    print(f"  {C['d']}判定看【长途段】——把流量从境外拉回中国的那一段骨干，它决定延迟和拥塞；{C['n']}")
+    print(f"  {C['d']}后面的『→ xxx』是落地进了哪家的网，延迟取最后一个有响应的跳（≈到目的地 RTT）。{C['n']}")
     res = run_targets(targets)
 
     verdicts = {}
@@ -427,11 +431,11 @@ def report_routes(num="二"):
                 print(f"    {C['r']}✗ {city:<4} 无响应（ICMP/UDP 被拦或不可达）{C['n']}")
                 verdicts.setdefault(car, []).append((city, "无响应", "fail"))
                 continue
-            lab, lvl, ms, via = route_verdict(hops, car)
+            lab, lvl, ms, land = route_verdict(hops, car)
             col, sym = _mark(lvl)
             lat = f"{ms:.0f} ms" if ms else ""
-            print(f"    {col}{sym} {city:<4} {lab:<22}{C['n']}{C['d']}{lat:>9}"
-                  f"{('   ' + via) if via else ''}{C['n']}")
+            print(f"    {col}{sym} {city:<4} {lab:<22}{C['n']}"
+                  f"{C['d']}{('→ ' + land) if land else '':<16}{lat:>9}{C['n']}")
             verdicts.setdefault(car, []).append((city, lab, lvl))
     return verdicts
 
@@ -543,8 +547,10 @@ def check_local():
           f"{C['c']}curl -sL nxtrace.org/nt | bash && nexttrace 219.141.136.12{C['n']}")
     print(f"  2. 这里测的是【回程】（VPS→中国）。去程（中国→VPS）本机测不到，"
           f"\n     要在国内侧测。三网的去程和回程经常走【不同】骨干。")
-    print(f"  3. 判定只认【目标本网】骨干：去联通的路上经过 59.43 不算「联通走 CN2」，"
-          f"\n     那只是转接段，会作为备注列出。本网骨干一跳没探到就标『未探到』。")
+    print(f"  3. 判定看的是【长途段】，不是落地网。一台「三网回程 CN2 GIA」的机器，"
+          f"\n     去联通、去移动的长途段也是 59.43——这正是它卖的东西。落地进了哪家的网"
+          f"\n     单独列在『→』后面（移动的落地是 CMNET/AS9808，那是移动国内网，"
+          f"\n     跟线路档次无关）。两件事分开看，别混成一件。")
     print(f"  4. 「可达」≠「解锁」。流媒体解锁要看区域判定，需专门的解锁检测脚本。")
     print(f"  5. 黑名单标「未知」的项是被拒答/超时，不是干净。")
     return 0
