@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.45"
+SCRIPT_VERSION = "1.5.46"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9747,6 +9747,12 @@ def _short_err(s):
     s = re.sub(r"\s+", " ", s).strip()
     # 常见网络错误给个人话结论,原文太长且对定位没有额外帮助
     for pat, msg in (("context deadline exceeded", "网盘接口超时"),
+                     # 【canceled 和 deadline exceeded 不是一回事，别混成一句】
+                     # deadline exceeded = 等到我们自己设的时限，网盘没回话；
+                     # canceled = 【发起方主动撤了】—— 网页上就是浏览器等不下去先断了，
+                     # OpenList 顺手把上游那个请求也取消掉。前者要去查网盘，
+                     # 后者说明请求慢到了人先放弃，慢的根子仍在网盘，但不是同一种证据。
+                     ("context canceled", "请求被中途取消（多半是页面等太久先断了）"),
                      ("i/o timeout", "网盘接口超时"),
                      ("TLS handshake timeout", "网盘接口 TLS 握手超时"),
                      ("connection refused", "连接被拒绝"),
