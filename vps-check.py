@@ -109,29 +109,32 @@ def asn_of(ip):
 # ⚠ 59.43/202.97 必须按【前缀】认，不能按 ASN：
 #    59.43.0.0/16 是 CN2 的内部传输网，【不在 BGP 全局路由表里】，Cymru 查不到 AS。
 #    （实测 59.43.0.1 → 无结果；而 202.97.0.1 → AS4134 CHINANET-BACKBONE。）
+# 第三项是这条骨干【属于哪家】——判定必须按目标运营商挑本网骨干，
+# 否则从 CN2 机器出去，去联通/移动的路径头几跳也全是 59.43，
+# 会把三家都标成「电信 CN2」（实测就是这个现象）。
 BACKBONE_AS = {
-    "4809":  ("电信 CN2",        "premium"),
-    "4134":  ("电信 163",        "normal"),
-    "9929":  ("联通 9929",       "premium"),
-    "4837":  ("联通 169",        "normal"),
-    "58807": ("移动 CMIN2",      "premium"),
-    "58453": ("移动 CMI",        "normal"),
-    "9808":  ("移动 CMNET",      "normal"),
-    "4847":  ("电信 CNIX",       "normal"),
+    "4809":  ("电信 CN2",        "premium", "电信"),
+    "4134":  ("电信 163",        "normal",  "电信"),
+    "9929":  ("联通 9929",       "premium", "联通"),
+    "4837":  ("联通 169",        "normal",  "联通"),
+    "58807": ("移动 CMIN2",      "premium", "移动"),
+    "58453": ("移动 CMI",        "normal",  "移动"),
+    "9808":  ("移动 CMNET",      "normal",  "移动"),
+    "4847":  ("电信 CNIX",       "normal",  "电信"),
 }
 def classify_hop(ip):
-    """→ (标签, 等级)。等级：premium / normal / "" """
+    """→ (标签, 等级, 归属)。等级：premium / normal / "" """
     if ip.startswith("59.43."):
-        return "电信 CN2 (59.43)", "premium"
+        return "电信 CN2 (59.43)", "premium", "电信"
     if ip.startswith("202.97."):
-        return "电信 163 (202.97)", "normal"
+        return "电信 163 (202.97)", "normal", "电信"
     asn, _, cc, name = asn_of(ip)
     if asn and asn in BACKBONE_AS:
-        lab, lvl = BACKBONE_AS[asn]
-        return f"{lab} (AS{asn})", lvl
+        lab, lvl, car = BACKBONE_AS[asn]
+        return f"{lab} (AS{asn})", lvl, car
     if asn:
-        return f"AS{asn} {name[:34]}", ""
-    return "", ""
+        return f"AS{asn} {name[:34]}", "", ""
+    return "", "", ""
 
 # ---------------------------------------------------------------- 回程路由
 # 三网常用测试点。⚠ 不盲信：跑之前先查每个目标的真实 ASN/国家，
@@ -174,7 +177,7 @@ def ensure_traceroute():
         if have("traceroute"): return True
     return False
 
-def traceroute(ip, maxhop=20, timeout=90):
+def traceroute(ip, maxhop=30, timeout=120):
     """→ [(hop, ip, ms)]；ip 为 None 表示该跳无响应。
 
        两种工具输出格式不同，必须分开解析：
@@ -287,8 +290,8 @@ def reach(host, port=443, timeout=5):
         return None
 
 # ---------------------------------------------------------------- 报告
-def report_ip(ip):
-    title("一、本机 IP 画像")
+def report_ip(ip, num="一", local=True):
+    title(f"{num}、{'本机' if local else '目标'} IP 画像")
     asn, pfx, cc, name = asn_of(ip)
     print(f"  IP        : {C['b']}{ip}{C['n']}")
     print(f"  ASN       : {'AS'+asn if asn else '查不到'}  {name}")
@@ -314,24 +317,34 @@ def report_ip(ip):
         elif v and k == "hosting": worst = max(worst, 1)
     return worst
 
-def route_verdict(hops):
-    """从逐跳里提炼线路判定。优质骨干优先——只要路径上出现过 59.43/9929/CMIN2，
-       这条就是走的优质网；否则取最后一个能识别的骨干。
-       返回 (标签, 等级, 该跳延迟)。"""
-    best = last = None
+def route_verdict(hops, car):
+    """从逐跳里提炼【目标运营商本网】的骨干判定 → (标签, 等级, 该跳延迟, 备注)。
+
+       为什么必须按运营商挑：从一台 CN2 机器出去，无论目的地是电信、联通还是
+       移动，路径【头几跳都是 59.43】——按「第一个 premium」取就会把联通、移动
+       也判成「电信 CN2」（用户实测 24 个点全标 CN2，就是这个 bug）。
+       所以只认归属 == 目标运营商的跳；本网骨干一跳都没探到时，如实说没探到，
+       并把路径上确实经过的他网骨干作为备注附上，而不是拿它冒充结论。"""
+    own_best = own_last = via = None
     for _, hip, ms in hops:
         if not hip:
             continue
-        lab, lvl = classify_hop(hip)
+        lab, lvl, hcar = classify_hop(hip)
         # 只认已知骨干（premium/normal）。classify_hop 对认不出的 AS 会回一个
         # "AS#### 名字"、等级为空——那多半是【目的地自己的省级接入网】
         # （如 AS4835 CHINANET-IDC-SN），把它当结论会把骨干判定盖掉。
         if lvl not in ("premium", "normal"):
             continue
-        last = (lab, lvl, ms)
-        if lvl == "premium" and best is None:
-            best = (lab, lvl, ms)
-    return best or last or ("未识别", "", None)
+        if hcar == car:
+            own_last = (lab, lvl, ms)
+            if lvl == "premium" and own_best is None:
+                own_best = (lab, lvl, ms)
+        elif via is None or lvl == "premium":
+            via = lab                      # 他网转接段，只作备注
+    pick = own_best or own_last
+    if pick:
+        return pick + (f"经 {via}" if via else "",)
+    return ("未探到本网骨干", "", None, f"路径经 {via}" if via else "")
 
 def _mark(lvl):
     """判定行的符号+颜色：一眼扫过去就知道好坏。"""
@@ -363,14 +376,13 @@ def run_targets(targets, workers=6):
         print("\r" + " " * 40 + "\r", end="")
     return out
 
-def report_routes(full=False):
-    title("二、三网回程路由（VPS → 中国）")
+def report_routes(num="二"):
+    title(f"{num}、三网回程路由（本机 → 中国）")
     if not ensure_traceroute():
         print(f"  {C['r']}没有 traceroute/mtr 且装不上，跳过本节{C['n']}"); return None
-    targets = TARGETS if full else [t for t in TARGETS if t[1] == "北京"]
-    print(f"  {C['d']}{len(targets)} 个测试点，并发跑。测试点先校验归属，对不上的标『存疑』跳过。{C['n']}")
-    if not full:
-        print(f"  {C['d']}（快速模式只测北京、并列出逐跳；完整模式测 8 城 24 点、只出判定）{C['n']}")
+    targets = TARGETS
+    print(f"  {C['d']}{len(targets)} 个测试点（{len(CITIES)} 城 × 三网），并发跑，约 2 分钟。{C['n']}")
+    print(f"  {C['d']}测试点先校验归属，对不上的标『存疑』跳过；只认【目标本网】骨干。{C['n']}")
     res = run_targets(targets)
 
     verdicts = {}
@@ -389,23 +401,16 @@ def report_routes(full=False):
                 print(f"    {C['r']}✗ {city:<4} 无响应（ICMP/UDP 被拦或不可达）{C['n']}")
                 verdicts.setdefault(car, []).append((city, "无响应", "fail"))
                 continue
-            lab, lvl, ms = route_verdict(hops)
+            lab, lvl, ms, via = route_verdict(hops, car)
             col, sym = _mark(lvl)
             lat = f"{ms:.0f} ms" if ms else ""
-            print(f"    {col}{sym} {city:<4} {lab:<22}{C['n']}{C['d']}{lat:>9}{C['n']}")
+            print(f"    {col}{sym} {city:<4} {lab:<22}{C['n']}{C['d']}{lat:>9}"
+                  f"{('   ' + via) if via else ''}{C['n']}")
             verdicts.setdefault(car, []).append((city, lab, lvl))
-            if not full:                                  # 快速模式才列逐跳，24 点全列刷屏
-                for n, hip, hms in hops:
-                    if not hip:
-                        continue
-                    hl, hv = classify_hop(hip)
-                    hc, _ = _mark(hv)
-                    tail = f"  {hc}{hl}{C['n']}" if hl else ""
-                    print(f"      {C['d']}{n:>2}  {hip:<16}{(f'{hms:.1f} ms' if hms else ''):>10}{C['n']}{tail}")
     return verdicts
 
-def report_bl(ip):
-    title("三、IP 黑名单（DNSBL）")
+def report_bl(ip, num="三"):
+    title(f"{num}、IP 黑名单（DNSBL）")
     resolver = _sys_resolvers()[0]
     print(f"  {C['d']}用系统解析器 {resolver} 查询——Spamhaus 等会拒绝来自公共 DNS 的查询{C['n']}")
     hr("·")
@@ -425,8 +430,8 @@ def report_bl(ip):
         print(f"  {C['d']}「未知」是查询被拒或超时，不代表干净——别当成通过{C['n']}")
     return listed
 
-def report_reach():
-    title("四、常用服务可达性（TCP:443 握手）")
+def report_reach(num="四"):
+    title(f"{num}、常用服务可达性（TCP:443 握手）")
     print(f"  {C['d']}只测能否连上，不代表解锁——解锁要看返回内容和区域判定{C['n']}")
     hr("·")
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
@@ -434,39 +439,49 @@ def report_reach():
             if ms is None: print(f"  {C['r']}✗ {lab:<10} 连不上{C['n']}")
             else:          print(f"  {C['g']}✓ {lab:<10} {ms} ms{C['n']}")
 
-def main():
-    full = "--full" in sys.argv
-    print(f"\n{C['b']}VPS 线路与 IP 纯净度体检{C['n']}")
+def _conclude_routes(v):
+    """把三网判定压成一行一家，看得见差异。"""
+    for car in CARRIERS:
+        rows = v.get(car)
+        if not rows: continue
+        prem = [c for c, l, lv in rows if lv == "premium"]
+        norm = [c for c, l, lv in rows if lv == "normal"]
+        miss = [c for c, l, lv in rows if lv in ("fail", "skip")]
+        unk  = [c for c, l, lv in rows if lv == ""]
+        labs = sorted({l for _, l, lv in rows if lv == "premium"}) or \
+               sorted({l for _, l, lv in rows if lv == "normal"})
+        col = C["g"] + C["b"] if prem else (C["y"] if norm else C["d"])
+        sym = "●" if prem else ("○" if norm else "·")
+        tail = f"优质 {len(prem)} / 普通 {len(norm)}"
+        if unk:  tail += f" / 未探到 {len(unk)}"
+        if miss: tail += f" / 没测到 {len(miss)}"
+        print(f"  {col}{sym} {car}{C['n']}  {col}{'、'.join(labs) or '未识别'}{C['n']}"
+              f"   {C['d']}{tail}（共 {len(rows)} 个点）{C['n']}")
+        if prem and norm:      # 同一家里既有优质又有普通 → 分城列出来，看得见差异
+            print(f"      {C['g']}优质：{'、'.join(prem)}{C['n']}")
+            print(f"      {C['y']}普通：{'、'.join(norm)}{C['n']}")
+
+def _flag_line(flag):
+    if flag is None:                       # 画像没取到，别把「没查成」说成「无异常」
+        return "画像未取到（ip-api 限流或无外网）"
+    return ("有 proxy 标记，纯净度差" if flag == 2 else
+            "机房 IP（正常现象，流媒体可能受限）" if flag == 1 else "无异常标记")
+
+def check_local():
+    """本机 IP 检测：画像 + 三网回程 + 黑名单 + 可达性，四节全上。"""
+    print(f"\n{C['b']}本机 IP 检测（线路 + 纯净度）{C['n']}")
     ip = my_ip()
     if not ip:
         print(f"{C['r']}拿不到公网 IP，检查外网连通性。{C['n']}"); return 1
-    flag = report_ip(ip)
-    v = report_routes(full)
-    listed = report_bl(ip)
-    report_reach()
+    flag = report_ip(ip, "一", local=True)
+    v = report_routes("二")
+    listed = report_bl(ip, "三")
+    report_reach("四")
 
     title("五、结论")
-    if v:
-        for car in CARRIERS:
-            rows = v.get(car)
-            if not rows: continue
-            prem = [c for c, l, lv in rows if lv == "premium"]
-            norm = [c for c, l, lv in rows if lv == "normal"]
-            miss = [c for c, l, lv in rows if lv in ("fail", "skip")]
-            labs = sorted({l for _, l, lv in rows if lv == "premium"}) or \
-                   sorted({l for _, l, lv in rows if lv == "normal"})
-            col = C["g"] + C["b"] if prem else C["y"]
-            sym = "●" if prem else "○"
-            tail = f"优质 {len(prem)} / 普通 {len(norm)}"
-            if miss: tail += f" / 没测到 {len(miss)}"
-            print(f"  {col}{sym} {car}{C['n']}  {col}{'、'.join(labs) or '未识别'}{C['n']}"
-                  f"   {C['d']}{tail}（共 {len(rows)} 个点）{C['n']}")
-            if prem and norm:      # 同一家里既有优质又有普通 → 分城列出来，看得见差异
-                print(f"      {C['g']}优质：{'、'.join(prem)}{C['n']}")
-                print(f"      {C['y']}普通：{'、'.join(norm)}{C['n']}")
+    if v: _conclude_routes(v)
     print()
-    print(f"  IP 标记   : " + ("有 proxy 标记，纯净度差" if flag == 2 else
-                               "机房 IP（正常现象，流媒体可能受限）" if flag == 1 else "无异常标记"))
+    print(f"  IP 标记   : {_flag_line(flag)}")
     print(f"  黑名单     : " + (f"命中 {len(listed)} 个：{', '.join(listed)}" if listed else "未命中"))
     hr()
     print(f"{C['b']}局限（必须知道，否则会误判）{C['n']}")
@@ -477,9 +492,44 @@ def main():
           f"{C['c']}curl -sL nxtrace.org/nt | bash && nexttrace 219.141.136.12{C['n']}")
     print(f"  2. 这里测的是【回程】（VPS→中国）。去程（中国→VPS）本机测不到，"
           f"\n     要在国内侧测。三网的去程和回程经常走【不同】骨干。")
-    print(f"  3. 「可达」≠「解锁」。流媒体解锁要看区域判定，需专门的解锁检测脚本。")
-    print(f"  4. 黑名单标「未知」的项是被拒答/超时，不是干净。")
+    print(f"  3. 判定只认【目标本网】骨干：去联通的路上经过 59.43 不算「联通走 CN2」，"
+          f"\n     那只是转接段，会作为备注列出。本网骨干一跳没探到就标『未探到』。")
+    print(f"  4. 「可达」≠「解锁」。流媒体解锁要看区域判定，需专门的解锁检测脚本。")
+    print(f"  5. 黑名单标「未知」的项是被拒答/超时，不是干净。")
     return 0
+
+def check_external(ip):
+    """外部 IP 检测：只查这个 IP 本身的属性——画像 + 黑名单。
+
+       为什么不测回程和可达性：traceroute 和 TCP 握手测的是【本机】的出网情况，
+       换个 IP 当参数结果还是本机的，跟那个 IP 无关。与其给一份名不副实的报告，
+       不如只出这个 IP 真正可查的两项。"""
+    print(f"\n{C['b']}外部 IP 检测（IP 纯净度）{C['n']}  {C['d']}目标 {ip}{C['n']}")
+    print(f"  {C['d']}只查该 IP 自身属性：画像 + 黑名单。回程路由/服务可达性测的是"
+          f"【本机】出网，\n  换个 IP 当参数也测不到它，故不列——要测那台机的线路，"
+          f"请在那台机上跑「本机 IP 检测」。{C['n']}")
+    flag = report_ip(ip, "一", local=False)
+    listed = report_bl(ip, "二")
+
+    title("三、结论")
+    print(f"  IP 标记   : {_flag_line(flag)}")
+    print(f"  黑名单     : " + (f"命中 {len(listed)} 个：{', '.join(listed)}" if listed else "未命中"))
+    hr()
+    print(f"{C['b']}局限{C['n']}")
+    print(f"  1. 画像来自 ip-api.com，机房/代理标记是它的判定，各家风控库不完全一致。")
+    print(f"  2. 黑名单标「未知」的项是被拒答/超时，不是干净。")
+    print(f"  3. 线路（三网回程）只能在【那台机器本机】上测，这里给不出。")
+    return 0
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if not args:
+        return check_local()
+    ip = args[0]
+    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip) or \
+       any(int(x) > 255 for x in ip.split(".")):
+        print(f"{C['r']}不是合法的 IPv4 地址：{ip}{C['n']}"); return 1
+    return check_external(ip)
 
 if __name__ == "__main__":
     sys.exit(main())

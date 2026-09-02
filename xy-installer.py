@@ -3559,8 +3559,10 @@ def vps_check_menu():
     print("\n" + "=" * 60)
     print("  VPS 线路检测（三网回程 + IP 纯净度）")
     print("=" * 60)
-    print("  查四样：本机 IP 画像（机房/代理标记）、三网回程走哪条骨干、")
-    print("          IP 黑名单（10 个 DNSBL）、常用服务可达性。")
+    print("  本机：IP 画像（机房/代理标记）、三网回程走哪条骨干、")
+    print("        IP 黑名单（10 个 DNSBL）、常用服务可达性。")
+    print("  外部：只查那个 IP 自己的画像 + 黑名单——回程和可达性测的是【本机】")
+    print("        出网，换个 IP 当参数也测不到，要测线路得在那台机上跑本机检测。")
     print("-" * 60)
     print("  ⓘ 只测【回程】(VPS→中国)。去程(中国→VPS)本机测不到，要在国内侧测——")
     print("     三网的去程和回程经常走【不同】骨干，别拿回程结论推去程。")
@@ -3568,15 +3570,21 @@ def vps_check_menu():
     print("     里（查不到 AS），细分规则无从核实。与其给个「自信但可能错」的结论，")
     print("     不如把证据摆出来。要定性用 nexttrace。")
     print("-" * 60)
-    print("  1 快速（三网各测北京一点，列出逐跳，约 1 分钟）")
-    print("  2 完整（三网 × 京沪莆深宁蓉西汉 8 城 = 24 点，只出判定，约 2 分钟）")
+    print("  1 本机IP检测（四节全查：画像 + 三网回程 8 城 24 点 + 黑名单 + 可达性，约 2 分钟）")
+    print("  2 外部IP检测（输入任意 IP，只查它自己的画像 + 黑名单，约 10 秒）")
     print("  0 返回")
     c = _ask("选择: ").strip()
     if c not in ("1", "2"):
         return
+    arg = ""
+    if c == "2":
+        ip = _ask("要检测的 IP: ").strip()
+        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip) or any(int(x) > 255 for x in ip.split(".")):
+            print("  不是合法的 IPv4 地址。"); return
+        arg = " " + ip
     if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
         print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {VPSCHK_LOCAL}" + (" --full" if c == "2" else ""), shell=True)
+    subprocess.run(f"python3 {VPSCHK_LOCAL}{arg}", shell=True)
 
 def _netopt_state():
     """读网络优化当前档位。返回 (mode, mb)：
