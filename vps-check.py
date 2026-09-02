@@ -571,27 +571,77 @@ def check_local():
     print(f"  5. 黑名单标「未知」的项是被拒答/超时，不是干净。")
     return 0
 
+SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/vps-check.py"
+
+def report_link(ip, num="二"):
+    """本机 → 目标 IP 的链路。注意这【不是】那台机器到中国的线路。
+
+       为什么还是值得测：做中转/落地链（本仓库的聚合节点就是这个场景）时，
+       要知道的正是「我这台机到那台机有多远、走不走得通」——这条链路本机测得到，
+       而且只有本机测得到。至于那台机回中国走哪条骨干，本机没有任何办法探到，
+       别把这两件事混了。"""
+    title(f"{num}、本机 → 目标 的链路")
+    print(f"  {C['y']}这是【你这台机】到它的路，不是【它】到中国的路。{C['n']}")
+    print(f"  {C['d']}做中转/落地链时看这个：两台机之间通不通、多远。{C['n']}")
+    hr("·")
+    ms = reach(ip, 443)
+    hs = reach(ip, 80)
+    if ms is None and hs is None:
+        print(f"  TCP 握手   : {C['y']}443/80 都不通{C['n']}   {C['d']}（对方没开这两个端口，或防火墙挡了，不代表机器不在）{C['n']}")
+    else:
+        got = [f"443 {ms} ms" if ms is not None else "", f"80 {hs} ms" if hs is not None else ""]
+        print(f"  TCP 握手   : {C['g']}{' / '.join(x for x in got if x)}{C['n']}")
+    if not ensure_traceroute():
+        print(f"  {C['r']}没有 traceroute/mtr 且装不上，逐跳跳过{C['n']}"); return
+    hops = traceroute(ip)
+    if not hops:
+        print(f"  逐跳       : {C['y']}无响应（ICMP/UDP 被拦）{C['n']}"); return
+    end = [m for _, h, m in hops if h and m is not None]
+    print(f"  逐跳       : {len(hops)} 跳" + (f"，末跳 {end[-1]:.0f} ms" if end else ""))
+    gap = []                                  # 连续无响应的跳折成一行，别刷 20 行 *
+    def flush():
+        if gap:
+            span = f"{gap[0]}" if len(gap) == 1 else f"{gap[0]}-{gap[-1]}"
+            print(f"    {C['d']}{span:>5}  * 无响应 {len(gap)} 跳{C['n']}")
+            gap.clear()
+    for n, hip, hms in hops:
+        if not hip:
+            gap.append(n); continue
+        flush()
+        asn, _pfx, cc, name = asn_of(hip)
+        who = f"AS{asn} {name[:30]}" if asn else "查不到 AS"
+        print(f"    {C['d']}{n:>2}  {hip:<16}{(f'{hms:.1f} ms' if hms else ''):>10}  {who} {cc}{C['n']}")
+    flush()
+
 def check_external(ip):
-    """外部 IP 检测：只查这个 IP 本身的属性——画像 + 黑名单。
+    """外部 IP 检测：这个 IP 自身的属性（画像、黑名单）+ 本机到它的链路。
 
-       为什么不测回程和可达性：traceroute 和 TCP 握手测的是【本机】的出网情况，
-       换个 IP 当参数结果还是本机的，跟那个 IP 无关。与其给一份名不副实的报告，
-       不如只出这个 IP 真正可查的两项。"""
-    print(f"\n{C['b']}外部 IP 检测（IP 纯净度）{C['n']}  {C['d']}目标 {ip}{C['n']}")
-    print(f"  {C['d']}只查该 IP 自身属性：画像 + 黑名单。回程路由/服务可达性测的是"
-          f"【本机】出网，\n  换个 IP 当参数也测不到它，故不列——要测那台机的线路，"
-          f"请在那台机上跑「本机 IP 检测」。{C['n']}")
+       测不了、也不该假装能测的是【它到中国走哪条骨干】——那要在它自己身上跑
+       traceroute，本机没有任何办法探到。所以这里不给回程判定，只在结论里
+       把「去那台机上跑」的命令原样给出来。"""
+    print(f"\n{C['b']}外部 IP 检测{C['n']}  {C['d']}目标 {ip}{C['n']}")
+    print(f"  {C['d']}查三样：该 IP 的画像、本机到它的链路、它的黑名单。{C['n']}")
+    print(f"  {C['y']}测不了它的三网回程{C['n']}{C['d']}——那要在它自己身上跑 traceroute，"
+          f"本机探不到。命令见结论。{C['n']}")
     flag = report_ip(ip, "一", local=False)
-    listed, _ = report_bl(ip, "二")
+    report_link(ip, "二")
+    listed, _ = report_bl(ip, "三")
 
-    title("三、结论")
+    title("四、结论")
     print(f"  IP 标记   : {_flag_line(flag)}")
     print(f"  黑名单     : " + (f"命中 {len(listed)} 个：{', '.join(listed)}" if listed else "未命中"))
+    hr("·")
+    print(f"  {C['b']}要测它的三网回程，SSH 上去跑这一行{C['n']}（纯 stdlib，不装任何东西）：")
+    print(f"    {C['c']}curl -fsSL {SELF_URL} | python3{C['n']}")
     hr()
     print(f"{C['b']}局限{C['n']}")
-    print(f"  1. 画像来自 ip-api.com，机房/代理标记是它的判定，各家风控库不完全一致。")
-    print(f"  2. 黑名单标「未知」的项是被拒答/超时，不是干净。")
-    print(f"  3. 线路（三网回程）只能在【那台机器本机】上测，这里给不出。")
+    print(f"  1. {C['y']}三网回程只能在那台机器本机上测{C['n']}——traceroute 是从【发起方】"
+          f"往外探，\n     在这儿跑，探到的永远是本机的出网路径，跟目标那台机怎么回中国无关。"
+          f"\n     这不是没做，是原理上做不到。")
+    print(f"  2. 「本机 → 目标」那一节测的是你这两台机之间的链路（中转/落地链看这个），"
+          f"\n     不要拿它当目标机的线路质量。")
+    print(f"  3. 画像来自 ip-api.com，机房/代理标记是它的判定，各家风控库不完全一致。")
+    print(f"  4. 黑名单标「未知」的项是被拒答/超时，不是干净。")
     return 0
 
 def show_hops(ip):
