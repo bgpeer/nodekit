@@ -107,6 +107,9 @@ GHRELAY_TOKEN_FILE = BGP_DIR + "/ghrelay.token"  # 本机中转的 token（防�
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
 NETOPT_LOCAL = BGP_DIR + "/net-optimize.py"      # 本地缓存的网络优化脚本
 NETOPT_URL   = _RAW + "net-optimize.py"
+# VPS 线路检测（三网回程骨干 + IP 纯净度），同样是拉本仓库脚本来跑
+VPSCHK_LOCAL = BGP_DIR + "/vps-check.py"
+VPSCHK_URL   = _RAW + "vps-check.py"
 # 网络优化的落盘状态（net-optimize.py 写的，卸载时 rmtree 整个目录）：
 #   config           KEY=VAL，含 ADAPTIVE_QOS_MODE（adaptive / fixed_cake）
 #   adaptive-qos.conf JSON，含 threshold（激活阈值，单位字节）
@@ -3550,6 +3553,31 @@ def _run_net_optimize(args="", env_extra=None):
     subprocess.run(f"python3 {NETOPT_LOCAL} {args}".strip(), shell=True,
                    env=dict(os.environ, **(env_extra or {})))
 
+def vps_check_menu():
+    """VPS 线路检测：三网回程走哪条骨干 + IP 纯净度。脚本在本仓库 vps-check.py。
+       纯 stdlib、无第三方依赖；traceroute 缺了它自己 apt/yum/apk 装。"""
+    print("\n" + "=" * 60)
+    print("  VPS 线路检测（三网回程 + IP 纯净度）")
+    print("=" * 60)
+    print("  查四样：本机 IP 画像（机房/代理标记）、三网回程走哪条骨干、")
+    print("          IP 黑名单（10 个 DNSBL）、常用服务可达性。")
+    print("-" * 60)
+    print("  ⓘ 只测【回程】(VPS→中国)。去程(中国→VPS)本机测不到，要在国内侧测——")
+    print("     三网的去程和回程经常走【不同】骨干，别拿回程结论推去程。")
+    print("  ⓘ 不区分 CN2 GIA / GT：两者都走 59.43 段，而 59.43 不在 BGP 全局路由表")
+    print("     里（查不到 AS），细分规则无从核实。与其给个「自信但可能错」的结论，")
+    print("     不如把证据摆出来。要定性用 nexttrace。")
+    print("-" * 60)
+    print("  1 快速（三网各测北京一个点，约 1 分钟）")
+    print("  2 完整（三网 × 京沪穗 共 9 个点，约 3 分钟）")
+    print("  0 返回")
+    c = _ask("选择: ").strip()
+    if c not in ("1", "2"):
+        return
+    if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
+        print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); return
+    subprocess.run(f"python3 {VPSCHK_LOCAL}" + (" --full" if c == "2" else ""), shell=True)
+
 def _netopt_state():
     """读网络优化当前档位。返回 (mode, mb)：
        mode = None（未优化）/ 'fixed_cake' / 'fixed_burst' / 'adaptive'；
@@ -5093,8 +5121,9 @@ def main_menu():
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
         print("  15. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  16. 更新脚本（不影响节点）")
-        print("  17. 更新核心（sing-box / xray）")
-        print("  18. 卸载")
+        print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
+        print("  18. 更新核心（sing-box / xray）")
+        print("  19. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -5117,8 +5146,9 @@ def main_menu():
         elif c == "14":  ghrelay_menu()
         elif c == "15":  media_stack_menu()
         elif c == "16":  update_script()
-        elif c == "17":  update_cores()
-        elif c == "18":  uninstall_all()
+        elif c == "17":  vps_check_menu()
+        elif c == "18":  update_cores()
+        elif c == "19":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
