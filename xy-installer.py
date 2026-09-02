@@ -3608,7 +3608,7 @@ def vps_check_menu():
     _vpschk_last()
     print("-" * 60)
     print("  1 本机IP检测（约 2 分钟）")
-    print("  2 外部IP检测（输入任意 IP，查画像 + 黑名单）")
+    print("  2 外部IP检测（输入任意 IP，查画像 + 本机到它的链路 + 黑名单）")
     print("  0 返回")
     c = _ask("选择: ").strip()
     if c not in ("1", "2"):
