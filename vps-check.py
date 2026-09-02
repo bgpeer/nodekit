@@ -8,12 +8,17 @@
 #   2. 查不准就明说，不给"自信但错误"的结论。GIA/GT 的细分本脚本【不下结论】，
 #      只把证据（59.43 跳、跳数、延迟）摆出来——理由见文件末尾「局限」。
 # ============================================================================
-import json, os, re, socket, struct, random, subprocess, sys, urllib.request, concurrent.futures as cf
+import json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, concurrent.futures as cf
 
 C = {"g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "c": "\033[36m",
      "b": "\033[1m", "d": "\033[2m", "n": "\033[0m"}
 if not sys.stdout.isatty():
     C = {k: "" for k in C}
+
+# 上次「本机检测」的结果落这儿，给 xy-installer 的菜单直接读出来显示。
+# 只存本机的：外部 IP 检测查的是别人的 IP，跟这台机器的线路无关，存了会误导。
+LAST_FILE = ("/etc/bgpeer/vps-check.last.json" if os.path.isdir("/etc/bgpeer")
+             else os.path.expanduser("~/.vps-check.last.json"))
 
 def hr(ch="─", n=68): print(C["d"] + ch * n + C["n"])
 def title(t):
@@ -428,7 +433,7 @@ def report_bl(ip, num="三"):
           f"未知 {len(unknown)} / 共 {len(DNSBLS)}")
     if unknown:
         print(f"  {C['d']}「未知」是查询被拒或超时，不代表干净——别当成通过{C['n']}")
-    return listed
+    return listed, unknown
 
 def report_reach(num="四"):
     title(f"{num}、常用服务可达性（TCP:443 握手）")
@@ -467,6 +472,30 @@ def _flag_line(flag):
     return ("有 proxy 标记，纯净度差" if flag == 2 else
             "机房 IP（正常现象，流媒体可能受限）" if flag == 1 else "无异常标记")
 
+def save_last(ip, flag, v, listed, unknown):
+    """把这次本机检测压成一份小 JSON 落盘，菜单里直接显示，省得每次都要重跑。
+       只落本机结果——外部 IP 检测查的是别人的 IP，跟这台机的线路无关。"""
+    routes = {}
+    for car in CARRIERS:
+        rows = v.get(car) if v else None
+        if not rows: continue
+        prem = [c for c, l, lv in rows if lv == "premium"]
+        norm = [c for c, l, lv in rows if lv == "normal"]
+        labs = sorted({l for _, l, lv in rows if lv == "premium"}) or \
+               sorted({l for _, l, lv in rows if lv == "normal"})
+        routes[car] = {"labs": labs, "prem": len(prem), "norm": len(norm),
+                       "unk": len([1 for _, _, lv in rows if lv == ""]),
+                       "miss": len([1 for _, _, lv in rows if lv in ("fail", "skip")]),
+                       "total": len(rows)}
+    data = {"ts": int(time.time()), "ip": ip, "flag": flag, "routes": routes,
+            "bl_listed": listed, "bl_unknown": len(unknown), "bl_total": len(DNSBLS)}
+    try:
+        os.makedirs(os.path.dirname(LAST_FILE), exist_ok=True)
+        with open(LAST_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except OSError as e:
+        print(f"  {C['d']}（结果没能写进 {LAST_FILE}：{e}）{C['n']}")
+
 def check_local():
     """本机 IP 检测：画像 + 三网回程 + 黑名单 + 可达性，四节全上。"""
     print(f"\n{C['b']}本机 IP 检测（线路 + 纯净度）{C['n']}")
@@ -475,7 +504,7 @@ def check_local():
         print(f"{C['r']}拿不到公网 IP，检查外网连通性。{C['n']}"); return 1
     flag = report_ip(ip, "一", local=True)
     v = report_routes("二")
-    listed = report_bl(ip, "三")
+    listed, unknown = report_bl(ip, "三")
     report_reach("四")
 
     title("五、结论")
@@ -483,6 +512,7 @@ def check_local():
     print()
     print(f"  IP 标记   : {_flag_line(flag)}")
     print(f"  黑名单     : " + (f"命中 {len(listed)} 个：{', '.join(listed)}" if listed else "未命中"))
+    save_last(ip, flag, v, listed, unknown)
     hr()
     print(f"{C['b']}局限（必须知道，否则会误判）{C['n']}")
     print(f"  1. {C['y']}本脚本不区分 CN2 GIA 和 CN2 GT{C['n']}——两者都走 59.43 段，"
@@ -509,7 +539,7 @@ def check_external(ip):
           f"【本机】出网，\n  换个 IP 当参数也测不到它，故不列——要测那台机的线路，"
           f"请在那台机上跑「本机 IP 检测」。{C['n']}")
     flag = report_ip(ip, "一", local=False)
-    listed = report_bl(ip, "二")
+    listed, _ = report_bl(ip, "二")
 
     title("三、结论")
     print(f"  IP 标记   : {_flag_line(flag)}")
