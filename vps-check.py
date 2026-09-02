@@ -117,29 +117,37 @@ def asn_of(ip):
 # 第三项是这条骨干【属于哪家】——判定必须按目标运营商挑本网骨干，
 # 否则从 CN2 机器出去，去联通/移动的路径头几跳也全是 59.43，
 # 会把三家都标成「电信 CN2」（实测就是这个现象）。
+# 第四项是【国际段 intl / 国内落地网 domestic】。
+# 为什么要分：能定性一条线路好坏的是【国际段】走哪条（CN2 还是 163、9929 还是
+# 169、CMIN2 还是 CMI）。国内落地网是到达那家用户必经的，跟线路档次无关。
+# 移动尤其要分——CMNET(AS9808) 是移动【国内】网，从境外去移动的路径末尾必然
+# 进它，而国际段是另外两个 AS（CMIN2 58807 / CMI 58453）。不分的话「取最后一个
+# 本网骨干」永远落到 CMNET，把真正该看的国际段盖掉（实测就是这个现象：8 个点
+# 全标 CMNET，看不出到底是 CMIN2 还是 CMI）。
+# 电信 163(AS4134) 和联通 169(AS4837) 国际国内共用一个 AS，分不开，仍按国际段算。
 BACKBONE_AS = {
-    "4809":  ("电信 CN2",        "premium", "电信"),
-    "4134":  ("电信 163",        "normal",  "电信"),
-    "9929":  ("联通 9929",       "premium", "联通"),
-    "4837":  ("联通 169",        "normal",  "联通"),
-    "58807": ("移动 CMIN2",      "premium", "移动"),
-    "58453": ("移动 CMI",        "normal",  "移动"),
-    "9808":  ("移动 CMNET",      "normal",  "移动"),
-    "4847":  ("电信 CNIX",       "normal",  "电信"),
+    "4809":  ("电信 CN2",        "premium", "电信", "intl"),
+    "4134":  ("电信 163",        "normal",  "电信", "intl"),
+    "9929":  ("联通 9929",       "premium", "联通", "intl"),
+    "4837":  ("联通 169",        "normal",  "联通", "intl"),
+    "58807": ("移动 CMIN2",      "premium", "移动", "intl"),
+    "58453": ("移动 CMI",        "normal",  "移动", "intl"),
+    "9808":  ("移动 CMNET",      "normal",  "移动", "domestic"),
+    "4847":  ("电信 CNIX",       "normal",  "电信", "intl"),
 }
 def classify_hop(ip):
-    """→ (标签, 等级, 归属)。等级：premium / normal / "" """
+    """→ (标签, 等级, 归属, 范围)。等级：premium / normal / ""；范围：intl / domestic / "" """
     if ip.startswith("59.43."):
-        return "电信 CN2 (59.43)", "premium", "电信"
+        return "电信 CN2 (59.43)", "premium", "电信", "intl"
     if ip.startswith("202.97."):
-        return "电信 163 (202.97)", "normal", "电信"
+        return "电信 163 (202.97)", "normal", "电信", "intl"
     asn, _, cc, name = asn_of(ip)
     if asn and asn in BACKBONE_AS:
-        lab, lvl, car = BACKBONE_AS[asn]
-        return f"{lab} (AS{asn})", lvl, car
+        lab, lvl, car, scope = BACKBONE_AS[asn]
+        return f"{lab} (AS{asn})", lvl, car, scope
     if asn:
-        return f"AS{asn} {name[:34]}", "", ""
-    return "", "", ""
+        return f"AS{asn} {name[:34]}", "", "", ""
+    return "", "", "", ""
 
 # ---------------------------------------------------------------- 回程路由
 # 三网常用测试点。⚠ 不盲信：跑之前先查每个目标的真实 ASN/国家，
@@ -322,34 +330,47 @@ def report_ip(ip, num="一", local=True):
         elif v and k == "hosting": worst = max(worst, 1)
     return worst
 
-def route_verdict(hops, car):
-    """从逐跳里提炼【目标运营商本网】的骨干判定 → (标签, 等级, 该跳延迟, 备注)。
+def _short(lab):
+    """备注里用短名，"电信 CN2 (59.43)" → "电信 CN2"。手机上一行放不下会折行。"""
+    return lab.split(" (")[0]
 
-       为什么必须按运营商挑：从一台 CN2 机器出去，无论目的地是电信、联通还是
-       移动，路径【头几跳都是 59.43】——按「第一个 premium」取就会把联通、移动
-       也判成「电信 CN2」（用户实测 24 个点全标 CN2，就是这个 bug）。
-       所以只认归属 == 目标运营商的跳；本网骨干一跳都没探到时，如实说没探到，
-       并把路径上确实经过的他网骨干作为备注附上，而不是拿它冒充结论。"""
-    own_best = own_last = via = None
+def route_verdict(hops, car):
+    """从逐跳里提炼【目标运营商国际段】的骨干判定 → (标签, 等级, 该跳延迟, 备注)。
+
+       两条都是踩过坑才加的：
+
+       1. 必须按运营商挑。从一台 CN2 机器出去，无论目的地是电信、联通还是移动，
+          路径【头几跳都是 59.43】——按「第一个 premium」取就会把联通、移动也
+          判成「电信 CN2」（实测 24 个点全标 CN2）。所以只认归属 == 目标运营商的跳。
+       2. 必须只认国际段。到移动的路径末尾必然进 CMNET(AS9808，移动国内网)，
+          按「最后一个本网骨干」取就永远是 CMNET，把该看的国际段（CMIN2 还是 CMI）
+          盖掉（实测 8 个点全标 CMNET）。所以国内落地网只作备注，不当结论。
+
+       本网国际段一跳都没探到时如实说没探到，把路上经过的他网骨干和落地网
+       作为备注附上，而不是拿它们冒充结论。"""
+    own_best = own_last = own_dom = via = None
     for _, hip, ms in hops:
         if not hip:
             continue
-        lab, lvl, hcar = classify_hop(hip)
+        lab, lvl, hcar, scope = classify_hop(hip)
         # 只认已知骨干（premium/normal）。classify_hop 对认不出的 AS 会回一个
         # "AS#### 名字"、等级为空——那多半是【目的地自己的省级接入网】
         # （如 AS4835 CHINANET-IDC-SN），把它当结论会把骨干判定盖掉。
         if lvl not in ("premium", "normal"):
             continue
-        if hcar == car:
+        if hcar != car:
+            if via is None or lvl == "premium":
+                via = _short(lab)                     # 他网转接段，只作备注
+        elif scope == "domestic":
+            own_dom = _short(lab)                     # 本网国内落地，只作备注
+        else:
             own_last = (lab, lvl, ms)
             if lvl == "premium" and own_best is None:
                 own_best = (lab, lvl, ms)
-        elif via is None or lvl == "premium":
-            via = lab                      # 他网转接段，只作备注
+    note = "、".join(x for x in (f"经 {via}" if via else "",
+                                 f"落地 {own_dom}" if own_dom else "") if x)
     pick = own_best or own_last
-    if pick:
-        return pick + (f"经 {via}" if via else "",)
-    return ("未探到本网骨干", "", None, f"路径经 {via}" if via else "")
+    return (pick + (note,)) if pick else ("未探到国际段", "", None, note)
 
 def _mark(lvl):
     """判定行的符号+颜色：一眼扫过去就知道好坏。"""
