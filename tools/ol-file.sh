@@ -14,7 +14,7 @@
 #   ③ 拉 1 MiB     慢 = 地址拿到了但拉不动，那是限速/线路
 set -u
 
-TOOL_VER="2026-08-31d"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-02a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"
@@ -122,6 +122,10 @@ def show_logs():
     print(f"  {D}· too many requests / 429      网盘在限流，等一会儿{X}")
     print(f"  {D}· token / 401 / unauthorized   授权失效了，去 OpenList 重新扫码{X}")
     print(f"  {D}· context deadline exceeded    网盘接口没在时限内回话，限流或线路{X}")
+    print(f"  {D}· context canceled             【发起方先断了】—— 网页等不下去，"
+          f"自己把请求取消了；{X}")
+    print(f"  {D}                               OpenList 顺手也取消了上游那一条。"
+          f"不是网盘拒绝，是它太慢{X}")
     print(f"  {D}· 一行都没有                    问题不在 OpenList，往浏览器/线路那边看{X}")
 
 
