@@ -5,7 +5,7 @@
       {"tag": "bootstrap", "type": "udp", "server": "223.5.5.5"},
       {"tag": "local", "type": "https", "server": "223.5.5.5", "path": "/dns-query", "tls": {"server_name": "dns.alidns.com"}, "domain_resolver": "bootstrap", "detour": "🎯直连"},
       {"tag": "remote", "type": "https", "server": "1.1.1.1", "path": "/dns-query", "tls": {"server_name": "cloudflare-dns.com"}, "domain_resolver": "bootstrap", "detour": "🌍代理"},
-      {"tag": "google", "type": "https", "server": "8.8.8.8", "path": "/dns-query", "tls": {"server_name": "dns.google"}, "domain_resolver": "bootstrap", "detour": "🌍代理"},
+      {"tag": "Final", "type": "https", "server": "8.8.8.8", "path": "/dns-query", "tls": {"server_name": "dns.google"}, "domain_resolver": "bootstrap", "detour": "🌍代理"},
       {"tag": "system", "type": "local"},
       {"tag": "fakeip", "type": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"}
     ],
@@ -17,7 +17,7 @@
       {"clash_mode": "全局", "server": "remote"},
       {"clash_mode": "直连", "server": "local"}
     ],
-    "final": "google",
+    "final": "Final",
     "strategy": "prefer_ipv4",
     "disable_cache": false,
     "cache_capacity": 4096,
