@@ -1802,6 +1802,7 @@ def build_singbox_sub(nodes, tpl_url):
             new_ob.append(x)
     cfg["outbounds"] = new_ob
     _sb_direct_ip(cfg, _direct_targets(nodes))                    # 各 VPS IP 直连（走紧凑序列化，不破坏格式）
+    _sb_selfdns(cfg, _selfdns_doh())                              # 开关开启：dns.final 换成本机自建 DoH
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
@@ -2268,6 +2269,53 @@ def _sb_direct_ip(cfg, targets):
         # 追加到最后而不是插到最前：sing-box 的兜底走 route.final、没有 MATCH 这一条，
         # 排在末尾就等价于 mihomo 那边的「MATCH 上一层」——自己写的规则一律优先。
         route["rules"] = rules + add
+
+def _sb_selfdns(cfg, url):
+    """sing-box：把自建 DoH 接到 dns.servers 里 tag=final 那台上（就地改 cfg dict）。
+
+       为什么改 final 而不是像 mihomo/小火箭那样"插在列表最前留兜底"：sing-box 的
+       DNS 【没有列表回落】——一条 dns 规则只指一个 server tag，指到的那台挂了查询
+       就直接失败，不会自动换下一台。所以这里不做假的"兜底"，就是把 final 换掉，
+       并在开关菜单里把这个差别讲明白。
+
+       为什么是 final：模板里 A/AAAA 走 fakeip，剩下真正要出结果的解析（直连域名、
+       节点地址）都落到 dns.final 上，换它才有意义。remote/local 不动——local 是
+       国内解析要拿就近 CDN，remote 是"全局"模式专用。
+
+       detour 走【直连】：DoH 就架在自己节点域名上，走代理等于让解析依赖代理、
+       代理又要先解析，套娃。domain_resolver 用模板里的 bootstrap(223.5.5.5 UDP)
+       解析这个域名本身，同理。
+
+       地址由 _selfdns_doh() 按本机域名动态生成，不写死在模板里。关掉开关时 url 为空、
+       直接返回；模板每次都是实时重拉的，"不写入"本身就等于"已删除"。"""
+    if not url:
+        return
+    m = re.match(r"^https://([^/:]+)(?::(\d+))?(/.*)$", url)
+    if not m:
+        return
+    host, port, path = m.group(1), m.group(2), m.group(3)
+    dns = cfg.get("dns")
+    if not isinstance(dns, dict) or not isinstance(dns.get("servers"), list):
+        return
+    servers = dns["servers"]
+    tags = {o.get("tag") for o in cfg.get("outbounds", []) if isinstance(o, dict)}
+    direct = "🎯直连" if "🎯直连" in tags else next((t for t in tags if t and "直连" in str(t)), "")
+    have_bootstrap = any(isinstance(o, dict) and o.get("tag") == "bootstrap" for o in servers)
+    for i, o in enumerate(servers):
+        if not isinstance(o, dict) or o.get("tag") != "final":
+            continue
+        new = {"tag": "final", "type": "https", "server": host}
+        if port and port != "443":
+            new["server_port"] = int(port)
+        new["path"] = path
+        # 解析 DoH 域名本身：优先模板里的 bootstrap；模板没有就沿用原来那台的写法
+        dr = "bootstrap" if have_bootstrap else o.get("domain_resolver")
+        if dr:
+            new["domain_resolver"] = dr
+        if direct:
+            new["detour"] = direct
+        servers[i] = new                       # 整个换掉：原来的 tls.server_name 是给
+        return                                 # dns.google 用的，留着会拿错 SNI 去握手
 
 def _sr_direct_ip(path, targets):
     """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。
@@ -3441,8 +3489,13 @@ def ghrelay_menu():
 
 def selfdns_toggle():
     """开关：把本机自建 DNS(AdGuard DoH) 写进订阅配置的 DNS，循环切换、写/删后自动刷新订阅。
-       只写 mihomo / 小火箭（列表型 DNS，把自建 DoH 放最前当主用、原有留兜底，没通自动回落）；
-       sing-box 的 DNS 无列表回落机制，强改易断解析，故不写入。adguard 菜单调用（selfdns-toggle）。"""
+       三个格式都写，但机制不同、后果也不同：
+         mihomo / 小火箭 —— 列表型 DNS，自建 DoH 放最前当主用、原有留兜底，没通自动回落。
+         sing-box —— 【没有列表回落】，一条 dns 规则只指一个 server tag，指到的那台挂了
+                     查询就直接失败。所以是把 dns.final 整个换成自建 DoH，
+                     DNS 机器挂了 sing-box 的默认解析就断（另两个只是慢一下）。
+                     不做假的"兜底"，把差别在菜单里讲明白，让用户自己决定。
+       adguard 菜单调用（selfdns-toggle）。"""
     dom = _host()
     if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or ""):
         print("  需要域名（DoH 走域名+证书）。当前节点不是域名，无法写入自建 DNS。"); return
@@ -3471,10 +3524,14 @@ def selfdns_toggle():
         act = "已写入"
     G["host"] = dom; ensure_deps()
     if build_subscription(read_saved_links()):               # 重新生成三格式并托管（不换 token）
-        print(f"\n  ✓ {act}自建 DNS，订阅已刷新（写入 mihomo / 小火箭；sing-box 未动，避免断解析）。")
+        print(f"\n  ✓ {act}自建 DNS，订阅已刷新（mihomo / sing-box / 小火箭 三个都写）。")
         if act == "已写入":
             print(f"  写入的 DoH：{_selfdns_doh()}")
-            print("  ⚠ 确保 AdGuard 已开加密、防火墙放行 DoH 端口；没通也不影响——会自动回落到原 DNS。")
+            print("  ⚠ 确保 AdGuard 已开加密、防火墙放行 DoH 端口。")
+            print("    mihomo / 小火箭：放在列表最前当主用，没通会自动回落到原 DNS，只是慢一下。")
+            print("    sing-box：换的是 dns.final，且 sing-box【没有 DNS 回落机制】——"
+                  "这台 DNS 挂了\n              它的默认解析就断（多机聚合时尤其要注意："
+                  "别的节点还活着，解析却没了）。")
             print(f"\n  ▸ 建议顺手关掉「开放解析器」：DoH 挂在公网上，不设白名单谁扫到都能用。")
             print(f"    AdGuard 后台 → 设置 → DNS设置 → 访问设置 → 允许的客户端，填入这一行：")
             print(f"        {selfdns_clientid()}")
