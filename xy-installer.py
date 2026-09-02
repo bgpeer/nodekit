@@ -2270,24 +2270,39 @@ def _sb_direct_ip(cfg, targets):
         # 排在末尾就等价于 mihomo 那边的「MATCH 上一层」——自己写的规则一律优先。
         route["rules"] = rules + add
 
+# 自建 DoH 顶掉原兜底 DNS 时要清掉的【寻址/传输】字段：它们描述的是原来那台
+# （8.8.8.8 / dns.google 之类），留一个都会让新地址握错手——尤其 tls.server_name，
+# 留着就拿 dns.google 当 SNI 去连你自己的域名。除这些之外的字段一律保留，
+# 别人自定义模板里加的 client_subnet、strategy 之类不该被我们抹掉。
+_SB_DNS_ADDR_KEYS = ("type", "server", "server_port", "path", "tls", "headers",
+                     "detour", "method", "interface_name", "inet4_range", "inet6_range")
+
 def _sb_selfdns(cfg, url):
-    """sing-box：把自建 DoH 接到 dns.servers 里 tag=final 那台上（就地改 cfg dict）。
+    """sing-box：把自建 DoH 顶掉【配置自己声明的兜底 DNS】（就地改 cfg dict）。
 
-       为什么改 final 而不是像 mihomo/小火箭那样"插在列表最前留兜底"：sing-box 的
-       DNS 【没有列表回落】——一条 dns 规则只指一个 server tag，指到的那台挂了查询
-       就直接失败，不会自动换下一台。所以这里不做假的"兜底"，就是把 final 换掉，
-       并在开关菜单里把这个差别讲明白。
+       认哪一台：读 dns.final 的值——那是配置自己写明"没被规则命中时用谁"的 tag，
+       模板里恰好叫 "final"，但自定义模板可以叫别的名。所以按 dns.final 指向的 tag 找，
+       不按字面量 "final"，更不按地址（8.8.8.8）——按地址锚定的话，别人把兜底换成
+       9.9.9.9 就再也匹配不上，静默失效。dns.final 没写才退回找 tag=="final"。
 
-       为什么是 final：模板里 A/AAAA 走 fakeip，剩下真正要出结果的解析（直连域名、
-       节点地址）都落到 dns.final 上，换它才有意义。remote/local 不动——local 是
-       国内解析要拿就近 CDN，remote 是"全局"模式专用。
+       为什么改兜底而不是像 mihomo/小火箭那样"插在列表最前留兜底"：sing-box 的 DNS
+       【没有列表回落】——一条 dns 规则只指一个 server tag，指到的那台挂了查询就直接
+       失败，不会自动换下一台。所以这里不做假的"兜底"，就是把它换掉，并在开关菜单里
+       把这个差别讲明白。
+
+       为什么是兜底那台而不是 local/remote：local 是国内解析，换掉就拿不到就近 CDN
+       （同 mihomo 那边 cn-dns 不动）；remote 是 clash_mode=全局 专用。兜底那台是
+       没被任何规则命中时才用，动它副作用最小。
 
        detour 走【直连】：DoH 就架在自己节点域名上，走代理等于让解析依赖代理、
        代理又要先解析，套娃。domain_resolver 用模板里的 bootstrap(223.5.5.5 UDP)
        解析这个域名本身，同理。
 
        地址由 _selfdns_doh() 按本机域名动态生成，不写死在模板里。关掉开关时 url 为空、
-       直接返回；模板每次都是实时重拉的，"不写入"本身就等于"已删除"。"""
+       直接返回；模板每次都是实时重拉的，"不写入"本身就等于"已删除"。
+
+       找不到就【说出来】而不是静默跳过：用了自定义模板的人得知道 sing-box 这份没写进去，
+       否则会以为三个格式都带上了。"""
     if not url:
         return
     m = re.match(r"^https://([^/:]+)(?::(\d+))?(/.*)$", url)
@@ -2296,26 +2311,35 @@ def _sb_selfdns(cfg, url):
     host, port, path = m.group(1), m.group(2), m.group(3)
     dns = cfg.get("dns")
     if not isinstance(dns, dict) or not isinstance(dns.get("servers"), list):
+        print("  ⚠ sing-box 模板里没有 dns.servers，自建 DNS 未写入这一份。")
         return
     servers = dns["servers"]
+    want = dns.get("final") or "final"            # 配置自己声明的兜底 tag
     tags = {o.get("tag") for o in cfg.get("outbounds", []) if isinstance(o, dict)}
     direct = "🎯直连" if "🎯直连" in tags else next((t for t in tags if t and "直连" in str(t)), "")
     have_bootstrap = any(isinstance(o, dict) and o.get("tag") == "bootstrap" for o in servers)
     for i, o in enumerate(servers):
-        if not isinstance(o, dict) or o.get("tag") != "final":
+        if not isinstance(o, dict) or o.get("tag") != want:
             continue
-        new = {"tag": "final", "type": "https", "server": host}
+        # 按 tag → 寻址 → 其它 → 解析器/出口 的顺序拼，跟模板里手写的排法一致，
+        # 别人对着 diff 看时不会觉得整条被搅乱了
+        keep = {k: v for k, v in o.items()
+                if k not in _SB_DNS_ADDR_KEYS and k not in ("tag", "domain_resolver")}
+        new = {"tag": o.get("tag"), "type": "https", "server": host}
         if port and port != "443":
             new["server_port"] = int(port)
         new["path"] = path
+        new.update(keep)                       # 别人自定义加的字段原样带过来
         # 解析 DoH 域名本身：优先模板里的 bootstrap；模板没有就沿用原来那台的写法
         dr = "bootstrap" if have_bootstrap else o.get("domain_resolver")
         if dr:
             new["domain_resolver"] = dr
         if direct:
             new["detour"] = direct
-        servers[i] = new                       # 整个换掉：原来的 tls.server_name 是给
-        return                                 # dns.google 用的，留着会拿错 SNI 去握手
+        servers[i] = new
+        return
+    print(f"  ⚠ sing-box 模板的 dns.servers 里没有 tag=\"{want}\" 这台（dns.final 指向它），"
+          f"自建 DNS 未写入这一份。")
 
 def _sr_direct_ip(path, targets):
     """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。
