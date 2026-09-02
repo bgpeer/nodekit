@@ -338,42 +338,58 @@ def route_verdict(hops, car):
     """→ (长途段标签, 等级, 该跳延迟, 落地标签)。
 
        决定一条回程好坏的是【长途段】——把流量从境外拉回中国的那一段骨干。
-       所以判定取【路径上第一个能认出的骨干跳】，不管它属于哪家：一台三网回程
-       CN2 GIA 的机器，去联通、去移动的长途段也是 59.43，这正是它卖的东西，
-       不是 bug。落地进了哪家的网另外列（`→ 联通 169`），两件事分开说。
+       落地进了哪家的网是另一件事，单独列（`→ 联通 169`），不参与档次判定。
 
-       踩过的两个坑，都是把这两件事混成一件造成的：
-       1. 早先直接把长途段安到目标运营商头上，输出成「联通 → 电信 CN2」，
+       长途段怎么挑：**优质骨干出现在路径的任何位置就算优质**，不是「第一个骨干跳」。
+       实测踩的坑：DMIT LA 的路径里，进 59.43 之前还有一跳属于 AS4134（中国电信
+       在美国那侧的接入），按「第一个」取就把整条 CN2 GIA 判成了「163 普通」——
+       24 个点一个优质都没有，而落地那列明晃晃写着 `→ 电信 CN2`，自相矛盾。
+       59.43 / 9929 / CMIN2 只要在路径上出现过，这条长途就是走的它们。
+
+       没有优质骨干时，普通骨干取【第一次出现】而不是最后一次：到移动的路径
+       末尾必然是 CMNET(AS9808，移动国内网)，取最后一次就永远是 CMNET，把前面
+       真正的国际段（CMI/CMIN2）盖掉。国内落地网干脆不进长途段候选。
+       同为普通时优先目标运营商自己的骨干——去联通的路径描述成「联通 169」
+       比描述成路上蹭过的「电信 163」贴切。
+
+       这个函数前后翻过三次车，都是把【长途段】和【落地】混成一件事：
+       1. 取第一个 premium 跳、安到目标运营商头上 → 输出「联通 → 电信 CN2」，
           读起来像「联通的骨干是 CN2」，是胡话。
-       2. 后来矫枉过正，改成只认目标运营商自己的骨干，结果三网回程 GIA 的机器
-          联通被判成「联通 169 普通」——把人家真正的卖点判没了。
-
-       落地取【目标运营商自己的最后一跳】：移动是 CMNET(AS9808，国内网)，
-       联通是 169/9929，电信是 163/CNIX。它只说进了谁家的网，不参与档次判定。
+       2. 矫枉过正，只认目标运营商自己的骨干 → 三网回程 GIA 的机器联通被判成
+          「联通 169 普通」，把人家真正的卖点判没了。
+       3. 改取「第一个能认出的骨干跳」 → 被 CN2 前面那跳 AS4134 骗了，全判成 163。
 
        延迟取【最后一个有响应的跳】而不是长途段入口那跳：入口跳只是刚进骨干，
        拿它比三家等于比谁家入口近，没意义；最后一跳约等于到目的地的 RTT，
        三家之间才可比。路径被截断时它是个下限。"""
-    haul = land = end_ms = None
+    prem = own_norm = any_norm = land = end_ms = None
     for _, hip, ms in hops:
         if not hip:
             continue
         if ms is not None:
-            end_ms = ms                        # 一路刷到最后一个有响应的跳
-        lab, lvl, hcar, _scope = classify_hop(hip)
+            end_ms = ms                          # 一路刷到最后一个有响应的跳
+        lab, lvl, hcar, scope = classify_hop(hip)
         # 只认已知骨干（premium/normal）。classify_hop 对认不出的 AS 会回一个
         # "AS#### 名字"、等级为空——那多半是【目的地自己的省级接入网】
         # （如 AS4835 CHINANET-IDC-SN），把它当骨干会把判定带偏。
         if lvl not in ("premium", "normal"):
             continue
-        if haul is None:
-            haul = (lab, lvl)                  # 第一个骨干跳 = 长途段
         if hcar == car:
-            land = _short(lab)                 # 目标本网，取最后一跳 = 落地
-    note = "" if (land and haul and land == _short(haul[0])) else (land or "")
+            land = _short(lab)                   # 目标本网，取最后一跳 = 落地
+        if scope == "domestic":
+            continue                             # 国内落地网不做长途段候选
+        if lvl == "premium":
+            if prem is None:
+                prem = (lab, lvl)
+        else:
+            if hcar == car and own_norm is None:
+                own_norm = (lab, lvl)
+            if any_norm is None:
+                any_norm = (lab, lvl)
+    haul = prem or own_norm or any_norm
     if haul is None:
-        return ("未识别", "", end_ms, note)
-    return haul + (end_ms, note)
+        return ("未识别", "", end_ms, land or "")
+    return haul + (end_ms, "" if land == _short(haul[0]) else (land or ""))
 
 def _mark(lvl):
     """判定行的符号+颜色：一眼扫过去就知道好坏。"""
@@ -578,7 +594,42 @@ def check_external(ip):
     print(f"  3. 线路（三网回程）只能在【那台机器本机】上测，这里给不出。")
     return 0
 
+def show_hops(ip):
+    """把到某个 IP 的逐跳连同分类打出来。判定不对时先看这个，别猜。
+
+       加它的由头：判定接连改错了三版，每次都是靠截图里的蛛丝马迹反推路径长什么样
+       ——而路径本来是可以直接打出来的。有这个口子，下次一条命令就看清了。"""
+    if not ensure_traceroute():
+        print(f"{C['r']}没有 traceroute/mtr 且装不上{C['n']}"); return 1
+    print(f"\n{C['b']}逐跳 → {ip}{C['n']}")
+    hr()
+    hops = traceroute(ip)
+    if not hops:
+        print(f"  {C['r']}无响应{C['n']}"); return 1
+    for n, hip, ms in hops:
+        if not hip:
+            print(f"  {C['d']}{n:>2}  *{C['n']}"); continue
+        lab, lvl, hcar, scope = classify_hop(hip)
+        col, sym = _mark(lvl)
+        asn, pfx, cc, name = asn_of(hip)
+        tag = f"{col}{sym} {lab}{C['n']}" if lab else f"{C['d']}· {('AS'+asn+' '+name[:30]) if asn else '查不到 AS'}{C['n']}"
+        meta = f"{C['d']}[{lvl or '-'}/{hcar or '-'}/{scope or '-'}] {pfx or ''} {cc or ''}{C['n']}"
+        print(f"  {n:>2}  {hip:<16}{(f'{ms:.1f} ms' if ms else ''):>10}  {tag}  {meta}")
+    hr()
+    for car in CARRIERS:
+        lab, lvl, ms, land = route_verdict(hops, car)
+        col, sym = _mark(lvl)
+        print(f"  按【{car}】判定 → {col}{sym} {lab}{C['n']}"
+              f"{('　落地 ' + land) if land else ''}"
+              f"{C['d']}　{f'{ms:.0f} ms' if ms else ''}{C['n']}")
+    return 0
+
 def main():
+    if "--hops" in sys.argv:
+        rest = sys.argv[sys.argv.index("--hops") + 1:]
+        if not rest:
+            print(f"{C['r']}用法：vps-check.py --hops <IP>{C['n']}"); return 1
+        return show_hops(rest[0])
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if not args:
         return check_local()
