@@ -110,6 +110,40 @@ def asn_of(ip):
     _ASN_CACHE[ip] = res
     return res
 
+def as_name(asn):
+    r = dns_txt(f"AS{asn}.asn.cymru.com")
+    if not r: return ""
+    g = [x.strip() for x in r[0].split("|")]
+    return g[4] if len(g) > 4 else ""
+
+def _asn_short(name):
+    """Cymru 的 AS 名字是 "IIJ - Internet Initiative Japan Inc., JP"，
+       破折号前那截才是简称，够认人了，后面一长串只会把行撑爆。"""
+    return name.split(" - ")[0].strip()[:18]
+
+def peers_of(ip, cap=4):
+    """这个 IP 所在前缀的【邻居 AS】（Cymru peer 记录）→ [(asn, 名字)]。
+       跟 asn_of 一样按最长前缀取——同一个 IP 可能落在多条记录里。
+
+       ⚠ 这【查不出 CN2】。实测：一台确认走 CN2 GIA 的 DMIT 机器
+       （69.63.210.0/24），邻居只有 AS2914(NTT) / AS3257(GTT) / AS137409，
+       没有 4809 也没有 4134。原因是 CN2 是私有电路、59.43 根本不在 BGP
+       全局表里，商家把出境流量交给哪条电路是转发决策，全局路由表看不见。
+       所以这行只当【上游构成】看（NTT/GTT/Cogent/HE 之类），不能拿来判线路。"""
+    recs = dns_txt(f"{_rev(ip)}.peer.asn.cymru.com") or []
+    best, best_len = None, -1
+    for rec in recs:
+        f = [x.strip() for x in rec.split("|")]
+        if len(f) < 2: continue
+        try: plen = int(f[1].split("/")[1])
+        except (IndexError, ValueError): plen = 0
+        if plen > best_len:
+            best, best_len = f, plen
+    if not best: return []
+    origin = (asn_of(ip)[0] or "")            # peer 记录里会带上源 AS 自己，去掉
+    out = [a for a in best[0].split() if a != origin]
+    return [(a, _asn_short(as_name(a))) for a in out[:cap]]
+
 # ---------------------------------------------------------------- 骨干判定
 # ⚠ 59.43/202.97 必须按【前缀】认，不能按 ASN：
 #    59.43.0.0/16 是 CN2 的内部传输网，【不在 BGP 全局路由表里】，Cymru 查不到 AS。
@@ -309,6 +343,10 @@ def report_ip(ip, num="一", local=True):
     print(f"  IP        : {C['b']}{ip}{C['n']}")
     print(f"  ASN       : {'AS'+asn if asn else '查不到'}  {name}")
     print(f"  宣告前缀   : {pfx or '-'}    注册地: {cc or '-'}")
+    peers = peers_of(ip)
+    if peers:
+        print(f"  上游/邻居  : " + "、".join(f"AS{a} {n}" for a, n in peers)
+              + f"   {C['d']}（查不到 CN2，见末尾局限）{C['n']}")
     p = ip_profile(ip)
     if not p:
         print(f"  {C['y']}ip-api.com 拿不到画像（限流或无外网），跳过标记检测{C['n']}")
@@ -640,8 +678,18 @@ def check_external(ip):
           f"\n     这不是没做，是原理上做不到。")
     print(f"  2. 「本机 → 目标」那一节测的是你这两台机之间的链路（中转/落地链看这个），"
           f"\n     不要拿它当目标机的线路质量。")
-    print(f"  3. 画像来自 ip-api.com，机房/代理标记是它的判定，各家风控库不完全一致。")
-    print(f"  4. 黑名单标「未知」的项是被拒答/超时，不是干净。")
+    print(f"  3. {C['y']}「上游/邻居」那行查不出 CN2{C['n']}，别拿它判线路。实测过：一台确认走"
+          f"\n     CN2 GIA 的机器（DMIT LA / 69.63.210.0/24），邻居只有 AS2914(NTT)、"
+          f"\n     AS3257(GTT)、AS137409，没有 4809 也没有 4134。CN2 是私有电路、"
+          f"\n     59.43 不在 BGP 全局表里，商家把出境流量交给哪条电路是转发决策，"
+          f"\n     全局路由表看不见。那行只当【上游构成】看。")
+    print(f"  4. 想在【不登录目标机】的前提下摸它的中国线路，只有一条路：从国内侧测"
+          f"\n     【去程】（中国→目标）。去程和回程经常走不同骨干，只能当参考。可用："
+          f"\n     {C['c']}itdog.cn{C['n']} / {C['c']}ping.pe{C['n']}（网页，手动跑）、"
+          f"商家自己的 Looking Glass、RIPE Atlas（要 API key\n     和积分，国内探针很少）。"
+          f"这些都要么是网页要么要密钥，没法塞进本脚本，所以这里不做。")
+    print(f"  5. 画像来自 ip-api.com，机房/代理标记是它的判定，各家风控库不完全一致。")
+    print(f"  6. 黑名单标「未知」的项是被拒答/超时，不是干净。")
     return 0
 
 def show_hops(ip):
