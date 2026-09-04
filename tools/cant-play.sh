@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04j"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04k"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -98,7 +98,7 @@ items, start = [], 0
 while True:
     try:
         d = emby(f"/Items?Recursive=true&IncludeItemTypes=Movie,Episode,Video"
-                 f"&Fields=Path,MediaSources,Container"
+                 f"&Fields=Path,MediaSources,MediaStreams,Container"
                  f"&StartIndex={start}&Limit=500")
     except Exception as e:
         print(f"  {R}✖ 问不到 Emby：{safe(e)}{X}")
@@ -164,6 +164,48 @@ print(f"  {D}Path      {cpath}{X}")
 print(f"  {D}容器      {cont or '（空）'}　大小 "
       f"{(str(round(size / 1024 / 1024 / 1024, 2)) + ' GB') if size else '0B'}"
       f"　时长 {int(secs // 60)} 分{X}")
+# 【编码必须打出来】前六段测的是"服务器给不给得出数据"，而 load fail 还有一个完全
+# 不同的死法：Emby 判定客户端解不了这个编码 → 要转码 → 而这套东西【不能转码】
+# （文件在网盘上，ffmpeg 手里只有一条 URL）→ 客户端连 /stream 都不去请求就报错。
+# 那种情况下 MediaWarp 日志里一条记录都没有 —— 光看日志会误判成"客户端没走 MediaWarp"。
+# 所以把编码摆在最前面，让人一眼看出"这文件我的设备本来就放不了"。
+_ms = (srcs[0].get("MediaStreams") or []) if srcs else []
+_v = next((x for x in _ms if x.get("Type") == "Video"), {})
+_auds = [x for x in _ms if x.get("Type") == "Audio"]
+if _v or _auds:
+    _vc = str(_v.get("Codec") or "?").lower()
+    _prof = str(_v.get("Profile") or "")
+    _depth = _v.get("BitDepth") or 0
+    _vtxt = f"{_vc}"
+    if _prof:
+        _vtxt += f" {_prof}"
+    if _depth:
+        _vtxt += f" {_depth}bit"
+    _atxt = "、".join(
+        f"{str(a.get('Codec') or '?').lower()}"
+        + (f" {a.get('Channels')}声道" if a.get("Channels") else "")
+        for a in _auds[:3]) or "（没有音轨信息）"
+    print(f"  {D}视频      {_vtxt}{X}")
+    print(f"  {D}音频      {_atxt}{X}")
+    # 这几种是"很多客户端直接放不了"的重灾区。不下死结论 —— 能不能放取决于具体
+    # 设备，但必须点出来，否则人会在服务器这头一直查下去（这次就查了七轮）。
+    _hard = []
+    if _depth and int(_depth) >= 10 and _vc in ("hevc", "h265", "vp9", "av1"):
+        _hard.append(f"{_vc} {_depth}bit")
+    if any(str(a.get("Codec") or "").lower() in
+           ("truehd", "dts", "dtshd", "eac3", "flac", "mlp") for a in _auds):
+        _hard.append("、".join(sorted({str(a.get("Codec")).lower() for a in _auds
+                                       if str(a.get("Codec") or "").lower() in
+                                       ("truehd", "dts", "dtshd", "eac3", "flac", "mlp")})))
+    if _hard:
+        print(f"  {Y}⚠ {'、'.join(_hard)} —— 很多客户端【解不了】这个{X}")
+        print(f"  {D}解不了时 Emby 会要求转码，而这套东西不能转码（文件在网盘上，"
+              f"本机没有它）。表现就是点开直接 load fail，而且【MediaWarp 日志里"
+              f"一条请求都没有】—— 客户端连 /stream 都不会去要。{X}")
+        print(f"  {D}判断办法：拿 Emby 网页版播一次。网页版能播 = 服务器这边没问题，"
+              f"是你那个客户端解不了；网页版也不行 = 再往下看后面几段。{X}")
+        print(f"  {D}真解不了的话只有两条路：换能解的播放器（Infuse / VidHub / "
+              f"支持 HEVC 10bit + TrueHD 的电视盒子），或者换一个压制版的片源。{X}")
 
 # 【判"原盘"要有真凭据】容器写着 bluray/iso，或者路径就在 BDMV/CERTIFICATE 里面 ——
 # 二者必居其一。上一版还把"大小 0B 且时长 0"也算进来，那是错的：那个组合最常见的
