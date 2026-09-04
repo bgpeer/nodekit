@@ -1001,8 +1001,19 @@ OpenList 顺手把上游那条也取消掉，说明的是「慢」而不是「�
 | `playing.sh` | 看正在播的那一路是直接播放还是转码 |
 | `dav-check.sh` | OpenList 自带的 WebDAV，每个盘是走 302 直链还是本机代理（决定了拿 Infuse / VidHub 直连值不值得，以及进度条拖不拖得动） |
 
-⚠️ 拉这些脚本时给 URL 带个时间戳绕开 CDN 缓存，否则可能拿到几分钟前的旧版：
-`curl -fsSL "…/tools/xxx.sh?_t=$(date +%s)" -o /tmp/xxx.sh`
+⚠️ **拉这些脚本会拿到旧版**，而且屏上看不出来 —— 每个脚本第一行都会打印自己的
+`版本 xxx`，对不上就是拿到旧的了（不是「改了没用」）。
+
+`raw.githubusercontent.com` 有 CDN 缓存，**加 `?_t=$(date +%s)` 挡不住** —— 实测：
+带着时间戳连拉两次，拿到的都还是几分钟前那一版。可靠的办法是**指定提交号**：
+
+```bash
+SHA=$(curl -fsSL https://api.github.com/repos/bgpeer/nodekit/commits/main | \
+      sed -nE 's/.*"sha": "([0-9a-f]{40})".*/\1/p' | head -1)
+curl -fsSL "https://raw.githubusercontent.com/bgpeer/nodekit/$SHA/tools/xxx.sh" -o /tmp/xxx.sh
+```
+
+提交号是内容的一部分，那条 URL 永远只对应那一份文件，不存在缓存问题。
 
 ### 三条硬限制
 
