@@ -14,7 +14,7 @@
 #   ③ 拉 1 MiB     慢 = 地址拿到了但拉不动，那是限速/线路
 set -u
 
-TOOL_VER="2026-09-04a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04d"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"
@@ -73,6 +73,32 @@ def api(p, body=None, timeout=180, method="POST"):
         # 【别把非 JSON 一句 JSONDecodeError 带过】接口路径或方法用错时返回的是一页
         # HTML，而"问不到状态"这四个字完全看不出是哪种错。原样给回前几十个字符。
         return {"code": -1, "message": f"返回的不是 JSON：{raw[:80]}"}, el
+
+
+def hls_first_segment(text, base):
+    """从 m3u8 里取第一个能拉的地址。主列表就先下一层，媒体列表就取第一个分片。
+
+    和 media-stack.py 的 warm_hls 同一个道理：拉播放列表等于只读了一遍目录，
+    网盘一点视频数据都没准备 —— 要量真实速度，必须下钻到分片。
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    urls = [l for l in lines if not l.startswith("#")]
+    if not urls:
+        return ""
+    nxt = urllib.parse.urljoin(base, urls[0])
+    if "#EXT-X-STREAM-INF" in text:          # 主列表：再下一层才是分片
+        try:
+            req = urllib.request.Request(safe_url(nxt),
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                sub = r.read(1 << 18).decode("utf-8", "replace")
+            subs = [l.strip() for l in sub.splitlines()
+                    if l.strip() and not l.startswith("#")]
+            if subs:
+                return urllib.parse.urljoin(nxt, subs[0])
+        except Exception:
+            return ""
+    return nxt
 
 
 # ---- OpenList 自己说了什么。上面那几行是"卡在哪"，这一段才是"为什么" ----
@@ -254,6 +280,24 @@ except Exception as e:
     print(f"  ② 取播放地址  {R}没回话{X}  {type(e).__name__}"
           f"{D}（网页上就是一直转圈）{X}")
 
+def pull(url, note="", n=1 << 20):
+    """拉一段，报耗时/大小/速度，并说清楚断点续传支不支持。返回读到的前几百字节。"""
+    req = urllib.request.Request(safe_url(url),
+                                 headers={"User-Agent": "Mozilla/5.0",
+                                          "Range": f"bytes=0-{n - 1}"})
+    t0 = time.monotonic()
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        buf = resp.read(n)
+        code = resp.status
+    t = time.monotonic() - t0
+    got = len(buf)
+    mbps = got * 8 / t / 1e6 if t > 0 else 0
+    c = G if mbps >= 8 else (Y if mbps >= 3 else R)
+    print(f"  ③ 拉 1 MiB{note:<4}{c}{t:6.1f} 秒{X}  {got / 1024:.0f} KB  "
+          f"{c}{mbps:.1f} Mbps{X}{D}（{got / t / 1024:.0f} KB/s）{X}")
+    return buf, code
+
+
 # ---- ③ 真的拉一段，确认这条地址能不能出数据 ----
 if raw.startswith("http"):
     N = 1 << 20
@@ -261,16 +305,7 @@ if raw.startswith("http"):
                                  headers={"User-Agent": "Mozilla/5.0",
                                           "Range": f"bytes=0-{N - 1}"})
     try:
-        t0 = time.monotonic()
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            got = len(resp.read(N))
-            code = resp.status
-        t = time.monotonic() - t0
-        mbps = got * 8 / t / 1e6 if t > 0 else 0
-        c = G if mbps >= 8 else (Y if mbps >= 3 else R)
-        print(f"  ③ 拉 1 MiB    {c}{t:6.1f} 秒{X}  {got / 1024:.0f} KB  "
-              f"{c}{mbps:.1f} Mbps{X}"
-              f"{D}（{got / t / 1024:.0f} KB/s）{X}")
+        body, code = pull(raw)
         # 【206 还是 200，决定了能不能拖进度条】我们发的是 Range 请求：
         #   206 Partial Content = 对方认 Range，播放器想从哪儿开始就从哪儿开始
         #   200 OK              = 不认，整个文件从头发。播放器要跳到 30 分钟处，
@@ -278,7 +313,25 @@ if raw.startswith("http"):
         #                         只能从头看"，而且流量白烧一遍
         # 这一条对【代理型存储】（WebDAV、本地盘这些没有 CDN 直链的）尤其要紧：
         # 那条路上 OpenList 要把 Range 透传给上游，上游还得自己支持，缺一环都不行。
-        if code == 206:
+        # 【转码流不能拿 Range 来判】m3u8 是一份【完整的小文件】（播放列表），服务器
+        # 当然回 200、当然不认 Range —— 那不是"拖不动进度条"，HLS 的 seek 本来就是
+        # 靠切换分片做的，跟 Range 没关系。上一版拿同一把尺子去量，把夸克的转码流
+        # 判成了"进度条拉不动"，结论正好反了。判据：内容以 #EXTM3U 开头。
+        head = body[:200].lstrip()
+        if head.startswith(b"#EXTM3U"):
+            print(f"  {D}   └ 这是{X}{C}转码流的播放列表{X}{D}（HLS，m3u8）—— "
+                  f"上面那个大小是列表本身，不是视频{X}")
+            print(f"  {D}      HLS 的进度条靠切换分片，不看 Range，"
+                  f"所以 200 在这里是正常的{X}")
+            seg = hls_first_segment(body.decode("utf-8", "replace"), raw)
+            if seg:
+                try:
+                    pull(seg, "（分片）")
+                except Exception as e:
+                    print(f"  {D}      分片拉不动：{type(e).__name__}{X}")
+            else:
+                print(f"  {D}      列表里没解析出分片地址{X}")
+        elif code == 206:
             print(f"  {D}   └ 断点续传  {G}支持{X}{D}（206）—— 进度条能拖{X}")
         else:
             print(f"  {D}   └ 断点续传  {R}不支持{X}{D}（HTTP {code}，我们要的是 206）"
