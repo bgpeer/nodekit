@@ -17,7 +17,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04g"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04h"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -132,6 +132,17 @@ if len(hit) > 1:
         print(f"    {n:>2}. {str(i.get('Name'))[:34]:<34} {D}{c:<8}{z}{X}")
     if len(hit) > 12:
         print(f"    {D}…还有 {len(hit) - 12} 个，把片名写得更具体一点{X}")
+    # 【同名条目里混着原盘时必须点破】原盘条目在 Emby 里长得和正常条目一模一样
+    # （有海报、有简介），点下去必定 load fail。实测就是这么绕进去的：链路六段
+    # 全通了，人却在 Emby 里点了旁边那条原盘，看到的还是 load fail，
+    # 于是以为"没修好"。
+    _disc = [i for i in hit
+             if _facts(i)[0].lower() in ("bluray", "bdmv", "dvd", "iso")]
+    if _disc and len(_disc) < len(hit):
+        print(f"  {Y}⚠ 这里面有 {len(_disc)} 条是【蓝光原盘】条目"
+              f"（容器 bluray、大小 0B），点它必定 load fail{X}")
+        print(f"  {D}要播的是容器 mkv/mp4 那几条。原盘那几条点一次"
+              f"「5 生成媒体库」会被压成正常条目。{X}")
 try:
     pick = int(os.environ.get("MS_N") or "1")
 except ValueError:
@@ -439,7 +450,40 @@ try:
             print(f"  {G if good else Y}HTTP 206{X}  {D}{cr}　拿到 {n2} 字节，"
                   f"{el2:.1f} 秒{X}")
             if good:
-                print(f"  {G}✔ 进度条能拖{X}  {D}服务器认 Range，从哪儿要就从哪儿给{X}")
+                print(f"  {G}✔ 服务器认 Range{X}  {D}从哪儿要就从哪儿给{X}")
+                # 【能 seek ≠ 拖过去能看】上面只要了 64 KiB，那点数据任何服务器
+                # 都给得起。而"拖了之后卡住 / 跳回开头"是【供不上数据】：播放器
+                # seek 完要立刻填满缓冲，填不上就放弃重来。所以还得从同一个位置
+                # 持续拉几秒，量真实吞吐 —— 这跟 ⑤ 从头拉不是一回事，
+                # 很多源是开头快、拖到中间就慢下来。
+                print(f"  {D}再从同一个位置连着拉 4 秒，量拖过去之后供不供得上...{X}")
+                req3 = urllib.request.Request(loc, headers={
+                    "Range": f"bytes={mid}-{mid + (24 << 20)}", "User-Agent": UA})
+                try:
+                    got3, t3 = 0, time.time()
+                    with urllib.request.urlopen(req3, timeout=60) as r3:
+                        while time.time() - t3 < 4:
+                            chunk = r3.read(1 << 16)
+                            if not chunk:
+                                break
+                            got3 += len(chunk)
+                    el3 = max(0.1, time.time() - t3)
+                    m3 = got3 * 8 / el3 / 1e6
+                    if not need:
+                        print(f"  {D}拖过去之后 {m3:.1f} Mbps"
+                              f"（读不到码率，比不了）{X}")
+                    elif m3 >= need:
+                        print(f"  {G}✔ 拖过去也供得上{X}  {D}{m3:.1f} Mbps ≥ "
+                              f"这部片要的 {need:.1f} Mbps{X}")
+                    else:
+                        print(f"  {R}✖ 拖过去就供不上了{X}  {D}只有 {m3:.1f} Mbps，"
+                              f"这部片要 {need:.1f} Mbps{X}")
+                        print(f"  {D}这正是「一拖就卡住 / 跳回从头播」的原因："
+                              f"播放器 seek 完要立刻填满缓冲，填不上就放弃重来。"
+                              f"服务器是认 Range 的（上面刚验过），纯粹是慢。{X}")
+                except Exception as e3:
+                    print(f"  {Y}持续拉的时候断了：{safe(e3)}{X}")
+                    print(f"  {D}拖过去之后连不稳 —— 表现就是一拖就卡。{X}")
             else:
                 print(f"  {Y}回的 206 起点和要的对不上{X}  "
                       f"{D}要 {mid}，给的是 {start_at}{X}")
