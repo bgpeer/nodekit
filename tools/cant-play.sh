@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04l"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04m"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -169,9 +169,32 @@ print(f"  {D}容器      {cont or '（空）'}　大小 "
 # （文件在网盘上，ffmpeg 手里只有一条 URL）→ 客户端连 /stream 都不去请求就报错。
 # 那种情况下 MediaWarp 日志里一条记录都没有 —— 光看日志会误判成"客户端没走 MediaWarp"。
 # 所以把编码摆在最前面，让人一眼看出"这文件我的设备本来就放不了"。
-_ms = (srcs[0].get("MediaStreams") or []) if srcs else []
+# 【MediaStreams 要按 id 单独取】列表查询里 MediaSource 内部的 MediaStreams 是空的，
+# 只有按 id 取那一次才填。上一版从列表结果里取，于是这一整段静默跳过 —— 屏上一行
+# 编码都没有，而"是不是音轨解不了"恰恰是这次要回答的问题。
+_ms = []
+try:
+    _one = (emby(f"/Items?Ids={iid}&Fields=MediaSources,MediaStreams")
+            .get("Items") or [{}])[0]
+    _ms = (_one.get("MediaStreams")
+           or ((_one.get("MediaSources") or [{}])[0].get("MediaStreams"))
+           or [])
+except Exception:
+    _ms = []
+if not _ms and srcs:
+    _ms = srcs[0].get("MediaStreams") or []
 _v = next((x for x in _ms if x.get("Type") == "Video"), {})
 _auds = [x for x in _ms if x.get("Type") == "Audio"]
+if not _ms:
+    # 【读不到就要说】静默跳过是上一版最坏的地方：屏上没有这两行，看的人根本不知道
+    # 这一环压根没测到，而它可能正是原因。
+    print(f"  {Y}⚠ 读不到这一条的编码信息（Emby 还没探到媒体流）{X}")
+    print(f"  {D}手工查：Emby 网页 → 这部片 → 右上角「…」→ 媒体信息，"
+          f"看视频/音频编码。{X}")
+    print(f"  {D}最要紧的是音轨：TrueHD / DTS 这类多数客户端解不了，而这套东西"
+          f"【连音轨都转不了】—— 那种情况下点开就是 load fail，"
+          f"MediaWarp 日志里一条记录都不会有。{X}")
+    print(f"  {D}一句话自查：去 OpenList 挂载页面播一次 —— 有画面、没声音，就是它。{X}")
 if _v or _auds:
     _vc = str(_v.get("Codec") or "?").lower()
     _prof = str(_v.get("Profile") or "")
