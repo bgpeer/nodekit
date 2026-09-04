@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.49"
+SCRIPT_VERSION = "1.5.50"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4323,12 +4323,16 @@ def do_sync():
     d = ms_install_dir()
     if not is_installed(d):
         return
-    rec = {"ts": int(time.time()), "ok": False, "pruned": 0, "nodur_before": 0,
+    rec = {"ts": int(time.time()), "ok": False, "pruned": 0, "bluray": 0,
+           "bluray_stuck": 0, "nodur_before": 0,
            "nodur_after": 0, "missing": 0, "error": ""}
     try:
         key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                                "auth")
         normalize_strm_files(d)
+        # 原盘目录压成单个 strm。放这儿是因为上一轮"问不到片段大小"的那些要有机会重试，
+        # 而且新扫进来的原盘不必等到用户下次手动点「5」才可播。
+        rec["bluray"], rec["bluray_stuck"] = collapse_bluray_folders(d, quiet=True)
         rec["pruned"] = prune_dead_strm(d)   # 每日对齐不设预算：凌晨没人等
         if not key:
             rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
@@ -6315,6 +6319,118 @@ def strm_not_in_emby(d, key):
     return sorted(missing)
 
 
+DISC_DIRS = ("bdmv", "certificate")     # 蓝光原盘那棵目录树的两个顶层目录
+
+
+def _bluray_discs(root):
+    """strm 树里的蓝光原盘：{原盘根目录: [BDMV 底下所有 strm 的路径]}。
+
+    认法就是"这一层底下有没有 BDMV 目录"—— 那是蓝光原盘的固定结构，不是命名习惯，
+    不会认错。文件名里写着 BluRay 的普通 mkv 不受影响（它没有 BDMV 目录）。
+    """
+    discs = {}
+    for dirpath, dirnames, _files in os.walk(root):
+        low = {n.lower(): n for n in dirnames}
+        if "bdmv" not in low:
+            continue
+        strms = []
+        for dp2, _dn2, fs2 in os.walk(os.path.join(dirpath, low["bdmv"])):
+            strms += [os.path.join(dp2, f) for f in fs2 if f.endswith(".strm")]
+        discs[dirpath] = strms
+        # BDMV 上面已经自己走过一遍了，别让 os.walk 再钻一次
+        dirnames[:] = [n for n in dirnames if n.lower() not in DISC_DIRS]
+    return discs
+
+
+def _bluray_main_stream(strms, tok):
+    """这套原盘的正片：BDMV/STREAM 里【最大】的那个片段。拿不到大小就返回空串。
+
+    【拿不到大小宁可不做】随便挑一个的话，用户点开看到的是三十秒的厂标或菜单动画 ——
+    那比"播不了"更难受，因为它看起来是成功的，人会以为片源就是坏的。
+
+    一套原盘问一次 fs/list 就够（几十个片段都在同一个 STREAM 目录里）。
+    """
+    by_dir = {}
+    for p in strms:
+        try:
+            tgt = open(p, encoding="utf-8").read().strip()
+        except OSError:
+            continue
+        if tgt.startswith("/"):
+            by_dir.setdefault(os.path.dirname(tgt), {})[os.path.basename(tgt)] = tgt
+    best, best_size = "", -1
+    for dirn, files in by_dir.items():
+        try:
+            r = _ol_api("/api/fs/list", {"path": dirn, "password": "", "page": 1,
+                                         "per_page": 0, "refresh": False},
+                        tok, timeout=60)
+        except Exception:
+            continue
+        if r.get("code") != 200:
+            continue
+        for x in ((r.get("data") or {}).get("content") or []):
+            n = x.get("name")
+            if n in files and int(x.get("size") or 0) > best_size:
+                best, best_size = files[n], int(x.get("size") or 0)
+    return best
+
+
+def collapse_bluray_folders(d, quiet=False):
+    """把蓝光原盘目录压成一个 strm。返回 (处理了几套, 还没处理的几套)。
+
+    【为什么这件事必须做，而不是提醒一下就算】原盘不是一个文件，是一整棵目录树：
+    BDMV/STREAM 里几十个 .m2ts，外加播放列表和菜单索引。Emby 一看见 BDMV 就把整个
+    文件夹认成一个"蓝光原盘"条目（容器写 Bluray），播放时要按索引在多个片段之间跳 ——
+    那需要它拿得到【本地目录】。而 strm 里只装得下一条指向【单个文件】的地址。
+
+    所以原盘条目在 Emby 里必定是：大小 0B、码率 0bps、点播放 load fail。这跟网盘是
+    哪一家、线路好不好、直链方式怎么选都没有关系 —— 换哪个盘都一样。
+
+    【做法：把正片挑出来，其余整棵树删掉】STREAM 里最大的那个片段就是正片（预告、
+    菜单动画、花絮通常小一到两个数量级）。给它在原盘目录里生成一个同名 strm，Emby
+    就当成一部普通电影去刮削和播放，302 照常生效。
+
+    【为什么连 strm 一起删】留着的话 Emby 还是会看见 BDMV 目录，还是会把这一套认成
+    原盘条目 —— 那等于白做。删的只是本地那几十个几十字节的文本文件，网盘上的原盘
+    一个字节都没动，什么时候想还原重新扫一次就有。
+    """
+    root = strm_root(d)
+    if not os.path.isdir(root):
+        return 0, 0
+    discs = _bluray_discs(root)
+    if not discs:
+        return 0, 0
+    tok = _ol_token(d)
+    done, stuck = 0, []
+    for disc, strms in sorted(discs.items()):
+        name = os.path.basename(disc.rstrip("/")) or "BluRay"
+        main = _bluray_main_stream(strms, tok) if strms else ""
+        if not main:
+            stuck.append(name)
+            continue
+        try:
+            write_atomic(os.path.join(disc, name + ".strm"), main)
+        except OSError as e:
+            stuck.append(f"{name}（写不进去：{_short_err(e)}）")
+            continue
+        for sub in os.listdir(disc):
+            if sub.lower() in DISC_DIRS:
+                shutil.rmtree(os.path.join(disc, sub), ignore_errors=True)
+        done += 1
+    if not quiet and (done or stuck):
+        if done:
+            ok(f"{done} 套蓝光原盘目录已压成单个 strm（取 BDMV 里最大的那个片段＝正片）")
+            print(f"  {DIM}原盘是一整棵目录树，strm 只装得下一条指向单个文件的地址 ——"
+                  f"不压的话 Emby 里就是 0B / 0bps、点播放 load fail。{RST}")
+        if stuck:
+            warn(f"{len(stuck)} 套原盘没能处理（问不到片段大小，多半是列目录超时）：")
+            print(f"  {DIM}{'、'.join(stuck[:5])}"
+                  f"{' …' if len(stuck) > 5 else ''}{RST}")
+            print(f"  {DIM}下一轮对齐会再试；宁可不动，也不能随便挑一个片段 ——"
+                  f"挑错了点开是厂标或菜单动画，看着像成功了。{RST}")
+    return done, len(stuck)
+
+
 def normalize_strm_files(d):
     """把所有 strm 统一成【路径形式】。返回改了几个。
 
@@ -7429,6 +7545,10 @@ def do_strm():
         print(f"  {DIM}·{RST} AutoFilm 扫的是 {BOLD}{read_yaml_scalar(cfg_path, 'source_dir', '/')}{RST}，"
               f"这个路径在 OpenList 里点得开吗")
         return
+
+    # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
+    # 之后再删再建，中间那段时间用户点进去就是 load fail。
+    collapse_bluray_folders(d)
 
     # 生成只会【加】不会【减】。用户在网盘里整理过片子的话，旧路径那批 strm
     # 还留在本地，Emby 里就是同一部片子两个条目、一个点不开。放在扫描之前收尾，
