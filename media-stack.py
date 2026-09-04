@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.50"
+SCRIPT_VERSION = "1.5.51"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3851,7 +3851,8 @@ def auto_libraries_apply(d, key, quiet=False):
             ids = [i for n, i, _on, _o in metatube_libraries(key) if n in set(mt_libs)]
             if set_metatube_libraries(key, ids):
                 ok(f"MetaTube 只在 {'、'.join(mt_libs) or '（无）'} 生效")
-        emby_scan_wait(key, timeout=900)   # 新库要扫一次才有内容
+        # 新库要扫一次才有内容。刚扫过就不会真去扫（见 emby_scan_wait 的去重）
+        emby_scan_wait(key, timeout=900, label="扫描新建的媒体库")
     if not quiet:
         print(f"  {DIM}规则文件：{lib_rules_path(d)}"
               f"（改仓库里那份，「7 更新」会拉下来）{RST}")
@@ -4166,7 +4167,9 @@ def migrate_strm_layout(d, key):
     _sweep_empty_dirs(strm_root(d))
     ok(f"{n} 个 strm 已挪好，strm 目录树和网盘对上了")
     if key:
-        emby_scan_wait(key, timeout=900)
+        # 【挪完必须扫】要靠"扫一次看到旧位置的文件没了"让 Emby 真删掉旧条目。
+        info("让 Emby 看一眼挪过的位置...")
+        emby_scan_wait(key, timeout=900, label="重扫挪过位置的条目", force=True)
         back = _restore_progress(d, key, saved)
         if back:
             ok(f"{back} 个条目的续播点已贴回")
@@ -4295,7 +4298,7 @@ def scan_if_grown(d, key, force=False):
         was = -1
     if not key or (now == was and not force):
         return False
-    emby_scan_wait(key, timeout=600)
+    emby_scan_wait(key, timeout=600, label="扫描媒体库")
     try:
         with open(mark, "w") as f:
             f.write(str(now))
@@ -4339,7 +4342,7 @@ def do_sync():
         else:
             rec["nodur_before"] = len(items_without_duration(key))
             tune_strm_libraries(key)   # 扫描前先调好，新条目一进来就是对的
-            emby_scan_wait(key, timeout=900)
+            emby_scan_wait(key, timeout=900, label="每日对齐的扫描")
             align_library(d, key)      # 和小时级那轮同一份，不会飘
             rec["nodur_after"] = len(items_without_duration(key))
             rec["missing"] = len(strm_not_in_emby(d, key))
@@ -5620,14 +5623,40 @@ def strm_count(d):
     return n
 
 
-def emby_scan_wait(key, timeout=600):
+SCAN_DEDUP_SEC = 300      # 刚扫完这么久之内、本地又没变，就不再扫一遍
+
+
+# 上一次全库扫描是什么时候扫完的、那一刻本地有多少个 strm。
+_scan_state = {"done_at": 0.0, "strm": -1}
+
+
+def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
     """让 Emby 扫一次媒体库并【等它扫完】。返回是否确认扫完。
 
     必须等：迁移时要靠"先扫一次看到文件没了"来让 Emby 真正删掉旧条目。没等完就去重新生成
     的话，Emby 一次扫描里同时看到删和加，会当成没变过，旧条目的错误媒体信息就留下来了。
+
+    【同一趟里不重复扫】「5 生成媒体库」这条路上原来最多扫三遍：挪完 strm 扫一次、生成
+    流程自己扫一次、按规则建了新库再扫一次。每一遍都是让 Emby 把两千多个文件重新过一遍，
+    而中间本地【一个文件都没变】—— 第二遍第三遍纯属让人干等。所以：距上一次扫完不到
+    SCAN_DEDUP_SEC 秒、且这中间本地 strm 数没变，就直接返回。
+    （盲点是"数目没变但文件挪过位置"。挪文件的只有 migrate_strm_layout，而它挪完自己
+    就扫，扫完才记下新的数 —— 所以这个盲点在现有流程里落不到实处。）
+
+    【等的时候要说话】原来 migrate 挪完 strm 之后直接进这里干等，最长十五分钟，屏上
+    一个字都没有 —— 用户看到的就是"卡在「14 个 strm 已挪好」不动了"。
     """
     if not key:
         return False
+    now_n = -1
+    try:
+        now_n = strm_count(ms_install_dir())
+    except Exception:
+        pass
+    if (not force and _scan_state["strm"] == now_n >= 0
+            and time.time() - _scan_state["done_at"] < SCAN_DEDUP_SEC):
+        print(f"  {DIM}刚扫过一遍，本地也没变，跳过这次扫描{RST}")
+        return True
 
     def scan_task():
         try:
@@ -5651,10 +5680,19 @@ def emby_scan_wait(key, timeout=600):
     except Exception:
         return False
 
-    deadline = time.time() + timeout
+    t0 = time.time()
+    deadline = t0 + timeout
+    nudge = t0 + 20
     seen_running = False
     while time.time() < deadline:
         time.sleep(3)
+        if time.time() >= nudge:
+            el = int(time.time() - t0)
+            # 【必须报出在等什么】两千多个 strm，Emby 要挨个 stat 一遍，几分钟很正常。
+            # 不说话的话这几分钟和"卡死了"在屏上长得一模一样。
+            print(f"  {DIM}...Emby 还在{label}（{now_n if now_n >= 0 else '?'} 个条目），"
+                  f"已等 {el // 60} 分 {el % 60} 秒{RST}")
+            nudge = time.time() + 30
         t = scan_task()
         if t is None:
             continue
@@ -5663,6 +5701,7 @@ def emby_scan_wait(key, timeout=600):
             continue
         end = (t.get("LastExecutionResult") or {}).get("EndTimeUtc", "")
         if seen_running or (end and end != before):
+            _scan_state["done_at"], _scan_state["strm"] = time.time(), now_n
             return True
     return False
 
@@ -7565,7 +7604,7 @@ def do_strm():
     migrate_strm_layout(d, key)
     if key:
         info("通知 Emby 扫描媒体库...")
-        if emby_scan_wait(key, timeout=900):
+        if emby_scan_wait(key, timeout=900, label="扫描媒体库"):
             ok("Emby 已扫完")
         else:
             ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
