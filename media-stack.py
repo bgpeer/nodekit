@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.55"
+SCRIPT_VERSION = "1.5.56"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -778,6 +778,37 @@ def ensure_openlist_site_url(d, cfg=None, quiet=False):
     return True
 
 
+def openlist_api_addr(cfg):
+    """MediaWarp 该用【哪个地址】去调 OpenList 的接口。
+
+    【这一项决定了代理型存储（WebDAV 源、本地目录）能不能在 Emby 里播】那类驱动在网盘侧
+    没有 CDN 直链，OpenList 只能把自己的 /d/ 地址当直链回给 MediaWarp。而 OpenList v4
+    【没有「网站 URL」这个设置】—— v4.2.6 的设置列表里带 url 的只有 site_title 和
+    qbittorrent_url，那一项在 v4 里被去掉了。它一律【按请求里的 Host 头】拼那个地址：
+    用 http://openlist:5244 去问，回来的就是 http://openlist:5244/d/…，MediaWarp 原样
+    302 给播放器，而手机、电视解析不了这个容器名，客户端上就是一句 load fail。
+
+    所以只能从这头改：让 MediaWarp 用【对外地址】去问。nginx 那边 Host 和
+    X-Forwarded-Proto 都是原样透传的（见 gen_nginx_conf），OpenList 拼出来的自然就是
+    对外地址。代价只有一跳本机 nginx —— 换直链不是热路径，而且上面还有 alist_api_ttl
+    那层缓存。非代理型的盘完全不受影响：它们的 raw_url 是网盘 CDN 给的，跟这个地址无关。
+
+    【连不通就退回内网地址】域名在容器里解析不了、证书没签好的话，用对外地址会让
+    【所有】盘都换不到直链 —— 那比"WebDAV 那个盘播不了"严重得多。所以先探一次再决定。
+    """
+    internal = f"http://openlist:{OPENLIST_PORT}"
+    pub = (openlist_public_url(cfg) or "").rstrip("/")
+    if not pub or "127.0.0.1" in pub or "localhost" in pub:
+        return internal
+    try:
+        req = urllib.request.Request(pub + "/api/public/settings",
+                                     headers={"User-Agent": "media-stack"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return pub if r.status == 200 else internal
+    except Exception:
+        return internal
+
+
 def gen_autofilm_conf(cfg):
     """AutoFilm：定时遍历 OpenList，把网盘里的视频写成 .strm 文本文件。
 
@@ -973,7 +1004,12 @@ alist_strm:
   # 视频流从网盘直达播放器，完全不经过本机带宽 —— 这正是这套东西存在的意义。
   raw_url: true
   list:
-    - addr: http://openlist:5244
+    # 【这里必须是【对外地址】，不能是 http://openlist:5244】WebDAV 源、本地目录这类
+    # 代理型存储在网盘侧没有 CDN 直链，OpenList 只能回自己的 /d/ 地址 —— 而它是按
+    # 【请求里的 Host】拼的（OpenList v4 把「网站 URL」那个设置去掉了，没有别的地方能改）。
+    # 用容器内网名去问，拿回来的就是内网名，302 给手机电视就是解析不了。
+    # 探不通时会自动退回内网地址，见 openlist_api_addr()。
+    - addr: {openlist_api_addr(cfg)}
       username: {cfg['ol_user']}
       password: {cfg['ol_pass']}
       prefix_list:
@@ -4301,13 +4337,7 @@ def align_library(d, key, heal=True):
     【但要管 Emby 扫描】strm 数一变就通知 Emby 扫一次，数没变一个请求都不发。
     """
     follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
-    # 【每小时对一遍「网站 URL」】它空着的话，WebDAV / 本地目录这类代理型存储发出去的
-    # 直链是容器内网名，手机电视解析不了 —— 而整条链每一步看着都成功。装完就该是对的，
-    # 但用户可能自己在 OpenList 网页里改过，也可能是从老版本升上来的。
-    try:
-        ensure_openlist_site_url(d, quiet=True)
-    except Exception:
-        pass
+
     # 【必须在这儿也来一遍】strm 不是只有点「5 生成媒体库」才会产生 —— AutoFilm 自己的
     # 定时任务也会按新配置生成。实测翻过车：「7 更新」重写了 autofilm 配置，它的 cron
     # 到点按新布局生成了 cloud/quark/…，而旧的那批没人搬，两份并存。
@@ -5157,10 +5187,9 @@ def do_update(from_menu=False):
             continue
         write_atomic(path, text)
         subprocess.run(["docker", "restart", svc], capture_output=True)
-    # 【每次更新都对一遍】它决定了 WebDAV / 本地目录这类"代理型"存储发出去的直链
-    # 是对外地址还是容器内网名。老装的机器上这一项是空的，表现为那些盘在 Emby 里
-    # 一律 load fail，而整条链每一步看着都成功。
-    ensure_openlist_site_url(d, cfg)
+    # 【老版本 OpenList（alist v3）还有「网站 URL」这个设置，有就顺手填上】
+    # v4 已经把它去掉了，那边靠的是上面重新生成的 mediawarp 配置里那个 addr。
+    ensure_openlist_site_url(d, cfg, quiet=True)
     if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
         warn("MediaWarp 的 Emby API Key 是空的，302 直链不会生效。")
         warn("用「3 后补参数 → 添加 API 密钥」补上。")
@@ -11625,35 +11654,44 @@ def do_healthcheck():
     except Exception as e:
         _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
-    # ---- OpenList 的「网站 URL」----
+    # ---- MediaWarp 用哪个地址问 OpenList ----
     # 【代理型存储（WebDAV 源、本地目录）能不能在 Emby 里播，全看这一项】它们在网盘侧
-    # 没有 CDN 直链，OpenList 只能回自己的 /d/ 地址；这一项空着的话，那个地址的主机名
-    # 就按【谁来问】拼 —— MediaWarp 在容器里问，拿回来的是 openlist:5244，302 给播放器
-    # 就是解析不了的内网名。整条链每一步都"成功"，只有最后那个地址是废的。
-    _site = ""
+    # 没有 CDN 直链，OpenList 只能回自己的 /d/ 地址，而那个地址是【按请求里的 Host 拼】的
+    # ——OpenList v4 已经没有「网站 URL」那个设置了，改不了它，只能改问它的人。
+    # MediaWarp 拿 http://openlist:5244 去问，拿回来的就是内网名，302 给手机电视解析不了。
+    # 【不能用 read_yaml_scalar("addr")】配置里有两个 addr：server.addr 是 Emby
+    # （http://emby:8096），alist_strm 那个才是 OpenList。取第一个就永远读成 Emby，
+    # 这一项会一直报错还指错方向。只在 alist_strm: 之后那一段里找。
+    _mw_addr = ""
     try:
-        _tok = _ol_token(d)
-        if _tok:
-            _r = _ol_api("/api/admin/setting/list", {}, _tok, timeout=20, method="GET")
-            _it = next((x for x in (_r.get("data") or [])
-                        if x.get("key") in SITE_URL_KEYS), None)
-            _site = str((_it or {}).get("value") or "")
-    except Exception:
-        _it = None
-    _want_site = (openlist_public_url(cfg) or "").rstrip("/")
-    if _site.rstrip("/") == _want_site and _want_site:
-        _hc("OpenList 网站 URL", "ok", _site)
-    elif not _site:
-        _hc("OpenList 网站 URL", "bad",
-            f"{YELLOW}空着 —— WebDAV / 本地目录这类盘发出去的直链会是容器内网名{RST}")
-        todo.append(("OpenList 的「网站 URL」空着。代理型存储（WebDAV 源、本地目录）"
-                     "在网盘侧没有 CDN 直链，OpenList 只能回自己的地址，而这一项空着时"
-                     "它按请求方用的主机名拼 —— MediaWarp 拿到的是 openlist:5244，"
-                     "302 给手机电视就是解析不了，表现为 load fail",
-                     "跑一次「7 更新」会自动填上；或去 OpenList 设置里把它填成 "
-                     + (_want_site or "对外地址")))
+        _txt = open(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                    encoding="utf-8").read()
+        _seg = _txt.split("alist_strm:", 1)
+        if len(_seg) == 2:
+            _m = re.search(r"^\s*-?\s*addr:\s*(\S+)", _seg[1], re.M)
+            _mw_addr = _m.group(1).strip('"\'') if _m else ""
+    except OSError:
+        pass
+    _proxy_drives = [mp for _sid, mp, drv, _add, cols in _storage_rows(d)
+                     if _truthy(cols.get("web_proxy"))
+                     or str(drv or "").lower() in ("webdav", "local", "crypt")]
+    _want_addr = (openlist_public_url(cfg) or "").rstrip("/")
+    if not _proxy_drives:
+        pass                      # 没有代理型的盘，这一项与它无关，不占屏
+    elif _mw_addr.rstrip("/") == _want_addr and _want_addr:
+        _hc("MediaWarp→OpenList", "ok",
+            f"{_mw_addr}{DIM}（代理型的盘发得出对外地址）{RST}")
     else:
-        _hc("OpenList 网站 URL", "warn", f"{_site}{DIM}（脚本算出的是 {_want_site}）{RST}")
+        _hc("MediaWarp→OpenList", "bad",
+            f"{_mw_addr or '?'}  {YELLOW}内网地址 —— "
+            f"{'、'.join(_proxy_drives[:2])} 这类盘的 302 播放器连不上{RST}")
+        todo.append((f"MediaWarp 用 {_mw_addr or '内网地址'} 去问 OpenList，"
+                     f"而 {'、'.join(_proxy_drives[:2])} 是代理型存储（WebDAV 源、"
+                     f"本地目录）—— 它们在网盘侧没有 CDN 直链，OpenList 只能回自己的"
+                     f"地址，而那个地址是按请求里的 Host 拼的，于是 302 出去的是容器"
+                     f"内网名，手机电视解析不了，表现为 load fail",
+                     f"跑一次「7 更新」：它会把这个地址改成 {_want_addr or '对外地址'}"
+                     f"（探不通会自动退回内网地址，不会把别的盘搞坏）"))
 
     # ---- 302 端到端 ----
     own_host = urllib.parse.urlsplit(openlist_public_url(cfg)).hostname or ""
