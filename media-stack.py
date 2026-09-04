@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.54"
+SCRIPT_VERSION = "1.5.55"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -748,7 +748,12 @@ def ensure_openlist_site_url(d, cfg=None, quiet=False):
     item = next((x for x in items if x.get("key") in SITE_URL_KEYS), None)
     if item is None:
         if not quiet:
-            print(f"  {DIM}这个 OpenList 版本没有「网站 URL」这一项，跳过{RST}")
+            # 【把带 url 的键名摆出来】不然这就是个死胡同：屏上只说"没有这一项"，
+            # 而这一项决定了 WebDAV 那类盘能不能播。换个版本它可能改了名字，
+            # 印出来才知道该往 SITE_URL_KEYS 里加哪一个。
+            near = [str(x.get("key")) for x in items if "url" in str(x.get("key")).lower()]
+            print(f"  {DIM}这个 OpenList 版本没有「网站 URL」这一项，跳过"
+                  + (f"（带 url 的设置项：{'、'.join(near[:6])}）" if near else "") + f"{RST}")
         return False
     if str(item.get("value") or "").rstrip("/") == want:
         return False
