@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.48"
+SCRIPT_VERSION = "1.5.49"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -541,7 +541,7 @@ def parse_scan_spec(s):
         if p not in seen:
             seen.add(p)
             out.append(p)
-    return out or None
+    return merge_scan_paths(out) or None
 
 
 def _paths_under(paths, mp):
@@ -552,10 +552,33 @@ def _paths_under(paths, mp):
     return [p for p in paths if p == root or p.startswith(root + "/")]
 
 
+def merge_scan_paths(paths):
+    """扫描路径列表规范化：去重、去掉末尾斜杠、【子路径被父路径吃掉】。
+
+    /网盘 和 /网盘/mov/电影 同时在表里，实际效果和只写 /网盘 一模一样 —— 扫整个盘的时候
+    本来就包含那条子路径。可屏上是两条，人会以为"限定了只扫电影"，而实际扫的是整个盘，
+    手机备份和截图照样进媒体库。规矩说出来就一句：【有最大的就扫最大的】。
+
+    AutoFilm 那边还要更糟一点：两个任务范围重叠，同一部片被扫两遍、strm 写两次。
+
+    排序保证父目录一定排在自己的子目录前面（"/网盘" < "/网盘/mov"），所以一趟就够。
+    """
+    out = []
+    for p in sorted({(x or "").rstrip("/") for x in paths if x}):
+        if any(p == q or p.startswith(q + "/") for q in out):
+            continue
+        out.append(p)
+    return out
+
+
 def explicit_scan_paths():
-    """用户在「挂载路径」里给某个盘明确指定的那些路径。"""
+    """用户在「挂载路径」里给某个盘明确指定的那些路径。
+
+    【读出来就先归并一次】老配置里可能已经躺着"整个盘 + 它底下的子目录"这种组合，
+    那是上一版没有拦住留下的。在这里归并，菜单、体检、生成配置看到的就是同一份。
+    """
     sp = ms_state().get("scan_spec")
-    return [] if sp == SCAN_AUTO else list(sp or [])
+    return [] if sp == SCAN_AUTO else merge_scan_paths(sp or [])
 
 
 def auto_rest_on():
@@ -595,7 +618,7 @@ def resolve_scan_paths(d, spec):
                  if mp and mp != "/"]
     else:
         paths = list(spec or [])
-    return order_scan_paths(d, paths)
+    return order_scan_paths(d, merge_scan_paths(paths))
 
 
 def order_scan_paths(d, paths):
@@ -9248,39 +9271,39 @@ def _pick_dirs(d, mp):
             print(f"    {DIM}还是可以直接把路径贴进来（下面那行）{RST}")
         elif not subs:
             print(f"    {DIM}（这一层底下没有目录了）{RST}")
-        tips = ["单个编号 进去看看", "多个编号（逗号隔开）就选它们",
-                ". 就选整个盘" if cur == root else ". 就选当前这层"]
+        # 【不用字母键】上一版是 a 整个盘 / m 手打路径 —— 字母是脚本自己发明的暗号，
+        # 而编号、. 、* 、.. 这几个在文件路径里本来就是这个意思，不用记。
+        tips = ["编号 进这一层", "多个编号（逗号隔开）一次选好几个",
+                ". 就选整个盘" if cur == root else ". 就选这一层"]
         if subs:
-            tips.append("* 当前这层全部")
+            tips.append("* 这一层全部")
         if cur != root:
-            tips.append("u 上一层")
-        tips += ["或直接贴一条路径", "回车取消"]
+            tips.append(".. 上一层")
+        tips += ["或者直接把路径贴进来", "回车取消"]
         print(f"  {DIM}{'　'.join(tips)}{RST}")
         pick = ask("要扫哪个").strip()
         if not pick:
             return []
-        if pick.lower() == "u":
+        if pick == "..":
             cur = cur.rsplit("/", 1)[0]
             if len(cur) < len(root):
                 cur = root
             continue
-        if pick in (".",) or pick.lower() == "a":   # a 是上一版「整个盘」的键，留着
+        if pick == ".":
             return [cur]
         if pick == "*":
             if not subs:
                 print("这一层底下没有目录。")
                 continue
             return [f"{cur}/{n}" for n in subs]
-        if pick.startswith("/") or pick.lower() == "m":
-            raw = pick if pick.startswith("/") else ask(f"路径（以 {mp} 开头）").strip()
-            raw = raw.rstrip("/")
+        if pick.startswith("/"):
+            raw = pick.rstrip("/")
             if not raw:
                 return []
             if not raw.startswith(root + "/") and raw != root:
                 warn(f"这条不在 {mp} 底下，没有加。")
                 continue
             return [raw]
-        pick = pick.lower()
         toks = [t.strip() for t in pick.replace("，", ",").split(",") if t.strip()]
         nums = [int(t) for t in toks
                 if t.isdigit() and subs and 1 <= int(t) <= len(subs)]
@@ -9310,11 +9333,16 @@ def _drive_paths_menu(d, mp):
         else:
             print(f"  {DIM}{'整个盘（自动）' if auto_rest_on() else '未加路径'}{RST}")
         print("-" * 60)
-        print(f"  {DIM}a 添加　d 删除　0 返回{RST}")
+        # 【和别的每一屏一样，编号，不用字母】原来是 a 添加 / d 删除，整套菜单里只有这一屏
+        # 是字母键 —— 别的屏全是 1/2/0。同一套东西两种规矩，每次进来都得先认一遍。
+        print("  1. 添加")
+        print("  2. 删除")
+        print("  0. 返回")
+        print("-" * 60)
         c = ask("请选择").strip().lower()
         if c in ("0", "", "q"):
             return
-        if c == "d":
+        if c in ("2", "d"):
             if not mine:
                 print("没有可删的。")
                 continue
@@ -9333,7 +9361,7 @@ def _drive_paths_menu(d, mp):
             save_ms_state(scan_spec=[p for p in exp if p not in gone])
             _apply_scan_paths(d, f"删掉 {'、'.join(gone)}，")
             continue
-        if c != "a":
+        if c not in ("1", "a"):
             print("无效选择。")
             continue
 
@@ -9347,8 +9375,21 @@ def _drive_paths_menu(d, mp):
             warn(f"整个盘会把手机备份、截图也扫进来")
             if not ask_yn("仍然要整个盘？", False):
                 continue
-        save_ms_state(scan_spec=exp + [p for p in got if p not in exp])
-        _apply_scan_paths(d, f"加了 {'、'.join(got)}，")
+        # 【有最大的就扫最大的】加了父目录，它底下那些子路径就该消失 —— 留着既没用又骗人：
+        # 屏上写着"只扫电影"，实际扫的是整个盘。反过来，整个盘已经在扫了还想加它底下的
+        # 一条，那条同样是白加 —— 这时候要说清楚"没加"，不能报一句"已应用"了事。
+        merged = merge_scan_paths(exp + got)
+        eaten = [p for p in exp if p not in merged]
+        added = [p for p in merged if p not in exp]
+        if not added:
+            print(f"  {DIM}{'、'.join(got)} 已经在正在扫的路径底下了 ——"
+                  f" 父目录扫的时候本来就包含它，没有加。{RST}")
+            continue
+        save_ms_state(scan_spec=merged)
+        if eaten:
+            print(f"  {DIM}去掉 {'、'.join(eaten)}：它在刚加的路径底下，"
+                  f"留着也是扫同一批文件{RST}")
+        _apply_scan_paths(d, f"加了 {'、'.join(added)}，")
 
 
 
