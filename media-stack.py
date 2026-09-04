@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.51"
+SCRIPT_VERSION = "1.5.52"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4167,9 +4167,13 @@ def migrate_strm_layout(d, key):
     _sweep_empty_dirs(strm_root(d))
     ok(f"{n} 个 strm 已挪好，strm 目录树和网盘对上了")
     if key:
-        # 【挪完必须扫】要靠"扫一次看到旧位置的文件没了"让 Emby 真删掉旧条目。
-        info("让 Emby 看一眼挪过的位置...")
-        emby_scan_wait(key, timeout=900, label="重扫挪过位置的条目", force=True)
+        # 【挪完必须让 Emby 知道】不然旧条目留着、新条目不出现，一部片两个入口。
+        # 先走快车道：挪了哪几条我们【一清二楚】，没必要为十几条让它重扫两千多个。
+        moved = [(_strm_container_path(d, src), "Deleted") for src, _dst in moves]
+        moved += [(_strm_container_path(d, dst), "Created") for _src, dst in moves]
+        if not emby_notify_changes(key, moved):
+            info("让 Emby 看一眼挪过的位置...")
+            emby_scan_wait(key, timeout=900, label="重扫挪过位置的条目", force=True)
         back = _restore_progress(d, key, saved)
         if back:
             ok(f"{back} 个条目的续播点已贴回")
@@ -6310,25 +6314,23 @@ def _strm_container_path(d, host_path):
     return STRM_PATH + "/" + rel.replace(os.sep, "/")
 
 
-def strm_not_in_emby(d, key):
-    """本地有 strm、Emby 却没收进去的文件。返回容器内路径列表。
+EMBY_TARGETED_MAX = 300     # 变动超过这么多条，就老实全库扫一遍
 
-    这是整套东西里最难自查的一类失败：文件在网盘上、strm 生成了、媒体库路径也没填错，Emby
-    就是不认它 —— 而界面上【一个字的提示都没有】，用户看到的只是"我明明放了两部，只出来
-    一部"。原因基本都在 Emby 自己的电影库布局规则上（一个文件夹被当成一部电影、同名文件被
-    并成"版本"、文件名带标记解析不出片名），这些规则 Emby 从不解释，出问题也不报错。
 
-    枚举时【不加 IncludeItemTypes】：万一 Emby 把它归成了别的类型（音乐视频、额外内容之类），
-    加了类型过滤反而会把它算成"没收录"，报出假阳性。只按路径以 .strm 结尾来认。
+def emby_strm_paths(key):
+    """Emby 现在收录了哪些 strm（容器内路径）。问不出来返回 None。
+
+    【None 和空集合不是一回事】问不出来（库没建、接口失败）和"一个都没收录"处置相反，
+    前者只能放弃判断，后者是实打实的结论。
     """
     try:
         libs = _emby("/Library/VirtualFolders", key)
         users = _emby("/Users", key)
     except Exception:
-        return []
+        return None
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
-        return []
+        return None
     known = set()
     for lb in libs:
         pid = lb.get("ItemId")
@@ -6338,7 +6340,7 @@ def strm_not_in_emby(d, key):
             r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
                       f"&Fields=Path,MediaSources", key)
         except Exception:
-            return []                  # 有一个库问不到就整个放弃，别报假阳性
+            return None                # 有一个库问不到就整个放弃，别报假阳性
         for i in r.get("Items") or []:
             # 条目自己的 Path 【不一定】是那个 strm：片子单独放一个文件夹时，Emby 把整个
             # 文件夹当成这部电影，条目的 Path 是【文件夹】，真正的文件在 MediaSources 里。
@@ -6348,7 +6350,68 @@ def strm_not_in_emby(d, key):
                      [str(s.get("Path") or "") for s in (i.get("MediaSources") or [])]:
                 if p.endswith(".strm"):
                     known.add(p)
-    if not known:
+    return known
+
+
+def emby_notify_changes(key, changes, timeout=90, quiet=False):
+    """把【具体变了哪几条路径】告诉 Emby，而不是让它重扫整个媒体库。
+
+    changes 是 [(容器内路径, "Created" | "Deleted")]。
+
+    【为什么值得单独走这条路】全库扫描是让 Emby 把两千多个 strm 挨个过一遍，几分钟起步。
+    而点一次「5 生成媒体库」真正变动的常常只有十几条 —— 为了这十几条让人等几分钟，还每次
+    都等。Emby 自己有这个接口（它的媒体库监视器用的就是它），给一份变动清单，它只碰这几条。
+
+    【返回 True 必须是"确认收进去了"】不确认就报成功是这里最坏的做法：新片没进库，而屏上
+    写着已完成，用户回 Emby 里找不到，而且没有任何线索指向这一步。所以发完清单要回头问
+    Emby 要一次收录列表，确认到了才算数；确认不了就返回 False，调用方退回全库扫描。
+
+    【接口不一定有】这条 API 在不同 Emby 版本上不保证存在。发不出去就是 False，
+    照样退回全库扫描 —— 这条路是【快车道】，不是唯一的路。
+    """
+    changes = [(p, k) for p, k in changes if p]
+    if not changes or len(changes) > EMBY_TARGETED_MAX or not key:
+        return False
+    try:
+        _emby("/Library/Media/Updated", key, method="POST", timeout=60,
+              body={"Updates": [{"Path": p, "UpdateType": k} for p, k in changes]})
+    except Exception as e:
+        if not quiet:
+            print(f"  {DIM}没法只更新变动的那几条（{_short_err(e)}），改成全库扫描{RST}")
+        return False
+    want = {p for p, k in changes if k != "Deleted"}
+    gone = {p for p, k in changes if k == "Deleted"}
+    if not quiet:
+        info(f"只让 Emby 过一遍变动的 {len(changes)} 条，不重扫整个库...")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(3)
+        have = emby_strm_paths(key)
+        if have is None:
+            return False
+        if want <= have and not (gone & have):
+            if not quiet:
+                el = int(time.time() - t0)
+                ok(f"Emby 已收到这 {len(changes)} 条变动（{el} 秒）")
+            return True
+    if not quiet:
+        print(f"  {DIM}等了 {timeout} 秒 Emby 还没认下这几条，改成全库扫描{RST}")
+    return False
+
+
+def strm_not_in_emby(d, key):
+    """本地有 strm、Emby 却没收进去的文件。返回容器内路径列表。
+
+    这是整套东西里最难自查的一类失败：文件在网盘上、strm 生成了、媒体库路径也没填错，Emby
+    就是不认它 —— 而界面上【一个字的提示都没有】，用户看到的只是"我明明放了两部，只出来
+    一部"。原因基本都在 Emby 自己的电影库布局规则上（一个文件夹被当成一部电影、同名文件被
+    并成"版本"、文件名带标记解析不出片名），这些规则 Emby 从不解释，出问题也不报错。
+
+    枚举那一段在 emby_strm_paths() 里（问不出来返回 None，那是"放弃判断"，
+    不是"一个都没有"）。
+    """
+    known = emby_strm_paths(key)
+    if known is None or not known:
         return []                      # 一个都没有多半是库还没建，那是另一回事
     missing = []
     for hp, _tgt in strm_inventory(d):
@@ -7305,6 +7368,9 @@ def do_strm():
         print(f"  的 alist_strm 认不出来，表现是「挂载能播、Emby 一直转圈」。{RST}")
 
     before = strm_count(d)
+    # 【记下这一趟开工前有哪些】收尾时拿它一减，就知道到底新增/删除了哪几条 ——
+    # 有了这份清单才能只让 Emby 过这几条，而不是重扫整个库（见 emby_notify_changes）。
+    snap0 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d)}
     print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
 
     # 【有人在看片就先问一声】扫库和播放抢的是同一个网盘账号，而夸克风控很严。
@@ -7603,11 +7669,18 @@ def do_strm():
     # 里，那条每小时都跑，不管这批 strm 是谁生成的。）
     migrate_strm_layout(d, key)
     if key:
-        info("通知 Emby 扫描媒体库...")
-        if emby_scan_wait(key, timeout=900, label="扫描媒体库"):
-            ok("Emby 已扫完")
-        else:
-            ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
+        snap1 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d)}
+        diff = ([(p, "Created") for p in sorted(snap1 - snap0) if p]
+                + [(p, "Deleted") for p in sorted(snap0 - snap1) if p])
+        # 变动少就只报这几条（几秒）。多了、没变动、或者这条路没走通，都退回全库扫描 ——
+        # 【"没变动"也要退回去扫】本地没变不等于 Emby 里就是对的：媒体库可能是刚建的，
+        # 里头一个条目都没有。emby_scan_wait 自己有去重，刚扫过就不会真扫。
+        if not emby_notify_changes(key, diff):
+            info("通知 Emby 扫描媒体库...")
+            if emby_scan_wait(key, timeout=900, label="扫描媒体库"):
+                ok("Emby 已扫完")
+            else:
+                ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
         # 【补时长不在这儿跑】它是整条流程里最慢的一步，而且跟"生成成没成功"
         # 无关。扔后台之后用户扫完就能走人，缺多少时长看体检那行「条目时长」。
         align_library(d, key, heal=False)   # 库选项 + 片名 + 身份 + 脏进度
