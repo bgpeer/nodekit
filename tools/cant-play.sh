@@ -12,12 +12,13 @@
 #   ③ OpenList 认不认这条路径  ← 网盘里改过名/删了，或者存储掉线
 #   ④ MediaWarp 换不换直链    ← 令牌废了（重启过 OpenList），一律 404
 #   ⑤ 那条直链拉不拉得动      ← 403、限速、绑 IP
-#   ⑥ 拖得动进度条吗          ← 不认 Range：网页从头播没事，一拖就死，Emby 直接播不了
+#   ⑥ 拖得动进度条吗          ← 不认 Range 或被限流（429）：网页从头播没事，
+#                              一拖就死，Emby 直接播不了
 #
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04h"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04i"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -435,6 +436,12 @@ try:
     print()
     print(f"  {B}⑥ 拖进度条（从文件中间要一段）{X}")
     hr()
+    # 【必须先歇一下】⑤ 刚拉完 1 MiB，紧接着再发一个请求，撞上源的频率限制就是
+    # 429 —— 而那是【脚本自己造出来的】。实测栽过一次：同一个文件，单独测时 ⑥ 报
+    # "进度条能拖"，跟在 ⑤ 后面测就报 429，两次结论相反。歇三秒，测的才是它本来的样子。
+    print(f"  {D}先歇 3 秒再要 —— 紧跟着上一步发请求会撞上源的频率限制，"
+          f"那个 429 是脚本自己造的{X}")
+    time.sleep(3)
     mid = max(1 << 20, (ol_size or size or (1 << 30)) // 2)
     req2 = urllib.request.Request(loc, headers={
         "Range": f"bytes={mid}-{mid + 65535}", "User-Agent": UA})
@@ -499,12 +506,44 @@ try:
         else:
             print(f"  {R}✖ HTTP {st2}{X}  {D}要中间那一段被拒了{X}")
     except urllib.error.HTTPError as e2:
-        print(f"  {R}✖ HTTP {e2.code}{X}  {D}要中间那一段被拒了 —— 进度条拖不动，"
-              f"播放器多半直接播不出来{X}")
+        if e2.code == 429:
+            # 【429 不是"不支持 seek"，是"你请求太频繁"】处置完全不同，说错方向
+            # 会让人去折腾 Range、折腾播放器，而真正的限制在源那边。
+            ra = e2.headers.get("Retry-After", "")
+            print(f"  {R}✖ HTTP 429 —— 源在限流{X}"
+                  + (f"  {D}它要求等 {ra} 秒{X}" if ra else ""))
+            print(f"  {D}歇 8 秒再要一次，看是一直被限还是刚才那下太密...{X}")
+            time.sleep(8)
+            try:
+                with urllib.request.urlopen(req2, timeout=90) as r4:
+                    print(f"  {Y}第二次成功了（HTTP {r4.status}）{X}")
+                    print(f"  {D}说明这个源【限的是频率，不是能力】：隔开就给，"
+                          f"连着要就拒。{X}")
+            except urllib.error.HTTPError as e4:
+                print(f"  {R}第二次还是 HTTP {e4.code}{X}")
+            except Exception as e4:
+                print(f"  {R}第二次也没成：{safe(e4)}{X}")
+            print()
+            print(f"  {B}这就是「拖进度条跳回开头 / Emby 直接 load fail」的原因{X}")
+            print(f"  {D}播放器一 seek 就是一个新请求；开播时更要连发好几个"
+                  f"（探测编码、要首帧、再要播放位置）。撞上限流被拒，播放器"
+                  f"只好放弃、从头再来 —— 你看到的就是「跳回开头」和「load fail」。{X}")
+            print(f"  {D}而挂载网页从头播没事，是因为那是【一个】连续的请求，"
+                  f"中途不再要新的。{X}")
+            print(f"  {D}限的是源那边，OpenList 只是照转 —— 改直链方式、换播放器、"
+                  f"调 Emby 设置都碰不到它。{X}")
+            print(f"  {B}这个源不适合放要拖进度条的片子{X}"
+                  f"{D}；大码率的放夸克/阿里（302 直连网盘 CDN，不吃这个限制）。{X}")
+        else:
+            print(f"  {R}✖ HTTP {e2.code}{X}  {D}要中间那一段被拒了 —— 进度条拖不动，"
+                  f"播放器多半直接播不出来{X}")
     except Exception as e2:
         print(f"  {R}✖ 要不到中间那一段：{safe(e2)}{X}")
 except urllib.error.HTTPError as e:
     print(f"  {R}✖ HTTP {e.code}{X}  {D}直链拿到了，但拉不动{X}")
+    if e.code == 429:
+        print(f"  {D}429 = 源在限流（请求太频繁）。播放器开播要连发好几个请求，"
+              f"撞上就是 load fail。隔一会儿再跑一次这个脚本看是不是一直这样。{X}")
     if e.code == 403:
         print(f"  {D}403 常见两种：直链绑了取它的那台机器的 IP/UA；"
               f"或者签名过期。前者要把这个盘的「回源方式」改成本机代理"
