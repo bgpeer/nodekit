@@ -16,7 +16,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04d"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -34,8 +34,13 @@ OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 [ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
+# 直链缓存时长是【按最短命的那家网盘算出来的】，不是固定值 —— 这台机器上是 9m，
+# 写死"2 小时"会让人以为还要干等两小时。从配置里读。
+TTL="$(sed -nE 's/^[[:space:]]*alist_api_ttl:[[:space:]]*"?([^"[:space:]#]+).*/\1/p' \
+        "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
+[ -n "$TTL" ] || TTL="一小会儿"
 
-export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N"
+export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N" MS_TTL="$TTL"
 python3 - <<'PY'
 import json, os, re, time, urllib.error, urllib.parse, urllib.request
 
@@ -46,6 +51,7 @@ KEY  = os.environ["MS_KEY"]
 OLPW = os.environ.get("MS_OLPW") or ""
 DATA_ROOT = os.environ["MS_DATA_ROOT"].rstrip("/")
 Q = os.environ["MS_Q"]
+TTL = os.environ.get("MS_TTL") or "一小会儿"
 G="\033[32m"; Y="\033[33m"; R="\033[31m"; D="\033[2m"; B="\033[1m"; C="\033[36m"; X="\033[0m"
 
 # 【脱敏】这一屏是会被截图发出来的。键名不限定前面是 ? 还是 &（裸 token= 也要盖），
@@ -317,8 +323,8 @@ if (bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
     print(f"  {B}修：把 OpenList 的「网站 URL」填成对外地址{X}")
     print(f"  {D}跑一次「7 更新」会自动填（脚本要 v1.5.53 以上），"
           f"或者去 OpenList 设置里手填 https://list.<你的域名>。{X}")
-    print(f"  {D}填完已经缓存的旧地址最多 2 小时后自动换过来；"
-          f"等不及就 docker restart mediawarp。{X}")
+    print(f"  {D}填完已经缓存的旧地址最多 {TTL} 后自动换过来（这台机器的直链缓存"
+          f"就是这个值）；等不及就 docker restart mediawarp。{X}")
     print(f"  {D}下面那一步是在这台机器上拉的 —— 这里能拉动不代表手机能。{X}")
 
 # ================= ⑤ 那条直链拉不拉得动 =================
