@@ -2,6 +2,7 @@
 # 「挂载里能播，Emby 里点开就 load fail / 一直转圈」专用。只读，不改任何东西。
 #
 #   bash cant-play.sh 鹿鼎记          片名的一部分、文件名的一部分都行
+#   bash cant-play.sh 鹿鼎记 3        同名的有好几个时，查第 3 个
 #
 # 【为什么要一条链路一条链路地走】播不了在客户端上永远只有一句 load fail，而这条链
 # 有五段，每一段坏了的表现【一模一样】：
@@ -15,12 +16,13 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
+N="${2:-1}"          # 同名的多个条目里查第几个（不填就是第一个）
 if [ -z "$Q" ]; then
-  echo "用法：bash cant-play.sh <片名的一部分>"
+  echo "用法：bash cant-play.sh <片名的一部分> [第几个]"
   exit 1
 fi
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -33,7 +35,7 @@ OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 [ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
 
-export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q"
+export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N"
 python3 - <<'PY'
 import json, os, re, time, urllib.error, urllib.parse, urllib.request
 
@@ -104,10 +106,33 @@ if not hit:
     print(f"  {D}strm 还没进库。点「5 生成媒体库」，完了看它最后那段"
           f"「Emby 媒体库可以指向这些路径」有没有建库。{X}")
     raise SystemExit
+
+def _facts(i):
+    """列表那一行要摆的事实：容器、大小 —— 一眼就能看出该查哪一个。"""
+    s0 = (i.get("MediaSources") or [{}])[0]
+    sz = int(s0.get("Size") or 0)
+    return (str(s0.get("Container") or i.get("Container") or "?"),
+            f"{sz / 1024 / 1024 / 1024:.2f} GB" if sz else "0B")
+
+
 if len(hit) > 1:
-    print(f"  {Y}匹配到 {len(hit)} 个，查第一个{X}  "
-          f"{D}{'、'.join(str(i.get('Name')) for i in hit[:4])}{X}")
-it = hit[0]
+    # 【七个同名条目，只查第一个还不说是哪一个，等于瞎猜】把它们摆出来，
+    # 谁坏了往往一眼就看得出（容器 bluray、大小 0B）。
+    print(f"  {Y}匹配到 {len(hit)} 个{X}  {D}第二个参数可以指定查第几个，"
+          f"例如：bash cant-play.sh {Q} 3{X}")
+    for n, i in enumerate(hit[:12], 1):
+        c, z = _facts(i)
+        print(f"    {n:>2}. {str(i.get('Name'))[:34]:<34} {D}{c:<8}{z}{X}")
+    if len(hit) > 12:
+        print(f"    {D}…还有 {len(hit) - 12} 个，把片名写得更具体一点{X}")
+try:
+    pick = int(os.environ.get("MS_N") or "1")
+except ValueError:
+    pick = 1
+pick = pick if 1 <= pick <= len(hit) else 1
+it = hit[pick - 1]
+if len(hit) > 1:
+    print(f"  {D}这次查第 {pick} 个{X}")
 iid, cpath = it.get("Id"), str(it.get("Path") or "")
 srcs = it.get("MediaSources") or []
 size = int((srcs[0].get("Size") if srcs else 0) or 0)
@@ -119,7 +144,23 @@ print(f"  {D}容器      {cont or '（空）'}　大小 "
       f"{(str(round(size / 1024 / 1024 / 1024, 2)) + ' GB') if size else '0B'}"
       f"　时长 {int(secs // 60)} 分{X}")
 
-if cont.lower() in ("bluray", "bdmv", "dvd", "iso") or (not size and not secs):
+# 【判"原盘"要有真凭据】容器写着 bluray/iso，或者路径就在 BDMV/CERTIFICATE 里面 ——
+# 二者必居其一。上一版还把"大小 0B 且时长 0"也算进来，那是错的：那个组合最常见的
+# 意思是【Emby 还没探到媒体信息】，一条普普通通的 strm 刚进库就是这样。
+# 结果就是把一条正常条目判成原盘、还让人去做一件毫不相干的事，而真正的原因半个字
+# 没提。宁可不下结论，也不能下一个错的。
+looks_disc = (cont.lower() in ("bluray", "bdmv", "dvd", "iso")
+              or bool(re.search(r"/(BDMV|CERTIFICATE)(/|$)", cpath, re.I)))
+if not size and not secs and not looks_disc:
+    print()
+    print(f"  {Y}⚠ Emby 还没探到这一条的媒体信息（大小 0B、时长 0）{X}")
+    print(f"  {D}这【不一定】是播不了的原因，但它自己就是个毛病：续播点是按时长算"
+          f"百分比的，分母为 0 那套逻辑整个失效 —— 停止播放直接判「已看完」。{X}")
+    print(f"  {D}补时长是「5 生成媒体库」之后在后台跑的（每 3 分钟一轮），"
+          f"补到哪儿了看「6 链路体检」的「条目时长」那一行。{X}")
+    print(f"  {D}下面接着往下查 —— 探不到时长往往【正是】因为下面某一段不通。{X}")
+
+if looks_disc:
     print()
     print(f"  {R}✖ 这是一个蓝光原盘（或光盘镜像）条目，不是一个视频文件{X}")
     print(f"  {D}原盘是一整棵目录树（BDMV/STREAM 里几十个 .m2ts + 索引），"
