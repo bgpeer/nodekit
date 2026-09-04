@@ -14,11 +14,13 @@
 #   ⑤ 那条直链拉不拉得动      ← 403、限速、绑 IP
 #   ⑥ 拖得动进度条吗          ← 不认 Range 或被限流（429）：网页从头播没事，
 #                              一拖就死，Emby 直接播不了
+#   (7) 真实播放那一刻        ← 前六段测的都是脚本【自己造的】请求。客户端要转码、
+#                              或者压根没走 MediaWarp，前六段照样全绿
 #
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04i"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04j"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -44,7 +46,7 @@ TTL="$(sed -nE 's/^[[:space:]]*alist_api_ttl:[[:space:]]*"?([^"[:space:]#]+).*/\
 
 export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N" MS_TTL="$TTL"
 python3 - <<'PY'
-import json, os, re, time, urllib.error, urllib.parse, urllib.request
+import json, os, re, subprocess, time, urllib.error, urllib.parse, urllib.request
 
 EMBY = "http://127.0.0.1:8096"
 MW   = "http://127.0.0.1:9000"
@@ -550,5 +552,65 @@ except urllib.error.HTTPError as e:
               f"（4 挂载路径 → 选那个盘 → 2 直链方式）。{X}")
 except Exception as e:
     print(f"  {R}✖ 拉不动：{safe(e)}{X}")
+# ================= (7) 真实播放那一刻发生了什么 =================
+# 【前面六段测的都是脚本自己造的请求】它们全通，只证明"这条路走得通"，不证明
+# "Emby 客户端走的是这条路"。而最常见的那个死因恰恰不在这六段里：Emby 判定客户端
+# 解不了这个编码 → 决定转码 → 而 strm + 302 这套【根本不能转码】（文件在网盘上，
+# ffmpeg 手里只有一条 URL 和一台没有那个文件的机器）。
+# 转码那条路在日志里长得不一样：master.m3u8 / main.m3u8，而不是 /stream。
+print()
+print(f"  {B}(7) 真实播放那一刻（读 MediaWarp 日志）{X}")
+hr()
+print(f"  {D}前面六段测的都是脚本自己造的请求。这一步看【你点播放时】实际发生了什么。{X}")
+try:
+    _p = subprocess.run(["docker", "logs", "--tail", "1500", "mediawarp"],
+                        capture_output=True, text=True, timeout=60)
+    mwlog = (_p.stdout or "") + (_p.stderr or "")
+    mwerr = ""
+except Exception as _e:
+    mwlog, mwerr = "", str(_e)
+if mwerr:
+    print(f"  {Y}读不到 MediaWarp 日志：{safe(mwerr)}{X}")
+else:
+    HIT = re.compile(r"(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d).*?\|\s*(\d{3})\s*\|"
+                     r".*?(/videos/" + str(iid) + r"/(\S*))", re.I)
+    rows = [m.groups() for m in (HIT.search(l) for l in mwlog.splitlines()) if m]
+    OKC = ("200", "204", "206", "302", "304")
+    TRANS = re.compile(r"master\.m3u8|main\.m3u8|hls", re.I)
+    if not rows:
+        print(f"  {Y}日志里没有这个条目的任何播放请求{X}")
+        print(f"  {D}也就是说：你点播放的时候，请求【根本没到 MediaWarp】。{X}")
+        print(f"  {D}最常见的原因是客户端连的不是 MediaWarp —— 直连 Emby 的 8096 "
+              f"会绕过 302 拦截。客户端里填的服务器地址应该是 https://emby.<你的域名>。{X}")
+        print(f"  {D}（也可能只是你还没点过播放。点一次再跑这个脚本。）{X}")
+    else:
+        print(f"  {D}最近 {min(len(rows), 6)} 条（时间 | 状态 | 走哪条路）：{X}")
+        for ts, code, path, tail in rows[-6:]:
+            kind = "转码" if TRANS.search(tail) else "直接播放"
+            col = G if code in OKC else R
+            print(f"    {D}{ts}{X}  {col}{code}{X}  {D}{kind}  {path[:52]}{X}")
+        bad = [r for r in rows if r[1] not in OKC]
+        trans = [r for r in rows if TRANS.search(r[3])]
+        print()
+        if trans:
+            print(f"  {R}[X] 客户端在要转码流（master.m3u8）{X}")
+            print(f"  {D}这套东西【不能转码】：文件在网盘上，ffmpeg 手里只有一条 URL，"
+                  f"本机没有那个文件。所以一旦 Emby 判定要转码，必定 load fail —— "
+                  f"而前面六段全是好的。{X}")
+            print(f"  {B}修：让它直接播放{X}{D} —— 客户端里把画质/播放设置改成"
+                  f"「原始质量 / 直接播放」。改完还是转码，就是这个客户端解不了"
+                  f"里面的编码（x265 10bit、TrueHD 这类，老设备和部分播放器就是解不了），"
+                  f"换 Infuse / VidHub 试试。{X}")
+        elif bad:
+            print(f"  {R}[X] 有 {len(bad)} 次请求失败，最近一次 HTTP {bad[-1][1]}{X}")
+            print(f"  {D}前面六段都通，说明不是链路。看这个状态码：401/403 多半是 "
+                  f"MediaWarp 的 OpenList 令牌废了（docker restart mediawarp）；"
+                  f"404 是它没认出这条 strm。{X}")
+        else:
+            print(f"  {G}[v] 请求都成功了（直接播放，302 发出去了）{X}")
+            print(f"  {D}MediaWarp 这边是好的。那 load fail 就出在【302 之后】—— "
+                  f"播放器自己去连那个地址失败了。最常见的是客户端解不了这个编码"
+                  f"（这套东西不能转码），换 Infuse / VidHub 一试就知道。{X}")
+
 print()
 PY
