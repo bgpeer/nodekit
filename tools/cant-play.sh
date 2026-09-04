@@ -12,11 +12,12 @@
 #   ③ OpenList 认不认这条路径  ← 网盘里改过名/删了，或者存储掉线
 #   ④ MediaWarp 换不换直链    ← 令牌废了（重启过 OpenList），一律 404
 #   ⑤ 那条直链拉不拉得动      ← 403、限速、绑 IP
+#   ⑥ 拖得动进度条吗          ← 不认 Range：网页从头播没事，一拖就死，Emby 直接播不了
 #
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04d"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04e"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -228,6 +229,7 @@ if OLPW:
                or {}).get("token", "")
     except Exception as e:
         print(f"  {Y}登不上 OpenList：{safe(e)}{X}")
+ol_size = 0        # OpenList 报的文件大小。⑥ 要拿它算文件中点 —— Emby 那边常常是 0
 if not tok:
     print(f"  {Y}没有 OpenList 令牌，这一步跳过{X}"
           f"  {D}（读不到 {os.path.dirname(DATA_ROOT)}/.secrets 里的 OPENLIST_PASS）{X}")
@@ -248,6 +250,7 @@ else:
         data = r.get("data") or {}
         raw = str(data.get("raw_url") or "")
         sz = int(data.get("size") or 0)
+        ol_size = sz          # Emby 那边的大小常常是 0，定位文件中点要用这个
         print(f"  {G}✔{X} 认得这个文件  {D}{sz / 1024 / 1024 / 1024:.2f} GB{X}")
         if not raw:
             print(f"  {R}✖ 但它没给出直链（raw_url 是空的）{X}")
@@ -351,11 +354,51 @@ try:
         print(f"  {Y}这个速度放 1080p 原盘大概率要卡{X}"
               f"  {D}用 tools/ali-403.sh 换几种方式量一遍，"
               f"几条路速度齐平就是网盘限速，不是线路{X}")
-    else:
-        print()
-        print(f"  {G}五段全通{X}  {D}链路本身是好的。还是播不了的话，多半是客户端"
-              f"解不了这个编码（这套东西不能转码）—— 换 Infuse / VidHub 试试，"
-              f"或者看 tools/playing.sh 那一路是直接播放还是转码。{X}")
+
+    # ---------- ⑥ 拖进度条（从文件中间要一段）----------
+    # 【这一步和上面那步不是一回事】上面拉的是【开头】，服务器就算完全不认 Range、
+    # 从头把整个文件发过来，也照样"成功"。而播放器开播时几乎总要先 seek 一下，
+    # 拖进度条更是必须从中间要 —— 不支持的话表现正是：网页里从头播能播，
+    # 一拖就卡死，Emby / 外部播放器直接播不出来。这是代理型存储（WebDAV 源）
+    # 最常见的死因，而且光看"能不能拉到数据"永远发现不了。
+    print()
+    print(f"  {B}⑥ 拖进度条（从文件中间要一段）{X}")
+    hr()
+    mid = max(1 << 20, (ol_size or size or (1 << 30)) // 2)
+    req2 = urllib.request.Request(loc, headers={
+        "Range": f"bytes={mid}-{mid + 65535}", "User-Agent": UA})
+    try:
+        t0 = time.time()
+        with urllib.request.urlopen(req2, timeout=90) as r2:
+            st2, cr = r2.status, r2.headers.get("Content-Range", "")
+            n2 = len(r2.read(65536))
+        el2 = time.time() - t0
+        if st2 == 206 and cr:
+            start_at = cr.split()[-1].split("-")[0].split("/")[0]
+            good = start_at.isdigit() and int(start_at) == mid
+            print(f"  {G if good else Y}HTTP 206{X}  {D}{cr}　拿到 {n2} 字节，"
+                  f"{el2:.1f} 秒{X}")
+            if good:
+                print(f"  {G}✔ 进度条能拖{X}  {D}服务器认 Range，从哪儿要就从哪儿给{X}")
+            else:
+                print(f"  {Y}回的 206 起点和要的对不上{X}  "
+                      f"{D}要 {mid}，给的是 {start_at}{X}")
+        elif st2 == 200:
+            print(f"  {R}✖ 回的是 200，不是 206 —— 服务器不认 Range{X}")
+            print(f"  {D}它把整个文件从头发过来了。表现就是：网页里从头播能播，"
+                  f"一拖进度条就卡死；而 Emby / 外部播放器开播时就要 seek，"
+                  f"于是直接播不出来。{X}")
+            print(f"  {D}这是代理型存储（WebDAV 源）最常见的死因 —— 上游那台 WebDAV "
+                  f"服务器不支持断点续传，OpenList 只是照转，改哪个配置都没用。{X}")
+            print(f"  {B}只能换个盘放{X}{D}：夸克 / 阿里 / 115 是 302 到网盘 CDN，"
+                  f"那些都认 Range。{X}")
+        else:
+            print(f"  {R}✖ HTTP {st2}{X}  {D}要中间那一段被拒了{X}")
+    except urllib.error.HTTPError as e2:
+        print(f"  {R}✖ HTTP {e2.code}{X}  {D}要中间那一段被拒了 —— 进度条拖不动，"
+              f"播放器多半直接播不出来{X}")
+    except Exception as e2:
+        print(f"  {R}✖ 要不到中间那一段：{safe(e2)}{X}")
 except urllib.error.HTTPError as e:
     print(f"  {R}✖ HTTP {e.code}{X}  {D}直链拿到了，但拉不动{X}")
     if e.code == 403:
