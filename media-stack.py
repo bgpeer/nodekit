@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.52"
+SCRIPT_VERSION = "1.5.53"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -708,6 +708,69 @@ def openlist_public_url(cfg):
     # 没域名时 openlist 的端口是 0.0.0.0 绑定的(见 gen_compose 的 bind),
     # 直接用 IP:端口,和用户平时打开 OpenList 界面的地址一样
     return f"http://{cfg['host_ip']}:{OPENLIST_PORT}"
+
+
+# OpenList 里那个「网站 URL」在不同版本上叫不同的键。不猜 —— 去设置列表里找哪个真的在。
+SITE_URL_KEYS = ("api_url", "site_url")
+
+
+def ensure_openlist_site_url(d, cfg=None, quiet=False):
+    """把 OpenList 的「网站 URL」设成【播放器也能访问】的那个地址。返回改没改。
+
+    【这一项决定了 WebDAV / 本地目录这类盘在 Emby 里能不能播】它们是"代理型"存储：
+    网盘那侧根本没有 CDN 直链，OpenList 只能把自己的 /d/ 地址当成直链回给你。而那个
+    地址的主机名是【谁来问就按谁用的主机名拼】—— MediaWarp 在容器里用
+    http://openlist:5244 问，OpenList 就回 http://openlist:5244/d/…，MediaWarp 原样
+    302 给播放器。手机、电视根本解析不了 openlist 这个名字，报的是
+    "Name or service not known"，在客户端上就是一句 load fail。
+
+    整条链每一步都"成功"了：strm 是对的、OpenList 认得这个文件、MediaWarp 也确实
+    302 了 —— 只有最后那个地址是内网的。这就是为什么它极难自己看出来。
+
+    修法是 OpenList 自己的设置：填上「网站 URL」之后，它拼 /d/ 地址就不再看请求里的
+    主机名，一律用这个对外地址。这是那个设置项存在的全部意义。
+
+    【键名不硬编】不同版本里它叫 api_url 或 site_url。去设置列表里找哪个真的存在 ——
+    写一个不存在的键进去，OpenList 会存着然后完全忽略，而屏上写着"已设置"。
+    """
+    cfg = cfg or rebuild_cfg_from_disk(d)
+    want = (openlist_public_url(cfg) or "").rstrip("/")
+    if not want or "127.0.0.1" in want or "localhost" in want:
+        return False           # 连我们自己都算不出一个对外地址，就别乱写
+    tok = _ol_token(d)
+    if not tok:
+        return False
+    try:
+        r = _ol_api("/api/admin/setting/list", {}, tok, timeout=30, method="GET")
+    except Exception:
+        return False
+    items = (r.get("data") or []) if r.get("code") == 200 else []
+    item = next((x for x in items if x.get("key") in SITE_URL_KEYS), None)
+    if item is None:
+        if not quiet:
+            print(f"  {DIM}这个 OpenList 版本没有「网站 URL」这一项，跳过{RST}")
+        return False
+    if str(item.get("value") or "").rstrip("/") == want:
+        return False
+    old = str(item.get("value") or "")
+    item = dict(item, value=want)
+    try:
+        # 【整条 item 原样发回去】只发 key/value 的话，help、type、group 这些元信息
+        # 会被 upsert 覆盖成空 —— 设置页面上那一项就变成没有说明的裸输入框。
+        _ol_api("/api/admin/setting/save", [item], tok, timeout=30)
+    except Exception as e:
+        if not quiet:
+            warn(f"设不上 OpenList 的「网站 URL」：{_short_err(e)}")
+        return False
+    if not quiet:
+        ok(f"OpenList 的「网站 URL」已设成 {want}"
+           + (f"{DIM}（原来是{'空的' if not old else ' ' + old}）{RST}"))
+        print(f"  {DIM}WebDAV 源、本地目录这类盘在网盘侧没有 CDN 直链，OpenList 只能回"
+              f"自己的地址 —— 不填这一项它回的是容器内网名（openlist:5244），"
+              f"手机电视解析不了，点开就是 load fail。{RST}")
+        print(f"  {DIM}已经缓存过的旧地址最多 2 小时后自动换过来；等不及就"
+              f"docker restart mediawarp。{RST}")
+    return True
 
 
 def gen_autofilm_conf(cfg):
@@ -4233,6 +4296,13 @@ def align_library(d, key, heal=True):
     【但要管 Emby 扫描】strm 数一变就通知 Emby 扫一次，数没变一个请求都不发。
     """
     follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
+    # 【每小时对一遍「网站 URL」】它空着的话，WebDAV / 本地目录这类代理型存储发出去的
+    # 直链是容器内网名，手机电视解析不了 —— 而整条链每一步看着都成功。装完就该是对的，
+    # 但用户可能自己在 OpenList 网页里改过，也可能是从老版本升上来的。
+    try:
+        ensure_openlist_site_url(d, quiet=True)
+    except Exception:
+        pass
     # 【必须在这儿也来一遍】strm 不是只有点「5 生成媒体库」才会产生 —— AutoFilm 自己的
     # 定时任务也会按新配置生成。实测翻过车：「7 更新」重写了 autofilm 配置，它的 cron
     # 到点按新布局生成了 cloud/quark/…，而旧的那批没人搬，两份并存。
@@ -5082,6 +5152,10 @@ def do_update(from_menu=False):
             continue
         write_atomic(path, text)
         subprocess.run(["docker", "restart", svc], capture_output=True)
+    # 【每次更新都对一遍】它决定了 WebDAV / 本地目录这类"代理型"存储发出去的直链
+    # 是对外地址还是容器内网名。老装的机器上这一项是空的，表现为那些盘在 Emby 里
+    # 一律 load fail，而整条链每一步看着都成功。
+    ensure_openlist_site_url(d, cfg)
     if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
         warn("MediaWarp 的 Emby API Key 是空的，302 直链不会生效。")
         warn("用「3 后补参数 → 添加 API 密钥」补上。")
@@ -10971,10 +11045,13 @@ def public_visitors(limit=20000):
     return total, sorted(hits.items(), key=lambda kv: -kv[1])
 
 
-def _ol_api(path, body, token=None, timeout=60):
+def _ol_api(path, body, token=None, timeout=60, method="POST"):
+    """OpenList 的接口。method="GET" 时不带 body —— 它的几条查询接口只认 GET，
+    发成 POST 会回 405，而那种失败长得像"接口不存在"。"""
     req = urllib.request.Request(
         f"http://127.0.0.1:{OPENLIST_PORT}{path}",
-        data=json.dumps(body).encode(), method="POST",
+        data=json.dumps(body).encode() if method != "GET" else None,
+        method=method,
         headers={"Content-Type": "application/json",
                  **({"Authorization": token} if token else {})})
     return json.load(urllib.request.urlopen(req, timeout=timeout))
@@ -11537,6 +11614,36 @@ def do_healthcheck():
     except Exception as e:
         _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
+    # ---- OpenList 的「网站 URL」----
+    # 【代理型存储（WebDAV 源、本地目录）能不能在 Emby 里播，全看这一项】它们在网盘侧
+    # 没有 CDN 直链，OpenList 只能回自己的 /d/ 地址；这一项空着的话，那个地址的主机名
+    # 就按【谁来问】拼 —— MediaWarp 在容器里问，拿回来的是 openlist:5244，302 给播放器
+    # 就是解析不了的内网名。整条链每一步都"成功"，只有最后那个地址是废的。
+    _site = ""
+    try:
+        _tok = _ol_token(d)
+        if _tok:
+            _r = _ol_api("/api/admin/setting/list", {}, _tok, timeout=20, method="GET")
+            _it = next((x for x in (_r.get("data") or [])
+                        if x.get("key") in SITE_URL_KEYS), None)
+            _site = str((_it or {}).get("value") or "")
+    except Exception:
+        _it = None
+    _want_site = (openlist_public_url(cfg) or "").rstrip("/")
+    if _site.rstrip("/") == _want_site and _want_site:
+        _hc("OpenList 网站 URL", "ok", _site)
+    elif not _site:
+        _hc("OpenList 网站 URL", "bad",
+            f"{YELLOW}空着 —— WebDAV / 本地目录这类盘发出去的直链会是容器内网名{RST}")
+        todo.append(("OpenList 的「网站 URL」空着。代理型存储（WebDAV 源、本地目录）"
+                     "在网盘侧没有 CDN 直链，OpenList 只能回自己的地址，而这一项空着时"
+                     "它按请求方用的主机名拼 —— MediaWarp 拿到的是 openlist:5244，"
+                     "302 给手机电视就是解析不了，表现为 load fail",
+                     "跑一次「7 更新」会自动填上；或去 OpenList 设置里把它填成 "
+                     + (_want_site or "对外地址")))
+    else:
+        _hc("OpenList 网站 URL", "warn", f"{_site}{DIM}（脚本算出的是 {_want_site}）{RST}")
+
     # ---- 302 端到端 ----
     own_host = urllib.parse.urlsplit(openlist_public_url(cfg)).hostname or ""
     _hc_wait("302 直链", 90)
