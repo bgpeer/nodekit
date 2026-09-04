@@ -977,6 +977,7 @@ OpenList 顺手把上游那条也取消掉，说明的是「慢」而不是「�
 | `compare-speed.sh` | 把 MediaWarp 302 和 OpenList 转码流并排比 |
 | `ali-token.sh` | 查阿里的类型和令牌配不配对 |
 | `playing.sh` | 看正在播的那一路是直接播放还是转码 |
+| `dav-check.sh` | OpenList 自带的 WebDAV，每个盘是走 302 直链还是本机代理（决定了拿 Infuse / VidHub 直连值不值得，以及进度条拖不拖得动） |
 
 ⚠️ 拉这些脚本时给 URL 带个时间戳绕开 CDN 缓存，否则可能拿到几分钟前的旧版：
 `curl -fsSL "…/tools/xxx.sh?_t=$(date +%s)" -o /tmp/xxx.sh`
