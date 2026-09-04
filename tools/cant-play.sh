@@ -16,7 +16,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04b"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04c"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -301,6 +301,25 @@ if not loc:
 host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
 kind = "HLS 分片流" if ".m3u8" in loc.lower() else "整文件"
 print(f"  {G}✔ 302{X}  {D}{el:.1f} 秒{X}  →  {C}{host}{X}  {D}{kind}{X}")
+
+# 【302 成功 ≠ 播得了】302 到一个【只有容器里解析得了】的名字，对播放器就是死路：
+# 手机、电视报 "Name or service not known"，客户端上只有一句 load fail。
+# 而这一整条链每一步都是"成功"的 —— 这就是它极难自己看出来的原因。
+bare = host.split(":")[0]
+if (bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
+        or bare.startswith(("127.", "172.1", "172.2", "172.3", "10.", "192.168."))):
+    print()
+    print(f"  {R}✖ 302 指向的是内网地址，播放器根本连不上{X}  {D}{host}{X}")
+    print(f"  {D}这是代理型存储（WebDAV 源、本地目录）特有的：它们在网盘侧没有 CDN"
+          f"直链，OpenList 只能回自己的 /d/ 地址 —— 而那个地址的主机名是"
+          f"【谁来问就按谁用的主机名拼】。MediaWarp 在容器里用 http://openlist:5244"
+          f"去问，拿回来的就是 openlist:5244。{X}")
+    print(f"  {B}修：把 OpenList 的「网站 URL」填成对外地址{X}")
+    print(f"  {D}跑一次「7 更新」会自动填（脚本要 v1.5.53 以上），"
+          f"或者去 OpenList 设置里手填 https://list.<你的域名>。{X}")
+    print(f"  {D}填完已经缓存的旧地址最多 2 小时后自动换过来；"
+          f"等不及就 docker restart mediawarp。{X}")
+    print(f"  {D}下面那一步是在这台机器上拉的 —— 这里能拉动不代表手机能。{X}")
 
 # ================= ⑤ 那条直链拉不拉得动 =================
 print()
