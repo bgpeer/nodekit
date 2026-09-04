@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.53"
+SCRIPT_VERSION = "1.5.54"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7160,7 +7160,13 @@ def prune_dead_strm(d, budget=None):
 # cron 上跑两轮 —— 当天账单：VPS 下行 80.4 GB、上行 1.0 GB。
 #
 # 所以每轮只探一批，转着来。宁可多花几天补完，也不能一个晚上把人家的流量包打光。
-HEAL_LIMIT  = 50         # 每轮最多探几个条目
+HEAL_LIMIT  = 50         # 每轮至少探几个条目
+# 【积压多的时候要能自己提速】上限写死 50 的话，一个刚扫进来两千多条的库要按每小时
+# 50 个补，光补时长就得跑两天多 —— 而这两天里那些片子看一半退出全被当成看完。
+# 真正该管住的是【时间】不是【个数】：慢的时候 HEAL_BUDGET 600 秒自己就刹住了，
+# 快的时候（缓存命中、线路好，一个两秒）没道理还卡在 50。所以按积压量放大，
+# 再用这个上限兜住 —— 探一个要从网盘拉一段文件头，不设顶会把流量打光（实测一天 80 GB）。
+HEAL_LIMIT_MAX = 300
 HEAL_BUDGET = 600        # 整轮封顶（秒）。用满就收工，剩下的下一轮接着
 HEAL_ROUNDS = 2
 HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预热同一个理由）
@@ -7228,7 +7234,7 @@ def heal_media_info(d, key):
     # 【取多少要先夹到总数】不夹的话 (allpend+allpend) 在待探数少于 HEAL_LIMIT 时
     # 会把同一批切出来两遍 —— 7 个待探切成 14 个，每个条目探两次、流量翻倍。
     # 而这一步的全部意义就是省流量。
-    take = min(HEAL_LIMIT, len(allpend))
+    take = min(max(HEAL_LIMIT, len(allpend) // 8), HEAL_LIMIT_MAX, len(allpend))
     pend = (allpend + allpend)[cur:cur + take]
     save_ms_state(heal_cursor=(cur + take) % len(allpend))
     print()
@@ -12211,12 +12217,21 @@ def do_healthcheck():
                 names = "、".join(n for _u, _i, n in nodur[:3])
                 if len(nodur) > 3:
                     names += f" 等 {len(nodur)} 个"
+                # 【必须说"还要多久"】只报个数字的话，人没法判断"它到底在不在补"——
+                # 而它确实在补，只是每小时一批。不说清楚，看到两千多个只会以为没在跑。
+                _per = min(max(HEAL_LIMIT, len(nodur) // 8), HEAL_LIMIT_MAX)
+                _hrs = max(1, -(-len(nodur) // _per))    # 向上取整
                 _hc("条目时长", "bad",
                     f"{names}  {YELLOW}没有时长，不会有进度条记忆{RST}")
+                print(f"    {' ':<20}{DIM}后台每小时补一批（这次一批 {_per} 个），"
+                      f"照这个速度还要约 {_hrs} 小时补完{RST}")
                 todo.append((f"{len(nodur)} 个条目没探到时长，"
                              f"它们看到一半退出会被当成看完、下次从头开始",
-                             "点「5 生成媒体库」会挨个补探一遍；"
-                             "补不上多半是当时网盘那条线在抖，再点一次"))
+                             f"【已经在自动补了】每小时一批、一批 {_per} 个，"
+                             f"约 {_hrs} 小时补完，不用管它。想快一点就点"
+                             "「5 生成媒体库」，它会另外在后台再补一批（最多 200 个）。"
+                             "补一个要从网盘拉一段文件头，所以有意压着速度 —— "
+                             "不限量实测一天能打掉 80 GB 流量"))
             elif slibs:
                 _hc("条目时长", "ok", "都有")
 
