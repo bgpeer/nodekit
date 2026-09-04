@@ -1029,9 +1029,14 @@ curl -fsSL "https://raw.githubusercontent.com/bgpeer/nodekit/$SHA/tools/xxx.sh" 
 去问，拿回来的就是 `openlist:5244`，302 给手机电视就是 `Name or service not known`，
 客户端上只有一句 `load fail`。整条链每一步都「成功」，只有最后那个地址是废的。
 
-脚本会自动把 OpenList 的「网站 URL」设成对外地址（装完、每次「`7 更新`」、以及每小时的
-对齐都对一遍），「`6 链路体检`」里也有这一项。这类盘的视频**会经过你的 VPS**，
-那是驱动本身决定的，改不掉。
+OpenList v4 **没有「网站 URL」这个设置**（v4.2.6 的设置里带 url 的只剩 `site_title` 和
+`qbittorrent_url`），改不了它。所以脚本从另一头改：让 **MediaWarp 用对外地址去问 OpenList**
+（`alist_strm.list[].addr`），OpenList 拼出来的自然就是对外地址 —— nginx 那边 `Host` 和
+`X-Forwarded-Proto` 都是原样透传的。「`7 更新`」会自动改好，**探不通就退回内网地址**
+（不然域名解析不了会让所有盘都换不到直链，比一个盘播不了严重得多）。
+「`6 链路体检`」里有 `MediaWarp→OpenList` 这一项。
+
+这类盘的视频**会经过你的 VPS**，那是驱动本身决定的，改不掉。
 
 ⚠️ **蓝光原盘目录（BDMV）不是一个文件**，strm 里只装得下一条指向**单个文件**的地址。
 Emby 一看见 `BDMV` 目录就把整个文件夹认成一个「蓝光原盘」条目（容器写 `Bluray`），
