@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.46"
+SCRIPT_VERSION = "1.5.47"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8292,6 +8292,148 @@ def link_method_storages(d):
     return out
 
 
+# x_storages 这张表上、跟"视频字节走哪条路"有关的列。它们【不在 addition 里】——
+# addition 是各驱动自己的字段，这几个是 OpenList 存储表自己的列，每个盘都有。
+STORAGE_COLS = ("web_proxy", "webdav_policy", "proxy_range", "down_proxy_url")
+
+
+def _truthy(v):
+    """sqlite 里的布尔值。gorm 存 0/1，但换个版本存 "true" 也不奇怪，都认。"""
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _storage_rows(d):
+    """读 OpenList 的存储表：[(id, 挂载点, 驱动, addition 字典, 表列字典)]。
+
+    【为什么要连表上的列一起读】"直链方式"有两个存放位置：驱动自己的开关在 addition 这个
+    JSON 里（夸克的 link_method、百度的 download_api……），而"视频字节过不过 VPS"是存储表
+    自己的列（web_proxy / webdav_policy），跟驱动无关、每个盘都有。只读 addition 的话后面
+    这一类永远看不见 —— 那正是"这个盘只有原画直链一种、什么都不能调"的由来。
+
+    【列名先问再取】OpenList 版本之间这几列会变。select 一个不存在的列是整条语句报错，
+    会把整屏功能连坐掉；先 pragma 问一遍，只取真的有的。
+    """
+    db = os.path.join(d, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return []
+    base = ["id", "mount_path", "driver", "addition"]
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        have = {r[1] for r in con.execute("pragma table_info(x_storages)")}
+        extra = [c for c in STORAGE_COLS if c in have and c not in base]
+        rows = con.execute("select " + ", ".join(base + extra) +
+                           " from x_storages order by mount_path").fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        try:
+            a = json.loads(r[3])
+        except Exception:
+            a = {}
+        out.append((r[0], r[1], r[2], a, dict(zip(extra, r[4:]))))
+    return out
+
+
+# 驱动自己的「直链方式」开关。一行一个字段：
+#   (键名, 屏上标题, ((值, 名字, 一句说明), ...))
+#
+# 【判断标准只有一条：这个键【已经在那个盘的 addition 里】】OpenList 每个驱动的字段各不
+# 相同，同一件事在夸克叫 link_method、在百度叫 download_api、PikPak 又是另一个名字。而
+# 写一个这个驱动没有的键进去，OpenList 会原样存着然后完全忽略 —— 屏上凭空多一个看着能用
+# 的开关，切完什么都没变，那比"没有这个开关"更坏。所以宁可少给，绝不给一个假的。
+#
+# 【也正因为如此，这张表可以放心地往下加】猜错的行不会显示（没有哪个盘的 addition 里有
+# 那个键），代价是零；猜对了就白捡一个开关。以后 OpenList 支持了新驱动、或者哪个驱动新
+# 加了字段，来这里加一行就行，别的地方一个字都不用改。
+LINK_SWITCHES = (
+    ("link_method", "画质",
+     (("download",  "原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
+                               "跨境线路上 4K 原盘经常拉不动"),
+      ("streaming", "转码流",   "网盘自己转码后的流，码率低一个量级，卡的时候选它；"
+                               "转码在网盘那边做，不吃本机 CPU"))),
+    ("download_api", "取直链的接口",
+     (("official",    "官方接口",   "网盘官方的下载接口，最稳；有的账号会被它限速"),
+      ("crack",       "非官方接口", "绕开官方那条，速度常常快一截；网盘一改就失效"),
+      ("crack_video", "非官方·视频", "同上，取的是视频那条地址"))),
+    ("use_transcoding_address", "画质",
+     ((False, "原画直链", "发原始文件的下载地址"),
+      (True,  "转码流",   "发网盘转码后的地址，码率低、卡的时候选它"))),
+)
+
+# 上面哪些是【画质】开关（"播出来是什么"），其余的是【通道】开关（"从哪儿取这条地址"）。
+# 分开是为了那一列的措辞：一个盘没有画质开关，它走的就是原画 —— 屏上得写「原画直链」，
+# 不能只写「开放平台接口」，那句话没回答"清晰度是什么"。
+QUALITY_KEYS = ("link_method", "use_transcoding_address")
+
+
+# 【这一项每个盘都有】上面那些是某些驱动特有的字段，这个不是 —— 它是存储表自己的列。
+# 它管的不是画质，是【视频的字节从哪儿走】：
+#   302 直链  播放器直接连网盘。不吃 VPS 带宽 —— 这套东西存在的理由就是这个
+#   本机代理  每个字节先到 VPS 再转给播放器，来回两份流量，还更慢
+#
+# 【那为什么还要留"本机代理"】有的网盘发的直链绑 IP、绑 UA、或者签名只对取它的那台机器
+# 有效，播放器自己去连就是 403 —— 这类盘不代理【根本播不了】。这不是理论：WebDAV 源和
+# 本地目录这两类驱动在网盘侧压根没有 CDN 直链，OpenList 只能回自己的地址。
+# 判断不用猜，跑 tools/dav-check.sh，每个盘现在实际走哪条一目了然。
+#
+# 两个字段一起写：web_proxy 管网页和 /d/ 那条（Emby 的 302 走这条），webdav_policy 管
+# /dav/ 那条（Infuse / VidHub 直连 OpenList 走这条）。只改一个的话，同一个盘在 Emby 里
+# 和在播放器里走的是两条不同的路，出了问题根本对不上。
+SOURCE_MODES = (
+    ("direct", "302 直链",
+     "视频从播放器直连网盘，不经过 VPS 带宽（默认；这套东西的意义就在这儿）",
+     {"web_proxy": 0, "webdav_policy": "302_redirect"}),
+    ("proxy", "本机代理",
+     "每个字节先过你的 VPS 再转给播放器：吃双份带宽、也更慢。"
+     "但直链绑 IP / 绑 UA 的盘只有这条路能播",
+     {"web_proxy": 1, "webdav_policy": "native_proxy"}),
+)
+
+
+def drive_links(d, mp, drv=""):
+    """这个盘在「直链方式」这一屏上能调的开关，按屏上顺序。
+
+    每一项：(键名, 放哪儿, 屏上标题, 选项表, 当前值)
+      放哪儿  "addition" 驱动自己的字段 / "column" 存储表的列 /
+              "source" 回源方式（一次写两列）/ "alipan" 要连令牌一起换
+      选项表  ((值, 名字, 一句说明), ...)
+
+    盘不在库里就返回空 —— 空和"没有可调的"是同一种处置，调用方不用分。
+    """
+    row = next((r for r in _storage_rows(d) if r[1] == mp), None)
+    if row is None:
+        return []
+    _sid, _mp, drv2, add, cols = row
+    out = []
+    for key, title, opts in LINK_SWITCHES:
+        if key not in add:
+            continue
+        cur = add.get(key)
+        if all(cur != v for v, _n, _w in opts):
+            # 【收录之外的取值也要显示出来】显示成"未知"等于把人蒙在鼓里，
+            # 而且他一旦切走就再也切不回来了
+            opts = tuple(opts) + ((cur, f"保持原样（{cur}）",
+                                   "这套脚本没收录的取值，原样保留"),)
+        out.append((key, "addition", title, tuple(opts), cur))
+    if str(drv2 or drv or "").lower() == "aliyundriveopen":
+        # 阿里的通道不能在这里直接写：类型和令牌必须一起换，见 _alipan_channel_menu
+        out.append(("alipan_type", "alipan", "接口通道",
+                    tuple((k, n, w) for k, (n, w, _p) in ALIPAN_TYPES.items()),
+                    str(add.get("alipan_type") or "default")))
+    if any(k in cols for k in ("web_proxy", "webdav_policy")):
+        out.append(("__source__", "source", "回源方式",
+                    tuple((k, n, w) for k, n, w, _u in SOURCE_MODES),
+                    "proxy" if _truthy(cols.get("web_proxy")) else "direct"))
+    return out
+
+
+def _opt_name(opts, cur):
+    """选项表里 cur 对应的显示名。认不出来就把值本身摆出来。"""
+    return next((n for v, n, _w in opts if v == cur), str(cur))
+
+
 # OpenList 每个存储的目录缓存时长（分钟）。默认 30。
 #
 # 【为什么这个值值得单独摆出来调】实测过一台机器：同一条网盘路径，第一次列目录 12.7 秒，
@@ -8920,21 +9062,30 @@ def toggle_metatube():
 
 
 
-def _write_link_method(d, stores, target):
-    """把这些存储的 link_method 写成 target。"""
-    _write_addition(d, [(sid, mp) for sid, mp, _drv, _cur in stores],
-                    {"link_method": target})
-
-
 def _write_addition(d, targets, updates, quiet_keys=()):
-    """把 updates 合进这些存储的 addition，然后重启 OpenList 和 MediaWarp。
+    """把 updates 合进这些存储的 addition。薄封装，见 _write_storage。"""
+    _write_storage(d, targets, addition=updates, quiet_keys=quiet_keys)
+
+
+def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
+    """改这些存储，然后重启 OpenList 和 MediaWarp。
 
     targets 是 [(存储 id, 挂载点)]。这段（停容器、备份、写、还原、重启顺序）每一步都是踩
-    出来的，所有要动 addition 的入口都走这里，不能各抄一份。
+    出来的，所有要动存储的入口都走这里，不能各抄一份。
+
+    addition 合进 addition 那个 JSON（驱动自己的字段）；columns 直接写表上的列
+    （web_proxy / webdav_policy 这类每个盘都有的开关）。两者可以一起给。
+
+    【列要先问再写】表上没有的列直接 update 是整条语句报错 —— 而那时候容器已经停了、
+    库已经动过一半，比一开始就不写危险得多。写之前 pragma 问一遍，只写真的有的。
 
     quiet_keys 里的键【新旧两个值都不打】，只报"已更新"—— 旧值也是一串还在有效期内的
     刷新令牌，而这一屏正是用户会截图发出来的。换令牌这件事，前后两个都是秘密。
     """
+    addition = dict(addition or {})
+    columns = dict(columns or {})
+    if not addition and not columns:
+        return
     # OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停，避免锁冲突
     info("停止 OpenList...")
     subprocess.run(["docker", "stop", "openlist"], capture_output=True, timeout=120)
@@ -8944,18 +9095,31 @@ def _write_addition(d, targets, updates, quiet_keys=()):
     try:
         shutil.copy2(db, bak)
         con = sqlite3.connect(db)
+        have = {r[1] for r in con.execute("pragma table_info(x_storages)")}
+        cols = {k: v for k, v in columns.items() if k in have}
+        for k in columns:
+            if k not in have:
+                print(f"  {DIM}这个 OpenList 版本的存储表没有 {k} 这一列，跳过{RST}")
         for sid, mp in targets:
             row = con.execute("select addition from x_storages where id=?", (sid,)).fetchone()
             a = json.loads(row[0])
             shown = []
-            for k, v in updates.items():
+            for k, v in addition.items():
                 if k in quiet_keys:
                     shown.append(f"{k}: {'（原来的）' if a.get(k) else '空'} → （已更新）")
                 else:
-                    shown.append(f"{k}: {a.get(k) or '空'} → {v}")
+                    shown.append(f"{k}: {a.get(k) if a.get(k) not in (None, '') else '空'} → {v}")
                 a[k] = v
-            con.execute("update x_storages set addition=? where id=?",
-                        (json.dumps(a, ensure_ascii=False), sid))
+            sets, vals = [], []
+            if addition:
+                sets.append("addition=?")
+                vals.append(json.dumps(a, ensure_ascii=False))
+            for k, v in cols.items():
+                sets.append(f"{k}=?")
+                vals.append(v)
+                shown.append(f"{k} → {v}")
+            con.execute(f"update x_storages set {', '.join(sets)} where id=?",
+                        (*vals, sid))
             ok(f"{mp}  " + "　".join(shown))
         con.commit()
         con.close()
@@ -9043,8 +9207,75 @@ def _apply_scan_paths(d, why=""):
     return paths
 
 
+def _pick_dirs(mp):
+    """在这个盘里挑扫描路径。返回挑中的路径（空 = 取消）。
+
+    【一个盘挂多少条路径都行】上层是 scan_spec 那个列表，加进去就是追加一条，删也是按条
+    删 —— 一直都支持。真正卡住的是【挑不到】：上一版只列挂载点【下面一层】，而截图里那个
+    盘是 /七米蓝影视/mov/电影/A、/B、/C…… 按字母分的，想扫到字母那一层只能选「m 手打」
+    把整条路径敲进去 —— 在手机 ssh 上手打长中文路径，正是当初做这个菜单要避免的事。
+    改成能一层一层往下走。
+
+    【单个编号 = 进去看看，多个编号 = 就选它们】这条规矩不用解释也猜得到，而且两件事都
+    做得到：想选中你正站着的这一层，按 . 就行。全要就按 *（十几个字母目录一个个点太蠢）。
+    """
+    root = mp.rstrip("/")
+    cur = root
+    while True:
+        print(f"\n  {DIM}正在列 {cur} 下面的目录...{RST}")
+        subs = _ol_subdirs(cur)
+        print(f"  {BOLD}{cur}{RST}")
+        for j, name in enumerate(subs, 1):
+            print(f"    {j:>2}. {name}")
+        if not subs:
+            print(f"    {DIM}（这一层底下没有目录了）{RST}")
+        tips = ["单个编号 进去看看", "多个编号（逗号隔开）就选它们",
+                ". 就选整个盘" if cur == root else ". 就选当前这层"]
+        if subs:
+            tips.append("* 当前这层全部")
+        if cur != root:
+            tips.append("u 上一层")
+        tips += ["m 手打路径", "回车取消"]
+        print(f"  {DIM}{'　'.join(tips)}{RST}")
+        pick = ask("要扫哪个").strip().lower()
+        if not pick:
+            return []
+        if pick == "u":
+            cur = cur.rsplit("/", 1)[0]
+            if len(cur) < len(root):
+                cur = root
+            continue
+        if pick in (".", "a"):      # a 是上一版「整个盘」的键，留着不为难老用户
+            return [cur]
+        if pick == "*":
+            if not subs:
+                print("这一层底下没有目录。")
+                continue
+            return [f"{cur}/{n}" for n in subs]
+        if pick == "m":
+            raw = ask(f"路径（以 {mp} 开头）").strip().rstrip("/")
+            if not raw:
+                return []
+            if not raw.startswith(root + "/") and raw != root:
+                warn(f"这条不在 {mp} 底下，没有加。")
+                return []
+            return [raw]
+        toks = [t.strip() for t in pick.replace("，", ",").split(",") if t.strip()]
+        nums = [int(t) for t in toks
+                if t.isdigit() and subs and 1 <= int(t) <= len(subs)]
+        # 【认不出来就整条不算】一串编号里有一个越界就照样加剩下的，等于悄悄少加一条，
+        # 而屏上写的是"已应用"—— 要么全对要么重来
+        if not nums or len(nums) != len(toks):
+            print("没认出有效的编号。")
+            continue
+        if len(nums) == 1:
+            cur = f"{cur}/{subs[nums[0] - 1]}"      # 单个 = 往下走一层
+            continue
+        return [f"{cur}/{subs[n - 1]}" for n in nums]
+
+
 def _drive_paths_menu(d, mp):
-    """一个盘的「路径」子菜单：加 / 换 / 删。"""
+    """一个盘的「路径」子菜单：加 / 换 / 删。一个盘想挂几条挂几条。"""
     while True:
         exp = explicit_scan_paths()
         mine = _paths_under(exp, mp)
@@ -9066,45 +9297,27 @@ def _drive_paths_menu(d, mp):
             if not mine:
                 print("没有可删的。")
                 continue
-            t = ask("删第几条？（回车取消）").strip()
-            if not (t.isdigit() and 1 <= int(t) <= len(mine)):
-                print("没有改动。")
-                continue
-            gone = mine[int(t) - 1]
-            save_ms_state(scan_spec=[p for p in exp if p != gone])
-            _apply_scan_paths(d, f"删掉 {gone}，")
+            # 挂了十几条（按字母分类的那种）时，一条一条删要重进十几次这一屏
+            t = ask("删第几条？（逗号隔开多条，* 全删，回车取消）").strip()
+            if t == "*":
+                gone = list(mine)
+            else:
+                toks = [x.strip() for x in t.replace("，", ",").split(",") if x.strip()]
+                nums = [int(x) for x in toks
+                        if x.isdigit() and 1 <= int(x) <= len(mine)]
+                if not nums or len(nums) != len(toks):
+                    print("没有改动。")
+                    continue
+                gone = [mine[n - 1] for n in sorted(set(nums))]
+            save_ms_state(scan_spec=[p for p in exp if p not in gone])
+            _apply_scan_paths(d, f"删掉 {'、'.join(gone)}，")
             continue
         if c != "a":
             print("无效选择。")
             continue
 
-        # 添加：把这个盘下面的目录列出来点编号，别逼人在手机上手打长路径
-        print(f"\n  {DIM}正在列 {mp} 下面的目录...{RST}")
-        subs = _ol_subdirs(mp)
-        for j, name in enumerate(subs, 1):
-            print(f"    {j:>2}. {name}")
-        print(f"  {DIM}编号（逗号隔开多个）　a 整个盘　m 手打路径　回车取消{RST}")
-        pick = ask("要扫哪个").strip().lower()
-        if not pick:
-            continue
-        got = []
-        if pick == "a":
-            got = [mp.rstrip("/")]
-        elif pick == "m":
-            raw = ask(f"路径（以 {mp} 开头）").strip().rstrip("/")
-            if not raw:
-                continue
-            if not raw.startswith(mp.rstrip("/") + "/") and raw != mp.rstrip("/"):
-                warn(f"这条不在 {mp} 底下，没有加。")
-                continue
-            got = [raw]
-        else:
-            for tok in pick.replace("，", ",").split(","):
-                tok = tok.strip()
-                if tok.isdigit() and subs and 1 <= int(tok) <= len(subs):
-                    got.append(f"{mp.rstrip('/')}/{subs[int(tok) - 1]}")
+        got = [p for p in _pick_dirs(mp) if p]
         if not got:
-            print("没认出有效的编号，没有改动。")
             continue
         bare = [p for p in got if p.strip("/").count("/") == 0]
         if bare:
@@ -9178,24 +9391,28 @@ ALIPAN_TYPES = {
 
 
 def drive_channel(d, mp, drv):
-    """这个盘的「直链走哪条路」：(当前值显示名, 能不能在这里切)。
+    """这个盘的「直链走哪条路」：(一句话, 能不能在这里切)。
 
     【别把"没有 link_method"说成"这个盘没有直链方式"】阿里当然有 302 直链，MediaWarp 照样
     把播放器重定向到 dl1-v6.aliyundrive.cloud。没有的只是"原画/转码流"这个【选择】：那是
     夸克/UC 的 TV 驱动特有的字段。说"没有开关"和说"没有直链"，差得远。
+
+    而且【每个盘至少还有"回源方式"能调】（走 302 还是本机代理，见 SOURCE_MODES）——
+    以前这一屏对着 115、WebDAV 这类盘只会写一句"只有这一种"，用户看到的就是
+    "这个盘什么都不能做"，可它明明有一个决定能不能播的开关。
+
+    【正常状态不占屏，反常状态必须显眼】回源方式是 302 时一个字都不写（默认，人人如此）；
+    切成本机代理才挂到后面 —— 那是会吃双份带宽的状态，不该藏在子菜单里才看得见。
     """
-    dl = str(drv or "").lower()
-    lm = [x for x in link_method_storages(d) if x[1] == mp]
-    if lm:
-        cur = lm[0][3]
-        return LINK_METHODS.get(cur, (cur or "未知",))[0], True
-    if dl == "aliyundriveopen":
-        cur = ""
-        for m2, _drv2, _st, _root, mode in openlist_storages(d):
-            if m2 == mp:
-                cur = mode or "default"
-        return f"原画直链 · {ALIPAN_TYPES.get(cur, (cur,))[0]}", True
-    return "原画直链", False
+    sw = drive_links(d, mp, drv)
+    if not sw:
+        return "原画直链", False
+    names = [_opt_name(o, c) for k, _w, _t, o, c in sw if k in QUALITY_KEYS] or ["原画直链"]
+    names += [_opt_name(o, c) for k, w, _t, o, c in sw
+              if k not in QUALITY_KEYS and w != "source"]
+    names += [_opt_name(o, c) for _k, w, _t, o, c in sw
+              if w == "source" and c != "direct"]
+    return " · ".join(names), True
 
 
 def _jwt_field(tok, name):
@@ -9339,60 +9556,119 @@ def _ali_storages(d):
 
 
 def _link_method_menu(d, mounts, who):
-    """直链方式 / 接口通道。按驱动给它真正有的那个开关。
+    """直链方式。mounts 是要看的挂载点，who 只用于打印。
 
-    mounts 是要一起改的挂载点；who 只用于打印。单盘传一个，
-    「剩余网盘」传它管的那一批 —— 两边共用这一段，免得同一个开关有两套行为。
+    单盘传一个，「剩余网盘」传它管的那一批 —— 两边共用这一段，免得同一个开关有两套行为。
+
+    【一批盘不再合并成一个开关】原来的做法是：这批里凡是有 link_method 的盘一起切，其余
+    的盘【一个字都不提】。混着夸克、阿里、115、WebDAV 的时候，屏上只看得见夸克那一个开关，
+    另外三个盘等于不存在；而它们各有各的开关（阿里的接口通道、每个盘都有的回源方式）。
+    用户的原话是「这个里面可能混合各种各样的网盘而且连接方式也应该有很多不同」。
+    改成先把这批盘各自现在是什么、能调几项列出来，再进某一个盘去改。
+
+    【也不再一起写】不同驱动的字段本来就不一样，"一起切"这件事只在它们碰巧同驱动时成立。
     """
-    stores = [x for x in link_method_storages(d) if x[1] in mounts]
-    if stores:
-        curs = {c for _s, _m, _d, c in stores}
-        print()
-        for _sid, mp2, drv2, cur2 in stores:
-            print(f"  {DIM}{mp2}（{driver_cn(drv2)}）当前：{RST}"
-                  f"{CYAN}{LINK_METHODS.get(cur2, (cur2 or '未知',))[0]}{RST}")
-        print()
-        for k, (name, why) in LINK_METHODS.items():
-            print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}：{why}")
-        print()
-        if len(curs) == 1:
-            cur = stores[0][3]
-            target = "streaming" if cur == "download" else "download"
-            if not ask_yn(f"切换成「{LINK_METHODS[target][0]}」？", True):
-                print("没有改动。")
-                return
-        else:
-            print("  1. 原画直链（download）")
-            print("  2. 转码流（streaming）")
-            c = ask("要切换成哪个？（回车取消）").strip()
-            target = {"1": "download", "2": "streaming"}.get(c, "")
-            if not target:
-                print("没有改动。")
-                return
-        _write_link_method(d, stores, target)
+    ms = [m for m in mounts if m]
+    if not ms:
+        print(f"\n  {who} 底下没有盘。")
         return
+    if len(ms) == 1:
+        _one_drive_link_menu(d, ms[0])
+        return
+    while True:
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{who}{RST} 的直链方式")
+        print("-" * 60)
+        for i, m in enumerate(ms, 1):
+            ch, _sw = drive_channel(d, m, "")
+            n = len(drive_links(d, m))
+            print(f"  {i:>2}. {pad(m, 24)}{CYAN}{ch}{RST}"
+                  + (f"  {DIM}{n} 项可调{RST}" if n else f"  {DIM}没有可调的{RST}"))
+        print("   0. 返回")
+        print("-" * 60)
+        c = ask("改哪个盘").strip()
+        if c in ("0", "", "q"):
+            return
+        if not (c.isdigit() and 1 <= int(c) <= len(ms)):
+            print("无效选择。")
+            continue
+        _one_drive_link_menu(d, ms[int(c) - 1])
 
-    # 没有 link_method 的盘：阿里有它自己的通道开关，别的就是只有原画一种
-    ali = [x for x in _ali_storages(d) if x[1] in mounts]
-    if len(ali) == 1:
-        _alipan_channel_menu(d, ali[0][1])
-        return
-    if len(ali) > 1:
+
+def _one_drive_link_menu(d, mp):
+    """一个盘的直链方式：把它【真的有】的开关列出来，选一项改。
+
+    开关表是 drive_links() 给的，这里只管画屏和写库 —— 加一种新开关不用碰这个函数。
+    """
+    while True:
+        sw = drive_links(d, mp)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{mp}{RST} 的直链方式")
+        print("-" * 60)
+        if not sw:
+            print(f"  {DIM}读不到这个盘的存储记录（OpenList 的库里没有它）。{RST}")
+            ask("按回车返回...")
+            return
+        for i, (_k, _w, title, opts, cur) in enumerate(sw, 1):
+            print(f"  {i:>2}. {pad(title, 20)}当前：{CYAN}{_opt_name(opts, cur)}{RST}")
+        print("   0. 返回")
+        print("-" * 60)
+        c = ask("改哪一项").strip()
+        if c in ("0", "", "q"):
+            return
+        if not (c.isdigit() and 1 <= int(c) <= len(sw)):
+            print("无效选择。")
+            continue
+        key, where, _title, opts, cur = sw[int(c) - 1]
+        if where == "alipan":
+            # 类型和令牌必须一起换，那一屏有它自己的一整套拦截，不能在这里直接写
+            _alipan_channel_menu(d, mp)
+            continue
         print()
-        print(f"  {DIM}这批里有 {len(ali)} 个阿里盘，接口通道要一个一个换"
-              f"（每个盘的令牌不一样）：{'、'.join(x[1] for x in ali)}{RST}")
-        return
-    print()
-    print(f"  {who} 只有{BOLD}原画直链{RST}一种"
-          f"{DIM}（302 照常生效；「转码流」是夸克 / UC 的 TV 驱动才有的）{RST}")
+        for v, name, why in opts:
+            star = f"  {GREEN}← 现在{RST}" if v == cur else ""
+            print(f"  {DIM}·{RST} {BOLD}{name}{RST}{star}")
+            print(f"      {DIM}{why}{RST}")
+        print()
+        for j, (_v, name, _w) in enumerate(opts, 1):
+            print(f"  {j}. 换成「{name}」")
+        print("  0. 返回")
+        t = ask("请选择").strip()
+        if not (t.isdigit() and 1 <= int(t) <= len(opts)):
+            print("没有改动。")
+            continue
+        val = opts[int(t) - 1][0]
+        if val == cur:
+            print("本来就是这个，没有改动。")
+            continue
+        sid = next((r[0] for r in _storage_rows(d) if r[1] == mp), None)
+        if sid is None:
+            warn(f"读不到 {mp} 的存储记录。")
+            continue
+        if where == "source":
+            if val == "proxy":
+                warn("本机代理：视频的每个字节都要经过你的 VPS，来回两份流量。")
+                if not ask_yn("确定换成本机代理？", False):
+                    print("没有改动。")
+                    continue
+            _write_storage(d, [(sid, mp)],
+                           columns=next(u for k, _n, _w, u in SOURCE_MODES if k == val))
+        else:
+            _write_storage(d, [(sid, mp)], addition={key: val})
 
 
 def _scan_of(mp):
-    """这个盘现在扫什么，一句话。给菜单那一列用。"""
+    """这个盘现在扫什么，一句话。给菜单那一列用。
+
+    【多了就不全列】一个盘挂十几条路径是正常用法（按字母分类的盘），全列出来会把外层
+    那一屏撑成一坨 —— 那一屏是一行一个盘。要看全部就进这个盘的「1 扫描路径」。
+    """
     mine = _paths_under(explicit_scan_paths(), mp)
-    if mine:
+    if not mine:
+        return "整个盘（自动）" if auto_rest_on() else "未加路径"
+    if len(mine) <= 2:
         return "、".join(mine)
-    return "整个盘（自动）" if auto_rest_on() else "未加路径"
+    return f"{len(mine)} 条：{mine[0]} …"
 
 
 def _drive_menu(d, mp, drv):
@@ -9405,8 +9681,9 @@ def _drive_menu(d, mp, drv):
         print(f"  {BOLD}{driver_cn(drv)}{RST}   {CYAN}{_scan_of(mp)}{RST}")
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
+        n = len(drive_links(d, mp, drv)) if switchable else 0
         print(f"  2. 直链方式          当前：{CYAN}{ch}{RST}"
-              + ("" if switchable else f"{DIM}（只有这一种）{RST}"))
+              + (f"  {DIM}{n} 项可调{RST}" if n else f"  {DIM}（只有这一种）{RST}"))
         print(f"  3. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
         has115 = "115" in str(drv)
         if has115:
@@ -9436,14 +9713,13 @@ def _rest_menu(d):
         rest = [mp for mp, _drv, _st, _r, _m in openlist_storages(d)
                 if mp and mp != "/" and not _paths_under(exp, mp)]
         on = auto_rest_on()
-        lm = [x for x in link_method_storages(d) if x[1] in rest]
-        ali = [x for x in _ali_storages(d) if x[1] in rest]
-        if lm:
-            ch = LINK_METHODS.get(lm[0][3], (lm[0][3],))[0]
-        elif ali:
-            ch = "原画直链 · 接口通道"
-        else:
-            ch = "原画直链"
+        # 【这一行只是概览，别替它们编一个统一答案】剩余组里可能混着夸克、阿里、115、
+        # WebDAV，各有各的开关。以前这里拿组里第一个有 link_method 的盘的值当整组的值，
+        # 屏上写「原画直链」而组里另外三个盘根本没有这个字段 —— 那是个假的统一。
+        chs = [drive_channel(d, m, "")[0] for m in rest]
+        uniq = sorted(set(chs))
+        ch = uniq[0] if len(uniq) == 1 else (f"各盘不同（{len(rest)} 个盘）"
+                                             if rest else "没有剩余的盘")
         print("\n" + "=" * 60)
         print(f"  {BOLD}♻ 剩余网盘（自动）{RST}   "
               + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}")
