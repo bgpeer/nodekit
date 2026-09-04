@@ -14,7 +14,7 @@
 #   ③ 拉 1 MiB     慢 = 地址拿到了但拉不动，那是限速/线路
 set -u
 
-TOOL_VER="2026-09-02a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"
@@ -27,7 +27,21 @@ OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head
 
 export OL_PATH="$P" OL_PW="$OLPW"
 python3 - <<'PY'
-import json, os, re, subprocess, time, urllib.error, urllib.request
+import json, os, re, subprocess, time, urllib.error, urllib.parse, urllib.request
+
+
+def safe_url(u):
+    """把地址里的非 ASCII 字符转义掉，不然 urllib 直接 UnicodeEncodeError。
+
+    【为什么以前没暴露】夸克、阿里那种 CDN 直链本来就是转义好的，一路都对。而
+    【代理型存储】（WebDAV、本地盘）返回的是 OpenList 自己的 /d/ 地址 —— 路径里
+    原样带着中文。于是恰恰是最需要量一量的那类盘，第三步张口就报 UnicodeEncodeError，
+    连"能不能拉"都没测到。safe 里留着 % ，避免把已经转义过的再转一遍。
+    """
+    p = urllib.parse.urlsplit(u)
+    return urllib.parse.urlunsplit((p.scheme, p.netloc,
+                                    urllib.parse.quote(p.path, safe="/%"),
+                                    p.query, p.fragment))
 
 BASE = "http://127.0.0.1:5244"
 G="\033[32m"; Y="\033[33m"; R="\033[31m"; C="\033[36m"; D="\033[2m"; B="\033[1m"; X="\033[0m"
@@ -243,18 +257,32 @@ except Exception as e:
 # ---- ③ 真的拉一段，确认这条地址能不能出数据 ----
 if raw.startswith("http"):
     N = 1 << 20
-    req = urllib.request.Request(raw, headers={"User-Agent": "Mozilla/5.0",
-                                               "Range": f"bytes=0-{N - 1}"})
+    req = urllib.request.Request(safe_url(raw),
+                                 headers={"User-Agent": "Mozilla/5.0",
+                                          "Range": f"bytes=0-{N - 1}"})
     try:
         t0 = time.monotonic()
         with urllib.request.urlopen(req, timeout=60) as resp:
             got = len(resp.read(N))
+            code = resp.status
         t = time.monotonic() - t0
         mbps = got * 8 / t / 1e6 if t > 0 else 0
         c = G if mbps >= 8 else (Y if mbps >= 3 else R)
         print(f"  ③ 拉 1 MiB    {c}{t:6.1f} 秒{X}  {got / 1024:.0f} KB  "
               f"{c}{mbps:.1f} Mbps{X}"
               f"{D}（{got / t / 1024:.0f} KB/s）{X}")
+        # 【206 还是 200，决定了能不能拖进度条】我们发的是 Range 请求：
+        #   206 Partial Content = 对方认 Range，播放器想从哪儿开始就从哪儿开始
+        #   200 OK              = 不认，整个文件从头发。播放器要跳到 30 分钟处，
+        #                         只能把前 30 分钟全下下来 —— 表现就是"进度条拉不动、
+        #                         只能从头看"，而且流量白烧一遍
+        # 这一条对【代理型存储】（WebDAV、本地盘这些没有 CDN 直链的）尤其要紧：
+        # 那条路上 OpenList 要把 Range 透传给上游，上游还得自己支持，缺一环都不行。
+        if code == 206:
+            print(f"  {D}   └ 断点续传  {G}支持{X}{D}（206）—— 进度条能拖{X}")
+        else:
+            print(f"  {D}   └ 断点续传  {R}不支持{X}{D}（HTTP {code}，我们要的是 206）"
+                  f" —— 进度条拉不动，跳转只能从头下{X}")
     except urllib.error.HTTPError as e:
         print(f"  ③ 拉 1 MiB    {R}HTTP {e.code}{X}  地址拿到了，网盘拒绝下载")
     except Exception as e:
