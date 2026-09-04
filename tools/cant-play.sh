@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04k"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04l"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -202,10 +202,18 @@ if _v or _auds:
         print(f"  {D}解不了时 Emby 会要求转码，而这套东西不能转码（文件在网盘上，"
               f"本机没有它）。表现就是点开直接 load fail，而且【MediaWarp 日志里"
               f"一条请求都没有】—— 客户端连 /stream 都不会去要。{X}")
-        print(f"  {D}判断办法：拿 Emby 网页版播一次。网页版能播 = 服务器这边没问题，"
-              f"是你那个客户端解不了；网页版也不行 = 再往下看后面几段。{X}")
-        print(f"  {D}真解不了的话只有两条路：换能解的播放器（Infuse / VidHub / "
-              f"支持 HEVC 10bit + TrueHD 的电视盒子），或者换一个压制版的片源。{X}")
+        print(f"  {B}一句话自查：去 OpenList 挂载页面播这个文件{X}")
+        print(f"  {D}【有画面、没声音】= 音轨解不了，那就是它了 —— 挂载页面用的是"
+              f"浏览器的解码器，浏览器只认 AAC/MP3/Opus/FLAC，TrueHD / DTS 一概不认。{X}")
+        print(f"  {D}Emby 撞的是同一堵墙，只是更早：客户端说解不了这条音轨 → Emby 说"
+              f"那我转音轨 → 而这套东西【连音轨都转不了】（文件在网盘上，服务器手里"
+              f"没有它）→ 客户端拿不到可播的源 → 瞬间 load fail，连 /stream 都不去要，"
+              f"所以 MediaWarp 日志里一条记录都没有。{X}")
+        print(f"  {D}画面声音都正常 = 不是编码问题，往后面几段看。{X}")
+        print(f"  {D}真解不了的话只有两条路，都不在服务器这头：{X}")
+        print(f"  {D}  · 换能解的播放器 —— Infuse / VidHub / Kodi / 电视盒子，"
+              f"它们自带 TrueHD、DTS、HEVC 10bit 的解码{X}")
+        print(f"  {D}  · 换片源 —— 音轨是 AAC 或 AC3 的压制版，什么都能放{X}")
 
 # 【判"原盘"要有真凭据】容器写着 bluray/iso，或者路径就在 BDMV/CERTIFICATE 里面 ——
 # 二者必居其一。上一版还把"大小 0B 且时长 0"也算进来，那是错的：那个组合最常见的
