@@ -17,7 +17,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04e"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04f"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -269,10 +269,53 @@ else:
     else:
         msg = str(r.get("message") or "")
         print(f"  {R}✖ OpenList 不认这条路径{X}  {D}{safe(msg)[:120]}{X}")
-        if "object not found" in msg.lower():
-            print(f"  {D}网盘里这个文件被删了或改名了。点「5 生成媒体库」重建。{X}")
-        elif "storage not found" in msg.lower():
+        if "storage not found" in msg.lower():
             print(f"  {D}这个存储掉线了。去 OpenList 网页看它的状态。{X}")
+            raise SystemExit
+        if "object not found" not in msg.lower():
+            raise SystemExit
+        # 【"找不到"有两种，处置相反，不能都说成"文件被删了"】
+        #   · 上游真的删了 / 改名了      → 点「5 生成媒体库」重建，本地那条 strm 是废的
+        #   · 这一轮列目录没列全 / 撞限流 → 文件好好的，过一会儿自己就好；重建反而会把
+        #                                  一批还活着的 strm 当成失效删掉
+        # 两者当场就能分开：去列它的父目录（带 refresh，绕开缓存），看那个名字在不在。
+        # 实测撞到过：同一个文件，六分钟前挂载页面还播得动，这里却报 object not found。
+        want = os.path.basename(body)
+        parent = os.path.dirname(body)
+        print(f"  {D}再去列一次它的父目录（带 refresh，绕开缓存）看名字在不在...{X}")
+        try:
+            req = urllib.request.Request(
+                f"{OL}/api/fs/list",
+                data=json.dumps({"path": parent, "password": "", "page": 1,
+                                 "per_page": 0, "refresh": True}).encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": tok}, method="POST")
+            rl = json.load(urllib.request.urlopen(req, timeout=180))
+        except Exception as e:
+            rl = {"code": -1, "message": str(e)}
+        if rl.get("code") != 200:
+            print(f"  {Y}父目录也列不出来{X}  {D}{safe(rl.get('message'))[:100]}{X}")
+            print(f"  {D}这不是「文件没了」，是【这个源现在列不动】—— 上游那台 WebDAV "
+                  f"在抖或者在限流。别急着点「5 生成媒体库」：那一步会把列不到的"
+                  f"当成还在（三态判据），但也修不好这个，等它缓过来再说。{X}")
+        else:
+            names = [str(x.get("name") or "")
+                     for x in ((rl.get("data") or {}).get("content") or [])]
+            if want in names:
+                print(f"  {Y}父目录里【有】这个名字，可 fs/get 却说找不到{X}")
+                print(f"  {D}是刚才那一下的偶发（缓存里存了一份不完整的列表，或者 "
+                      f"上游那一瞬抖了）。文件是好的，隔几分钟再跑一次这个脚本。{X}")
+                print(f"  {D}它也解释了「挂载里能播、Emby 里不行」—— 两次请求赶上的"
+                      f"运气不一样，而不是哪个配置错了。{X}")
+            elif not names:
+                print(f"  {Y}父目录列出来是空的{X}  {D}0 个条目 —— 上游这一轮什么都没给，"
+                      f"多半是限流。不是文件被删了。{X}")
+            else:
+                print(f"  {R}父目录里确实没有这个名字{X}  {D}上游删了或改名了{X}")
+                near = [n for n in names if n[:8] == want[:8]][:3]
+                print(f"  {D}那一层现在有 {len(names)} 个条目"
+                      + (f"，名字接近的：{'、'.join(near)}" if near else "") + f"{X}")
+                print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，本地那条 strm 会被清掉{X}")
         raise SystemExit
 
 # ================= ④ MediaWarp 换不换直链 =================
