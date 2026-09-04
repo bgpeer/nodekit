@@ -16,7 +16,7 @@
 # 路径从接口里取，不用手打中文 —— 裸 curl 打中文路径要自己转义，上一版就是这么 404 的。
 set -u
 
-TOOL_VER="2026-09-04a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -74,28 +74,31 @@ if only:
         raise SystemExit(1)
 
 
-def find_video(root, depth=6):
-    """从挂载点往下钻，找到第一个视频文件。找不到返回 ""。
+def find_video(root, budget=25):
+    """在这个盘里找一个视频文件来试。找不到返回 ""。
 
-    【不带 refresh】这里只是要一个能拿来试的文件名，读缓存足够；带 refresh 会去打
-    那个本来就被限流的列目录接口，为了做个检测反而把线路搞得更堵。
+    【不能每层只钻第一个文件夹】上一版就是那么写的，一头扎进一条没有视频的岔路
+    （「文档」「图片」这种）就到底了，回头也不回，然后报"没找到视频文件"——
+    而那个盘里明明有片子。等于那个盘根本没测到，输出还写得像结论。
+    改成广度优先，一层层铺开找，用满 budget 次列目录为止（大盘不至于没完没了地钻）。
+
+    【不带 refresh】只是要一个能拿来试的文件名，读缓存足够。带 refresh 等于为了做个
+    检测，反而去打那个本来就被限流的列目录接口。
     """
-    path = root
-    for _ in range(depth):
+    queue, used = [root], 0
+    while queue and used < budget:
+        path = queue.pop(0)
+        used += 1
         try:
             d = api("/api/fs/list", {"path": path, "password": "", "page": 1,
                                      "per_page": 100, "refresh": False}, tok).get("data") or {}
         except Exception:
-            return ""
+            continue
         items = d.get("content") or []
-        vids = [i for i in items
-                if not i.get("is_dir") and str(i.get("name", "")).lower().endswith(VIDEO)]
-        if vids:
-            return path.rstrip("/") + "/" + vids[0]["name"]
-        dirs = [i for i in items if i.get("is_dir")]
-        if not dirs:
-            return ""
-        path = path.rstrip("/") + "/" + dirs[0]["name"]
+        for i in items:
+            if not i.get("is_dir") and str(i.get("name", "")).lower().endswith(VIDEO):
+                return path.rstrip("/") + "/" + i["name"]
+        queue += [path.rstrip("/") + "/" + i["name"] for i in items if i.get("is_dir")]
     return ""
 
 
@@ -107,7 +110,7 @@ print("=" * 62)
 for mp in mounts:
     f = find_video(mp)
     if not f:
-        print(f"  {mp:<16}{Y}没找到视频文件{X}  {D}（空盘，或者列目录没通）{X}")
+        print(f"  {mp:<16}{Y}没找到视频文件{X}  {D}（找了 25 个目录都没有，或者列目录没通）{X}")
         continue
     # WebDAV 的地址要按 URL 转义 —— 中文原样塞进去 urllib 直接 UnicodeEncodeError
     url = BASE + "/dav" + urllib.parse.quote(f, safe="/")
