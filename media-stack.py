@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.47"
+SCRIPT_VERSION = "1.5.48"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9173,21 +9173,32 @@ def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
 
 
 def _ol_subdirs(path, token=None):
-    """列出这个路径下的子目录名。取不到返回 []。
+    """列出这个路径下的子目录名。返回 (名字列表, 没列成的原因)。
 
     给「挂载路径」那一屏挑目录用 —— 在 ssh 里手打 /quark/夸克挂载/电影 又长又
     容易错，列出来点编号才是能用的交互。
+
+    【必须三态，不能两态】"没有子目录"有两个截然不同的原因，处置也相反：
+      · 这一层底下真的只有文件  → 正常，按 . 选中它就行
+      · 列目录根本没通          → 那才是故障，而且往往就是要查的那件事
+    上一版两种都返回 []，屏上只有一行光秃秃的提示语 —— 用户看到的是"这个盘什么都没有"，
+    而实际上是【没登录】：这里调 fs/list 一直没带令牌，OpenList 的游客默认是关的，
+    它回的是 Guest user is disabled。整整一屏都是这么来的，还一个字都不解释。
+
+    【没给令牌就自己去登】列目录这条接口认令牌，而这一屏的调用方手里未必有。
     """
+    if token is None:
+        token = _ol_token(ms_install_dir())
     try:
         r = _ol_api("/api/fs/list", {"path": path, "password": "", "page": 1,
                                      "per_page": 0, "refresh": False},
                     token, timeout=60)
-    except Exception:
-        return []
+    except Exception as e:
+        return [], _short_err(e)
     if r.get("code") != 200:
-        return []
+        return [], (r.get("message") or f"OpenList 回了 {r.get('code')}")
     return sorted(x.get("name") for x in ((r.get("data") or {}).get("content") or [])
-                  if x.get("is_dir") and x.get("name"))
+                  if x.get("is_dir") and x.get("name")), ""
 
 
 def _apply_scan_paths(d, why=""):
@@ -9207,27 +9218,35 @@ def _apply_scan_paths(d, why=""):
     return paths
 
 
-def _pick_dirs(mp):
+def _pick_dirs(d, mp):
     """在这个盘里挑扫描路径。返回挑中的路径（空 = 取消）。
 
     【一个盘挂多少条路径都行】上层是 scan_spec 那个列表，加进去就是追加一条，删也是按条
-    删 —— 一直都支持。真正卡住的是【挑不到】：上一版只列挂载点【下面一层】，而截图里那个
-    盘是 /七米蓝影视/mov/电影/A、/B、/C…… 按字母分的，想扫到字母那一层只能选「m 手打」
-    把整条路径敲进去 —— 在手机 ssh 上手打长中文路径，正是当初做这个菜单要避免的事。
+    删 —— 一直都支持。真正卡住的是【挑不到】：上一版只列挂载点【下面一层】，而按字母分类
+    的盘（/网盘/mov/电影/A、/B、/C……）想扫到字母那一层只能选「m 手打」把整条路径敲
+    进去 —— 在手机 ssh 上手打长中文路径，正是当初做这个菜单要避免的事。
     改成能一层一层往下走。
 
     【单个编号 = 进去看看，多个编号 = 就选它们】这条规矩不用解释也猜得到，而且两件事都
     做得到：想选中你正站着的这一层，按 . 就行。全要就按 *（十几个字母目录一个个点太蠢）。
+
+    【直接贴一条路径也认】实测有人在"要扫哪个"这里直接把整条路径打进去了 —— 那是完全合理
+    的反应，可上一版只回一句"没认出有效的编号"。斜杠开头的一律当路径收。
     """
     root = mp.rstrip("/")
     cur = root
+    tok = _ol_token(d)
     while True:
         print(f"\n  {DIM}正在列 {cur} 下面的目录...{RST}")
-        subs = _ol_subdirs(cur)
+        subs, err = _ol_subdirs(cur, tok)
         print(f"  {BOLD}{cur}{RST}")
         for j, name in enumerate(subs, 1):
             print(f"    {j:>2}. {name}")
-        if not subs:
+        if err:
+            # 【列不动是故障，不能和"底下没目录"长一样】前者要去查，后者按 . 选中就完事
+            print(f"    {YELLOW}列不出来：{err}{RST}")
+            print(f"    {DIM}还是可以直接把路径贴进来（下面那行）{RST}")
+        elif not subs:
             print(f"    {DIM}（这一层底下没有目录了）{RST}")
         tips = ["单个编号 进去看看", "多个编号（逗号隔开）就选它们",
                 ". 就选整个盘" if cur == root else ". 就选当前这层"]
@@ -9235,31 +9254,33 @@ def _pick_dirs(mp):
             tips.append("* 当前这层全部")
         if cur != root:
             tips.append("u 上一层")
-        tips += ["m 手打路径", "回车取消"]
+        tips += ["或直接贴一条路径", "回车取消"]
         print(f"  {DIM}{'　'.join(tips)}{RST}")
-        pick = ask("要扫哪个").strip().lower()
+        pick = ask("要扫哪个").strip()
         if not pick:
             return []
-        if pick == "u":
+        if pick.lower() == "u":
             cur = cur.rsplit("/", 1)[0]
             if len(cur) < len(root):
                 cur = root
             continue
-        if pick in (".", "a"):      # a 是上一版「整个盘」的键，留着不为难老用户
+        if pick in (".",) or pick.lower() == "a":   # a 是上一版「整个盘」的键，留着
             return [cur]
         if pick == "*":
             if not subs:
                 print("这一层底下没有目录。")
                 continue
             return [f"{cur}/{n}" for n in subs]
-        if pick == "m":
-            raw = ask(f"路径（以 {mp} 开头）").strip().rstrip("/")
+        if pick.startswith("/") or pick.lower() == "m":
+            raw = pick if pick.startswith("/") else ask(f"路径（以 {mp} 开头）").strip()
+            raw = raw.rstrip("/")
             if not raw:
                 return []
             if not raw.startswith(root + "/") and raw != root:
                 warn(f"这条不在 {mp} 底下，没有加。")
-                return []
+                continue
             return [raw]
+        pick = pick.lower()
         toks = [t.strip() for t in pick.replace("，", ",").split(",") if t.strip()]
         nums = [int(t) for t in toks
                 if t.isdigit() and subs and 1 <= int(t) <= len(subs)]
@@ -9316,7 +9337,7 @@ def _drive_paths_menu(d, mp):
             print("无效选择。")
             continue
 
-        got = [p for p in _pick_dirs(mp) if p]
+        got = [p for p in _pick_dirs(d, mp) if p]
         if not got:
             continue
         bare = [p for p in got if p.strip("/").count("/") == 0]
@@ -9678,7 +9699,7 @@ def _drive_menu(d, mp, drv):
         ch, switchable = drive_channel(d, mp, drv)
         tp = title_policy_of(mp)
         print("\n" + "=" * 60)
-        print(f"  {BOLD}{driver_cn(drv)}{RST}   {CYAN}{_scan_of(mp)}{RST}")
+        print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}")
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
         n = len(drive_links(d, mp, drv)) if switchable else 0
@@ -9778,10 +9799,13 @@ def mount_paths_menu():
             return
         # 【这一屏只管设置，不报状态】存储通不通归「6 链路体检」——
         # 那边是真去列一次目录、换一次直链，比这里读一个陈年字段准得多。
+        # 【必须带挂载点，光有驱动名认不出是哪个盘】驱动名不唯一：挂两个 WebDAV
+        # （一个公益源、一个自己的）时，这一列就是两行一模一样的「WebDAV」，
+        # 点进去才知道是哪个。挂载点是用户自己在 OpenList 里起的名字，那才是他认得的那个。
         for i, (mp, drv, _st) in enumerate(stores, 1):
             where = _scan_of(mp)
             col = CYAN if where != "未加路径" else DIM
-            print(f"  {i:>2}. {pad(driver_cn(drv), 24)}{col}{where}{RST}")
+            print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 30)}{col}{where}{RST}")
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
         # 返回也要占一行。这一屏原来只在提示里写「0 = 返回」，而别的每一屏
