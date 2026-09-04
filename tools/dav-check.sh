@@ -16,7 +16,7 @@
 # 路径从接口里取，不用手打中文 —— 裸 curl 打中文路径要自己转义，上一版就是这么 404 的。
 set -u
 
-TOOL_VER="2026-09-04b"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-04c"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -75,7 +75,13 @@ if only:
 
 
 def find_video(root, budget=25):
-    """在这个盘里找一个视频文件来试。找不到返回 ""。
+    """在这个盘里找一个视频文件来试。返回 (路径, 没找到的原因)。
+
+    【三态，不能两态】"没找到视频"有两个完全不同的原因，处置也相反：
+      · 这个盘真的空 / 真的没有视频  → 正常，什么都不用做
+      · 列目录根本没通               → 那才是故障，而且往往就是要查的那件事
+    两种打同一句"没找到视频文件"，等于把一条故障伪装成一句无害的说明 —— 实测就闹过：
+    一个盘是用户自己清空的（正常），另一个其实是列目录失败，而输出上一模一样。
 
     【不能每层只钻第一个文件夹】上一版就是那么写的，一头扎进一条没有视频的岔路
     （「文档」「图片」这种）就到底了，回头也不回，然后报"没找到视频文件"——
@@ -85,21 +91,29 @@ def find_video(root, budget=25):
     【不带 refresh】只是要一个能拿来试的文件名，读缓存足够。带 refresh 等于为了做个
     检测，反而去打那个本来就被限流的列目录接口。
     """
-    queue, used = [root], 0
+    queue, used, seen, err = [root], 0, 0, ""
     while queue and used < budget:
         path = queue.pop(0)
         used += 1
         try:
             d = api("/api/fs/list", {"path": path, "password": "", "page": 1,
                                      "per_page": 100, "refresh": False}, tok).get("data") or {}
-        except Exception:
+        except Exception as e:
+            err = err or type(e).__name__
             continue
         items = d.get("content") or []
+        seen += len(items)
         for i in items:
             if not i.get("is_dir") and str(i.get("name", "")).lower().endswith(VIDEO):
-                return path.rstrip("/") + "/" + i["name"]
+                return path.rstrip("/") + "/" + i["name"], ""
         queue += [path.rstrip("/") + "/" + i["name"] for i in items if i.get("is_dir")]
-    return ""
+    if err:
+        return "", f"列目录没通（{err}）"
+    if seen == 0:
+        return "", "这个盘是空的"
+    if queue:
+        return "", f"翻了 {used} 个目录还没翻完，都没有视频"
+    return "", f"{seen} 个条目里没有视频文件"
 
 
 auth = "Basic " + base64.b64encode(f"admin:{pw}".encode()).decode()
@@ -108,9 +122,10 @@ print(f"  {B}OpenList 的 WebDAV：每个盘走哪条路{X}")
 print("=" * 62)
 
 for mp in mounts:
-    f = find_video(mp)
+    f, why = find_video(mp)
     if not f:
-        print(f"  {mp:<16}{Y}没找到视频文件{X}  {D}（找了 25 个目录都没有，或者列目录没通）{X}")
+        # 列不动是故障（红），空盘是正常状态（暗色），两者不能长一样
+        print(f"  {mp:<16}{(R if '没通' in why else D)}{why}{X}")
         continue
     # WebDAV 的地址要按 URL 转义 —— 中文原样塞进去 urllib 直接 UnicodeEncodeError
     url = BASE + "/dav" + urllib.parse.quote(f, safe="/")
