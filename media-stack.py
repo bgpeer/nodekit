@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.56"
+SCRIPT_VERSION = "1.5.57"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -6093,6 +6093,15 @@ def items_without_duration(key):
     （TMDb 给的片长）。探测失败的条目照样能从 TMDb 拿到一个片长填在条目上，而 MediaSource
     那边还是 0 —— 只看条目的话这个函数会认为它"已经有时长了"而跳过，补时长那步永远不会再
     试它。用户看到的是"明明显示 17 分钟，进度条还是记不住"，而体检也跟着报「时长 都有」。
+
+    【光有时长不算探到】实测撞到过一个条目：大小 5.69 GB、时长 97 分都在，而
+    MediaStreams 是【0 条】—— 一条音视频轨都没有。那种条目【根本播不了】：客户端问
+    Emby"这个怎么播"，拿回来一个没有任何轨道的源，不知道用什么解码器、找不到视频轨，
+    于是直接 load fail，而且【连 /stream 都不去请求】，MediaWarp 日志里一条记录都没有
+    —— 从服务器这头看，整条链路每一段都是好的，查到死也查不出来。
+
+    而只看时长的话，这种条目在时长入库的那一刻就从名单里出去了，heal 再也不碰它。
+    所以判据是【时长 和 媒体流，缺一不可】。
     """
     out = []
     try:
@@ -6117,15 +6126,20 @@ def items_without_duration(key):
         try:
             d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
                       f"&IncludeItemTypes=Movie,Episode,Video"
-                      f"&Fields=Path,MediaSources", key)
+                      f"&Fields=Path,MediaSources,MediaStreams", key)
         except Exception:
             continue
         for i in d.get("Items") or []:
             srcs = i.get("MediaSources") or []
             # 有源就以源为准（源才是文件的真实探测结果）；一个源都没有时退回看条目
-            need = (any(not (s.get("RunTimeTicks") or 0) for s in srcs) if srcs
-                    else not (i.get("RunTimeTicks") or 0))
-            if need:
+            no_dur = (any(not (s.get("RunTimeTicks") or 0) for s in srcs) if srcs
+                      else not (i.get("RunTimeTicks") or 0))
+            # 【媒体流为空 = 没探到，哪怕时长已经有了】见 docstring：那种条目播不了，
+            # 而且从服务器这头查不出任何毛病。列表查询里 MediaSource 内部的
+            # MediaStreams 常常是空的，所以条目顶层那份也认 —— 两处都空才算没有。
+            no_streams = not ((i.get("MediaStreams") or [])
+                              or any(s.get("MediaStreams") for s in srcs))
+            if no_dur or no_streams:
                 out.append((uid, i.get("Id"), i.get("Name") or "?"))
     return out
 
@@ -12265,11 +12279,15 @@ def do_healthcheck():
                 _per = min(max(HEAL_LIMIT, len(nodur) // 8), HEAL_LIMIT_MAX)
                 _hrs = max(1, -(-len(nodur) // _per))    # 向上取整
                 _hc("条目时长", "bad",
-                    f"{names}  {YELLOW}没有时长，不会有进度条记忆{RST}")
+                    f"{names}  {YELLOW}没探到媒体信息（时长或音视频轨），"
+                    f"进度条记不住，缺轨道的还【根本播不了】{RST}")
                 print(f"    {' ':<20}{DIM}后台每小时补一批（这次一批 {_per} 个），"
                       f"照这个速度还要约 {_hrs} 小时补完{RST}")
-                todo.append((f"{len(nodur)} 个条目没探到时长，"
-                             f"它们看到一半退出会被当成看完、下次从头开始",
+                todo.append((f"{len(nodur)} 个条目没探到媒体信息。只缺时长的，"
+                             f"看一半退出会被当成看完；【连音视频轨都没有】的更严重 —— "
+                             f"客户端拿不到可播的轨道，点开直接 load fail，而且连 "
+                             f"/stream 都不去请求，MediaWarp 日志里一条记录都没有，"
+                             f"从服务器这头怎么查都是好的",
                              f"【已经在自动补了】每小时一批、一批 {_per} 个，"
                              f"约 {_hrs} 小时补完，不用管它。想快一点就点"
                              "「5 生成媒体库」，它会另外在后台再补一批（最多 200 个）。"
