@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.57"
+SCRIPT_VERSION = "1.5.58"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11584,6 +11584,23 @@ def do_healthcheck():
     # 这个调用慢或超时,播放器就停在那儿等
     # 按网盘分组各测一个:多盘的时候一个好一个坏,只测一个文件根本看不出来
     # (以前取的是所有 strm 里字典序第一个,属于哪个盘全看运气)
+    # MediaWarp 用哪个地址问 OpenList —— 下面「换直链」那一项拿它当判据：
+    # 代理型存储的 raw_url 是按请求 Host 拼的，体检从 127.0.0.1 问必然拿回本机地址，
+    # 真正决定 302 落点的是 MediaWarp 用的那个地址。
+    # 【不能用 read_yaml_scalar("addr")】配置里有两个 addr：server.addr 是 Emby
+    # （http://emby:8096），alist_strm 那个才是 OpenList。取第一个就永远读成 Emby，
+    # 这一项会一直报错还指错方向。只在 alist_strm: 之后那一段里找。
+    _mw_addr = ""
+    try:
+        _txt = open(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                    encoding="utf-8").read()
+        _seg = _txt.split("alist_strm:", 1)
+        if len(_seg) == 2:
+            _m = re.search(r"^\s*-?\s*addr:\s*(\S+)", _seg[1], re.M)
+            _mw_addr = _m.group(1).strip('"\'') if _m else ""
+    except OSError:
+        pass
+
     by_mount = {}
     for f in sorted(glob.glob(os.path.join(
             read_env(os.path.join(d, ".env"), "DATA_ROOT") or os.path.join(d, "media"),
@@ -11623,18 +11640,30 @@ def do_healthcheck():
                              "网盘接口到本机的线路问题，服务端改不了；"
                              "缓存已开 2h，同一部片只慢第一次"))
             elif _is_internal_host(raw.split("/")[2]):
-                # 【快 ≠ 通】实测撞过：一屏上「换直链 ✔ 0.0 秒 → 127.0.0.1:5244」和「302 直链
-                # ✖ 内部地址，客户端连不上」并排。0.0 秒恰恰是症状 —— 它根本没去网盘换，直接把
-                # OpenList 自己的地址回来了。代理型存储（WebDAV、本地盘这些没有 CDN 直链的驱动）
-                # 就是这样：视频要经 OpenList 中转，外网客户端拿到这个地址只会连不上。
-                _hc(label, "bad", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
-                                  f"{RED}本机地址，外网放不了{RST}")
-                todo.append((
-                    f"{mount} 换出来的「直链」是本机地址（{raw.split('/')[2]}）——"
-                    f"这个盘的片子在外网点开会一直连不上",
-                    "这类驱动（WebDAV、本地目录等）在网盘那边没有 CDN 直链，"
-                    "OpenList 只能自己中转，302 也就没法指向外部。"
-                    "和 public_url 无关，其它盘不受影响"))
+                # 代理型存储（WebDAV 源、本地目录）在网盘侧没有 CDN 直链，OpenList 只能回
+                # 自己的 /d/ 地址 —— 而那个地址是按【请求里的 Host】拼的。
+                #
+                # 【体检是从 127.0.0.1 问的，所以拿回 127.0.0.1 是必然的】这不能说明
+                # MediaWarp 拿到的也是内网地址。上一版在这里直接判红，于是每一个代理型的盘
+                # 都【永远报红】，还配一条早就过时的待办（"改配置没用"）—— 而正确的修法
+                # 已经做进去了：让 MediaWarp 用对外地址去问（见 openlist_api_addr）。
+                # 一条永远红的检查项比没有这项更坏，它会一直把人往错的方向带。
+                #
+                # 所以判据换成【MediaWarp 用的是哪个地址】，那才是真正决定 302 落点的东西。
+                if _mw_addr and not _is_internal_host(
+                        urllib.parse.urlsplit(_mw_addr).netloc or _mw_addr):
+                    _hc(label, "ok", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
+                                     f"{DIM}（体检是从本机问的所以回本机地址；"
+                                     f"MediaWarp 走 {_mw_addr}，302 出去的是对外地址）{RST}")
+                else:
+                    _hc(label, "bad", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
+                                      f"{RED}本机地址，外网放不了{RST}")
+                    todo.append((
+                        f"{mount} 是代理型存储（WebDAV、本地目录），OpenList 只能回自己的"
+                        f"地址；而 MediaWarp 现在用 {_mw_addr or '内网地址'} 去问它，"
+                        f"于是 302 出去的是容器内网名，手机电视解析不了",
+                        "跑一次「7 更新」：它会把 MediaWarp 问 OpenList 的地址改成对外地址"
+                        "（探不通会自动退回，不会把别的盘搞坏）"))
             elif el > 2:
                 _hc(label, "warn",
                     f"{el:.1f} 秒  偏慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
@@ -11669,23 +11698,12 @@ def do_healthcheck():
         _hc("MediaWarp→Emby", "bad", _short_err(e))
         todo.append(("MediaWarp 打不通 Emby", "docker logs --tail 30 mediawarp"))
     # ---- MediaWarp 用哪个地址问 OpenList ----
+    # （_mw_addr 在上面「换直链」那几行就用到了，见那里的注释 —— 它是判断
+    #   "本机地址到底要不要紧"的唯一依据，所以读取放在更前面）
     # 【代理型存储（WebDAV 源、本地目录）能不能在 Emby 里播，全看这一项】它们在网盘侧
     # 没有 CDN 直链，OpenList 只能回自己的 /d/ 地址，而那个地址是【按请求里的 Host 拼】的
     # ——OpenList v4 已经没有「网站 URL」那个设置了，改不了它，只能改问它的人。
     # MediaWarp 拿 http://openlist:5244 去问，拿回来的就是内网名，302 给手机电视解析不了。
-    # 【不能用 read_yaml_scalar("addr")】配置里有两个 addr：server.addr 是 Emby
-    # （http://emby:8096），alist_strm 那个才是 OpenList。取第一个就永远读成 Emby，
-    # 这一项会一直报错还指错方向。只在 alist_strm: 之后那一段里找。
-    _mw_addr = ""
-    try:
-        _txt = open(os.path.join(d, "mediawarp", "config", "config.yaml"),
-                    encoding="utf-8").read()
-        _seg = _txt.split("alist_strm:", 1)
-        if len(_seg) == 2:
-            _m = re.search(r"^\s*-?\s*addr:\s*(\S+)", _seg[1], re.M)
-            _mw_addr = _m.group(1).strip('"\'') if _m else ""
-    except OSError:
-        pass
     _proxy_drives = [mp for _sid, mp, drv, _add, cols in _storage_rows(d)
                      if _truthy(cols.get("web_proxy"))
                      or str(drv or "").lower() in ("webdav", "local", "crypt")]
