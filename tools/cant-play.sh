@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-05a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-05b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -112,9 +112,36 @@ hit = [i for i in items
        if Q.lower() in str(i.get("Name") or "").lower()
        or Q.lower() in str(i.get("Path") or "").lower()]
 if not hit:
-    print(f"  {R}✖ Emby 里没有匹配「{Q}」的条目{X}")
-    print(f"  {D}strm 还没进库。点「5 生成媒体库」，完了看它最后那段"
-          f"「Emby 媒体库可以指向这些路径」有没有建库。{X}")
+    print(f"  {R}✖ Emby 里没有匹配「{safe(Q)}」的条目{X}")
+    # 【先数一数，别急着下结论】库里有没有东西是当场能数出来的。上一版不数，
+    # 张口就说「strm 还没进库，点 5 生成媒体库」—— 而那是三种可能里最少见的
+    # 一种。实测把说明里的占位词原样敲进来，得到的就是这句，于是人以为库没建，
+    # 去重扫一遍，白等半小时，回来还是同一句话。
+    if not items:
+        print(f"  {D}Emby 库里一个条目都没有 —— 这种情况才轮得到重建库。{X}")
+        print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，完了看它最后那段"
+              f"「Emby 媒体库可以指向这些路径」有没有建库。{X}")
+        raise SystemExit
+    print(f"  {D}库里现在有 {len(items)} 个条目，所以多半只是【片名对不上】——"
+          f"打错了，或者填的不是 Emby 里显示的那个名字。{X}")
+    # 【给几个能直接抄的名字】一个照着做的例子胜过一句正确的废话。按盘分组，
+    # 人要查哪个盘的片子就从那一组里挑一个。
+    by_drive = {}
+    for i in items:
+        p = str(i.get("Path") or "")
+        mount = (p[len("/data/strm/"):].split("/")[0]
+                 if p.startswith("/data/strm/") else "其它")
+        by_drive.setdefault(mount, []).append(str(i.get("Name") or ""))
+    print()
+    print(f"  {D}库里现有的片名，一个盘举三个（抄一个填进去就行）：{X}")
+    for mount in sorted(by_drive)[:5]:
+        names = [n for n in by_drive[mount] if n][:3]
+        print(f"    {C}{mount}{X}  {D}（共 {len(by_drive[mount])} 个）{X}")
+        for n in names:
+            print(f"      {D}·{X} {n[:44]}")
+    print()
+    print(f"  {D}片名只填一小段就行，不用全名 —— 它是按包含匹配的，"
+          f"路径里的字也算。{X}")
     raise SystemExit
 
 def _facts(i):
