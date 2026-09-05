@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.62"
+SCRIPT_VERSION = "1.5.63"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10147,9 +10147,11 @@ def _link_method_menu(d, mounts, who):
         print("-" * 60)
         for i, m in enumerate(ms, 1):
             ch, _sw = drive_channel(d, m, "")
-            n = len(drive_links(d, m))
+            # 【别在带编号的菜单里再摆一个数字】以前这里写「2 项可调」，
+            # 而它右边的行首正好是「2.」—— 一眼扫过去像两个 2，得停下来分辨
+            # 哪个才是要敲的键。有几项进去一看就知道，行尾这个数字不值这个代价。
             print(f"  {i:>2}. {pad(m, 24)}{CYAN}{ch}{RST}"
-                  + (f"  {DIM}{n} 项可调{RST}" if n else f"  {DIM}没有可调的{RST}"))
+                  + ("" if drive_links(d, m) else f"  {DIM}没有可调的{RST}"))
         print("   0. 返回")
         print("-" * 60)
         c = ask("改哪个盘").strip()
@@ -10265,9 +10267,10 @@ def _drive_menu(d, mp, drv):
         print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}")
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
-        n = len(drive_links(d, mp, drv)) if switchable else 0
+        # 数字不进这一行，理由见上一屏同样的地方：右边就是行首的「2.」
+        has_sw = switchable and drive_links(d, mp, drv)
         print(f"  2. 直链方式          当前：{CYAN}{ch}{RST}"
-              + (f"  {DIM}{n} 项可调{RST}" if n else f"  {DIM}（只有这一种）{RST}"))
+              + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"))
         print(f"  3. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
         has115 = "115" in str(drv)
         if has115:
