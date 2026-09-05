@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.63"
+SCRIPT_VERSION = "1.5.64"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7314,7 +7314,28 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 HEAL_RETRY_MIN = 3       # 后台两轮之间隔几分钟。太密会撞网盘限流，反而更难成
 HEAL_BG_BUDGET = 1800    # 后台整体封顶（秒）。用满收工，剩下的交给每小时那轮
 HEAL_BG_MAX    = 200     # 后台一次最多探几个条目 —— 拉文件头是要走流量的
+
+# 【自适应配额：撞了限流就退，一直顺就慢慢加】拥塞控制那一套（AIMD）。
+#
+# 实测把因果链闭上了：停掉后台任务静置几分钟，同一条直链 8 发 0 发 429；后台任务在跑
+# 的时候，同一条链 8 发里 4 发 429 —— 那些 429 是【我们自己打出来的】。一批 300 个、
+# 每个先拉文件头再让 ffprobe 连发好几发，上游一限量整轮全废，而它还按原速接着打，
+# 用户那头看到的是"挂载页面也连不上了"。
+#
+# 单个条目的退避（重试三次）救不了这个：它只让【这一个文件】慢下来，而上游限的是
+# 这个源的【整体请求量】。所以要有一个跨轮次的闸门，记在状态文件里 ——
+# 只在本轮里判断没用，一轮跑完进程就退了。
+HEAL_PACE_MIN  = 20      # 砍到底也还要探这么多，不然等于停摆
+HEAL_PACE_STEP = 50      # 一轮干净就往上加这么多
+HEAL_429_STOP  = 3       # 一轮里撞这么多次限流就当场收工，别再打了
+HEAL_429_COOL  = 10      # 撞一次之后歇几秒再探下一个条目
 HEAL_PRE_T  = 40         # 预检超时：只是确认线路此刻通不通，不必等满
+
+
+# 【调用方靠这个串认出"被限量了"】不另加返回值：_netdisk_head_ok 的 (能不能, 说明)
+# 这个形状在好几处日志文案里露过脸，改签名要连带改一串。用常量比较，不写字面量 ——
+# 字面量对不上时是【静默失效】：配额永远不退，而屏上一切正常。
+THROTTLED_WHY = "上游网盘一直在限流（429，退避重试三次都被拒）"
 
 
 def _netdisk_head_ok(raw_url, timeout=HEAL_PRE_T):
@@ -7342,14 +7363,40 @@ def _netdisk_head_ok(raw_url, timeout=HEAL_PRE_T):
             n = len(urllib.request.urlopen(req, timeout=timeout).read(WARM_BYTES))
             return (n > 0), (f"{n // 1024}KB" if n else "网盘返回了 0 字节")
         except urllib.error.HTTPError as e:
-            if e.code == 429:
+            if e.code in (429, 500, 502, 503):
+                # 500/502/503 在限量的源上和 429 是一回事：上游被打急了就掐连接，
+                # OpenList 那边取不到数据，报出来是 500。当成同一件事退避。
                 continue
             if e.code == 403:
                 return False, "上游网盘拒了（403，多半是不认这个 UA）"
             return False, _short_err(e)
         except Exception as e:
             return False, _short_err(e)
-    return False, "上游网盘一直在限流（429，退避重试三次都被拒）"
+    # 【这个返回值调用方要认】它是自适应配额的唯一输入 —— 见 HEAL_PACE_MIN 那段。
+    return False, THROTTLED_WHY
+
+
+def heal_pace():
+    """这一批探几个。撞过限流就是砍过半的那个数，一直顺就是上限。"""
+    try:
+        v = int(ms_state().get("heal_pace") or HEAL_LIMIT_MAX)
+    except (TypeError, ValueError):
+        v = HEAL_LIMIT_MAX
+    return max(HEAL_PACE_MIN, min(HEAL_LIMIT_MAX, v))
+
+
+def set_heal_pace(throttled):
+    """按这一轮的遭遇调下一批的配额。返回新配额。
+
+    砍半、加常数 —— 拥塞控制那一套：退让要快（撞一次就砍一半），恢复要慢
+    （一轮干净才加一档）。反过来的话，上游刚缓过来就又被打满。
+    """
+    cur = heal_pace()
+    new = (max(HEAL_PACE_MIN, cur // 2) if throttled
+           else min(HEAL_LIMIT_MAX, cur + HEAL_PACE_STEP))
+    if new != cur:
+        save_ms_state(heal_pace=new)
+    return new
 
 
 def heal_media_info(d, key):
@@ -7383,7 +7430,10 @@ def heal_media_info(d, key):
     # 【取多少要先夹到总数】不夹的话 (allpend+allpend) 在待探数少于 HEAL_LIMIT 时
     # 会把同一批切出来两遍 —— 7 个待探切成 14 个，每个条目探两次、流量翻倍。
     # 而这一步的全部意义就是省流量。
-    take = min(max(HEAL_LIMIT, len(allpend) // 8), HEAL_LIMIT_MAX, len(allpend))
+    # 【配额是上一轮的遭遇定的】上一轮撞了限流，这一轮就自动砍半 —— 见 heal_pace。
+    # 不夹到总数的话 (allpend+allpend) 在待探数少于一批时会把同一批切两遍。
+    _pace = heal_pace()
+    take = min(max(HEAL_LIMIT, len(allpend) // 8), _pace, len(allpend))
     pend = (allpend + allpend)[cur:cur + take]
     save_ms_state(heal_cursor=(cur + take) % len(allpend))
     print()
@@ -7412,7 +7462,7 @@ def heal_media_info(d, key):
 
     cfg = rebuild_cfg_from_disk(d)
     base = openlist_public_url(cfg)
-    done = 0
+    done = hit = 0
     todo_items = list(pend)
     t_all = time.monotonic()
     for rnd in range(1, HEAL_ROUNDS + 1):
@@ -7423,18 +7473,31 @@ def heal_media_info(d, key):
                   f"（第 {rnd}/{HEAL_ROUNDS} 轮）{RST}")
             time.sleep(HEAL_GAP)
         again = []
-        done += _heal_round(d, key, todo_items, base, token, again, t_all)
+        _d, _t = _heal_round(d, key, todo_items, base, token, again, t_all)
+        done += _d
+        hit += _t
         todo_items = again
+        if _t >= HEAL_429_STOP:
+            # 【撞满了就别再打第二轮】第二轮是给"这一下没探到"准备的，而被限量
+            # 时整轮都探不到 —— 再打一轮只是把上游按得更久。
+            print(f"  {YELLOW}上游在限量（这一轮撞了 {_t} 次），本轮到此为止{RST}")
+            break
+    _new = set_heal_pace(hit >= HEAL_429_STOP)
     _heal_summary(done, len(pend))
+    if hit >= HEAL_429_STOP:
+        print(f"  {DIM}下一批自动减到 {_new} 个 —— 上游按请求量限，"
+              f"打得越猛补得越慢。它缓过来之后会自己加回去。{RST}")
+    elif _new > _pace:
+        print(f"  {DIM}这一轮没撞限流，下一批加到 {_new} 个。{RST}")
 
 
 def _heal_round(d, key, pend, base, token, again, t_all=None):
-    """探一轮。探不到的塞进 again 供下一轮再试。返回这一轮成功几个。
+    """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流)。
 
     【每个条目要先把行占上】探一个条目最坏要等 3 分钟，而结果是【探完才打印】的 ——
     等待的那三分钟屏幕上一个字都不动，从屏幕上看和死机没有区别。
     """
-    done = 0
+    done = hit = 0
     total = len(pend)
     for idx, (uid, iid, name) in enumerate(pend, 1):
         # 预算是【这一轮里也要看】的：一个条目最多等 3 分钟，50 个就是两个多小时，
@@ -7480,6 +7543,16 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
         if not good:
             print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}网盘没给出文件头（{why}）{RST}\033[K")
             again.append((uid, iid, name))
+            if why == THROTTLED_WHY:
+                # 【退避要落在"下一个条目"上，不只是"这一个文件的重试"上】
+                # 上游限的是这个源的整体请求量，不是某一个文件。紧接着去探下一个，
+                # 等于换个文件继续撞同一堵墙。
+                hit += 1
+                if hit >= HEAL_429_STOP:
+                    print(f"  {YELLOW}连着撞了 {hit} 次限流，这一轮先停 —— "
+                          f"再打下去只会把上游按得更久{RST}")
+                    break
+                time.sleep(HEAL_429_COOL)
             continue
         url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
         mins, streams = 0, False
@@ -7535,7 +7608,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
         else:
             print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}\033[K")
             again.append((uid, iid, name))
-    return done
+    return done, hit
 
 
 def _heal_summary(done, total):
@@ -12474,7 +12547,9 @@ def do_healthcheck():
                     names += f" 等 {len(nodur)} 个"
                 # 【必须说"还要多久"】只报个数字的话，人没法判断"它到底在不在补"——
                 # 而它确实在补，只是每小时一批。不说清楚，看到两千多个只会以为没在跑。
-                _per = min(max(HEAL_LIMIT, len(nodur) // 8), HEAL_LIMIT_MAX)
+                # 【跟 heal 用同一个配额】不然屏上说 300、实际在跑 20，
+                # 人只会以为它没在动 —— 而它正在按上游能受的速度慢慢补。
+                _per = min(max(HEAL_LIMIT, len(nodur) // 8), heal_pace())
                 _hrs = max(1, -(-len(nodur) // _per))    # 向上取整
                 _hc("条目时长", "bad",
                     f"{names}  {YELLOW}没探到媒体信息（时长或音视频轨），"
