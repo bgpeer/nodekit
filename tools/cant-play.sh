@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-04m"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-05a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -453,9 +453,12 @@ if (bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
           f"直链，OpenList 只能回自己的 /d/ 地址 —— 而那个地址的主机名是"
           f"【谁来问就按谁用的主机名拼】。MediaWarp 在容器里用 http://openlist:5244"
           f"去问，拿回来的就是 openlist:5244。{X}")
-    print(f"  {B}修：把 OpenList 的「网站 URL」填成对外地址{X}")
-    print(f"  {D}跑一次「7 更新」会自动填（脚本要 v1.5.53 以上），"
-          f"或者去 OpenList 设置里手填 https://list.<你的域名>。{X}")
+    print(f"  {B}修：跑一次「7 更新」{X}{D}（脚本要 v1.5.58 以上）{X}")
+    # 【别再让人去填「网站 URL」】OpenList v4 已经没有那个设置了，翻遍设置页也找不到，
+    # 而这条提示让人来回找了好几轮。能改的只有【问它的人】：MediaWarp 的 alist_strm.addr。
+    print(f"  {D}OpenList v4 没有「网站 URL」这个设置，翻设置页是找不到的。"
+          f"能改的是【问它的人】—— 更新会把 MediaWarp 问 OpenList 的地址"
+          f"改成 https://list.<你的域名>，于是拼出来的 /d/ 地址也就成了对外地址。{X}")
     print(f"  {D}填完已经缓存的旧地址最多 {TTL} 后自动换过来（这台机器的直链缓存"
           f"就是这个值）；等不及就 docker restart mediawarp。{X}")
     print(f"  {D}下面那一步是在这台机器上拉的 —— 这里能拉动不代表手机能。{X}")
@@ -684,6 +687,99 @@ else:
             print(f"  {D}MediaWarp 这边是好的。那 load fail 就出在【302 之后】—— "
                   f"播放器自己去连那个地址失败了。最常见的是客户端解不了这个编码"
                   f"（这套东西不能转码），换 Infuse / VidHub 一试就知道。{X}")
+
+# ================= ⑧ 换个 UA 再问一次（Emby 的探测就死在这里） =================
+# 【这一段是①-⑥ 全绿却播不了的谜底】上面那些请求全都戴着第 90 行那个 Chrome UA，
+# 上游给它开门；而 Emby 探测用的是 ffprobe，UA 是 Lavf/59.27.100 —— 实测 access log 里
+# 同一个文件、同一段时间：Lavf → 429，Python-urllib → 403，Chrome → 429 429 429 然后
+# 206/200。只有 UA 不同，结果天差地别。
+#
+# 探测被拒 = 条目里【一条音视频轨都没有】。客户端问「这个怎么播」，拿回一个没有任何
+# 轨道的源，直接 load fail，而且【连 /stream 都不请求】——所以 MediaWarp 日志里干干净净，
+# 从服务器这头一段一段查过去每一段都是好的。查一整天也查不出来。
+print()
+print(f"  {B}⑧ 换个 UA 再问一次（Emby 的探测就死在这里）{X}")
+hr()
+probe_url = raw or loc
+if not probe_url:
+    print(f"  {Y}前面没拿到直链，这一段跳过{X}")
+else:
+    # 两路问：绕过 nginx 看上游【原本】的态度，经过 nginx 看 UA 改写生没生效。
+    # 只有 OpenList 自己的 /d/、/p/ 地址才绕得过去；CDN 直链（夸克、阿里）不经过
+    # 我们的 nginx，那种情况下改写这条路本来就够不着，下面会说清楚。
+    _sp = urllib.parse.urlsplit(probe_url)
+    _ours = _sp.path.startswith(("/d/", "/p/"))
+    routes = []
+    if _ours:
+        routes.append(("绕过 nginx（直接问 OpenList）",
+                       urllib.parse.urlunsplit(
+                           ("http", "127.0.0.1:5244", _sp.path, _sp.query, ""))))
+    routes.append(("经过 nginx（播放器走的就是这条）", probe_url))
+
+    UAS = [("Emby 的 ffprobe", "Lavf/59.27.100"),
+           ("体检脚本", "Python-urllib/3.12"),
+           ("浏览器", UA),
+           ("浏览器（再来一次）", UA)]
+
+    res = {}
+    for rname, rurl in routes:
+        print(f"  {D}{rname}{X}")
+        for i, (who, ua) in enumerate(UAS):
+            if i:
+                time.sleep(4)      # 隔开发，别自己造出 429 来又当成上游限流
+            rq = urllib.request.Request(
+                rurl, headers={"User-Agent": ua, "Range": "bytes=0-65535"})
+            try:
+                with urllib.request.urlopen(rq, timeout=60) as rr:
+                    n, st = len(rr.read(1 << 16)), rr.status
+                res[(rname, who)] = st
+                print(f"    {G}✔{X} {who:<20} {D}HTTP {st}，{n // 1024}KB{X}")
+            except urllib.error.HTTPError as e:
+                res[(rname, who)] = e.code
+                why = {403: "上游不认这个 UA", 429: "上游在限流",
+                       401: "签名过期或没带上"}.get(e.code, "")
+                print(f"    {R}✖{X} {who:<20} {R}HTTP {e.code}{X}"
+                      + (f"  {D}{why}{X}" if why else ""))
+            except Exception as e:
+                res[(rname, who)] = 0
+                print(f"    {R}✖{X} {who:<20} {R}{safe(e)}{X}")
+
+    def _ok(rname, who):
+        return res.get((rname, who), 0) in (200, 206)
+
+    print()
+    _via = routes[-1][0]
+    _bare = routes[0][0] if _ours else ""
+    # 上游本来的态度看绕过那一路；够不着 nginx 的 CDN 直链就只有一路，看它自己
+    _ref = _bare or _via
+    _lavf_ref = _ok(_ref, "Emby 的 ffprobe")
+    _br_ref = _ok(_ref, "浏览器") or _ok(_ref, "浏览器（再来一次）")
+
+    if not _lavf_ref and _br_ref:
+        print(f"  {R}✖ 上游按 User-Agent 挡人{X}"
+              f"  {D}浏览器过得去，ffprobe 过不去{X}")
+        print(f"  {D}Emby 每次探测都在这里被拒，所以条目里一条音视频轨都没有 ——"
+              f"点开就是 load fail，而 MediaWarp 日志里一条记录都没有。{X}")
+        if not _ours:
+            print(f"  {Y}这条是网盘 CDN 的直链，不经过本机 nginx —— 改写不了它的 UA。{X}")
+            print(f"  {D}这个盘的片子只能靠把「回源方式」改成本机代理绕过去"
+                  f"（4 挂载路径 → 选那个盘 → 2 直链方式），代价是视频要过本机带宽。{X}")
+        elif _ok(_via, "Emby 的 ffprobe"):
+            print(f"  {G}✔ 而经过 nginx 这一路 ffprobe 是通的 —— UA 改写已经生效{X}")
+            print(f"  {D}剩下的是补探测还没跑到这个条目。跑「6 链路体检」看还差多少个，"
+                  f"补探测是按小时在后台推进的。{X}")
+        else:
+            print(f"  {B}修：跑一次「7 更新」{X}{D}（脚本要 v1.5.60 以上）—— "
+                  f"它会让 nginx 把探测类 UA 换成浏览器 UA 再送进 OpenList。"
+                  f"OpenList 是透明代理，会把这个 UA 原样带去上游。{X}")
+    elif not _br_ref and not _lavf_ref:
+        print(f"  {Y}两个 UA 都被拒了 —— 不是 UA 的问题{X}")
+        print(f"  {D}上游此刻要么在限流（429，隔几分钟再跑一次这个脚本），"
+              f"要么这条签名已经过期（401）。{X}")
+    else:
+        print(f"  {G}✔ UA 不是这里的问题{X}  {D}ffprobe 那个 UA 也拿得到数据{X}")
+        print(f"  {D}那就往 ⑦ 那段看：客户端是不是在要转码流。{X}")
+
 
 print()
 PY
