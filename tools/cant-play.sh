@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-05d"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-05e"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -830,58 +830,80 @@ else:
     _names = {t: n for t, n, _u in routes}
     _via = _names.get("经过", "")
     _bare = _names.get("绕过", "")
-    # 上游本来的态度看绕过那一路；够不着 nginx 的 CDN 直链就只有一路，看它自己
-    _ref = _bare or _via or (routes[0][1] if routes else "")
-    _lavf_ref = _ok(_ref, "Emby 的 ffprobe")
-    _br_ref = _ok(_ref, "浏览器") or _ok(_ref, "浏览器（再来一次）")
 
-    if not _lavf_ref and _br_ref:
-        print(f"  {R}✖ 上游按 User-Agent 挡人{X}"
-              f"  {D}浏览器过得去，ffprobe 过不去{X}")
-        print(f"  {D}Emby 每次探测都在这里被拒，所以条目里一条音视频轨都没有 ——"
-              f"点开就是 load fail，而 MediaWarp 日志里一条记录都没有。{X}")
-        if not _ours:
-            print(f"  {Y}这条是网盘 CDN 的直链，不经过本机 nginx —— 改写不了它的 UA。{X}")
-            print(f"  {D}这个盘的片子只能靠把「回源方式」改成本机代理绕过去"
-                  f"（4 挂载路径 → 选那个盘 → 2 直链方式），代价是视频要过本机带宽。{X}")
-        elif _ok(_via, "Emby 的 ffprobe"):
-            print(f"  {G}✔ 而经过 nginx 这一路 ffprobe 是通的 —— UA 改写已经生效{X}")
-            print(f"  {D}剩下的是补探测还没跑到这个条目。跑「6 链路体检」看还差多少个，"
-                  f"补探测是按小时在后台推进的。{X}")
-        elif _rw_on and not _via:
-            # 开关开着，可这次没测到"经过 nginx"那一路（拿不到对外地址），
-            # 那就【什么都不能断言】—— 上一版会在这里照样下结论。
-            print(f"  {Y}这个盘的改写开关是开着的，但这次没能测到"
-                  f"「经过 nginx」那一路，所以还不知道它帮上忙没有{X}")
-            print(f"  {D}先把上面那条「拿不到对外地址」修掉，再跑一次这个脚本。{X}")
-        elif _rw_on:
-            # 【开关开着、还是过不去 —— 别再叫人去开一遍】上一版就是在这里叫人去
-            # 「7 更新」，而开关明明已经开了。这种情况说明 UA 只是第一道门，
-            # 后面还有第二道：按频率限。那道门不是换个 UA 能过的。
-            print(f"  {Y}开关已经开着，可经过 nginx 这一路 ffprobe 还是没过"
-                  f"（HTTP {res.get((_via, 'Emby 的 ffprobe'), '?')}）{X}")
-            print(f"  {D}也就是说 UA 只是第一道门，后面还有第二道：{B}按频率限{X}"
-                  f"{D}。同一屏里浏览器 UA 也吃了 429/500 就是证据 —— 那一发根本"
-                  f"没经过改写，纯粹是打得太密。{X}")
-            print(f"  {D}Emby 探测一部片要连发好几个请求（探编码、要首帧、要中间"
-                  f"一段），一撞上就整条探测失败 —— 所以补探测在这个源上会一直"
-                  f"补不动，而单发的 ⑤ 却是好的。{X}")
-            print(f"  {D}这道墙在上游，服务端这头没有能拆它的按钮。能做的只有少打："
-                  f"别在补探测跑的时候翻挂载、把扫描路径收窄到真正要看的目录。{X}")
+    def _code(rn, who):
+        return res.get((rn, who), 0)
+
+    # 【403 和 429 是两堵不同的墙，不能混着数】
+    #   403      上游不认这个 UA      换个 UA 就能过
+    #   429/500  上游嫌你打得太密     换什么 UA 都没用
+    # 上一版的判据是「ffprobe 失败 且 浏览器成功 → 按 UA 挡」，不分失败的是哪一种。
+    # 可在一个随机失败率一半的源上，"ffprobe 那发恰好失败、浏览器那发恰好成功"几乎
+    # 必然发生 —— 于是它几乎必然误报"按 UA 挡人"。实测就撞上了：ffprobe 两路都是
+    # 429（量），屏上却打出「上游按 User-Agent 挡人」，紧跟着又打「开关已经开着还是
+    # 没过」，两句话自己跟自己打架，而正中间那行 403 → 206 才是答案，没人提。
+    _n_all = len(res)
+    _n_ok = sum(1 for v in res.values() if v in (200, 206))
+    _n_403 = sum(1 for v in res.values() if v == 403)
+    _n_busy = sum(1 for v in res.values() if v in (429, 500, 502, 503))
+    print(f"  {D}{_n_all} 发里成功 {_n_ok} 发　"
+          f"{_n_403} 发 403（不认 UA）　"
+          f"{_n_busy} 发 429/500（嫌打得太密）{X}")
+    print()
+
+    # ---- 改写到底生没生效：拿「体检脚本」那一对做对照 ----
+    # 【它是唯一干净的对照】Python-urllib 这个 UA 在绕过那一路稳定吃 403，而 403 跟
+    # 打得密不密无关 —— 所以同一个 UA 走了 nginx 之后【还是不是 403】，就是「UA 有没有
+    # 被换掉」的直接证据，不受限流的随机性干扰。
+    # 拿 ffprobe 那一对做对照【不行】：它两路都可能因为限流而 429，什么都证明不了。
+    if _bare and _via:
+        _a, _b = _code(_bare, "体检脚本"), _code(_via, "体检脚本")
+        if _a == 403 and _b != 403:
+            print(f"  {G}✔ UA 改写确认生效{X}  {D}同一个 UA：绕过 nginx 是 403"
+                  f"（不认），经过 nginx 变成 HTTP {_b} —— UA 确实被换掉了{X}")
+        elif _a == 403 and _b == 403:
+            print(f"  {R}✖ UA 改写没顶上{X}  {D}同一个 UA 两路都是 403{X}")
+            if not _rw_on:
+                print(f"  {B}修：给这个盘开「探测 UA」{X}{D} —— 4 挂载路径 → 选 "
+                      f"{mount or '那个盘'} → 2 直链方式 → 探测 UA → 伪装成浏览器"
+                      f"（脚本要 v1.5.61 以上）{X}")
+            else:
+                print(f"  {D}开关是开着的，那就查 nginx 那边："
+                      f"grep ms_ua /etc/nginx/conf.d/media-stack.conf{X}")
+        elif _a in (200, 206):
+            # 【对照发自己就成功了 = 此刻根本没有 UA 墙】那就没什么可证明的。
+            # 说成"忙到没轮到看"是错的 —— 那是 429 那一支的说法。
+            print(f"  {D}上游此刻不挡这个 UA（绕过那一路的对照发直接成功了），"
+                  f"所以这次测不出改写有没有用 —— 也不需要{X}")
         else:
-            print(f"  {B}修：给这个盘开「探测 UA」{X}"
-                  f"{D} —— 4 挂载路径 → 选 {mount or '那个盘'} → 2 直链方式 → "
-                  f"探测 UA → 伪装成浏览器（脚本要 v1.5.61 以上）。{X}")
-            print(f"  {D}nginx 会把探测类 UA 换成浏览器 UA 再送进 OpenList，"
-                  f"而 OpenList 是透明代理，会把这个 UA 原样带去上游。{X}")
-    elif not _br_ref and not _lavf_ref:
-        print(f"  {Y}两个 UA 都被拒了 —— 不是 UA 的问题{X}")
-        print(f"  {D}上游此刻要么在限流（429/500，隔几分钟再跑一次这个脚本），"
-              f"要么这条签名已经过期（401）。{X}")
-    else:
-        print(f"  {G}✔ UA 不是这里的问题{X}  {D}ffprobe 那个 UA 也拿得到数据{X}")
-        print(f"  {D}那就往 ⑦ 那段看：客户端是不是在要转码流。{X}")
+            print(f"  {Y}这次没测出改写生没生效{X}  {D}绕过那一路的对照发不是 403"
+                  f"（HTTP {_a or '连不上'}）—— 上游此刻忙到连 UA 都没轮到看。"
+                  f"隔十几分钟再跑一次{X}")
+    elif not _ours:
+        print(f"  {Y}这条是网盘 CDN 的直链，不经过本机 nginx —— 改写不了它的 UA{X}")
+        print(f"  {D}真被 CDN 按 UA 挡住时，只能把这个盘的「回源方式」改成本机代理"
+              f"（4 挂载路径 → 选那个盘 → 2 直链方式），代价是视频过本机带宽。{X}")
 
+    # ---- 这个源现在到底卡在哪 ----
+    print()
+    if _n_busy and _n_busy >= _n_403:
+        print(f"  {R}✖ 主要卡在【量】上{X}  {D}{_n_busy}/{_n_all} 发是 429/500 —— "
+              f"上游嫌请求太密，跟 UA 无关（浏览器 UA 一样吃）{X}")
+        print(f"  {D}Emby 探测一部片要连发好几个请求（探编码、要首帧、要中间一段），"
+              f"撞上一发就整条探测失败 —— 所以补探测在这个源上一直补不动，"
+              f"而单发的 ⑤ 有时却是好的。{X}")
+        print(f"  {D}这道墙在上游。能做的只有少打：别在补探测跑的时候翻挂载、"
+              f"把扫描路径收窄到真正要看的目录。{X}")
+    elif _n_403:
+        print(f"  {R}✖ 主要卡在【UA】上{X}  {D}{_n_403}/{_n_all} 发是 403{X}")
+        print(f"  {D}Emby 每次探测都在这里被拒，条目里一条音视频轨都没有 —— 点开"
+              f"就是 load fail，而 MediaWarp 日志里一条记录都没有。{X}")
+    elif _n_ok == _n_all:
+        print(f"  {G}✔ 这一段全通{X}  {D}UA 和频率都不是问题。"
+              f"往 ⑦ 那段看：客户端是不是在要转码流。{X}")
+    else:
+        print(f"  {Y}失败的那几发既不是 403 也不是 429{X}"
+              f"  {D}看上面各行的状态码{X}")
 
 print()
 PY
