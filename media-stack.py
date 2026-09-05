@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.64"
+SCRIPT_VERSION = "1.5.65"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7062,6 +7062,9 @@ def _strm_sidecars(strm_path):
 # 「5 生成媒体库」里核对失效 strm 最多花这么久。超了就记下游标，下次接着走。
 # 每日对齐那次不设限 —— 凌晨跑，没人等。
 PRUNE_BUDGET = 60
+# 本地目录在这么多天内动过的，下一轮优先核对 —— 刚生成过新 strm 的地方，
+# 最可能还留着改名/挪位置之前的那一份。
+PRUNE_FRESH_DAYS = 3
 
 
 def _dir_names(path, token):
@@ -7092,6 +7095,82 @@ def _dir_names(path, token):
         return None
     return {x.get("name") for x in ((r.get("data") or {}).get("content") or [])
             if x.get("name")}
+
+
+def _dir_names_cached(path, token, cache):
+    """带本轮缓存的列目录。逐层往上求证时会反复问到同几个祖先，不缓存就是白花钱。"""
+    if path not in cache:
+        cache[path] = _dir_names(path, token)
+    return cache[path]
+
+
+def resolve_target(tgt, token, cache):
+    """这个网盘路径现在是什么状态："gone" / "alive" / "unknown"。
+
+    【问不出来不等于判不出来】从文件往上找【第一个列得出来的祖先】，用它的列表回答
+    "下一级还在不在"：
+
+      /quark/夸克挂载/动漫 这一层就挂了       → 盘或上层的问题，什么都别动
+      /quark/夸克挂载/动漫 通、仙逆 这层挂了  → 看「仙逆」在不在「动漫」的列表里，
+                                                不在 = 整个目录没了，底下那批一起清
+      两层都通                                → 才去看 156 4K.mp4 在不在
+
+    上一版只问文件所在的那一个目录，那一层超时就返回"当成还在"—— 于是网盘里删掉的
+    整个目录，本地那批 strm 会一直赖着，Emby 里就是一排点不开的旧条目。
+
+    【停在挂载点那一层，不问根目录】/quark 自己都列不出来 = 存储掉线，那种情况必须是
+    unknown。真去问根目录、发现挂载点不在里面就判死的话，OpenList 重启的那几秒就足够
+    把整个盘的 strm 清光。
+    """
+    parts = [p for p in tgt.strip("/").split("/") if p]
+    for up in range(1, len(parts)):          # up=1 是直接父目录；到挂载点那层为止
+        anc = "/" + "/".join(parts[:len(parts) - up])
+        names = _dir_names_cached(anc, token, cache)
+        if names is None:
+            continue                          # 这一层也问不出来，再往上
+        return "alive" if parts[len(parts) - up] in names else "gone"
+    return "unknown"
+
+
+def _prune_order(by_dir, dir_local, d, budget):
+    """核对顺序：先查有理由怀疑的，剩下的照旧游标轮转。
+
+    【别无差别地绕圈】几百个目录按字典序轮转、每次只有 budget 秒，绕完一圈要点五六次
+    「5」。而绝大多数目录这次根本没动过，问它们是纯粹的重复劳动 —— 片子越多越明显。
+
+    有理由怀疑的就两类：
+      · 上一轮没问出结果的  —— 旧条目赖着不走，来源就是它们
+      · 本地目录刚变过的    —— AutoFilm 刚在那儿生成过新 strm，最可能还留着改名前那份
+
+    返回 (排好序的目录列表, 游标位置)。
+    """
+    order = sorted(by_dir)
+    if not budget:
+        return order, 0                       # 每日对齐那次不设限，老老实实全扫
+    try:
+        recheck = set(json.load(open(os.path.join(d, "prune_recheck.json"),
+                                    encoding="utf-8")))
+    except Exception:
+        recheck = set()
+    cutoff = time.time() - PRUNE_FRESH_DAYS * 86400
+    fresh = set()
+    for dirpath, local in dir_local.items():
+        try:
+            if os.path.getmtime(local) > cutoff:
+                fresh.add(dirpath)
+        except OSError:
+            pass
+    rest = [p for p in order if p not in recheck and p not in fresh]
+    # 冷目录仍然按游标绕圈，不然它们永远轮不到
+    cur = 0
+    try:
+        last = open(os.path.join(d, "prune_cursor.txt")).read().strip()
+        cur = rest.index(last) if last in rest else 0
+    except (OSError, ValueError):
+        cur = 0
+    hot = [p for p in order if p in recheck] + [p for p in order if p in fresh
+                                                and p not in recheck]
+    return hot + rest[cur:] + rest[:cur], len(hot)
 
 
 def prune_dead_strm(d, budget=None):
@@ -7128,54 +7207,76 @@ def prune_dead_strm(d, budget=None):
           f"当成还在 —— 宁可留废文件，不能误删。{RST}")
 
     # 按目录归拢，一个目录问一次。两万个文件常常只分布在几百个目录上
-    by_dir = {}
+    by_dir, dir_local = {}, {}
     for local, tgt in inv:
         by_dir.setdefault(os.path.dirname(tgt), []).append((local, tgt))
+        dir_local.setdefault(os.path.dirname(tgt), os.path.dirname(local))
     print(f"  {DIM}按目录核对：{len(inv)} 个文件分布在 {len(by_dir)} 个目录里，"
           f"一个目录问一次。{RST}")
+    print(f"  {DIM}问不出来的会往上再问一层：上一层列得出来、这一层的名字不在里面，"
+          f"就是整个目录没了；一直问到挂载点还不通才当成线路问题，什么都不动。{RST}")
 
     # 【时间预算 + 游标】34231 个文件分布在 2716 个目录上，一个目录一次跨境列举，
     # 全跑完要一小时 —— 而这是在"已经把扫完的盘推给 Emby、用户以为可以走了"之后
     # 发生的，等于把刚省下的时间又还回去。实测用户就是在这儿 Ctrl-C 的。
     # 改成每次只花 budget 秒，从上次停下的地方接着走，绕一圈算一遍。
     # 少删一轮的代价只是废 strm 多留一会儿；而让人干等一小时是实打实的。
-    order = sorted(by_dir)
-    cur = 0
+    order, n_hot = _prune_order(by_dir, dir_local, d, budget)
+    if n_hot:
+        print(f"  {DIM}这轮先查 {n_hot} 个有理由怀疑的目录（上轮没问出结果的、"
+              f"以及最近 {PRUNE_FRESH_DAYS} 天动过的），其余按游标接着绕。{RST}")
     mark = os.path.join(d, "prune_cursor.txt")
-    if budget:
-        try:
-            last = open(mark).read().strip()
-            # 【从停下的那个目录本身开始，不是它后面】stopped_at 记的是"没轮到
-            # 就超预算了"的那个目录，+1 会把它永远跳过去 —— 绕多少圈都核对不到。
-            cur = order.index(last) if last in order else 0
-        except (OSError, ValueError):
-            cur = 0
-        order = order[cur:] + order[:cur]        # 从游标处绕一圈
     t0 = time.monotonic()
     stopped_at = ""
     dead, unknown, seen = [], 0, 0
+    cache = {}                 # 本轮的列目录结果，逐层往上会反复问到同几个祖先
+    again = []                 # 这轮没问出结果的目录，记下来下轮优先
     for i, dirpath in enumerate(order):
         items = by_dir[dirpath]
         if budget and time.monotonic() - t0 > budget:
-            stopped_at = dirpath
+            # 【还在 hot 区间就别动游标】游标记的是【冷目录那一段】的位置。
+            # 在 hot 里停下却把它清空的话，冷目录每轮都从头开始，后半段一辈子
+            # 轮不到 —— 而 hot 区间越大越容易停在里面。None = 这次不写。
+            stopped_at = dirpath if i >= n_hot else None
             print(f"  {DIM}这轮先核对到这儿（{i}/{len(order)} 个目录），"
                   f"下次从这里接着走 —— 没核对的一律当成还在。{RST}")
             break
-        names = _dir_names(dirpath, token)
         seen += len(items)
-        if names is None:
-            unknown += len(items)            # 这个目录问不出来，里面的一律当还在
-        else:
+        # 【先问这一层，问不出来才逐层往上】这一层通的话，一次列举就答完了整个目录，
+        # 跟上一版一样便宜；只有问不出来时才多花那几层。
+        names = _dir_names_cached(dirpath, token, cache)
+        if names is not None:
             for local, tgt in items:
                 if os.path.basename(tgt) not in names:
                     dead.append((local, tgt))
+        else:
+            # 这一层问不出来 —— 往上求证到底是"整个目录没了"还是"线路挂了"
+            st = resolve_target(dirpath, token, cache)
+            if st == "gone":
+                # 上一层列得出来，而这个目录的名字不在里面 = 整个目录没了
+                dead += items
+                print(f"  {DIM}·{RST} {dirpath}  "
+                      f"{YELLOW}整个目录在网盘上没了（上一层列得出来，里面没有它）"
+                      f"{RST}{DIM}，底下 {len(items)} 个一起清{RST}")
+            else:
+                unknown += len(items)        # 一路问不通，什么都不动
+                again.append(dirpath)
         if (i + 1) % 20 == 0 and i + 1 < len(order):
             print(f"  {DIM}...已核对 {seen}/{len(inv)} 个文件"
                   f"（{i + 1}/{len(order)} 个目录）{RST}")
     if budget:
+        if stopped_at is not None:
+            try:
+                with open(mark, "w") as f:
+                    f.write(stopped_at)          # 跑完一圈写空串，下次从头
+            except OSError:
+                pass
+        # 【没问出结果的下轮优先】它们正是"旧条目赖着不走"的来源：网盘那边其实
+        # 已经删了，只是那一刻问不到答案。不记账的话要等游标绕一整圈才轮到。
         try:
-            with open(mark, "w") as f:
-                f.write(stopped_at or "")        # 跑完一圈就清空，下次从头
+            with open(os.path.join(d, "prune_recheck.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump(again[:500], f, ensure_ascii=False)
         except OSError:
             pass
 
