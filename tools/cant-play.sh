@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-05b"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-05c"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -738,45 +738,75 @@ else:
     _ours = _sp.path.startswith(("/d/", "/p/"))
     routes = []
     if _ours:
-        routes.append(("绕过 nginx（直接问 OpenList）",
+        routes.append(("绕过", "绕过 nginx（直接问 OpenList）",
                        urllib.parse.urlunsplit(
                            ("http", "127.0.0.1:5244", _sp.path, _sp.query, ""))))
-    routes.append(("经过 nginx（播放器走的就是这条）", probe_url))
+    routes.append(("经过", "经过 nginx（播放器走的就是这条）", probe_url))
+
+    # 【改写开没开，是读出来的，不是猜出来的】上一版从状态码倒推，于是开关明明已经
+    # 开了，它还叫人去开 —— 而且叫的还是过时的做法（「7 更新」）。配置文件就在本机。
+    NGXC = "/etc/nginx/conf.d/media-stack.conf"
+    mount = "/" + body.strip("/").split("/")[0] if body.startswith("/") else ""
+    try:
+        _conf = open(NGXC, encoding="utf-8", errors="replace").read()
+    except OSError:
+        _conf = ""
+    _hitblk = ""
+    _mm = re.search(r"map \$uri \$ms_hit \{(.*?)\n\}", _conf, re.S)
+    if _mm:
+        _hitblk = _mm.group(1)
+    _bare_mp = mount.strip("/")
+    _rw_on = ("$ms_ua" in _conf and bool(_bare_mp)
+              and (_bare_mp in _hitblk or re.escape(_bare_mp) in _hitblk))
+    print(f"  {D}这个盘的「探测 UA」开关：{X}"
+          + (f"{G}已开{X}  {D}（{mount}，nginx 会把探测类 UA 换成浏览器 UA）{X}"
+             if _rw_on else
+             f"{Y}未开{X}  {D}（{mount or '?'}，探测原样带 ffmpeg 的 UA 出去）{X}"))
+    print()
 
     UAS = [("Emby 的 ffprobe", "Lavf/59.27.100"),
            ("体检脚本", "Python-urllib/3.12"),
            ("浏览器", UA),
            ("浏览器（再来一次）", UA)]
 
-    res = {}
-    for rname, rurl in routes:
-        print(f"  {D}{rname}{X}")
-        for i, (who, ua) in enumerate(UAS):
-            if i:
+    # 【按 UA 交错，不按路分批】上一版是先把绕过那一路四发打完再打经过那一路 ——
+    # 而上游正在按频率限，后跑的那一路面对的是一个【已经被前面八发惹毛了的】上游。
+    # 于是"经过 nginx 更差"这个结论有相当一部分是测试顺序造出来的，不是路的差别。
+    # 交错之后，同一个 UA 的两发背靠背，两边吃到的上游脾气是同一份。
+    res, _first = {}, True
+    for who, ua in UAS:
+        print(f"  {D}{who}{X}")
+        for tag, rname, rurl in routes:
+            if not _first:
                 time.sleep(4)      # 隔开发，别自己造出 429 来又当成上游限流
+            _first = False
             rq = urllib.request.Request(
                 rurl, headers={"User-Agent": ua, "Range": "bytes=0-65535"})
             try:
                 with urllib.request.urlopen(rq, timeout=60) as rr:
                     n, st = len(rr.read(1 << 16)), rr.status
                 res[(rname, who)] = st
-                print(f"    {G}✔{X} {who:<20} {D}HTTP {st}，{n // 1024}KB{X}")
+                print(f"    {G}✔{X} {tag:<4} {D}HTTP {st}，{n // 1024}KB{X}")
             except urllib.error.HTTPError as e:
                 res[(rname, who)] = e.code
+                # 【500 和 429 在这个场景下是一回事的两种表现】上游被打急了就直接
+                # 掐连接，OpenList 那边取不到数据，报出来就是 500。上一版没有它的
+                # 释义，屏上只剩一个光秃秃的 HTTP 500，看不出跟旁边那些 429 同源。
                 why = {403: "上游不认这个 UA", 429: "上游在限流",
-                       401: "签名过期或没带上"}.get(e.code, "")
-                print(f"    {R}✖{X} {who:<20} {R}HTTP {e.code}{X}"
+                       500: "上游把连接掐了（打太密时的另一种表现）",
+                       502: "上游没回话", 401: "签名过期或没带上"}.get(e.code, "")
+                print(f"    {R}✖{X} {tag:<4} {R}HTTP {e.code}{X}"
                       + (f"  {D}{why}{X}" if why else ""))
             except Exception as e:
                 res[(rname, who)] = 0
-                print(f"    {R}✖{X} {who:<20} {R}{safe(e)}{X}")
+                print(f"    {R}✖{X} {tag:<4} {R}{safe(e)}{X}")
 
     def _ok(rname, who):
         return res.get((rname, who), 0) in (200, 206)
 
     print()
-    _via = routes[-1][0]
-    _bare = routes[0][0] if _ours else ""
+    _via = routes[-1][1]
+    _bare = routes[0][1] if _ours else ""
     # 上游本来的态度看绕过那一路；够不着 nginx 的 CDN 直链就只有一路，看它自己
     _ref = _bare or _via
     _lavf_ref = _ok(_ref, "Emby 的 ffprobe")
@@ -795,13 +825,29 @@ else:
             print(f"  {G}✔ 而经过 nginx 这一路 ffprobe 是通的 —— UA 改写已经生效{X}")
             print(f"  {D}剩下的是补探测还没跑到这个条目。跑「6 链路体检」看还差多少个，"
                   f"补探测是按小时在后台推进的。{X}")
+        elif _rw_on:
+            # 【开关开着、还是过不去 —— 别再叫人去开一遍】上一版就是在这里叫人去
+            # 「7 更新」，而开关明明已经开了。这种情况说明 UA 只是第一道门，
+            # 后面还有第二道：按频率限。那道门不是换个 UA 能过的。
+            print(f"  {Y}开关已经开着，可经过 nginx 这一路 ffprobe 还是没过"
+                  f"（HTTP {res.get((_via, 'Emby 的 ffprobe'), '?')}）{X}")
+            print(f"  {D}也就是说 UA 只是第一道门，后面还有第二道：{B}按频率限{X}"
+                  f"{D}。同一屏里浏览器 UA 也吃了 429/500 就是证据 —— 那一发根本"
+                  f"没经过改写，纯粹是打得太密。{X}")
+            print(f"  {D}Emby 探测一部片要连发好几个请求（探编码、要首帧、要中间"
+                  f"一段），一撞上就整条探测失败 —— 所以补探测在这个源上会一直"
+                  f"补不动，而单发的 ⑤ 却是好的。{X}")
+            print(f"  {D}这道墙在上游，服务端这头没有能拆它的按钮。能做的只有少打："
+                  f"别在补探测跑的时候翻挂载、把扫描路径收窄到真正要看的目录。{X}")
         else:
-            print(f"  {B}修：跑一次「7 更新」{X}{D}（脚本要 v1.5.60 以上）—— "
-                  f"它会让 nginx 把探测类 UA 换成浏览器 UA 再送进 OpenList。"
-                  f"OpenList 是透明代理，会把这个 UA 原样带去上游。{X}")
+            print(f"  {B}修：给这个盘开「探测 UA」{X}"
+                  f"{D} —— 4 挂载路径 → 选 {mount or '那个盘'} → 2 直链方式 → "
+                  f"探测 UA → 伪装成浏览器（脚本要 v1.5.61 以上）。{X}")
+            print(f"  {D}nginx 会把探测类 UA 换成浏览器 UA 再送进 OpenList，"
+                  f"而 OpenList 是透明代理，会把这个 UA 原样带去上游。{X}")
     elif not _br_ref and not _lavf_ref:
         print(f"  {Y}两个 UA 都被拒了 —— 不是 UA 的问题{X}")
-        print(f"  {D}上游此刻要么在限流（429，隔几分钟再跑一次这个脚本），"
+        print(f"  {D}上游此刻要么在限流（429/500，隔几分钟再跑一次这个脚本），"
               f"要么这条签名已经过期（401）。{X}")
     else:
         print(f"  {G}✔ UA 不是这里的问题{X}  {D}ffprobe 那个 UA 也拿得到数据{X}")
