@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-05c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-05d"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -727,7 +727,14 @@ else:
 print()
 print(f"  {B}⑧ 换个 UA 再问一次（Emby 的探测就死在这里）{X}")
 hr()
-probe_url = raw or loc
+# 【对外地址只能从 302 的 Location 拿】raw 是 ③ 从 OpenList 的接口要来的，而
+# 代理型的盘那个地址【就是 OpenList 自己的内网地址】（③ 上面刚印过「直链指向
+# 127.0.0.1:5244」）。上一版拿 raw 当"经过 nginx"那一路，于是两路问的是同一个
+# 地址，nginx 从头到尾没参与 —— 这一段存在的全部理由就是对比这两条路，它却把
+# 同一件事测了两遍。证据是屏上「体检脚本」两路都 403：Python-urllib 在改写名单里，
+# 真走了 nginx 不可能还是 403。
+# loc 是 ④ 里 MediaWarp 302 出去的地址，也就是播放器真要连的那个，正是要测的那路。
+probe_url = loc or raw
 if not probe_url:
     print(f"  {Y}前面没拿到直链，这一段跳过{X}")
 else:
@@ -736,12 +743,24 @@ else:
     # 我们的 nginx，那种情况下改写这条路本来就够不着，下面会说清楚。
     _sp = urllib.parse.urlsplit(probe_url)
     _ours = _sp.path.startswith(("/d/", "/p/"))
+    _host = _sp.netloc
+    _inhost = (_host.split(":")[0] in ("openlist", "emby", "mediawarp", "localhost")
+               or _host.startswith(("127.", "10.", "192.168.", "172.")))
     routes = []
     if _ours:
         routes.append(("绕过", "绕过 nginx（直接问 OpenList）",
                        urllib.parse.urlunsplit(
                            ("http", "127.0.0.1:5244", _sp.path, _sp.query, ""))))
-    routes.append(("经过", "经过 nginx（播放器走的就是这条）", probe_url))
+    # 【地址一样就别凑两行】拿不到对外地址时这一路测不了，说清楚为什么 ——
+    # 偷偷拿同一个地址测两遍，比少一行坏得多：屏上看着像做了对比，其实没有。
+    if _ours and _inhost:
+        print(f"  {Y}拿不到对外地址（这条直链指向 {safe(_host)}），"
+              f"「经过 nginx」这一路测不了{X}")
+        print(f"  {D}④ 那个 302 应该落在 list.<你的域名> 上。落在内网名上时先看"
+              f"体检里的「MediaWarp→OpenList」那一项。{X}")
+        print()
+    else:
+        routes.append(("经过", "经过 nginx（播放器走的就是这条）", probe_url))
 
     # 【改写开没开，是读出来的，不是猜出来的】上一版从状态码倒推，于是开关明明已经
     # 开了，它还叫人去开 —— 而且叫的还是过时的做法（「7 更新」）。配置文件就在本机。
@@ -805,10 +824,14 @@ else:
         return res.get((rname, who), 0) in (200, 206)
 
     print()
-    _via = routes[-1][1]
-    _bare = routes[0][1] if _ours else ""
+    # 【别再用 routes[-1] 当"经过那一路"】它现在可能整个不存在（拿不到对外地址），
+    # 那时候 routes[-1] 就是"绕过"，于是拿绕过的结果去回答"改写生效没有" —— 又是
+    # 一次自己骗自己。按名字取，取不到就是没测。
+    _names = {t: n for t, n, _u in routes}
+    _via = _names.get("经过", "")
+    _bare = _names.get("绕过", "")
     # 上游本来的态度看绕过那一路；够不着 nginx 的 CDN 直链就只有一路，看它自己
-    _ref = _bare or _via
+    _ref = _bare or _via or (routes[0][1] if routes else "")
     _lavf_ref = _ok(_ref, "Emby 的 ffprobe")
     _br_ref = _ok(_ref, "浏览器") or _ok(_ref, "浏览器（再来一次）")
 
@@ -825,6 +848,12 @@ else:
             print(f"  {G}✔ 而经过 nginx 这一路 ffprobe 是通的 —— UA 改写已经生效{X}")
             print(f"  {D}剩下的是补探测还没跑到这个条目。跑「6 链路体检」看还差多少个，"
                   f"补探测是按小时在后台推进的。{X}")
+        elif _rw_on and not _via:
+            # 开关开着，可这次没测到"经过 nginx"那一路（拿不到对外地址），
+            # 那就【什么都不能断言】—— 上一版会在这里照样下结论。
+            print(f"  {Y}这个盘的改写开关是开着的，但这次没能测到"
+                  f"「经过 nginx」那一路，所以还不知道它帮上忙没有{X}")
+            print(f"  {D}先把上面那条「拿不到对外地址」修掉，再跑一次这个脚本。{X}")
         elif _rw_on:
             # 【开关开着、还是过不去 —— 别再叫人去开一遍】上一版就是在这里叫人去
             # 「7 更新」，而开关明明已经开了。这种情况说明 UA 只是第一道门，
