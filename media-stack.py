@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.59"
+SCRIPT_VERSION = "1.5.60"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -82,6 +82,17 @@ SUBDOMAINS = [
     ("emby", MEDIAWARP_PORT, "emby",       "Emby"),
     ("list", OPENLIST_PORT,  "openlist",   "OpenList"),
 ]
+
+# 【上游网盘按 User-Agent 挡人，这是从 access log 实测出来的】同一个文件、同一段时间：
+#   Lavf/59.27.100（Emby 的 ffprobe）→ 429    Python-urllib/3.12（体检）→ 403
+#   Chrome → 429、429、429，然后 206 / 200    ← 只有浏览器 UA 撑过了限流
+# 而 OpenList 是【透明代理】：server/common/proxy.go 里 ProcessHeader 把客户端的每个头
+# （含 UA）原样带去上游，再把上游的状态码原样写回。所以那些 429/403 既不是 nginx 也不是
+# OpenList 发的，是上游发的 —— 我们唯一能改的，就是上游看见的这个 UA。
+#
+# 【别再写 "Mozilla/5.0" 这种半截的】六个字符，任何一个像样的防盗链都认得出不是浏览器。
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
 RST = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
 RED = "\033[31m"; GREEN = "\033[32m"; YELLOW = "\033[33m"
@@ -1108,7 +1119,31 @@ def gen_nginx_site(cfg):
                       f"    auth_basic_user_file {HTPASSWD_FILE};\n")
 
     out = ["# 由 media-stack.py 自动生成，重跑会覆盖，别手改。",
-           "# 本文件只新增站点，不改动节点(bgpeer)的任何 nginx 配置。"]
+           "# 本文件只新增站点，不改动节点(bgpeer)的任何 nginx 配置。",
+           # 【探测类 UA 换成浏览器 UA 再送进 OpenList】上游网盘按 UA 挡人：实测
+           # ffprobe 的 Lavf/59.27.100 一律 429、Python-urllib 一律 403，而浏览器 UA
+           # 撞几次限流之后能拿到 206/200。OpenList 是透明代理（ProcessHeader 把客户端
+           # 的头原样带去上游），所以在这里换掉，上游看见的就是换过的。
+           #
+           # 这一条是 Emby 里「条目有时长、媒体流 0 条、点开 load fail、MediaWarp 日志
+           # 里却一条记录都没有」的根因：探测那一发在上游就被拒了，轨道从来没进去过。
+           #
+           # 只改 list 子域（见下面的 proxy_set_header），emby / home 不碰。
+           # 【故意不改写 curl / wget】留一条能看见上游真实脸色的路，
+           # 不然 tools/cant-play.sh 测出来的全是改写后的结果，等于自己骗自己。
+           "#",
+           "# 上游网盘按 User-Agent 挡人：ffprobe 的 Lavf/… 一律 429、Python-urllib 一律",
+           "# 403，而浏览器 UA 撞几次限流之后能拿到 206/200。OpenList 是透明代理，会把",
+           "# 客户端的 UA 原样带去上游 —— 所以在这里换掉，上游看见的就是换过的。",
+           "# 这是 Emby「有时长、媒体流 0 条、点开 load fail」的根因：探测在上游就被拒了。",
+           f'map $http_user_agent $ms_ua {{',
+           f'    default              $http_user_agent;',
+           f'    ""                   "{BROWSER_UA}";',
+           f'    "~*^Lavf/"           "{BROWSER_UA}";',
+           f'    "~*ffmpeg|ffprobe"   "{BROWSER_UA}";',
+           f'    "~*^Python-urllib"   "{BROWSER_UA}";',
+           f'    "~*^Go-http-client"  "{BROWSER_UA}";',
+           f'}}']
     for sub, port, container, _label in SUBDOMAINS:
         if sub == "home" and not cfg["homepage"]:
             continue
@@ -1119,6 +1154,11 @@ def gen_nginx_site(cfg):
         #            输弹框那对账号，然后以为"登不进去"。徒增困惑，安全上也没多拿到什么。
         # 只有 Homepage 是真的零认证，谁打开都能看到全部服务地址，那层必须保留。
         a = "" if sub in ("emby", "list") else auth_block
+        # OpenList 那个站点才需要换 UA —— 视频字节是从这里流向上游的。
+        # emby 子域后面是 MediaWarp/Emby，自家程序，UA 换了反而看不出是谁在请求。
+        ua = ("        # 探测类 UA 换成浏览器 UA，见文件开头 map 那段的说明\n"
+              "        proxy_set_header User-Agent       $ms_ua;\n"
+              if sub == "list" else "")
         out.append(f"""
 server {{
 {listen_line}
@@ -1144,7 +1184,7 @@ server {{
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade           $http_upgrade;
         proxy_set_header Connection        "upgrade";
-        # MediaWarp 返回的 302 必须原样透传给播放器，
+{ua}        # MediaWarp 返回的 302 必须原样透传给播放器，
         # 被 nginx 改写或跟随的话直链就失效了，流量会退回服务器中转
         proxy_redirect  off;
         proxy_buffering off;
@@ -7241,14 +7281,27 @@ def _netdisk_head_ok(raw_url, timeout=HEAL_PRE_T):
     """
     if not raw_url:
         return False, "没拿到直链"
-    try:
-        req = urllib.request.Request(
-            raw_url, headers={"User-Agent": "Mozilla/5.0",
-                              "Range": f"bytes=0-{WARM_BYTES - 1}"})
-        n = len(urllib.request.urlopen(req, timeout=timeout).read(WARM_BYTES))
-        return (n > 0), (f"{n // 1024}KB" if n else "网盘返回了 0 字节")
-    except Exception as e:
-        return False, _short_err(e)
+    req = urllib.request.Request(
+        raw_url, headers={"User-Agent": BROWSER_UA,
+                          "Range": f"bytes=0-{WARM_BYTES - 1}"})
+    # 【429 要退避重试，不能一次失败就判死】上游即便认了 UA 也还按频率限：实测同一个
+    # 文件用浏览器 UA 连吃三个 429，隔了半分钟才拿到 206。一次就判"这条线不通"的话，
+    # 后面那 200 秒的探测被白白跳过，而线其实是好的 —— 只是刚才那一下撞上了限流。
+    for wait in (0, 4, 9):
+        if wait:
+            time.sleep(wait)
+        try:
+            n = len(urllib.request.urlopen(req, timeout=timeout).read(WARM_BYTES))
+            return (n > 0), (f"{n // 1024}KB" if n else "网盘返回了 0 字节")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                continue
+            if e.code == 403:
+                return False, "上游网盘拒了（403，多半是不认这个 UA）"
+            return False, _short_err(e)
+        except Exception as e:
+            return False, _short_err(e)
+    return False, "上游网盘一直在限流（429，退避重试三次都被拒）"
 
 
 def heal_media_info(d, key):
@@ -10612,7 +10665,7 @@ def restart_mediawarp_when_ready(d, quiet=False):
 
 
 def _fetch_text(url, timeout, limit=1 << 20):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read(limit).decode("utf-8", "replace")
 
@@ -10661,7 +10714,7 @@ def warm_hls(loc, at_sec, timeout):
     pick = min(pick, len(segs) - 1)
     try:
         req = urllib.request.Request(urllib.parse.urljoin(loc, segs[pick]),
-                                     headers={"User-Agent": "Mozilla/5.0"})
+                                     headers={"User-Agent": BROWSER_UA})
         n = len(urllib.request.urlopen(req, timeout=timeout).read(WARM_BYTES))
         return f"已拉第 {pick + 1}/{len(segs)} 个分片 {n // 1024}KB"
     except Exception as e:
@@ -10897,7 +10950,7 @@ def warm_links(d, key, limit=None):
                 at = f"  {DIM}（{warm_hls(loc, pos / 6e8 * 60, WARM_STEP_T)}）{RST}"
             else:
                 # 原画：完整文件，直接跳到续播点那个字节位置
-                head = {"User-Agent": "Mozilla/5.0"}
+                head = {"User-Agent": BROWSER_UA}
                 if size and run and pos:
                     off = min(int(size * pos / run), max(size - WARM_BYTES, 0))
                     head["Range"] = f"bytes={off}-{off + WARM_BYTES - 1}"
@@ -11003,8 +11056,15 @@ def probe_302(key, own_host="", want_kind=""):
     url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
            f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
     opener = urllib.request.build_opener(_NoRedirect)
+    # 【这两跳以前一个 UA 都没设】裸 opener 发出去的是 Python-urllib/3.12，
+    # 而上游网盘按 UA 挡人 —— access log 里那条 403 就是这一跳自己招来的，
+    # 体检却把它报成「换直链失败」，一连三次把人往配置那边带。
+    def _open(u, timeout):
+        return opener.open(
+            urllib.request.Request(u, headers={"User-Agent": BROWSER_UA}),
+            timeout=timeout)
     try:
-        with opener.open(url, timeout=90) as resp:
+        with _open(url, 90) as resp:
             # 没抛异常就是没重定向
             return "bad", f"返回 {resp.status}，不是 302 —— 视频会经过本机中转"
     except urllib.error.HTTPError as e:
@@ -11026,10 +11086,18 @@ def probe_302(key, own_host="", want_kind=""):
         # 「302 → 自己的域名」看起来像成功,实际可能第二跳就死了。
         if own_host and bare == own_host:
             try:
-                with opener.open(loc, timeout=60) as r2:
+                with _open(loc, 60) as r2:
                     return "bad", (f"302 → {bare} 之后没有再跳转（HTTP {r2.status}）"
                                    f"  {RED}视频会经过本机{RST}")
             except urllib.error.HTTPError as e2:
+                if e2.code in (403, 429):
+                    # 【这两个码来自上游网盘，不是本机】OpenList 是透明代理，
+                    # 上游回什么状态码它就原样写回什么。403 = 上游不认这个 UA，
+                    # 429 = 上游在限频。都不是配置错，改配置一点用都没有。
+                    return "bad", (
+                        f"{bare} 返回 HTTP {e2.code}  "
+                        f"{RED}{'上游网盘拒绝了这次请求' if e2.code == 403 else '上游网盘在限流'}"
+                        f"{RST}{DIM}（这个码是上游发的，OpenList 只是原样转回来）{RST}")
                 if e2.code not in (301, 302, 303, 307, 308):
                     return "bad", f"{bare} 返回 HTTP {e2.code}  {RED}换直链失败{RST}"
                 loc = e2.headers.get("Location", "")
