@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.58"
+SCRIPT_VERSION = "1.5.59"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7381,7 +7381,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
             again.append((uid, iid, name))
             continue
         url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
-        mins = 0
+        mins, streams = 0, False
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
             with open(host, "w", encoding="utf-8") as f:
@@ -7398,14 +7398,21 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
             # —— 谎报成功比报失败坏得多：这个条目从此被当成已修好，再也不会重试，
             # 而进度条依然是坏的。判据必须和 items_without_duration 保持一致。
             try:
-                got = _emby(f"/Users/{uid}/Items/{iid}?Fields=MediaSources",
-                            key, timeout=30)
+                got = _emby(f"/Users/{uid}/Items/{iid}"
+                            f"?Fields=MediaSources,MediaStreams", key, timeout=30)
                 srcs = got.get("MediaSources") or []
                 ticks = (min((s.get("RunTimeTicks") or 0) for s in srcs) if srcs
                          else (got.get("RunTimeTicks") or 0))
                 mins = ticks / 6e8
+                # 【时长进去了不等于探到了】时长在容器头里，最容易拿到；而客户端要能
+                # 播，靠的是【音视频轨】。上一版只核对时长，一有值就判成功、从重试名单
+                # 里划掉 —— 于是轨道一直是空的，条目却被当成修好了。
+                # 而 items_without_duration 那边（判据已经含轨道）下一轮又把它捞回来，
+                # 两个名单之间来回弹，永远好不了，屏上一路打的还都是「✔ 97 分钟」。
+                streams = ((got.get("MediaStreams") or [])
+                           or any(x.get("MediaStreams") for x in srcs))
             except Exception:
-                mins = 0
+                mins, streams = 0, False
         finally:
             # 还原必须发生：留在 URL 形式上的话，这个条目的播放就绕过了直链缓存，
             # 每次开播都要现换一次直链（实测 7.5~47 秒）
@@ -7414,9 +7421,16 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
                     f.write(original if original.strip().startswith("/") else p)
             except OSError as e:
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
-        if mins:
+        if mins and streams:
             done += 1
             print(f"\r  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟\033[K")
+        elif mins:
+            # 【这一种要单独说】时长有、轨道没有 = 探测中途断了（源限流、超时、
+            # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
+            # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
+            print(f"\r  {DIM}\u00b7{RST} {name[:26]}  "
+                  f"{YELLOW}只探到时长，没有音视频轨（这样点开会 load fail）{RST}\033[K")
+            again.append((uid, iid, name))
         else:
             print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}\033[K")
             again.append((uid, iid, name))
