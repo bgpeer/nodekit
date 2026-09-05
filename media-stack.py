@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.60"
+SCRIPT_VERSION = "1.5.61"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -233,6 +233,25 @@ def save_ms_state(install_dir=None, **extra):
         write_atomic(MS_STATE, json.dumps(cur, ensure_ascii=False, indent=2) + "\n")
     except OSError:
         pass
+
+
+# 【按盘开关，默认全关】上一版把 UA 改写写在 location / 里，所有盘一起吃 —— 探测
+# 是过了 UA 那一关，可紧接着一股脑打到上游，上游改用频率限（体检那行从 403 变成
+# 429），把那个源上的一切都限住，挂载页面跟着连不上。四个盘各有各的脾气，一个
+# 全局开关既不对症也不安全：为了修一个盘，把另外三个好好的盘拖下水。
+def ua_spoof_mounts():
+    """哪些挂载点要把探测类 UA 换成浏览器 UA。默认空 —— 谁都不改。"""
+    v = ms_state().get("ua_spoof")
+    return [str(x) for x in v if str(x).startswith("/")] if isinstance(v, list) else []
+
+
+def set_ua_spoof(mp, on):
+    """开/关一个盘的 UA 改写。返回改完之后的完整名单。"""
+    cur = [m for m in ua_spoof_mounts() if m != mp]
+    if on:
+        cur.append(mp)
+    save_ms_state(ua_spoof=sorted(cur))
+    return sorted(cur)
 
 
 def ms_install_dir():
@@ -1131,19 +1150,46 @@ def gen_nginx_site(cfg):
            # 只改 list 子域（见下面的 proxy_set_header），emby / home 不碰。
            # 【故意不改写 curl / wget】留一条能看见上游真实脸色的路，
            # 不然 tools/cant-play.sh 测出来的全是改写后的结果，等于自己骗自己。
-           "#",
-           "# 上游网盘按 User-Agent 挡人：ffprobe 的 Lavf/… 一律 429、Python-urllib 一律",
-           "# 403，而浏览器 UA 撞几次限流之后能拿到 206/200。OpenList 是透明代理，会把",
-           "# 客户端的 UA 原样带去上游 —— 所以在这里换掉，上游看见的就是换过的。",
-           "# 这是 Emby「有时长、媒体流 0 条、点开 load fail」的根因：探测在上游就被拒了。",
-           f'map $http_user_agent $ms_ua {{',
-           f'    default              $http_user_agent;',
-           f'    ""                   "{BROWSER_UA}";',
-           f'    "~*^Lavf/"           "{BROWSER_UA}";',
-           f'    "~*ffmpeg|ffprobe"   "{BROWSER_UA}";',
-           f'    "~*^Python-urllib"   "{BROWSER_UA}";',
-           f'    "~*^Go-http-client"  "{BROWSER_UA}";',
-           f'}}']
+           ]
+    # 【按盘开关，默认一个都不开】上一版把这条 proxy_set_header 写在 location / 里，
+    # 于是所有盘一起换脸：探测是过了上游的 UA 那一关，可紧接着一股脑打过去，上游
+    # 改用频率限（体检那行从 403 变成 429），那个源上的一切都被限住，挂载页面跟着
+    # 连不上。名单空的时候这一整段【一个字都不生成】—— 也就是回到没这个功能之前。
+    spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
+    if spoof:
+        # 两级判断，两个都成立才换：
+        #   $ms_hit   这条 URI 属不属于开了开关的那个盘（/d/挂载点/… 或 /p/挂载点/…）
+        #   $ms_probe 这个 UA 是不是探测器（浏览器、curl、wget 一概不动）
+        # location / 一个字不动 —— 上一版就是动了那里才殃及全站。
+        out += [
+            "#",
+            "# 上游网盘按 User-Agent 挡人：ffprobe 的 Lavf/… 一律 429、Python-urllib",
+            "# 一律 403，而浏览器 UA 撞几次限流之后能拿到 206/200。OpenList 是透明",
+            "# 代理，会把客户端的 UA 原样带去上游 —— 所以在这里换掉，上游看见的就是",
+            "# 换过的。这是 Emby「有时长、媒体流 0 条、点开 load fail」的根因。",
+            "# 只对下面这几个盘生效，是在「4 挂载路径 → 选盘 → 2 直链方式」里开的。",
+            "map $uri $ms_hit {",
+            "    default 0;",
+        ]
+        for mp in spoof:
+            # 挂载点里有中文、空格、正则元字符都可能 —— 元字符必须转义，
+            # 不然一个 . 就能匹配到别的盘上去。$uri 是解码后的，中文直接比得上。
+            out.append(f'    "~^/[dp]/{re.escape(mp.strip("/"))}(/|$)" 1;')
+        out += [
+            "}",
+            "map $http_user_agent $ms_probe {",
+            "    default 0;",
+            '    ""                  1;',
+            '    "~*^Lavf/"          1;',
+            '    "~*ffmpeg|ffprobe"  1;',
+            '    "~*^Python-urllib"  1;',
+            '    "~*^Go-http-client" 1;',
+            "}",
+            "map $ms_hit$ms_probe $ms_ua {",
+            "    default $http_user_agent;",
+            f'    "11"    "{BROWSER_UA}";',
+            "}",
+        ]
     for sub, port, container, _label in SUBDOMAINS:
         if sub == "home" and not cfg["homepage"]:
             continue
@@ -1156,9 +1202,11 @@ def gen_nginx_site(cfg):
         a = "" if sub in ("emby", "list") else auth_block
         # OpenList 那个站点才需要换 UA —— 视频字节是从这里流向上游的。
         # emby 子域后面是 MediaWarp/Emby，自家程序，UA 换了反而看不出是谁在请求。
-        ua = ("        # 探测类 UA 换成浏览器 UA，见文件开头 map 那段的说明\n"
+        # 【没有盘开这个开关就整行都不生成】$ms_ua 那几个 map 也不会生成，
+        # 引用一个没定义的变量 nginx -t 直接不过。
+        ua = ("        # 只有开了开关的那几个盘 + 探测类 UA 才换，见文件开头的 map\n"
               "        proxy_set_header User-Agent       $ms_ua;\n"
-              if sub == "list" else "")
+              if sub == "list" and spoof else "")
         out.append(f"""
 server {{
 {listen_line}
@@ -8842,6 +8890,19 @@ SOURCE_MODES = (
 )
 
 
+# 【这一项是 nginx 层的，不写进 OpenList 的库】它决定 Emby 的探测（ffprobe）在上游
+# 眼里长什么样。开关按盘存在脚本自己的状态文件里，见 ua_spoof_mounts。
+UA_SPOOF_MODES = (
+    ("asis", "原样（默认）",
+     "Emby 探测用 ffmpeg 的 UA（Lavf/…）去问上游。上游要是按 UA 挡人，"
+     "探测就永远拿不到音视频轨，条目点开 load fail"),
+    ("spoof", "伪装成浏览器",
+     "本机 nginx 把探测类 UA（Lavf/ffmpeg/Python-urllib 这些）换成浏览器 UA 再送出去。"
+     "上游按 UA 挡的话这条能救活；但探测量大，上游也可能转而按频率限整个源 —— "
+     "一个盘一个盘地开，开完去挂载页面播一部确认没被限"),
+)
+
+
 def drive_links(d, mp, drv=""):
     """这个盘在「直链方式」这一屏上能调的开关，按屏上顺序。
 
@@ -8876,6 +8937,15 @@ def drive_links(d, mp, drv=""):
         out.append(("__source__", "source", "回源方式",
                     tuple((k, n, w) for k, n, w, _u in SOURCE_MODES),
                     "proxy" if _truthy(cols.get("web_proxy")) else "direct"))
+    # 【只给代理型的盘】视频字节经本机 nginx 流向上游的，才有"换 UA"这回事。
+    # 夸克、阿里这类有 CDN 直链的盘，Emby 是跟着 302 直接去网盘 CDN 的 ——
+    # 那条请求根本不经过本机，给了也是个假开关（见 LINK_SWITCHES 开头那段：
+    # 宁可少给，绝不给一个假的）。
+    if (_truthy(cols.get("web_proxy"))
+            or str(drv2 or drv or "").lower() in ("webdav", "local", "crypt")):
+        out.append(("__ua__", "ua", "探测 UA",
+                    tuple((k, n, w) for k, n, w in UA_SPOOF_MODES),
+                    "spoof" if mp in ua_spoof_mounts() else "asis"))
     return out
 
 
@@ -9901,6 +9971,9 @@ def drive_channel(d, mp, drv):
               if k not in QUALITY_KEYS and w != "source"]
     names += [_opt_name(o, c) for _k, w, _t, o, c in sw
               if w == "source" and c != "direct"]
+    # 默认状态不占屏，反常状态必须显眼 —— 跟上面 source 一个规矩
+    names += [_opt_name(o, c) for _k, w, _t, o, c in sw
+              if w == "ua" and c != "asis"]
     return " · ".join(names), True
 
 
@@ -10133,6 +10206,24 @@ def _one_drive_link_menu(d, mp):
         sid = next((r[0] for r in _storage_rows(d) if r[1] == mp), None)
         if sid is None:
             warn(f"读不到 {mp} 的存储记录。")
+            continue
+        if where == "ua":
+            # 【这一项不写 OpenList 的库，写 nginx】所以要当场重生成站点配置。
+            # apply_nginx_site 自带 nginx -t + 失败回滚，节点配置动不了。
+            if val == "spoof":
+                warn("开了之后，这个盘的探测会真的打到上游去。")
+                print(f"  {DIM}上游按 UA 挡人的话这条能救活；但探测量大，上游也可能"
+                      f"转而按频率限【整个源】—— 表现是挂载页面也连不上。{RST}")
+                print(f"  {DIM}开完去挂载页面播一部片子确认一下；不对劲就回这里关掉。{RST}")
+                if not ask_yn(f"确定给 {mp} 开启？", False):
+                    print("没有改动。")
+                    continue
+            set_ua_spoof(mp, val == "spoof")
+            cfg2 = rebuild_cfg_from_disk(ms_install_dir())
+            if cfg2.get("has_domain") and os.path.exists(cfg2.get("crt") or ""):
+                apply_nginx_site(cfg2)
+            else:
+                warn("没有域名或证书，nginx 站点没有重新生成 —— 这个开关暂时不生效。")
             continue
         if where == "source":
             if val == "proxy":
