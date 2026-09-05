@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.61"
+SCRIPT_VERSION = "1.5.62"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9967,8 +9967,12 @@ def drive_channel(d, mp, drv):
     if not sw:
         return "原画直链", False
     names = [_opt_name(o, c) for k, _w, _t, o, c in sw if k in QUALITY_KEYS] or ["原画直链"]
+    # 【"默认就不写"的那几类要在这里一并排掉】这一行是通道类开关的兜底，条件写成
+    # 反选（w != "source"）就意味着【以后新加的每一类都会默认落进来】—— 探测 UA
+    # 就是这么漏出去的：下面明明只在非默认时才追加，屏上照样印出「原样（默认）」，
+    # 因为这一行已经无条件把它捞进去了。
     names += [_opt_name(o, c) for k, w, _t, o, c in sw
-              if k not in QUALITY_KEYS and w != "source"]
+              if k not in QUALITY_KEYS and w not in ("source", "ua")]
     names += [_opt_name(o, c) for _k, w, _t, o, c in sw
               if w == "source" and c != "direct"]
     # 默认状态不占屏，反常状态必须显眼 —— 跟上面 source 一个规矩
