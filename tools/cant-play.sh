@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-05f"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-05g"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -89,6 +89,65 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+# 本脚本自己的后台任务名（和 media-stack.py 的 CRON_TIMEOUT 对齐）。
+# selfupdate 不在里面：它只下载一个 py 文件，不碰网盘。
+BG_SUBS = {"warm": "直链预热", "heal": "补探测", "sync": "每日对齐",
+           "keepalive": "链路保活", "precache": "目录预热", "strm": "生成媒体库"}
+
+
+def bg_tasks():
+    """当前在跑的 media-stack 后台任务：[(中文名, 已跑秒数), ...]。
+
+    【这一项决定下面那些 429 该怎么解读】它们打的是同一个网盘：补探测一批几百个
+    条目、每个都要从网盘拉一段文件头，预热还要再换一轮直链。这时候测出来的
+    429/500，测的是"排队排到你没有"，不是"这条链不行"。
+
+    读 /proc，判法跟 media-stack.py 的 running_tasks 一致：只认【python 本体 +
+    那几个子命令】—— flock / timeout 是它的父进程，cmdline 里也带着同样的字样，
+    不滤掉的话一个任务会被数成三个。
+    """
+    out = []
+    try:
+        hz = os.sysconf("SC_CLK_TCK") or 100
+        up = float(open("/proc/uptime").read().split()[0])
+    except (OSError, ValueError, AttributeError):
+        return out
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            args = [a.decode("utf-8", "replace") for a in
+                    open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0") if a]
+            if len(args) < 3 or not any(a.endswith("media-stack.py") for a in args):
+                continue
+            if args[-1] not in BG_SUBS:
+                continue
+            if not os.path.basename(args[0]).startswith("python"):
+                continue
+            st = open(f"/proc/{pid}/stat").read()
+            age = up - float(st[st.rindex(")") + 2:].split()[19]) / hz
+            out.append((BG_SUBS[args[-1]], max(0, int(age))))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def bg_line():
+    """把在跑的任务写成一行；没有就返回空串。"""
+    return "、".join(f"{n}（已跑 {a // 60} 分{a % 60} 秒）" for n, a in BG)
+
+
+BG = bg_tasks()
+if BG:
+    print()
+    print(f"  {Y}⚠ 此刻有后台任务正在打同一个网盘：{X}{B}{bg_line()}{X}")
+    print(f"  {D}下面 ⑤⑥⑧ 里的 429/500 有很大一部分是它们造成的 —— 这一屏测出来的"
+          f"是【排队排到你没有】，不是【这条链不行】。{X}")
+    print(f"  {D}要一个干净的结果，先让它们停下来再测：{X}")
+    print(f"      {B}systemctl stop cron{X}"
+          f"{D} ； {X}{B}pkill -f 'media-stack.py (warm|heal|sync|keepalive|precache)'{X}")
+    print(f"  {D}测完记得 {X}{B}systemctl start cron{X}{D} 恢复。{X}")
 
 # ================= ① Emby 里的这个条目 =================
 print()
@@ -648,7 +707,14 @@ except urllib.error.HTTPError as e:
     print(f"  {R}✖ HTTP {e.code}{X}  {D}直链拿到了，但拉不动{X}")
     if e.code == 429:
         print(f"  {D}429 = 源在限流（请求太频繁）。播放器开播要连发好几个请求，"
-              f"撞上就是 load fail。隔一会儿再跑一次这个脚本看是不是一直这样。{X}")
+              f"撞上就是 load fail。{X}")
+        if BG:
+            # 【别让人去猜】后台在不在跑，这个脚本自己就看得见。
+            print(f"  {Y}而此刻 {bg_line()} 正在跑 —— 这一发多半是排在它后面被挤掉的，"
+                  f"不代表这条链不行{X}")
+        else:
+            print(f"  {D}没有后台任务在跑，所以这是源那边真的在限。"
+                  f"隔一会儿再跑一次看是不是一直这样。{X}")
     if e.code == 403:
         print(f"  {D}403 常见两种：直链绑了取它的那台机器的 IP/UA；"
               f"或者签名过期。前者要把这个盘的「回源方式」改成本机代理"
@@ -915,8 +981,14 @@ else:
         print(f"  {D}Emby 探测一部片要连发好几个请求（探编码、要首帧、要中间一段），"
               f"撞上一发就整条探测失败 —— 所以补探测在这个源上一直补不动，"
               f"而单发的 ⑤ 有时却是好的。{X}")
-        print(f"  {D}先看是不是自己在打自己：补探测每小时一批、每个都要拉文件头。"
-              f"停掉后台任务静置几分钟再跑一次这个脚本，429 归零就是它。{X}")
+        if BG:
+            print(f"  {Y}而这不用猜：{bg_line()} 此刻正在跑{X}"
+                  f"  {D}—— 它们打的是同一个网盘{X}")
+            print(f"  {D}也就是说这一屏测的是「排队排到你没有」。等它们跑完，"
+                  f"或者按最上面那两条命令停掉，再测一次才算数。{X}")
+        else:
+            print(f"  {D}此刻没有后台任务在跑（已经查过了），所以这是源那边真的在限 ——"
+                  f"不是自己打自己。{X}")
     elif _r_403:
         print(f"  {R}✖ 主要卡在【UA】上{X}  {D}{_r_403}/{_r_all} 发是 403{X}")
         print(f"  {D}Emby 每次探测都在这里被拒，条目里一条音视频轨都没有 —— 点开"
