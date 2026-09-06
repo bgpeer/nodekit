@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.72"
+SCRIPT_VERSION = "1.5.73"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7990,7 +7990,24 @@ def print_strm_counts(d, only=None):
                   f"  {DIM}← OpenList 里已经没有这个盘了{RST}")
     except OSError:
         pass
-    print(f"    {pad('合计', 30)}     {BOLD}{total:>5}{RST} 个 strm 文件")
+    # 【剩余网盘也要有一行】它不是一个真实的挂载点，是个开关：没被单独设过路径的盘
+    # 归它管。所以它的数字是【上面那些行里的一部分】，不能计进合计 —— 那会把同一批
+    # 文件数两遍。开着的时候摆出它管着哪几个盘，那才是这一行的价值：用户一眼看出
+    # "我没单独设的那几个盘，现在是不是真的在被扫"。
+    _rest = [mp for mp, _d, _s, _r, _m in openlist_storages(d)
+             if mp and mp != "/" and not _paths_under(explicit_scan_paths(), mp)]
+    if auto_rest_on():
+        _n = sum(strm_count(d, mp) for mp in _rest)
+        print(f"    {pad('♻ 剩余网盘（自动）', 30)}{GREEN}当前：开{RST}"
+              f"　已有 {CYAN}{_n:>5}{RST} 个"
+              + (f"  {DIM}← {'、'.join(_rest[:3])} 归它管{RST}" if _rest
+                 else f"  {DIM}（每个盘都单独设过路径，它没活干）{RST}"))
+    else:
+        print(f"    {pad('♻ 剩余网盘（自动）', 30)}{DIM}当前：关{RST}"
+              + (f"  {DIM}← {'、'.join(_rest[:3])} 没设路径，也就不会被扫{RST}"
+                 if _rest else ""))
+    print(f"    {pad('合计', 30)}     {BOLD}{total:>5}{RST} 个 strm 文件"
+          f"  {DIM}（剩余网盘那行是上面几行里的一部分，没重复计）{RST}")
 
 
 def do_strm(only=None):
