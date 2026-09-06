@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.78"
+SCRIPT_VERSION = "1.5.79"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -6876,37 +6876,104 @@ def _bluray_discs(root):
     return discs
 
 
-def _bluray_main_stream(strms, tok):
-    """这套原盘的正片：BDMV/STREAM 里【最大】的那个片段。拿不到大小就返回空串。
+# 原盘片段的扩展名。BDMV/STREAM 里除了 .m2ts 还会有 CLIPINF/PLAYLIST 那些索引文件，
+# 它们也是"文件"，不筛一下就会被当成候选（虽然小、排不到最大，但一套原盘要是只剩索引
+# 文件，挑出来的东西根本不能播）。
+DISC_VIDEO_EXT = (".m2ts", ".mts", ".ts", ".mkv", ".mp4", ".m4v")
 
-    【拿不到大小宁可不做】随便挑一个的话，用户点开看到的是三十秒的厂标或菜单动画 ——
-    那比"播不了"更难受，因为它看起来是成功的，人会以为片源就是坏的。
 
-    一套原盘问一次 fs/list 就够（几十个片段都在同一个 STREAM 目录里）。
+def _ol_ls(path, tok):
+    """列一个网盘目录。返回 content 列表；问不到返回 None（【不是空表】）。
+
+    空表和"问不到"必须分得开：空表是"这儿确实没东西"，问不到是"线路不行/超时"。
+    上面挑正片那一步只在真的什么都没有时才放弃，跨境列目录超时不该被当成"没有片段"。
     """
-    by_dir = {}
+    try:
+        r = _ol_api("/api/fs/list", {"path": path, "password": "", "page": 1,
+                                     "per_page": 0, "refresh": False},
+                    tok, timeout=60)
+    except Exception:
+        return None
+    if r.get("code") != 200:
+        return None
+    return (r.get("data") or {}).get("content") or []
+
+
+def _ol_child(path, want, tok):
+    """在网盘目录 path 底下找名字等于 want 的子目录，返回它的【真实大小写】全路径。
+
+    各家网盘（和各套压制组）写的是 BDMV/bdmv、STREAM/stream 都有，硬拼一个大小写
+    过去就会 404。照实取一次名字，比猜省事。
+    """
+    for x in (_ol_ls(path, tok) or []):
+        if str(x.get("name") or "").lower() == want and x.get("is_dir"):
+            return path.rstrip("/") + "/" + x["name"]
+    return ""
+
+
+def _disc_stream_dirs(disc, strms, tok):
+    """这套原盘在【网盘上】的 STREAM 目录（可能不止一个：3D 原盘会有两套）。
+
+    两条路：本地 strm 的目标路径里已经带着真实大小写，能省掉两次列目录；一个 strm
+    都没有时（.m2ts 常常压根生不出 strm）就从本地目录名反推网盘路径，逐层问名字。
+    """
+    out, bdmvs = [], []
     for p in strms:
         try:
             tgt = open(p, encoding="utf-8").read().strip()
         except OSError:
             continue
-        if tgt.startswith("/"):
-            by_dir.setdefault(os.path.dirname(tgt), {})[os.path.basename(tgt)] = tgt
+        if not tgt.startswith("/"):
+            continue
+        parts = [x for x in tgt.strip("/").split("/") if x]
+        low = [x.lower() for x in parts]
+        if "bdmv" not in low:
+            continue
+        i = len(low) - 1 - low[::-1].index("bdmv")
+        bdmv = "/" + "/".join(parts[:i + 1])
+        if low[i + 1:i + 2] == ["stream"]:
+            d2 = bdmv + "/" + parts[i + 1]
+            if d2 not in out:
+                out.append(d2)
+        elif bdmv not in bdmvs:
+            bdmvs.append(bdmv)
+    if not out and not bdmvs and _under(disc, STRM_PATH):
+        # 本地一个 strm 都没有：strm 树去掉前缀就是网盘路径
+        cloud = "/" + os.path.relpath(disc, STRM_PATH).strip("/")
+        b = _ol_child(cloud, "bdmv", tok)
+        if b:
+            bdmvs.append(b)
+    for b in bdmvs:
+        d2 = _ol_child(b, "stream", tok)
+        if d2 and d2 not in out:
+            out.append(d2)
+    return out
+
+
+def _bluray_main_stream(disc, strms, tok):
+    """这套原盘的正片：BDMV/STREAM 里【最大】的那个片段。问不到大小就返回空串。
+
+    【拿不到大小宁可不做】随便挑一个的话，用户点开看到的是三十秒的厂标或菜单动画 ——
+    那比"播不了"更难受，因为它看起来是成功的，人会以为片源就是坏的。
+
+    【候选来自网盘那份清单，不看本地有没有 strm】曾经写成"只在本地已有 strm 的文件名
+    里比大小"，那是错的：AutoFilm 按扩展名生成 strm，.m2ts 不在它的默认表里，一套几十
+    个片段的原盘本地常常只落下一个 strm。于是能进比较的永远只有那一个，函数却一本正经
+    地把它当成"最大的"返回 —— 实测撞到过 BDMV 底下只有 1 个 strm、而网盘那头 00003.m2ts
+    有 20.88 GB。挑错了整棵树还照删不误，正是这段注释要防的那件事。
+
+    一套原盘问一次 fs/list 就够（几十个片段都在同一个 STREAM 目录里）。
+    """
     best, best_size = "", -1
-    for dirn, files in by_dir.items():
-        try:
-            r = _ol_api("/api/fs/list", {"path": dirn, "password": "", "page": 1,
-                                         "per_page": 0, "refresh": False},
-                        tok, timeout=60)
-        except Exception:
-            continue
-        if r.get("code") != 200:
-            continue
-        for x in ((r.get("data") or {}).get("content") or []):
-            n = x.get("name")
-            if n in files and int(x.get("size") or 0) > best_size:
-                best, best_size = files[n], int(x.get("size") or 0)
-    return best
+    for dirn in _disc_stream_dirs(disc, strms, tok):
+        for x in (_ol_ls(dirn, tok) or []):
+            n = str(x.get("name") or "")
+            if x.get("is_dir") or os.path.splitext(n)[1].lower() not in DISC_VIDEO_EXT:
+                continue
+            sz = int(x.get("size") or 0)
+            if sz > best_size:
+                best, best_size = dirn.rstrip("/") + "/" + n, sz
+    return best if best_size > 0 else ""
 
 
 def collapse_bluray_folders(d, quiet=False, only=None):
@@ -6939,7 +7006,9 @@ def collapse_bluray_folders(d, quiet=False, only=None):
     done, stuck = 0, []
     for disc, strms in sorted(discs.items()):
         name = os.path.basename(disc.rstrip("/")) or "BluRay"
-        main = _bluray_main_stream(strms, tok) if strms else ""
+        # 【strms 为空也要试】原盘的 .m2ts 常常一个 strm 都生不出来，那种恰恰是最
+        # 需要压的 —— 以前这里直接判死，等于把最典型的一类原盘漏在外面。
+        main = _bluray_main_stream(disc, strms, tok)
         if not main:
             stuck.append(name)
             continue
