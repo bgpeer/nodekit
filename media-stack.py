@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.67"
+SCRIPT_VERSION = "1.5.68"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -726,6 +726,50 @@ def scan_task_id(path):
     return t
 
 
+# 【"关"＝一个永远不到的日期】2 月 30 日。APScheduler 实测：get_next_fire_time 返回
+# None，不报错。比留空或删掉 cron 键安全 —— 后者要赌 AutoFilm 的解析器怎么处理缺字段。
+NEVER_CRON = "0 0 0 30 2 *"
+
+
+def autofilm_tz_shift():
+    """AutoFilm 调度器的时钟比北京时间【慢】多少分钟。读不到返回 None。
+
+    【不能用容器里的 date】它认 TZ 环境变量，而 AutoFilm 没读到 TZ 时会回落到 UTC，
+    两者能差好几个小时（实测 date 说 19:57、调度器认为是 11:56）。所以拿调度器自己
+    打在日志里的时间去比 —— 那才是 cron 真正用的那个时钟。
+
+    四舍五入到 15 分钟：时区偏移都是 15 分钟的整数倍，这样能把读数的一分钟抖动抹掉。
+    """
+    hm = autofilm_clock()
+    if hm is None:
+        return None
+    bj = time.gmtime(time.time() + 8 * 3600)
+    d = (bj.tm_hour * 60 + bj.tm_min) - (hm[0] * 60 + hm[1])
+    d = ((d + 720) % 1440) - 720          # 折到 -12h..+12h，跨日也对
+    return int(round(d / 15.0)) * 15
+
+
+def cron_to_bj(cron, shift):
+    """cron（调度器时钟）里的每天几点 → 北京时间 "HH:MM"。不是每天型就返回 None。"""
+    p = str(cron or "").split()
+    if len(p) != 6 or not (p[1].isdigit() and p[2].isdigit()):
+        return None
+    t = (int(p[2]) * 60 + int(p[1]) + (shift or 0)) % 1440
+    return f"{t // 60:02d}:{t % 60:02d}"
+
+
+def bj_to_cron(hh, mm, shift):
+    """北京时间 → cron 字符串（调度器时钟）。"""
+    t = (hh * 60 + mm - (shift or 0)) % 1440
+    return f"0 {t % 60} {t // 60} * * *"
+
+
+def strm_cron_global():
+    """全局定时。【先读状态文件】—— 有了按盘定时之后，从配置里读第一个 cron 拿到的
+       可能是某个盘自己的值，那就不是全局了。"""
+    return ms_state().get("strm_cron_global") or ""
+
+
 def strm_cron_of(path, fallback=None):
     """这条扫描路径该用哪个 cron。按【挂载点】存，一个盘一个。
 
@@ -735,7 +779,7 @@ def strm_cron_of(path, fallback=None):
     """
     m = "/" + strm_mount_dir(path)
     v = (ms_state().get("strm_cron_by_mount") or {}).get(m)
-    return v or fallback or DEFAULT_STRM_CRON
+    return v or strm_cron_global() or fallback or DEFAULT_STRM_CRON
 
 
 def set_strm_cron(mount, hours):
@@ -748,13 +792,23 @@ def set_strm_cron(mount, hours):
     save_ms_state(strm_cron_by_mount=cur)
 
 
+def cron_desc(v, shift=None):
+    """一条 cron 说人话：关 / 每 N 小时一次 / 每天几点（北京时间）。"""
+    if not v:
+        return ""
+    if v == NEVER_CRON:
+        return "关"
+    m = re.search(r"\*/(\d+)", v)
+    if m:
+        return f"每 {m.group(1)} 小时一次"      # 这一种不受时区影响
+    bj = cron_to_bj(v, shift)
+    return f"每天 {bj}" if bj else v
+
+
 def strm_cron_desc(mount):
     """这个盘的定时，一句话。给菜单那一列用。"""
     v = (ms_state().get("strm_cron_by_mount") or {}).get(mount)
-    if not v:
-        return "跟全局"
-    m = re.search(r"\*/(\d+)", v)
-    return f"每 {m.group(1)} 小时一次" if m else v
+    return cron_desc(v, autofilm_tz_shift()) if v else "跟全局"
 
 
 def openlist_public_url(cfg):
@@ -4658,15 +4712,30 @@ def build_summary(cfg, colored=True):
 
 
 def cron_human(cron):
-    """把 6 位 cron 说成人话：'0 15 5 * * *' → '每天 05:15（北京时间）'。
+    """把 AutoFilm 的 6 位 cron 说成人话，时刻换算成北京时间。
 
-    时刻按哪个时区解释最容易被误解（调度器钉在北京时间，不是服务器本地时区），所以时区
-    必须跟着时刻一起显示，不能只报一个 05:15。看不懂的格式就原样打出来，不猜。
+    【原来这里假定"调度器钉在北京时间"，那是错的】autofilm_clock 的注释就写着：
+    AutoFilm 读不到 TZ 时会回落到 UTC。所以 cron 里那个 05:15 在 UTC 时钟上是
+    北京时间 13:15 —— 体检照着原值报「每天 05:15（北京时间）」，差了整整八小时，
+    而用户完全没法从屏幕上看出来。
+
+    改成拿调度器【自己打在日志里的时间】反推偏移再换算（见 autofilm_tz_shift）。
+    读不到偏移就【不说是哪个时区】—— 报一个可能错八小时的"北京时间"，比说
+    "换算不出来"坏得多。
     """
     p = cron.split()
+    if cron.strip() == NEVER_CRON:
+        return "不自动扫描（要手动点「5 生成媒体库」）"
+    m = re.search(r"\*/(\d+)", cron)
+    if m and len(p) == 6:
+        return f"每 {m.group(1)} 小时一次"          # 这一种不受时区影响
     if len(p) == 6 and p[3] == p[4] == p[5] == "*" and all(x.isdigit() for x in p[:3]):
-        return f"每天 {int(p[2]):02d}:{int(p[1]):02d}（北京时间）"
-    return f"{cron}   {DIM}(6 位 cron，按北京时间){RST}"
+        sh = autofilm_tz_shift()
+        if sh is None:
+            return (f"每天 {int(p[2]):02d}:{int(p[1]):02d}"
+                    f"　{DIM}(按 AutoFilm 自己的时钟，此刻读不到它是哪个时区){RST}")
+        return f"每天 {cron_to_bj(cron, sh)}（北京时间）"
+    return f"{cron}   {DIM}(6 位 cron){RST}"
 
 
 def openlist_storages(d):
@@ -5053,7 +5122,10 @@ def rebuild_cfg_from_disk(d):
     # 【用 effective 而不是 resolve】单独设过的盘 + 剩余自动，见 effective_scan_paths。
     # 生成 autofilm 配置的就是这个值，所以"剩余网盘"开关必须在这里生效。
     cfg["scan_paths"] = effective_scan_paths(d)
-    cfg["strm_cron"]    = read_yaml_scalar(af, "cron", DEFAULT_STRM_CRON)
+    # 【先读状态文件】有了按盘定时之后，配置里第一个 cron 可能是某个盘自己的值，
+    # 拿它当全局会把别的盘一起带偏
+    cfg["strm_cron"]    = (strm_cron_global()
+                           or read_yaml_scalar(af, "cron", DEFAULT_STRM_CRON))
     # 只迁移「没被动过的旧默认值」：以前默认 0 0 5 * * *，而 AutoFilm 当时按 UTC 解释，
     # 对国内用户等于下午一点多在跑。现在调度器钉在北京时间、默认值改成 05:15，
     # 老机器更新时顺手带过去。用户自己改过 cron 的一律保持原样，不越俎代庖。
@@ -10538,19 +10610,78 @@ def _drive_menu(d, mp, drv):
             print("无效选择。")
 
 
-def _scan_menu(d, mount, label=""):
-    """一个盘的「生成媒体库」：立即扫一次 / 改这个盘的定时。
+def _apply_autofilm_cron(d):
+    """把改过的定时写进 AutoFilm 配置并重启 —— 它是启动时把 cron 读进内存的。"""
+    try:
+        cfg2 = rebuild_cfg_from_disk(d)
+        write_atomic(os.path.join(d, "autofilm", "config", "config.yaml"),
+                     gen_autofilm_conf(cfg2))
+        subprocess.run(["docker", "restart", "autofilm"],
+                       capture_output=True, timeout=120)
+        ok("AutoFilm 配置已更新并重启")
+        return True
+    except Exception as e:
+        warn(f"写 AutoFilm 配置失败：{_short_err(e)}")
+        print(f"  {DIM}跑一次「7 更新」也会重新生成。{RST}")
+        return False
 
-    【只管单个盘】"扫全部"归主菜单的「5 生成媒体库」——两个入口做同一件事，
-    只会让人问"这俩有什么区别"。
+
+def _global_cron_menu(d):
+    """改全局定时：每天几点（北京时间），0 = 关。
+
+    【必须换算时区】AutoFilm 调度器用它自己那个时钟，和容器里的 date 能差好几个小时。
+    照北京时间直接写进 cron，触发时刻整个错开，表现是"设了没反应"。见 autofilm_tz_shift。
+    """
+    shift = autofilm_tz_shift()
+    if shift is None:
+        warn("读不到 AutoFilm 的时钟，没法把北京时间换算成它认的时刻。")
+        print(f"  {DIM}它要跑起来一会儿才会在日志里打时间。等几分钟再来，"
+              f"或者 docker restart autofilm 之后再试。{RST}")
+        return
+    print()
+    print(f"  {DIM}填每天几点扫，北京时间，像 05:15 或 5.15 都认。0 = 关掉自动扫描"
+          f"（还可以随时手动点「立即扫描」）。{RST}")
+    print(f"  {DIM}挑个没人看片的时刻 —— 扫库和播放抢的是同一个网盘账号。{RST}")
+    v = ask("每天几点（北京时间）", "").strip()
+    if not v:
+        print("没有改动。")
+        return
+    if v == "0":
+        save_ms_state(strm_cron_global=NEVER_CRON)
+        ok("自动扫描已关闭　新片子要靠手动点「立即扫描」才进库")
+        _apply_autofilm_cron(d)
+        return
+    m = re.match(r"^(\d{1,2})[:.：]?(\d{2})$", v)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        print("看不懂这个时刻（要 0-23 时、0-59 分，像 05:15），没有改动。")
+        return
+    cron = bj_to_cron(int(m.group(1)), int(m.group(2)), shift)
+    save_ms_state(strm_cron_global=cron)
+    ok(f"全局定时：每天 {int(m.group(1)):02d}:{m.group(2)}（北京时间）")
+    print(f"  {DIM}写进配置的是 {cron}"
+          f"　—— AutoFilm 的时钟比北京时间{'慢' if shift >= 0 else '快'} "
+          f"{abs(shift) // 60} 小时{abs(shift) % 60} 分，已经换算过{RST}")
+    _apply_autofilm_cron(d)
+
+
+def _scan_menu(d, mount=None, label=""):
+    """「生成媒体库」：立即扫一次 / 改定时。
+
+    mount 给了就是【那一个盘】，没给就是【所有网盘】—— 两层结构一样，用户在盘里学会
+    的那一套，到主菜单这里照用。
     """
     while True:
+        cur = (strm_cron_desc(mount) if mount
+               else (cron_desc(strm_cron_global(), autofilm_tz_shift())
+                     or f"每天 {cron_to_bj(DEFAULT_STRM_CRON, autofilm_tz_shift()) or '05:15'}"))
         print("\n" + "-" * 60)
-        print(f"  {BOLD}生成媒体库{RST}   {CYAN}{label or mount}{RST}")
+        print(f"  {BOLD}生成媒体库{RST}   {CYAN}{label or mount or '所有网盘'}{RST}")
         print("-" * 60)
-        print(f"  1. 立即扫描{DIM}    只扫这个盘，别的盘一个目录都不列{RST}")
-        print(f"  2. 定时扫描{DIM}（0=跟全局）{RST}    "
-              f"当前：{CYAN}{strm_cron_desc(mount)}{RST}")
+        print(f"  1. 立即扫描"
+              + (f"{DIM}    只扫这个盘，别的盘一个目录都不列{RST}" if mount
+                 else f"{DIM}    所有盘扫一遍{RST}"))
+        print(f"  2. 定时扫描{DIM}（0={'跟全局' if mount else '关'}）{RST}    "
+              f"当前：{CYAN}{cur}{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -10559,6 +10690,8 @@ def _scan_menu(d, mount, label=""):
         if c == "1":
             do_strm(only=mount)
             ask("\n按回车返回...")
+        elif c == "2" and not mount:
+            _global_cron_menu(d)
         elif c == "2":
             print()
             print(f"  {DIM}填每几小时扫一次（1-24）。0 = 不单独设，跟全局那个定时走。{RST}")
@@ -10570,18 +10703,7 @@ def _scan_menu(d, mount, label=""):
                 continue
             set_strm_cron(mount, int(v))
             ok(f"{mount} 的扫描定时：{strm_cron_desc(mount)}")
-            # 【配置要重写，不然改的只是状态文件】AutoFilm 是启动时把 cron 读进内存的，
-            # 所以还要重启它才真的换过来。
-            try:
-                cfg2 = rebuild_cfg_from_disk(d)
-                p = os.path.join(d, "autofilm", "config", "config.yaml")
-                write_atomic(p, gen_autofilm_conf(cfg2))
-                subprocess.run(["docker", "restart", "autofilm"],
-                               capture_output=True, timeout=120)
-                ok("AutoFilm 配置已更新并重启")
-            except Exception as e:
-                warn(f"写 AutoFilm 配置失败：{_short_err(e)}")
-                print(f"  {DIM}跑一次「7 更新」也会重新生成。{RST}")
+            _apply_autofilm_cron(d)
         else:
             print("无效选择。")
 
@@ -10672,7 +10794,7 @@ def mount_paths_menu():
         # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
         # 装完那一刻网盘还没挂，没有它就是死局（见 do_strm 的说明）。
         # 两个入口做同一件事，只会让人问"这俩有什么区别"。
-        print(f"  {DIM}   单个盘点进去有「生成媒体库」；"
+        print(f"  {DIM}   单个盘点进去有「生成媒体库」（立即扫 / 定时）；"
               f"全部一起扫在主菜单的「5 生成媒体库」{RST}")
 
         # 返回也要占一行。这一屏原来只在提示里写「0 = 返回」，而别的每一屏
@@ -13173,7 +13295,7 @@ def main_menu():
         elif c == "4":
             mount_paths_menu()
         elif c == "5":
-            do_strm()
+            _scan_menu(ms_install_dir())
         elif c == "6":
             do_healthcheck()
         elif c == "7":
