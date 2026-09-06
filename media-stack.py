@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.66"
+SCRIPT_VERSION = "1.5.67"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10538,20 +10538,19 @@ def _drive_menu(d, mp, drv):
             print("无效选择。")
 
 
-def _scan_menu(d, mount=None, label=""):
-    """「生成媒体库」子菜单：立即扫一次 / 改这个盘的定时。
+def _scan_menu(d, mount, label=""):
+    """一个盘的「生成媒体库」：立即扫一次 / 改这个盘的定时。
 
-    mount 为 None 时管的是【所有网盘】—— 那一档只有"立即扫描"，定时仍归全局那个值
-    （装的时候问过，改它要重写 AutoFilm 配置里所有任务，不该藏在这一层）。
+    【只管单个盘】"扫全部"归主菜单的「5 生成媒体库」——两个入口做同一件事，
+    只会让人问"这俩有什么区别"。
     """
     while True:
         print("\n" + "-" * 60)
-        print(f"  {BOLD}生成媒体库{RST}   {CYAN}{label or '所有网盘'}{RST}")
+        print(f"  {BOLD}生成媒体库{RST}   {CYAN}{label or mount}{RST}")
         print("-" * 60)
-        print("  1. 立即扫描")
-        if mount:
-            print(f"  2. 定时扫描{DIM}（0=跟全局）{RST}    "
-                  f"当前：{CYAN}{strm_cron_desc(mount)}{RST}")
+        print(f"  1. 立即扫描{DIM}    只扫这个盘，别的盘一个目录都不列{RST}")
+        print(f"  2. 定时扫描{DIM}（0=跟全局）{RST}    "
+              f"当前：{CYAN}{strm_cron_desc(mount)}{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -10560,7 +10559,7 @@ def _scan_menu(d, mount=None, label=""):
         if c == "1":
             do_strm(only=mount)
             ask("\n按回车返回...")
-        elif c == "2" and mount:
+        elif c == "2":
             print()
             print(f"  {DIM}填每几小时扫一次（1-24）。0 = 不单独设，跟全局那个定时走。{RST}")
             print(f"  {DIM}扫得勤，新片进库快，但每一轮都要跟播放抢同一个网盘账号 ——"
@@ -10669,8 +10668,13 @@ def mount_paths_menu():
             print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 30)}{col}{where}{RST}")
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
-        print(f"  {len(stores) + 2:>2}. {pad('所有网盘生成媒体库', 24)}"
-              f"{DIM}扫全部，一个盘一个盘地扫用上面各自的{RST}")
+        # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
+        # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
+        # 装完那一刻网盘还没挂，没有它就是死局（见 do_strm 的说明）。
+        # 两个入口做同一件事，只会让人问"这俩有什么区别"。
+        print(f"  {DIM}   单个盘点进去有「生成媒体库」；"
+              f"全部一起扫在主菜单的「5 生成媒体库」{RST}")
+
         # 返回也要占一行。这一屏原来只在提示里写「0 = 返回」，而别的每一屏
         # 都是列成 "0. 返回" —— 同一套菜单里两种写法，回车能不能退出还得试。
         # 编号宽度跟上面的条目对齐（上面用的是 {i:>2}）。
@@ -10679,12 +10683,10 @@ def mount_paths_menu():
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 2:
+        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 1:
             print("无效选择。")
             continue
-        if int(c) == len(stores) + 2:
-            _scan_menu(d)
-        elif int(c) == len(stores) + 1:
+        if int(c) == len(stores) + 1:
             _rest_menu(d)
         else:
             mp, drv, _st = stores[int(c) - 1]
