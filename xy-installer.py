@@ -1905,6 +1905,20 @@ def _sr_country_groups(names_list, existing=()):
             gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f",{g}" for g in gnames)
 
+def _sr_fill_names(tpl, frag):
+    """展开 __XY_NAMES__（国家组名），但跳过该行已经写死的名字。
+
+       为什么要按行去重：模板可以把常见国家组直接写进成员列表（现在的小火箭模板
+       就是这么写的，配 policy-regex-filter 让客户端自己收拢节点）。这种组
+       _sr_country_groups 不会重复生成，但仍会把名字放进 frag——它得指向模板里的
+       同名组。这时全局 replace 会让同一行出现两遍同一个组。按行去重之后：
+       模板写死的照旧，只有模板里没有的国家（英国、德国、🎲其他随机…）才追加进去。"""
+    names = [n for n in frag.split(",") if n]
+    def one(line):
+        add = "".join(f",{n}" for n in names if n not in line)
+        return line.replace("__XY_NAMES__", add)
+    return re.sub(r"(?m)^.*__XY_NAMES__.*$", lambda m: one(m.group(0)), tpl)
+
 def build_shadowrocket_sub(nodes, tpl_url):
     lines, names_list = [], []
     for key, d in nodes:
@@ -1924,7 +1938,7 @@ def build_shadowrocket_sub(nodes, tpl_url):
     out = tpl
     out = _fill_block(out, "__XY_NODES__", "\n".join(lines))    # 块锚点整行替换，缩进容错
     out = _fill_block(out, "__XY_GROUPS__", groups_txt)
-    out = out.replace("__XY_NAMES__", names_frag)               # 行内锚点
+    out = _sr_fill_names(out, names_frag)                       # 行内锚点（按行去重）
     open(SR_FILE, "w").write(out)
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
