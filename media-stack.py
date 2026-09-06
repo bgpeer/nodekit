@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.68"
+SCRIPT_VERSION = "1.5.69"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8044,7 +8044,11 @@ def do_strm(only=None):
         # 通知 Emby 扫描全在其余任务还在生成的时候执行，Emby 看到的是半成品。
         # 任务数从 AutoFilm 【自己的配置】数，不从脚本的 cfg 猜 —— 那才是它真正会跑几个任务，
         # 而且 do_strm 这个位置根本没有 cfg。
-        want_tasks = max(1, len(read_yaml_all(cfg_path, "source_dir")))
+        # 【只扫一个盘时不能数配置里的全部任务】那会让它去等另外两个盘 —— 而这一轮
+        # 只有这个盘的 cron 被改成"马上触发"，那两个根本不会跑。实测就撞上了：夸克
+        # 1 分 7 秒扫完，屏上却一直卡在「已完成 1/3」，直到软截止才走人。
+        want_tasks = (len(ids) if ids
+                      else max(1, len(read_yaml_all(cfg_path, "source_dir"))))
         done_lines, early = [], False
         started, last, shown, quiet_since = False, "", "", time.monotonic()
         t_started = 0.0                  # AutoFilm 真正动起来那一刻，用来拆时间
@@ -8056,6 +8060,10 @@ def do_strm(only=None):
             lines = out.splitlines()
             for ln in lines:
                 if "Alist2Strm 任务完成" in ln and ln not in done_lines:
+                    # 只扫一个盘时，别的盘（定时正好到点）那行"完成"不算数 ——
+                    # 算进去会让这一轮提前收工，而这个盘其实还没扫完
+                    if ids and not any(f"task_id={t}" in ln for t in ids):
+                        continue
                     done_lines.append(ln)
             if len(done_lines) >= want_tasks:
                 done = "\n".join(done_lines)
@@ -8103,6 +8111,12 @@ def do_strm(only=None):
                 if want_tasks > 1:
                     fin = set(re.findall(r"task_id=(\S+)", "\n".join(done_lines)))
                     run = [t for t in re.findall(r"task_id=(\S+)", out) if t not in fin]
+                    # 【容器一重启，AutoFilm 会把所有任务登记一遍】那些登记行里也带
+                    # task_id，不筛的话另外两个盘会以"…还在跑"的样子挂在屏上，
+                    # 而这一轮它们压根没被触发
+                    if ids:
+                        fin = {t for t in fin if t in ids}
+                        run = [t for t in run if t in ids]
                     seen_run = list(dict.fromkeys(run))[:4]
                     bits = [f"{GREEN}✔{RST}{DIM}{t}{RST}" for t in sorted(fin)]
                     bits += [f"{YELLOW}…{RST}{DIM}{t}{RST}" for t in seen_run]
