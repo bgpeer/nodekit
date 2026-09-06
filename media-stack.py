@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.69"
+SCRIPT_VERSION = "1.5.70"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2935,8 +2935,15 @@ def episode_no(name):
 
     只认【第一段独立的数字】：「231 4K」→ 231，「第154集」→ 154。分辨率那种数字必须
     躲开 —— 「4K」「1080p」「2160p」先删掉再找，否则「231 4K」会被抠成 4。
+
+    【SxxExx 要先认，不然取到的是季号】「S01E155」按"第一段数字"取到的是 01 —— 季号。
+    而这种命名和「156 4K」在同一个目录里【混着出现】（用户网盘实测），一旦脚本接管
+    命名，S01E155 会被写成第 1 集，和真正的第 1 集撞在一起。
     """
     s = re.sub(r"(?i)\b\d{3,4}[pi]\b|\b[248]k\b", " ", name)
+    m = re.search(r"(?i)s\d{1,2}\s*[\s._-]?\s*e\s*(\d{1,4})", s)
+    if m:
+        return int(m.group(1))
     m = re.search(r"\d{1,4}", s)
     return int(m.group()) if m else 0
 
@@ -3043,6 +3050,30 @@ def episode_title_from_name(stem, ep, show=""):
     return got or f"第{int(ep)}集"
 
 
+# 「整条标题就是一个集号」——第157集 / 157 / E157 / EP157 / S01E157，都算占位符。
+# 【必须整条匹配】只在标题【从头到尾】就是这么一个东西时才算；「第157集 断东河」
+# 那种带着真名的一个字都不能碰。
+EP_PLACEHOLDER = re.compile(r"(?i)^\s*(?:第\s*(\d{1,4})\s*[集话話]"
+                            r"|e[.\s]?p?\s*(\d{1,4})"
+                            r"|s\d{1,2}\s*e\s*(\d{1,4})"
+                            r"|(\d{1,4}))\s*$")
+
+
+def _wrong_ep_placeholder(name, index):
+    """标题是个集号占位符，而那个号和条目的集号对不上 → 这名字一定是错的。
+
+    刮削源里这种错数据是真实存在的（实测 TMDb 给第 157 集的标题是「第57集」）。
+    号对得上的占位符【不算错】—— 那只是这一集本来就没有正式标题，重起也是同一个。
+    """
+    if not index:
+        return False
+    m = EP_PLACEHOLDER.match(str(name or ""))
+    if not m:
+        return False
+    n = next((g for g in m.groups() if g), None)
+    return n is not None and int(n) != int(index)
+
+
 def untitled_episodes(d, rules, key, items=None):
     """标题栏里放的还是文件名、刮削器给的真剧集名一直没进来的条目。
 
@@ -3054,6 +3085,16 @@ def untitled_episodes(d, rules, key, items=None):
 
     只认【和文件名一模一样】的。带着我们自己写的编号 nfo 的条目不算在内 —— 那些的名字
     由 nfo 给，交给刮削器重新识别只会把季集编号一起换掉。
+
+    【还有一种：标题是个带着错号的占位符】实测撞到过：
+
+        S1E156  名字=第156集   文件=156 4K.strm    ✓
+        S1E157  名字=第57集    文件=157 4K.strm    ✗
+
+    「第57集」不等于文件名「157 4K」，所以上面那条判据把它当成【刮削器给的真名】放过了。
+    可它根本不是名字，是个【号写错了的占位符】—— 刮削源那条数据本身就错。
+    判据故意收得很紧：整条标题就是一个纯集号（第N集 / EN / SxxEyy）而那个 N 和条目的
+    集号对不上，才算。「断东河·吴」这种真名一个字都不碰。
     """
     if items is None:
         items = _episode_items(key)
@@ -3077,7 +3118,7 @@ def untitled_episodes(d, rules, key, items=None):
             continue
         stems = {os.path.splitext(os.path.basename(p))[0].strip(),
                  cloud_name_stem(hp).strip()}
-        if name in stems:
+        if name in stems or _wrong_ep_placeholder(name, i.get("IndexNumber")):
             out[hp] = i.get("Id")
     return out
 
