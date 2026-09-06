@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.77"
+SCRIPT_VERSION = "1.5.78"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11833,7 +11833,34 @@ def warm_links(d, key, limit=None):
     return done, len(cut)
 
 
-def probe_302(key, own_host="", want_kind=""):
+def probe_302_items(key, mounts, cap=2000):
+    """给每个挂载点各挑一个 strm 条目出来。返回 {挂载点: 条目}。
+
+    【必须一个盘一个】只挑一部片去测，等于拿它代表整套 —— 而各个盘的链路形态两两
+    不同（CDN 直链 / 本机代理 / 转码流），一个结论盖多种形态，必然有几种是错的。
+    """
+    want, got, start = set(mounts), {}, 0
+    while len(got) < len(want) and start < cap:
+        try:
+            d = _emby(f"/Items?Recursive=true&StartIndex={start}&Limit=200"
+                      f"&IncludeItemTypes=Movie,Episode&Fields=Path", key)
+        except Exception:
+            break
+        items = d.get("Items") or []
+        if not items:
+            break
+        for i in items:
+            p = str(i.get("Path") or "")
+            if not _under(p, STRM_PATH):
+                continue
+            m = "/" + p[len(STRM_PATH):].lstrip("/").split("/")[0]
+            if m in want and m not in got:
+                got[m] = i
+        start += len(items)
+    return got
+
+
+def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
     """真的发一次播放请求，看 MediaWarp 到底回不回 302、302 到哪。
 
     这是整套东西唯一的端到端证明。前面那些检查（存储 work、能换到直链）都只说明"零件是好
@@ -11844,17 +11871,26 @@ def probe_302(key, own_host="", want_kind=""):
     strm 改成 URL 形式之后这里【多了一跳】：MediaWarp 302 到的是 OpenList 的公网地址，播放器
     要再跟一次才到网盘 CDN，所以拿到第一跳之后还要再跟一次 —— 否则「302 → 自己的域名」看起来
     像成功，实际上可能第二跳就死了。返回 (state, 说明)。
+
+    【proxied 决定第二跳怎么判】本机代理的盘（WebDAV 源、本地目录，或手动切成本机代理的）
+    在网盘侧根本没有 CDN 直链，字节本来就该从 OpenList 出来、【不会再跳一次】。曾经不分
+    青红皂白把"第二跳返回 200"报成故障，那是把一个【设计如此】的状态说成坏了 —— 用户会
+    去改本来就对的配置。
+
+    item 给定时就测那一部，不给才自己挑 —— 按盘各测一次靠的就是它。
     """
     if not key:
         return "skip", "没有 Emby API Key"
-    try:
-        u = (f"http://127.0.0.1:8096/Items?Recursive=true&Limit=8"
-             f"&IncludeItemTypes=Movie,Episode&Fields=Path&api_key={key}")
-        with urllib.request.urlopen(u, timeout=20) as resp:
-            items = (json.load(resp).get("Items") or [])
-    except Exception as e:
-        return "skip", f"取不到媒体条目（{_short_err(e)}）"
-    item = next((i for i in items if _under(str(i.get("Path", "")), STRM_PATH)), None)
+    if item is None:
+        try:
+            u = (f"http://127.0.0.1:8096/Items?Recursive=true&Limit=8"
+                 f"&IncludeItemTypes=Movie,Episode&Fields=Path&api_key={key}")
+            with urllib.request.urlopen(u, timeout=20) as resp:
+                items = (json.load(resp).get("Items") or [])
+        except Exception as e:
+            return "skip", f"取不到媒体条目（{_short_err(e)}）"
+        item = next((i for i in items
+                     if _under(str(i.get("Path", "")), STRM_PATH)), None)
     if not item:
         return "skip", "媒体库里还没有网盘条目"
 
@@ -11897,6 +11933,13 @@ def probe_302(key, own_host="", want_kind=""):
         if own_host and bare == own_host:
             try:
                 with _open(loc, 60) as r2:
+                    # 【本机代理的盘就该停在这儿】它在网盘侧没有 CDN 直链，字节从
+                    # OpenList 出来是它唯一的路。报成故障会让人去改本来就对的配置。
+                    if proxied:
+                        return "ok", (f"302 → {bare} → {GREEN}本机代理出字节{RST}"
+                                      f"  {DIM}HTTP {r2.status}；这个盘在网盘侧没有 "
+                                      f"CDN 直链，这就是它的正常形态（视频过本机带宽）"
+                                      f"{RST}")
                     return "bad", (f"302 → {bare} 之后没有再跳转（HTTP {r2.status}）"
                                    f"  {RED}视频会经过本机{RST}")
             except urllib.error.HTTPError as e2:
@@ -12677,8 +12720,24 @@ def do_healthcheck():
             + (f"  {DIM}按 {'、'.join(_shortest)} 的直链有效期定的{RST}"
                if _shortest else f"  {DIM}没有短命直链的盘{RST}"))
 
-    st302, msg302 = probe_302(key, own_host, _want)
-    _hc("302 直链", st302, msg302)
+    # 【按盘各测一次】各个盘的链路形态两两不同（CDN 直链 / 本机代理 / 转码流），
+    # 只测一部片再拿它代表整套，必然有几种形态被判错 —— 实测就撞上了：七米蓝是
+    # 本机代理，"第二跳不再跳转"是它的正常形态，却被报成故障。
+    _proxied = {mp: (_truthy(cols.get("web_proxy"))
+                     or str(drv or "").lower() in PROXY_ONLY_DRIVERS)
+                for _s, mp, drv, _a, cols in _storage_rows(d)}
+    _pick = probe_302_items(key, list(_proxied)) if key and _proxied else {}
+    st302, msg302 = "skip", ""
+    for _mp in sorted(_pick):
+        _s1, _m1 = probe_302(key, own_host, _want, item=_pick[_mp],
+                             proxied=_proxied.get(_mp, False))
+        _hc(f"302 直链 {_mp}", _s1, _m1)
+        # 汇总给下面那几条待办用：只要有一个坏的就按坏的走
+        if _s1 == "bad" or (st302 == "skip" and _s1 == "ok"):
+            st302, msg302 = _s1, _m1
+    if not _pick:
+        st302, msg302 = probe_302(key, own_host, _want)
+        _hc("302 直链", st302, msg302)
     if st302 == "bad":
         if "不是 302" in msg302:
             todo.append(("MediaWarp 没有拦截播放请求，视频会经过本机中转",
@@ -12696,7 +12755,16 @@ def do_healthcheck():
                          "CDN 直链，改配置没用；如果所有盘都这样，才是 autofilm 的"
                          "public_url 填成了内部地址，「7 更新」会重新生成"))
         else:
-            todo.append(("302 没生成", "多半是上一行的换直链失败，等线路恢复再试"))
+            # 【别再说"上一行的换直链失败"】那句话在换直链三行全绿时就是自相矛盾。
+            # 走到这一支的多半是第二跳出了状况（上游限流、签名过期、网盘超时），
+            # 而那和"换不到直链"是两回事。
+            # 【别把 ANSI_RE.sub 写进 f-string】里面那对 ASCII 双引号会把整个
+            # f-string 截断，而 py_compile 直到运行到这一行才报 —— 抽出来算。
+            _m302 = ANSI_RE.sub("", msg302)[:60]
+            todo.append((f"有盘的 302 没走通：{_m302}",
+                         "上面那几行「302 直链 <盘>」哪个红就看哪个 —— 各个盘的形态"
+                         "不一样，一个盘坏不代表别的盘也坏。第二跳报 403/429 是上游"
+                         "网盘在挡人或限流，不是这边的配置问题，隔一会儿再跑一次"))
 
     # ---- 直链方式 / 证书 ----
     lms = link_method_storages(d)
