@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.65"
+SCRIPT_VERSION = "1.5.66"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -726,6 +726,37 @@ def scan_task_id(path):
     return t
 
 
+def strm_cron_of(path, fallback=None):
+    """这条扫描路径该用哪个 cron。按【挂载点】存，一个盘一个。
+
+    【只做"每 N 小时"这一种】每天几点那种要换算 AutoFilm 调度器自己的时钟，而那个时钟
+    和容器里的 date 能差好几个小时（见 autofilm_clock 的注释，踩过）。全局那个已经背着
+    这个坑了，按盘再引一次不值得 —— 而"每几小时"不受时区影响，写下去就是对的。
+    """
+    m = "/" + strm_mount_dir(path)
+    v = (ms_state().get("strm_cron_by_mount") or {}).get(m)
+    return v or fallback or DEFAULT_STRM_CRON
+
+
+def set_strm_cron(mount, hours):
+    """给一个盘设「每 N 小时扫一次」；hours 为 0 表示回到全局那个定时。"""
+    cur = dict(ms_state().get("strm_cron_by_mount") or {})
+    if hours:
+        cur[mount] = f"0 0 */{int(hours)} * * *"
+    else:
+        cur.pop(mount, None)
+    save_ms_state(strm_cron_by_mount=cur)
+
+
+def strm_cron_desc(mount):
+    """这个盘的定时，一句话。给菜单那一列用。"""
+    v = (ms_state().get("strm_cron_by_mount") or {}).get(mount)
+    if not v:
+        return "跟全局"
+    m = re.search(r"\*/(\d+)", v)
+    return f"每 {m.group(1)} 小时一次" if m else v
+
+
 def openlist_public_url(cfg):
     """strm 里要写的 OpenList 地址。
 
@@ -889,7 +920,7 @@ def _gen_strm_task(cfg, path):
     # id 和路径都加引号：纯数字的挂载路径（比如 /115）不加引号会被 YAML 读成整数，
     # 路径里带冒号、井号之类的字符也会把这一行拆坏
     return f"""  - id: "{scan_task_id(path)}"
-    cron: "{cfg['strm_cron']}"
+    cron: "{strm_cron_of(path, cfg.get('strm_cron'))}"
     alist: openlist
     source_dir: "{path}"
     target_dir: "{STRM_PATH}/{strm_subpath(path)}"
@@ -7752,8 +7783,38 @@ def autofilm_clock():
     return t.tm_hour, t.tm_min
 
 
-def do_strm():
+def _patch_cron(text, fire, ids=None):
+    """把配置里的 cron 改成 fire。ids 给定时【只改这几个任务】。返回 (新文本, 改了几个)。
+
+    任务块长这样，id 和 cron 是紧挨着的两行（见 _gen_strm_task）：
+        - id: "quark_夸克挂载"
+          cron: "0 15 5 * * *"
+    所以按 id 就能只动某一个盘 —— 别的盘保持它自己的定时，不会被这一下捎带着触发。
+    """
+    n = 0
+
+    def rep(m):
+        nonlocal n
+        if ids is not None and m.group(1) not in ids:
+            return m.group(0)
+        n += 1
+        return f'  - id: "{m.group(1)}"\n{m.group(2)}"{fire}"'
+
+    out = re.sub(r'(?m)^  - id: "([^"]*)"\n(\s*cron:\s*)".*"$', rep, text)
+    if n == 0 and ids is None:
+        # 【退路】配置格式变了（比如手改过缩进）就退回只认 cron 那一行的老写法。
+        # 全部一起扫时这样是安全的；只扫一个盘时不能这么退 —— 那会把所有盘都触发。
+        out, n = re.subn(r'(?m)^(\s*cron:\s*)".*"$',
+                         lambda m: f'{m.group(1)}"{fire}"', text)
+    return out, n
+
+
+def do_strm(only=None):
     """立刻跑一次 strm 生成，跑完顺手让 Emby 扫一次媒体库。
+
+    only 给挂载点（比如 "/quark"）时【只扫那一个盘】。扫描的耗时取决于目录个数：
+    七米蓝 563 个目录要两分多钟，夸克几十个目录几秒钟 —— 为了夸克新加的一集陪着
+    七米蓝一起等，还顺带把它的上游限量配额又打一遍，没有道理。
 
     为什么必须有这个按钮：装完的那一刻网盘还没挂上 —— OpenList 里的存储得用户自己在网页
     里添加，所以安装流程里跑 strm 一定是空的。以前这一步只有命令行 `media-stack strm`，
@@ -7818,7 +7879,8 @@ def do_strm():
         # 只清【这次真要扫的那几个盘】。别的盘的缓存没有理由跟着遭殃 ——
         # 缓存命中的列目录不碰网盘接口，而列目录正是被限流的那一个。
         clear_dir_cache(d, {"/" + m for m in
-                            (strm_mount_dir(p) for p in effective_scan_paths(d)) if m})
+                            (strm_mount_dir(p) for p in effective_scan_paths(d)) if m
+                            and (not only or "/" + m == only)})
     except Exception as e:
         warn(f"清目录缓存失败（不影响扫描，但刚加的片子可能看不见）：{_short_err(e)}")
 
@@ -7835,8 +7897,15 @@ def do_strm():
     # cron，看不出问题；一个网盘一个任务之后，只有排在最前面那个任务被改成
     # "两分钟后触发"，其余的还是原来的凌晨定时 —— 于是永远停在「已完成 1/3」，
     # 剩下两个根本没启动，而界面上看着像是它们卡住了。
-    patched, n_fire = re.subn(r'(?m)^(\s*cron:\s*)".*"$',
-                              lambda m: f'{m.group(1)}"{fire}"', original)
+    ids = None
+    if only:
+        ids = {scan_task_id(p) for p in effective_scan_paths(d)
+               if "/" + strm_mount_dir(p) == only}
+        if not ids:
+            warn(f"{only} 下面一条扫描路径都没有，没什么可扫的。")
+            print(f"  {DIM}先在这个盘的「1 扫描路径」里加一条。{RST}")
+            return
+    patched, n_fire = _patch_cron(original, fire, ids)
     if not n_fire:
         # 还没动过文件就退出，别进 try —— 否则 finally 会白写一次文件
         err("没能改写 cron 那一行，为安全起见没有继续。")
@@ -10441,14 +10510,15 @@ def _drive_menu(d, mp, drv):
         print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}")
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
-        # 数字不进这一行，理由见上一屏同样的地方：右边就是行首的「2.」
+        print(f"  2. 生成媒体库        {DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}")
+        # 数字不进这一行，理由见上一屏同样的地方：右边就是行首的编号
         has_sw = switchable and drive_links(d, mp, drv)
-        print(f"  2. 直链方式          当前：{CYAN}{ch}{RST}"
+        print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}"
               + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"))
-        print(f"  3. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
+        print(f"  4. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
         has115 = "115" in str(drv)
         if has115:
-            print(f"  4. 网盘扫码登录")
+            print(f"  5. 网盘扫码登录")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -10457,11 +10527,62 @@ def _drive_menu(d, mp, drv):
         if c == "1":
             _drive_paths_menu(d, mp)
         elif c == "2":
-            _link_method_menu(d, [mp], driver_cn(drv))
+            _scan_menu(d, mp, f"{driver_cn(drv)} {mp}")
         elif c == "3":
+            _link_method_menu(d, [mp], driver_cn(drv))
+        elif c == "4":
             _title_menu(d, mp)
-        elif c == "4" and has115:
+        elif c == "5" and has115:
             qr115_login()
+        else:
+            print("无效选择。")
+
+
+def _scan_menu(d, mount=None, label=""):
+    """「生成媒体库」子菜单：立即扫一次 / 改这个盘的定时。
+
+    mount 为 None 时管的是【所有网盘】—— 那一档只有"立即扫描"，定时仍归全局那个值
+    （装的时候问过，改它要重写 AutoFilm 配置里所有任务，不该藏在这一层）。
+    """
+    while True:
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}生成媒体库{RST}   {CYAN}{label or '所有网盘'}{RST}")
+        print("-" * 60)
+        print("  1. 立即扫描")
+        if mount:
+            print(f"  2. 定时扫描{DIM}（0=跟全局）{RST}    "
+                  f"当前：{CYAN}{strm_cron_desc(mount)}{RST}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "1":
+            do_strm(only=mount)
+            ask("\n按回车返回...")
+        elif c == "2" and mount:
+            print()
+            print(f"  {DIM}填每几小时扫一次（1-24）。0 = 不单独设，跟全局那个定时走。{RST}")
+            print(f"  {DIM}扫得勤，新片进库快，但每一轮都要跟播放抢同一个网盘账号 ——"
+                  f"限流严的盘（公共 WebDAV 源）别调太勤。{RST}")
+            v = ask("每几小时", "0").strip()
+            if not v.isdigit() or int(v) > 24:
+                print("要填 0-24 的整数，没有改动。")
+                continue
+            set_strm_cron(mount, int(v))
+            ok(f"{mount} 的扫描定时：{strm_cron_desc(mount)}")
+            # 【配置要重写，不然改的只是状态文件】AutoFilm 是启动时把 cron 读进内存的，
+            # 所以还要重启它才真的换过来。
+            try:
+                cfg2 = rebuild_cfg_from_disk(d)
+                p = os.path.join(d, "autofilm", "config", "config.yaml")
+                write_atomic(p, gen_autofilm_conf(cfg2))
+                subprocess.run(["docker", "restart", "autofilm"],
+                               capture_output=True, timeout=120)
+                ok("AutoFilm 配置已更新并重启")
+            except Exception as e:
+                warn(f"写 AutoFilm 配置失败：{_short_err(e)}")
+                print(f"  {DIM}跑一次「7 更新」也会重新生成。{RST}")
         else:
             print("无效选择。")
 
@@ -10548,6 +10669,8 @@ def mount_paths_menu():
             print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 30)}{col}{where}{RST}")
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
+        print(f"  {len(stores) + 2:>2}. {pad('所有网盘生成媒体库', 24)}"
+              f"{DIM}扫全部，一个盘一个盘地扫用上面各自的{RST}")
         # 返回也要占一行。这一屏原来只在提示里写「0 = 返回」，而别的每一屏
         # 都是列成 "0. 返回" —— 同一套菜单里两种写法，回车能不能退出还得试。
         # 编号宽度跟上面的条目对齐（上面用的是 {i:>2}）。
@@ -10556,10 +10679,12 @@ def mount_paths_menu():
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 1:
+        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 2:
             print("无效选择。")
             continue
-        if int(c) == len(stores) + 1:
+        if int(c) == len(stores) + 2:
+            _scan_menu(d)
+        elif int(c) == len(stores) + 1:
             _rest_menu(d)
         else:
             mp, drv, _st = stores[int(c) - 1]
