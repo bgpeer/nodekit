@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.71"
+SCRIPT_VERSION = "1.5.72"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7948,6 +7948,51 @@ def _patch_cron(text, fire, ids=None):
     return out, n
 
 
+def print_strm_counts(d, only=None):
+    """开工前先报清楚：这一趟要动的是哪个盘、里面有多少 strm。
+
+    只报一个总数的话，扫全部时那是个大数（比如 2784），看不出四个盘怎么分 —— 而
+    "哪个盘多大"正是此刻最有用的信息：它直接决定这一趟要等多久（扫描耗时看目录个数）。
+    """
+    print()
+    if only:
+        row = next((r for r in openlist_storages(d) if r[0] == only), None)
+        who = f"{driver_cn(row[1])} {only}" if row else only
+        print(f"  当前媒体库 {BOLD}{who}{RST} 已有 "
+              f"{BOLD}{strm_count(d, only)}{RST} 个 strm 文件")
+        return
+
+    print(f"  {BOLD}当前媒体库{RST}")
+    seen, total = set(), 0
+    for mp, drv, _st, _r, _m in openlist_storages(d):
+        if not mp or mp == "/":
+            continue
+        n = strm_count(d, mp)
+        seen.add(mp.strip("/").split("/")[0])
+        total += n
+        # 【0 也要摆出来】用户点进来常常就是为了确认"我加的路径到底扫没扫到东西"，
+        # 而"一个都没有"正是最需要看见的那一行
+        col = CYAN if n else DIM
+        print(f"    {pad(f'{driver_cn(drv)} {mp}', 30)}已有 {col}{n:>5}{RST} 个")
+    # 【OpenList 里已经没有、本地还留着的盘】那批 strm 是彻底没人管的死文件：
+    # prune 不碰（存储都不在了，问谁去），扫描也不会覆盖。不列出来的话用户
+    # 永远不知道库里还压着这么一批。
+    try:
+        base = os.path.join(strm_root(d), STRM_SUBDIR)
+        for name in sorted(os.listdir(base)):
+            if name in seen or not os.path.isdir(os.path.join(base, name)):
+                continue
+            n = strm_count(d, "/" + name)
+            if not n:
+                continue
+            total += n
+            print(f"    {pad('/' + name, 30)}已有 {YELLOW}{n:>5}{RST} 个"
+                  f"  {DIM}← OpenList 里已经没有这个盘了{RST}")
+    except OSError:
+        pass
+    print(f"    {pad('合计', 30)}     {BOLD}{total:>5}{RST} 个 strm 文件")
+
+
 def do_strm(only=None):
     """立刻跑一次 strm 生成，跑完顺手让 Emby 扫一次媒体库。
 
@@ -7988,7 +8033,7 @@ def do_strm(only=None):
     # 【记下这一趟开工前有哪些】收尾时拿它一减，就知道到底新增/删除了哪几条 ——
     # 有了这份清单才能只让 Emby 过这几条，而不是重扫整个库（见 emby_notify_changes）。
     snap0 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, only)}
-    print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
+    print_strm_counts(d, only)
 
     # 【有人在看片就先问一声】扫库和播放抢的是同一个网盘账号，而夸克风控很严。
     # 实测撞过：AutoFilm 在扫的那两分钟里，同一条路径列目录要 20.5 秒，
