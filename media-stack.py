@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.74"
+SCRIPT_VERSION = "1.5.75"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4364,10 +4364,11 @@ def print_library_targets(d, key, max_rows=14, only=None):
     """
     rows = [r for r in library_targets(d, key) if r[1] <= 3]
     if only:
-        # 只扫一个盘时，别把四个盘的路径全摆出来 —— 这一屏是给"这次动过的东西"
+        # 只扫某几个盘时，别把所有盘的路径全摆出来 —— 这一屏是给"这次动过的东西"
         # 收尾的，别的盘的路径此刻是噪音
-        _c = f"{STRM_PATH}/{only.strip('/').split('/')[0]}"
-        rows = [r for r in rows if _under(r[0], _c) or r[0] == _c]
+        _cs = [f"{STRM_PATH}/{m.strip('/').split('/')[0]}" for m in only_mounts(only)]
+        rows = [r for r in rows
+                if any(_under(r[0], c) or r[0] == c for c in _cs)]
     if not rows:
         print(f"  {BOLD}Emby 媒体库要指向的路径{RST}（容器内路径，不是宿主机路径）：")
         print(f"      {CYAN}{BOLD}{STRM_PATH}{RST}")
@@ -5964,24 +5965,48 @@ def strm_root(d):
                         or os.path.join(d, "media"), "strm")
 
 
-def strm_subtree(d, only=None):
-    """本地 strm 树里属于这个盘的那棵子树；only 为空就是整棵树。
+def strm_subtrees(d, only=None):
+    """本地 strm 树里要处理的那几棵子树的根。only 为空就是整棵树（一个元素）。
 
     【按盘做事的每一步都要从这儿取根】只扫一个盘时，数 strm、压原盘、核对失效、
-    报没收录、列路径 —— 全都只该看这一棵。上一版只把 AutoFilm 那一步限住了，
+    报没收录、列路径 —— 全都只该看这几棵。曾经只把 AutoFilm 那一步限住了，
     收尾照样整库来一遍，其中 prune 还挨个去问了别的盘的上游。
+
+    【为什么是"一串"不是"一个"】「剩余网盘（自动）」管的是一批盘（没单独设过路径的
+    那些），它那个「生成媒体库」要一次扫完它们。只支持单个挂载点的话，这一组就只能
+    去扫全部，把别的大盘一起拖下水。
     """
     if not only:
-        return strm_root(d)
-    m = only.strip("/").split("/")[0]
-    return os.path.join(strm_root(d), STRM_SUBDIR, m) if m else strm_root(d)
+        return [strm_root(d)]
+    ms = [only] if isinstance(only, str) else list(only)
+    out = []
+    for mp in ms:
+        m = str(mp or "").strip("/").split("/")[0]
+        if m:
+            out.append(os.path.join(strm_root(d), STRM_SUBDIR, m))
+    return out or [strm_root(d)]
+
+
+def _walk_subtrees(d, only=None):
+    """把那几棵子树串成一趟 os.walk。"""
+    for root in strm_subtrees(d, only):
+        for t in os.walk(root):
+            yield t
+
+
+def only_mounts(only):
+    """把 only 规整成挂载点列表；空就是空列表（＝全部）。"""
+    if not only:
+        return []
+    return [only] if isinstance(only, str) else [str(x) for x in only]
 
 
 def strm_count(d, only=None):
     """本地已生成的 .strm 数量。0 就意味着 Emby 里一定是空的。"""
     n = 0
-    for _dirpath, _dirnames, files in os.walk(strm_subtree(d, only)):
-        n += sum(1 for f in files if f.endswith(".strm"))
+    for root in strm_subtrees(d, only):
+        for _dirpath, _dirnames, files in os.walk(root):
+            n += sum(1 for f in files if f.endswith(".strm"))
     return n
 
 
@@ -6893,10 +6918,11 @@ def collapse_bluray_folders(d, quiet=False, only=None):
     原盘条目 —— 那等于白做。删的只是本地那几十个几十字节的文本文件，网盘上的原盘
     一个字节都没动，什么时候想还原重新扫一次就有。
     """
-    root = strm_subtree(d, only)
-    if not os.path.isdir(root):
-        return 0, 0
-    discs = _bluray_discs(root)
+    # 【按串走】only 可以是一个盘，也可以是「剩余网盘」那一组的一串盘
+    discs = {}
+    for root in strm_subtrees(d, only):
+        if os.path.isdir(root):
+            discs.update(_bluray_discs(root))
     if not discs:
         return 0, 0
     tok = _ol_token(d)
@@ -7218,7 +7244,7 @@ def strm_inventory(d, only=None):
     only 给挂载点时只看那个盘 —— 见 strm_subtree。
     """
     out = []
-    for dirpath, _dirnames, files in os.walk(strm_subtree(d, only)):
+    for dirpath, _dirnames, files in _walk_subtrees(d, only):
         for fn in files:
             if not fn.endswith(".strm"):
                 continue
@@ -7567,9 +7593,10 @@ def prune_dead_strm(d, budget=None, only=None):
         n += 1
     # 顺手收掉空目录：整理之后旧的目录层级会整层空下来，留着 Emby 里就是一排空文件夹。
     # 深的先删，这样父目录轮到自己时看到的已经是子目录删完之后的状态
-    root = strm_subtree(d, only)
-    for dirpath, _dn, _f in sorted(os.walk(root), key=lambda x: -len(x[0])):
-        if os.path.abspath(dirpath) == os.path.abspath(root):
+    roots = strm_subtrees(d, only)
+    _all = [t for r in roots for t in os.walk(r)]
+    for dirpath, _dn, _f in sorted(_all, key=lambda x: -len(x[0])):
+        if any(os.path.abspath(dirpath) == os.path.abspath(r) for r in roots):
             continue
         try:
             if not os.listdir(dirpath):
@@ -7998,11 +8025,23 @@ def print_strm_counts(d, only=None):
     "哪个盘多大"正是此刻最有用的信息：它直接决定这一趟要等多久（扫描耗时看目录个数）。
     """
     print()
-    if only:
-        row = next((r for r in openlist_storages(d) if r[0] == only), None)
-        who = f"{driver_cn(row[1])} {only}" if row else only
+    _ms = only_mounts(only)
+    if len(_ms) == 1:
+        row = next((r for r in openlist_storages(d) if r[0] == _ms[0]), None)
+        who = f"{driver_cn(row[1])} {_ms[0]}" if row else _ms[0]
         print(f"  当前媒体库 {BOLD}{who}{RST} 已有 "
               f"{BOLD}{strm_count(d, only)}{RST} 个 strm 文件")
+        return
+    if _ms:
+        # 剩余网盘那一组：列出组里每个盘，再给个合计 —— 组里可能有盘一个都没有，
+        # 那一行的 0 正是"我加的路径到底生效没有"的答案
+        print(f"  {BOLD}当前媒体库{RST}{DIM}（♻ 剩余网盘这一组）{RST}")
+        for mp in _ms:
+            row = next((r for r in openlist_storages(d) if r[0] == mp), None)
+            who = f"{driver_cn(row[1])} {mp}" if row else mp
+            n = strm_count(d, mp)
+            print(f"    {pad(who, 30)}已有 {(CYAN if n else DIM)}{n:>5}{RST} 个")
+        print(f"    {pad('合计', 30)}     {BOLD}{strm_count(d, only):>5}{RST} 个")
         return
 
     print(f"  {BOLD}当前媒体库{RST}")
@@ -8122,9 +8161,10 @@ def do_strm(only=None):
     try:
         # 只清【这次真要扫的那几个盘】。别的盘的缓存没有理由跟着遭殃 ——
         # 缓存命中的列目录不碰网盘接口，而列目录正是被限流的那一个。
+        _ms = set(only_mounts(only))
         clear_dir_cache(d, {"/" + m for m in
                             (strm_mount_dir(p) for p in effective_scan_paths(d)) if m
-                            and (not only or "/" + m == only)})
+                            and (not _ms or "/" + m in _ms)})
     except Exception as e:
         warn(f"清目录缓存失败（不影响扫描，但刚加的片子可能看不见）：{_short_err(e)}")
 
@@ -8143,10 +8183,12 @@ def do_strm(only=None):
     # 剩下两个根本没启动，而界面上看着像是它们卡住了。
     ids = None
     if only:
+        _ms = set(only_mounts(only))
         ids = {scan_task_id(p) for p in effective_scan_paths(d)
-               if "/" + strm_mount_dir(p) == only}
+               if "/" + strm_mount_dir(p) in _ms}
         if not ids:
-            warn(f"{only} 下面一条扫描路径都没有，没什么可扫的。")
+            warn(f"{'、'.join(only_mounts(only))} 下面一条扫描路径都没有，"
+                 f"没什么可扫的。")
             print(f"  {DIM}先在这个盘的「1 扫描路径」里加一条。{RST}")
             return
     patched, n_fire = _patch_cron(original, fire, ids)
@@ -10857,14 +10899,16 @@ def _scan_menu(d, mount=None, label=""):
     的那一套，到主菜单这里照用。
     """
     while True:
-        cur = (strm_cron_desc(mount) if mount
+        cur = (strm_cron_desc(only_mounts(mount)[0]) if mount
                else (cron_desc(strm_cron_global(), autofilm_tz_shift())
                      or f"每天 {cron_to_bj(DEFAULT_STRM_CRON, autofilm_tz_shift()) or '05:15'}"))
         print("\n" + "-" * 60)
-        print(f"  {BOLD}生成媒体库{RST}   {CYAN}{label or mount or '所有网盘'}{RST}")
+        print(f"  {BOLD}生成媒体库{RST}   "
+              f"{CYAN}{label or '、'.join(only_mounts(mount)) or '所有网盘'}{RST}")
         print("-" * 60)
         print(f"  1. 立即扫描"
-              + (f"{DIM}    只扫这个盘，别的盘一个目录都不列{RST}" if mount
+              + (f"{DIM}    只扫这{'几个' if len(only_mounts(mount)) > 1 else '个'}盘，"
+                 f"别的盘一个目录都不列{RST}" if mount
                  else f"{DIM}    所有盘扫一遍{RST}"))
         print(f"  2. 定时扫描{DIM}（0={'跟全局' if mount else '关'}）{RST}    "
               f"当前：{CYAN}{cur}{RST}")
@@ -10887,8 +10931,10 @@ def _scan_menu(d, mount=None, label=""):
             if not v.isdigit() or int(v) > 24:
                 print("要填 0-24 的整数，没有改动。")
                 continue
-            set_strm_cron(mount, int(v))
-            ok(f"{mount} 的扫描定时：{strm_cron_desc(mount)}")
+            for _m in only_mounts(mount):
+                set_strm_cron(_m, int(v))
+            ok(f"{'、'.join(only_mounts(mount))} 的扫描定时："
+               f"{strm_cron_desc(only_mounts(mount)[0])}")
             _apply_autofilm_cron(d)
         else:
             print("无效选择。")
@@ -10917,8 +10963,13 @@ def _rest_menu(d):
         print("=" * 60)
         print(f"  1. 自动路径开关      当前："
               + (f"{GREEN}开{RST}" if on else f"{DIM}关{RST}"))
-        print(f"  2. 直链方式          当前：{CYAN}{ch}{RST}")
-        print(f"  3. 片名用哪个        当前："
+        print(f"  2. 生成媒体库        "
+              + (f"{DIM}定时：{RST}{CYAN}{strm_cron_desc(rest[0])}{RST}"
+                 if on and rest else
+                 f"{DIM}自动路径开关是关的，这组盘不会被扫{RST}" if not on
+                 else f"{DIM}没有剩余的盘{RST}"))
+        print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}")
+        print(f"  4. 片名用哪个        当前："
               f"{CYAN}{names.get(title_policy())}{RST}")
         print("  0. 返回")
         print("-" * 60)
@@ -10926,9 +10977,20 @@ def _rest_menu(d):
         if c in ("0", "", "q"):
             return
         if c == "2":
-            _link_method_menu(d, rest, "这些剩余的盘")
+            # 【关着就扫不了】关着时这些盘根本没有扫描任务，触发也没东西可触发。
+            # 直说，比让人点进去看一个空菜单强。
+            if not on:
+                warn("自动路径开关是关的 —— 这组盘没有扫描任务，扫不了。")
+                print(f"  {DIM}先用「1 自动路径开关」打开。{RST}")
+            elif not rest:
+                warn("没有剩余的盘（每个盘都单独设过路径了）。")
+            else:
+                _scan_menu(d, rest, f"♻ 剩余网盘（{len(rest)} 个）")
             continue
         if c == "3":
+            _link_method_menu(d, rest, "这些剩余的盘")
+            continue
+        if c == "4":
             _title_menu(d, None)
             continue
         if c != "1":
