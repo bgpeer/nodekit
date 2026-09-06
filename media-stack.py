@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.70"
+SCRIPT_VERSION = "1.5.71"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4356,13 +4356,18 @@ def library_targets(d, key):
     return out
 
 
-def print_library_targets(d, key, max_rows=14):
+def print_library_targets(d, key, max_rows=14, only=None):
     """把可选路径打成一行一条：几部片、建没建过库、完整路径。
 
     一行一条而不是画树：用户要做的是【把路径复制到 Emby 的文件夹框里】，路径必须完整
     可见。树形 + 单独一行放完整路径行数翻倍，在手机终端上一屏都装不下。
     """
     rows = [r for r in library_targets(d, key) if r[1] <= 3]
+    if only:
+        # 只扫一个盘时，别把四个盘的路径全摆出来 —— 这一屏是给"这次动过的东西"
+        # 收尾的，别的盘的路径此刻是噪音
+        _c = f"{STRM_PATH}/{only.strip('/').split('/')[0]}"
+        rows = [r for r in rows if _under(r[0], _c) or r[0] == _c]
     if not rows:
         print(f"  {BOLD}Emby 媒体库要指向的路径{RST}（容器内路径，不是宿主机路径）：")
         print(f"      {CYAN}{BOLD}{STRM_PATH}{RST}")
@@ -5959,10 +5964,23 @@ def strm_root(d):
                         or os.path.join(d, "media"), "strm")
 
 
-def strm_count(d):
+def strm_subtree(d, only=None):
+    """本地 strm 树里属于这个盘的那棵子树；only 为空就是整棵树。
+
+    【按盘做事的每一步都要从这儿取根】只扫一个盘时，数 strm、压原盘、核对失效、
+    报没收录、列路径 —— 全都只该看这一棵。上一版只把 AutoFilm 那一步限住了，
+    收尾照样整库来一遍，其中 prune 还挨个去问了别的盘的上游。
+    """
+    if not only:
+        return strm_root(d)
+    m = only.strip("/").split("/")[0]
+    return os.path.join(strm_root(d), STRM_SUBDIR, m) if m else strm_root(d)
+
+
+def strm_count(d, only=None):
     """本地已生成的 .strm 数量。0 就意味着 Emby 里一定是空的。"""
     n = 0
-    for _dirpath, _dirnames, files in os.walk(strm_root(d)):
+    for _dirpath, _dirnames, files in os.walk(strm_subtree(d, only)):
         n += sum(1 for f in files if f.endswith(".strm"))
     return n
 
@@ -6753,7 +6771,7 @@ def emby_notify_changes(key, changes, timeout=90, quiet=False):
     return False
 
 
-def strm_not_in_emby(d, key):
+def strm_not_in_emby(d, key, only=None):
     """本地有 strm、Emby 却没收进去的文件。返回容器内路径列表。
 
     这是整套东西里最难自查的一类失败：文件在网盘上、strm 生成了、媒体库路径也没填错，Emby
@@ -6768,7 +6786,7 @@ def strm_not_in_emby(d, key):
     if known is None or not known:
         return []                      # 一个都没有多半是库还没建，那是另一回事
     missing = []
-    for hp, _tgt in strm_inventory(d):
+    for hp, _tgt in strm_inventory(d, only):
         cp = _strm_container_path(d, hp)
         if cp and cp not in known:
             missing.append(cp)
@@ -6831,7 +6849,7 @@ def _bluray_main_stream(strms, tok):
     return best
 
 
-def collapse_bluray_folders(d, quiet=False):
+def collapse_bluray_folders(d, quiet=False, only=None):
     """把蓝光原盘目录压成一个 strm。返回 (处理了几套, 还没处理的几套)。
 
     【为什么这件事必须做，而不是提醒一下就算】原盘不是一个文件，是一整棵目录树：
@@ -6850,7 +6868,7 @@ def collapse_bluray_folders(d, quiet=False):
     原盘条目 —— 那等于白做。删的只是本地那几十个几十字节的文本文件，网盘上的原盘
     一个字节都没动，什么时候想还原重新扫一次就有。
     """
-    root = strm_root(d)
+    root = strm_subtree(d, only)
     if not os.path.isdir(root):
         return 0, 0
     discs = _bluray_discs(root)
@@ -7049,7 +7067,7 @@ def strm_dirs_uncovered(d, key):
     return out
 
 
-def report_not_in_emby(d, key):
+def report_not_in_emby(d, key, only=None):
     """把 Emby 没收录的 strm 摆出来，并说清楚该怎么改。
 
     单独一个函数是因为「5 生成媒体库」和「6 链路体检」都要用，而这段话的价值全在措辞上 ——
@@ -7059,7 +7077,9 @@ def report_not_in_emby(d, key):
     实测撞到的那次恰恰是独占的 —— 人家早就一片一个文件夹了，脚本还在教他"把这几个挪进各自
     的单独文件夹"，照着做只会白折腾。两种情形的成因和改法完全不同，得分开说。
     """
-    missing = strm_not_in_emby(d, key)
+    # 【只扫一个盘就只报这个盘】别的盘那些没收录的条目跟这次操作无关，摆出来
+    # 只会让人以为是这一趟弄出来的。传到源头去筛，顺带省掉一遍全库 os.walk。
+    missing = strm_not_in_emby(d, key, only)
     if not missing:
         return 0
     # 【先问最基本的那个问题】这个文件在不在任何媒体库的范围内。不在的话，后面讲布局规则、
@@ -7167,10 +7187,13 @@ def _strm_siblings(d, strm_path):
         return 1                    # 数不出来就当独占，宁可少给一段用不上的建议
 
 
-def strm_inventory(d):
-    """本地每个 strm 和它在 OpenList 上的目标路径 [(本地文件, 网盘路径), ...]。"""
+def strm_inventory(d, only=None):
+    """本地每个 strm 和它在 OpenList 上的目标路径 [(本地文件, 网盘路径), ...]。
+
+    only 给挂载点时只看那个盘 —— 见 strm_subtree。
+    """
     out = []
-    for dirpath, _dirnames, files in os.walk(strm_root(d)):
+    for dirpath, _dirnames, files in os.walk(strm_subtree(d, only)):
         for fn in files:
             if not fn.endswith(".strm"):
                 continue
@@ -7317,7 +7340,7 @@ def _prune_order(by_dir, dir_local, d, budget):
     return hot + rest[cur:] + rest[:cur], len(hot)
 
 
-def prune_dead_strm(d, budget=None):
+def prune_dead_strm(d, budget=None, only=None):
     """删掉网盘上【确认已经不存在】的 strm。返回删了几个。
 
     用户在网盘里整理片子（新建文件夹、分类、改名）之后，AutoFilm 会在新路径下生成一批新的
@@ -7331,7 +7354,10 @@ def prune_dead_strm(d, budget=None):
     唯一保留的刹车是"整个挂载点全判死"：那更像存储掉线、根目录 ID 填错之类的配置问题，第一
     轮只记账不删。strm 随时能重新生成，真正删不回来的是 Emby 那边的观看记录 —— 刹车为它踩。
     """
-    inv = strm_inventory(d)
+    # 【只扫一个盘时，别去问别的盘】prune 是整条流程里最贵的一步：一个目录一次
+    # 跨境列举。上一版不限定，于是点夸克的扫描会挨个去问七米蓝那 136 个目录，
+    # 而那是个限量的上游 —— 99 个超时就是被限流的结果，还白白占了它的配额。
+    inv = strm_inventory(d, only)
     if not inv:
         return 0
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
@@ -7516,7 +7542,7 @@ def prune_dead_strm(d, budget=None):
         n += 1
     # 顺手收掉空目录：整理之后旧的目录层级会整层空下来，留着 Emby 里就是一排空文件夹。
     # 深的先删，这样父目录轮到自己时看到的已经是子目录删完之后的状态
-    root = strm_root(d)
+    root = strm_subtree(d, only)
     for dirpath, _dn, _f in sorted(os.walk(root), key=lambda x: -len(x[0])):
         if os.path.abspath(dirpath) == os.path.abspath(root):
             continue
@@ -7958,10 +7984,10 @@ def do_strm(only=None):
         print(f"  {DIM}URL 形式只该在补探测的那几秒存在。留在磁盘上的话 MediaWarp")
         print(f"  的 alist_strm 认不出来，表现是「挂载能播、Emby 一直转圈」。{RST}")
 
-    before = strm_count(d)
+    before = strm_count(d, only)
     # 【记下这一趟开工前有哪些】收尾时拿它一减，就知道到底新增/删除了哪几条 ——
     # 有了这份清单才能只让 Emby 过这几条，而不是重扫整个库（见 emby_notify_changes）。
-    snap0 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d)}
+    snap0 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, only)}
     print(f"\n  当前本地已有 {BOLD}{before}{RST} 个 strm 文件。")
 
     # 【有人在看片就先问一声】扫库和播放抢的是同一个网盘账号，而夸克风控很严。
@@ -8212,7 +8238,7 @@ def do_strm(only=None):
         except OSError:
             pass
 
-    after = strm_count(d)
+    after = strm_count(d, only)
     print()
     if done:
         # 【累加，不是覆盖】dict(findall) 会让最后一个任务的数字盖掉前面的，
@@ -8266,12 +8292,12 @@ def do_strm(only=None):
 
     # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
     # 之后再删再建，中间那段时间用户点进去就是 load fail。
-    collapse_bluray_folders(d)
+    collapse_bluray_folders(d, only=only)
 
     # 生成只会【加】不会【减】。用户在网盘里整理过片子的话，旧路径那批 strm
     # 还留在本地，Emby 里就是同一部片子两个条目、一个点不开。放在扫描之前收尾，
     # 让 Emby 这一趟同时看到"新的多了"和"旧的没了"。
-    prune_dead_strm(d, budget=PRUNE_BUDGET)
+    prune_dead_strm(d, budget=PRUNE_BUDGET, only=only)
 
     # 生成完顺手让 Emby 扫一遍，省得用户还要再进 Emby 后台找「扫描媒体库」
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
@@ -8282,7 +8308,7 @@ def do_strm(only=None):
     # 里，那条每小时都跑，不管这批 strm 是谁生成的。）
     migrate_strm_layout(d, key)
     if key:
-        snap1 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d)}
+        snap1 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, only)}
         diff = ([(p, "Created") for p in sorted(snap1 - snap0) if p]
                 + [(p, "Deleted") for p in sorted(snap0 - snap1) if p])
         # 变动少就只报这几条（几秒）。多了、没变动、或者这条路没走通，都退回全库扫描 ——
@@ -8298,7 +8324,7 @@ def do_strm(only=None):
         # 无关。扔后台之后用户扫完就能走人，缺多少时长看体检那行「条目时长」。
         align_library(d, key, heal=False)   # 库选项 + 片名 + 身份 + 脏进度
         auto_libraries_apply(d, key)  # 按关键词规则把该建的库建上
-        report_not_in_emby(d, key)
+        report_not_in_emby(d, key, only)
         # 【后台跑】跟「7 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
         # 关系，没道理让用户对着它干等。
@@ -8323,7 +8349,7 @@ def do_strm(only=None):
         print(f"  {DIM}填 API Key：「3 后补参数 → 添加 API 密钥」{RST}")
 
     print()
-    print_library_targets(d, key)
+    print_library_targets(d, key, only=only)
     print(f"  {DIM}Emby → 设置 → 媒体库 → 添加媒体库 → 选内容类型 → 文件夹填上面某一条{RST}")
     print(f"  {YELLOW}内容类型别选错{RST}{DIM}：剧集要选「电视剧」，"
           f"用「电影」类型去刮剧集，每一集会变成一部独立电影。{RST}")
