@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.73"
+SCRIPT_VERSION = "1.5.74"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -6332,6 +6332,27 @@ def split_shared_identities(d, key):
     return n
 
 
+HEAL_FRESH_H = 24        # 进库这么多小时内的算「新片」，补探测让它们插队
+
+
+def _is_fresh_item(i):
+    """这个条目是不是最近才进库的。看 Emby 的 DateCreated，读不出来当成不是。
+
+    读不出来【必须当成老的】：当成新的话，一旦某个 Emby 版本不给这个字段，
+    所有条目都变成"新片"，插队就退化成"没有插队"，而且是静默的。
+    """
+    v = str(i.get("DateCreated") or "")[:19]
+    if not v:
+        return False
+    try:
+        t = time.mktime(time.strptime(v, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return False
+    # DateCreated 是 UTC，而 mktime 按本地时区解释 —— 差的那几个小时对
+    # 「24 小时内」这个粒度无所谓，不值得为它引一套时区换算
+    return (time.time() - t) < HEAL_FRESH_H * 3600 + time.timezone
+
+
 def items_without_duration(key):
     """Emby 里还没探测出时长的影视条目 [(id, 名字), ...]。
 
@@ -6376,7 +6397,7 @@ def items_without_duration(key):
         try:
             d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
                       f"&IncludeItemTypes=Movie,Episode,Video"
-                      f"&Fields=Path,MediaSources,MediaStreams", key)
+                      f"&Fields=Path,MediaSources,MediaStreams,DateCreated", key)
         except Exception:
             continue
         for i in d.get("Items") or []:
@@ -6390,7 +6411,11 @@ def items_without_duration(key):
             no_streams = not ((i.get("MediaStreams") or [])
                               or any(s.get("MediaStreams") for s in srcs))
             if no_dur or no_streams:
-                out.append((uid, i.get("Id"), i.get("Name") or "?"))
+                # 第四位 =【是不是刚进库的】。补探测靠它让新片插队 ——
+                # 刚加进来的片子正是此刻最想看的那一部，不该跟三个月前就在
+                # 队里的老片按同一个顺序排。见 heal_media_info。
+                out.append((uid, i.get("Id"), i.get("Name") or "?",
+                            _is_fresh_item(i)))
     return out
 
 
@@ -7697,7 +7722,7 @@ def heal_media_info(d, key):
     # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
     # 条目怎么探都探不出来（网盘上是残缺文件、格式 Emby 不认），每轮都从头取
     # 的话它们会把名额永远占死，后面的条目一辈子轮不到。
-    cur = int(ms_state().get("heal_cursor") or 0) % max(1, len(allpend))
+    cur = int(ms_state().get("heal_cursor") or 0)
     # 【取多少要先夹到总数】不夹的话 (allpend+allpend) 在待探数少于 HEAL_LIMIT 时
     # 会把同一批切出来两遍 —— 7 个待探切成 14 个，每个条目探两次、流量翻倍。
     # 而这一步的全部意义就是省流量。
@@ -7705,8 +7730,22 @@ def heal_media_info(d, key):
     # 不夹到总数的话 (allpend+allpend) 在待探数少于一批时会把同一批切两遍。
     _pace = heal_pace()
     take = min(max(HEAL_LIMIT, len(allpend) // 8), _pace, len(allpend))
-    pend = (allpend + allpend)[cur:cur + take]
-    save_ms_state(heal_cursor=(cur + take) % len(allpend))
+    # 【新片插队，但只占一半名额】刚扫进来的条目在 Emby 里是 0B / 0bps，时长为 0，
+    # 于是进度条记不住 —— 而那正是用户此刻最想看的那一部。让它跟三个月前就在队里的
+    # 老片按同一个顺序排，是把优先级排反了。
+    # 【不能全给新的】一次扫进来几百个新片的话，老积压就永远轮不到 —— 而现在正积着
+    # 两千多个。一半一半：新片当轮就补上，老队也不饿死。
+    fresh = [x for x in allpend if len(x) > 3 and x[3]]
+    rest = [x for x in allpend if not (len(x) > 3 and x[3])]
+    head = fresh[:max(1, take // 2)] if fresh else []
+    need = take - len(head)
+    if rest and need > 0:
+        cur = cur % len(rest)
+        head += (rest + rest)[cur:cur + need]
+        save_ms_state(heal_cursor=(cur + need) % len(rest))
+    elif fresh:
+        head = fresh[:take]              # 全是新片，那就全探新片
+    pend = head
     print()
     if len(allpend) > len(pend):
         info(f"给 {len(pend)} 个条目补媒体信息（时长、编码）"
@@ -7770,7 +7809,11 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
     """
     done = hit = 0
     total = len(pend)
-    for idx, (uid, iid, name) in enumerate(pend, 1):
+    for idx, _it in enumerate(pend, 1):
+        # 【按下标取，别解包】items_without_duration 现在给的是四元组（多一个
+        # "是不是新片"），而重试名单里塞回来的也是同一个元组 —— 解包会随元素
+        # 个数变化而崩，下标不会。
+        uid, iid, name = _it[0], _it[1], _it[2]
         # 预算是【这一轮里也要看】的：一个条目最多等 3 分钟，50 个就是两个多小时，
         # 光靠外层每轮之间那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
         if t_all is not None and time.monotonic() - t_all > HEAL_BUDGET:
@@ -7783,7 +7826,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
             it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
         except Exception:
             print("\r\033[K", end="")
-            again.append((uid, iid, name))     # 问 Emby 失败可能只是这一下，值得再试
+            again.append(_it)     # 问 Emby 失败可能只是这一下，值得再试
             continue
         # 下面几种是【问题在本地，重试也没用】：路径对不上、文件读不了、
         # strm 里没有可用目标。不进 again，免得白跑一轮还刷一屏同样的话
@@ -7806,14 +7849,14 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
             sign, raw = got0.get("sign", ""), got0.get("raw_url", "")
         except Exception as e:
             print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}换直链失败：{_short_err(e)}{RST}\033[K")
-            again.append((uid, iid, name))
+            again.append(_it)
             continue
         # 先自己拉一段文件头。不通就别去烧 Emby 那 200 秒了，而且拉过之后
         # 直链是热的，紧接着的探测更容易在超时内跑完
         good, why = _netdisk_head_ok(raw)
         if not good:
             print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}网盘没给出文件头（{why}）{RST}\033[K")
-            again.append((uid, iid, name))
+            again.append(_it)
             if why == THROTTLED_WHY:
                 # 【退避要落在"下一个条目"上，不只是"这一个文件的重试"上】
                 # 上游限的是这个源的整体请求量，不是某一个文件。紧接着去探下一个，
@@ -7875,10 +7918,10 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
             # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
             print(f"\r  {DIM}\u00b7{RST} {name[:26]}  "
                   f"{YELLOW}只探到时长，没有音视频轨（这样点开会 load fail）{RST}\033[K")
-            again.append((uid, iid, name))
+            again.append(_it)
         else:
             print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}\033[K")
-            again.append((uid, iid, name))
+            again.append(_it)
     return done, hit
 
 
@@ -13035,7 +13078,7 @@ def do_healthcheck():
                 # 记忆"会以为是那个库的设置没生效 —— 而实际上门槛早就调好了，
                 # 缺的只是【某一部片子】的时长。一个是库的问题，一个是条目的问题，
                 # 排查方向完全相反，光给数字分不出来。
-                names = "、".join(n for _u, _i, n in nodur[:3])
+                names = "、".join(x[2] for x in nodur[:3])
                 if len(nodur) > 3:
                     names += f" 等 {len(nodur)} 个"
                 # 【必须说"还要多久"】只报个数字的话，人没法判断"它到底在不在补"——
