@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.75"
+SCRIPT_VERSION = "1.5.76"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10706,6 +10706,17 @@ def _link_method_menu(d, mounts, who):
         _one_drive_link_menu(d, ms[int(c) - 1])
 
 
+# 网盘侧【本来就有 CDN 直链】的驱动。这几类的默认路是"播放器直连网盘"，
+# 本机代理对它们是多此一举（而且不解除任何限速，见 SOURCE_MODES 那段的提示）。
+# 反过来 webdav / local / crypt 在网盘侧根本没有直链，本机代理是它们唯一的路。
+PROXY_ONLY_DRIVERS = ("webdav", "local", "crypt")
+
+
+def has_cdn_link(drv):
+    """这个驱动在网盘侧有没有自己的 CDN 直链。"""
+    return str(drv or "").lower() not in PROXY_ONLY_DRIVERS
+
+
 def _one_drive_link_menu(d, mp):
     """一个盘的直链方式：把它【真的有】的开关列出来，选一项改。
 
@@ -10763,6 +10774,15 @@ def _one_drive_link_menu(d, mp):
                 warn("开了之后，这个盘的探测会真的打到上游去。")
                 print(f"  {DIM}上游按 UA 挡人的话这条能救活；但探测量大，上游也可能"
                       f"转而按频率限【整个源】—— 表现是挂载页面也连不上。{RST}")
+                _drv0 = next((r[2] for r in _storage_rows(d) if r[1] == mp), "")
+                if has_cdn_link(_drv0):
+                    # 【这个开关是给 WebDAV 源准备的】阿里、夸克、115 这类网盘发的
+                    # 直链常常绑请求方，换了 UA 反而直接被拒。它们只有在被强行改成
+                    # 本机代理之后才会看见这一项 —— 那本身多半就是个误操作。
+                    print(f"  {YELLOW}这个盘有自己的 CDN 直链，而那种直链常常"
+                          f"【绑请求方】—— 换了 UA 反而可能被拒。{RST}")
+                    print(f"  {DIM}这个开关是给「上游按 UA 挡人」的 WebDAV 源准备的，"
+                          f"套到这类盘上多半帮倒忙。{RST}")
                 print(f"  {DIM}开完去挂载页面播一部片子确认一下；不对劲就回这里关掉。{RST}")
                 if not ask_yn(f"确定给 {mp} 开启？", False):
                     print("没有改动。")
@@ -10777,6 +10797,17 @@ def _one_drive_link_menu(d, mp):
         if where == "source":
             if val == "proxy":
                 warn("本机代理：视频的每个字节都要经过你的 VPS，来回两份流量。")
+                _drv0 = next((r[2] for r in _storage_rows(d) if r[1] == mp), "")
+                if has_cdn_link(_drv0):
+                    # 【说清楚它不解除限速】实测撞过：阿里被开放平台接口限到 ~4 Mbps，
+                    # 用户以为过一遍自己的 VPS 能绕开，换完那部 16.6 Mbps 的片子当场
+                    # load fail —— 而在这之前用 302 直链是能看的。
+                    # 本机代理没有解除任何限速，只是在中间加了一跳，瓶颈那一段没变。
+                    print(f"  {YELLOW}而且它【不会解除网盘的限速】{RST}"
+                          f"{DIM} —— 只是把「播放器 → 网盘」变成「播放器 → 你的 VPS "
+                          f"→ 网盘」，慢的那一段一个字节都没变，还多一次转发。{RST}")
+                    print(f"  {DIM}这个盘本来就有 CDN 直链（播放器直连网盘）。"
+                          f"嫌慢的话该改的是「接口通道」，不是这里。{RST}")
                 if not ask_yn("确定换成本机代理？", False):
                     print("没有改动。")
                     continue
