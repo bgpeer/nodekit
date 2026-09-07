@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.85"
+SCRIPT_VERSION = "1.5.86"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7364,6 +7364,18 @@ def _bluray_main_stream(disc, strms, tok):
     return best if best_size > 0 else ""
 
 
+def disc_policy():
+    """蓝光原盘怎么办："skip" 不进库（默认）/ "collapse" 压成单个 strm。
+
+    【默认不进库】原盘进库必定是 0B / 0bps 点开 load fail；压成单 strm 之后能播，
+    但那是 20 GB / 24 Mbps / TrueHD 7.1 的正片，跨境线路多半拉不动、客户端多半解不了
+    那条音轨。而它在库里和能播的那份同名同海报，用户点中坏的那个概率是一半。
+    敢把默认值定成"不进库"，唯一的理由是【删的只有本地那几十字节的 strm】——
+    网盘上的原盘一个字节都不动，改回来再扫一次就全回来。
+    """
+    return ms_state().get("disc_policy") or "skip"
+
+
 def dead_disc_dirs(d, only=None):
     """本地还挂着 BDMV 树的原盘目录。
 
@@ -7377,37 +7389,6 @@ def dead_disc_dirs(d, only=None):
         if os.path.isdir(root):
             out += sorted(_bluray_discs(root))
     return out
-
-
-def dead_disc_hint(d, mp):
-    """(这个盘有几套点不开的原盘, 它们相对盘根的公共上级目录)。
-
-    公共目录是给「不扫的目录」当现成规则用的。算不出一条【比整个盘更具体、又不是
-    原盘目录本身】的，就返回空串 —— 宁可不给建议，也不能给一条会把半个盘挡掉的。
-    """
-    base = os.path.join(strm_root(d), STRM_SUBDIR,
-                        str(mp or "").strip("/").split("/")[0])
-    rels = [os.path.relpath(x, base) for x in dead_disc_dirs(d, mp) if _under(x, base)]
-    if not rels:
-        return 0, ""
-    parts = [x.split(os.sep) for x in rels]
-    common = []
-    for seg in zip(*parts):
-        if len(set(seg)) != 1:
-            break
-        common.append(seg[0])
-    if not common or len(common) >= min(len(p) for p in parts):
-        return len(rels), ""
-    sug = "/".join(common)
-    # 【公共目录底下不能有别的片子】原盘散落在两个不相干的地方时，公共目录会一路
-    # 退到 mov/电影 那一层 —— 那一条规则会把整个扫描路径挡掉。实测就退到过那儿。
-    # 判据不用"看着够不够深"这种手感，直接数：建议目录里的 strm 比原盘里的多，
-    # 说明多出来的是别人的片子，这条建议就不能给。
-    hold = _count_strm_in(os.path.join(base, *common))
-    mine = sum(_count_strm_in(os.path.join(base, r)) for r in rels)
-    if hold > mine:
-        return len(rels), ""
-    return len(rels), sug
 
 
 def collapse_bluray_folders(d, quiet=False, only=None):
@@ -7428,6 +7409,10 @@ def collapse_bluray_folders(d, quiet=False, only=None):
     【为什么连 strm 一起删】留着的话 Emby 还是会看见 BDMV 目录，还是会把这一套认成
     原盘条目 —— 那等于白做。删的只是本地那几十个几十字节的文本文件，网盘上的原盘
     一个字节都没动，什么时候想还原重新扫一次就有。
+
+    【默认根本不压，直接不让它进库】见 disc_policy()。压出来的是 20 GB / 24 Mbps /
+    TrueHD 7.1 的正片，跨境线路多半拉不动；而它在库里和能播的那份同名同海报。
+    要压的人自己去把开关改成 collapse。
     """
     # 【按串走】only 可以是一个盘，也可以是「剩余网盘」那一组的一串盘
     discs = {}
@@ -7435,6 +7420,26 @@ def collapse_bluray_folders(d, quiet=False, only=None):
         if os.path.isdir(root):
             discs.update(_bluray_discs(root))
     if not discs:
+        return 0, 0
+    if disc_policy() == "skip":
+        # 【默认这一支】只把 BDMV/CERTIFICATE 那两棵本地树删掉，别的文件不碰；
+        # 目录空了会被 _sweep_empty_dirs 收走。一次网盘接口都不用调。
+        gone = 0
+        for disc in sorted(discs):
+            try:
+                subs = os.listdir(disc)
+            except OSError:
+                continue
+            for sub in subs:
+                if sub.lower() in DISC_DIRS:
+                    shutil.rmtree(os.path.join(disc, sub), ignore_errors=True)
+            gone += 1
+        if gone and not quiet:
+            ok(f"{gone} 套蓝光原盘没有进库{DIM}（BDMV 目录树，进了库也是 0B / 0bps、"
+               f"点开 load fail）{RST}")
+            print(f"  {DIM}网盘上的原盘一个字节都没动。想要的话："
+                  f"「4 挂载路径 → 选盘 → 5 不扫的目录 → 3 原盘怎么办」"
+                  f"改成压成单个 strm，再扫一次就回来。{RST}")
         return 0, 0
     tok = _ol_token(d)
     done, stuck = 0, []
@@ -11457,28 +11462,35 @@ def _skip_dirs_menu(d, mp):
         # 【脚本知道该挡哪个目录，就别让用户自己去找】那些 0B / 0bps 点不开的条目，
         # 本地看得见：strm 树里还挂着 BDMV 的就是。连它们的公共上级目录一起算出来，
         # 做成一个按键 —— 用户来这一屏，要的本来就是这件事。
-        _nd, _sug = dead_disc_hint(d, mp)
+        _nd = len(dead_disc_dirs(d, mp))
         if _nd:
-            print(f"  {YELLOW}这个盘有 {_nd} 套点不开的原盘{RST}"
-                  f"{DIM}（BDMV 目录树，Emby 里是 0B / 0bps，点开 load fail）{RST}")
+            print(f"  {YELLOW}这个盘有 {_nd} 套蓝光原盘{RST}"
+                  f"{DIM}（BDMV 目录树，进库就是 0B / 0bps、点开 load fail）{RST}")
         print("-" * 60)
         print("  1. 添加")
         print("  2. 删除")
-        if _nd and _sug:
-            print(f"  3. 挡掉那 {_nd} 套原盘   {DIM}{_sug}{RST}")
+        print(f"  3. 原盘怎么办        当前：{CYAN}"
+              + ("不进库" if disc_policy() == "skip" else "压成单个 strm") + RST)
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if c == "3" and _nd and _sug:
-            rels = [_sug] if _sug not in pats else []
-            if not rels:
-                print("这条规则已经加过了。")
-                continue
-            print(f"\n  {DIM}会加这一条：{RST}{_sug}")
-            print(f"  {DIM}那 {_nd} 套原盘都在它底下。压制版、普通 mkv 不受影响 ——"
-                  f"规则只挡这一棵子树。{RST}")
+        if c == "3":
+            print()
+            print(f"  {DIM}蓝光原盘（BDMV 目录树）不是一个文件，是一整棵目录树，"
+                  f"而 strm 里只装得下一条指向单个文件的地址。{RST}")
+            print(f"  1. 不进库{DIM}　默认。删的只是本地 strm，网盘一个字节不动{RST}")
+            print(f"  2. 压成单个 strm{DIM}　取 BDMV 里最大的片段＝正片。"
+                  f"那多半是 20 GB / 24 Mbps / TrueHD，跨境线路未必拉得动{RST}")
+            print(f"  0. 返回")
+            v = ask("请选择").strip()
+            if v in ("1", "2"):
+                save_ms_state(disc_policy=("skip" if v == "1" else "collapse"))
+                ok("原盘：" + ("不进库" if v == "1" else "压成单个 strm"))
+                if _nd and ask_yn(f"现在就按这个处理那 {_nd} 套？", True):
+                    collapse_bluray_folders(d, only=mp)
+            continue
         elif c == "1":
             picks = _pick_dirs(d, mp, "不扫哪个")
             if not picks:
