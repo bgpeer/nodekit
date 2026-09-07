@@ -38,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.93"
+SCRIPT_VERSION = "1.5.94"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2374,7 +2374,7 @@ def clean_media_name(base):
     if out and CJK_RE.search(out[0]):
         out = [p for i, p in enumerate(out) if i == 0 or CJK_RE.search(p)]
     words = " ".join(out).split()
-    while words:                        # 结尾的标记词一个个剥掉：爱的世界 邵氏 4K 国粤双语
+    while words:                        # 结尾的标记词一个个剥掉：片名 邵氏 4K 国粤双语
         w = words[-1].strip("-—·~[]()")
         if NAME_YEAR_RE.match(w):
             year = year or w
@@ -2387,8 +2387,8 @@ def clean_media_name(base):
     title = " ".join(words).strip(" .-_·~")
     if len(title) < 2 or title.isdigit() or "/" in title:
         return ""
-    # 【清出来的东西还带着站点标记，那就不是片名】实测撞到「一只鱼4kyu cc豆瓣6」——
-    # 发布站的名字被当成片名清了出来。这种改上去比不改【更糟】：Emby 拿它去搜永远
+    # 【清出来的东西还带着站点标记，那就不是片名】实测撞到过「<站点名>4kyu cc豆瓣6」
+    # 这种：发布站自己的名字被当成片名清了出来。这种改上去比不改【更糟】：Emby 拿它去搜永远
     # 搜不到，而原名说不定还能搜到。认不准就别动，这是这个函数一以贯之的规矩。
     if NAME_SITE_RE.search(title):
         return ""
@@ -3185,9 +3185,9 @@ EP_JUNK = re.compile(
     r"高清|超清|蓝光|全集|完结|未删减|v\d)$")
 # 【别把 · 当分隔符】U+00B7 那个点在中文人名/译名里是【名字的一部分】：
 # 「断东河·吴」拆开就毁了。而 U+2022 的 • 是真的当分隔符用的
-# （实测网盘里的「仙逆 [第154集•4K]」）。两个字符长得像，作用相反。
+# （实测网盘里的「某剧 [第154集•4K]」）。两个字符长得像，作用相反。
 EP_SPLIT = re.compile(r"[\s._\-\[\]()（）【】•｜|/／]+")
-# 集号本身的各种写法。名字里这一段要整个去掉 —— 留着就成了「仙逆 第154集•4K」
+# 集号本身的各种写法。名字里这一段要整个去掉 —— 留着就成了「某剧 第154集•4K」
 EP_MARK = re.compile(r"(?i)^(?:第\s*0*%d\s*[集话話]|e?p?0*%d|s\d{1,2}e0*%d)$")
 # 带连字符的成组标记要【先整条去掉】，不能等切开再逐个认 —— WEB-DL 切成
 # WEB 和 DL 之后哪个都不在上面那张表里，结果「初露锋芒」后面挂着个 WEB DL。
@@ -3212,7 +3212,7 @@ def episode_title_from_name(stem, ep, show=""):
 
         「236.断东河·吴」        → 断东河·吴
         「237 4K」               → 第237集
-        「仙逆 [第154集•4K]」     → 第154集   （剧名和画质标记都去掉）
+        「某剧 [第154集•4K]」     → 第154集   （剧名和画质标记都去掉）
 
     show 传剧名的话，名字里重复的剧名也去掉 —— Emby 本来就在剧集页里显示。
     """
@@ -4688,8 +4688,8 @@ def migrate_strm_layout(d, key, wait=True):
         kept = [x for x in moves if x[1] in clash]
         moves = [x for x in moves if x[1] not in clash]
         warn(f"{len(kept)} 个 strm 的目标名字和别人撞了，这几个保持原样：")
-        # 【必须连原名一起打】只打目标名的话，屏上一行「一只鱼4kyu cc豆瓣6」
-        # 用户根本不知道它是从哪个文件来的，也就没法判断清洗器是不是清歪了。
+        # 【必须连原名一起打】只打目标名的话，屏上冒出来一行谁也不认识的字，
+        # 用户不知道它是从哪个文件来的，也就没法判断清洗器是不是清歪了。
         for src, dst in sorted(kept, key=lambda x: x[1])[:5]:
             print(f"  {DIM}{os.path.basename(src)[:-5][:44]}{RST}")
             print(f"    → {os.path.basename(dst)[:-5]}")
@@ -6375,7 +6375,7 @@ def _skip_hit(parts, pats):
     """这条相对路径命中了哪条规则（没命中返回空串）。
 
     按【整段】比，不按子串 —— 「合集」不该顺手匹配掉「合集电影」。规则本身可以是
-    多段（mov/电影/合集/周星驰/BD+DVD合集），那就要求这几段连续出现。
+    多段（比如 电影/合集/原盘），那就要求这几段连续出现。
     """
     low = [str(x).lower() for x in parts]
     for p in pats:
@@ -7055,7 +7055,7 @@ def title_policy_of(mount):
     """某个网盘的片名来源。没单独设过就跟默认值走。
 
     【为什么要分盘设】同一台机器上，夸克里是规规矩矩的「片名 (年份).mkv」，刮削结果更好；
-    另一个盘里全是「仙逆 [第154集•4K]」这种，刮削器只会乱撞，文件名反而准。
+    另一个盘里全是「某剧 [第154集•4K]」这种，刮削器只会乱撞，文件名反而准。
     """
     if not mount:
         return title_policy()
@@ -7905,10 +7905,10 @@ def resolve_target(tgt, token, cache):
     【问不出来不等于判不出来】从文件往上找【第一个列得出来的祖先】，用它的列表回答
     "下一级还在不在"：
 
-      /quark/夸克挂载/动漫 这一层就挂了       → 盘或上层的问题，什么都别动
-      /quark/夸克挂载/动漫 通、仙逆 这层挂了  → 看「仙逆」在不在「动漫」的列表里，
-                                                不在 = 整个目录没了，底下那批一起清
-      两层都通                                → 才去看 156 4K.mp4 在不在
+      /网盘/动漫 这一层就挂了        → 盘或上层的问题，什么都别动
+      /网盘/动漫 通、某剧 这层挂了   → 看「某剧」在不在「动漫」的列表里，
+                                       不在 = 整个目录没了，底下那批一起清
+      两层都通                       → 才去看 156 4K.mp4 在不在
 
     上一版只问文件所在的那一个目录，那一层超时就返回"当成还在"—— 于是网盘里删掉的
     整个目录，本地那批 strm 会一直赖着，Emby 里就是一排点不开的旧条目。
@@ -7983,8 +7983,8 @@ def prune_dead_strm(d, budget=None, only=None):
     轮只记账不删。strm 随时能重新生成，真正删不回来的是 Emby 那边的观看记录 —— 刹车为它踩。
     """
     # 【只扫一个盘时，别去问别的盘】prune 是整条流程里最贵的一步：一个目录一次
-    # 跨境列举。上一版不限定，于是点夸克的扫描会挨个去问七米蓝那 136 个目录，
-    # 而那是个限量的上游 —— 99 个超时就是被限流的结果，还白白占了它的配额。
+    # 跨境列举。上一版不限定，于是点某一个盘的扫描会挨个去问另一个盘那上百个目录，
+    # 而那往往是个限量的上游 —— 几十个超时就是被限流的结果，还白白占了它的配额。
     inv = strm_inventory(d, only)
     if not inv:
         return 0
@@ -8638,7 +8638,7 @@ def _patch_cron(text, fire, ids=None):
     """把配置里的 cron 改成 fire。ids 给定时【只改这几个任务】。返回 (新文本, 改了几个)。
 
     任务块长这样，id 和 cron 是紧挨着的两行（见 _gen_strm_task）：
-        - id: "quark_夸克挂载"
+        - id: "quark_电影"
           cron: "0 15 5 * * *"
     所以按 id 就能只动某一个盘 —— 别的盘保持它自己的定时，不会被这一下捎带着触发。
     """
@@ -8738,8 +8738,8 @@ def do_strm(only=None):
     """立刻跑一次 strm 生成，跑完顺手让 Emby 扫一次媒体库。
 
     only 给挂载点（比如 "/quark"）时【只扫那一个盘】。扫描的耗时取决于目录个数：
-    七米蓝 563 个目录要两分多钟，夸克几十个目录几秒钟 —— 为了夸克新加的一集陪着
-    七米蓝一起等，还顺带把它的上游限量配额又打一遍，没有道理。
+    实测一个五百多目录的盘要两分多钟，几十个目录的盘几秒钟 —— 为了后者新加的一集
+    陪着前者一起等，还顺带把前者的上游限量配额又打一遍，没有道理。
 
     为什么必须有这个按钮：装完的那一刻网盘还没挂上 —— OpenList 里的存储得用户自己在网页
     里添加，所以安装流程里跑 strm 一定是空的。以前这一步只有命令行 `media-stack strm`，
@@ -10135,7 +10135,7 @@ def drive_links(d, mp, drv=""):
     # 那条请求根本不经过本机，给了也是个假开关（见 LINK_SWITCHES 开头那段：
     # 宁可少给，绝不给一个假的）。
     if (_truthy(cols.get("web_proxy"))
-            or str(drv2 or drv or "").lower() in ("webdav", "local", "crypt")):
+            or str(drv2 or drv or "").lower() in PROXY_ONLY_DRIVERS):
         out.append(("__ua__", "ua", "探测 UA",
                     tuple((k, n, w) for k, n, w in UA_SPOOF_MODES),
                     "spoof" if mp in ua_spoof_mounts() else "asis"))
@@ -10924,8 +10924,8 @@ def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
 def _ol_subdirs(path, token=None):
     """列出这个路径下的子目录名。返回 (名字列表, 没列成的原因)。
 
-    给「挂载路径」那一屏挑目录用 —— 在 ssh 里手打 /quark/夸克挂载/电影 又长又
-    容易错，列出来点编号才是能用的交互。
+    给「挂载路径」那一屏挑目录用 —— 在 ssh 里手打一长串中文路径又长又容易错，
+    列出来点编号才是能用的交互。
 
     【必须三态，不能两态】"没有子目录"有两个截然不同的原因，处置也相反：
       · 这一层底下真的只有文件  → 正常，按 . 选中它就行
@@ -10971,7 +10971,7 @@ def _pick_dirs(d, mp, prompt="要扫哪个"):
     """在这个盘里挑目录。返回挑中的路径（空 = 取消）。
 
     prompt 换一句就能给「不扫的目录」用 —— 挑目录这件事两边一模一样，而【点编号挑】
-    在那边更要紧：排除规则要写的是深处那一层（…/周星驰/BD+DVD合集），手打更长更容易错。
+    在那边更要紧：排除规则要写的是深处那一层，路径更长、手打更容易错。
 
     【一个盘挂多少条路径都行】上层是 scan_spec 那个列表，加进去就是追加一条，删也是按条
     删 —— 一直都支持。真正卡住的是【挑不到】：上一版只列挂载点【下面一层】，而按字母分类
@@ -11485,8 +11485,12 @@ def _link_method_menu(d, mounts, who):
 
 # 网盘侧【本来就有 CDN 直链】的驱动。这几类的默认路是"播放器直连网盘"，
 # 本机代理对它们是多此一举（而且不解除任何限速，见 SOURCE_MODES 那段的提示）。
-# 反过来 webdav / local / crypt 在网盘侧根本没有直链，本机代理是它们唯一的路。
-PROXY_ONLY_DRIVERS = ("webdav", "local", "crypt")
+#
+# 反过来，下面这一类【发不出 HTTP 直链】，OpenList 只能自己代理 —— 本机代理不是一个
+# 可选项，是唯一的路。判据是协议本身：WebDAV / FTP / SFTP / SMB 传的是文件流，
+# 没有"给你一个带签名的公网地址"这回事；local 是本机目录；crypt 要现解密。
+# 【别只写 webdav】少列一种，用户换一种挂法就又回到"装完播不了、得自己去翻开关"。
+PROXY_ONLY_DRIVERS = ("webdav", "ftp", "sftp", "smb", "local", "crypt")
 
 
 def has_cdn_link(drv):
@@ -13674,8 +13678,8 @@ def do_healthcheck():
                if _shortest else f"  {DIM}没有短命直链的盘{RST}"))
 
     # 【按盘各测一次】各个盘的链路形态两两不同（CDN 直链 / 本机代理 / 转码流），
-    # 只测一部片再拿它代表整套，必然有几种形态被判错 —— 实测就撞上了：七米蓝是
-    # 本机代理，"第二跳不再跳转"是它的正常形态，却被报成故障。
+    # 只测一部片再拿它代表整套，必然有几种形态被判错 —— 实测就撞上了：代理型的盘
+    # "第二跳不再跳转"是它的正常形态，却被报成故障。
     _proxied = {mp: (_truthy(cols.get("web_proxy"))
                      or str(drv or "").lower() in PROXY_ONLY_DRIVERS)
                 for _s, mp, drv, _a, cols in _storage_rows(d)}

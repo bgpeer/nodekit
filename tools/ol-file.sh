@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 挂载页面点开一个文件转圈：到底卡在哪一步。只读。
 #
-#   bash ol-file.sh "/quark/夸克挂载/动漫/吞噬星空/238 4K.mp4"
+#   bash ol-file.sh "/quark/动漫/某剧/238 4K.mp4"
 #
 # 【为什么单独有这个】另外六个脚本都是从 Emby 那头查的（要片名、要条目 id）。可
 # "在 OpenList 网页里点开文件转圈"这件事根本没走 Emby —— 网页调的是 OpenList 自己
@@ -18,7 +18,7 @@ TOOL_VER="2026-09-04d"          # 见 link-history.sh 里的说明：CDN 会缓�
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"
-[ -n "$P" ] || { echo "用法：bash ${0##*/} \"/quark/夸克挂载/动漫/某剧/238 4K.mp4\""; exit 1; }
+[ -n "$P" ] || { echo "用法：bash ${0##*/} \"/quark/动漫/某剧/238 4K.mp4\""; exit 1; }
 
 DIR="${MS_DIR:-/opt/media-stack}"
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
