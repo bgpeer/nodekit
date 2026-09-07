@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.87"
+SCRIPT_VERSION = "1.5.88"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10143,13 +10143,45 @@ def reload_storages(d, mounts):
     n = 0
     for sid, mp in ids:
         try:
-            for act in ("disable", "enable"):
-                r = _ol_api(f"/api/admin/storage/{act}?id={sid}", {}, tok, timeout=60)
-                if r.get("code") != 200:
-                    raise RuntimeError(r.get("message", act)[:60])
+            r = _ol_api(f"/api/admin/storage/disable?id={sid}", {}, tok, timeout=60)
+            if r.get("code") != 200:
+                raise RuntimeError(str(r.get("message") or "disable"))
+            # 【enable 必须重试】这两步是停用 + 启用。停用成了、启用挂了的话，这个盘就
+            # 停在【停用】上 —— 之后 AutoFilm 去列目录当然什么都没有，而屏上只有一句
+            # "重新加载失败"，谁也想不到盘被自己人关掉了。
+            # 启用要向网盘的接口要一次令牌（夸克是 open-api-drive.quark.cn），
+            # 跨境线路上时通时不通，多试两次往往就过了。
+            why = ""
+            for i in range(3):
+                try:
+                    r = _ol_api(f"/api/admin/storage/enable?id={sid}", {}, tok, timeout=90)
+                    why = "" if r.get("code") == 200 else str(r.get("message") or "enable")
+                except Exception as e:
+                    why = _short_err(e)
+                if not why:
+                    break
+                time.sleep(3 * (i + 1))
+            if why:
+                raise RuntimeError(why)
             n += 1
         except Exception as e:
-            warn(f"重新加载 {mp} 失败：{_short_err(e)}")
+            # 【把话说完】原来截在 60 个字符，正好切在 URL 开头（`Get "https://open-`）——
+            # 既不知道在连哪台主机，也不知道是超时还是被拒，而那是唯一有诊断价值的部分。
+            _why = str(e).strip()
+            warn(f"重新加载 {mp} 失败：{_why[:200]}")
+            _st = next((str(st or "") for m2, _dv, st, _r, _m in openlist_storages(d)
+                        if m2 == mp), "")
+            if _st and _st != "work":
+                # 盘真的没起来 —— 这才是要动手的情况
+                print(f"  {RED}这个盘现在的状态是 {_st}{RST}"
+                      f"{DIM} —— 它这轮列不出目录。去 OpenList 网页上把它"
+                      f"停用再启用一次，或者等线路缓过来再点一次「5 生成媒体库」。{RST}")
+            else:
+                print(f"  {DIM}这一步只是清目录缓存，已有的片子一个都不受影响 ——"
+                      f"最多是这一轮看不到网盘里刚加的新片。{RST}")
+            if "deadline" in _why or "timeout" in _why.lower() or "i/o" in _why:
+                print(f"  {DIM}是连网盘的接口超时（不是这台机器的问题）。"
+                      f"夸克的开放接口在部分跨境线路上就是时通时不通，已经重试过 3 次。{RST}")
     return n
 
 
