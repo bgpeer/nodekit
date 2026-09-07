@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.83"
+SCRIPT_VERSION = "1.5.84"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2311,19 +2311,23 @@ def follow_new_storages(d):
 # 一律按【整段】比对，不做子串匹配 —— 「高清」不能把「高清晰度谋杀案」腰斩。
 _NAME_JUNK = (
     r"4k|8k|2160p?|1080[pi]|720[pi]|576[pi]|480[pi]|hd|fhd|uhd|sd"
-    r"|blu-?ray|bd|bdrip|bdremux|dvd|dvdrip|dvdscr|web-?dl|web-?rip|web|hdtv"
+    r"|blu-?ray|bd|bdrip|bdremux|bd\d{3,4}[pi]?|hd\d{3,4}[pi]?"
+    r"|dvd|dvdrip|dvdscr|web-?dl|web-?rip|web|hdtv"
     r"|remux|hdr\d*|sdr|dolby|dolbyvision|dv|repack|proper"
     r"|x26[45]|h\.?26[45]|hevc|avc|vc-?1|mpeg\d?|\d+bits?|\d+fps"
     r"|dts|dts-?hd|dts-?hd-?ma|dtsma|truehd|atmos|e?ac-?3|aac|flac|lpcm|ddp?\d*"
     r"|\d+audio|[257]\.[01]"
     r"|国语|粤语|英语|日语|韩语|国粤双语|国英双语|双语|中字|中英字幕|中英双字|中英双语"
     r"|简繁|简体|繁体|内封|内嵌|外挂|无字|高清中字|超清中英双字"
+    r"|[国粤英日韩中]{1,3}双语中?字?|中英双[语字](?:字幕)?"
     r"|高清|超清|标清|蓝光|原盘|收藏版|加长版|导演剪辑版|修复版|重制版|未删减|完整版"
     r"|国配|台配|港版|邵氏|豆瓣|评分|合集|系列"
 )
 NAME_JUNK_RE = re.compile(r"(?i)^(?:" + _NAME_JUNK + r")$")
 NAME_SCORE_RE = re.compile(r"^\d+(?:\.\d+)?\s*分$")
 NAME_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+# 清出来的"片名"里出现这些，说明清到的是【发布站/压制组的标记】，不是片名。
+NAME_SITE_RE = re.compile(r"(?i)豆瓣|评分|imdb|\d+kyu|\b\w+\.(?:cc|com|net|org|tv|me)\b")
 CJK_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
 
@@ -2372,8 +2376,35 @@ def clean_media_name(base):
     title = " ".join(words).strip(" .-_·~")
     if len(title) < 2 or title.isdigit() or "/" in title:
         return ""
+    # 【清出来的东西还带着站点标记，那就不是片名】实测撞到「一只鱼4kyu cc豆瓣6」——
+    # 发布站的名字被当成片名清了出来。这种改上去比不改【更糟】：Emby 拿它去搜永远
+    # 搜不到，而原名说不定还能搜到。认不准就别动，这是这个函数一以贯之的规矩。
+    if NAME_SITE_RE.search(title):
+        return ""
     want = f"{title} ({year})" if year else title
     return "" if want == base else want
+
+
+def name_drop_tags(base):
+    """原名里【被清掉的那些标记】，按出现顺序，最多两个。撞名时拿它当区分后缀。
+
+    「[菲利普船长].超清中英双字」→ ["超清中英双字"]；「….1080p.国粤双语」→ ["1080p", "国粤双语"]。
+    两个文件清出同一个片名时，这两串多半是不一样的 —— 那正是它们本来的区别。
+    """
+    s2 = re.sub(r"[\[\]【】\(\)（）]", ".", base)
+    out = []
+    for p in re.split(r"[.\u3000_\s]+", s2):
+        p = p.strip(" -—·~")
+        if p and NAME_JUNK_RE.match(p) and p not in out:
+            out.append(p)
+        if len(out) >= 2:
+            break
+    return out
+
+
+def clash_policy():
+    """撞名的怎么办："keep" 保持原样（默认）/ "suffix" 加后缀区分。"""
+    return ms_state().get("clash_policy") or "keep"
 
 
 def rename_policy():
@@ -4601,14 +4632,42 @@ def migrate_strm_layout(d, key):
             same = False
         if not same:
             clash.add(dst)
+    if clash and clash_policy() == "suffix":
+        # 【把原名里被清掉的标记接回去当区分】`片名 (2015)` 撞了，就变成
+        # `片名 (2015) - BD720P` 和 `片名 (2015) - 超清中英双字`：两个名字都读得懂、
+        # 都刮得到，一部片都不会少。标记也一模一样时再按原名排序补 (2)(3)。
+        fixed, used = [], set()
+        for src, dst in sorted(moves, key=lambda x: x[0]):
+            if dst not in clash:
+                fixed.append((src, dst))
+                used.add(dst)
+                continue
+            stem = os.path.basename(dst)[:-5]
+            tags = name_drop_tags(os.path.basename(src)[:-5])
+            cand = f"{stem} - {' '.join(tags)}" if tags else stem
+            want = os.path.join(os.path.dirname(dst), cand + ".strm")
+            i = 2
+            while want in used or (os.path.exists(want)
+                                   and os.path.abspath(want) != os.path.abspath(src)):
+                want = os.path.join(os.path.dirname(dst), f"{cand} ({i}).strm")
+                i += 1
+            fixed.append((src, want))
+            used.add(want)
+        moves, clash = fixed, set()
+        info("撞名的已加后缀区分（原名里被清掉的标记接回片名后面），一部都不少")
     if clash:
         kept = [x for x in moves if x[1] in clash]
         moves = [x for x in moves if x[1] not in clash]
         warn(f"{len(kept)} 个 strm 的目标名字和别人撞了，这几个保持原样：")
-        for nm in sorted({os.path.basename(x[1])[:-5] for x in kept})[:5]:
-            print(f"  {DIM}·{RST} {nm}")
+        # 【必须连原名一起打】只打目标名的话，屏上一行「一只鱼4kyu cc豆瓣6」
+        # 用户根本不知道它是从哪个文件来的，也就没法判断清洗器是不是清歪了。
+        for src, dst in sorted(kept, key=lambda x: x[1])[:5]:
+            print(f"  {DIM}{os.path.basename(src)[:-5][:44]}{RST}")
+            print(f"    → {os.path.basename(dst)[:-5]}")
+        if len(kept) > 5:
+            print(f"  {DIM}… 还有 {len(kept) - 5} 个{RST}")
         print(f"  {DIM}两个不同的文件清出了同一个名字，挪过去会少一部片 ——"
-              f"宁可留着原名。{RST}")
+              f"宁可留着原名。想全都保住：「名称重定义 → 撞名的怎么办」选加后缀。{RST}")
     if not moves:
         # 【没得挪也要清一遍】。strm 早就挪好了的话 moves 是空的，可上一轮遗留的
         # 空壳目录、孤儿 nfo/海报还在 —— 它们不含 .strm，脚本的路径列表看不见，
@@ -10917,7 +10976,11 @@ def _rename_menu(d, mp=None):
         print(f"  2. 清洗后的名字")
         if mp:
             print(f"  3. 跟默认走{DIM}（{names.get(dflt, dflt)}）{RST}")
-        print(f"  4. 先看看会改成什么{DIM}（只看，不动文件）{RST}")
+        # 【按钮名是个名词，不是一句话】别的每一行都是两三个字的标签，只有这一行
+        # 原来写成「先看看会改成什么（只看，不动文件）」—— 菜单是用来扫的。
+        print(f"  4. 预览              {DIM}只列，不动文件{RST}")
+        print(f"  5. 撞名的怎么办      当前：{CYAN}"
+              + ("加后缀区分" if clash_policy() == "suffix" else "保持原样") + RST)
         print(f"  0. 返回")
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
@@ -10935,6 +10998,23 @@ def _rename_menu(d, mp=None):
             if len(pv) > 15:
                 print(f"  {DIM}… 还有 {len(pv) - 15} 个{RST}")
             print(f"  {DIM}改的只是本机 strm 的文件名，网盘里的文件一个都不碰。{RST}")
+            continue
+        if c == "5":
+            print()
+            print(f"  {DIM}两个不同的文件清出同一个片名时怎么办。{RST}")
+            print(f"  1. 保持原样{DIM}　这几个不改名，顶着网盘原名留在库里{RST}")
+            print(f"  2. 加后缀区分{DIM}　把原名里被清掉的标记接回片名后面："
+                  f"片名 (2015) - BD720P，一部都不少{RST}")
+            print(f"  0. 返回")
+            v = ask("请选择").strip()
+            if v == "1":
+                save_ms_state(clash_policy="keep")
+                ok("撞名的：保持原样")
+            elif v == "2":
+                save_ms_state(clash_policy="suffix")
+                ok("撞名的：加后缀区分")
+                if ask_yn("现在就把撞名的那几个改过来？", True):
+                    migrate_strm_layout(d, read_emby_api_key(d))
             continue
         val = {"1": "off", "2": "on"}.get(c, "x")
         if c == "3" and mp:
