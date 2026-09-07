@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.82"
+SCRIPT_VERSION = "1.5.83"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2114,14 +2114,12 @@ def do_selfupdate():
     try:
         if not os.access(me, os.W_OK):
             raise RuntimeError("脚本文件不可写")
-        req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}",
-                                     headers={"User-Agent": "media-stack"})
-        body = urllib.request.urlopen(req, timeout=60).read().decode()
+        body, _rv, _how = fetch_self_latest(60)
         # 和 self_update 同一道门槛：别把 404 页面/限流提示写进去，那会废掉文件
-        if "SCRIPT_VERSION" not in body or len(body) < 10000:
-            raise RuntimeError("拉到的内容不像 media-stack.py")
-        cur = open(me, encoding="utf-8").read()
-        if body == cur:
+        if not body:
+            raise RuntimeError(_how or "拉到的内容不像 media-stack.py")
+        # 【定时那条更不能降级】没人看着，降回去之后连"下一轮自动更新"都是旧的
+        if ver_tuple(_rv) <= ver_tuple(SCRIPT_VERSION):
             rec["ok"] = True                  # 已是最新，什么都不用做
         else:
             # 【换上去之前先 compile】语法坏掉的版本换进去，等于把这台机器上
@@ -2617,8 +2615,10 @@ def set_rules_url(url):
 def fetch_lib_rules(d, src=None, url=None):
     """把【当前这套】规则拉到本机。返回 True 表示拉到了新内容。
 
-    带时间戳绕开 raw.githubusercontent 的 CDN 缓存 —— 不绕的话"刚推的改动"拉下来还是
-    旧的，看起来就像改了没用。
+    发不缓存的请求头绕开 raw.githubusercontent 的 CDN —— 【URL 上加时间戳没用】，
+    它的缓存键不认这种自造的查询参数。原来这里写着"带时间戳绕开缓存"，那句话是错的，
+    而且错得有欺骗性：看代码的人会以为这条路已经堵上了，实际上"刚推的改动"拉下来
+    还是旧的，看起来就像改了没用。
 
     拉失败【不是错误】：机器上还留着上一次那份。而【解析不出规则就一个字都不写】：
     拉到一页 404 或者限流提示照写进去的话，下一轮所有媒体库会当场消失。
@@ -2628,9 +2628,7 @@ def fetch_lib_rules(d, src=None, url=None):
     if not u:
         return False
     try:
-        req = urllib.request.Request(f"{u}{'&' if '?' in u else '?'}_t={int(time.time())}",
-                                     headers={"User-Agent": "media-stack"})
-        body = urllib.request.urlopen(req, timeout=20).read().decode()
+        body = _no_cache_get(u, 20)
     except Exception:
         return False
     if not parse_lib_rules(body):
@@ -5418,6 +5416,72 @@ def pull_images(compose, env_file):
     return True
 
 
+# GitHub 的 contents 接口。raw.githubusercontent 的 CDN 压着旧文件时，这条路还能问到
+# 真的最新版 —— 它不走那层缓存。限流比 raw 严（未登录每小时 60 次），所以只在
+# raw 给出"和本机一样"这个可疑答案时才走一次。
+SELF_API = ("https://api.github.com/repos/bgpeer/nodekit/contents/"
+            "media-stack.py?ref=main")
+
+
+def _no_cache_get(url, timeout=20, accept=""):
+    """带上不缓存的请求头去取。CDN 认这两个头，不认自造的 ?_t= 查询参数。"""
+    sep = "&" if "?" in url else "?"
+    hdr = {"User-Agent": "media-stack",
+           "Cache-Control": "no-cache, no-store, max-age=0",
+           "Pragma": "no-cache"}
+    if accept:
+        hdr["Accept"] = accept
+    req = urllib.request.Request(f"{url}{sep}_t={int(time.time())}", headers=hdr)
+    return urllib.request.urlopen(req, timeout=timeout).read().decode()
+
+
+def _body_version(body):
+    m = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', body or "")
+    return m.group(1) if m else ""
+
+
+def ver_tuple(v):
+    """"1.5.82" → (1, 5, 82)。比不出来的当成 (0,)，永远不会被当成更新的版本。
+
+    【必须按段比整数】字符串比大小会把 "1.5.82" 判成比 "1.5.78" 小（'2' < '7'），
+    那正好是这套版本号最常见的形状。
+    """
+    try:
+        return tuple(int(x) for x in str(v).strip().lstrip("v").split("."))
+    except Exception:
+        return (0,)
+
+
+def looks_like_self(body):
+    """拉到的东西像不像本脚本。别把 404 页面或限流提示写进去，那会当场废掉这个文件。"""
+    return bool(body) and "SCRIPT_VERSION" in body and len(body) >= 10000
+
+
+def fetch_self_latest(timeout=20):
+    """去仓库取最新的脚本。返回 (正文, 版本号, 从哪条路取到的)；取不到返回 ("", "", 原因)。
+
+    【raw 说"和本机一样"的时候必须再问一条路】raw.githubusercontent 给默认分支带
+    max-age=300 的缓存，刚推上去的改动在那五分钟里拉下来还是旧的 —— 而这个函数的
+    调用方只会照着答案打一行"已是最新"，用户连点几次都看不出哪里不对。
+    """
+    body, why = "", ""
+    try:
+        body = _no_cache_get(SELF_URL, timeout)
+    except Exception as e:
+        why = _short_err(e)
+    if looks_like_self(body) and _body_version(body) != SCRIPT_VERSION:
+        return body, _body_version(body), "仓库"
+    try:
+        alt = _no_cache_get(SELF_API, timeout, accept="application/vnd.github.raw")
+        if looks_like_self(alt) and _body_version(alt) != SCRIPT_VERSION:
+            return alt, _body_version(alt), "接口（CDN 里那份还是旧的）"
+    except Exception as e:
+        why = why or _short_err(e)
+    if looks_like_self(body):
+        return body, _body_version(body), "仓库"
+    return "", "", why or "拉到的内容不像 media-stack.py"
+
+
 def self_update():
     """把脚本自己换成仓库里的最新版；换过了返回 True，调用方应立刻 re-exec。
 
@@ -5433,35 +5497,31 @@ def self_update():
         warn(f"脚本文件不可写（{me}），这次跳过检查更新。")
         print(f"  {DIM}继续用本机这份 v{SCRIPT_VERSION} 刷新配置。{RST}")
         return False
-    try:
-        req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}",
-                                     headers={"User-Agent": "media-stack"})
-        body = urllib.request.urlopen(req, timeout=20).read().decode()
-    except Exception as e:
-        warn(f"拉取最新脚本失败（{e}）")
+    body, rv, how = fetch_self_latest(20)
+    if not body:
+        warn(f"拉取最新脚本失败（{how}）")
         print(f"  {DIM}继续用本机这份 v{SCRIPT_VERSION} 刷新配置。{RST}")
         return False
-    # 只接受长得像本脚本的内容，别把一页 404/限流提示写进去，那会直接废掉这个文件
-    if "SCRIPT_VERSION" not in body or len(body) < 10000:
-        warn("拉到的内容不像 media-stack.py，已忽略，继续用本机这份。")
-        return False
-    try:
-        if body == open(me, encoding="utf-8").read():
+    if ver_tuple(rv) <= ver_tuple(SCRIPT_VERSION):
+        # 【比本机旧就不动】CDN 压着旧文件的时候，"内容不同就换过去"会把刚升上来的
+        # 机器【降回去】—— 用户点一次更新退一个版本，屏上还写着"脚本已更新"。
+        if ver_tuple(rv) < ver_tuple(SCRIPT_VERSION):
+            warn(f"仓库那边拉到的是 v{rv or '?'}，比本机的 v{SCRIPT_VERSION} 旧，"
+                 f"不覆盖。")
+            print(f"  {DIM}多半是 CDN 还压着旧文件，过几分钟再点一次。{RST}")
+        else:
             # 【没得升也要说一声】原来这里是静默 return，于是"没打那行"同时意味着三件
             # 事：已是最新、拉取失败、脚本不可写 —— 用户没法从屏幕上分辨，只会以为
             # "更新功能不见了"。所以照着有更新时的形状打，只是箭头两头一样。
             ok(f"脚本 v{SCRIPT_VERSION} → v{SCRIPT_VERSION}"
-               f"{DIM}（已是最新，仓库里没有更新的版本）{RST}")
-            return False
-    except OSError:
+               f"{DIM}（已是最新，{how}里也是这一版）{RST}")
         return False
-    m = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', body)
     tmp = me + ".new"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(body)
     os.chmod(tmp, 0o755)
     os.replace(tmp, me)          # 先写临时文件再原子替换，中途断网也不会留个半截脚本
-    ok(f"脚本已更新：v{SCRIPT_VERSION} → v{m.group(1) if m else '?'}，用新版继续...")
+    ok(f"脚本已更新：v{SCRIPT_VERSION} → v{rv}，用新版继续...")
     return True
 
 
