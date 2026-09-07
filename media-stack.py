@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.88"
+SCRIPT_VERSION = "1.5.89"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10165,10 +10165,14 @@ def reload_storages(d, mounts):
                 raise RuntimeError(why)
             n += 1
         except Exception as e:
-            # 【把话说完】原来截在 60 个字符，正好切在 URL 开头（`Get "https://open-`）——
-            # 既不知道在连哪台主机，也不知道是超时还是被拒，而那是唯一有诊断价值的部分。
-            _why = str(e).strip()
-            warn(f"重新加载 {mp} 失败：{_why[:200]}")
+            # 【必须走 _short_err，不能自己截字符串】上一版为了"把话说完"改成
+            # str(e)[:200]，而存储 status 里那条 Go 错误的 URL query 带着
+            # access_token —— 200 个字符正好把令牌整个露出来，而这一屏是会被截图
+            # 发出去的。_short_err 会先把 URL 砍到问号前，再给出人话结论。
+            _why = _short_err(e)
+            warn(f"重新加载 {mp} 失败：{_why}")
+            print(f"  {DIM}在连的是这个盘的网盘接口（域名在 OpenList 网页的存储列表里"
+                  f"看得到，这里不打印 —— 那条 URL 里带着令牌）。{RST}")
             _st = next((str(st or "") for m2, _dv, st, _r, _m in openlist_storages(d)
                         if m2 == mp), "")
             if _st and _st != "work":
@@ -10179,7 +10183,7 @@ def reload_storages(d, mounts):
             else:
                 print(f"  {DIM}这一步只是清目录缓存，已有的片子一个都不受影响 ——"
                       f"最多是这一轮看不到网盘里刚加的新片。{RST}")
-            if "deadline" in _why or "timeout" in _why.lower() or "i/o" in _why:
+            if "超时" in _why or "TLS" in _why:
                 print(f"  {DIM}是连网盘的接口超时（不是这台机器的问题）。"
                       f"夸克的开放接口在部分跨境线路上就是时通时不通，已经重试过 3 次。{RST}")
     return n
