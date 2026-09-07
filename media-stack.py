@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.78"
+SCRIPT_VERSION = "1.5.82"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2309,8 +2309,108 @@ def follow_new_storages(d):
     return added
 
 
-def planned_strm_path(d, netdisk_path, scan_paths):
-    """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。"""
+# 文件名里那些【不是片名】的词。分辨率、编码、音轨、语言、来源、画质、发布组习惯用语。
+# 一律按【整段】比对，不做子串匹配 —— 「高清」不能把「高清晰度谋杀案」腰斩。
+_NAME_JUNK = (
+    r"4k|8k|2160p?|1080[pi]|720[pi]|576[pi]|480[pi]|hd|fhd|uhd|sd"
+    r"|blu-?ray|bd|bdrip|bdremux|dvd|dvdrip|dvdscr|web-?dl|web-?rip|web|hdtv"
+    r"|remux|hdr\d*|sdr|dolby|dolbyvision|dv|repack|proper"
+    r"|x26[45]|h\.?26[45]|hevc|avc|vc-?1|mpeg\d?|\d+bits?|\d+fps"
+    r"|dts|dts-?hd|dts-?hd-?ma|dtsma|truehd|atmos|e?ac-?3|aac|flac|lpcm|ddp?\d*"
+    r"|\d+audio|[257]\.[01]"
+    r"|国语|粤语|英语|日语|韩语|国粤双语|国英双语|双语|中字|中英字幕|中英双字|中英双语"
+    r"|简繁|简体|繁体|内封|内嵌|外挂|无字|高清中字|超清中英双字"
+    r"|高清|超清|标清|蓝光|原盘|收藏版|加长版|导演剪辑版|修复版|重制版|未删减|完整版"
+    r"|国配|台配|港版|邵氏|豆瓣|评分|合集|系列"
+)
+NAME_JUNK_RE = re.compile(r"(?i)^(?:" + _NAME_JUNK + r")$")
+NAME_SCORE_RE = re.compile(r"^\d+(?:\.\d+)?\s*分$")
+NAME_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+CJK_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def clean_media_name(base):
+    """把网盘那种带一堆标记的文件名清成「片名 (年份)」。清不动、或者清完没变就返回空串。
+
+    【返回空串＝别动它】名字本来就规矩的（`流浪地球 (2019)`、`老友记 S01E01`）走到最后
+    会和原名一模一样，返回空串；清出来只剩数字的（`156 4K` → `156`）也返回空串 ——
+    那是集号，改名只会把事情弄得更糟。宁可少改一个，不能改错一个。
+    """
+    s = base
+    # 评分块：[[豆瓣5].9分]  【豆瓣8.1】  (IMDb 7.2)
+    s = re.sub(r"[\[\(【][^\[\]\(\)【】]*(?:豆瓣|imdb|评分)[^\[\]\(\)【】]*[\]\)】]",
+               ".", s, flags=re.I)
+    s = re.sub(r"[\[\(【][^\[\]\(\)【】]*\d+(?:\.\d+)?\s*分[^\[\]\(\)【】]*[\]\)】]",
+               ".", s)
+    s = re.sub(r"^[.\s]*\d+(?:\.\d+)?\s*分[\]\)】]", ".", s)   # 上一步剥剩的 ".9分]"
+    s = re.sub(r"【[^】]{1,12}】", ".", s)          # 发布组：【蓝色狂想】
+    s = re.sub(r"[\[\]【】\(\)（）]", ".", s)       # 剩下的括号一律当分隔符
+    out, year = [], ""
+    for p in re.split(r"[.\u3000_]+", s):
+        p = p.strip().strip(" -—·~")
+        if not p:
+            continue
+        if NAME_YEAR_RE.match(p):
+            year = year or p
+            break                       # 年份就是片名的右边界
+        if NAME_JUNK_RE.match(p) or NAME_SCORE_RE.match(p):
+            break
+        out.append(p)
+    # 中文片名后面跟着的英文别名一并丢掉 —— 刮削器拿中文名去搜更准，
+    # 「血仍未冷.The.Replacement.Killers」留成一串反而两边都对不上
+    if out and CJK_RE.search(out[0]):
+        out = [p for i, p in enumerate(out) if i == 0 or CJK_RE.search(p)]
+    words = " ".join(out).split()
+    while words:                        # 结尾的标记词一个个剥掉：爱的世界 邵氏 4K 国粤双语
+        w = words[-1].strip("-—·~[]()")
+        if NAME_YEAR_RE.match(w):
+            year = year or w
+            words.pop()
+            continue
+        if NAME_JUNK_RE.match(w) or NAME_SCORE_RE.match(w):
+            words.pop()
+            continue
+        break
+    title = " ".join(words).strip(" .-_·~")
+    if len(title) < 2 or title.isdigit() or "/" in title:
+        return ""
+    want = f"{title} ({year})" if year else title
+    return "" if want == base else want
+
+
+def rename_policy():
+    """「名称重定义」的默认值。"on" = strm 用清洗后的名字，"off" = 跟网盘原名。"""
+    return ms_state().get("rename_policy") or "off"
+
+
+def rename_policy_of(mount):
+    """某个网盘要不要清洗名字。没单独设过就跟默认值走。
+
+    【为什么分盘设】同一台机器上，夸克里是规规矩矩的「片名 (年份).mkv」，清洗器碰都
+    不会碰；而另一个盘里全是「[[豆瓣6].1分]华丽上班族.Office.2015.BD720P.国粤双语」，
+    不清洗 Emby 一部都刮不到。一个全局开关伺候不了这两种。
+    """
+    if not mount:
+        return rename_policy()
+    return (ms_state().get("rename_by_drive") or {}).get(mount) or rename_policy()
+
+
+def set_rename_policy_of(mount, val):
+    """给某个盘单独定；val 传 None 表示"跟默认值走"。"""
+    by = dict(ms_state().get("rename_by_drive") or {})
+    if val is None:
+        by.pop(mount, None)
+    else:
+        by[mount] = val
+    save_ms_state(rename_by_drive=by)
+
+
+def planned_strm_path(d, netdisk_path, scan_paths, clean=None):
+    """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。
+
+    clean 显式传 True/False 可以越过「名称重定义」的设置 —— 菜单里的预览要在还没打开
+    开关的时候就把"会改成什么"摆出来，靠的就是它。
+    """
     best = ""
     for sp in scan_paths:
         if _under(netdisk_path, sp) and len(sp) > len(best):
@@ -2320,8 +2420,37 @@ def planned_strm_path(d, netdisk_path, scan_paths):
     rel = netdisk_path[len(best.rstrip("/")):].lstrip("/")
     if not rel:
         return ""
+    stem = os.path.splitext(rel)[0]
+    if clean is None:
+        mnt = "/" + netdisk_path.strip("/").split("/")[0]
+        clean = rename_policy_of(mnt) == "on"
+    if clean:
+        head, tail = os.path.split(stem)
+        got = clean_media_name(tail)
+        if got:
+            stem = os.path.join(head, got) if head else got
     return os.path.join(strm_root(d), STRM_SUBDIR, *strm_subpath(best).split("/"),
-                        os.path.splitext(rel)[0] + ".strm")
+                        stem + ".strm")
+
+
+def rename_preview(d, only=None, clean=True):
+    """会把哪些 strm 改名。返回 [(旧名, 新名, 网盘路径)]，【不动任何文件】。
+
+    只列文件名真的变了的 —— 挪目录那种（扫描路径改了）不是这一屏要说的事。
+    """
+    try:
+        sps = (rebuild_cfg_from_disk(d).get("scan_paths") or [])
+    except Exception:
+        return []
+    out = []
+    for host, target in strm_inventory(d, only):
+        want = planned_strm_path(d, target, sps, clean=clean)
+        if not want:
+            continue
+        a, b = os.path.basename(host), os.path.basename(want)
+        if a != b:
+            out.append((a[:-5], b[:-5], target))
+    return out
 
 
 def _progress_by_target(d, key):
@@ -4453,6 +4582,35 @@ def migrate_strm_layout(d, key):
         want = planned_strm_path(d, target, sps)
         if want and os.path.abspath(want) != os.path.abspath(host):
             moves.append((host, want))
+    # 【两个不同的文件挪到同一个地方 = 少一部片】清洗名字之后这不再是理论风险：
+    # `[片名].超清中英双字.mp4` 和 `[片名].1080p.mkv` 会清出同一个名字，
+    # shutil.move 到已存在的路径是【静默覆盖】—— 库里就这么少一部，还查不出来。
+    # 撞了就这几条全都不挪，把原名留着比悄悄合掉强。
+    seen = {}
+    for _src, dst in moves:
+        seen[dst] = seen.get(dst, 0) + 1
+    clash = {k for k, v in seen.items() if v > 1}
+    # 目的地已经有个别的文件（内容不一样）也不能覆盖。内容一样的是 AutoFilm 按网盘
+    # 原名重新生成的那一份，覆盖过去正好把它收掉。
+    srcs = {os.path.abspath(x) for x, _ in moves}
+    for _src, dst in moves:
+        if dst in clash or os.path.abspath(dst) in srcs or not os.path.exists(dst):
+            continue
+        try:
+            same = (open(dst, encoding="utf-8").read().strip()
+                    == open(_src, encoding="utf-8").read().strip())
+        except OSError:
+            same = False
+        if not same:
+            clash.add(dst)
+    if clash:
+        kept = [x for x in moves if x[1] in clash]
+        moves = [x for x in moves if x[1] not in clash]
+        warn(f"{len(kept)} 个 strm 的目标名字和别人撞了，这几个保持原样：")
+        for nm in sorted({os.path.basename(x[1])[:-5] for x in kept})[:5]:
+            print(f"  {DIM}·{RST} {nm}")
+        print(f"  {DIM}两个不同的文件清出了同一个名字，挪过去会少一部片 ——"
+              f"宁可留着原名。{RST}")
     if not moves:
         # 【没得挪也要清一遍】。strm 早就挪好了的话 moves 是空的，可上一轮遗留的
         # 空壳目录、孤儿 nfo/海报还在 —— 它们不含 .strm，脚本的路径列表看不见，
@@ -4656,12 +4814,15 @@ def do_sync():
     if not is_installed(d):
         return
     rec = {"ts": int(time.time()), "ok": False, "pruned": 0, "bluray": 0,
-           "bluray_stuck": 0, "nodur_before": 0,
+           "bluray_stuck": 0, "skipped": 0, "nodur_before": 0,
            "nodur_after": 0, "missing": 0, "error": ""}
     try:
         key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                                "auth")
         normalize_strm_files(d)
+        # 【规则拦不住 AutoFilm】它每一轮都会把排除掉的目录重新生成出来，所以这里也要清
+        # 一遍 —— 不然用户在菜单里清干净了，第二天早上那批条目又回到库里。
+        rec["skipped"] = apply_skip_dirs(d, quiet=True)
         # 原盘目录压成单个 strm。放这儿是因为上一轮"问不到片段大小"的那些要有机会重试，
         # 而且新扫进来的原盘不必等到用户下次手动点「5」才可播。
         rec["bluray"], rec["bluray_stuck"] = collapse_bluray_folders(d, quiet=True)
@@ -6001,6 +6162,114 @@ def only_mounts(only):
     return [only] if isinstance(only, str) else [str(x) for x in only]
 
 
+def skip_dirs_of(mp):
+    """这个盘的「不扫的目录」规则（相对盘根的路径片段）。空 = 什么都不排除。"""
+    m = "/" + str(mp or "").strip("/").split("/")[0]
+    v = (ms_state().get("skip_dirs") or {}).get(m) or []
+    return [str(x).strip("/") for x in v if str(x).strip("/")]
+
+
+def set_skip_dirs(mp, pats):
+    """写回这个盘的规则，返回清理后的清单。
+
+    【. 和 .. 必须挡在门口】它们会匹配到任意一层，一条规则就能把整棵树端了。
+    这个函数的下游是 shutil.rmtree，宁可多挡几个也不能放进去。
+    """
+    m = "/" + str(mp or "").strip("/").split("/")[0]
+    cur = dict(ms_state().get("skip_dirs") or {})
+    clean = []
+    for x in pats:
+        x = str(x or "").strip().strip("/")
+        segs = x.split("/")
+        if not x or any(seg in ("", ".", "..", "*") for seg in segs):
+            continue
+        if x not in clean:
+            clean.append(x)
+    if clean:
+        cur[m] = clean
+    else:
+        cur.pop(m, None)
+    save_ms_state(skip_dirs=cur)
+    return clean
+
+
+def _skip_hit(parts, pats):
+    """这条相对路径命中了哪条规则（没命中返回空串）。
+
+    按【整段】比，不按子串 —— 「合集」不该顺手匹配掉「合集电影」。规则本身可以是
+    多段（mov/电影/合集/周星驰/BD+DVD合集），那就要求这几段连续出现。
+    """
+    low = [str(x).lower() for x in parts]
+    for p in pats:
+        seg = [x.lower() for x in p.split("/") if x]
+        if not seg:
+            continue
+        for i in range(len(low) - len(seg) + 1):
+            if low[i:i + len(seg)] == seg:
+                return p
+    return ""
+
+
+def _count_strm_in(path):
+    n = 0
+    for _dp, _dn, fs in os.walk(path):
+        n += sum(1 for f in fs if f.endswith(".strm"))
+    return n
+
+
+def skip_dirs_targets(d, only=None):
+    """规则会清掉哪些目录。返回 [(本地目录, 命中的规则, 里面几个 strm)]，【不删任何东西】。
+
+    菜单要拿它做预览，执行那一步也用它 —— 预览和实际删的是同一份名单，不会出现
+    "屏上说 14 个、删了 200 个"这种事。
+    """
+    out = []
+    root = os.path.join(strm_root(d), STRM_SUBDIR)
+    want = ["/" + str(x).strip("/").split("/")[0] for x in only_mounts(only)]
+    try:
+        drives = sorted(x for x in os.listdir(root)
+                        if os.path.isdir(os.path.join(root, x)))
+    except OSError:
+        return out
+    for dv in drives:
+        if want and ("/" + dv) not in want:
+            continue
+        pats = skip_dirs_of("/" + dv)
+        if not pats:
+            continue
+        base = os.path.join(root, dv)
+        for dp, dns, _fs in os.walk(base):
+            rel = os.path.relpath(dp, base)
+            if rel == ".":
+                continue          # 盘根永远不参与匹配，规则再离谱也端不掉整个盘
+            hit = _skip_hit(rel.split(os.sep), pats)
+            if hit:
+                out.append((dp, hit, _count_strm_in(dp)))
+                dns[:] = []       # 命中就整棵拿走，不必再往下钻
+    return out
+
+
+def apply_skip_dirs(d, only=None, quiet=False):
+    """按规则清掉本地 strm。返回清掉几个。
+
+    【为什么每轮都要跑】规则拦不住 AutoFilm —— 它下一轮照样把那些目录生成出来。
+    所以这不是"删一次就完了"，而是每次生成之后、每天对齐之中各清一遍。
+    """
+    tg = skip_dirs_targets(d, only)
+    gone, dirs = 0, 0
+    for dp, _hit, n in tg:
+        try:
+            shutil.rmtree(dp)
+            gone, dirs = gone + n, dirs + 1
+        except OSError as e:
+            if not quiet:
+                warn(f"{os.path.basename(dp)} 没删干净：{_short_err(e)}")
+    if gone and not quiet:
+        ok(f"按「不扫的目录」清掉 {gone} 个 strm（{dirs} 个目录）")
+        print(f"  {DIM}网盘里的片子一个都没动 —— 规则删掉再扫一次就全回来。{RST}")
+    return gone
+
+
 def strm_count(d, only=None):
     """本地已生成的 .strm 数量。0 就意味着 Emby 里一定是空的。"""
     n = 0
@@ -6876,37 +7145,104 @@ def _bluray_discs(root):
     return discs
 
 
-def _bluray_main_stream(strms, tok):
-    """这套原盘的正片：BDMV/STREAM 里【最大】的那个片段。拿不到大小就返回空串。
+# 原盘片段的扩展名。BDMV/STREAM 里除了 .m2ts 还会有 CLIPINF/PLAYLIST 那些索引文件，
+# 它们也是"文件"，不筛一下就会被当成候选（虽然小、排不到最大，但一套原盘要是只剩索引
+# 文件，挑出来的东西根本不能播）。
+DISC_VIDEO_EXT = (".m2ts", ".mts", ".ts", ".mkv", ".mp4", ".m4v")
 
-    【拿不到大小宁可不做】随便挑一个的话，用户点开看到的是三十秒的厂标或菜单动画 ——
-    那比"播不了"更难受，因为它看起来是成功的，人会以为片源就是坏的。
 
-    一套原盘问一次 fs/list 就够（几十个片段都在同一个 STREAM 目录里）。
+def _ol_ls(path, tok):
+    """列一个网盘目录。返回 content 列表；问不到返回 None（【不是空表】）。
+
+    空表和"问不到"必须分得开：空表是"这儿确实没东西"，问不到是"线路不行/超时"。
+    上面挑正片那一步只在真的什么都没有时才放弃，跨境列目录超时不该被当成"没有片段"。
     """
-    by_dir = {}
+    try:
+        r = _ol_api("/api/fs/list", {"path": path, "password": "", "page": 1,
+                                     "per_page": 0, "refresh": False},
+                    tok, timeout=60)
+    except Exception:
+        return None
+    if r.get("code") != 200:
+        return None
+    return (r.get("data") or {}).get("content") or []
+
+
+def _ol_child(path, want, tok):
+    """在网盘目录 path 底下找名字等于 want 的子目录，返回它的【真实大小写】全路径。
+
+    各家网盘（和各套压制组）写的是 BDMV/bdmv、STREAM/stream 都有，硬拼一个大小写
+    过去就会 404。照实取一次名字，比猜省事。
+    """
+    for x in (_ol_ls(path, tok) or []):
+        if str(x.get("name") or "").lower() == want and x.get("is_dir"):
+            return path.rstrip("/") + "/" + x["name"]
+    return ""
+
+
+def _disc_stream_dirs(disc, strms, tok):
+    """这套原盘在【网盘上】的 STREAM 目录（可能不止一个：3D 原盘会有两套）。
+
+    两条路：本地 strm 的目标路径里已经带着真实大小写，能省掉两次列目录；一个 strm
+    都没有时（.m2ts 常常压根生不出 strm）就从本地目录名反推网盘路径，逐层问名字。
+    """
+    out, bdmvs = [], []
     for p in strms:
         try:
             tgt = open(p, encoding="utf-8").read().strip()
         except OSError:
             continue
-        if tgt.startswith("/"):
-            by_dir.setdefault(os.path.dirname(tgt), {})[os.path.basename(tgt)] = tgt
+        if not tgt.startswith("/"):
+            continue
+        parts = [x for x in tgt.strip("/").split("/") if x]
+        low = [x.lower() for x in parts]
+        if "bdmv" not in low:
+            continue
+        i = len(low) - 1 - low[::-1].index("bdmv")
+        bdmv = "/" + "/".join(parts[:i + 1])
+        if low[i + 1:i + 2] == ["stream"]:
+            d2 = bdmv + "/" + parts[i + 1]
+            if d2 not in out:
+                out.append(d2)
+        elif bdmv not in bdmvs:
+            bdmvs.append(bdmv)
+    if not out and not bdmvs and _under(disc, STRM_PATH):
+        # 本地一个 strm 都没有：strm 树去掉前缀就是网盘路径
+        cloud = "/" + os.path.relpath(disc, STRM_PATH).strip("/")
+        b = _ol_child(cloud, "bdmv", tok)
+        if b:
+            bdmvs.append(b)
+    for b in bdmvs:
+        d2 = _ol_child(b, "stream", tok)
+        if d2 and d2 not in out:
+            out.append(d2)
+    return out
+
+
+def _bluray_main_stream(disc, strms, tok):
+    """这套原盘的正片：BDMV/STREAM 里【最大】的那个片段。问不到大小就返回空串。
+
+    【拿不到大小宁可不做】随便挑一个的话，用户点开看到的是三十秒的厂标或菜单动画 ——
+    那比"播不了"更难受，因为它看起来是成功的，人会以为片源就是坏的。
+
+    【候选来自网盘那份清单，不看本地有没有 strm】曾经写成"只在本地已有 strm 的文件名
+    里比大小"，那是错的：AutoFilm 按扩展名生成 strm，.m2ts 不在它的默认表里，一套几十
+    个片段的原盘本地常常只落下一个 strm。于是能进比较的永远只有那一个，函数却一本正经
+    地把它当成"最大的"返回 —— 实测撞到过 BDMV 底下只有 1 个 strm、而网盘那头 00003.m2ts
+    有 20.88 GB。挑错了整棵树还照删不误，正是这段注释要防的那件事。
+
+    一套原盘问一次 fs/list 就够（几十个片段都在同一个 STREAM 目录里）。
+    """
     best, best_size = "", -1
-    for dirn, files in by_dir.items():
-        try:
-            r = _ol_api("/api/fs/list", {"path": dirn, "password": "", "page": 1,
-                                         "per_page": 0, "refresh": False},
-                        tok, timeout=60)
-        except Exception:
-            continue
-        if r.get("code") != 200:
-            continue
-        for x in ((r.get("data") or {}).get("content") or []):
-            n = x.get("name")
-            if n in files and int(x.get("size") or 0) > best_size:
-                best, best_size = files[n], int(x.get("size") or 0)
-    return best
+    for dirn in _disc_stream_dirs(disc, strms, tok):
+        for x in (_ol_ls(dirn, tok) or []):
+            n = str(x.get("name") or "")
+            if x.get("is_dir") or os.path.splitext(n)[1].lower() not in DISC_VIDEO_EXT:
+                continue
+            sz = int(x.get("size") or 0)
+            if sz > best_size:
+                best, best_size = dirn.rstrip("/") + "/" + n, sz
+    return best if best_size > 0 else ""
 
 
 def collapse_bluray_folders(d, quiet=False, only=None):
@@ -6939,7 +7275,9 @@ def collapse_bluray_folders(d, quiet=False, only=None):
     done, stuck = 0, []
     for disc, strms in sorted(discs.items()):
         name = os.path.basename(disc.rstrip("/")) or "BluRay"
-        main = _bluray_main_stream(strms, tok) if strms else ""
+        # 【strms 为空也要试】原盘的 .m2ts 常常一个 strm 都生不出来，那种恰恰是最
+        # 需要压的 —— 以前这里直接判死，等于把最典型的一类原盘漏在外面。
+        main = _bluray_main_stream(disc, strms, tok)
         if not main:
             stuck.append(name)
             continue
@@ -8446,6 +8784,9 @@ def do_strm(only=None):
         print(f"  {DIM}·{RST} AutoFilm 扫的是 {BOLD}{read_yaml_scalar(cfg_path, 'source_dir', '/')}{RST}，"
               f"这个路径在 OpenList 里点得开吗")
         return
+
+    # 【排除放在压原盘之前】不然会先花一堆列目录的时间去压那些马上就要清掉的原盘。
+    apply_skip_dirs(d, only=only)
 
     # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
     # 之后再删再建，中间那段时间用户点进去就是 load fail。
@@ -10291,8 +10632,11 @@ def _apply_scan_paths(d, why=""):
     return paths
 
 
-def _pick_dirs(d, mp):
-    """在这个盘里挑扫描路径。返回挑中的路径（空 = 取消）。
+def _pick_dirs(d, mp, prompt="要扫哪个"):
+    """在这个盘里挑目录。返回挑中的路径（空 = 取消）。
+
+    prompt 换一句就能给「不扫的目录」用 —— 挑目录这件事两边一模一样，而【点编号挑】
+    在那边更要紧：排除规则要写的是深处那一层（…/周星驰/BD+DVD合集），手打更长更容易错。
 
     【一个盘挂多少条路径都行】上层是 scan_spec 那个列表，加进去就是追加一条，删也是按条
     删 —— 一直都支持。真正卡住的是【挑不到】：上一版只列挂载点【下面一层】，而按字母分类
@@ -10331,7 +10675,7 @@ def _pick_dirs(d, mp):
             tips.append(".. 上一层")
         tips += ["或者直接把路径贴进来", "回车取消"]
         print(f"  {DIM}{'　'.join(tips)}{RST}")
-        pick = ask("要扫哪个").strip()
+        pick = ask(prompt).strip()
         if not pick:
             return []
         if pick == "..":
@@ -10487,6 +10831,73 @@ def _title_menu(d, mp=None):
     else:
         print(f"  {DIM}没有 Emby API Key，改不到已有条目上 —— "
               f"先去「3 后补参数 → 1」填上。{RST}")
+
+
+def _rename_menu(d, mp=None):
+    """名称重定义。mp=None 时改的是【默认值】（「剩余网盘」那一屏用）。
+
+    和「片名用哪个」同一套三态，理由也一样：一台机器上各个盘的命名习惯天差地别。
+    """
+    names = {"on": "清洗后的名字", "off": "网盘原名"}
+    dflt = rename_policy()
+    while True:
+        print()
+        if mp:
+            own = (ms_state().get("rename_by_drive") or {}).get(mp)
+            print(f"  {mp} 当前："
+                  + (f"{CYAN}{BOLD}{names.get(own, own)}{RST}{DIM}（单独设的）{RST}"
+                     if own else f"{DIM}跟默认走 → {names.get(dflt, dflt)}{RST}"))
+        else:
+            print(f"  默认（没单独设过的盘都用它）当前："
+                  f"{CYAN}{BOLD}{names.get(dflt, dflt)}{RST}")
+        print(f"  {DIM}清洗＝去掉 [[豆瓣6].1分] 这类前缀、4K/国粤双语/BD1080p 这类标记，"
+              f"留下「片名 (年份)」。{RST}")
+        print(f"  {DIM}名字本来就规矩的一个都不动；清出来只剩数字的（集号）也不动。{RST}")
+        print(f"  1. 网盘原名")
+        print(f"  2. 清洗后的名字")
+        if mp:
+            print(f"  3. 跟默认走{DIM}（{names.get(dflt, dflt)}）{RST}")
+        print(f"  4. 先看看会改成什么{DIM}（只看，不动文件）{RST}")
+        print(f"  0. 返回")
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "4":
+            pv = rename_preview(d, mp, clean=True)
+            print()
+            if not pv:
+                ok("没有需要改的 —— 这些名字 Emby 本来就读得懂。")
+                continue
+            info(f"会改 {len(pv)} 个（下面列前 15 个）：")
+            for a, b, _t in pv[:15]:
+                print(f"  {DIM}{a[:46]}{RST}")
+                print(f"    → {GREEN}{b}{RST}")
+            if len(pv) > 15:
+                print(f"  {DIM}… 还有 {len(pv) - 15} 个{RST}")
+            print(f"  {DIM}改的只是本机 strm 的文件名，网盘里的文件一个都不碰。{RST}")
+            continue
+        val = {"1": "off", "2": "on"}.get(c, "x")
+        if c == "3" and mp:
+            val = None
+        if val == "x":
+            print("无效选择。")
+            continue
+        if mp:
+            set_rename_policy_of(mp, val)
+            ok(f"{mp} 的名称："
+               + (f"跟默认走（{names.get(dflt, dflt)}）" if val is None else names[val]))
+        else:
+            save_ms_state(rename_policy=val)
+            ok(f"默认名称：{names[val]}")
+        # 【改完当场落地】不然要等到下一轮生成或对齐，中间那段时间屏上写着"清洗后的
+        # 名字"而 Emby 里一个条目都没变，看着就是没生效。
+        key = read_emby_api_key(d)
+        n = len(rename_preview(d, mp))
+        if n and ask_yn(f"现在就把这 {n} 个 strm 改过来？", True):
+            migrate_strm_layout(d, key)
+        elif n:
+            print(f"  {DIM}下一轮「5 生成媒体库」或每天的对齐会做。{RST}")
+        return
 
 
 # 阿里云盘的「接口通道」。它没有 link_method（那是夸克/UC 的字段），
@@ -10841,6 +11252,78 @@ def _scan_of(mp):
     return f"{len(mine)} 条：{mine[0]} …"
 
 
+def _skip_dirs_menu(d, mp):
+    """一个盘的「不扫的目录」：加 / 删。规则命中的整棵子树在每轮生成和对齐时清掉。"""
+    while True:
+        pats = skip_dirs_of(mp)
+        tg = skip_dirs_targets(d, mp)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{mp}{RST} 不扫的目录")
+        print("-" * 60)
+        if pats:
+            for i, p in enumerate(pats, 1):
+                k = sum(1 for x in tg if x[1] == p)
+                n = sum(x[2] for x in tg if x[1] == p)
+                print(f"  {i:>2}. {p}   {DIM}命中 {k} 个目录 · {n} 个 strm{RST}")
+        else:
+            print(f"  {DIM}（没有规则，整个盘都扫）{RST}")
+        print(f"  {DIM}这个盘现在有 {strm_count(d, mp)} 个 strm{RST}")
+        print("-" * 60)
+        print("  1. 添加")
+        print("  2. 删除")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "1":
+            picks = _pick_dirs(d, mp, "不扫哪个")
+            if not picks:
+                continue
+            root = mp.rstrip("/")
+            rels = []
+            for p in picks:
+                r = p.rstrip("/")
+                r = r[len(root):].strip("/") if r.startswith(root + "/") else ""
+                if r:
+                    rels.append(r)
+            if not rels:
+                # 选中盘根 = 整个盘都不扫，那不是排除规则该干的事
+                warn("整个盘不扫的话，去「扫描路径」里把它删掉，别用这里。")
+                continue
+            set_skip_dirs(mp, pats + rels)
+            tg2 = [x for x in skip_dirs_targets(d, mp) if x[1] in rels]
+            n = sum(x[2] for x in tg2)
+            print()
+            ok(f"已加 {len(rels)} 条规则，命中 {len(tg2)} 个目录 · {n} 个 strm")
+            for dp, _h, cnt in tg2[:6]:
+                print(f"  {DIM}·{RST} {os.path.basename(dp)}　{cnt} 个 strm")
+            if len(tg2) > 6:
+                print(f"  {DIM}… 还有 {len(tg2) - 6} 个{RST}")
+            if not n:
+                continue
+            print(f"  {DIM}删的只是本机生成的 strm，{RST}{BOLD}网盘里的片子一个都不碰{RST}"
+                  f"{DIM} —— 规则删掉再扫一次就全回来。{RST}")
+            if ask_yn("现在就清掉，不等下一轮对齐？", True):
+                apply_skip_dirs(d, only=mp)
+                print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 ——"
+                      f"「5 生成媒体库」最后会通知扫描，每天的对齐也会做。{RST}")
+        elif c == "2":
+            if not pats:
+                print("没有规则可删。")
+                continue
+            v = ask("删第几条").strip()
+            if not (v.isdigit() and 1 <= int(v) <= len(pats)):
+                print("无效选择。")
+                continue
+            gone = pats.pop(int(v) - 1)
+            set_skip_dirs(mp, pats)
+            ok(f"已删掉规则 {gone}")
+            print(f"  {DIM}那些目录下一次扫描就会重新生成出来。{RST}")
+        else:
+            print("无效选择。")
+
+
 def _drive_menu(d, mp, drv):
     """单个网盘的设置。"""
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
@@ -10857,9 +11340,16 @@ def _drive_menu(d, mp, drv):
         print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}"
               + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"))
         print(f"  4. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
+        _sk = skip_dirs_of(mp)
+        print(f"  5. 不扫的目录        当前："
+              + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"))
+        _rn = {"on": "清洗后的名字", "off": "网盘原名"}
+        print(f"  6. 名称重定义        当前：{CYAN}{_rn.get(rename_policy_of(mp))}{RST}"
+              + ("" if (ms_state().get("rename_by_drive") or {}).get(mp)
+                 else f"  {DIM}（跟默认）{RST}"))
         has115 = "115" in str(drv)
         if has115:
-            print(f"  5. 网盘扫码登录")
+            print(f"  7. 网盘扫码登录")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -10873,7 +11363,11 @@ def _drive_menu(d, mp, drv):
             _link_method_menu(d, [mp], driver_cn(drv))
         elif c == "4":
             _title_menu(d, mp)
-        elif c == "5" and has115:
+        elif c == "5":
+            _skip_dirs_menu(d, mp)
+        elif c == "6":
+            _rename_menu(d, mp)
+        elif c == "7" and has115:
             qr115_login()
         else:
             print("无效选择。")
@@ -11012,6 +11506,8 @@ def _rest_menu(d):
         print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}")
         print(f"  4. 片名用哪个        当前："
               f"{CYAN}{names.get(title_policy())}{RST}")
+        print(f"  5. 名称重定义        当前：{CYAN}"
+              + ("清洗后的名字" if rename_policy() == "on" else "网盘原名") + RST)
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -11033,6 +11529,9 @@ def _rest_menu(d):
             continue
         if c == "4":
             _title_menu(d, None)
+            continue
+        if c == "5":
+            _rename_menu(d, None)
             continue
         if c != "1":
             print("无效选择。")
@@ -13218,6 +13717,20 @@ def do_healthcheck():
                     ("自定义链接" if _rs == "custom" else "作者的")
                     + f"　{len(_rl)} 条")
                 print(f"      {DIM}{_ru}{RST}")
+            # 【写在电影库上的 episode_number 是【静默无效】的】fix_episode_strm_names
+            # 第一步就把规则筛成 type: tvshows，电影库那一行连看都不会看一眼。
+            # 不说的话，用户"每个库都写上、不开的写 false"之后会以为自己关掉了什么，
+            # 而实际上那一行从头到尾没参与过任何判断 —— 这种假的开关比没有更坏。
+            _epmv = [r["name"] for r in _rl
+                     if (r.get("type") or "movies") != "tvshows"
+                     and r.get("epnum") is not None]
+            if _epmv:
+                _hc("剧集编号设置", "warn",
+                    f"{'、'.join(_epmv[:4])} 是电影库，写的 episode_number 不生效")
+                todo.append((
+                    f"{len(_epmv)} 个电影库写了 episode_number，那一行是摆设",
+                    "补季集编号只对 type: tvshows 的库做（电影没有季集这回事）。"
+                    "留着会让人以为自己设过了，把那几行删掉"))
 
             # ---- 剧集缩略图 ----
             # 【看起来"每集都有图"是假象】没有自己那张图的一集，Emby 拿整部剧
@@ -13442,6 +13955,8 @@ def do_healthcheck():
                 did = []
                 if sy.get("pruned"):
                     did.append(f"清了 {sy['pruned']} 个失效")
+                if sy.get("skipped"):
+                    did.append(f"按「不扫的目录」清了 {sy['skipped']} 个")
                 fixed = sy.get("nodur_before", 0) - sy.get("nodur_after", 0)
                 if fixed > 0:
                     did.append(f"补了 {fixed} 个时长")
