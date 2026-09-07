@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.86"
+SCRIPT_VERSION = "1.5.87"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2434,6 +2434,23 @@ def set_rename_policy_of(mount, val):
     save_ms_state(rename_by_drive=by)
 
 
+def planned_stem(stem, mount, clean=None):
+    """按当前策略，这个网盘文件对应的 strm 【应该】叫什么（不含 .strm）。
+
+    【必须只有这一处】planned_strm_path 和 restore_strm_names 曾经各写各的：前者把名字
+    清洗掉，后者认死"文件名必须等于网盘文件名"，于是每小时把前者的成果全撤了，下一轮
+    再改回来 —— 2600 个文件来回改、Emby 跟着全库重扫两遍。两个功能各自都对，合在一起
+    是个永动机。判断只留一份，就不会再有下一次。
+    """
+    if clean is None:
+        clean = rename_policy_of(mount) == "on"
+    if clean:
+        got = clean_media_name(stem)
+        if got:
+            return got
+    return stem
+
+
 def planned_strm_path(d, netdisk_path, scan_paths, clean=None):
     """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。
 
@@ -2450,14 +2467,9 @@ def planned_strm_path(d, netdisk_path, scan_paths, clean=None):
     if not rel:
         return ""
     stem = os.path.splitext(rel)[0]
-    if clean is None:
-        mnt = "/" + netdisk_path.strip("/").split("/")[0]
-        clean = rename_policy_of(mnt) == "on"
-    if clean:
-        head, tail = os.path.split(stem)
-        got = clean_media_name(tail)
-        if got:
-            stem = os.path.join(head, got) if head else got
+    head, tail = os.path.split(stem)
+    tail = planned_stem(tail, "/" + netdisk_path.strip("/").split("/")[0], clean)
+    stem = os.path.join(head, tail) if head else tail
     return os.path.join(strm_root(d), STRM_SUBDIR, *strm_subpath(best).split("/"),
                         stem + ".strm")
 
@@ -3948,6 +3960,11 @@ def restore_strm_names(d):
 
     什么时候用：用户把 ep_fix 关掉的时候。只是"以后不改了"的话，已经改坏的那些还留在
     那儿，等于关不掉。还原之后观看进度会自己回来（进度按网盘路径记，见 PROGRESS_MAP）。
+
+    【"原来的名字"要按当前策略算，不能死认网盘文件名】开了「名称重定义」的盘，清洗名
+    才是它的正确名字。这一句原来是无条件的，而它跑在每小时的 align_library 里 ——
+    于是 migrate 改一轮、它撤一轮，2600 个文件来回改，Emby 跟着全库重扫两遍，
+    一轮四十分钟，从开了那个开关起就没停过。见 planned_stem()。
     """
     n = 0
     for dp, _dn, fs in os.walk(os.path.join(strm_root(d), STRM_SUBDIR)):
@@ -3962,7 +3979,8 @@ def restore_strm_names(d):
                 continue
             if not tgt:
                 continue
-            want = os.path.splitext(os.path.basename(tgt))[0] + ".strm"
+            want = planned_stem(os.path.splitext(os.path.basename(tgt))[0],
+                                drive_of_strm(src)) + ".strm"
             if want == f or not want.strip():
                 continue
             dst = os.path.join(dp, want)
@@ -4593,7 +4611,7 @@ def _sweep_empty_dirs(root_dir):
     return gone
 
 
-def migrate_strm_layout(d, key):
+def migrate_strm_layout(d, key, wait=True):
     """把已有的 strm 挪到它按当前规则【应该】在的位置。返回挪了几个。
 
     为什么必须由脚本来挪、而不是让 AutoFilm 在新位置重新生成一遍：旧位置的 strm 不会被
@@ -4711,8 +4729,13 @@ def migrate_strm_layout(d, key):
         moved = [(_strm_container_path(d, src), "Deleted") for src, _dst in moves]
         moved += [(_strm_container_path(d, dst), "Created") for _src, dst in moves]
         if not emby_notify_changes(key, moved):
-            info("让 Emby 看一眼挪过的位置...")
-            emby_scan_wait(key, timeout=900, label="重扫挪过位置的条目", force=True)
+            if not wait:
+                # 【调用方马上就要全库扫一次，这儿白等】等的是同一件事：两次各 15 分钟，
+                # 用户对着屏幕干等半小时，而中间那次的结果下一次会重新算一遍。
+                emby_scan_wait(key, timeout=0, label="重扫挪过位置的条目", force=True)
+            else:
+                info("让 Emby 看一眼挪过的位置...")
+                emby_scan_wait(key, timeout=900, label="重扫挪过位置的条目", force=True)
         back = _restore_progress(d, key, saved)
         if back:
             ok(f"{back} 个条目的续播点已贴回")
@@ -4753,7 +4776,7 @@ def do_heal():
         time.sleep(HEAL_RETRY_MIN * 60)
 
 
-def align_library(d, key, heal=True):
+def align_library(d, key, heal=True, migrate=True):
     """把【所有】指向 strm 的媒体库和它们里面的条目，拉到脚本认定的状态。
 
     这一坨原本散在 do_strm / do_sync 里各抄一遍，而 do_sync 一天只跑一次(05:45)，后果就是
@@ -4776,7 +4799,10 @@ def align_library(d, key, heal=True):
     # 【必须在这儿也来一遍】strm 不是只有点「5 生成媒体库」才会产生 —— AutoFilm 自己的
     # 定时任务也会按新配置生成。实测翻过车：「7 更新」重写了 autofilm 配置，它的 cron
     # 到点按新布局生成了 cloud/quark/…，而旧的那批没人搬，两份并存。
-    migrate_strm_layout(d, key)
+    # 【调用方刚挪过就别再挪一遍】do_strm 那条路上 migrate 就在几行之前，再来一次
+    # 是白挪 2600 个文件、白让 Emby 重扫一轮。
+    if migrate:
+        migrate_strm_layout(d, key)
     if not key:
         return
     # 【改了就得让 Emby 重扫】库选项对【已经建好的条目】不会追溯生效 —— 把多版本合并
@@ -8974,7 +9000,8 @@ def do_strm(only=None):
     # （注意这里跑在 AutoFilm 生成【之后】—— 所以新旧可能已经并存，migrate 会把
     # 旧的覆盖到新位置上去，结果一样，只是多搬一次。真正的兜底在 align_library
     # 里，那条每小时都跑，不管这批 strm 是谁生成的。）
-    migrate_strm_layout(d, key)
+    # wait=False：下面紧跟着就是全库扫描，等的是同一件事，白等一次 15 分钟
+    migrate_strm_layout(d, key, wait=False)
     if key:
         snap1 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, only)}
         diff = ([(p, "Created") for p in sorted(snap1 - snap0) if p]
@@ -8990,7 +9017,8 @@ def do_strm(only=None):
                 ok("已通知 Emby 扫描（后台进行，稍等片刻刷新 Emby 页面）")
         # 【补时长不在这儿跑】它是整条流程里最慢的一步，而且跟"生成成没成功"
         # 无关。扔后台之后用户扫完就能走人，缺多少时长看体检那行「条目时长」。
-        align_library(d, key, heal=False)   # 库选项 + 片名 + 身份 + 脏进度
+        # migrate=False：上面刚挪过，再挪一遍是白挪 2600 个文件、白等一轮重扫
+        align_library(d, key, heal=False, migrate=False)
         auto_libraries_apply(d, key)  # 按关键词规则把该建的库建上
         report_not_in_emby(d, key, only)
         # 【后台跑】跟「7 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
