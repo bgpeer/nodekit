@@ -17,6 +17,7 @@
 #      sudo python3 media-stack.py info
 # ============================================================================
 import base64
+import concurrent.futures
 import glob
 import json
 import os
@@ -28,6 +29,7 @@ import sqlite3
 import string
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -36,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.91"
+SCRIPT_VERSION = "1.5.92"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8228,6 +8230,14 @@ HEAL_PACE_STEP = 50      # 一轮干净就往上加这么多
 HEAL_429_STOP  = 3       # 一轮里撞这么多次限流就当场收工，别再打了
 HEAL_429_COOL  = 10      # 撞一次之后歇几秒再探下一个条目
 HEAL_PRE_T  = 40         # 预检超时：只是确认线路此刻通不通，不必等满
+# 【同时探几个】一个条目里绝大部分时间是干等（换直链最长 120 秒、Emby 探测最长 200 秒），
+# 本机 CPU 基本不动。串着跑等于把三条独立的等待排成一队。
+#
+# 当初写成串行是为了不把上游惹毛 —— 那是对的，也有实测：一批 300 个连着打，同一条直链
+# 8 发里 4 发 429，用户那头连挂载页面都打不开。但真正管住这件事的是后来加的两样东西：
+# 撞限流就砍半的配额（heal_pace）、一轮撞满 HEAL_429_STOP 次就当场收工。有了这两道闸，
+# 并行度就成了一个可以调的旋钮，而不是一个只能设成 1 的常数。
+HEAL_WORKERS = 3
 
 
 # 【调用方靠这个串认出"被限量了"】不另加返回值：_netdisk_head_ok 的 (能不能, 说明)
@@ -8410,76 +8420,60 @@ def heal_media_info(d, key, budget=None):
         print(f"  {DIM}这一轮没撞限流，下一批加到 {_new} 个。{RST}")
 
 
-def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
-    """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流)。
+def heal_workers():
+    """这一轮同时探几个。上一轮撞过限流（配额已经砍到底）就退回单线程。"""
+    return 1 if heal_pace() <= HEAL_PACE_MIN else HEAL_WORKERS
 
-    【每个条目要先把行占上】探一个条目最坏要等 3 分钟，而结果是【探完才打印】的 ——
-    等待的那三分钟屏幕上一个字都不动，从屏幕上看和死机没有区别。
+
+def _heal_one(d, key, _it, base, token):
+    """探一个条目。返回 (结局, 名字, 秒数, 附言)。
+
+    结局四种，对应四种完全不同的处置：
+      ok        探到了（时长【和】音视频轨都有）
+      retry     这一下没成，值得下一轮再试（线路抖、Emby 超时、只探到时长没轨道）
+      skip      问题在本地（strm 不在、内容不可用），重试也没用，别占名额
+      throttle  上游在限量 —— 这一种要让整轮刹车，不是只重试这一个
     """
-    done = hit = 0
-    total = len(pend)
-    for idx, _it in enumerate(pend, 1):
-        # 【按下标取，别解包】items_without_duration 现在给的是四元组（多一个
-        # "是不是新片"），而重试名单里塞回来的也是同一个元组 —— 解包会随元素
-        # 个数变化而崩，下标不会。
-        uid, iid, name = _it[0], _it[1], _it[2]
-        # 预算是【这一轮里也要看】的：一个条目最多等 3 分钟，50 个就是两个多小时，
-        # 光靠外层每轮之间那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
-        if t_all is not None and time.monotonic() - t_all > (budget or HEAL_BUDGET):
-            print(f"\r  {DIM}这轮时间用完了，剩下的下一轮接着探。{RST}\033[K")
-            break
-        _t1 = time.monotonic()
-        print(f"\r  {DIM}·{RST} {pad(name[:26], 28)}"
-              f"{DIM}探测中… {idx}/{total}，最多 3 分钟{RST}\033[K",
-              end="", flush=True)
-        try:
-            it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
-        except Exception:
-            print("\r\033[K", end="")
-            again.append(_it)     # 问 Emby 失败可能只是这一下，值得再试
-            continue
-        # 下面几种是【问题在本地，重试也没用】：路径对不上、文件读不了、
-        # strm 里没有可用目标。不进 again，免得白跑一轮还刷一屏同样的话
-        host = _strm_host_path(d, it.get("Path") or "")
-        if not host or not os.path.exists(host):
-            print("\r\033[K", end="")      # 占位行要擦掉，不然下一条盖在上面
-            continue
-        try:
-            original = open(host, encoding="utf-8").read()
-        except OSError:
-            print("\r\033[K", end="")
-            continue
-        p = strm_target_path(original)
-        if not p:
-            print("\r\033[K", end="")
-            continue
-        try:
-            got0 = (_ol_api("/api/fs/get", {"path": p, "password": ""},
-                            token, timeout=120).get("data") or {})
-            sign, raw = got0.get("sign", ""), got0.get("raw_url", "")
-        except Exception as e:
-            print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}换直链失败：{_short_err(e)}{RST}\033[K")
-            again.append(_it)
-            continue
-        # 先自己拉一段文件头。不通就别去烧 Emby 那 200 秒了，而且拉过之后
-        # 直链是热的，紧接着的探测更容易在超时内跑完
-        good, why = _netdisk_head_ok(raw)
-        if not good:
-            print(f"\r  {DIM}·{RST} {name[:26]}  {YELLOW}网盘没给出文件头（{why}）{RST}\033[K")
-            again.append(_it)
-            if why == THROTTLED_WHY:
-                # 【退避要落在"下一个条目"上，不只是"这一个文件的重试"上】
-                # 上游限的是这个源的整体请求量，不是某一个文件。紧接着去探下一个，
-                # 等于换个文件继续撞同一堵墙。
-                hit += 1
-                if hit >= HEAL_429_STOP:
-                    print(f"  {YELLOW}连着撞了 {hit} 次限流，这一轮先停 —— "
-                          f"再打下去只会把上游按得更久{RST}")
-                    break
-                time.sleep(HEAL_429_COOL)
-            continue
-        url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
-        mins, streams = 0, False
+    # 【按下标取，别解包】items_without_duration 现在给的是四元组（多一个
+    # "是不是新片"），而重试名单里塞回来的也是同一个元组 —— 解包会随元素
+    # 个数变化而崩，下标不会。
+    uid, iid, name = _it[0], _it[1], _it[2]
+    _t1 = time.monotonic()
+    el = lambda: time.monotonic() - _t1
+    try:
+        it = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30)
+    except Exception:
+        return "retry", name, el(), ""    # 问 Emby 失败可能只是这一下，值得再试
+    # 下面几种是【问题在本地，重试也没用】：路径对不上、文件读不了、
+    # strm 里没有可用目标。不进重试名单，免得白跑一轮还刷一屏同样的话
+    host = _strm_host_path(d, it.get("Path") or "")
+    if not host or not os.path.exists(host):
+        return "skip", name, el(), ""
+    try:
+        original = open(host, encoding="utf-8").read()
+    except OSError:
+        return "skip", name, el(), ""
+    p = strm_target_path(original)
+    if not p:
+        return "skip", name, el(), ""
+    try:
+        got0 = (_ol_api("/api/fs/get", {"path": p, "password": ""},
+                        token, timeout=120).get("data") or {})
+        sign, raw = got0.get("sign", ""), got0.get("raw_url", "")
+    except Exception as e:
+        return "retry", name, el(), f"换直链失败：{_short_err(e)}"
+    # 先自己拉一段文件头。不通就别去烧 Emby 那 200 秒了，而且拉过之后
+    # 直链是热的，紧接着的探测更容易在超时内跑完
+    good, why = _netdisk_head_ok(raw)
+    if not good:
+        # 【限流要让整轮刹车，不只是重试这一个】上游限的是这个源的整体请求量，
+        # 不是某一个文件。紧接着去探下一个，等于换个文件继续撞同一堵墙。
+        if why == THROTTLED_WHY:
+            return "throttle", name, el(), f"网盘没给出文件头（{why}）"
+        return "retry", name, el(), f"网盘没给出文件头（{why}）"
+    url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
+    mins, streams = 0, False
+    if True:                          # 缩进只是为了让下面这段 try/finally 原样保留
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
             with open(host, "w", encoding="utf-8") as f:
@@ -8519,23 +8513,84 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
                     f.write(original if original.strip().startswith("/") else p)
             except OSError as e:
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
-        _sec = time.monotonic() - _t1
-        if mins and streams:
-            done += 1
-            print(f"\r  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟"
-                  f"  {DIM}{_sec:.0f}s{RST}\033[K")
-        elif mins:
-            # 【这一种要单独说】时长有、轨道没有 = 探测中途断了（源限流、超时、
-            # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
-            # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
-            print(f"\r  {DIM}\u00b7{RST} {name[:26]}  "
-                  f"{YELLOW}只探到时长，没有音视频轨（这样点开会 load fail）{RST}"
-                  f"  {DIM}{_sec:.0f}s{RST}\033[K")
-            again.append(_it)
-        else:
-            print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}"
-                  f"  {DIM}{_sec:.0f}s{RST}\033[K")
-            again.append(_it)
+    if mins and streams:
+        return "ok", name, el(), f"{mins:.0f} 分钟"
+    if mins:
+        # 【这一种要单独说】时长有、轨道没有 = 探测中途断了（源限流、超时、
+        # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
+        # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
+        return "retry", name, el(), "只探到时长，没有音视频轨（这样点开会 load fail）"
+    return "retry", name, el(), "Emby 没探出时长"
+
+
+def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
+    """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流)。
+
+    【并行】一个条目里绝大部分时间是干等网络，串着跑等于把几条独立的等待排成一队。
+    并行度见 heal_workers()：撞过限流就退回 1 个。
+
+    【撞限流要立刻拉停整轮】排队还没轮到的一个都不发出去 —— 上游限的是整体请求量，
+    这时候还往外发，只会把它按得更久。
+    """
+    done = hit = 0
+    total = len(pend)
+    lim = budget or HEAL_BUDGET
+    stop = threading.Event()
+    lock = threading.Lock()
+
+    def run(_it):
+        if stop.is_set():
+            return None               # 已经拉停了，排队没轮到的直接作废
+        return (_it,) + _heal_one(d, key, _it, base, token)
+
+    nw = heal_workers()
+    if nw > 1:
+        print(f"  {DIM}同时探 {nw} 个{RST}")
+    n = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=nw) as ex:
+        futs = [ex.submit(run, _it) for _it in pend]
+        try:
+            for fut in concurrent.futures.as_completed(futs):
+                got = fut.result()
+                if got is None:
+                    continue
+                _it, res, name, sec, note = got
+                with lock:
+                    n += 1
+                    idx = n
+                if res == "ok":
+                    done += 1
+                    print(f"  {GREEN}\u2714{RST} {pad(str(idx) + '/' + str(total), 9)}"
+                          f"{name[:26]}  {note}  {DIM}{sec:.0f}s{RST}")
+                elif res == "skip":
+                    pass              # 本地就没这个文件，一个字都不用说
+                elif res == "throttle":
+                    hit += 1
+                    again.append(_it)
+                    print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
+                          f"{name[:26]}  {YELLOW}{note}{RST}  {DIM}{sec:.0f}s{RST}")
+                    if hit >= HEAL_429_STOP:
+                        print(f"  {YELLOW}连着撞了 {hit} 次限流，这一轮先停 —— "
+                              f"再打下去只会把上游按得更久{RST}")
+                        stop.set()
+                        break
+                else:
+                    again.append(_it)
+                    print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
+                          f"{name[:26]}  {YELLOW}{note or 'Emby 没探出时长'}{RST}"
+                          f"  {DIM}{sec:.0f}s{RST}")
+                # 预算是【这一轮里也要看】的：一个条目最坏要等 3 分钟，光靠每轮之间
+                # 那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
+                if t_all is not None and time.monotonic() - t_all > lim:
+                    print(f"  {DIM}这轮时间用完了，剩下的下一轮接着探。{RST}")
+                    stop.set()
+                    break
+        finally:
+            # 【退出前一定要把没跑的取消掉】不然 with 会等着线程池把 300 个全跑完，
+            # "这轮时间用完了"打完之后还要再干半小时 —— 而屏幕上一个字都没有。
+            stop.set()
+            for f2 in futs:
+                f2.cancel()
     return done, hit
 
 
