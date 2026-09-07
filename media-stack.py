@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.84"
+SCRIPT_VERSION = "1.5.85"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7364,6 +7364,52 @@ def _bluray_main_stream(disc, strms, tok):
     return best if best_size > 0 else ""
 
 
+def dead_disc_dirs(d, only=None):
+    """本地还挂着 BDMV 树的原盘目录。
+
+    【这就是 Emby 里那些 0B / 0bps 的条目】原盘不是一个文件是一整棵目录树，strm 里
+    只装得下一条指向单个文件的地址 —— 所以只要 BDMV 还在，那一套在 Emby 里必定是
+    大小 0、码率 0、点开 load fail。用户看见的"一个显示 7.8 Mbps、一个没有"，
+    没有的那个就是它。
+    """
+    out = []
+    for root in strm_subtrees(d, only):
+        if os.path.isdir(root):
+            out += sorted(_bluray_discs(root))
+    return out
+
+
+def dead_disc_hint(d, mp):
+    """(这个盘有几套点不开的原盘, 它们相对盘根的公共上级目录)。
+
+    公共目录是给「不扫的目录」当现成规则用的。算不出一条【比整个盘更具体、又不是
+    原盘目录本身】的，就返回空串 —— 宁可不给建议，也不能给一条会把半个盘挡掉的。
+    """
+    base = os.path.join(strm_root(d), STRM_SUBDIR,
+                        str(mp or "").strip("/").split("/")[0])
+    rels = [os.path.relpath(x, base) for x in dead_disc_dirs(d, mp) if _under(x, base)]
+    if not rels:
+        return 0, ""
+    parts = [x.split(os.sep) for x in rels]
+    common = []
+    for seg in zip(*parts):
+        if len(set(seg)) != 1:
+            break
+        common.append(seg[0])
+    if not common or len(common) >= min(len(p) for p in parts):
+        return len(rels), ""
+    sug = "/".join(common)
+    # 【公共目录底下不能有别的片子】原盘散落在两个不相干的地方时，公共目录会一路
+    # 退到 mov/电影 那一层 —— 那一条规则会把整个扫描路径挡掉。实测就退到过那儿。
+    # 判据不用"看着够不够深"这种手感，直接数：建议目录里的 strm 比原盘里的多，
+    # 说明多出来的是别人的片子，这条建议就不能给。
+    hold = _count_strm_in(os.path.join(base, *common))
+    mine = sum(_count_strm_in(os.path.join(base, r)) for r in rels)
+    if hold > mine:
+        return len(rels), ""
+    return len(rels), sug
+
+
 def collapse_bluray_folders(d, quiet=False, only=None):
     """把蓝光原盘目录压成一个 strm。返回 (处理了几套, 还没处理的几套)。
 
@@ -11408,15 +11454,32 @@ def _skip_dirs_menu(d, mp):
         else:
             print(f"  {DIM}（没有规则，整个盘都扫）{RST}")
         print(f"  {DIM}这个盘现在有 {strm_count(d, mp)} 个 strm{RST}")
+        # 【脚本知道该挡哪个目录，就别让用户自己去找】那些 0B / 0bps 点不开的条目，
+        # 本地看得见：strm 树里还挂着 BDMV 的就是。连它们的公共上级目录一起算出来，
+        # 做成一个按键 —— 用户来这一屏，要的本来就是这件事。
+        _nd, _sug = dead_disc_hint(d, mp)
+        if _nd:
+            print(f"  {YELLOW}这个盘有 {_nd} 套点不开的原盘{RST}"
+                  f"{DIM}（BDMV 目录树，Emby 里是 0B / 0bps，点开 load fail）{RST}")
         print("-" * 60)
         print("  1. 添加")
         print("  2. 删除")
+        if _nd and _sug:
+            print(f"  3. 挡掉那 {_nd} 套原盘   {DIM}{_sug}{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if c == "1":
+        if c == "3" and _nd and _sug:
+            rels = [_sug] if _sug not in pats else []
+            if not rels:
+                print("这条规则已经加过了。")
+                continue
+            print(f"\n  {DIM}会加这一条：{RST}{_sug}")
+            print(f"  {DIM}那 {_nd} 套原盘都在它底下。压制版、普通 mkv 不受影响 ——"
+                  f"规则只挡这一棵子树。{RST}")
+        elif c == "1":
             picks = _pick_dirs(d, mp, "不扫哪个")
             if not picks:
                 continue
@@ -11431,23 +11494,6 @@ def _skip_dirs_menu(d, mp):
                 # 选中盘根 = 整个盘都不扫，那不是排除规则该干的事
                 warn("整个盘不扫的话，去「扫描路径」里把它删掉，别用这里。")
                 continue
-            set_skip_dirs(mp, pats + rels)
-            tg2 = [x for x in skip_dirs_targets(d, mp) if x[1] in rels]
-            n = sum(x[2] for x in tg2)
-            print()
-            ok(f"已加 {len(rels)} 条规则，命中 {len(tg2)} 个目录 · {n} 个 strm")
-            for dp, _h, cnt in tg2[:6]:
-                print(f"  {DIM}·{RST} {os.path.basename(dp)}　{cnt} 个 strm")
-            if len(tg2) > 6:
-                print(f"  {DIM}… 还有 {len(tg2) - 6} 个{RST}")
-            if not n:
-                continue
-            print(f"  {DIM}删的只是本机生成的 strm，{RST}{BOLD}网盘里的片子一个都不碰{RST}"
-                  f"{DIM} —— 规则删掉再扫一次就全回来。{RST}")
-            if ask_yn("现在就清掉，不等下一轮对齐？", True):
-                apply_skip_dirs(d, only=mp)
-                print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 ——"
-                      f"「5 生成媒体库」最后会通知扫描，每天的对齐也会做。{RST}")
         elif c == "2":
             if not pats:
                 print("没有规则可删。")
@@ -11460,8 +11506,29 @@ def _skip_dirs_menu(d, mp):
             set_skip_dirs(mp, pats)
             ok(f"已删掉规则 {gone}")
             print(f"  {DIM}那些目录下一次扫描就会重新生成出来。{RST}")
+            continue
         else:
             print("无效选择。")
+            continue
+        # 【加规则那两条路在这里合流】手挑的和「一键挡原盘」后面要做的事一模一样：
+        # 落规则、报命中多少、问一句要不要现在清。抄两份迟早改歪一份。
+        set_skip_dirs(mp, pats + rels)
+        tg2 = [x for x in skip_dirs_targets(d, mp) if x[1] in rels]
+        n = sum(x[2] for x in tg2)
+        print()
+        ok(f"已加 {len(rels)} 条规则，命中 {len(tg2)} 个目录 · {n} 个 strm")
+        for dp, _h, cnt in tg2[:6]:
+            print(f"  {DIM}·{RST} {os.path.basename(dp)}　{cnt} 个 strm")
+        if len(tg2) > 6:
+            print(f"  {DIM}… 还有 {len(tg2) - 6} 个{RST}")
+        if not n:
+            continue
+        print(f"  {DIM}删的只是本机生成的 strm，{RST}{BOLD}网盘里的片子一个都不碰{RST}"
+              f"{DIM} —— 规则删掉再扫一次就全回来。{RST}")
+        if ask_yn("现在就清掉，不等下一轮对齐？", True):
+            apply_skip_dirs(d, only=mp)
+            print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 ——"
+                  f"「5 生成媒体库」最后会通知扫描，每天的对齐也会做。{RST}")
 
 
 def _drive_menu(d, mp, drv):
