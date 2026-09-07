@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.90"
+SCRIPT_VERSION = "1.5.91"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1446,6 +1446,7 @@ case "${1:-info}" in
   logs <服务>     跟踪日志，如 media-stack logs mediawarp
   restart [服务]  重启，省略服务名则全部重启
   strm            立刻跑一次 strm 生成并跟日志
+  heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
   selfupdate      只把脚本换成仓库里的最新版(不动镜像、不重启容器)
@@ -1571,6 +1572,14 @@ case "${1:-info}" in
     echo "${b}看上面那行「Alist2Strm 任务完成」里的 strm_created_count / strm_skipped_count。${r}"
     echo "${y}skipped 不是失败,是文件已经在了。之后去 Emby 扫一次媒体库。${r}"
     ;;
+  heal)
+    # 【Python 那边早就有这个子命令，壳里一直没有】cron 调的是
+    # `python3 /etc/bgpeer/media-stack.py heal`，而用户敲的是这个壳 ——
+    # 两份名单各写各的，加一个只加一半不会报错，要等用户敲下去才发现。
+    # 上一次栽在这儿的是 selfupdate，见上面那段注释。
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" heal ;;
   302)
     echo "跟踪 MediaWarp 日志。现在去播放一集，看到 302 就说明直链生效:"
     docker logs -f --tail 20 mediawarp ;;
@@ -14529,10 +14538,16 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("warm"):
                 do_warm()
-        elif arg == "heal":               # 「4」扔后台的补时长，不交互
+        elif arg == "heal":               # 「4」扔后台的补时长；手动敲也走这条
             require_root()
             if take_task_lock("heal"):
                 do_heal()
+            elif has_tty():
+                # 【抢不到锁要说话】原来是一声不吭直接退出 —— 用户敲完命令屏幕上
+                # 什么都没有，和"跑完了"长得一模一样。cron 那条不说，是因为没人看。
+                warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
+                print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
+                      f"把那一轮停掉。{RST}")
         elif arg == "selfupdate":         # cron 调的自动更新，只换脚本
             require_root()
             if take_task_lock("selfupdate"):
