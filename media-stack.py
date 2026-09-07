@@ -38,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.92"
+SCRIPT_VERSION = "1.5.93"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9080,6 +9080,11 @@ def do_strm(only=None):
     # 【排除放在压原盘之前】不然会先花一堆列目录的时间去压那些马上就要清掉的原盘。
     apply_skip_dirs(d, only=only)
 
+    # 【新挂的盘按驱动给一套能播的默认】不挂在每小时那条上：写存储要停 OpenList、
+    # 还要重启 MediaWarp，半夜有人正看着片子突然断一下不合适。这条路是用户手点的，
+    # 本来就要重启这些东西，而且人在屏幕前看着。
+    apply_drive_defaults(d)
+
     # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
     # 之后再删再建，中间那段时间用户点进去就是 load fail。
     collapse_bluray_folders(d, only=only)
@@ -11487,6 +11492,69 @@ PROXY_ONLY_DRIVERS = ("webdav", "local", "crypt")
 def has_cdn_link(drv):
     """这个驱动在网盘侧有没有自己的 CDN 直链。"""
     return str(drv or "").lower() not in PROXY_ONLY_DRIVERS
+
+
+def apply_drive_defaults(d, quiet=False):
+    """第一次见到一个盘时，按驱动把「直链方式」调到实测能播的那一档。返回动了几个盘。
+
+    默认值不是拍脑袋定的，是从驱动的实现里推出来的：
+
+      · 夸克 / UC 的 TV 驱动 → 转码流。QuarkTV 的 Link() 里留了个岔路口，
+        link_method=streaming 时直接返回转码流；跨境线路上这个开关经常是决定性的 ——
+        同一个 4K 文件原画拉不动、转码流很流畅。
+      · WebDAV / local / crypt → 本机代理 + 伪装成浏览器。这三类在网盘侧压根没有
+        CDN 直链，本机代理是它们唯一的路；而字节一旦经过本机，Emby 的探测（ffmpeg
+        的 UA）就会被上游按 UA 挡掉，条目永远探不到音视频轨、点开 load fail。
+      · 阿里：OpenList 的默认（原画直链 · 开放平台接口）就是对的，不动。
+
+    【只在第一次见到时设】设完把挂载点记进状态文件，以后这个盘不管被改成什么都不再碰。
+    替用户做一次选择是帮忙，反复把他的选择改回来是耍流氓。
+    """
+    seen = set(ms_state().get("drive_defaults") or [])
+    rows = [r for r in _storage_rows(d) if r[1] and r[1] != "/" and r[1] not in seen]
+    if not rows:
+        return 0
+    trans, proxy, ua, said = [], [], [], []
+    for sid, mp, drv, add, cols in rows:
+        low = str(drv or "").lower()
+        did = []
+        if add.get("link_method") not in (None, "streaming"):
+            trans.append((sid, mp))
+            did.append("转码流")
+        if low in PROXY_ONLY_DRIVERS and not _truthy(cols.get("web_proxy")):
+            proxy.append((sid, mp))
+            did.append("本机代理")
+        if low in PROXY_ONLY_DRIVERS and mp not in ua_spoof_mounts():
+            ua.append(mp)
+            did.append("伪装成浏览器")
+        if did:
+            said.append((mp, did))
+    # 【不管有没有改，都记下来】"看过了、按驱动不用改"和"改过了"对下一轮是同一件事：
+    # 别再碰它。只记改过的话，默认值就是对的那些盘会被反复重新判断，用户以后自己
+    # 关掉某一项，下一轮又被打开。
+    save_ms_state(drive_defaults=sorted(seen | {r[1] for r in rows}))
+    if not said:
+        return 0
+    if not quiet:
+        print()
+        info("新挂的网盘按驱动设了直链方式（只在第一次见到它的时候设）：")
+        for mp, did in said:
+            print(f"  {DIM}·{RST} {pad(mp, 18)}{CYAN}{' · '.join(did)}{RST}")
+        print(f"  {DIM}这几档是实测能播的那一套。想换：4 挂载路径 → 选盘 → 3 直链方式。{RST}")
+    if trans:
+        _write_addition(d, trans, {"link_method": "streaming"})
+    if proxy:
+        _write_storage(d, proxy, columns={"web_proxy": 1,
+                                          "webdav_policy": "native_proxy"})
+    if ua:
+        for mp in ua:
+            set_ua_spoof(mp, True)
+        cfg2 = rebuild_cfg_from_disk(d)
+        if cfg2.get("has_domain") and os.path.exists(cfg2.get("crt") or ""):
+            apply_nginx_site(cfg2)
+        elif not quiet:
+            warn("没有域名或证书，nginx 站点没重新生成 —— 伪装成浏览器暂时不生效。")
+    return len(said)
 
 
 def _one_drive_link_menu(d, mp):
