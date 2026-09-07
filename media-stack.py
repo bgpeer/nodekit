@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.79"
+SCRIPT_VERSION = "1.5.80"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4656,12 +4656,15 @@ def do_sync():
     if not is_installed(d):
         return
     rec = {"ts": int(time.time()), "ok": False, "pruned": 0, "bluray": 0,
-           "bluray_stuck": 0, "nodur_before": 0,
+           "bluray_stuck": 0, "skipped": 0, "nodur_before": 0,
            "nodur_after": 0, "missing": 0, "error": ""}
     try:
         key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                                "auth")
         normalize_strm_files(d)
+        # 【规则拦不住 AutoFilm】它每一轮都会把排除掉的目录重新生成出来，所以这里也要清
+        # 一遍 —— 不然用户在菜单里清干净了，第二天早上那批条目又回到库里。
+        rec["skipped"] = apply_skip_dirs(d, quiet=True)
         # 原盘目录压成单个 strm。放这儿是因为上一轮"问不到片段大小"的那些要有机会重试，
         # 而且新扫进来的原盘不必等到用户下次手动点「5」才可播。
         rec["bluray"], rec["bluray_stuck"] = collapse_bluray_folders(d, quiet=True)
@@ -5999,6 +6002,114 @@ def only_mounts(only):
     if not only:
         return []
     return [only] if isinstance(only, str) else [str(x) for x in only]
+
+
+def skip_dirs_of(mp):
+    """这个盘的「不扫的目录」规则（相对盘根的路径片段）。空 = 什么都不排除。"""
+    m = "/" + str(mp or "").strip("/").split("/")[0]
+    v = (ms_state().get("skip_dirs") or {}).get(m) or []
+    return [str(x).strip("/") for x in v if str(x).strip("/")]
+
+
+def set_skip_dirs(mp, pats):
+    """写回这个盘的规则，返回清理后的清单。
+
+    【. 和 .. 必须挡在门口】它们会匹配到任意一层，一条规则就能把整棵树端了。
+    这个函数的下游是 shutil.rmtree，宁可多挡几个也不能放进去。
+    """
+    m = "/" + str(mp or "").strip("/").split("/")[0]
+    cur = dict(ms_state().get("skip_dirs") or {})
+    clean = []
+    for x in pats:
+        x = str(x or "").strip().strip("/")
+        segs = x.split("/")
+        if not x or any(seg in ("", ".", "..", "*") for seg in segs):
+            continue
+        if x not in clean:
+            clean.append(x)
+    if clean:
+        cur[m] = clean
+    else:
+        cur.pop(m, None)
+    save_ms_state(skip_dirs=cur)
+    return clean
+
+
+def _skip_hit(parts, pats):
+    """这条相对路径命中了哪条规则（没命中返回空串）。
+
+    按【整段】比，不按子串 —— 「合集」不该顺手匹配掉「合集电影」。规则本身可以是
+    多段（mov/电影/合集/周星驰/BD+DVD合集），那就要求这几段连续出现。
+    """
+    low = [str(x).lower() for x in parts]
+    for p in pats:
+        seg = [x.lower() for x in p.split("/") if x]
+        if not seg:
+            continue
+        for i in range(len(low) - len(seg) + 1):
+            if low[i:i + len(seg)] == seg:
+                return p
+    return ""
+
+
+def _count_strm_in(path):
+    n = 0
+    for _dp, _dn, fs in os.walk(path):
+        n += sum(1 for f in fs if f.endswith(".strm"))
+    return n
+
+
+def skip_dirs_targets(d, only=None):
+    """规则会清掉哪些目录。返回 [(本地目录, 命中的规则, 里面几个 strm)]，【不删任何东西】。
+
+    菜单要拿它做预览，执行那一步也用它 —— 预览和实际删的是同一份名单，不会出现
+    "屏上说 14 个、删了 200 个"这种事。
+    """
+    out = []
+    root = os.path.join(strm_root(d), STRM_SUBDIR)
+    want = ["/" + str(x).strip("/").split("/")[0] for x in only_mounts(only)]
+    try:
+        drives = sorted(x for x in os.listdir(root)
+                        if os.path.isdir(os.path.join(root, x)))
+    except OSError:
+        return out
+    for dv in drives:
+        if want and ("/" + dv) not in want:
+            continue
+        pats = skip_dirs_of("/" + dv)
+        if not pats:
+            continue
+        base = os.path.join(root, dv)
+        for dp, dns, _fs in os.walk(base):
+            rel = os.path.relpath(dp, base)
+            if rel == ".":
+                continue          # 盘根永远不参与匹配，规则再离谱也端不掉整个盘
+            hit = _skip_hit(rel.split(os.sep), pats)
+            if hit:
+                out.append((dp, hit, _count_strm_in(dp)))
+                dns[:] = []       # 命中就整棵拿走，不必再往下钻
+    return out
+
+
+def apply_skip_dirs(d, only=None, quiet=False):
+    """按规则清掉本地 strm。返回清掉几个。
+
+    【为什么每轮都要跑】规则拦不住 AutoFilm —— 它下一轮照样把那些目录生成出来。
+    所以这不是"删一次就完了"，而是每次生成之后、每天对齐之中各清一遍。
+    """
+    tg = skip_dirs_targets(d, only)
+    gone, dirs = 0, 0
+    for dp, _hit, n in tg:
+        try:
+            shutil.rmtree(dp)
+            gone, dirs = gone + n, dirs + 1
+        except OSError as e:
+            if not quiet:
+                warn(f"{os.path.basename(dp)} 没删干净：{_short_err(e)}")
+    if gone and not quiet:
+        ok(f"按「不扫的目录」清掉 {gone} 个 strm（{dirs} 个目录）")
+        print(f"  {DIM}网盘里的片子一个都没动 —— 规则删掉再扫一次就全回来。{RST}")
+    return gone
 
 
 def strm_count(d, only=None):
@@ -8516,6 +8627,9 @@ def do_strm(only=None):
               f"这个路径在 OpenList 里点得开吗")
         return
 
+    # 【排除放在压原盘之前】不然会先花一堆列目录的时间去压那些马上就要清掉的原盘。
+    apply_skip_dirs(d, only=only)
+
     # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
     # 之后再删再建，中间那段时间用户点进去就是 load fail。
     collapse_bluray_folders(d, only=only)
@@ -10360,8 +10474,11 @@ def _apply_scan_paths(d, why=""):
     return paths
 
 
-def _pick_dirs(d, mp):
-    """在这个盘里挑扫描路径。返回挑中的路径（空 = 取消）。
+def _pick_dirs(d, mp, prompt="要扫哪个"):
+    """在这个盘里挑目录。返回挑中的路径（空 = 取消）。
+
+    prompt 换一句就能给「不扫的目录」用 —— 挑目录这件事两边一模一样，而【点编号挑】
+    在那边更要紧：排除规则要写的是深处那一层（…/周星驰/BD+DVD合集），手打更长更容易错。
 
     【一个盘挂多少条路径都行】上层是 scan_spec 那个列表，加进去就是追加一条，删也是按条
     删 —— 一直都支持。真正卡住的是【挑不到】：上一版只列挂载点【下面一层】，而按字母分类
@@ -10400,7 +10517,7 @@ def _pick_dirs(d, mp):
             tips.append(".. 上一层")
         tips += ["或者直接把路径贴进来", "回车取消"]
         print(f"  {DIM}{'　'.join(tips)}{RST}")
-        pick = ask("要扫哪个").strip()
+        pick = ask(prompt).strip()
         if not pick:
             return []
         if pick == "..":
@@ -10910,6 +11027,78 @@ def _scan_of(mp):
     return f"{len(mine)} 条：{mine[0]} …"
 
 
+def _skip_dirs_menu(d, mp):
+    """一个盘的「不扫的目录」：加 / 删。规则命中的整棵子树在每轮生成和对齐时清掉。"""
+    while True:
+        pats = skip_dirs_of(mp)
+        tg = skip_dirs_targets(d, mp)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{mp}{RST} 不扫的目录")
+        print("-" * 60)
+        if pats:
+            for i, p in enumerate(pats, 1):
+                k = sum(1 for x in tg if x[1] == p)
+                n = sum(x[2] for x in tg if x[1] == p)
+                print(f"  {i:>2}. {p}   {DIM}命中 {k} 个目录 · {n} 个 strm{RST}")
+        else:
+            print(f"  {DIM}（没有规则，整个盘都扫）{RST}")
+        print(f"  {DIM}这个盘现在有 {strm_count(d, mp)} 个 strm{RST}")
+        print("-" * 60)
+        print("  1. 添加")
+        print("  2. 删除")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "1":
+            picks = _pick_dirs(d, mp, "不扫哪个")
+            if not picks:
+                continue
+            root = mp.rstrip("/")
+            rels = []
+            for p in picks:
+                r = p.rstrip("/")
+                r = r[len(root):].strip("/") if r.startswith(root + "/") else ""
+                if r:
+                    rels.append(r)
+            if not rels:
+                # 选中盘根 = 整个盘都不扫，那不是排除规则该干的事
+                warn("整个盘不扫的话，去「扫描路径」里把它删掉，别用这里。")
+                continue
+            set_skip_dirs(mp, pats + rels)
+            tg2 = [x for x in skip_dirs_targets(d, mp) if x[1] in rels]
+            n = sum(x[2] for x in tg2)
+            print()
+            ok(f"已加 {len(rels)} 条规则，命中 {len(tg2)} 个目录 · {n} 个 strm")
+            for dp, _h, cnt in tg2[:6]:
+                print(f"  {DIM}·{RST} {os.path.basename(dp)}　{cnt} 个 strm")
+            if len(tg2) > 6:
+                print(f"  {DIM}… 还有 {len(tg2) - 6} 个{RST}")
+            if not n:
+                continue
+            print(f"  {DIM}删的只是本机生成的 strm，{RST}{BOLD}网盘里的片子一个都不碰{RST}"
+                  f"{DIM} —— 规则删掉再扫一次就全回来。{RST}")
+            if ask_yn("现在就清掉，不等下一轮对齐？", True):
+                apply_skip_dirs(d, only=mp)
+                print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 ——"
+                      f"「5 生成媒体库」最后会通知扫描，每天的对齐也会做。{RST}")
+        elif c == "2":
+            if not pats:
+                print("没有规则可删。")
+                continue
+            v = ask("删第几条").strip()
+            if not (v.isdigit() and 1 <= int(v) <= len(pats)):
+                print("无效选择。")
+                continue
+            gone = pats.pop(int(v) - 1)
+            set_skip_dirs(mp, pats)
+            ok(f"已删掉规则 {gone}")
+            print(f"  {DIM}那些目录下一次扫描就会重新生成出来。{RST}")
+        else:
+            print("无效选择。")
+
+
 def _drive_menu(d, mp, drv):
     """单个网盘的设置。"""
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
@@ -10926,9 +11115,12 @@ def _drive_menu(d, mp, drv):
         print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}"
               + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"))
         print(f"  4. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
+        _sk = skip_dirs_of(mp)
+        print(f"  5. 不扫的目录        当前："
+              + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"))
         has115 = "115" in str(drv)
         if has115:
-            print(f"  5. 网盘扫码登录")
+            print(f"  6. 网盘扫码登录")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -10942,7 +11134,9 @@ def _drive_menu(d, mp, drv):
             _link_method_menu(d, [mp], driver_cn(drv))
         elif c == "4":
             _title_menu(d, mp)
-        elif c == "5" and has115:
+        elif c == "5":
+            _skip_dirs_menu(d, mp)
+        elif c == "6" and has115:
             qr115_login()
         else:
             print("无效选择。")
@@ -13511,6 +13705,8 @@ def do_healthcheck():
                 did = []
                 if sy.get("pruned"):
                     did.append(f"清了 {sy['pruned']} 个失效")
+                if sy.get("skipped"):
+                    did.append(f"按「不扫的目录」清了 {sy['skipped']} 个")
                 fixed = sy.get("nodur_before", 0) - sy.get("nodur_after", 0)
                 if fixed > 0:
                     did.append(f"补了 {fixed} 个时长")
