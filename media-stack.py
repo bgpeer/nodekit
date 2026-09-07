@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.81"
+SCRIPT_VERSION = "1.5.82"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -13717,6 +13717,20 @@ def do_healthcheck():
                     ("自定义链接" if _rs == "custom" else "作者的")
                     + f"　{len(_rl)} 条")
                 print(f"      {DIM}{_ru}{RST}")
+            # 【写在电影库上的 episode_number 是【静默无效】的】fix_episode_strm_names
+            # 第一步就把规则筛成 type: tvshows，电影库那一行连看都不会看一眼。
+            # 不说的话，用户"每个库都写上、不开的写 false"之后会以为自己关掉了什么，
+            # 而实际上那一行从头到尾没参与过任何判断 —— 这种假的开关比没有更坏。
+            _epmv = [r["name"] for r in _rl
+                     if (r.get("type") or "movies") != "tvshows"
+                     and r.get("epnum") is not None]
+            if _epmv:
+                _hc("剧集编号设置", "warn",
+                    f"{'、'.join(_epmv[:4])} 是电影库，写的 episode_number 不生效")
+                todo.append((
+                    f"{len(_epmv)} 个电影库写了 episode_number，那一行是摆设",
+                    "补季集编号只对 type: tvshows 的库做（电影没有季集这回事）。"
+                    "留着会让人以为自己设过了，把那几行删掉"))
 
             # ---- 剧集缩略图 ----
             # 【看起来"每集都有图"是假象】没有自己那张图的一集，Emby 拿整部剧
