@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.80"
+SCRIPT_VERSION = "1.5.81"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2309,8 +2309,108 @@ def follow_new_storages(d):
     return added
 
 
-def planned_strm_path(d, netdisk_path, scan_paths):
-    """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。"""
+# 文件名里那些【不是片名】的词。分辨率、编码、音轨、语言、来源、画质、发布组习惯用语。
+# 一律按【整段】比对，不做子串匹配 —— 「高清」不能把「高清晰度谋杀案」腰斩。
+_NAME_JUNK = (
+    r"4k|8k|2160p?|1080[pi]|720[pi]|576[pi]|480[pi]|hd|fhd|uhd|sd"
+    r"|blu-?ray|bd|bdrip|bdremux|dvd|dvdrip|dvdscr|web-?dl|web-?rip|web|hdtv"
+    r"|remux|hdr\d*|sdr|dolby|dolbyvision|dv|repack|proper"
+    r"|x26[45]|h\.?26[45]|hevc|avc|vc-?1|mpeg\d?|\d+bits?|\d+fps"
+    r"|dts|dts-?hd|dts-?hd-?ma|dtsma|truehd|atmos|e?ac-?3|aac|flac|lpcm|ddp?\d*"
+    r"|\d+audio|[257]\.[01]"
+    r"|国语|粤语|英语|日语|韩语|国粤双语|国英双语|双语|中字|中英字幕|中英双字|中英双语"
+    r"|简繁|简体|繁体|内封|内嵌|外挂|无字|高清中字|超清中英双字"
+    r"|高清|超清|标清|蓝光|原盘|收藏版|加长版|导演剪辑版|修复版|重制版|未删减|完整版"
+    r"|国配|台配|港版|邵氏|豆瓣|评分|合集|系列"
+)
+NAME_JUNK_RE = re.compile(r"(?i)^(?:" + _NAME_JUNK + r")$")
+NAME_SCORE_RE = re.compile(r"^\d+(?:\.\d+)?\s*分$")
+NAME_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+CJK_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+
+def clean_media_name(base):
+    """把网盘那种带一堆标记的文件名清成「片名 (年份)」。清不动、或者清完没变就返回空串。
+
+    【返回空串＝别动它】名字本来就规矩的（`流浪地球 (2019)`、`老友记 S01E01`）走到最后
+    会和原名一模一样，返回空串；清出来只剩数字的（`156 4K` → `156`）也返回空串 ——
+    那是集号，改名只会把事情弄得更糟。宁可少改一个，不能改错一个。
+    """
+    s = base
+    # 评分块：[[豆瓣5].9分]  【豆瓣8.1】  (IMDb 7.2)
+    s = re.sub(r"[\[\(【][^\[\]\(\)【】]*(?:豆瓣|imdb|评分)[^\[\]\(\)【】]*[\]\)】]",
+               ".", s, flags=re.I)
+    s = re.sub(r"[\[\(【][^\[\]\(\)【】]*\d+(?:\.\d+)?\s*分[^\[\]\(\)【】]*[\]\)】]",
+               ".", s)
+    s = re.sub(r"^[.\s]*\d+(?:\.\d+)?\s*分[\]\)】]", ".", s)   # 上一步剥剩的 ".9分]"
+    s = re.sub(r"【[^】]{1,12}】", ".", s)          # 发布组：【蓝色狂想】
+    s = re.sub(r"[\[\]【】\(\)（）]", ".", s)       # 剩下的括号一律当分隔符
+    out, year = [], ""
+    for p in re.split(r"[.\u3000_]+", s):
+        p = p.strip().strip(" -—·~")
+        if not p:
+            continue
+        if NAME_YEAR_RE.match(p):
+            year = year or p
+            break                       # 年份就是片名的右边界
+        if NAME_JUNK_RE.match(p) or NAME_SCORE_RE.match(p):
+            break
+        out.append(p)
+    # 中文片名后面跟着的英文别名一并丢掉 —— 刮削器拿中文名去搜更准，
+    # 「血仍未冷.The.Replacement.Killers」留成一串反而两边都对不上
+    if out and CJK_RE.search(out[0]):
+        out = [p for i, p in enumerate(out) if i == 0 or CJK_RE.search(p)]
+    words = " ".join(out).split()
+    while words:                        # 结尾的标记词一个个剥掉：爱的世界 邵氏 4K 国粤双语
+        w = words[-1].strip("-—·~[]()")
+        if NAME_YEAR_RE.match(w):
+            year = year or w
+            words.pop()
+            continue
+        if NAME_JUNK_RE.match(w) or NAME_SCORE_RE.match(w):
+            words.pop()
+            continue
+        break
+    title = " ".join(words).strip(" .-_·~")
+    if len(title) < 2 or title.isdigit() or "/" in title:
+        return ""
+    want = f"{title} ({year})" if year else title
+    return "" if want == base else want
+
+
+def rename_policy():
+    """「名称重定义」的默认值。"on" = strm 用清洗后的名字，"off" = 跟网盘原名。"""
+    return ms_state().get("rename_policy") or "off"
+
+
+def rename_policy_of(mount):
+    """某个网盘要不要清洗名字。没单独设过就跟默认值走。
+
+    【为什么分盘设】同一台机器上，夸克里是规规矩矩的「片名 (年份).mkv」，清洗器碰都
+    不会碰；而另一个盘里全是「[[豆瓣6].1分]华丽上班族.Office.2015.BD720P.国粤双语」，
+    不清洗 Emby 一部都刮不到。一个全局开关伺候不了这两种。
+    """
+    if not mount:
+        return rename_policy()
+    return (ms_state().get("rename_by_drive") or {}).get(mount) or rename_policy()
+
+
+def set_rename_policy_of(mount, val):
+    """给某个盘单独定；val 传 None 表示"跟默认值走"。"""
+    by = dict(ms_state().get("rename_by_drive") or {})
+    if val is None:
+        by.pop(mount, None)
+    else:
+        by[mount] = val
+    save_ms_state(rename_by_drive=by)
+
+
+def planned_strm_path(d, netdisk_path, scan_paths, clean=None):
+    """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。
+
+    clean 显式传 True/False 可以越过「名称重定义」的设置 —— 菜单里的预览要在还没打开
+    开关的时候就把"会改成什么"摆出来，靠的就是它。
+    """
     best = ""
     for sp in scan_paths:
         if _under(netdisk_path, sp) and len(sp) > len(best):
@@ -2320,8 +2420,37 @@ def planned_strm_path(d, netdisk_path, scan_paths):
     rel = netdisk_path[len(best.rstrip("/")):].lstrip("/")
     if not rel:
         return ""
+    stem = os.path.splitext(rel)[0]
+    if clean is None:
+        mnt = "/" + netdisk_path.strip("/").split("/")[0]
+        clean = rename_policy_of(mnt) == "on"
+    if clean:
+        head, tail = os.path.split(stem)
+        got = clean_media_name(tail)
+        if got:
+            stem = os.path.join(head, got) if head else got
     return os.path.join(strm_root(d), STRM_SUBDIR, *strm_subpath(best).split("/"),
-                        os.path.splitext(rel)[0] + ".strm")
+                        stem + ".strm")
+
+
+def rename_preview(d, only=None, clean=True):
+    """会把哪些 strm 改名。返回 [(旧名, 新名, 网盘路径)]，【不动任何文件】。
+
+    只列文件名真的变了的 —— 挪目录那种（扫描路径改了）不是这一屏要说的事。
+    """
+    try:
+        sps = (rebuild_cfg_from_disk(d).get("scan_paths") or [])
+    except Exception:
+        return []
+    out = []
+    for host, target in strm_inventory(d, only):
+        want = planned_strm_path(d, target, sps, clean=clean)
+        if not want:
+            continue
+        a, b = os.path.basename(host), os.path.basename(want)
+        if a != b:
+            out.append((a[:-5], b[:-5], target))
+    return out
 
 
 def _progress_by_target(d, key):
@@ -4453,6 +4582,35 @@ def migrate_strm_layout(d, key):
         want = planned_strm_path(d, target, sps)
         if want and os.path.abspath(want) != os.path.abspath(host):
             moves.append((host, want))
+    # 【两个不同的文件挪到同一个地方 = 少一部片】清洗名字之后这不再是理论风险：
+    # `[片名].超清中英双字.mp4` 和 `[片名].1080p.mkv` 会清出同一个名字，
+    # shutil.move 到已存在的路径是【静默覆盖】—— 库里就这么少一部，还查不出来。
+    # 撞了就这几条全都不挪，把原名留着比悄悄合掉强。
+    seen = {}
+    for _src, dst in moves:
+        seen[dst] = seen.get(dst, 0) + 1
+    clash = {k for k, v in seen.items() if v > 1}
+    # 目的地已经有个别的文件（内容不一样）也不能覆盖。内容一样的是 AutoFilm 按网盘
+    # 原名重新生成的那一份，覆盖过去正好把它收掉。
+    srcs = {os.path.abspath(x) for x, _ in moves}
+    for _src, dst in moves:
+        if dst in clash or os.path.abspath(dst) in srcs or not os.path.exists(dst):
+            continue
+        try:
+            same = (open(dst, encoding="utf-8").read().strip()
+                    == open(_src, encoding="utf-8").read().strip())
+        except OSError:
+            same = False
+        if not same:
+            clash.add(dst)
+    if clash:
+        kept = [x for x in moves if x[1] in clash]
+        moves = [x for x in moves if x[1] not in clash]
+        warn(f"{len(kept)} 个 strm 的目标名字和别人撞了，这几个保持原样：")
+        for nm in sorted({os.path.basename(x[1])[:-5] for x in kept})[:5]:
+            print(f"  {DIM}·{RST} {nm}")
+        print(f"  {DIM}两个不同的文件清出了同一个名字，挪过去会少一部片 ——"
+              f"宁可留着原名。{RST}")
     if not moves:
         # 【没得挪也要清一遍】。strm 早就挪好了的话 moves 是空的，可上一轮遗留的
         # 空壳目录、孤儿 nfo/海报还在 —— 它们不含 .strm，脚本的路径列表看不见，
@@ -10675,6 +10833,73 @@ def _title_menu(d, mp=None):
               f"先去「3 后补参数 → 1」填上。{RST}")
 
 
+def _rename_menu(d, mp=None):
+    """名称重定义。mp=None 时改的是【默认值】（「剩余网盘」那一屏用）。
+
+    和「片名用哪个」同一套三态，理由也一样：一台机器上各个盘的命名习惯天差地别。
+    """
+    names = {"on": "清洗后的名字", "off": "网盘原名"}
+    dflt = rename_policy()
+    while True:
+        print()
+        if mp:
+            own = (ms_state().get("rename_by_drive") or {}).get(mp)
+            print(f"  {mp} 当前："
+                  + (f"{CYAN}{BOLD}{names.get(own, own)}{RST}{DIM}（单独设的）{RST}"
+                     if own else f"{DIM}跟默认走 → {names.get(dflt, dflt)}{RST}"))
+        else:
+            print(f"  默认（没单独设过的盘都用它）当前："
+                  f"{CYAN}{BOLD}{names.get(dflt, dflt)}{RST}")
+        print(f"  {DIM}清洗＝去掉 [[豆瓣6].1分] 这类前缀、4K/国粤双语/BD1080p 这类标记，"
+              f"留下「片名 (年份)」。{RST}")
+        print(f"  {DIM}名字本来就规矩的一个都不动；清出来只剩数字的（集号）也不动。{RST}")
+        print(f"  1. 网盘原名")
+        print(f"  2. 清洗后的名字")
+        if mp:
+            print(f"  3. 跟默认走{DIM}（{names.get(dflt, dflt)}）{RST}")
+        print(f"  4. 先看看会改成什么{DIM}（只看，不动文件）{RST}")
+        print(f"  0. 返回")
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "4":
+            pv = rename_preview(d, mp, clean=True)
+            print()
+            if not pv:
+                ok("没有需要改的 —— 这些名字 Emby 本来就读得懂。")
+                continue
+            info(f"会改 {len(pv)} 个（下面列前 15 个）：")
+            for a, b, _t in pv[:15]:
+                print(f"  {DIM}{a[:46]}{RST}")
+                print(f"    → {GREEN}{b}{RST}")
+            if len(pv) > 15:
+                print(f"  {DIM}… 还有 {len(pv) - 15} 个{RST}")
+            print(f"  {DIM}改的只是本机 strm 的文件名，网盘里的文件一个都不碰。{RST}")
+            continue
+        val = {"1": "off", "2": "on"}.get(c, "x")
+        if c == "3" and mp:
+            val = None
+        if val == "x":
+            print("无效选择。")
+            continue
+        if mp:
+            set_rename_policy_of(mp, val)
+            ok(f"{mp} 的名称："
+               + (f"跟默认走（{names.get(dflt, dflt)}）" if val is None else names[val]))
+        else:
+            save_ms_state(rename_policy=val)
+            ok(f"默认名称：{names[val]}")
+        # 【改完当场落地】不然要等到下一轮生成或对齐，中间那段时间屏上写着"清洗后的
+        # 名字"而 Emby 里一个条目都没变，看着就是没生效。
+        key = read_emby_api_key(d)
+        n = len(rename_preview(d, mp))
+        if n and ask_yn(f"现在就把这 {n} 个 strm 改过来？", True):
+            migrate_strm_layout(d, key)
+        elif n:
+            print(f"  {DIM}下一轮「5 生成媒体库」或每天的对齐会做。{RST}")
+        return
+
+
 # 阿里云盘的「接口通道」。它没有 link_method（那是夸克/UC 的字段），
 # 但有一个作用类似、而且决定播放快慢的开关：alipan_type。
 # 取值和取令牌页面上的入口一一对应，两边必须配对，见 gen 使用信息那段。
@@ -11118,9 +11343,13 @@ def _drive_menu(d, mp, drv):
         _sk = skip_dirs_of(mp)
         print(f"  5. 不扫的目录        当前："
               + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"))
+        _rn = {"on": "清洗后的名字", "off": "网盘原名"}
+        print(f"  6. 名称重定义        当前：{CYAN}{_rn.get(rename_policy_of(mp))}{RST}"
+              + ("" if (ms_state().get("rename_by_drive") or {}).get(mp)
+                 else f"  {DIM}（跟默认）{RST}"))
         has115 = "115" in str(drv)
         if has115:
-            print(f"  6. 网盘扫码登录")
+            print(f"  7. 网盘扫码登录")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -11136,7 +11365,9 @@ def _drive_menu(d, mp, drv):
             _title_menu(d, mp)
         elif c == "5":
             _skip_dirs_menu(d, mp)
-        elif c == "6" and has115:
+        elif c == "6":
+            _rename_menu(d, mp)
+        elif c == "7" and has115:
             qr115_login()
         else:
             print("无效选择。")
@@ -11275,6 +11506,8 @@ def _rest_menu(d):
         print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}")
         print(f"  4. 片名用哪个        当前："
               f"{CYAN}{names.get(title_policy())}{RST}")
+        print(f"  5. 名称重定义        当前：{CYAN}"
+              + ("清洗后的名字" if rename_policy() == "on" else "网盘原名") + RST)
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -11296,6 +11529,9 @@ def _rest_menu(d):
             continue
         if c == "4":
             _title_menu(d, None)
+            continue
+        if c == "5":
+            _rename_menu(d, None)
             continue
         if c != "1":
             print("无效选择。")
