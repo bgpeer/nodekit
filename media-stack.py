@@ -36,7 +36,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.89"
+SCRIPT_VERSION = "1.5.90"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4746,13 +4746,20 @@ def migrate_strm_layout(d, key, wait=True):
 
 
 def do_heal():
-    """后台补时长：一轮一轮走，中间歇几分钟，直到没得补或者用满预算。
+    """补时长：一轮一轮走，中间歇几分钟。
 
     单独一个子命令而不是塞进 warm，是因为触发时机不同：warm 是每小时的例行，这个是
     【用户刚扫完盘】那一下 —— 那时候新条目最多、最需要赶紧补上。
 
     失败的隔几分钟再试：失败几乎全是当时网盘那条线在抖，同一个条目下一轮往往就成了。
     heal_media_info 自己带游标，所以反复调它就是"只补没探到的"。
+
+    【有人坐在终端前就补到完，没人就按预算收工】两者的风险完全不同：
+      · 自动那条（cron / 扫完扔后台）绝不能自作主张去下几十 GB —— 当年一晚上 80.4 GB
+        的账单就是这么来的。所以 30 分钟、200 个条目，到点收工，剩下的交给每小时那轮。
+      · 人手动敲 `media-stack heal`，是【看着数字往下掉、随时能 Ctrl-C】的场合。
+        队里积着两千多个的时候（改名那一轮换掉条目 id 就会这样），按每小时 30 个补
+        要三天半 —— 那个默认值在这种时候是帮倒忙。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -4761,17 +4768,32 @@ def do_heal():
                            "auth")
     if not key:
         return
+    full = has_tty()
+    if full:
+        n0 = len(items_without_duration(key))
+        if not n0:
+            ok("没有待补的条目，时长都齐了。")
+            return
+        print()
+        info(f"还有 {BOLD}{n0}{RST} 个条目没探到媒体信息，这一趟补到完为止。")
+        print(f"  {DIM}探一个要真的从网盘拉一段文件头（几 MB 起步），"
+              f"{n0} 个大概 {n0 * 4 // 1024 + 1} GB 上下的下行流量。{RST}")
+        print(f"  {DIM}随时 Ctrl-C 走人 —— 补到哪算哪，剩下的每小时那轮接着补。{RST}")
     t0, seen = time.monotonic(), 0
-    while time.monotonic() - t0 < HEAL_BG_BUDGET and seen < HEAL_BG_MAX:
+    while full or (time.monotonic() - t0 < HEAL_BG_BUDGET and seen < HEAL_BG_MAX):
         pend = items_without_duration(key)
         if not pend:
+            if full:
+                ok("补完了。")
             return                      # 全补齐了
-        heal_media_info(d, key)
+        heal_media_info(d, key, budget=(HEAL_BUDGET * 3 if full else None))
         seen += HEAL_LIMIT
         if not items_without_duration(key):
+            if full:
+                ok("补完了。")
             return
         # 【歇一下再来】隔太密只会连着撞同一段抽风的线路，还容易被网盘限流
-        if time.monotonic() - t0 + HEAL_RETRY_MIN * 60 >= HEAL_BG_BUDGET:
+        if not full and time.monotonic() - t0 + HEAL_RETRY_MIN * 60 >= HEAL_BG_BUDGET:
             return
         time.sleep(HEAL_RETRY_MIN * 60)
 
@@ -8266,7 +8288,7 @@ def set_heal_pace(throttled):
     return new
 
 
-def heal_media_info(d, key):
+def heal_media_info(d, key, budget=None):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
     Emby 拿不到时长时续播逻辑整个失效 —— 它按时长的百分比判断存不存续播点，分母为 0 就
@@ -8346,15 +8368,16 @@ def heal_media_info(d, key):
     done = hit = 0
     todo_items = list(pend)
     t_all = time.monotonic()
+    budget = HEAL_BUDGET if budget is None else budget
     for rnd in range(1, HEAL_ROUNDS + 1):
-        if not todo_items or time.monotonic() - t_all > HEAL_BUDGET:
+        if not todo_items or time.monotonic() - t_all > budget:
             break
         if rnd > 1:
             print(f"  {DIM}...{len(todo_items)} 个没探到，隔 {HEAL_GAP} 秒再试一轮"
                   f"（第 {rnd}/{HEAL_ROUNDS} 轮）{RST}")
             time.sleep(HEAL_GAP)
         again = []
-        _d, _t = _heal_round(d, key, todo_items, base, token, again, t_all)
+        _d, _t = _heal_round(d, key, todo_items, base, token, again, t_all, budget)
         done += _d
         hit += _t
         todo_items = again
@@ -8365,6 +8388,12 @@ def heal_media_info(d, key):
             break
     _new = set_heal_pace(hit >= HEAL_429_STOP)
     _heal_summary(done, len(pend))
+    # 【把时间花在哪儿说出来】原来一轮跑完只报"补上几个"，于是"慢"没有任何可查的
+    # 东西：到底是每个都要 3 分钟，还是大多数很快、少数拖死，从屏幕上看不出来。
+    _el = time.monotonic() - t_all
+    if len(pend):
+        print(f"  {DIM}本轮用时 {_mmss(int(_el))}，平均 {_el / len(pend):.0f} 秒一个"
+              f"（预算 {_mmss(budget)}）{RST}")
     if hit >= HEAL_429_STOP:
         print(f"  {DIM}下一批自动减到 {_new} 个 —— 上游按请求量限，"
               f"打得越猛补得越慢。它缓过来之后会自己加回去。{RST}")
@@ -8372,7 +8401,7 @@ def heal_media_info(d, key):
         print(f"  {DIM}这一轮没撞限流，下一批加到 {_new} 个。{RST}")
 
 
-def _heal_round(d, key, pend, base, token, again, t_all=None):
+def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
     """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流)。
 
     【每个条目要先把行占上】探一个条目最坏要等 3 分钟，而结果是【探完才打印】的 ——
@@ -8387,9 +8416,10 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
         uid, iid, name = _it[0], _it[1], _it[2]
         # 预算是【这一轮里也要看】的：一个条目最多等 3 分钟，50 个就是两个多小时，
         # 光靠外层每轮之间那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
-        if t_all is not None and time.monotonic() - t_all > HEAL_BUDGET:
+        if t_all is not None and time.monotonic() - t_all > (budget or HEAL_BUDGET):
             print(f"\r  {DIM}这轮时间用完了，剩下的下一轮接着探。{RST}\033[K")
             break
+        _t1 = time.monotonic()
         print(f"\r  {DIM}·{RST} {pad(name[:26], 28)}"
               f"{DIM}探测中… {idx}/{total}，最多 3 分钟{RST}\033[K",
               end="", flush=True)
@@ -8480,18 +8510,22 @@ def _heal_round(d, key, pend, base, token, again, t_all=None):
                     f.write(original if original.strip().startswith("/") else p)
             except OSError as e:
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
+        _sec = time.monotonic() - _t1
         if mins and streams:
             done += 1
-            print(f"\r  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟\033[K")
+            print(f"\r  {GREEN}\u2714{RST} {name[:26]}  {mins:.0f} 分钟"
+                  f"  {DIM}{_sec:.0f}s{RST}\033[K")
         elif mins:
             # 【这一种要单独说】时长有、轨道没有 = 探测中途断了（源限流、超时、
             # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
             # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
             print(f"\r  {DIM}\u00b7{RST} {name[:26]}  "
-                  f"{YELLOW}只探到时长，没有音视频轨（这样点开会 load fail）{RST}\033[K")
+                  f"{YELLOW}只探到时长，没有音视频轨（这样点开会 load fail）{RST}"
+                  f"  {DIM}{_sec:.0f}s{RST}\033[K")
             again.append(_it)
         else:
-            print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}\033[K")
+            print(f"\r  {DIM}\u00b7{RST} {name[:26]}  {YELLOW}Emby 没探出时长{RST}"
+                  f"  {DIM}{_sec:.0f}s{RST}\033[K")
             again.append(_it)
     return done, hit
 
@@ -8955,8 +8989,6 @@ def do_strm(only=None):
             # 重新加载存储。数字不摊开的话，用户只会得出"这脚本慢"这一个结论。
             _tot = int(time.monotonic() - t_start)
             _wait = int((t_started or time.monotonic()) - t_start)
-            def _mmss(n):
-                return f"{n // 60} 分 {n % 60} 秒" if n >= 60 else f"{n} 秒"
             print(f"  {DIM}用时 {_mmss(_tot)}：等 AutoFilm 到点触发 {_mmss(_wait)}"
                   f"（固定开销）+ 实际扫描 {_mmss(max(0, _tot - _wait))}{RST}")
             if nums.get("skipped_dir_count", 0):
@@ -12094,6 +12126,13 @@ def _hc_wait(label, secs):
     这里先打一行不换行的占位，_hc 用 \\r + 清行覆盖掉它。
     """
     print(f"    {pad(label, 20)}{DIM}测试中…最多 {secs} 秒{RST}", end="", flush=True)
+
+
+def _mmss(n):
+    """秒数说成人话。补时长的收尾和生成媒体库的用时都用它 —— 原来嵌在 do_strm
+    里面，别处想用就是 NameError。"""
+    n = int(n)
+    return f"{n // 60} 分 {n % 60} 秒" if n >= 60 else f"{n} 秒"
 
 
 def _short_err(s):
