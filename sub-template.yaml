@@ -61,12 +61,6 @@ tun:
   route-exclude-cidr: ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10", "fc00::/7", "fe80::/10"]
 
 dns-anchor:
-  # 国内 DNS 后面挂 #🎯直连：这两台【必须直连】，绕到境外出口去问阿里/腾讯，
-  # 拿回来的是境外视角的解析结果，国内 CDN 全跑偏。
-  # 为什么不靠 rules 里的 cn-ip 兜：dns.respect-rules 打开后 DNS 查询也走规则引擎，
-  # 而规则集是远程拉的——启动那几秒还没下载完，RULE-SET 一条都匹配不上，
-  # 查询直接掉到 MATCH → 🤡漏网之鱼 → 代理（实测连接详情里「规则」显示 Match）。
-  # 写在 nameserver 自己身上就不经过规则引擎，配置一加载就生效。
   cn-dns: &cn-dns ["https://223.5.5.5/dns-query#🎯直连", "https://doh.pub/dns-query#🎯直连"]
   global-dns: &global-dns ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query", "https://9.9.9.9/dns-query", "tls://1.1.1.1:853", "tls://8.8.8.8:853"]
 
