@@ -1757,7 +1757,7 @@ def _sb_country_groups(tags, existing=()):
 
 def build_singbox_sub(nodes, tpl_url):
     """对象级替换锚点：__XY_NODES__ 换节点对象、__XY_GROUPS__ 换国家组、
-       __XY_GROUP_NAMES__ 展开国家组名、__PATTERN__:正则 展开命中节点名，再按手写风格序列化。"""
+       __XY_NAMES__ / <正则> / __XY_NAMES__:<正则> 展开策略组成员，再按手写风格序列化。"""
     cfg = json.loads(_ghrelay_rewrite(fetch_url(tpl_url)))    # 规则/图标链接：开启则改走本机 GitHub 中转
     objs = []
     for key, d in nodes:
@@ -1776,17 +1776,41 @@ def build_singbox_sub(nodes, tpl_url):
     existing_tags = {o["tag"] for o in cfg.get("outbounds", [])
                      if isinstance(o, dict) and o.get("tag")}
     country_objs, country_names = _sb_country_groups(tags, existing_tags)
+    # 已知 tag 全集：模板自己定义的（含 DIRECT、策略组、静态节点）+ 注入的节点 + 自动建的国家组。
+    # 用来分辨「字面 tag 名」和「裸正则」——两者都是普通字符串，没有语法上的区别，
+    # 只能靠"是不是已经存在这么一个出站"来判。
+    known_tags = set(existing_tags) | set(tags) | set(country_names)
+
     def expand_list(lst):
+        """展开策略组成员。三种写法可拆解组合（前缀管建不建国家组，冒号后的正则管带不带节点）：
+
+             __XY_NAMES__        只列国家组名，不带节点
+             <正则>              只带命中的节点名，不列国家组      例：.*  或  🇺🇸|US
+             __XY_NAMES__:<正则> 两个都要：国家组名 + 命中的节点名
+
+           裸正则怎么跟字面 tag 名区分：先查 known_tags，是已知出站就当字面量，
+           否则才按正则去匹配节点名。所以 "DIRECT"、"🎯直连" 这些照常原样保留，
+           而 ".*" 这种不存在的 tag 才会被当成正则。
+
+           正则一条都没匹配上时【保留字面量】而不是丢掉：这样模板里把 tag 名写错一个字，
+           sing-box 会照常报 "outbound not found"，一眼能看出问题；静默丢掉反而查不出来。"""
         out = []
         for x in lst:
             if x == "__XY_NAMES__":
-                out += country_names                                 # 裸锚点 → 只国家组名
+                out += country_names                                 # 只国家组名
             elif isinstance(x, str) and x.startswith("__XY_NAMES__:"):
-                out += country_names                                 # 带:正则 → 国家组名 + 命中节点名
+                out += country_names                                 # 国家组名 + 命中节点名
                 out += [t for t in tags if re.search(x[len("__XY_NAMES__:"):], t)]
-            elif isinstance(x, str) and x.startswith("__PATTERN__:"):
-                sel = [t for t in tags if re.search(x[len("__PATTERN__:"):], t)]
-                out += sel or ["DIRECT"]                             # 旧锚点(向后兼容)：只命中的节点名
+            elif isinstance(x, str) and x not in known_tags:
+                try:
+                    hit = [t for t in tags if re.search(x, t)]       # 裸正则 → 只匹配节点名
+                except re.error:
+                    hit = []                                         # 不是合法正则 → 当字面量
+                if hit:
+                    out += hit
+                else:
+                    print(f"  ⚠ sing-box 模板里的 {x!r} 既不是已有出站、当正则也匹配不到节点，原样保留")
+                    out.append(x)
             else:
                 out.append(x)
         return out
