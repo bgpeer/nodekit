@@ -5408,8 +5408,9 @@ def cert_fix():
     if not os.path.exists(acme):
         print("  ✗ 找不到 acme.sh，无法续期。")
         return
-    print("  会做四件事：强制续期 → 重新导出到 /etc/ssl/sb/ → 把 reloadcmd 记进 acme.sh")
-    print("              → 重启 nginx / sing-box / xray / xy-sub（各几秒，期间节点会断一下）")
+    print("  会依次做：确认 cron 和 acme 续期任务都在 → 看 80 端口被谁占着、据此选验证方式")
+    print("            → 强制重签 → 导出到 /etc/ssl/sb/ → 把 reloadcmd 记进 acme.sh")
+    print("            → 重启 nginx / sing-box / xray / xy-sub（各几秒，期间节点会断一下）")
     if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
         print("  已取消。")
         return
