@@ -18,11 +18,11 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
+import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.80"
+SCRIPT_VERSION = "1.0.82"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -318,6 +318,39 @@ def cert_covers(path, domain):
         return False
     return domain in sh(f"openssl x509 -in {path} -noout -text 2>/dev/null", check=False)
 
+# acme.sh 续期后要执行的重载命令。它会被 acme.sh 记进该域名的 conf、每次续期自动跑。
+# 为什么非有不可：sing-box / xray / xy-sub 都是【启动时把证书读进内存】的，不会回头看文件。
+# 没有这条 hook，acme 把磁盘上的证书换了新的，三个进程还捏着旧的——90 天一到，客户端撞上
+# 过期证书，节点和订阅一起挂，而且日志里看不出所以然（就是「连不上」）。
+# 有 nginx 顺带 reload；对应服务不存在则静默跳过，末尾 true 保证 hook 本身永不失败。
+_ACME_RELOAD_HOOK = (" --reloadcmd '"
+                     "systemctl reload nginx 2>/dev/null; "
+                     "systemctl restart sing-box 2>/dev/null; "
+                     "systemctl restart xray 2>/dev/null; "
+                     "systemctl restart xy-sub 2>/dev/null; true'")
+
+_ACME_HOOK_DONE = False          # 一次运行里只补一次：ensure_acme 每个协议都会调一遍
+
+def _acme_install_cert(acme):
+    """把证书导出到 ACME_CRT/ACME_KEY，并把 reloadcmd 记进 acme.sh。"""
+    sh(f"{acme} --install-cert -d {G['domain']} --ecc "
+       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}")
+
+def _ensure_acme_reload_hook():
+    """给老安装补上 reloadcmd（证书没到期、走不到重签分支的那条路）。
+
+       失败不抛：证书本来就是好的，补 hook 只是让【下次续期】能自动重启进程，
+       补不上顶多回到原样，不该因此把安装流程打断。"""
+    global _ACME_HOOK_DONE
+    if _ACME_HOOK_DONE or not G.get("domain"):
+        return
+    _ACME_HOOK_DONE = True
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        return
+    sh(f"{acme} --install-cert -d {G['domain']} --ecc "
+       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
+
 def ensure_acme():
     """给了 --domain 就用 acme.sh standalone 签真证书；否则回落自签。"""
     if not G["domain"]:
@@ -355,16 +388,12 @@ def ensure_acme():
         if r.returncode and not skipped:
             raise RuntimeError("acme 签发失败(检查域名解析是否指向本机、80 端口是否可达):\n" + out)
         os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
-        # reloadcmd 会被 acme.sh 记住，续期时自动执行。sing-box/xray 是启动时把证书读进
-        # 内存的、不会自动重载证书文件，所以续期后必须重启它们，否则磁盘证书更新了、进程还用
-        # 旧证书，约 90 天后客户端撞上过期证书。有 nginx 顺带 reload；服务不存在则静默跳过。
-        reload_hook = (" --reloadcmd '"
-                       "systemctl reload nginx 2>/dev/null; "
-                       "systemctl restart sing-box 2>/dev/null; "
-                       "systemctl restart xray 2>/dev/null; "
-                       "systemctl restart xy-sub 2>/dev/null; true'")   # 订阅 HTTPS 证书同步刷新
-        sh(f"{acme} --install-cert -d {G['domain']} --ecc "
-           f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+        _acme_install_cert(acme)
+    else:
+        # 证书已经在、不用重签，但 reloadcmd 可能【压根没装过】——
+        # 这条 hook 是后来才加进脚本的，在它之前装的机器走不到上面那一步，
+        # acme.sh 续期时什么都不重启。补一次，幂等。
+        _ensure_acme_reload_hook()
     return ACME_CRT, ACME_KEY, False
 
 # ---------------------------------------------------------------------------- nginx 前置
@@ -2516,14 +2545,34 @@ def _fetch_text(url, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout).read().decode(errors="ignore")
 
 def peer_status(url):
-    """探测成员链接可达性，返回 HTTP 状态码字符串；不通返回 '000'。供菜单显示 ✓/红码。"""
+    """探测成员链接可达性，返回 (是否通, 给人看的说明)。
+
+       原来所有失败都压成一个「不通」，到底是机器没开、端口被墙、证书过期还是
+       token 换了，全看不出来，只能一台台上去翻——分清楚这几类，一眼就知道去哪查。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
-        return str(urllib.request.urlopen(req, timeout=8).status)
+        return True, str(urllib.request.urlopen(req, timeout=8).status)
     except urllib.error.HTTPError as e:
-        return str(e.code)
-    except Exception:
-        return "000"
+        if e.code == 404:
+            return False, "404 地址失效（对方换过 token 或重装过，去它那儿重新复制）"
+        return False, f"{e.code}"
+    except urllib.error.URLError as e:
+        r = getattr(e, "reason", e)
+        t = str(r)
+        if isinstance(r, socket.timeout) or "timed out" in t:
+            return False, "超时（对方机器没开，或端口被墙/被防火墙拦）"
+        if "certificate" in t.lower() or "SSL" in t or "ssl" in t:
+            # 最常见的一种：acme 续期换了证书，但 xy-sub 进程还捏着旧的
+            return False, "证书错误（多半是续期后 xy-sub 没重启：去那台机器 systemctl restart xy-sub）"
+        if "Name or service not known" in t or "nodename nor servname" in t:
+            return False, "域名解析不了"
+        if "Connection refused" in t:
+            return False, "连接被拒（对方 xy-sub 服务没在跑）"
+        if "reset by peer" in t:
+            return False, "连接被重置（端口多半被墙了）"
+        return False, f"不通（{t[:40]}）"
+    except Exception as e:
+        return False, f"不通（{str(e)[:40]}）"
 
 _NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://",
                  "hysteria2://", "hy2://", "tuic://", "anytls://")
@@ -3023,10 +3072,9 @@ def peers_menu():
         if peers:
             print("  已添加的成员链接（生成时不通的自动忽略）：")
             for i, u in enumerate(peers, 1):
-                code = peer_status(u)
-                mark = "\033[1;32m✓\033[0m" if code == "200" else \
-                       ("\033[1;31m不通\033[0m" if code == "000" else f"\033[1;31m{code}\033[0m")
-                print(f"    {i}. {u}   {mark}")
+                ok, why = peer_status(u)
+                print(f"    {i}. {u}   " +
+                      ("\033[1;32m✓\033[0m" if ok else f"\033[1;31m✗ {why}\033[0m"))
         else:
             print("  还没添加成员链接。到别的机器进本菜单，复制它顶部那条 links 链接，粘进来即可。")
         print("-" * 60)
@@ -3051,8 +3099,8 @@ def peers_menu():
             if u in peers:
                 print("  该链接已存在。"); continue
             peers.append(u); save_peers(peers)
-            code = peer_status(u)
-            print("  ✓ 已添加。" + ("连通 ✓" if code == "200" else f"（当前不通 {code}，之后通了会自动纳入）"))
+            ok, why = peer_status(u)
+            print("  ✓ 已添加。" + ("连通 ✓" if ok else f"（当前 ✗ {why}；之后通了会自动纳入）"))
         elif c == "2":
             if not peers:
                 continue
@@ -5288,6 +5336,74 @@ def cdn_menu():
         elif c in ("0", ""):
             return
 
+def _cert_secs_left(path=None):
+    """磁盘上 acme 证书还剩多少秒到期；没有证书/读不出返回 None（负数=已过期）。
+
+       用 calendar.timegm 而不是 time.mktime：openssl 打的是 GMT，mktime 会按本机时区
+       去解，服务器设了非 UTC 时区就会差出小半天，正好在到期这天给出相反的结论。"""
+    path = path or ACME_CRT
+    if not os.path.exists(path):
+        return None
+    out = sh(f"openssl x509 -noout -enddate -in {path}", check=False)
+    m = re.search(r"notAfter=(.+)", out or "")
+    if not m:
+        return None
+    try:
+        end = time.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z")
+    except ValueError:
+        return None
+    return int(calendar.timegm(end) - time.time())
+
+def _cert_left_text(secs):
+    """把剩余秒数说成人话。不写「已过期 0 天」这种话。"""
+    if secs is None:
+        return "读不出来"
+    if secs <= 0:
+        d = int(-secs // 86400)
+        return "刚刚过期" if d == 0 else f"已过期 {d} 天"
+    d = secs // 86400
+    if d == 0:
+        return f"今天就到期（还剩 {max(secs // 3600, 1)} 小时）"
+    return f"还剩 {d} 天到期"
+
+def cert_fix():
+    """强制续期 + 重新导出证书 + 把 reloadcmd 记进 acme.sh + 重启吃证书的几个服务。
+
+       为什么值得单独做个按钮：证书 90 天一换，而 sing-box / xray / xy-sub 都只在启动时
+       把它读进内存。续期这条链上任何一环断了（cron 没装、80 被占、reloadcmd 压根没记过），
+       表现都是「某天突然全部连不上」——日志里只有一句连不上，没人会往证书上想。"""
+    dom = ""
+    try:
+        dom = json.load(open(STATE_FILE)).get("domain", "")
+    except Exception:
+        pass
+    if not dom:
+        print("\n  本机用的是自签证书（没有域名），不涉及 acme 续期。")
+        return
+    print(f"\n  域名 {dom}    磁盘上的证书：{_cert_left_text(_cert_secs_left())}")
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print("  ✗ 找不到 acme.sh，无法续期。")
+        return
+    print("  会做四件事：强制续期 → 重新导出到 /etc/ssl/sb/ → 把 reloadcmd 记进 acme.sh")
+    print("              → 重启 nginx / sing-box / xray / xy-sub（各几秒，期间节点会断一下）")
+    if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    print("  正在续期…（走 acme.sh，可能要十几秒）")
+    sh(f"{acme} --renew -d {dom} --ecc --force", check=False)
+    G["domain"] = dom
+    sh(f"{acme} --install-cert -d {dom} --ecc "
+       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
+    for svc in ("nginx", "sing-box", "xray", "xy-sub"):
+        sh(f"systemctl restart {svc}", check=False)
+    left = _cert_secs_left()
+    if left is not None and left > 0:
+        print(f"  ✓ 完成，证书{_cert_left_text(left)}。")
+        print("    reloadcmd 已记进 acme.sh，以后自动续期会跟着重启这几个服务，不用再手动来一次。")
+    else:
+        print("  ⚠ 续期后证书仍不正常。常见原因：域名解析没指向本机、80 端口被占（standalone 验证要用）。")
+
 def main_menu():
     # 一次性自愈：xray 26.7.11+ 默认 minClientVer=26.3.27 会拒旧客户端(mihomo 硬编码 1.8.2 等)，
     # 给缺这项的 reality 入站补 1.0.0。只在首次(确有缺失时)改配置+重启 xray，之后即为 no-op。
@@ -5301,6 +5417,12 @@ def main_menu():
         t = traffic_line()
         if t:
             print(t)
+            print("-" * 60)
+        _left = _cert_secs_left()
+        if _left is not None and _left <= 10 * 86400:
+            # 证书一过期，节点和订阅会【一起】挂，而且报错只是「连不上」，极难联想到证书
+            print(f"  \033[1;31m⚠ TLS 证书{_cert_left_text(_left)}"
+                  f"——进 20 修复，否则节点和订阅会一起连不上\033[0m")
             print("-" * 60)
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
@@ -5321,6 +5443,7 @@ def main_menu():
         print("  17. 更新脚本（不影响节点）")
         print("  18. 更新核心（sing-box / xray）")
         print("  19. 卸载")
+        print("  20. 修复 TLS 证书（续期 + 重启吃证书的服务·90天到期前后用）")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -5346,6 +5469,7 @@ def main_menu():
         elif c == "17":  update_script()
         elif c == "18":  update_cores()
         elif c == "19":  uninstall_all()
+        elif c == "20":  cert_fix()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
@@ -5630,7 +5754,8 @@ def install_flow():
         print("  1. 只添加新协议   老节点的端口/UUID/密码/订阅地址全部不变，推荐")
         print("  2. 全部重新安装   所有节点重新生成，订阅地址也会换，客户端要重新导入")
         print("  0. 返回")
-        ans = (_ask("选择 [1/2/0] (回车=1): ") or "1").strip()
+        # 回车默认 0：这两条都会动正在跑的节点，不该靠误按回车触发
+        ans = (_ask("选择 [1/2/0] (回车=0 返回): ") or "0").strip()
         if ans == "0":
             print("已取消，返回主菜单。"); return
         if ans != "2":
