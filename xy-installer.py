@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.85"
+SCRIPT_VERSION = "1.0.86"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -161,6 +161,7 @@ NODE_FILE = "/root/xy-nodes.txt"                 # 本机节点分享链接（�
 SELF_LOCAL     = BGP_DIR + "/xy-installer.py"    # 本地脚本副本（cron 调它，不受网络影响）
 CORE_CRON_FILE = "/etc/cron.d/bgpeer-coreupdate" # 每月定点更新内核的 cron
 CORE_CRON_LOG  = "/var/log/bgpeer-coreupdate.log"
+CERT_FIX_LOG   = "/var/log/bgpeer-certfix.log"   # 证书修复日志（转后台跑，SSH 断了也查得到）
 
 # ---------------------------------------------------------------------------- 基础工具
 def sh(cmd, check=True):
@@ -2998,7 +2999,7 @@ def run(sb_names, xr_names):
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
     if sched:
-        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 16 手动立即更新。')
+        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 19 手动立即更新。')
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
 
 # ============================================================================ 管理面板 / 快捷命令
@@ -3349,10 +3350,11 @@ def _xray_heal_minclientver(restart=True):
     return True
 
 CORE_DONE_MARK = "本次更新结束"     # 前台跟随日志时用它判断后台已跑完
+CERT_DONE_MARK = "本次证书修复结束"  # 同上，证书修复用
 
 def update_cores_auto(only=None):
     """非交互更新已安装的内核到最新并重启。起不来会记进日志。
-       两个入口共用：cron 每月自动更新，以及菜单16 转到后台时。
+       两个入口共用：cron 每月自动更新，以及菜单19 转到后台时。
        only: None 或 "both" → 两个都更；"sing-box" / "xray" → 只更那一个。"""
     ensure_deps()
     ts = time.strftime("%F %T")
@@ -5389,8 +5391,10 @@ def _cert_left_text(secs):
         return f"今天就到期（还剩 {max(secs // 3600, 1)} 小时）"
     return f"还剩 {d} 天到期"
 
-def cert_fix():
-    """强制续期 + 重新导出证书 + 把 reloadcmd 记进 acme.sh + 重启吃证书的几个服务。
+def cert_fix_run():
+    """真正干活的那部分（非交互）。菜单入口把它派到独立会话里跑，见 cert_fix()。
+
+       强制续期 + 重新导出证书 + 把 reloadcmd 记进 acme.sh + 重启吃证书的几个服务。
 
        为什么值得单独做个按钮：证书 90 天一换，而 sing-box / xray / xy-sub 都只在启动时
        把它读进内存。续期这条链上任何一环断了（cron 没装、80 被占、reloadcmd 压根没记过），
@@ -5403,16 +5407,10 @@ def cert_fix():
     if not dom:
         print("\n  本机用的是自签证书（没有域名），不涉及 acme 续期。")
         return
-    print(f"\n  域名 {dom}    磁盘上的证书：{_cert_left_text(_cert_secs_left())}")
+    print(f"域名 {dom}    磁盘上的证书：{_cert_left_text(_cert_secs_left())}")
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
-        print("  ✗ 找不到 acme.sh，无法续期。")
-        return
-    print("  会依次做：确认 cron 和 acme 续期任务都在 → 看 80 端口被谁占着、据此选验证方式")
-    print("            → 强制重签 → 导出到 /etc/ssl/sb/ → 把 reloadcmd 记进 acme.sh")
-    print("            → 重启 nginx / sing-box / xray / xy-sub（各几秒，期间节点会断一下）")
-    if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
-        print("  已取消。")
+        print("✗ 找不到 acme.sh，无法续期。")
         return
     # 自动续期这条链有三环，缺一环都是「某天突然全挂」：
     #   ① acme.sh 自己的 cron 每天跑 --cron
@@ -5474,6 +5472,68 @@ def cert_fix():
         print("    reloadcmd 已记进 acme.sh，以后自动续期会跟着重启这几个服务，不用再手动来一次。")
     else:
         print("  ⚠ 续期后证书仍不正常。常见原因：域名解析没指向本机、80 端口被占（standalone 验证要用）。")
+    print(CERT_DONE_MARK)
+
+def cert_fix():
+    """菜单入口：确认后把修复派到独立会话里跑，前台只负责跟日志。
+
+       为什么非得转后台：修复的最后一步是 systemctl restart sing-box / xray，而你多半是
+       【挂着本机代理在管这台机】的——核心一重启，代理链路当场断，SSH 跟着断，前台这个
+       python 进程收到 SIGHUP 就死了。表现是「证书签下来了，但服务没重启完」「日志断在
+       一半」，下次进来还得再来一遍。start_new_session=True 让它脱离控制终端，SIGHUP
+       打不到它，SSH 断了照样在服务端跑完。跟菜单 19「更新核心」是同一套处理。"""
+    dom = ""
+    try:
+        dom = json.load(open(STATE_FILE)).get("domain", "")
+    except Exception:
+        pass
+    if not dom:
+        print("\n  本机用的是自签证书（没有域名），不涉及 acme 续期。")
+        return
+    print(f"\n  域名 {dom}    磁盘上的证书：{_cert_left_text(_cert_secs_left())}")
+    print("  会依次做：确认 cron 和 acme 续期任务都在 → 看 80 端口被谁占着、据此选验证方式")
+    print("            → 强制重签 → 导出到 /etc/ssl/sb/ → 把 reloadcmd 记进 acme.sh")
+    print("            → 重启 nginx / sing-box / xray / xy-sub")
+    print("  ⚠ 重启核心会掐断代理链路。你要是挂着本机代理连的 SSH，这一步会断线——")
+    print("    不用管，任务在后台跑完，重连进来看日志即可。")
+    if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    try:
+        start = os.path.getsize(CERT_FIX_LOG) if os.path.exists(CERT_FIX_LOG) else 0
+    except OSError:
+        start = 0
+    try:
+        subprocess.Popen(                                # -u：不缓冲，日志逐行落盘才跟得上
+            f"python3 -u {SELF_LOCAL} cert-fix >> {CERT_FIX_LOG} 2>&1",
+            shell=True, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print("\n  转后台失败，改在前台直接修:", e)      # 兜底：宁可断线，也不能不修
+        cert_fix_run()
+        return
+    print(f"\n  已转入后台执行（断开 SSH 也会在服务端跑完）。日志: {CERT_FIX_LOG}")
+    print("  下面实时跟随进度，断了就断了，重连后 tail 这个文件即可：\n")
+    pos, deadline = start, time.time() + 300
+    try:
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                if os.path.getsize(CERT_FIX_LOG) <= pos:
+                    continue
+                with open(CERT_FIX_LOG, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except OSError:
+                continue
+            text = chunk.decode("utf-8", "replace")
+            print("  " + text.rstrip("\n").replace("\n", "\n  "))
+            if CERT_DONE_MARK in text:
+                return
+        print(f"\n  等了 5 分钟还没跑完，后台仍在继续。稍后看日志: tail {CERT_FIX_LOG}")
+    except KeyboardInterrupt:
+        print(f"\n  已退出跟随，后台继续执行。稍后看日志: tail {CERT_FIX_LOG}")
 
 def main_menu():
     # 一次性自愈：xray 26.7.11+ 默认 minClientVer=26.3.27 会拒旧客户端(mihomo 硬编码 1.8.2 等)，
@@ -5493,7 +5553,7 @@ def main_menu():
         if _left is not None and _left <= 10 * 86400:
             # 证书一过期，节点和订阅会【一起】挂，而且报错只是「连不上」，极难联想到证书
             print(f"  \033[1;31m⚠ TLS 证书{_cert_left_text(_left)}"
-                  f"——进 20 修复，否则节点和订阅会一起连不上\033[0m")
+                  f"——进 15 修复，否则节点和订阅会一起连不上\033[0m")
             print("-" * 60)
         print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
         print("  2. 节点链接 / 订阅")
@@ -5509,12 +5569,12 @@ def main_menu():
         print("  12. 网络优化（BBR/QoS 内核调优）")
         print("  13. 自建DNS（AdGuard Home·全设备去广告）")
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
-        print("  15. 自建Emby（网盘直链媒体服务器·不影响节点）")
-        print("  16. VPS线路检测（三网回程骨干 + IP纯净度）")
-        print("  17. 更新脚本（不影响节点）")
-        print("  18. 更新核心（sing-box / xray）")
-        print("  19. 卸载")
-        print("  20. 修复 TLS 证书（续期 + 重启吃证书的服务·90天到期前后用）")
+        print("  15. 修复 TLS 证书（续期 + 重启吃证书的服务·90天到期前后用）")
+        print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
+        print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
+        print("  18. 更新脚本（不影响节点）")
+        print("  19. 更新核心（sing-box / xray）")
+        print("  20. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -5535,12 +5595,12 @@ def main_menu():
         elif c == "12":  net_optimize_menu()
         elif c == "13":  adguard_menu()
         elif c == "14":  ghrelay_menu()
-        elif c == "15":  media_stack_menu()
-        elif c == "16":  vps_check_menu()
-        elif c == "17":  update_script()
-        elif c == "18":  update_cores()
-        elif c == "19":  uninstall_all()
-        elif c == "20":  cert_fix()
+        elif c == "15":  cert_fix()
+        elif c == "16":  media_stack_menu()
+        elif c == "17":  vps_check_menu()
+        elif c == "18":  update_script()
+        elif c == "19":  update_cores()
+        elif c == "20":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
@@ -5910,8 +5970,11 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:          # 不带参数 → 管理面板（bgpeer 也走这里）
         main_menu()
         sys.exit(0)
-    if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单16 转后台都调这个
+    if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单19 转后台都调这个
         update_cores_auto(sys.argv[2] if len(sys.argv) > 2 else None)   # 可选 sing-box/xray/both
+        sys.exit(0)
+    if sys.argv[1] == "cert-fix":        # 菜单 15 转后台调这个（脱离 SSH，重启核心也断不掉）
+        cert_fix_run()
         sys.exit(0)
     if sys.argv[1] == "selfdns-toggle":  # adguard 菜单调用：开关"自建DNS写入订阅"
         selfdns_toggle()
