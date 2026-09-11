@@ -22,7 +22,7 @@ import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, ur
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.80"
+SCRIPT_VERSION = "1.0.81"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -2516,14 +2516,34 @@ def _fetch_text(url, timeout=15):
     return urllib.request.urlopen(req, timeout=timeout).read().decode(errors="ignore")
 
 def peer_status(url):
-    """探测成员链接可达性，返回 HTTP 状态码字符串；不通返回 '000'。供菜单显示 ✓/红码。"""
+    """探测成员链接可达性，返回 (是否通, 给人看的说明)。
+
+       原来所有失败都压成一个「不通」，到底是机器没开、端口被墙、证书过期还是
+       token 换了，全看不出来，只能一台台上去翻——分清楚这几类，一眼就知道去哪查。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
-        return str(urllib.request.urlopen(req, timeout=8).status)
+        return True, str(urllib.request.urlopen(req, timeout=8).status)
     except urllib.error.HTTPError as e:
-        return str(e.code)
-    except Exception:
-        return "000"
+        if e.code == 404:
+            return False, "404 地址失效（对方换过 token 或重装过，去它那儿重新复制）"
+        return False, f"{e.code}"
+    except urllib.error.URLError as e:
+        r = getattr(e, "reason", e)
+        t = str(r)
+        if isinstance(r, socket.timeout) or "timed out" in t:
+            return False, "超时（对方机器没开，或端口被墙/被防火墙拦）"
+        if "certificate" in t.lower() or "SSL" in t or "ssl" in t:
+            # 最常见的一种：acme 续期换了证书，但 xy-sub 进程还捏着旧的
+            return False, "证书错误（多半是续期后 xy-sub 没重启：去那台机器 systemctl restart xy-sub）"
+        if "Name or service not known" in t or "nodename nor servname" in t:
+            return False, "域名解析不了"
+        if "Connection refused" in t:
+            return False, "连接被拒（对方 xy-sub 服务没在跑）"
+        if "reset by peer" in t:
+            return False, "连接被重置（端口多半被墙了）"
+        return False, f"不通（{t[:40]}）"
+    except Exception as e:
+        return False, f"不通（{str(e)[:40]}）"
 
 _NODE_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://",
                  "hysteria2://", "hy2://", "tuic://", "anytls://")
@@ -3023,10 +3043,9 @@ def peers_menu():
         if peers:
             print("  已添加的成员链接（生成时不通的自动忽略）：")
             for i, u in enumerate(peers, 1):
-                code = peer_status(u)
-                mark = "\033[1;32m✓\033[0m" if code == "200" else \
-                       ("\033[1;31m不通\033[0m" if code == "000" else f"\033[1;31m{code}\033[0m")
-                print(f"    {i}. {u}   {mark}")
+                ok, why = peer_status(u)
+                print(f"    {i}. {u}   " +
+                      ("\033[1;32m✓\033[0m" if ok else f"\033[1;31m✗ {why}\033[0m"))
         else:
             print("  还没添加成员链接。到别的机器进本菜单，复制它顶部那条 links 链接，粘进来即可。")
         print("-" * 60)
@@ -3051,8 +3070,8 @@ def peers_menu():
             if u in peers:
                 print("  该链接已存在。"); continue
             peers.append(u); save_peers(peers)
-            code = peer_status(u)
-            print("  ✓ 已添加。" + ("连通 ✓" if code == "200" else f"（当前不通 {code}，之后通了会自动纳入）"))
+            ok, why = peer_status(u)
+            print("  ✓ 已添加。" + ("连通 ✓" if ok else f"（当前 ✗ {why}；之后通了会自动纳入）"))
         elif c == "2":
             if not peers:
                 continue
@@ -5630,7 +5649,8 @@ def install_flow():
         print("  1. 只添加新协议   老节点的端口/UUID/密码/订阅地址全部不变，推荐")
         print("  2. 全部重新安装   所有节点重新生成，订阅地址也会换，客户端要重新导入")
         print("  0. 返回")
-        ans = (_ask("选择 [1/2/0] (回车=1): ") or "1").strip()
+        # 回车默认 0：这两条都会动正在跑的节点，不该靠误按回车触发
+        ans = (_ask("选择 [1/2/0] (回车=0 返回): ") or "0").strip()
         if ans == "0":
             print("已取消，返回主菜单。"); return
         if ans != "2":
