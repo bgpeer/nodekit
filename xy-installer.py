@@ -22,7 +22,7 @@ import os, json, base64, secrets, uuid, argparse, subprocess, urllib.request, ur
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.79"
+SCRIPT_VERSION = "1.0.80"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -1164,6 +1164,38 @@ def xr_vmess_ws(port, tag):
                      "host": tls_host(), "path": path, "tls": "tls", "sni": tls_host()})
     return ib, lk
 
+def xr_vless_xhttp_tls(port, tag):
+    """VLESS + XHTTP + TLS：独立随机端口、自带证书、【不经 nginx】。
+
+       跟 reality-xhttp 的区别只在伪装方式：reality 借别人的站，这个用自己的
+       域名证书。好处是不依赖借用目标站的存活/可达性，也不受 reality 那套
+       「借用站必须支持 TLS1.3+H2、不能是 CDN」的挑剔；代价是暴露自己的域名。
+
+       为什么不照搬 mack-a 的「任意门」两层结构（dokodemo-door 公网口 →
+       127.0.0.1:45988 的真入站）：那是为了在他那套【单配置多入站 + 复杂分流】
+       里给这个入站单独挂一条绕过分流的路由（inboundTag → z_direct_outbound）。
+       本脚本每个入站各自独立、出站只有 direct/block，中间这一跳不产生任何
+       区别，只多一次本地转发和一条路由规则，所以直接监听公网口。"""
+    uid = new_uuid(); path = "/" + secrets.token_hex(3)
+    crt, key, insec = ensure_acme()
+    tls = _xr_tls(crt, key)
+    tls["serverName"] = tls_host()
+    tls["minVersion"] = "1.2"
+    tls["alpn"] = ["h2", "http/1.1"]
+    if not insec:
+        # 真证书才开：自签场景下客户端可能按 IP 连、不发 SNI，开了会被直接拒
+        tls["rejectUnknownSni"] = True
+    ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
+          "settings": {"clients": [{"id": uid}], "decryption": "none"},
+          "streamSettings": {"network": "xhttp", "security": "tls",
+                             "xhttpSettings": {"host": tls_host(), "path": path,
+                                               "mode": "auto"},
+                             "tlsSettings": tls}}
+    lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=tls"
+          f"&sni={tls_host()}&fp=chrome&type=xhttp&host={tls_host()}&path={path}"
+          f"&mode=auto&alpn=h2&allowInsecure={1 if insec else 0}#{tag}")
+    return ib, lk
+
 def xr_trojan(port, tag):
     pw = new_pw(); crt, key, insec = ensure_acme()
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "trojan", "tag": tag,
@@ -1180,6 +1212,7 @@ def xr_trojan(port, tag):
 XRAY = {"reality-vision": xr_reality_vision,
         "reality-grpc": xr_reality_grpc,
         "reality-xhttp": xr_reality_xhttp,
+        "xhttp-tls": xr_vless_xhttp_tls,
         "vless-ws": xr_vless_ws, "vmess-ws": xr_vmess_ws,
         "trojan": xr_trojan}
 # 已移除 ss2022：纯全加密无伪装，易被 GFW 全加密流量探测识别；有 reality 完全无需它。
@@ -2931,7 +2964,7 @@ def install_shortcut(content=None):
 def read_saved_links():
     out = []
     try:
-        for l in open("/root/xy-nodes.txt"):
+        for l in open(NODE_FILE):        # 用常量，别再写死路径（测试/改路径时两边会对不上）
             s = l.strip()
             if s.startswith("#"):          # 到「# 订阅链接:」注释就停，别把订阅 URL 当节点
                 break
@@ -5350,6 +5383,8 @@ def _pick(title, options, default=None):
     print("   0. 全部")
     if default is None:
         hint = "回车=全部"
+    elif not default:
+        hint = "回车=一个都不选，0/all=全部"      # 增量添加时某个核心可以整个跳过
     else:
         hint = "回车=" + "、".join(default) + "，0/all=全部"
     raw = _ask(f"选择(逗号分隔编号, {hint}): ")
@@ -5366,12 +5401,243 @@ def _pick(title, options, default=None):
             print(f"  ⚠ 忽略无效项: {tok}")
     return picked
 
+# ============================================================================ 增量添加协议
+# 已经装好一套节点后，只想再加一个协议（比如新出的 xhttp-tls），不该把现有节点全部
+# 重新生成——端口、UUID、密码、订阅 token 全会变，所有客户端都得重新导入一遍。
+# 这里走「只添加」：现有 inbound 原样保留，只为新协议生成 inbound 和链接，追加进
+# 节点文件后刷新订阅（不换 token），客户端拉一次订阅就多出新节点，老节点纹丝不动。
+
+_CORE_META = {
+    # 键: (服务名, 二进制, 配置路径, 协议表, 同名协议的小上标)
+    "sb":   ("sing-box", SB_BIN,   f"{SB_DIR}/config.json",   SB,   "¹"),
+    "xray": ("xray",     XRAY_BIN, f"{XRAY_DIR}/config.json", XRAY, "²"),
+}
+
+def _load_core_cfg(core):
+    """读某核心现有 config.json → (cfg, inbounds)；没装或读不出返回 (None, [])。"""
+    path = _CORE_META[core][2]
+    try:
+        cfg = json.load(open(path))
+    except Exception:
+        return None, []
+    return cfg, (cfg.get("inbounds") or [])
+
+def _cfg_port(ib):
+    """取 inbound 的端口：sing-box 是 listen_port，xray 是 port。"""
+    p = ib.get("listen_port", ib.get("port"))
+    return p if isinstance(p, int) else None
+
+def _ports_in_cfgs():
+    """两核心现有配置里已占用的端口——增量装新协议时先占位，避免随机撞上。
+
+       光靠 next_port() 里的 port_free() 探测不够：服务正在跑时那些端口确实绑着、探得出来，
+       但服务要是恰好挂了或正在重启，探测就会认为端口空闲、把它分给新协议，
+       等老服务起来两边抢同一个口。"""
+    used = set()
+    for core in _CORE_META:
+        for ib in _load_core_cfg(core)[1]:
+            p = _cfg_port(ib)
+            if p:
+                used.add(p)
+    return used
+
+def _installed_state():
+    """读上次安装记录 → (state dict, sb 协议名 list, xray 协议名 list)。
+       顺带把历史旧协议名映射成现名，免得「已装」判断漏掉老节点。"""
+    try:
+        st = json.load(open(STATE_FILE))
+    except Exception:
+        return {}, [], []
+    fix = lambda lst: [_PROTO_ALIASES.get(n, n) for n in (lst or [])]
+    return st, fix(st.get("sb")), fix(st.get("xray"))
+
+def _restore_state_to_G(st):
+    """把上次安装的参数灌回 G，保证新加的节点跟老节点同域名/同 SNI/同前缀。"""
+    G["domain"]     = st.get("domain", "")
+    G["sni"]        = st.get("sni") or G["sni"]
+    G["prefix"]     = st.get("prefix", "")
+    G["hy2_ports"]  = st.get("hy2_ports", "")
+    G["nginx"]      = st.get("nginx", "")
+    G["reality443"] = st.get("reality443", "")
+    G["sni_split"]  = st.get("sni_split", "")
+    G["smux"]       = st.get("smux", "")
+    G["host"]       = st.get("host") or G["domain"] or public_ip()
+
+def add_protocols_flow(st, have_sb, have_xr):
+    """只添加新协议：现有节点一个都不动。"""
+    avail_sb = [n for n in SB   if n not in have_sb]
+    avail_xr = [n for n in XRAY if n not in have_xr]
+    if not avail_sb and not avail_xr:
+        print("\n  两个核心的协议都已经装齐了，没有可添加的。")
+        return
+
+    _restore_state_to_G(st)
+    print("\n" + "=" * 60)
+    print("  只添加新协议（现有节点的端口/UUID/密码/订阅地址全部不动）")
+    print("=" * 60)
+    print(f"  沿用上次安装的参数：域名 {G['domain'] or '(无，自签+IP)'}   "
+          f"SNI {G['sni']}   前缀 {G['prefix'] or '(无)'}")
+
+    pick_sb, pick_xr = [], []
+    if avail_sb:
+        pick_sb = _pick("【sing-box 可添加的协议】", avail_sb, default=[])
+    if avail_xr:
+        pick_xr = _pick("【xray 可添加的协议】", avail_xr, default=[])
+    if not pick_sb and not pick_xr:
+        print("  没选任何协议，返回。")
+        return
+
+    # ws 家族藏在 nginx 443 后面时，新加一个就得把 nginx 的 location 表整个重写；
+    # 而旧节点的 path 只存在于运行中的配置里，重建容易出错（sni-split 还多一层 stream）。
+    # 与其冒险改坏正在用的 443，不如在这里挡掉，让用户走全部重装那条路。
+    if _nginx_front():
+        blocked = [n for n in pick_sb if n in _WS_FAMILY]
+        if blocked:
+            print(f"\n  ⚠ 跳过 {', '.join(blocked)}：这些协议现在藏在 nginx 443 后面，"
+                  f"新增要改动 nginx 反代表，增量模式不碰它。要加请选『全部重新安装』。")
+            pick_sb = [n for n in pick_sb if n not in blocked]
+    if not pick_sb and not pick_xr:
+        print("  没有可增量添加的协议，返回。")
+        return
+
+    # 新 reality 一律走随机端口：443 已经有主的话抢不得；没有主的话绑 443 还要动
+    # nginx/证书布局，那是重装该干的事。
+    if any(n in REALITY_443_PRIORITY for n in pick_sb + pick_xr) and not st.get("reality443"):
+        print("\n  提示：新加的 reality 走随机端口。想让它独占 443（抗封锁）要走全部重装。")
+
+    print("\n" + "-" * 60)
+    if pick_sb:
+        print("  新增 sing-box:", ", ".join(pick_sb))
+    if pick_xr:
+        print("  新增 xray:    ", ", ".join(pick_xr))
+    print("  现有节点:    ", f"sing-box {len(have_sb)} 个 / xray {len(have_xr)} 个（保持不动）")
+    print("  订阅地址:    ", "不变（客户端重拉一次订阅即多出新节点）")
+    print("-" * 60)
+    if (_ask("确认添加? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("已取消。")
+        return
+
+    ensure_deps()
+    _USED_PORTS.clear()
+    _USED_PORTS.update(_ports_in_cfgs())        # 避开现有节点的端口
+    NGINX_WS.clear()
+    NGINX_STREAM.clear()
+    # 同名协议（两核心都有）加小上标区分：跟已装的一起算，免得新旧重名
+    dup = (set(have_sb) | set(pick_sb)) & (set(have_xr) | set(pick_xr))
+
+    new_links = []
+    for core, picks in (("sb", pick_sb), ("xray", pick_xr)):
+        if not picks:
+            continue
+        name, binpath, path, table, mark = _CORE_META[core]
+        cfg, ibs = _load_core_cfg(core)
+        if cfg is None:
+            # 这个核心之前没装过：装上它，按全新流程建配置骨架
+            (install_singbox if core == "sb" else install_xray)()
+            cfg = ({"log": {"level": "info"}, "inbounds": [],
+                    "outbounds": [{"type": "direct"}]} if core == "sb" else
+                   {"log": {"loglevel": "warning"}, "inbounds": [],
+                    "outbounds": [{"protocol": "freedom", "tag": "direct"},
+                                  {"protocol": "blackhole", "tag": "block"}]})
+            ibs = cfg["inbounds"]
+        ins, lks = build(table, picks, dup=dup, mark=mark)
+        exist_tags = {ib.get("tag") for ib in ibs}
+        add_ins, add_lks = [], []
+        for ib, lk in zip(ins, lks):            # tag 撞了就跳过，别把老节点顶掉
+            if ib.get("tag") in exist_tags:
+                print(f"  ⚠ {name}: 节点名 {ib.get('tag')} 与现有重名，跳过。")
+                continue
+            add_ins.append(ib)
+            add_lks.append(lk)
+        if not add_ins:
+            continue
+        cfg["inbounds"] = ibs + add_ins
+        backup = path + ".bak"
+        try:
+            shutil.copyfile(path, backup)
+        except OSError:
+            backup = ""
+        json.dump(cfg, open(path, "w"), indent=2)
+        ok, msg = core_check(binpath, path)
+        if not ok:                              # 校验不过就原样退回，绝不拿坏配置去重启
+            if backup:
+                shutil.copyfile(backup, path)
+                os.remove(backup)
+            print(f"\n  ✗ {name} 配置校验失败，已回滚，现有节点未受影响：\n{msg}")
+            return
+        try:
+            sh(f"systemctl restart {name}")
+        except Exception as e:
+            if backup:
+                shutil.copyfile(backup, path)
+                os.remove(backup)
+                sh(f"systemctl restart {name}", check=False)
+            print(f"\n  ✗ {name} 重启失败，已回滚：{e}")
+            return
+        if backup:
+            os.remove(backup)
+        new_links += add_lks
+        if core == "sb":
+            have_sb = have_sb + picks
+        else:
+            have_xr = have_xr + picks
+
+    if not new_links:
+        print("  没有新增任何节点。")
+        return
+
+    # 追加链接 + 刷新订阅（不换 token：客户端里那条订阅地址继续有效）
+    links, tail = _node_file_parts()
+    links += [l for l in new_links if l not in links]
+    with open(NODE_FILE, "w") as f:
+        f.write("\n".join(links) + ("\n" if links else ""))
+        if tail:
+            f.write(tail if tail.startswith("\n") else "\n" + tail)
+    try:
+        build_subscription(read_saved_links(), new_token=False)
+    except Exception as e:
+        print("  ⚠ 订阅刷新失败（节点已装好，可到配置菜单点『更新配置』重试）:", e)
+
+    st.update({"sb": have_sb, "xray": have_xr})
+    try:
+        json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+    print("\n" + "=" * 60)
+    print(f"  已添加 {len(new_links)} 个节点（现有节点未做任何改动）")
+    print("=" * 60)
+    print("\n".join(new_links))
+    print("\n订阅地址没变，客户端重拉一次订阅即可看到新节点：")
+    print(sub_urls_text())
+
 def install_flow():
-    # 已装过就问是否重装节点；不重装就直接返回（更新配置在各配置菜单里做，这里不掺和）
-    if os.path.exists(STATE_FILE) and read_saved_links():
-        ans = _ask("检测到已安装 bgpeer 节点。重新安装节点? [y/N]: ")
-        if ans.strip().lower() not in ("y", "yes"):
-            print("已取消，返回主菜单。（更新配置请进对应配置菜单）"); return
+    # 已装过：先把装了什么摆出来，再让用户选「只加新的」还是「全部重来」。
+    # 分这两条路是因为代价天差地别——全部重装会把每个节点的端口/UUID/密码和订阅
+    # token 全部重新生成，所有客户端都得重新导入一遍；只加新协议则一个字节都不动老节点。
+    st, have_sb, have_xr = _installed_state()
+    if (have_sb or have_xr) and read_saved_links():
+        n_sb, n_xr = len(SB) - len(have_sb), len(XRAY) - len(have_xr)
+        print("\n" + "=" * 60)
+        print("  检测到本机已安装 bgpeer 节点")
+        print("=" * 60)
+        if have_sb:
+            print("  已装 sing-box:", ", ".join(have_sb))
+        if have_xr:
+            print("  已装 xray:    ", ", ".join(have_xr))
+        print(f"  还没装的:      sing-box {n_sb} 个 / xray {n_xr} 个")
+        print("-" * 60)
+        print("  1. 只添加新协议   老节点的端口/UUID/密码/订阅地址全部不变，推荐")
+        print("  2. 全部重新安装   所有节点重新生成，订阅地址也会换，客户端要重新导入")
+        print("  0. 返回")
+        ans = (_ask("选择 [1/2/0] (回车=1): ") or "1").strip()
+        if ans == "0":
+            print("已取消，返回主菜单。"); return
+        if ans != "2":
+            add_protocols_flow(st, have_sb, have_xr); return
+        if (_ask("  全部重新安装会让现有客户端全部失效，确认? y 确认 / 回车取消: ")
+                or "n").strip().lower() not in ("y", "yes"):
+            print("已取消，返回主菜单。"); return
         G["regen"] = "1"
     print("=" * 60)
     print("  sing-box + xray 交互安装")
