@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.83"
+SCRIPT_VERSION = "1.0.84"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -177,9 +177,14 @@ def have(binary):
 def ensure_deps():
     """安装脚本依赖：acme.sh --standalone 需要 socat；xray 解压需要 unzip。
        Debian/Ubuntu 最小系统默认不带这些，缺了会导致 --issue / 安装直接失败。"""
+    # cron 看着跟代理没关系，但它一缺，两件"自动"的事会【从第一天起就没在跑】且悄无声息：
+    #   · acme.sh 装自己那条续期任务时发现没有 crontab，只打一行警告就继续
+    #   · 本脚本放进 /etc/cron.d 的内核自动更新，没有 cron 守护进程也不会执行
+    # 最小化的 Debian / GCE 镜像确实可能不带它，装完一切看着正常，90 天后证书到期全线挂。
     need = [pkg for pkg, binary in
             (("curl", "curl"), ("socat", "socat"), ("unzip", "unzip"),
-             ("openssl", "openssl"), ("tar", "tar"), ("ca-certificates", None))
+             ("openssl", "openssl"), ("tar", "tar"), ("cron", "crontab"),
+             ("ca-certificates", None))
             if binary is not None and not have(binary)]
     # ca-certificates 无对应可执行文件，装 acme/真证书时保证 TLS 根证书齐全
     if not have("update-ca-certificates"):
@@ -189,6 +194,13 @@ def ensure_deps():
     print("安装依赖:", ", ".join(need))
     sh("apt-get update -y", check=False)
     sh("DEBIAN_FRONTEND=noninteractive apt-get install -y " + " ".join(need))
+    if "cron" in need:
+        _ensure_cron_running()
+
+def _ensure_cron_running():
+    """把 cron 守护进程拉起来并设为开机自启。装了包但没 enable，等于白装。"""
+    for unit in ("cron", "crond"):                 # Debian 系叫 cron，RHEL 系叫 crond
+        sh(f"systemctl enable --now {unit}", check=False)
 
 def port_free(port):
     """standalone 验证要独占 80 端口，先探测避免 acme 无谓失败。"""
@@ -5396,10 +5408,19 @@ def cert_fix():
     #   ③ reloadcmd 通知 sing-box/xray/xy-sub 重新读证书
     # ① 是 acme.sh 装的时候顺带装的，但系统换过 cron、迁移过、或者被清理过就没了，
     # 而且它没了【一点声响都没有】。这里顺手确认一遍，缺了就补。
+    if not have("crontab"):
+        print("  ⚠ 本机连 cron 都没装——自动续期从第一天起就没在跑，正在安装…")
+        sh("apt-get update -y", check=False)
+        sh("DEBIAN_FRONTEND=noninteractive apt-get install -y cron", check=False)
+    _ensure_cron_running()
     cron = sh("crontab -l 2>/dev/null", check=False) or ""
     if "acme.sh" not in cron:
-        print("  ⚠ 没有 acme.sh 的 cron（自动续期根本没在跑），正在补上…")
+        print("  ⚠ 没有 acme.sh 的续期任务，正在补上…")
         sh(f"{acme} --install-cronjob", check=False)
+        if "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or ""):
+            print("  ✓ 续期任务已装上（以后每天自动检查）")
+        else:
+            print("  ✗ 续期任务仍没装上，检查 cron 服务：systemctl status cron")
     print("  正在续期…（走 acme.sh，可能要十几秒）")
     r = subprocess.run(f"{acme} --renew -d {dom} --ecc --force",
                        shell=True, text=True, capture_output=True)
