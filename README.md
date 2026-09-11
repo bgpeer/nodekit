@@ -118,13 +118,37 @@ sudo python3 /tmp/xy.py
 | 核心 | 协议 |
 |------|------|
 | **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、reality-grpc、tuic、vmess-httpupgrade、anytls |
-| **xray** | reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、reality-vision、reality-grpc、vless-ws、vmess-ws、trojan |
+| **xray** | reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、xhttp-tls、reality-vision、reality-grpc、vless-ws、vmess-ws、trojan |
 
 可以只装 sing-box、只装 xray，或两个一起装。**端口/服务/配置都互不冲突**（两核心是独立进程、各绑各的随机端口、各写各的 config）。
+
+> **`xhttp-tls`（VLESS + XHTTP + TLS）**：跟 `reality-xhttp` 只差伪装方式——reality 借别人的站，
+> 这个用你自己的域名证书。好处是不依赖借用目标站的存活和可达性，也不受 reality 那套「借用站必须
+> 支持 TLS1.3 + H2、不能是 CDN」的挑剔；代价是暴露自己的域名。走独立随机端口、**不经 nginx**，
+> 跟 443 上那套互不干扰，所以随时可以单独加一个。
+>
+> ⚠ xhttp 是 xray 专属传输：`sing-box` 和 `小火箭` 都不支持，这两种格式的订阅会自动跳过它
+> （跟 `reality-xhttp` 一样），mihomo 订阅和单条分享链接照常可用。
 
 > 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`），sing-box 已能做且做得一样，xray 独有价值的只有 `reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
 >
 > 万一你让两核心装了同名协议（`vless-ws`/`vmess-ws`/`trojan`），为避免客户端订阅**重名报错**，会给它们**尾部各加一个小上标区分**：sing-box 那份加 `¹`、xray 那份加 `²`（如 `trojan¹` / `trojan²`）。只标撞名的这几个，其余不动；上标短，手机上也显示得下。端口/服务/配置本来就互不冲突。
+
+> **已经装过了，只想再加一个协议？** 再跑一次安装会先把已装的协议列出来，然后给两条路：
+>
+> | 选项 | 做什么 | 代价 |
+> |---|---|---|
+> | **1. 只添加新协议** | 现有 inbound 原样不动，只为新选的协议生成节点，追加进订阅 | **老节点的端口/UUID/密码/订阅地址一个字节都不变**，客户端重拉一次订阅就多出新节点 |
+> | **2. 全部重新安装** | 按全新流程重建两个核心的配置 | 每个节点的端口/UUID/密码**和订阅 token 全部重新生成**，所有客户端都要重新导入 |
+>
+> 增量模式会沿用 `state.json` 里上次的域名 / SNI / 名称前缀，新节点跟老节点风格一致；端口从现有
+> 配置里读出来先占位，不会撞车。写进去之前先跑一遍内核自带的配置校验（`sing-box check` /
+> `xray -test`），**校验不过就原样回滚、连服务都不重启**，现有节点不受影响。
+>
+> 两种情况增量模式会挡下来、提示你走重装：
+> - **ws 家族藏在 nginx 443 后面时**再加 ws 类——新增要重写 nginx 的 location 反代表，而旧节点的
+>   path 只存在于运行中的配置里，与其冒险改坏正在用的 443，不如重装一次。
+> - **想让新的 reality 独占 443**——那要改端口/证书布局，增量只给随机端口。
 
 ---
 
