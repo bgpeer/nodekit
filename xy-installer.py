@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.84"
+SCRIPT_VERSION = "1.0.85"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5348,6 +5348,17 @@ def cdn_menu():
         elif c in ("0", ""):
             return
 
+def _port80_owner():
+    """80 端口被谁占着；空闲返回 ""。用来判断 acme 验证该走哪条路。"""
+    out = sh("ss -lntp 2>/dev/null", check=False) or ""
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 4 or not f[3].endswith(":80"):
+            continue
+        m = re.search(r'users:\(\("([^"]+)"', line)
+        return m.group(1) if m else "未知程序"
+    return ""
+
 def _cert_secs_left(path=None):
     """磁盘上 acme 证书还剩多少秒到期；没有证书/读不出返回 None（负数=已过期）。
 
@@ -5421,9 +5432,29 @@ def cert_fix():
             print("  ✓ 续期任务已装上（以后每天自动检查）")
         else:
             print("  ✗ 续期任务仍没装上，检查 cron 服务：systemctl status cron")
+    # 续期方式必须跟【现在】的 80 端口状况对上。
+    # 装机时没有 nginx，acme.sh 记下的就是 standalone（要独占 80）；可后来别的功能
+    # （443 伪装站 / 自建 Emby / AdGuard）把 nginx 拉起来占了 80，standalone 从此永远
+    # 验证失败——而且失败只写在 acme 自己的日志里，面板上一个字都看不到。
+    # 这次翻车就是这么来的：cron 补上了也没用，续期照样跑不过。
+    owner = _port80_owner()
+    hooks = ""
+    if owner:
+        if "nginx" not in owner:
+            print(f"  ✗ 80 端口被 {owner} 占着，acme 验证进不来。")
+            print("    先停掉它再重试：ss -lntp | grep ':80'")
+            return
+        # 用 pre/post hook 让 acme 自己停一下 nginx，别去改用户的 nginx 配置——
+        # 那份 conf 可能同时装着 443 伪装站/ws 反代/Emby，重写它比证书过期还糟。
+        # hook 会被 acme.sh 记进这个域名的记录，以后【自动续期也照做】。
+        hooks = (" --pre-hook 'systemctl stop nginx' "
+                 "--post-hook 'systemctl start nginx'")
+        print("  80 端口被 nginx 占着 → 续期时自动停一下 nginx（约 10 秒），完事自动起回来")
     print("  正在续期…（走 acme.sh，可能要十几秒）")
-    r = subprocess.run(f"{acme} --renew -d {dom} --ecc --force",
-                       shell=True, text=True, capture_output=True)
+    # 用 --issue --force 而不是 --renew：--renew 会沿用记录里那套（可能已经失效的）
+    # 验证方式，--issue 则把这次用的方式写回记录，往后自动续期就跟着走对的路。
+    r = subprocess.run(f"{acme} --issue -d {dom} --standalone --keylength ec-256 "
+                       f"--force{hooks}", shell=True, text=True, capture_output=True)
     if r.returncode:
         # 续期失败要把原文打出来——十次有九次是「80 端口被占」或「域名没解析到本机」，
         # 吞掉报错就只剩一句「修复失败」，等于没说
