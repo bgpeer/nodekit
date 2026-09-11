@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.82"
+SCRIPT_VERSION = "1.0.83"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5390,8 +5390,26 @@ def cert_fix():
     if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
         print("  已取消。")
         return
+    # 自动续期这条链有三环，缺一环都是「某天突然全挂」：
+    #   ① acme.sh 自己的 cron 每天跑 --cron
+    #   ② 到期前 30 天自动重签，写出新证书文件
+    #   ③ reloadcmd 通知 sing-box/xray/xy-sub 重新读证书
+    # ① 是 acme.sh 装的时候顺带装的，但系统换过 cron、迁移过、或者被清理过就没了，
+    # 而且它没了【一点声响都没有】。这里顺手确认一遍，缺了就补。
+    cron = sh("crontab -l 2>/dev/null", check=False) or ""
+    if "acme.sh" not in cron:
+        print("  ⚠ 没有 acme.sh 的 cron（自动续期根本没在跑），正在补上…")
+        sh(f"{acme} --install-cronjob", check=False)
     print("  正在续期…（走 acme.sh，可能要十几秒）")
-    sh(f"{acme} --renew -d {dom} --ecc --force", check=False)
+    r = subprocess.run(f"{acme} --renew -d {dom} --ecc --force",
+                       shell=True, text=True, capture_output=True)
+    if r.returncode:
+        # 续期失败要把原文打出来——十次有九次是「80 端口被占」或「域名没解析到本机」，
+        # 吞掉报错就只剩一句「修复失败」，等于没说
+        print("  ✗ 续期失败，acme.sh 原文如下：")
+        print("    " + ((r.stdout or "") + (r.stderr or "")).strip().replace("\n", "\n    ")[-1200:])
+        print("  常见原因：80 端口被占（standalone 验证要用）、域名没解析到本机、出网被墙。")
+        return
     G["domain"] = dom
     sh(f"{acme} --install-cert -d {dom} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
