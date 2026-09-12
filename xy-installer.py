@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.91"
+SCRIPT_VERSION = "1.0.92"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -6289,11 +6289,12 @@ def del_protocols_flow(st, have_sb, have_xr):
         print(f"{RED}  ⚠ sing-box 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
     if not left_xr and have_xr:
         print(f"{RED}  ⚠ xray 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
-    print("  订阅地址:      不变（客户端重拉一次订阅，被删的节点就消失了）")
-    print("  协议本身:      随时能从『1 只添加新协议』再装回来")
-    print(f"{RED}  ⚠ 但装回来是【全新节点】：端口/UUID/密码/密钥全部重新生成，"
-          f"旧的分享链接永久失效{OFF}")
-    print(f"{RED}    客户端里手动选中过被删节点的，记得改回自动分组{OFF}")
+    # 三格式订阅删完会自动重生成、订阅地址也不换，客户端刷一下就行，不用红字吓人。
+    # 分组里万一手动选中过被删的节点，客户端自己会退回该组第一项（模板里第一项就是
+    # 自动/随机组），也不用人工干预。真正回不来的只有旧的那条分享链接。
+    print("  订阅地址:      不变，三格式配置会自动重新生成（客户端刷新一下即可）")
+    print("  协议本身:      随时能从『1 只添加新协议』再装回来，"
+          "但会是全新端口/UUID 的新节点，旧的单条分享链接作废")
     print("-" * 60)
     if (_ask("确认删除? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
         print("  已取消。")
