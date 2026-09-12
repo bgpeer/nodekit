@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.3"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5756,6 +5756,78 @@ def _acme_hook_ok(dom):
     except OSError:
         return False
 
+def acme_hijackers(keep=""):
+    """acme.sh 里【除了 keep 之外】还有哪些域名也把证书装到 /etc/ssl/sb/acme.crt。
+
+       为什么这是个坑：acme.sh 的 --install-cert 会把「装到哪个文件、装完跑什么」
+       存进该域名自己的记录里，往后每次自动续期都照着做。换过域名的机器上，旧域名
+       那条记录【没人删】——它的 cron 续期照跑，续完就把节点正在用的证书覆盖成旧域名
+       那张，还顺手按存着的 reloadcmd 重启了核心。
+       表现：某天半夜所有吃证书的节点集体「连不上」，reality 照常，而你什么都没做。
+       泛解析（*.域名）在的话，旧域名照样验证得过，所以它能一直成功地捣乱。
+
+       返回 [(域名, 记录文件)]。"""
+    base = os.path.expanduser("~/.acme.sh")
+    out = []
+    if not os.path.isdir(base):
+        return out
+    for d in sorted(os.listdir(base)):
+        conf = os.path.join(base, d, d.replace("_ecc", "") + ".conf")
+        if not os.path.exists(conf):
+            continue
+        dom = d[:-4] if d.endswith("_ecc") else d
+        if keep and dom == keep:
+            continue
+        try:
+            txt = open(conf).read()
+        except OSError:
+            continue
+        if re.search(r"^Le_RealCertPath=['\"]?" + re.escape(ACME_CRT), txt, re.M):
+            out.append((dom, conf))
+    return out
+
+def acme_records():
+    """acme.sh 里有哪些域名记录 → [{domain, dir, conf, path, secs, status, removable}]。
+
+       status 是「这张还有没有用」的判断，按危害从大到小排：
+         抢占中   装到节点证书路径、但不是节点域名 —— 续期时会把节点的证书覆盖掉
+         节点在用 / Emby 在用 / 其它服务在用   有主，不许删
+         没人用   装到的文件已经不存在，或压根没配过安装路径 —— 留着只是占地方
+    """
+    base = os.path.expanduser("~/.acme.sh")
+    nd, emby = node_domain(), _emby_cert()[0]
+    out = []
+    if not os.path.isdir(base):
+        return out
+    for d in sorted(os.listdir(base)):
+        dom = d[:-4] if d.endswith("_ecc") else d
+        conf = os.path.join(base, d, dom + ".conf")
+        if not os.path.exists(conf):
+            continue
+        try:
+            txt = open(conf).read()
+        except OSError:
+            continue
+        m = re.search(r"^Le_RealCertPath=['\"]?([^'\"\n]*)", txt, re.M)
+        path = (m.group(1) if m else "").strip()
+        bare = dom[2:] if dom.startswith("*.") else dom
+        # 判「是不是节点那张」不能把星号去掉再比：*.a.com 并【不】覆盖 a.com 本身，
+        # 这种记录多半是 Emby 的（它服务的是 <子域>.a.com）。用真正的覆盖判定。
+        if nd and _name_covers([dom], nd):
+            status, removable = "节点在用", False
+        elif emby and (bare == emby or _name_covers([dom], "x." + emby)):
+            status, removable = "Emby 在用", False
+        elif path and os.path.abspath(path) == os.path.abspath(ACME_CRT):
+            status, removable = "抢占中", True
+        elif path and os.path.exists(path):
+            status, removable = "别处在用", False
+        else:
+            status, removable = "没人用", True
+        out.append({"domain": dom, "dir": os.path.join(base, d), "conf": conf,
+                    "path": path, "secs": _cert_secs_left(os.path.join(base, d, "fullchain.cer")),
+                    "status": status, "removable": removable})
+    return out
+
 def _acme_cron_ok():
     """acme.sh 的每日续期任务在不在 crontab 里。"""
     return "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or "")
@@ -5783,6 +5855,13 @@ def _emby_shared(dom):
     p = _emby_crt(dom)
     return os.path.islink(p) and os.path.realpath(p) == os.path.realpath(ACME_CRT)
 
+def node_domain():
+    """节点当前对外用的域名（客户端连的就是它）。没有域名（自签+IP）返回 ''。"""
+    try:
+        return (json.load(open(STATE_FILE)).get("domain") or "").strip()
+    except Exception:
+        return ""
+
 def cert_info():
     """把证书的方方面面查出来，给面板用。纯读，不改任何东西。"""
     meta = cert_meta()
@@ -5791,6 +5870,7 @@ def cert_info():
     secs = _cert_secs_left()
     emby_dom, emby_secs = _emby_cert()
     names = names or []
+    nd = node_domain()
     # Emby 对外是 <子域>.<域名>（见 media-stack 的 server_name），所以判断「节点证书能不能
     # 顶替它」要拿一个子域去试，不能拿裸域——裸域证书盖不住任何子域名。
     emby_covered = bool(emby_dom) and _name_covers(names, "x." + emby_dom)
@@ -5809,6 +5889,11 @@ def cert_info():
         "emby_secs": emby_secs,
         "emby_covered": emby_covered,
         "emby_shared": bool(emby_dom) and _emby_shared(emby_dom),
+        # 节点域名盖没盖住：这是证书的底线。盖不住 = 客户端一律
+        # 「tls: bad certificate」，而 reality 照常通——最像「随机几个节点坏了」的一种故障。
+        "node_domain": nd,
+        "node_covered": (not nd) or _name_covers(names, nd),
+        "hijackers": [d for d, _c in acme_hijackers(keep=nd or dom)],
         "selfsigned": os.path.exists(CERT) and not os.path.exists(ACME_CRT),
     }
 
@@ -5851,8 +5936,19 @@ def cert_panel(info=None):
         print(f"    {R}✗ acme.sh 没记 reloadcmd —— 就算重签了，节点/订阅也不会重读新证书{N}")
     if not i["key_ok"]:
         print(f"    {R}✗ 私钥和证书对不上 —— 握手会直接失败{N}")
+    if not i["node_covered"]:
+        print(f"    {R}✗ 这张证书盖不住节点正在用的域名 {i['node_domain']}！{N}")
+        print(f"    {R}  所有吃证书的节点都会被客户端拒绝（tls: bad certificate），"
+              f"只有 reality 还通。{N}")
+        print(f"    {R}  点『2 强制重签』重签回 {i['node_domain']} 即可。{N}")
     if i["names"]:
         print(f"  覆盖域名:  {', '.join(i['names'])}")
+    if i["hijackers"]:
+        print(f"    {R}✗ acme.sh 里还有 {', '.join(i['hijackers'])} 也装到同一个文件！{N}")
+        print(f"    {R}  多半是换域名前留下的旧记录。它每次自动续期都会把这张证书覆盖成"
+              f"它自己那张，{N}")
+        print(f"    {R}  半夜发作、你什么都没做——吃证书的节点集体挂掉，reality 照常。{N}")
+        print(f"    {R}  点『2 强制重签』会顺手把它们撤掉。{N}")
     users = [n for n, ok in (("sing-box", os.path.exists(SB_BIN)),
                              ("xray", os.path.exists(XRAY_BIN)),
                              ("订阅服务", ACME_CRT in _sub_service_text()),
@@ -6045,10 +6141,17 @@ def cert_want_names(dom, wildcard, emby_dom=""):
     """这次要签哪些名字。
 
        带上 Emby 的子域是为了一张顶两张：Emby 对外是 <子域>.<它的域名>，
-       所以得有 *.<它的域名>；它跟节点同域时这条跟 *.dom 是同一个，自然去重。"""
+       所以得有 *.<它的域名>；它跟节点同域时这条跟 *.dom 是同一个，自然去重。
+
+       【一定】把节点正在用的域名也带上：这张证书是全机共用的，签一张不含它的
+       证书装上去，等于把所有吃证书的节点一起打死。已经被新名字的泛域名盖住了
+       就不用重复列。"""
     names = [dom] + ([f"*.{dom}"] if wildcard else [])
     if wildcard and emby_dom:
         names += [emby_dom, f"*.{emby_dom}"]
+    nd = node_domain()
+    if nd and not _name_covers(names, nd):
+        names.append(nd)
     return list(dict.fromkeys(names))
 
 def cert_install_apply(dom, wildcard, cf_token, names=None):
@@ -6119,6 +6222,21 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard):
     """把验过的新证书换上去，顺带记 reloadcmd、补续期任务、让吃证书的服务重读。
        换的过程带备份：任一步失败就把旧的放回去并重启回来。"""
     G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
+    # 最后一道闸：这张证书是全机共用的地基，节点正在用的域名【一定】要盖得住。
+    # 只校验「盖不盖得住你刚才输的域名」是不够的——输错一个字符（llj 打成 ly），
+    # 新证书对它自己完全合法，装上去却让所有吃证书的节点被客户端当场拒绝
+    # （tls: bad certificate），而 reality 照常通，看起来就像「随机几个节点坏了」。
+    nd = node_domain()
+    if nd and not _name_covers(cert_names(tmpc), nd):
+        for p in (tmpc, tmpk):
+            try: os.remove(p)
+            except OSError: pass
+        print(f"{R}  ✗ 新证书盖不住节点正在用的域名 {nd}"
+              f"（它覆盖的是 {', '.join(cert_names(tmpc)) or '(读不出)'}）。{N}")
+        print(f"{R}    装上去会让所有吃证书的节点被客户端拒绝，已丢弃，"
+              f"现有证书一个字节没动。{N}")
+        print(f"    域名是不是打错了？节点在用的是 {nd}。")
+        return
     bak = {}
     for src, dst in ((tmpc, ACME_CRT), (tmpk, ACME_KEY)):
         if os.path.exists(dst):
@@ -6272,6 +6390,95 @@ def emby_unshare(dom):
     print(f"{GRN}  ✓ 已还原：Emby 用回自己那张证书。{N}")
     print(f"    注意它在 acme.sh 里的续期记录已经撤了，到期前记得去『16 自建 Emby』重签。")
 
+_ACME_STATUS_COLOR = {"抢占中": "\033[1;31m", "没人用": "\033[1;33m",
+                      "节点在用": "\033[1;32m", "Emby 在用": "\033[1;32m",
+                      "别处在用": "\033[1;36m"}
+
+def cert_clean_flow():
+    """菜单 15 → 4：清理 acme.sh 里没用的旧证书记录。
+
+       为什么值得有：acme.sh 是「登记了就一直续」的，换域名、换用途之后旧记录
+       没人删。轻则占地方，重则抢占——它存着的安装路径还指着节点的证书文件，
+       每次续期都会把节点正在用的那张覆盖掉（半夜发作，最难查）。"""
+    R, Y, G_, N = "\033[1;31m", "\033[1;33m", "\033[1;32m", "\033[0m"
+    recs = acme_records()
+    if not recs:
+        print("\n  acme.sh 里没有任何域名记录。")
+        _ask("  按回车返回...")
+        return
+    print("\n" + "=" * 60)
+    print("  acme.sh 里的证书记录")
+    print("=" * 60)
+    for n, r in enumerate(recs, 1):
+        c = _ACME_STATUS_COLOR.get(r["status"], "")
+        print(f"  {n:>2}. {_pad(r['domain'], 26)}{c}{r['status']}{N}"
+              f"   {_cert_left_text(r['secs'])}")
+        if r["path"]:
+            print(f"      装到 {r['path']}")
+    print("-" * 60)
+    print(f"  {G_}节点在用 / Emby 在用 / 别处在用{N} = 有主，不列入可删")
+    print(f"  {R}抢占中{N} = 装到节点的证书文件、却不是节点域名 —— "
+          f"它每次续期都会把节点的证书覆盖掉，强烈建议删")
+    print(f"  {Y}没人用{N} = 装到的文件已经不在、或压根没配过安装路径")
+    can = [r for r in recs if r["removable"]]
+    if not can:
+        print(f"\n  {G_}没有需要清理的，都是有主的。{N}")
+        _ask("  按回车返回...")
+        return
+    print(f"\n  可删的：{', '.join(r['domain'] for r in can)}")
+    print("  删除 = 让 acme.sh 不再自动续它（--remove）。磁盘上的证书文件默认保留，")
+    print("        下一步会单独问要不要一并删掉。")
+    print("-" * 60)
+    raw = _ask("选哪些（逗号分隔编号，0/all=全部可删的，回车=取消）: ").strip()
+    if not raw:
+        print("  已取消。")
+        return
+    if raw == "0" or raw.lower() == "all":
+        picked = can
+    else:
+        picked = []
+        for tok in raw.replace("，", ",").split(","):
+            tok = tok.strip()
+            if tok.isdigit() and 1 <= int(tok) <= len(recs):
+                r = recs[int(tok) - 1]
+                if not r["removable"]:
+                    print(f"  ⚠ 跳过 {r['domain']}：{r['status']}，不能删。")
+                    continue
+                picked.append(r)
+            elif tok:
+                print(f"  ⚠ 忽略无效项: {tok}")
+    if not picked:
+        print("  没选中任何可删的，返回。")
+        return
+    print(f"\n  将撤销自动续期：{', '.join(r['domain'] for r in picked)}")
+    purge = (_ask("  连磁盘上的证书文件也一起删掉? y 删 / 回车=只停续期、文件保留: ")
+             or "").strip().lower() in ("y", "yes")
+    print(f"  文件：{'一并删除' if purge else '保留（以后想恢复还找得回来）'}")
+    if (_ask("确认? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print(f"{R}  ✗ 找不到 acme.sh，无法撤销。{N}")
+        return
+    for r in picked:
+        sh(f"{acme} --remove -d '{r['domain']}' --ecc", check=False)
+        sh(f"{acme} --remove -d '{r['domain']}'", check=False)
+        msg = f"  ✓ {r['domain']}：已停止自动续期"
+        if purge:
+            try:
+                shutil.rmtree(r["dir"])
+                msg += "，证书文件已删除"
+            except OSError as e:
+                msg += f"（文件删除失败：{e}）"
+        print(msg)
+    left = [x["domain"] for x in acme_records() if x["removable"]]
+    print(f"\n  剩下的可删项：{', '.join(left) if left else '无'}")
+    if any(r["status"] == "抢占中" for r in picked):
+        print(f"  {Y}刚删掉的里面有『抢占中』的——建议现在点『2 强制重签』，"
+              f"把节点的证书重签回来。{N}")
+    _ask("  按回车返回...")
+
 def cert_menu():
     """菜单 15：证书管理。"""
     while True:
@@ -6282,6 +6489,9 @@ def cert_menu():
             print("  3 Emby 共用本证书  " +
                   ("当前：已共用（选它可还原成两张）" if i["emby_shared"] else
                    "当前：各用各的（两张证书、两条续期链）"))
+        _can = [r for r in acme_records() if r["removable"]]
+        print("  4 清理旧证书    " +
+              (f"\033[1;33m有 {len(_can)} 个没用/抢占的记录\033[0m" if _can else "都是有主的"))
         print("  0 返回")
         c = (_ask("选择（回车=0 返回）: ") or "0").strip()
         if c == "0" or c == "":
@@ -6292,6 +6502,8 @@ def cert_menu():
             cert_fix()
         elif c == "3" and i["emby_domain"]:
             emby_unshare(i["emby_domain"]) if i["emby_shared"] else emby_share_flow(i)
+        elif c == "4":
+            cert_clean_flow()
         else:
             print("  无效选择。")
 
@@ -6353,6 +6565,21 @@ def cert_fix_run():
         hooks = (" --pre-hook 'systemctl stop nginx' "
                  "--post-hook 'systemctl start nginx'")
         print("  80 端口被 nginx 占着 → 续期时自动停一下 nginx（约 10 秒），完事自动起回来")
+    # 抢占者必须在重签【之前】撤掉：留着它，这次重签出来的证书过几个小时就又被它盖回去，
+    # 而且那时你已经不在看了。撤掉只是让 acme.sh 不再跟踪，磁盘上的证书文件一个不删。
+    hij = acme_hijackers(keep=dom)
+    if hij:
+        R, N = "\033[1;31m", "\033[0m"
+        print(f"{R}  ⚠ 发现 {len(hij)} 个旧域名也在往 {ACME_CRT} 装证书：{N}")
+        for d, _c in hij:
+            print(f"{R}      {d}{N}")
+        print("    这是换域名时留下的记录，它每次自动续期都会把节点的证书覆盖掉。")
+        print("    正在撤掉它们的续期跟踪（证书文件不删，只是不再自动续）…")
+        for d, _c in hij:
+            sh(f"{acme} --remove -d {d} --ecc", check=False)
+            sh(f"{acme} --remove -d {d}", check=False)
+        left = acme_hijackers(keep=dom)
+        print(f"    {'✓ 已全部撤掉' if not left else R + '✗ 仍剩 ' + ', '.join(d for d, _ in left) + N}")
     print("  正在续期…（走 acme.sh，可能要十几秒）")
     # 用 --issue --force 而不是 --renew：--renew 会沿用记录里那套（可能已经失效的）
     # 验证方式，--issue 则把这次用的方式写回记录，往后自动续期就跟着走对的路。
