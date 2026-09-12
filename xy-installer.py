@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.1.2"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5756,6 +5756,36 @@ def _acme_hook_ok(dom):
     except OSError:
         return False
 
+def acme_hijackers(keep=""):
+    """acme.sh 里【除了 keep 之外】还有哪些域名也把证书装到 /etc/ssl/sb/acme.crt。
+
+       为什么这是个坑：acme.sh 的 --install-cert 会把「装到哪个文件、装完跑什么」
+       存进该域名自己的记录里，往后每次自动续期都照着做。换过域名的机器上，旧域名
+       那条记录【没人删】——它的 cron 续期照跑，续完就把节点正在用的证书覆盖成旧域名
+       那张，还顺手按存着的 reloadcmd 重启了核心。
+       表现：某天半夜所有吃证书的节点集体「连不上」，reality 照常，而你什么都没做。
+       泛解析（*.域名）在的话，旧域名照样验证得过，所以它能一直成功地捣乱。
+
+       返回 [(域名, 记录文件)]。"""
+    base = os.path.expanduser("~/.acme.sh")
+    out = []
+    if not os.path.isdir(base):
+        return out
+    for d in sorted(os.listdir(base)):
+        conf = os.path.join(base, d, d.replace("_ecc", "") + ".conf")
+        if not os.path.exists(conf):
+            continue
+        dom = d[:-4] if d.endswith("_ecc") else d
+        if keep and dom == keep:
+            continue
+        try:
+            txt = open(conf).read()
+        except OSError:
+            continue
+        if re.search(r"^Le_RealCertPath=['\"]?" + re.escape(ACME_CRT), txt, re.M):
+            out.append((dom, conf))
+    return out
+
 def _acme_cron_ok():
     """acme.sh 的每日续期任务在不在 crontab 里。"""
     return "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or "")
@@ -5821,6 +5851,7 @@ def cert_info():
         # 「tls: bad certificate」，而 reality 照常通——最像「随机几个节点坏了」的一种故障。
         "node_domain": nd,
         "node_covered": (not nd) or _name_covers(names, nd),
+        "hijackers": [d for d, _c in acme_hijackers(keep=nd or dom)],
         "selfsigned": os.path.exists(CERT) and not os.path.exists(ACME_CRT),
     }
 
@@ -5870,6 +5901,12 @@ def cert_panel(info=None):
         print(f"    {R}  点『2 强制重签』重签回 {i['node_domain']} 即可。{N}")
     if i["names"]:
         print(f"  覆盖域名:  {', '.join(i['names'])}")
+    if i["hijackers"]:
+        print(f"    {R}✗ acme.sh 里还有 {', '.join(i['hijackers'])} 也装到同一个文件！{N}")
+        print(f"    {R}  多半是换域名前留下的旧记录。它每次自动续期都会把这张证书覆盖成"
+              f"它自己那张，{N}")
+        print(f"    {R}  半夜发作、你什么都没做——吃证书的节点集体挂掉，reality 照常。{N}")
+        print(f"    {R}  点『2 强制重签』会顺手把它们撤掉。{N}")
     users = [n for n, ok in (("sing-box", os.path.exists(SB_BIN)),
                              ("xray", os.path.exists(XRAY_BIN)),
                              ("订阅服务", ACME_CRT in _sub_service_text()),
@@ -6392,6 +6429,21 @@ def cert_fix_run():
         hooks = (" --pre-hook 'systemctl stop nginx' "
                  "--post-hook 'systemctl start nginx'")
         print("  80 端口被 nginx 占着 → 续期时自动停一下 nginx（约 10 秒），完事自动起回来")
+    # 抢占者必须在重签【之前】撤掉：留着它，这次重签出来的证书过几个小时就又被它盖回去，
+    # 而且那时你已经不在看了。撤掉只是让 acme.sh 不再跟踪，磁盘上的证书文件一个不删。
+    hij = acme_hijackers(keep=dom)
+    if hij:
+        R, N = "\033[1;31m", "\033[0m"
+        print(f"{R}  ⚠ 发现 {len(hij)} 个旧域名也在往 {ACME_CRT} 装证书：{N}")
+        for d, _c in hij:
+            print(f"{R}      {d}{N}")
+        print("    这是换域名时留下的记录，它每次自动续期都会把节点的证书覆盖掉。")
+        print("    正在撤掉它们的续期跟踪（证书文件不删，只是不再自动续）…")
+        for d, _c in hij:
+            sh(f"{acme} --remove -d {d} --ecc", check=False)
+            sh(f"{acme} --remove -d {d}", check=False)
+        left = acme_hijackers(keep=dom)
+        print(f"    {'✓ 已全部撤掉' if not left else R + '✗ 仍剩 ' + ', '.join(d for d, _ in left) + N}")
     print("  正在续期…（走 acme.sh，可能要十几秒）")
     # 用 --issue --force 而不是 --renew：--renew 会沿用记录里那套（可能已经失效的）
     # 验证方式，--issue 则把这次用的方式写回记录，往后自动续期就跟着走对的路。
