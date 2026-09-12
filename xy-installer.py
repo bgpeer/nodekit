@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.86"
+SCRIPT_VERSION = "1.0.87"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -2990,7 +2990,7 @@ def run(sb_names, xr_names):
         json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"],
                    "prefix": G.get("prefix", ""), "hy2_ports": G.get("hy2_ports", ""),
                    "nginx": G.get("nginx", ""), "reality443": G.get("reality443", ""),
-                   "sni_split": G.get("sni_split", ""),
+                   "sni_split": G.get("sni_split", ""), "smux": G.get("smux", ""),
                    "sb": sb_names, "xray": xr_names},
                   open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
@@ -5755,6 +5755,27 @@ def add_protocols_flow(st, have_sb, have_xr):
         print("  没有可增量添加的协议，返回。")
         return
 
+    # 首装时是【按选中的协议】决定问不问那几项的：没装 hy2 就没问过跳跃范围，
+    # 没装 reality 也可能没认真挑过借用目标。这次新选了它们，就得补问一遍——
+    # 不问等于替用户默默做主，hy2 尤其糟：不问会直接按默认段去配 iptables DNAT。
+    if any(n.startswith("reality-") for n in pick_sb + pick_xr):
+        ans = _ask(f"\n  reality 借用目标 SNI（回车沿用上次的 {G['sni']}）: ").strip()
+        if ans:
+            G["sni"] = ans
+        precheck_sni(pick_sb, pick_xr)                  # 连通性预检，只警告不阻断
+    if "hy2" in pick_sb:
+        cur = (G.get("hy2_ports") or "").strip()
+        tip = f"回车沿用上次的 {cur}" if cur else f"回车=默认 {HY2_PORTS}"
+        G["hy2_ports"] = _ask(f"  hy2 端口跳跃范围 起-止（{tip}，输 n 不用跳跃）: ").strip() or cur
+        if hy2_hop_on():
+            print(f"  ⚠ 跳跃段 {hy2_range()} 的 \033[1mUDP 整段\033[0m 要在云厂商防火墙里放行，"
+                  f"否则跳到的端口连不上（GCE/阿里云这类默认只放行你列过的端口）。")
+    if _WS_FAMILY & set(pick_sb):
+        cur = G.get("smux", "")
+        ans = _ask(f"  ws 类开启 smux 多路复用?（{'回车沿用上次的开启' if cur else '回车=不开'}，"
+                   f"y 开 / n 不开）: ").strip().lower()
+        G["smux"] = "1" if ans in ("y", "yes") else ("" if ans in ("n", "no") else cur)
+
     # 新 reality 一律走随机端口：443 已经有主的话抢不得；没有主的话绑 443 还要动
     # nginx/证书布局，那是重装该干的事。
     if any(n in REALITY_443_PRIORITY for n in pick_sb + pick_xr) and not st.get("reality443"):
@@ -5765,6 +5786,12 @@ def add_protocols_flow(st, have_sb, have_xr):
         print("  新增 sing-box:", ", ".join(pick_sb))
     if pick_xr:
         print("  新增 xray:    ", ", ".join(pick_xr))
+    if any(n.startswith("reality-") for n in pick_sb + pick_xr):
+        print("  借用 SNI:    ", G["sni"])
+    if "hy2" in pick_sb:
+        print("  hy2 跳跃:    ", hy2_range() or "关闭（固定单端口）")
+    if _WS_FAMILY & set(pick_sb):
+        print("  ws 多路复用: ", "开启 smux" if G.get("smux") else "不开")
     print("  现有节点:    ", f"sing-box {len(have_sb)} 个 / xray {len(have_xr)} 个（保持不动）")
     print("  订阅地址:    ", "不变（客户端重拉一次订阅即多出新节点）")
     print("-" * 60)
@@ -5853,7 +5880,8 @@ def add_protocols_flow(st, have_sb, have_xr):
     except Exception as e:
         print("  ⚠ 订阅刷新失败（节点已装好，可到配置菜单点『更新配置』重试）:", e)
 
-    st.update({"sb": have_sb, "xray": have_xr})
+    st.update({"sb": have_sb, "xray": have_xr, "sni": G["sni"],
+               "hy2_ports": G.get("hy2_ports", ""), "smux": G.get("smux", "")})
     try:
         json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
