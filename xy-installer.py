@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5783,6 +5783,13 @@ def _emby_shared(dom):
     p = _emby_crt(dom)
     return os.path.islink(p) and os.path.realpath(p) == os.path.realpath(ACME_CRT)
 
+def node_domain():
+    """节点当前对外用的域名（客户端连的就是它）。没有域名（自签+IP）返回 ''。"""
+    try:
+        return (json.load(open(STATE_FILE)).get("domain") or "").strip()
+    except Exception:
+        return ""
+
 def cert_info():
     """把证书的方方面面查出来，给面板用。纯读，不改任何东西。"""
     meta = cert_meta()
@@ -5791,6 +5798,7 @@ def cert_info():
     secs = _cert_secs_left()
     emby_dom, emby_secs = _emby_cert()
     names = names or []
+    nd = node_domain()
     # Emby 对外是 <子域>.<域名>（见 media-stack 的 server_name），所以判断「节点证书能不能
     # 顶替它」要拿一个子域去试，不能拿裸域——裸域证书盖不住任何子域名。
     emby_covered = bool(emby_dom) and _name_covers(names, "x." + emby_dom)
@@ -5809,6 +5817,10 @@ def cert_info():
         "emby_secs": emby_secs,
         "emby_covered": emby_covered,
         "emby_shared": bool(emby_dom) and _emby_shared(emby_dom),
+        # 节点域名盖没盖住：这是证书的底线。盖不住 = 客户端一律
+        # 「tls: bad certificate」，而 reality 照常通——最像「随机几个节点坏了」的一种故障。
+        "node_domain": nd,
+        "node_covered": (not nd) or _name_covers(names, nd),
         "selfsigned": os.path.exists(CERT) and not os.path.exists(ACME_CRT),
     }
 
@@ -5851,6 +5863,11 @@ def cert_panel(info=None):
         print(f"    {R}✗ acme.sh 没记 reloadcmd —— 就算重签了，节点/订阅也不会重读新证书{N}")
     if not i["key_ok"]:
         print(f"    {R}✗ 私钥和证书对不上 —— 握手会直接失败{N}")
+    if not i["node_covered"]:
+        print(f"    {R}✗ 这张证书盖不住节点正在用的域名 {i['node_domain']}！{N}")
+        print(f"    {R}  所有吃证书的节点都会被客户端拒绝（tls: bad certificate），"
+              f"只有 reality 还通。{N}")
+        print(f"    {R}  点『2 强制重签』重签回 {i['node_domain']} 即可。{N}")
     if i["names"]:
         print(f"  覆盖域名:  {', '.join(i['names'])}")
     users = [n for n, ok in (("sing-box", os.path.exists(SB_BIN)),
@@ -6045,10 +6062,17 @@ def cert_want_names(dom, wildcard, emby_dom=""):
     """这次要签哪些名字。
 
        带上 Emby 的子域是为了一张顶两张：Emby 对外是 <子域>.<它的域名>，
-       所以得有 *.<它的域名>；它跟节点同域时这条跟 *.dom 是同一个，自然去重。"""
+       所以得有 *.<它的域名>；它跟节点同域时这条跟 *.dom 是同一个，自然去重。
+
+       【一定】把节点正在用的域名也带上：这张证书是全机共用的，签一张不含它的
+       证书装上去，等于把所有吃证书的节点一起打死。已经被新名字的泛域名盖住了
+       就不用重复列。"""
     names = [dom] + ([f"*.{dom}"] if wildcard else [])
     if wildcard and emby_dom:
         names += [emby_dom, f"*.{emby_dom}"]
+    nd = node_domain()
+    if nd and not _name_covers(names, nd):
+        names.append(nd)
     return list(dict.fromkeys(names))
 
 def cert_install_apply(dom, wildcard, cf_token, names=None):
@@ -6119,6 +6143,21 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard):
     """把验过的新证书换上去，顺带记 reloadcmd、补续期任务、让吃证书的服务重读。
        换的过程带备份：任一步失败就把旧的放回去并重启回来。"""
     G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
+    # 最后一道闸：这张证书是全机共用的地基，节点正在用的域名【一定】要盖得住。
+    # 只校验「盖不盖得住你刚才输的域名」是不够的——输错一个字符（llj 打成 ly），
+    # 新证书对它自己完全合法，装上去却让所有吃证书的节点被客户端当场拒绝
+    # （tls: bad certificate），而 reality 照常通，看起来就像「随机几个节点坏了」。
+    nd = node_domain()
+    if nd and not _name_covers(cert_names(tmpc), nd):
+        for p in (tmpc, tmpk):
+            try: os.remove(p)
+            except OSError: pass
+        print(f"{R}  ✗ 新证书盖不住节点正在用的域名 {nd}"
+              f"（它覆盖的是 {', '.join(cert_names(tmpc)) or '(读不出)'}）。{N}")
+        print(f"{R}    装上去会让所有吃证书的节点被客户端拒绝，已丢弃，"
+              f"现有证书一个字节没动。{N}")
+        print(f"    域名是不是打错了？节点在用的是 {nd}。")
+        return
     bak = {}
     for src, dst in ((tmpc, ACME_CRT), (tmpk, ACME_KEY)):
         if os.path.exists(dst):
