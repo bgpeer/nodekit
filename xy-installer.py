@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.98"
+SCRIPT_VERSION = "1.0.99"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5761,8 +5761,10 @@ def _acme_cron_ok():
     return "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or "")
 
 def _emby_cert():
-    """Emby 那张证书（自建 Emby 用的是 /etc/nginx/certs/<域名>.crt）→ (域名, 剩余秒)。
-       没装 Emby 或没配域名返回 ('', None)。"""
+    """Emby 那张证书 → (基础域名, 剩余秒)。没装 Emby 或没配域名返回 ('', None)。
+
+       Emby 自己签的是泛域名 *.<域名>，装在 /etc/nginx/certs/<域名>.crt，
+       它的 nginx 是 server_name <子域>.<域名>（emby./mw. 等好几个子域）。"""
     for envf in ("/opt/emby-stack/.env", "/opt/media-stack/.env"):
         try:
             m = re.search(r"^DOMAIN=(.*)$", open(envf).read(), re.M)
@@ -5770,8 +5772,16 @@ def _emby_cert():
             continue
         dom = (m.group(1).strip().strip('"\'') if m else "")
         if dom:
-            return dom, _cert_secs_left(f"/etc/nginx/certs/{dom}.crt")
+            return dom, _cert_secs_left(_emby_crt(dom))
     return "", None
+
+def _emby_crt(dom):  return f"/etc/nginx/certs/{dom}.crt"
+def _emby_key(dom):  return f"/etc/nginx/certs/{dom}.key"
+
+def _emby_shared(dom):
+    """Emby 的证书路径是不是已经指到节点这张上了（软链）。"""
+    p = _emby_crt(dom)
+    return os.path.islink(p) and os.path.realpath(p) == os.path.realpath(ACME_CRT)
 
 def cert_info():
     """把证书的方方面面查出来，给面板用。纯读，不改任何东西。"""
@@ -5780,6 +5790,10 @@ def cert_info():
     names = cert_names()
     secs = _cert_secs_left()
     emby_dom, emby_secs = _emby_cert()
+    names = names or []
+    # Emby 对外是 <子域>.<域名>（见 media-stack 的 server_name），所以判断「节点证书能不能
+    # 顶替它」要拿一个子域去试，不能拿裸域——裸域证书盖不住任何子域名。
+    emby_covered = bool(emby_dom) and _name_covers(names, "x." + emby_dom)
     return {
         "domain": dom,
         "wildcard": any(n.startswith("*.") for n in names),
@@ -5793,6 +5807,8 @@ def cert_info():
         "hook_ok": _acme_hook_ok(dom) if dom else False,
         "emby_domain": emby_dom,
         "emby_secs": emby_secs,
+        "emby_covered": emby_covered,
+        "emby_shared": bool(emby_dom) and _emby_shared(emby_dom),
         "selfsigned": os.path.exists(CERT) and not os.path.exists(ACME_CRT),
     }
 
@@ -5846,10 +5862,9 @@ def cert_panel(info=None):
         print(f"  正在使用:  {', '.join(users)}")
     if i["emby_domain"]:
         ec = _left_color(i["emby_secs"])
-        same = i["emby_domain"] in (i["names"] or []) or (
-            i["wildcard"] and i["emby_domain"].endswith("." + i["domain"]))
-        print(f"  Emby 证书: {i['emby_domain']}   {ec}{_cert_left_text(i['emby_secs'])}{N}"
-              + (f"   {C}已被本证书覆盖{N}" if same else "   （另一张，独立续期）"))
+        print(f"  Emby 证书: *.{i['emby_domain']}   {ec}{_cert_left_text(i['emby_secs'])}{N}"
+              + (f"   {C}与节点共用一张{N}" if i["emby_shared"] else
+                 (f"   {C}本证书已能顶替它{N}" if i["emby_covered"] else "   （另一张，独立续期）")))
     print("-" * 60)
     return i
 
@@ -6064,20 +6079,140 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard):
     if not _installed_state()[1] and not _installed_state()[2]:
         print("    还没装节点：去『1 节点安装』，向导会认出这张证书直接用，不再重复申请。")
 
+def emby_share_flow(i):
+    """菜单 15 → 3：让 Emby 跟节点共用同一张证书。
+
+       为什么值得做：两张证书签的是同一个域名家族、各自 90 天、各自续期，
+       等于把「证书过期全挂」这个风险配了两份，而且续期链断掉的那份不会有人发现
+       （Emby 平时不看、真挂了才知道）。合并成一张之后，节点这张的 reloadcmd
+       本来就会 reload nginx，Emby 跟着一起吃到新证书。"""
+    Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
+    dom = i["emby_domain"]
+    if not dom:
+        print("\n  本机没装自建 Emby（或它没配域名），不涉及。")
+        _ask("  按回车返回...")
+        return
+    if i["emby_shared"]:
+        print(f"\n  {GRN}已经是共用的了{N}：/etc/nginx/certs/{dom}.crt → {ACME_CRT}")
+        print("  节点这张续期时会顺带 reload nginx，Emby 跟着吃到新证书。")
+        _ask("  按回车返回...")
+        return
+    if not i["emby_covered"]:
+        print(f"\n{Y}  当前这张证书顶替不了 Emby。{N}")
+        print(f"    Emby 对外是 <子域>.{dom}（emby./mw. 等好几个），要泛域名 *.{dom} 才盖得住；")
+        print(f"    而本机这张覆盖的是：{', '.join(i['names']) or '(读不出)'}")
+        print(f"    先去『1 安装证书』用 DNS-01 重签一张 *.{dom} 的，再回来合并。")
+        _ask("  按回车返回...")
+        return
+    print("\n" + "-" * 60)
+    print(f"  把 Emby 的证书指到节点这张上（两张变一张）")
+    print(f"  Emby 现在用:  {_emby_crt(dom)}   {_cert_left_text(i['emby_secs'])}")
+    print(f"  改成指向:     {ACME_CRT}   {_cert_left_text(i['secs'])}")
+    print(f"  做法:         把 crt/key 换成指向节点证书的软链（Emby 的 nginx 配置一个字不动，")
+    print(f"                以后重跑 Emby 安装也不会把它改回去）")
+    print(f"  顺带:         让 acme.sh 别再单独续 *.{dom} 那张（避免它续完把软链覆盖掉）")
+    print(f"                原证书文件会备份成 .bak，acme.sh 里的记录只是不再跟踪，不删文件")
+    print(f"  以后:         节点这张续期时本来就会 reload nginx，Emby 自动吃到新证书")
+    print("-" * 60)
+    if (_ask("确认合并? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    emby_share_apply(dom)
+
+def emby_share_apply(dom):
+    """真动手：备份 → 换成软链 → nginx -t → reload；不过就整个还原。"""
+    R, GRN, N = "\033[1;31m", "\033[1;32m", "\033[0m"
+    pairs = [(_emby_crt(dom), ACME_CRT), (_emby_key(dom), ACME_KEY)]
+    for tgt, _src in pairs:
+        if not os.path.exists(os.path.dirname(tgt)):
+            print(f"{R}  ✗ 找不到 {os.path.dirname(tgt)}，Emby 好像没装完，已放弃。{N}")
+            return
+    baks = []
+    try:
+        for tgt, src in pairs:
+            if os.path.lexists(tgt):
+                bak = tgt + ".bak"
+                if os.path.islink(tgt):
+                    os.remove(tgt)
+                else:
+                    shutil.move(tgt, bak)
+                    baks.append((bak, tgt))
+            os.symlink(src, tgt)
+        chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+        if chk.returncode:
+            raise RuntimeError((chk.stderr or chk.stdout).strip()[-400:])
+        sh("systemctl reload nginx", check=False)
+    except Exception as e:
+        for tgt, _src in pairs:                       # 先把软链摘掉
+            if os.path.islink(tgt):
+                os.remove(tgt)
+        for bak, tgt in baks:                         # 再把原文件放回去
+            shutil.move(bak, tgt)
+        sh("systemctl reload nginx", check=False)
+        print(f"{R}  ✗ 合并失败，已还原成原来那张并 reload 回去：{e}{N}")
+        return
+    # acme.sh 每天的 cron 会把 *.dom 那张续期并重新 install-cert，那一步会把软链
+    # 覆盖成实体文件，悄无声息地退回两张。--remove 只是让它别再跟踪，不删任何文件。
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if os.path.exists(acme):
+        sh(f"{acme} --remove -d '*.{dom}' --ecc", check=False)
+        print(f"  已让 acme.sh 不再单独续 *.{dom}（证书文件还在，只是不跟踪了）")
+    else:
+        # 这一步跳过不影响「现在能不能用」，但少了它，acme.sh 的每日 cron 续期
+        # *.dom 时会 install-cert 把软链覆盖成实体文件，悄无声息退回两张证书。
+        print(f"{R}  ⚠ 没找到 acme.sh，没能撤掉 *.{dom} 的单独续期记录。{N}")
+        print(f"    它下次自动续期会把软链覆盖掉、退回两张证书（不影响使用，"
+              f"只是又变回两条续期链）。手工撤：acme.sh --remove -d '*.{dom}' --ecc")
+    save_cert_meta(emby_shared=True, emby_domain=dom)
+    for bak, _t in baks:
+        print(f"  原证书已备份：{bak}")
+    print(f"\n{GRN}  ✓ 合并完成{N}：Emby 和节点现在共用 {ACME_CRT}")
+    print(f"    {_cert_left_text(_cert_secs_left())}；续期时 reload nginx，Emby 自动跟上。")
+
+def emby_unshare(dom):
+    """把软链摘掉、还原成 Emby 自己那张（.bak 还在就放回去）。"""
+    R, GRN, N = "\033[1;31m", "\033[1;32m", "\033[0m"
+    done = False
+    for tgt in (_emby_crt(dom), _emby_key(dom)):
+        if os.path.islink(tgt):
+            os.remove(tgt)
+            done = True
+        if os.path.exists(tgt + ".bak") and not os.path.exists(tgt):
+            shutil.move(tgt + ".bak", tgt)
+    if not done:
+        print("  本来就不是共用的，没动。")
+        return
+    save_cert_meta(emby_shared=False)
+    chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+    if chk.returncode:
+        print(f"{R}  ⚠ 还原后 nginx -t 不过（多半是备份的旧证书已过期）：{N}")
+        print("   " + (chk.stderr or chk.stdout).strip()[-300:])
+        print(f"   去『16 自建 Emby』重新签一张它自己的证书即可。")
+        return
+    sh("systemctl reload nginx", check=False)
+    print(f"{GRN}  ✓ 已还原：Emby 用回自己那张证书。{N}")
+    print(f"    注意它在 acme.sh 里的续期记录已经撤了，到期前记得去『16 自建 Emby』重签。")
+
 def cert_menu():
     """菜单 15：证书管理。"""
     while True:
         i = cert_panel()
         print(f"  1 安装证书      当前：{'已安装' if i['exists'] else '未安装'}")
         print("  2 强制重签      重新签一张并让所有服务重读（到期前后、或怀疑证书坏了时用）")
+        if i["emby_domain"]:
+            print("  3 Emby 共用本证书  " +
+                  ("当前：已共用（选它可还原成两张）" if i["emby_shared"] else
+                   "当前：各用各的（两张证书、两条续期链）"))
         print("  0 返回")
-        c = (_ask("选择 [1/2/0]（回车=0 返回）: ") or "0").strip()
+        c = (_ask("选择（回车=0 返回）: ") or "0").strip()
         if c == "0" or c == "":
             return
         if c == "1":
             cert_install_flow(i)
         elif c == "2":
             cert_fix()
+        elif c == "3" and i["emby_domain"]:
+            emby_unshare(i["emby_domain"]) if i["emby_shared"] else emby_share_flow(i)
         else:
             print("  无效选择。")
 
@@ -6363,7 +6498,7 @@ def main_menu():
         print("  12. 网络优化（BBR/QoS 内核调优）")
         print("  13. 自建DNS（AdGuard Home·全设备去广告）")
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
-        print("  15. 证书管理（查看状态 / 安装证书 / 强制重签·节点和 Emby 都吃它）")
+        print("  15. 证书管理（状态 / 安装 / 重签）")
         print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
         print("  18. 更新脚本（不影响节点）")
