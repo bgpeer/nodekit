@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.1.3"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5786,6 +5786,48 @@ def acme_hijackers(keep=""):
             out.append((dom, conf))
     return out
 
+def acme_records():
+    """acme.sh 里有哪些域名记录 → [{domain, dir, conf, path, secs, status, removable}]。
+
+       status 是「这张还有没有用」的判断，按危害从大到小排：
+         抢占中   装到节点证书路径、但不是节点域名 —— 续期时会把节点的证书覆盖掉
+         节点在用 / Emby 在用 / 其它服务在用   有主，不许删
+         没人用   装到的文件已经不存在，或压根没配过安装路径 —— 留着只是占地方
+    """
+    base = os.path.expanduser("~/.acme.sh")
+    nd, emby = node_domain(), _emby_cert()[0]
+    out = []
+    if not os.path.isdir(base):
+        return out
+    for d in sorted(os.listdir(base)):
+        dom = d[:-4] if d.endswith("_ecc") else d
+        conf = os.path.join(base, d, dom + ".conf")
+        if not os.path.exists(conf):
+            continue
+        try:
+            txt = open(conf).read()
+        except OSError:
+            continue
+        m = re.search(r"^Le_RealCertPath=['\"]?([^'\"\n]*)", txt, re.M)
+        path = (m.group(1) if m else "").strip()
+        bare = dom[2:] if dom.startswith("*.") else dom
+        # 判「是不是节点那张」不能把星号去掉再比：*.a.com 并【不】覆盖 a.com 本身，
+        # 这种记录多半是 Emby 的（它服务的是 <子域>.a.com）。用真正的覆盖判定。
+        if nd and _name_covers([dom], nd):
+            status, removable = "节点在用", False
+        elif emby and (bare == emby or _name_covers([dom], "x." + emby)):
+            status, removable = "Emby 在用", False
+        elif path and os.path.abspath(path) == os.path.abspath(ACME_CRT):
+            status, removable = "抢占中", True
+        elif path and os.path.exists(path):
+            status, removable = "别处在用", False
+        else:
+            status, removable = "没人用", True
+        out.append({"domain": dom, "dir": os.path.join(base, d), "conf": conf,
+                    "path": path, "secs": _cert_secs_left(os.path.join(base, d, "fullchain.cer")),
+                    "status": status, "removable": removable})
+    return out
+
 def _acme_cron_ok():
     """acme.sh 的每日续期任务在不在 crontab 里。"""
     return "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or "")
@@ -6348,6 +6390,95 @@ def emby_unshare(dom):
     print(f"{GRN}  ✓ 已还原：Emby 用回自己那张证书。{N}")
     print(f"    注意它在 acme.sh 里的续期记录已经撤了，到期前记得去『16 自建 Emby』重签。")
 
+_ACME_STATUS_COLOR = {"抢占中": "\033[1;31m", "没人用": "\033[1;33m",
+                      "节点在用": "\033[1;32m", "Emby 在用": "\033[1;32m",
+                      "别处在用": "\033[1;36m"}
+
+def cert_clean_flow():
+    """菜单 15 → 4：清理 acme.sh 里没用的旧证书记录。
+
+       为什么值得有：acme.sh 是「登记了就一直续」的，换域名、换用途之后旧记录
+       没人删。轻则占地方，重则抢占——它存着的安装路径还指着节点的证书文件，
+       每次续期都会把节点正在用的那张覆盖掉（半夜发作，最难查）。"""
+    R, Y, G_, N = "\033[1;31m", "\033[1;33m", "\033[1;32m", "\033[0m"
+    recs = acme_records()
+    if not recs:
+        print("\n  acme.sh 里没有任何域名记录。")
+        _ask("  按回车返回...")
+        return
+    print("\n" + "=" * 60)
+    print("  acme.sh 里的证书记录")
+    print("=" * 60)
+    for n, r in enumerate(recs, 1):
+        c = _ACME_STATUS_COLOR.get(r["status"], "")
+        print(f"  {n:>2}. {_pad(r['domain'], 26)}{c}{r['status']}{N}"
+              f"   {_cert_left_text(r['secs'])}")
+        if r["path"]:
+            print(f"      装到 {r['path']}")
+    print("-" * 60)
+    print(f"  {G_}节点在用 / Emby 在用 / 别处在用{N} = 有主，不列入可删")
+    print(f"  {R}抢占中{N} = 装到节点的证书文件、却不是节点域名 —— "
+          f"它每次续期都会把节点的证书覆盖掉，强烈建议删")
+    print(f"  {Y}没人用{N} = 装到的文件已经不在、或压根没配过安装路径")
+    can = [r for r in recs if r["removable"]]
+    if not can:
+        print(f"\n  {G_}没有需要清理的，都是有主的。{N}")
+        _ask("  按回车返回...")
+        return
+    print(f"\n  可删的：{', '.join(r['domain'] for r in can)}")
+    print("  删除 = 让 acme.sh 不再自动续它（--remove）。磁盘上的证书文件默认保留，")
+    print("        下一步会单独问要不要一并删掉。")
+    print("-" * 60)
+    raw = _ask("选哪些（逗号分隔编号，0/all=全部可删的，回车=取消）: ").strip()
+    if not raw:
+        print("  已取消。")
+        return
+    if raw == "0" or raw.lower() == "all":
+        picked = can
+    else:
+        picked = []
+        for tok in raw.replace("，", ",").split(","):
+            tok = tok.strip()
+            if tok.isdigit() and 1 <= int(tok) <= len(recs):
+                r = recs[int(tok) - 1]
+                if not r["removable"]:
+                    print(f"  ⚠ 跳过 {r['domain']}：{r['status']}，不能删。")
+                    continue
+                picked.append(r)
+            elif tok:
+                print(f"  ⚠ 忽略无效项: {tok}")
+    if not picked:
+        print("  没选中任何可删的，返回。")
+        return
+    print(f"\n  将撤销自动续期：{', '.join(r['domain'] for r in picked)}")
+    purge = (_ask("  连磁盘上的证书文件也一起删掉? y 删 / 回车=只停续期、文件保留: ")
+             or "").strip().lower() in ("y", "yes")
+    print(f"  文件：{'一并删除' if purge else '保留（以后想恢复还找得回来）'}")
+    if (_ask("确认? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print(f"{R}  ✗ 找不到 acme.sh，无法撤销。{N}")
+        return
+    for r in picked:
+        sh(f"{acme} --remove -d '{r['domain']}' --ecc", check=False)
+        sh(f"{acme} --remove -d '{r['domain']}'", check=False)
+        msg = f"  ✓ {r['domain']}：已停止自动续期"
+        if purge:
+            try:
+                shutil.rmtree(r["dir"])
+                msg += "，证书文件已删除"
+            except OSError as e:
+                msg += f"（文件删除失败：{e}）"
+        print(msg)
+    left = [x["domain"] for x in acme_records() if x["removable"]]
+    print(f"\n  剩下的可删项：{', '.join(left) if left else '无'}")
+    if any(r["status"] == "抢占中" for r in picked):
+        print(f"  {Y}刚删掉的里面有『抢占中』的——建议现在点『2 强制重签』，"
+              f"把节点的证书重签回来。{N}")
+    _ask("  按回车返回...")
+
 def cert_menu():
     """菜单 15：证书管理。"""
     while True:
@@ -6358,6 +6489,9 @@ def cert_menu():
             print("  3 Emby 共用本证书  " +
                   ("当前：已共用（选它可还原成两张）" if i["emby_shared"] else
                    "当前：各用各的（两张证书、两条续期链）"))
+        _can = [r for r in acme_records() if r["removable"]]
+        print("  4 清理旧证书    " +
+              (f"\033[1;33m有 {len(_can)} 个没用/抢占的记录\033[0m" if _can else "都是有主的"))
         print("  0 返回")
         c = (_ask("选择（回车=0 返回）: ") or "0").strip()
         if c == "0" or c == "":
@@ -6368,6 +6502,8 @@ def cert_menu():
             cert_fix()
         elif c == "3" and i["emby_domain"]:
             emby_unshare(i["emby_domain"]) if i["emby_shared"] else emby_share_flow(i)
+        elif c == "4":
+            cert_clean_flow()
         else:
             print("  无效选择。")
 
