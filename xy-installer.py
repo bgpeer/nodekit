@@ -6317,9 +6317,10 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
             os.remove(backup)
         new_links += add_lks
         if core == "sb":
-            have_sb = have_sb + picks
+            # 去重：残留协议本来就还挂在记录里（配置里没有而已），直接相加会写进去两遍
+            have_sb = list(dict.fromkeys(have_sb + picks))
         else:
-            have_xr = have_xr + picks
+            have_xr = list(dict.fromkeys(have_xr + picks))
 
     if not new_links:
         print("  没有新增任何节点。")
@@ -6329,9 +6330,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     links, tail = _node_file_parts()
     # 先摘掉这几个协议的旧链接：正常情况下压根没有（协议没装过），但残留场景下会有
     # 一条早就连不上的。不摘就会在订阅里留下两个同名节点，客户端只能挨个去试。
-    fresh_sb = [n for n in pick_sb]
-    fresh_xr = [n for n in pick_xr]
-    stale_links = [u for u in links if _link_hits(u, fresh_sb, fresh_xr)]
+    stale_links = [u for u in links if _link_hits(u, pick_sb, pick_xr)]
     if stale_links:
         print(f"  顺手摘掉 {len(stale_links)} 条同协议的旧链接（残留的死节点）")
         links = [u for u in links if u not in stale_links]
