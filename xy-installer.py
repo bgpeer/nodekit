@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.96"
+SCRIPT_VERSION = "1.0.97"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -6256,6 +6256,11 @@ def add_protocols_flow(st, have_sb, have_xr):
 
 def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     """真正执行增量添加（非交互）。由后台那半程调用，见 _node_op_dispatch / node_op_run。"""
+    # 先记下这次要装的里面哪些是【残留】（记录里有、配置里没有）——只有它们在订阅里
+    # 留着一条早就连不上的旧链接，待会儿要摘掉。必须在建新入站【之前】算，建完就分不出来了。
+    _ssb, _sxr = _stale_protos(have_sb, have_xr)
+    redo_sb = [n for n in pick_sb if n in _ssb]
+    redo_xr = [n for n in pick_xr if n in _sxr]
     ensure_deps()
     _USED_PORTS.clear()
     _USED_PORTS.update(_ports_in_cfgs())        # 避开现有节点的端口
@@ -6264,7 +6269,10 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     # 同名协议（两核心都有）加小上标区分：跟已装的一起算，免得新旧重名
     dup = (set(have_sb) | set(pick_sb)) & (set(have_xr) | set(pick_xr))
 
-    new_links = []
+    # 同删除：一个核心失败【不能】把另一个核心已经装好的节点丢在半路——那样节点在
+    # 服务器上跑着、订阅里却没有，客户端永远看不到它，而且毫无报错。失败只 break，
+    # 下面照样把已经装好的那部分写进链接、刷订阅、记进 state。
+    new_links, failed = [], []
     for core, picks in (("sb", pick_sb), ("xray", pick_xr)):
         if not picks:
             continue
@@ -6302,8 +6310,9 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
             if backup:
                 shutil.copyfile(backup, path)
                 os.remove(backup)
-            print(f"\n  ✗ {name} 配置校验失败，已回滚，现有节点未受影响：\n{msg}")
-            return
+            print(f"\n  ✗ {name} 配置校验失败，已回滚，{name} 下面选的协议一个没加：\n{msg}")
+            failed.append(name)
+            break
         try:
             sh(f"systemctl restart {name}")
         except Exception as e:
@@ -6311,8 +6320,9 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
                 shutil.copyfile(backup, path)
                 os.remove(backup)
                 sh(f"systemctl restart {name}", check=False)
-            print(f"\n  ✗ {name} 重启失败，已回滚：{e}")
-            return
+            print(f"\n  ✗ {name} 重启失败，已回滚，{name} 下面选的协议一个没加：{e}")
+            failed.append(name)
+            break
         if backup:
             os.remove(backup)
         new_links += add_lks
@@ -6328,9 +6338,10 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
 
     # 追加链接 + 刷新订阅（不换 token：客户端里那条订阅地址继续有效）
     links, tail = _node_file_parts()
-    # 先摘掉这几个协议的旧链接：正常情况下压根没有（协议没装过），但残留场景下会有
-    # 一条早就连不上的。不摘就会在订阅里留下两个同名节点，客户端只能挨个去试。
-    stale_links = [u for u in links if _link_hits(u, pick_sb, pick_xr)]
+    # 摘掉残留协议那条早就连不上的旧链接。【只认残留的】：老链接没有 ¹² 尾标时分不出
+    # 属于哪个核心，按协议名一刀切会误伤——sb 早装着 reality-vision、这次往 xray 加同名
+    # 协议，sb 那条好端端的链接就会被当成旧链接摘掉，节点凭空少一个。
+    stale_links = [u for u in links if _link_hits(u, redo_sb, redo_xr)]
     if stale_links:
         print(f"  顺手摘掉 {len(stale_links)} 条同协议的旧链接（残留的死节点）")
         links = [u for u in links if u not in stale_links]
@@ -6353,6 +6364,9 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
 
     print("\n" + "=" * 60)
     print(f"  已添加 {len(new_links)} 个节点（现有节点未做任何改动）")
+    if failed:
+        print(f"\033[1;31m  ⚠ {'、'.join(failed)} 那边失败了、已回滚，它下面选的协议一个没加。"
+              f"上面这些已经装好并写进订阅了，修好后再单独加那几个即可。\033[0m")
     print("=" * 60)
     print("\n".join(new_links))
     print("\n订阅地址没变，客户端重拉一次订阅即可看到新节点"
@@ -6508,10 +6522,14 @@ def del_protocols_flow(st, have_sb, have_xr):
 def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
     """真正执行删除（非交互）。由后台那半程调用，见 _node_op_dispatch / node_op_run。"""
     RED, OFF = "\033[1;31m", "\033[0m"
-    teardowns = _proto_fns("teardown", del_sb, del_xr)
-    left_sb = [n for n in have_sb if n not in del_sb]
+    left_sb = [n for n in have_sb if n not in del_sb]    # 循环里只用来判断「这个核心删空了没」
     left_xr = [n for n in have_xr if n not in del_xr]
-    removed, stale = [], []          # removed: 这轮真摘掉的入站；stale: 配置里本来就没有的
+    # 两个核心是分别处理的，其中一个失败【不能】把另一个已经做完的事丢在半路：
+    # 那样入站删了、订阅和记录却没跟着改，正是最难收拾的「删了一半」。失败只 break
+    # 出循环，下面的收尾照跑，但一律按【真正处理掉的】那部分算，不按用户当初勾的清单。
+    removed, stale = [], []          # removed: 真摘掉的入站；stale: 配置里本来就没有的
+    done = {"sb": [], "xray": []}    # 每个核心真正处理掉的协议
+    failed = []
     for core, dels, left in (("sb", del_sb, left_sb), ("xray", del_xr, left_xr)):
         if not dels:
             continue
@@ -6520,6 +6538,7 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
         if cfg is None:
             print(f"  {name}: 读不到配置文件（核心没装或文件坏了），只清记录和订阅。")
             stale += dels
+            done[core] += dels
             continue
         keep = [ib for ib in ibs if _ib_proto(ib) not in dels]
         gone = [ib for ib in ibs if _ib_proto(ib) in dels]
@@ -6529,6 +6548,7 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
             print(f"  {name}: 该协议的入站配置里已经没有了，"
                   f"这次清理订阅和安装记录里剩下的部分。")
             stale += dels
+            done[core] += dels
             continue
         cfg["inbounds"] = keep
         backup = path + ".bak"
@@ -6542,8 +6562,9 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
             if backup:
                 shutil.copyfile(backup, path)
                 os.remove(backup)
-            print(f"\n  ✗ {name} 配置校验失败，已回滚，什么都没删：\n{msg}")
-            return
+            print(f"\n  ✗ {name} 配置校验失败，已回滚，{name} 下面选的协议一个没删：\n{msg}")
+            failed.append(name)
+            break
         try:
             if keep:
                 sh(f"systemctl restart {name}")
@@ -6557,12 +6578,20 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
                 shutil.copyfile(backup, path)
                 os.remove(backup)
                 sh(f"systemctl restart {name}", check=False)
-            print(f"\n  ✗ {name} 重启失败，已回滚：{e}")
-            return
+            print(f"\n  ✗ {name} 重启失败，已回滚，{name} 下面选的协议一个没删：{e}")
+            failed.append(name)
+            break
         if backup:
             os.remove(backup)
+        done[core] += dels
         removed += [ib.get("tag", "?") for ib in gone]
 
+    # 往下一律用【真正处理掉的】那部分：清哪些副作用、摘哪些链接、记录里剩下什么，
+    # 都必须跟服务器上的实际情况对齐，不能拿用户当初勾选的清单去算。
+    ok_sb, ok_xr = done["sb"], done["xray"]
+    teardowns = _proto_fns("teardown", ok_sb, ok_xr)
+    left_sb = [n for n in have_sb if n not in ok_sb]
+    left_xr = [n for n in have_xr if n not in ok_xr]
     if not removed and not stale:
         print("  没有删掉任何入站。")
         return
@@ -6580,7 +6609,7 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
 
     # 摘掉对应的分享链接（CDN 节点的协议段是 CDN·xxx，天然不会命中，不受影响）
     links, tail = _node_file_parts()
-    kept = [u for u in links if not _link_hits(u, del_sb, del_xr)]
+    kept = [u for u in links if not _link_hits(u, ok_sb, ok_xr)]
     dropped = len(links) - len(kept)
     with open(NODE_FILE, "w") as f:
         f.write("\n".join(kept) + ("\n" if kept else ""))
@@ -6605,6 +6634,9 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
     if stale:
         print(f"  （其中 {', '.join(dict.fromkeys(stale))} 的入站配置里本来就没有，"
               f"这次清掉的是订阅和记录）")
+    if failed:
+        print(f"{RED}  ⚠ {'、'.join(failed)} 那边失败了、已回滚，它下面选的协议一个没删。"
+              f"其余部分已按上面的结果收尾完毕，修好后再来一次即可。{OFF}")
     print("=" * 60)
     for t in removed:
         print("   -", t)
