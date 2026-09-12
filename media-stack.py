@@ -8211,6 +8211,15 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 面前。而且失败的多半是当时线路在抖，隔几分钟再试往往就成了。
 # 所以「5」把它扔后台：一轮一轮走，中间隔 HEAL_RETRY_MIN 分钟，直到没有待探的、
 # 或者用满 HEAL_BG_BUDGET。
+# 【探不出来的要放弃，不能无限重试】轮转游标只保证"不把名额占死"，不保证"别再探"。
+# 当库里绝大多数条目都探不出音视频轨时（网盘上是残缺文件、Emby 不认的格式、上游按
+# UA/频率挡探测），轮转就等于把全库无限循环探下去 —— 每次都要从网盘拉一段文件头，
+# 而结果永远是同一个失败。现场实测：2727 个条目里 2697 个（98%）缺音视频轨，
+# 28 天探了 93868 次、单个条目最多探 135 次、跨 7 天，一次都没成功，白烧 30 GB/天。
+# 所以记一个持久的失败计数：连续失败到这个次数就不再提供给 heal。
+HEAL_GIVEUP = 3          # 连续探失败几次就放弃
+HEAL_GIVEUP_DAYS = 30    # 放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
+HEAL_FAIL_MAX = 40000    # 失败表最多记这么多条，超了丢掉最老的，别把状态文件撑爆
 HEAL_RETRY_MIN = 3       # 后台两轮之间隔几分钟。太密会撞网盘限流，反而更难成
 HEAL_BG_BUDGET = 1800    # 后台整体封顶（秒）。用满收工，剩下的交给每小时那轮
 HEAL_BG_MAX    = 200     # 后台一次最多探几个条目 —— 拉文件头是要走流量的
@@ -8307,6 +8316,42 @@ def set_heal_pace(throttled):
     return new
 
 
+def heal_fail_table():
+    """{条目id: [连续失败次数, 上次失败时间戳]}。读不出返回空表。"""
+    t = ms_state().get("heal_fail")
+    return t if isinstance(t, dict) else {}
+
+def heal_given_up(tab, iid, now=None):
+    """这个条目是不是已经放弃了（失败够多次、且还没到再试的日子）。"""
+    v = tab.get(str(iid))
+    if not isinstance(v, list) or len(v) < 2:
+        return False
+    cnt, ts = v[0], v[1]
+    if cnt < HEAL_GIVEUP:
+        return False
+    return (now or time.time()) - ts < HEAL_GIVEUP_DAYS * 86400
+
+def heal_fail_record(results):
+    """把这一轮的结果记进失败表。results: [(条目id, 成不成功)]。
+
+       成功就把记录抹掉（下次真坏了还能重新计数）；失败就累加并记下时间。
+       表满了先丢最老的 —— 丢掉只是让它下次还有机会被探，不会弄坏任何东西。"""
+    if not results:
+        return
+    tab = heal_fail_table()
+    now = int(time.time())
+    for iid, good in results:
+        k = str(iid)
+        if good:
+            tab.pop(k, None)
+        else:
+            cnt = tab.get(k, [0, 0])[0] if isinstance(tab.get(k), list) else 0
+            tab[k] = [cnt + 1, now]
+    if len(tab) > HEAL_FAIL_MAX:
+        for k, _v in sorted(tab.items(), key=lambda kv: kv[1][1])[:len(tab) - HEAL_FAIL_MAX]:
+            tab.pop(k, None)
+    save_ms_state(heal_fail=tab)
+
 def heal_media_info(d, key, budget=None):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
@@ -8329,6 +8374,16 @@ def heal_media_info(d, key, budget=None):
     探测。媒体信息已经在它的数据库里，跟 strm 里写什么再无关系。
     """
     allpend = items_without_duration(key)
+    if not allpend:
+        return
+    # 【放弃过的不再探】见 HEAL_GIVEUP 那段：探不出来的无限重试就是白烧流量。
+    # 只在 heal 这里滤掉，体检那边照旧报真实待探数 —— 那是给人看的诊断，不该被藏起来。
+    _tab, _now = heal_fail_table(), time.time()
+    _keep = [x for x in allpend if not heal_given_up(_tab, x[1], _now)]
+    if len(_keep) < len(allpend):
+        print(f"  {DIM}跳过 {len(allpend) - len(_keep)} 个探了 {HEAL_GIVEUP} 次仍没音视频轨"
+              f"的条目（{HEAL_GIVEUP_DAYS} 天后自动再试）{RST}")
+    allpend = _keep
     if not allpend:
         return
     # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
@@ -8533,6 +8588,10 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
     这时候还往外发，只会把它按得更久。
     """
     done = hit = 0
+    # 本轮每个条目的成败，轮末一次性落盘。只记【条目自己的】成败：
+    # throttle 是上游在限流、skip 是本地没这个文件，都不是"这个条目探不出来"的证据，
+    # 拿它们去累加失败次数会把好条目误判成放弃。
+    fails = []
     total = len(pend)
     lim = budget or HEAL_BUDGET
     stop = threading.Event()
@@ -8560,6 +8619,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
                     idx = n
                 if res == "ok":
                     done += 1
+                    fails.append((_it[1], True))
                     print(f"  {GREEN}\u2714{RST} {pad(str(idx) + '/' + str(total), 9)}"
                           f"{name[:26]}  {note}  {DIM}{sec:.0f}s{RST}")
                 elif res == "skip":
@@ -8576,6 +8636,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
                         break
                 else:
                     again.append(_it)
+                    fails.append((_it[1], False))
                     print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
                           f"{name[:26]}  {YELLOW}{note or 'Emby 没探出时长'}{RST}"
                           f"  {DIM}{sec:.0f}s{RST}")
@@ -8591,6 +8652,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
             stop.set()
             for f2 in futs:
                 f2.cancel()
+    heal_fail_record(fails)
     return done, hit
 
 
@@ -14675,6 +14737,14 @@ if __name__ == "__main__":
                 warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
                 print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
                       f"把那一轮停掉。{RST}")
+        elif arg == "heal-reset":         # 清空「探不出来」的放弃名单，让它们重新排队
+            require_root()
+            _n = len(heal_fail_table())
+            save_ms_state(heal_fail={})
+            ok(f"已清空放弃名单（{_n} 条），下一轮 heal 会重新探它们。")
+            print(f"  {DIM}只在你确实修好了源头之后才有意义（换了网盘、改了格式、"
+                  f"上游不再挡探测）；否则它们还会再失败 {HEAL_GIVEUP} 次被放弃一遍，"
+                  f"白烧一轮流量。{RST}")
         elif arg == "selfupdate":         # cron 调的自动更新，只换脚本
             require_root()
             if take_task_lock("selfupdate"):
