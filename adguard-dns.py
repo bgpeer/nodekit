@@ -182,6 +182,87 @@ def _doh_port():
     except (OSError, ValueError):
         return 10443
 
+# ── 共用证书的底线 ───────────────────────────────────────────────────────
+# /etc/ssl/sb/acme.crt 是【全机共用】的：节点(sing-box/xray)、订阅服务、nginx 443
+# 和 AdGuard 的 DoT 都指着它。这个文件有三个脚本会写，谁装一张盖不住节点域名的
+# 证书进去，所有吃证书的节点就会被客户端当场拒绝（tls: bad certificate），
+# 而 reality 照常通——看起来像「随机几个节点坏了」，最难往证书上想。
+#
+# 这边的 dom 来自 sub.host，节点的真相在 state.json，两者理论上一致但会漂：
+# 换过域名、手工改过、订阅还没重生成，都可能对不上。所以不能假设，得装之前验。
+
+def _node_domain():
+    """节点当前对外用的域名。以主脚本的 state.json 为准，读不到才退回 sub.host。"""
+    try:
+        import json
+        d = (json.load(open(BGP_DIR + "/state.json")).get("domain") or "").strip()
+        if d:
+            return d
+    except Exception:
+        pass
+    return _domain()
+
+def _cert_names(path):
+    """证书覆盖哪些域名（SAN 列表，含 *.x）。读不出返回 []。"""
+    if not os.path.exists(path):
+        return []
+    out = sh(f"openssl x509 -in {path} -noout -text 2>/dev/null") or ""
+    m = re.search(r"Subject Alternative Name:\s*\n\s*(.+)", out)
+    return [x.strip()[4:] for x in m.group(1).split(",") if x.strip().startswith("DNS:")] if m else []
+
+def _name_covers(names, domain):
+    """SAN 列表覆不覆盖这个域名（泛域名只顶一级，跟客户端的判定一致）。"""
+    d = (domain or "").lower().strip(".")
+    for n in [x.lower().strip(".") for x in names]:
+        if n == d:
+            return True
+        if n.startswith("*.") and d.endswith(n[1:]) and "." not in d[:-len(n[1:])]:
+            return True
+    return False
+
+def _install_cert_guarded(acme, dom, reload_hook, what=""):
+    """把证书导出到共用路径，但【导完必须还盖得住节点域名】，否则原样还原。
+
+       acme.sh 没法「先导到别处再验」——install-cert 同时也把路径记进域名记录里，
+       导到临时路径会让往后的自动续期都装到那个临时路径去。所以这里的做法是
+       先备份、导出、验、不合格就还原文件并把记录改回来。"""
+    R, G_, N = "\033[1;31m", "\033[1;32m", "\033[0m"
+    nd = _node_domain()
+    bak = {}
+    for p in (ACME_CRT, ACME_KEY):
+        if os.path.exists(p):
+            bak[p] = p + ".agh.bak"
+            shutil.copyfile(p, bak[p])
+    sh(f"{acme} --install-cert -d {dom} --ecc "
+       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+    if nd and not _name_covers(_cert_names(ACME_CRT), nd):
+        print(f"\n  {R}❌ 导出的证书盖不住节点正在用的域名 {nd}"
+              f"（它覆盖的是 {', '.join(_cert_names(ACME_CRT)) or '(读不出)'}）。{N}")
+        print(f"  {R}   装上去会让所有吃证书的节点被客户端拒绝（reality 不受影响），"
+              f"已还原成原来那张。{N}")
+        # 顺序不能反：先把 acme 记录改回节点域名（免得下次自动续期又来一遍），
+        # 【最后】才还原文件——install-cert 本身也会写这两个文件，先还原就白还原了。
+        if nd != dom:
+            sh(f"{acme} --install-cert -d {nd} --ecc "
+               f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+        for p, b in bak.items():                       # 文件还原，保证一个字节没动
+            shutil.copyfile(b, p)
+            os.remove(b)
+        if not bak:                                    # 本来就没有证书 → 别留下半张
+            for p in (ACME_CRT, ACME_KEY):
+                if os.path.exists(p):
+                    os.remove(p)
+        for svc in ("nginx", "sing-box", "xray", "xy-sub", "AdGuardHome"):
+            sh(f"systemctl restart {svc}")
+        print(f"     {'' if not what else what + '未生效。'}"
+              f"节点域名和本机 sub.host 可能对不上，"
+              f"到主面板『15 证书管理』看一眼。")
+        return False
+    for b in bak.values():
+        try: os.remove(b)
+        except OSError: pass
+    return True
+
 def _cert_wildcard_ok(dom):
     """本机 acme 证书是否覆盖 *.dom —— 这决定 DoT 能不能带 ClientID。
        DoT 的 ClientID 是塞在 SNI 第一段(tls://<ID>.域名)传过去的，证书里没有
@@ -394,8 +475,8 @@ def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
                    "systemctl restart xray 2>/dev/null; "
                    "systemctl restart xy-sub 2>/dev/null; "
                    "systemctl restart AdGuardHome 2>/dev/null; true'")
-    sh(f"{acme} --install-cert -d {dom} --ecc "
-       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+    if not _install_cert_guarded(acme, dom, reload_hook, "撤销泛域名"):
+        return
     if _cert_wildcard_ok(dom):
         print(f"  {R}❌ 证书里仍有 *.{dom}，撤销没生效。{N}"
               f"看 `openssl x509 -in {ACME_CRT} -noout -text | grep DNS:` 确认。")
@@ -509,8 +590,8 @@ def dot_clientid():
                    "systemctl restart xray 2>/dev/null; "
                    "systemctl restart xy-sub 2>/dev/null; "
                    "systemctl restart AdGuardHome 2>/dev/null; true'")
-    sh(f"{acme} --install-cert -d {dom} --ecc "
-       f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
+    if not _install_cert_guarded(acme, dom, reload_hook, "泛域名证书"):
+        return
     if not _cert_wildcard_ok(dom):
         print(f"\n  {R}❌ 证书导出后仍未覆盖 *.{dom}，没有生效。{N}原证书可能已被替换，"
               f"建议看 `openssl x509 -in {ACME_CRT} -noout -text | grep DNS:`。")
