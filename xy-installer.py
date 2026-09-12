@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.88"
+SCRIPT_VERSION = "1.0.89"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5555,7 +5555,7 @@ def main_menu():
             print(f"  \033[1;31m⚠ TLS 证书{_cert_left_text(_left)}"
                   f"——进 15 修复，否则节点和订阅会一起连不上\033[0m")
             print("-" * 60)
-        print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
+        print("  1. 节点安装（已装则可只加新协议 / 全部重装 / 删除协议）")
         print("  2. 节点链接 / 订阅")
         print("  3. 聚合节点链接（连机VPS合并多台VPS节点）")
         print("  4. 更换伪装域名（reality 借用的 SNI·带连通检测，不用重装）")
@@ -5985,6 +5985,220 @@ def add_protocols_flow(st, have_sb, have_xr):
     print("\n订阅地址没变，客户端重拉一次订阅即可看到新节点：")
     print(sub_urls_text())
 
+# ============================================================================ 删除协议
+# 删比加难：加只是往配置里塞一条，删要把【散落各处的副作用】一起收回来——
+# 端口跳跃的 iptables DNAT、nginx 前置的 location 反代、分享链接、订阅、状态记录。
+# 漏掉任何一样都不会报错，只会留下一个安静的坑：
+#   · DNAT 不删 → 整段 UDP 继续转给一个已经不存在的端口，连带劫走以后装在那段里的服务
+#   · nginx location 不删 → 443 上那条 path 反代到死端口，客户端拿到 502
+#   · 链接不删 → 订阅里留着连不上的死节点，客户端每次都去测它
+
+def _link_core_proto(u):
+    """分享链接 → (协议名, 归属核心)。两核心同名协议靠尾标区分：¹=sing-box、²=xray；
+       没有尾标说明只有一个核心装了它，核心位返回 ''。认不出返回 ('','')。"""
+    _, seg = _split_tag(_link_name(u))
+    if not seg:
+        return "", ""
+    core = "sb" if seg.endswith("¹") else ("xray" if seg.endswith("²") else "")
+    return seg.rstrip(_TAG_MARKS), core
+
+def _ib_proto(ib):
+    """inbound 的 tag → 协议名（去掉前缀和尾标）。"""
+    _, seg = _split_tag(ib.get("tag", ""))
+    return (seg or "").rstrip(_TAG_MARKS)
+
+def _rebuild_nginx_ws_from_cfg():
+    """从现有 sing-box 配置还原 nginx 前置的 ws 反代表。
+       前置模式下 ws 家族监听 127.0.0.1 且带 transport.path，据此能完整重建。"""
+    NGINX_WS.clear()
+    for ib in _load_core_cfg("sb")[1]:
+        if ib.get("listen") != "127.0.0.1":
+            continue
+        path, port = (ib.get("transport") or {}).get("path"), _cfg_port(ib)
+        if path and port:
+            NGINX_WS.append({"path": path, "port": port})
+    return list(NGINX_WS)
+
+def _drop_hy2_dnat():
+    """删掉端口跳跃的 DNAT 规则，返回删了几条。"""
+    n = 0
+    for ipt in ("iptables", "ip6tables"):
+        if not have(ipt):
+            continue
+        for line in (sh(f"{ipt} -t nat -S PREROUTING", check=False) or "").splitlines():
+            if line.startswith("-A") and "portHopping" in line:
+                sh(f"{ipt} -t nat " + line.replace("-A", "-D", 1), check=False)
+                n += 1
+    if n:
+        sh("netfilter-persistent save", check=False)
+    return n
+
+def del_protocols_flow(st, have_sb, have_xr):
+    """删除已装协议：只动选中的那几个，其余节点的端口/UUID/订阅地址全不变。"""
+    RED, OFF = "\033[1;31m", "\033[0m"
+    if not have_sb and not have_xr:
+        print("\n  还没装任何协议。")
+        return
+    _restore_state_to_G(st)
+    print("\n" + "=" * 60)
+    print("  删除协议")
+    print("=" * 60)
+    if have_sb:
+        print("  已装 sing-box:", ", ".join(have_sb))
+    if have_xr:
+        print("  已装 xray:    ", ", ".join(have_xr))
+    print("-" * 60)
+    print("  1. 选择删除")
+    print("  2. 全部删除")
+    print("  0. 返回")
+    c = (_ask("选择 [1/2/0]（回车=0 返回）: ") or "0").strip()
+    if c == "0":
+        return
+    if c == "2":
+        del_sb, del_xr = list(have_sb), list(have_xr)
+    elif c == "1":
+        del_sb = _pick("【sing-box 删哪些】", have_sb, default=[]) if have_sb else []
+        del_xr = _pick("【xray 删哪些】", have_xr, default=[]) if have_xr else []
+    else:
+        print("  无效选择，返回。")
+        return
+    if not del_sb and not del_xr:
+        print("  没选任何协议，返回。")
+        return
+
+    # sni-split 下 nginx 是 stream 分流 + 本地 https server 两层，443 的走向依赖具体后端；
+    # 删了它的后端再去重建这套结构，出错就是整个 443 崩掉。挡住，让走重装。
+    if G.get("sni_split") and (set(del_sb) & (_WS_FAMILY | {"reality-vision"})):
+        print(f"{RED}  ✗ 本机开着 nginx SNI 分流，443 的走向依赖这些协议做后端。{OFF}")
+        print("    删它们要重建整套 nginx 结构，增量模式不碰。请走『全部重新安装』。")
+        return
+
+    nginx_ws_touched = _nginx_front() and (set(del_sb) & _WS_FAMILY)
+    hy2_touched = "hy2" in del_sb
+    left_sb = [n for n in have_sb if n not in del_sb]
+    left_xr = [n for n in have_xr if n not in del_xr]
+
+    print("\n" + "-" * 60)
+    if del_sb:
+        print("  删除 sing-box:", ", ".join(del_sb))
+    if del_xr:
+        print("  删除 xray:    ", ", ".join(del_xr))
+    print("  删除后剩下:   ", f"sing-box {len(left_sb)} 个 / xray {len(left_xr)} 个")
+    if hy2_touched:
+        print("  连带清理:      端口跳跃的 iptables DNAT 规则")
+    if nginx_ws_touched:
+        print("  连带清理:      nginx 443 上对应的 location 反代")
+    if not left_sb:
+        print(f"{RED}  ⚠ sing-box 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
+    if not left_xr and have_xr:
+        print(f"{RED}  ⚠ xray 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
+    print("  订阅地址:      不变（客户端重拉一次订阅，被删的节点就消失了）")
+    print(f"{RED}  ⚠ 删掉的节点无法恢复，客户端里手动选中过它的要改回分组{OFF}")
+    print("-" * 60)
+    if (_ask("确认删除? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+
+    removed = []
+    for core, dels, left in (("sb", del_sb, left_sb), ("xray", del_xr, left_xr)):
+        if not dels:
+            continue
+        name, binpath, path, _tbl, _mk = _CORE_META[core]
+        cfg, ibs = _load_core_cfg(core)
+        if cfg is None:
+            continue
+        keep = [ib for ib in ibs if _ib_proto(ib) not in dels]
+        gone = [ib for ib in ibs if _ib_proto(ib) in dels]
+        if not gone:
+            print(f"  {name}: 配置里没找到要删的入站，跳过。")
+            continue
+        cfg["inbounds"] = keep
+        backup = path + ".bak"
+        try:
+            shutil.copyfile(path, backup)
+        except OSError:
+            backup = ""
+        json.dump(cfg, open(path, "w"), indent=2)
+        ok, msg = core_check(binpath, path)
+        if not ok:                                   # 删出来的配置都过不了校验 → 原样退回
+            if backup:
+                shutil.copyfile(backup, path)
+                os.remove(backup)
+            print(f"\n  ✗ {name} 配置校验失败，已回滚，什么都没删：\n{msg}")
+            return
+        try:
+            if keep:
+                sh(f"systemctl restart {name}")
+            else:
+                # 没有入站的核心留着只会空转（甚至起不来反复重启），停掉更干净；
+                # 以后再装协议时 write_service 会重新 enable，不用手动恢复。
+                sh(f"systemctl disable --now {name}", check=False)
+                print(f"  {name} 已无入站 → 服务已停止并禁用开机自启")
+        except Exception as e:
+            if backup:
+                shutil.copyfile(backup, path)
+                os.remove(backup)
+                sh(f"systemctl restart {name}", check=False)
+            print(f"\n  ✗ {name} 重启失败，已回滚：{e}")
+            return
+        if backup:
+            os.remove(backup)
+        removed += [ib.get("tag", "?") for ib in gone]
+
+    if not removed:
+        print("  没有删掉任何入站。")
+        return
+
+    if hy2_touched:
+        n = _drop_hy2_dnat()
+        print(f"  已清掉 {n} 条端口跳跃 DNAT 规则" if n else "  没有残留的端口跳跃 DNAT 规则")
+    if nginx_ws_touched:
+        try:
+            ws = _rebuild_nginx_ws_from_cfg()
+            write_nginx_conf()
+            print(f"  nginx 反代表已按剩下的 {len(ws)} 个 ws 节点重写")
+        except Exception as e:
+            print(f"{RED}  ⚠ nginx 重写失败，443 上可能留着指向死端口的 location：{e}{OFF}")
+
+    # 摘掉对应的分享链接（CDN 节点的协议段是 CDN·xxx，天然不会命中，不受影响）
+    targets = {("sb", p) for p in del_sb} | {("xray", p) for p in del_xr}
+    def _hit(u):
+        pr, co = _link_core_proto(u)
+        if not pr:
+            return False
+        return (co, pr) in targets if co else any(pr == q for _, q in targets)
+    links, tail = _node_file_parts()
+    kept = [u for u in links if not _hit(u)]
+    dropped = len(links) - len(kept)
+    with open(NODE_FILE, "w") as f:
+        f.write("\n".join(kept) + ("\n" if kept else ""))
+        if tail:
+            f.write(tail if tail.startswith("\n") else "\n" + tail)
+    try:
+        if read_saved_links():
+            build_subscription(read_saved_links(), new_token=False)
+        else:
+            print("  已无任何节点，订阅内容为空（订阅服务和地址保留）。")
+    except Exception as e:
+        print("  ⚠ 订阅刷新失败（节点已删，可到配置菜单点『更新配置』重试）:", e)
+
+    st.update({"sb": left_sb, "xray": left_xr})
+    try:
+        json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+    print("\n" + "=" * 60)
+    print(f"  已删除 {len(removed)} 个节点，摘掉 {dropped} 条分享链接")
+    print("=" * 60)
+    for t in removed:
+        print("   -", t)
+    if left_sb or left_xr:
+        print("\n  剩下的节点端口/UUID/订阅地址全部没动，客户端重拉一次订阅即可。")
+    else:
+        print("\n  本机已无代理节点。想重新装回来：主菜单 1 → 按向导走一遍。")
+        print("  （脚本本体、订阅服务、证书、CDN 节点都还在，没有卸载任何东西）")
+
 def install_flow():
     # 已装过：先把装了什么摆出来，再让用户选「只加新的」还是「全部重来」。
     # 分这两条路是因为代价天差地别——全部重装会把每个节点的端口/UUID/密码和订阅
@@ -6003,13 +6217,18 @@ def install_flow():
         print("-" * 60)
         print("  1. 只添加新协议   老节点的端口/UUID/密码/订阅地址全部不变，推荐")
         print("  2. 全部重新安装   所有节点重新生成，订阅地址也会换，客户端要重新导入")
+        print("  3. 删除协议       只删选中的，其余节点不动（含清理 DNAT / nginx 反代）")
         print("  0. 返回")
-        # 回车默认 0：这两条都会动正在跑的节点，不该靠误按回车触发
-        ans = (_ask("选择 [1/2/0] (回车=0 返回): ") or "0").strip()
+        # 回车默认 0：这几条都会动正在跑的节点，不该靠误按回车触发
+        ans = (_ask("选择 [1/2/3/0] (回车=0 返回): ") or "0").strip()
         if ans == "0":
             print("已取消，返回主菜单。"); return
-        if ans != "2":
+        if ans == "3":
+            del_protocols_flow(st, have_sb, have_xr); return
+        if ans == "1":
             add_protocols_flow(st, have_sb, have_xr); return
+        if ans != "2":
+            print("无效选择，返回主菜单。"); return
         if (_ask("  全部重新安装会让现有客户端全部失效，确认? y 确认 / 回车取消: ")
                 or "n").strip().lower() not in ("y", "yes"):
             print("已取消，返回主菜单。"); return
