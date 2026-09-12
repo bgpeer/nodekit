@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.99"
+SCRIPT_VERSION = "1.1.0"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5871,6 +5871,9 @@ def cert_panel(info=None):
 def cert_validate(crt, key, domain):
     """新签出来的证书能不能用 → (ok, 说明)。装上去之前必须全过，一条不过就别碰现有的。
 
+       domain 可以是一个域名，也可以是一串（升级成泛域名时要同时盖住节点域名和
+       Emby 的子域），一串里【每一个】都得盖住才算过。
+
        四件事都要查，少一件就可能把一台好机器换成连不上：
          ① 文件在不在、解析得开        ② 覆盖不覆盖这个域名（含泛域名）
          ③ 是不是已经过期              ④ 私钥跟证书配不配对
@@ -5881,8 +5884,11 @@ def cert_validate(crt, key, domain):
     names = cert_names(crt)
     if not names:
         return False, "证书解析不开（文件损坏或不是证书）"
-    if not _name_covers(names, domain):
-        return False, f"这张证书覆盖的是 {', '.join(names)}，不含 {domain}"
+    need = [domain] if isinstance(domain, str) else list(domain)
+    missing = [d for d in need if not _name_covers(names, d)]
+    if missing:
+        return False, (f"这张证书覆盖的是 {', '.join(names)}，"
+                       f"盖不住 {', '.join(missing)}")
     secs = _cert_secs_left(crt)
     if secs is None:
         return False, "读不出有效期"
@@ -5912,10 +5918,7 @@ def cert_install_flow(info):
     """菜单 15 → 1 安装证书。交互问完，真动手那半程转后台（重启核心会掐断 SSH）。"""
     Y, R, N = "\033[1;33m", "\033[1;31m", "\033[0m"
     if info["exists"]:
-        print(f"\n  已经装着 {info['domain']} 的证书了（{_cert_left_text(info['secs'])}）。")
-        print("  想重新签一张：选『2 强制重签』。")
-        print("  想换成别的域名：这一步还没做，先走『1 节点安装 → 2 全部重新安装』填新域名。")
-        _ask("  按回车返回...")
+        cert_upgrade_flow(info)
         return
     dom = _ask("\n  域名（要先把 A 记录解析到本机公网 IP）: ").strip().lower().rstrip(".")
     if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
@@ -5950,12 +5953,17 @@ def cert_install_flow(info):
             print("    HTTP-01 验证要求域名指向本机，先改好解析再来。")
             return
         print(f"  ✓ 解析检查通过：{dom} → {mine}")
+    want = cert_want_names(dom, wildcard, info["emby_domain"])
     print("\n" + "-" * 60)
-    print(f"  域名:      {dom}" + ("   （泛域名 *." + dom + "）" if wildcard else ""))
-    print(f"  验证方式:  {_MODE_TEXT['dns-cf' if wildcard else 'standalone']}")
-    print(f"  签发机构:  Let's Encrypt")
-    print(f"  装到:      {ACME_CRT}")
-    print(f"  完成后:    {'、'.join(_cert_consumers()) or '(暂无服务)'} 会重读证书")
+    print(f"  要签的域名: {', '.join(want)}")
+    if wildcard and len(want) > 2:
+        print(f"              （顺带把 Emby 的 {info['emby_domain']} 签进去，一张顶两张）")
+    print(f"  验证方式:   {_MODE_TEXT['dns-cf' if wildcard else 'standalone']}")
+    print(f"  签发机构:   Let's Encrypt")
+    print(f"  装到:       {ACME_CRT}")
+    print(f"  安全网:     先签到临时文件、验过（覆盖得到每一个域名 / 没过期 / 私钥配对）")
+    print(f"              才换上去；不过就丢弃新的，现有证书一个字节不动")
+    print(f"  完成后:     {'、'.join(_cert_consumers()) or '(暂无服务)'} 重读证书")
     print(f"{Y}  ⚠ 重启这些服务会掐断代理链路，挂着本机代理连的 SSH 会断——"
           f"不用管，后台会跑完。{N}")
     print("-" * 60)
@@ -5963,8 +5971,65 @@ def cert_install_flow(info):
         print("  已取消。")
         return
     plan = {"op": "cert-install", "domain": dom, "wildcard": wildcard,
-            "cf_token": cf_token, "G": dict(G)}
-    _node_op_dispatch(plan, lambda: cert_install_apply(dom, wildcard, cf_token))
+            "cf_token": cf_token, "names": want, "G": dict(G)}
+    _node_op_dispatch(plan, lambda: cert_install_apply(dom, wildcard, cf_token, want))
+
+def cert_upgrade_flow(i):
+    """已经有证书时进『1 安装证书』：能升级成泛域名就给这条路，否则说清楚该走哪儿。
+
+       为什么单独有这一步：从单域名升到泛域名【不是重签】——验证方式要从 HTTP-01
+       换成 DNS-01，签的名字也多了 *.域名。走『2 强制重签』沿用的是记录里原来那套，
+       永远签不出泛域名。没有这条路，装了单域名证书的机器就没法让 Emby 共用。"""
+    Y, GRN, C, N = "\033[1;33m", "\033[1;32m", "\033[1;36m", "\033[0m"
+    dom = i["domain"]
+    emby = i["emby_domain"]
+    want = cert_want_names(dom, True, emby)
+    missing = [n for n in want if not _name_covers(i["names"], n)]
+    print(f"\n  已经装着 {dom} 的证书（{cert_issuer()}，{_cert_left_text(i['secs'])}）")
+    print(f"  覆盖：{', '.join(i['names']) or '(读不出)'}")
+    if not missing:
+        print(f"\n  {GRN}已经是泛域名了，该盖的都盖住了。{N}")
+        print("  想重新签一张：选『2 强制重签』。")
+        if emby and not i["emby_shared"]:
+            print(f"  {C}想让 Emby 共用这一张：选『3 Emby 共用本证书』。{N}")
+        _ask("  按回车返回...")
+        return
+    print(f"\n  可以升级成泛域名，升完会覆盖：{', '.join(want)}")
+    print(f"  现在还缺：{Y}{', '.join(missing)}{N}")
+    if emby:
+        print(f"  升级后 Emby（{emby} 的各个子域）就能跟节点共用这一张，两条续期链并成一条。")
+    print("\n  升级要用 DNS-01（Cloudflare API）验证——泛域名只能这么签，HTTP-01 签不出来。")
+    print("-" * 60)
+    print("  1 升级成泛域名（DNS-01 · Cloudflare）")
+    print("  0 返回")
+    if (_ask("选择 [1/0]（回车=0 返回）: ") or "0").strip() != "1":
+        return
+    cf_token = ""
+    if _acme_has_cf():
+        print("  ✓ acme.sh 里已经存着 Cloudflare 凭据，直接用。")
+    else:
+        print("  需要一个 Cloudflare API Token（后台 → 我的个人资料 → API 令牌 →")
+        print("  创建令牌 → 用「编辑区域 DNS」模板，区域选这个域名）")
+        cf_token = _ask("  粘贴 Token: ").strip()
+        if not cf_token:
+            print("  没填 Token，已取消。")
+            return
+    print("\n" + "-" * 60)
+    print(f"  升级:      {dom}  →  {', '.join(want)}")
+    print(f"  验证方式:  {_MODE_TEXT['dns-cf']}")
+    print(f"  签发机构:  Let's Encrypt")
+    print(f"  安全网:    先签到临时文件、验过（覆盖得到每一个域名 / 没过期 / 私钥配对）")
+    print(f"             才换上去；不过就丢弃新的，现有证书一个字节不动")
+    print(f"  完成后:    {'、'.join(_cert_consumers()) or '(暂无服务)'} 重读证书")
+    print(f"{Y}  ⚠ 重启这些服务会掐断代理链路，挂着本机代理连的 SSH 会断——"
+          f"不用管，后台会跑完。{N}")
+    print("-" * 60)
+    if (_ask("确认升级? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    plan = {"op": "cert-install", "domain": dom, "wildcard": True,
+            "cf_token": cf_token, "names": want, "G": dict(G)}
+    _node_op_dispatch(plan, lambda: cert_install_apply(dom, True, cf_token, want))
 
 def _acme_has_cf():
     """acme.sh 的 account.conf 里存没存过 Cloudflare 凭据。"""
@@ -5976,8 +6041,20 @@ def _acme_has_cf():
             continue
     return False
 
-def cert_install_apply(dom, wildcard, cf_token):
-    """真正签发+安装（非交互，后台跑）。装上去之前先验，验不过绝不碰现有证书。"""
+def cert_want_names(dom, wildcard, emby_dom=""):
+    """这次要签哪些名字。
+
+       带上 Emby 的子域是为了一张顶两张：Emby 对外是 <子域>.<它的域名>，
+       所以得有 *.<它的域名>；它跟节点同域时这条跟 *.dom 是同一个，自然去重。"""
+    names = [dom] + ([f"*.{dom}"] if wildcard else [])
+    if wildcard and emby_dom:
+        names += [emby_dom, f"*.{emby_dom}"]
+    return list(dict.fromkeys(names))
+
+def cert_install_apply(dom, wildcard, cf_token, names=None):
+    """真正签发+安装（非交互，后台跑）。装上去之前先验，验不过绝不碰现有证书。
+
+       names：这次要签的完整域名列表，不给就按 dom/wildcard 推。"""
     G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
@@ -5995,9 +6072,11 @@ def cert_install_apply(dom, wildcard, cf_token):
     env = dict(os.environ)
     if cf_token:
         env["CF_Token"] = cf_token
+    want = names or cert_want_names(dom, wildcard)
     if wildcard:
-        issue = (f"{acme} --issue --dns dns_cf --keylength ec-256 "
-                 f"-d '{dom}' -d '*.{dom}' --server letsencrypt")
+        ds = " ".join(f"-d '{n}'" for n in want)
+        print(f"  要签的域名：{', '.join(want)}")
+        issue = f"{acme} --issue --dns dns_cf --keylength ec-256 {ds} --server letsencrypt"
     else:
         hooks = ""
         owner = _port80_owner()
@@ -6026,7 +6105,7 @@ def cert_install_apply(dom, wildcard, cf_token):
     os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
     sh(f"{acme} --install-cert -d {dom} --ecc "
        f"--fullchain-file {tmpc} --key-file {tmpk}", check=False)
-    ok, why = cert_validate(tmpc, tmpk, dom)
+    ok, why = cert_validate(tmpc, tmpk, want)
     if not ok:
         for p in (tmpc, tmpk):
             try: os.remove(p)
@@ -6410,7 +6489,8 @@ def node_op_run():
     G.update(plan.get("G") or {})
     try:
         if plan["op"] == "cert-install":
-            cert_install_apply(plan["domain"], plan["wildcard"], plan.get("cf_token", ""))
+            cert_install_apply(plan["domain"], plan["wildcard"],
+                               plan.get("cf_token", ""), plan.get("names"))
         elif plan["op"] == "install":
             run(plan["sb"], plan["xray"])
         else:
