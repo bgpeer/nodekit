@@ -18,11 +18,11 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
+import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicodedata, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.86"
+SCRIPT_VERSION = "1.0.90"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -709,11 +709,8 @@ def _reality_sni_ok(sni):
         return False, "目标不支持 TLS1.3（reality 强制要求），必须换"
     return False, "目标不支持 HTTP/2(h2)，reality 握手特征易露，建议换"
 
-def precheck_sni(sb_names, xr_names):
-    """选了 reality 类协议时，装前探测借用的 SNI 目标是否合格；不合格只警告不阻断。"""
-    reality_sel = any(n.startswith("reality-") for n in list(sb_names) + list(xr_names))
-    if not reality_sel:
-        return
+def _sni_precheck_one():
+    """探一次当前 G["sni"] 够不够格给 reality 借用；不合格只警告不阻断。"""
     ok, detail = _reality_sni_ok(G["sni"])
     if ok:
         print(f"  reality 借用目标 {G['sni']}: {detail}")
@@ -723,14 +720,17 @@ def precheck_sni(sb_names, xr_names):
               f"    建议换成支持 TLS1.3+h2 的大站：{SNI_SUGGESTIONS}\n"
               f"    （可 --sni 指定或在交互菜单里改；现按你填的继续装）{N}")
 
+def precheck_sni(sb_names, xr_names):
+    """选了 reality 类协议时，装前探一次借用目标。选没选据注册表判断，不靠名字前缀。"""
+    if proto_flag("reality", sb_names, xr_names):
+        _sni_precheck_one()
+
 def warn_selfsigned(sb_names, xr_names):
     """无域名时，依赖证书的 TLS 协议只能自签+insecure，是伪装/加密弱点。
        给出明确引导：优先 reality，或补一个域名走真证书。hy2/tuic 自签是常规，不在此列。"""
     if G["domain"]:
         return
-    cert_tls = ([n for n in sb_names if n in
-                 ("vless-vision", "trojan", "anytls", "vless-ws", "vmess-ws", "vmess-httpupgrade")]
-                + [n for n in xr_names if n in ("vless-ws", "vmess-ws", "trojan")])
+    cert_tls = proto_pick("cert", sb_names, xr_names)
     if not cert_tls:
         return
     Y, N = "\033[1;33m", "\033[0m"
@@ -1101,22 +1101,188 @@ def sb_vless_vision(port, tag):
 
 # 当前只装这 10 个协议（对齐 mack-a 的输出，顺序也一致）。
 # 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
-SB = {"vless-vision": sb_vless_vision,
-      "vless-ws": make_sb_vless("ws"),
-      "vmess-ws": make_sb_vmess("ws"),
-      "trojan": sb_trojan,
-      "hy2": sb_hysteria2,
-      "reality-vision": sb_reality_vision,
-      "reality-grpc": sb_reality_grpc,
-      "tuic": sb_tuic,
-      "vmess-httpupgrade": make_sb_vmess("httpupgrade"),
-      "anytls": sb_anytls}
-# 备用（以后想加回，取消注释挪进上面的 SB）：
-#   "ss2022": sb_ss2022,
-#   "vless-h2": make_sb_vless("h2"),
-#   "vless-httpupgrade": make_sb_vless("httpupgrade"),
-#   "vmess-h2": make_sb_vmess("h2"),
-#   "socks5": sb_socks5,
+# ═══════════════════════════════════════════════════════════════════════════════
+# 协议注册表
+# ═══════════════════════════════════════════════════════════════════════════════
+# 一个协议的【全部信息集中在一条记录里】：怎么建、删它要清什么、选中它要补问什么、
+# 它有哪些会影响流程的性质。这样加新协议就是加一行，不用再满文件找地方补代码——
+# 以前 hy2 的 iptables 规则和 ws 的 nginx 反代都是散在各处建的，只有「建」没有「拆」，
+# 删协议时全靠人肉记得，漏一个就是一个不报错的坑。
+#
+# ── 加一个新协议的清单 ──────────────────────────────────────────────────
+#   1. 写 builder：(port, tag) -> (inbound_dict, 分享链接)。
+#      builder 里顺手建的系统副作用（如 hy2 的 iptables DNAT），必须在第 2 步配一个
+#      teardown 把它收回来——「谁建的谁负责拆」是这张表唯一要守的纪律。
+#   2. 在下面的表里加一行 PROTO(...)，据实填这几项（不填=没有这个性质）：
+#        udp=True       入站是 UDP（hy2 跳跃段的冲突检测据此判断会不会被劫走）
+#        reality=True   reality 类（借用 SNI 的预检、443 优先级要用）
+#        ws_front=True  nginx 前置时藏在 443 后面（增量添加/删除的守卫要用）
+#        cert=True      吃服务器证书（无域名时退化成自签+insecure，要进自签告警）
+#        teardown=fn    删它时要清的副作用。fn(plan=True) 只回答「会清什么」给确认框看，
+#                       fn() 才真动手并回报清了什么；不适用时两种模式都返回 ""
+#        asks=fn        选中它才问的专属设置，fn(mode)，mode 为 install / add
+#        recap=fn       确认框里回显的 (标题, 值)，不需要就别填
+#      teardown/asks/recap 允许多个协议共用同一个函数（ws 三兄弟就是），
+#      按函数对象去重，所以不会问三遍、也不会把 nginx 反代表重写三遍。
+#      字段名打错、忘了包 PROTO(...)、reality 忘了标 —— 都会被 _check_proto_tables()
+#      在启动时当场 SystemExit，不会留到用户跑到那一步才发作。
+#   3. 客户端侧另有三个按【节点类型】分发的地方，新协议若走了新的传输方式才要动：
+#        link_to_proxy()     分享链接 -> mihomo 节点（按 scheme/type 通用解析，通常不用动）
+#        proto_key()         mihomo 节点 -> 协议键（决定 sing-box 订阅里映射到哪个 tag）
+#        shadowrocket_line() mihomo 节点 -> 小火箭行（不支持的返回 None 自动跳过）
+#   其余地方（安装/增量添加/删除/自签告警/UDP 冲突检测/确认框）全部读这张表，
+#   不要再往那些流程里写协议名——写死一个名字，就是下一个没人记得的坑。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def PROTO(build, *, udp=False, reality=False, ws_front=False, cert=False,
+          teardown=None, asks=None, recap=None):
+    """一条协议记录。字段含义见上面的清单。"""
+    return {"build": build, "udp": udp, "reality": reality, "ws_front": ws_front,
+            "cert": cert, "teardown": teardown, "asks": asks, "recap": recap}
+
+def proto_pick(flag, sb_names=(), xr_names=()):
+    """选中的协议里带某个性质的那些（据注册表，不靠名字前缀猜）。去重保序。"""
+    got = ([n for n in sb_names if SB.get(n, {}).get(flag)]
+           + [n for n in xr_names if XRAY.get(n, {}).get(flag)])
+    return list(dict.fromkeys(got))
+
+def proto_flag(flag, sb_names=(), xr_names=()):
+    """选中的协议里有没有带某个性质的。"""
+    return bool(proto_pick(flag, sb_names, xr_names))
+
+def _proto_fns(key, sb_names=(), xr_names=()):
+    """收集选中协议的 teardown / asks / recap 函数，按出现顺序去重。
+
+       去重是必须的：ws 三兄弟共用同一个 teardown/asks，不去重就会问三遍、
+       把 nginx 反代表重写三遍。用函数对象本身做键，共用即自动合并。"""
+    out = []
+    for table, names in ((SB, sb_names), (XRAY, xr_names)):
+        for n in names:
+            fn = table.get(n, {}).get(key)
+            if fn and fn not in out:
+                out.append(fn)
+    return out
+
+def run_asks(mode, sb_names=(), xr_names=()):
+    """按注册表补问选中协议各自的专属设置。mode: install(全新安装) / add(增量添加)。"""
+    for fn in _proto_fns("asks", sb_names, xr_names):
+        fn(mode)
+
+def _pad(text, width=13):
+    """按【显示宽度】右补空格（中文/emoji 占两列，str.ljust 按字符数算会对不齐）。"""
+    w = sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
+    return text + " " * max(1, width - w)
+
+def recap_lines(sb_names=(), xr_names=()):
+    """确认框里要回显的 [(标题, 值)]，同样来自注册表。"""
+    out = []
+    for fn in _proto_fns("recap", sb_names, xr_names):
+        r = fn()
+        if r:
+            out.append(r)
+    return out
+
+# ── teardown：删协议时要清的副作用 ───────────────────────────────────────
+# 约定：fn(plan=True) 只回答「会清什么」（给确认框看），fn() 才真动手并回报清了什么；
+# 两种模式写在同一个函数里，以后改动只有一处，不会出现「确认框说清 A、实际清了 B」。
+# 判断不适用（如 nginx 根本没前置）时两种模式都返回 ""，调用方据此跳过。
+
+def _td_hy2(plan=False):
+    """删 hy2：清掉端口跳跃的 iptables DNAT。
+
+       不清的话，整段 UDP 会继续被转给一个已经不存在的端口——不仅 hy2 没了，
+       以后装进那一段的任何 UDP 服务也会被一起劫走，而且毫无报错。"""
+    if plan:
+        return "端口跳跃的 iptables DNAT 规则"
+    n = _drop_hy2_dnat()
+    return f"已清掉 {n} 条端口跳跃 DNAT 规则" if n else "没有残留的端口跳跃 DNAT 规则"
+
+def _td_ws_front(plan=False):
+    """删 nginx 前置的 ws 类：按【剩下的】节点重写 443 的 location 反代表。
+
+       不重写的话，那条 path 还挂在 nginx 上、反代到一个已经没人听的本地端口，
+       客户端拿到的是 502 而不是「节点没了」，排查起来更费劲。
+       只在 nginx 真的前置着 ws 时才动它（reality 绑 443 的布局下 ws 走自己的端口）。"""
+    if not _nginx_front():
+        return ""
+    if plan:
+        return "nginx 443 上对应的 location 反代"
+    ws = _rebuild_nginx_ws_from_cfg()
+    write_nginx_conf()
+    return f"nginx 反代表已按剩下的 {len(ws)} 个 ws 节点重写"
+
+# ── asks / recap：选中该协议才问的设置，以及确认框里的回显 ────────────────
+
+def _asks_hy2(mode):
+    """选了 hy2：问端口跳跃范围（带冲突检测）。"""
+    # include_own：全新安装时本脚本自己的节点马上要重建，现在监听着的不算冲突
+    cur = (G.get("hy2_ports") or "").strip() if mode == "add" else ""
+    G["hy2_ports"] = ask_hy2_range(cur, include_own=(mode == "add"))
+    if hy2_hop_on():
+        print(f"  ⚠ 跳跃段 {hy2_range()} 的 \033[1mUDP 整段\033[0m 要在云厂商防火墙里放行，"
+              f"否则跳到的端口连不上（GCE/阿里云这类默认只放行你列过的端口）。")
+
+def _recap_hy2():
+    return ("hy2 跳跃", hy2_range() or "关闭（固定单端口）")
+
+def _asks_smux(mode):
+    """选了 ws 家族：问要不要开 smux 多路复用。"""
+    cur = G.get("smux", "")
+    if mode == "add":
+        ans = _ask(f"  ws 类开启 smux 多路复用?（{'回车沿用上次的开启' if cur else '回车=不开'}，"
+                   f"y 开 / n 不开）: ").strip().lower()
+        G["smux"] = "1" if ans in ("y", "yes") else ("" if ans in ("n", "no") else cur)
+    else:
+        ans = _ask("ws 类开启 smux 多路复用?(网页/小请求更快，大文件下载可能变慢) "
+                   "y开启/n不开(回车=不开): ")
+        G["smux"] = "1" if ans.lower() in ("y", "yes") else ""
+
+def _recap_smux():
+    return ("ws 多路复用", "开启 smux" if G.get("smux") else "不开(默认)")
+
+def _asks_reality(mode):
+    """选了 reality 类：确认借用目标 SNI 并做连通性预检。
+
+       只在增量添加时问——全新安装时 SNI 是统一问的（没有域名时 ws/trojan 也拿它
+       当伪装 Host，见 tls_host()），不能挪进来按协议问。"""
+    if mode != "add":
+        return
+    ans = _ask(f"\n  reality 借用目标 SNI（回车沿用上次的 {G['sni']}）: ").strip()
+    if ans:
+        G["sni"] = ans
+    _sni_precheck_one()
+
+def _recap_reality():
+    return ("借用 SNI", G["sni"])
+
+# ── 表本体 ───────────────────────────────────────────────────────────────
+# 当前只装这 10 个协议（对齐 mack-a 的输出，顺序也一致）。
+# 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
+SB = {
+    "vless-vision":      PROTO(sb_vless_vision, cert=True),
+    "vless-ws":          PROTO(make_sb_vless("ws"), cert=True, ws_front=True,
+                               teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+    "vmess-ws":          PROTO(make_sb_vmess("ws"), cert=True, ws_front=True,
+                               teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+    "trojan":            PROTO(sb_trojan, cert=True),
+    "hy2":               PROTO(sb_hysteria2, udp=True,
+                               teardown=_td_hy2, asks=_asks_hy2, recap=_recap_hy2),
+    "reality-vision":    PROTO(sb_reality_vision, reality=True,
+                               asks=_asks_reality, recap=_recap_reality),
+    "reality-grpc":      PROTO(sb_reality_grpc, reality=True,
+                               asks=_asks_reality, recap=_recap_reality),
+    "tuic":              PROTO(sb_tuic, udp=True),
+    "vmess-httpupgrade": PROTO(make_sb_vmess("httpupgrade"), cert=True, ws_front=True,
+                               teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+    "anytls":            PROTO(sb_anytls, cert=True),
+}
+# 备用（以后想加回，取消注释挪进上面的 SB，按上面的清单据实填标志位）：
+#   "ss2022":            PROTO(sb_ss2022),
+#   "vless-h2":          PROTO(make_sb_vless("h2"), cert=True),
+#   "vless-httpupgrade": PROTO(make_sb_vless("httpupgrade"), cert=True, ws_front=True,
+#                              teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+#   "vmess-h2":          PROTO(make_sb_vmess("h2"), cert=True),
+#   "socks5":            PROTO(sb_socks5),
 #   "naive": sb_naive,
 #   "shadowtls": sb_shadowtls,
 
@@ -1251,13 +1417,41 @@ def xr_trojan(port, tag):
 # xray 的 reality 三兄弟原来叫 vless-reality-*，三段名在手机客户端里显示不下、
 # 后半截被截掉（vless-reality-x…）。vless- 是冗余的——这几个本来就都是 vless，
 # sing-box 那边同样的东西就叫 reality-vision/grpc。统一砍成两段。
-XRAY = {"reality-vision": xr_reality_vision,
-        "reality-grpc": xr_reality_grpc,
-        "reality-xhttp": xr_reality_xhttp,
-        "xhttp-tls": xr_vless_xhttp_tls,
-        "vless-ws": xr_vless_ws, "vmess-ws": xr_vmess_ws,
-        "trojan": xr_trojan}
+XRAY = {
+    "reality-vision": PROTO(xr_reality_vision, reality=True,
+                            asks=_asks_reality, recap=_recap_reality),
+    "reality-grpc":   PROTO(xr_reality_grpc, reality=True,
+                            asks=_asks_reality, recap=_recap_reality),
+    "reality-xhttp":  PROTO(xr_reality_xhttp, reality=True,
+                            asks=_asks_reality, recap=_recap_reality),
+    # xray 的 ws/trojan/xhttp-tls 都听自己的端口、自己终结 TLS，不挂 nginx
+    # （所以不是 ws_front），无域名时退化成自签+allowInsecure → cert=True。
+    "xhttp-tls":      PROTO(xr_vless_xhttp_tls, cert=True),
+    "vless-ws":       PROTO(xr_vless_ws, cert=True),
+    "vmess-ws":       PROTO(xr_vmess_ws, cert=True),
+    "trojan":         PROTO(xr_trojan, cert=True),
+}
 # 已移除 ss2022：纯全加密无伪装，易被 GFW 全加密流量探测识别；有 reality 完全无需它。
+
+def _check_proto_tables():
+    """启动即自检协议表。写错一个字段名（比如 ws_front 打成 wsfront）默认值就会一直是
+       False，流程照跑、只是悄悄少做一件事——这种 bug 最难查，所以在这里直接拦下来。"""
+    fields = set(PROTO(lambda p, t: None))
+    for label, table in (("SB", SB), ("XRAY", XRAY)):
+        for n, p in table.items():
+            if not isinstance(p, dict) or set(p) != fields:
+                raise SystemExit(f"协议表 {label}['{n}'] 不是 PROTO(...) 记录（字段对不上）")
+            if not callable(p["build"]):
+                raise SystemExit(f"协议表 {label}['{n}'] 的 build 不可调用")
+            for k in ("teardown", "asks", "recap"):
+                if p[k] is not None and not callable(p[k]):
+                    raise SystemExit(f"协议表 {label}['{n}'] 的 {k} 既不是 None 也不可调用")
+    for n in REALITY_443_PRIORITY:
+        if not (SB.get(n, {}).get("reality") or XRAY.get(n, {}).get("reality")):
+            raise SystemExit(f"REALITY_443_PRIORITY 里的 {n} 在协议表里不存在或没标 reality=True")
+    if not SB.get(SNI_SPLIT_BACKEND, {}).get("reality"):
+        raise SystemExit(f"SNI_SPLIT_BACKEND 指定的 {SNI_SPLIT_BACKEND} "
+                         f"不在 sing-box 协议表里、或没标 reality=True")
 
 # 历史旧名 → 现名。老节点的名字烤在分享链接里，命令行也可能还写着旧名，都得认。
 # 老节点点一次『更新配置』就会跟着变短（规范化在渲染时做，见 _sep_name）。
@@ -1269,6 +1463,13 @@ _PROTO_ALIASES = {"vless-reality-vision": "reality-vision",
 # reality 绑 443 的优先级：优先 sing-box reality-vision（Vision flow 最稳），依次往下。
 # 只能有一个 reality 上 443（443/TCP 独占），其余 reality 留在随机端口。
 REALITY_443_PRIORITY = ["reality-vision", "reality-grpc", "reality-xhttp"]
+
+# sni-split 的 443 后端只能是 sing-box 的这一个协议：整个文件里只有它的 builder 会
+# 往 NGINX_STREAM 登记「借用 SNI → 本地端口」。挪到常量里，是为了让『为什么偏偏是它』
+# 有地方写，也让下面的自检替我们盯着别名/改名。
+SNI_SPLIT_BACKEND = "reality-vision"
+
+_check_proto_tables()      # 协议表写错字段 → 这里立刻 SystemExit，不留到运行时才发作
 
 def pick_reality_443(sb_names, xr_names):
     """返回 (要绑 443 的 reality 协议名, 归属核心)；没有 reality 被选则返回 ('', '')。
@@ -1308,7 +1509,7 @@ def build(table, names, pinned=None, dup=None, mark=""):
         tag = _tag(G.get("prefix", ""), n)
         if n in dup:                             # 两核心都有该协议 → 尾部小上标区分（sb ¹ / xray ²）
             tag += mark
-        ib, lk = table[n](port, tag)
+        ib, lk = table[n]["build"](port, tag)
         inbounds.append(ib); links.append(lk)
     return inbounds, links
 
@@ -1345,7 +1546,6 @@ def mlkem_ok():
 
 # ws 家族 smux 多路复用（mihomo 客户端；服务端 sing-box 同步开 multiplex）
 # 是否开启由 G["smux"] 决定（安装时询问，默认关：多路复用可能拖慢大文件下载）
-_WS_FAMILY = {"vless-ws", "vmess-ws", "vmess-httpupgrade"}   # 可开 smux 的 sing-box 节点键
 _SMUX = {"enabled": "true", "protocol": "h2mux",
          "max-connections": 4, "min-streams": 4, "padding": "true"}
 # sing-box 客户端出站的等价多路复用配置
@@ -2883,8 +3083,8 @@ def run(sb_names, xr_names):
     if G.get("sni_split"):
         if not G["domain"]:
             print("  sni-split 需要域名，已忽略。"); G["sni_split"] = ""
-        elif "reality-vision" not in sb_names:
-            print("  sni-split 需选 sing-box reality-vision（放到 443 后面），已忽略。")
+        elif SNI_SPLIT_BACKEND not in sb_names:
+            print(f"  sni-split 需选 sing-box {SNI_SPLIT_BACKEND}（放到 443 后面），已忽略。")
             G["sni_split"] = ""
         elif not sni_split_preflight():
             G["sni_split"] = ""; G["reality443"] = "1"    # 退回 reality-443 直连
@@ -2990,7 +3190,7 @@ def run(sb_names, xr_names):
         json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"],
                    "prefix": G.get("prefix", ""), "hy2_ports": G.get("hy2_ports", ""),
                    "nginx": G.get("nginx", ""), "reality443": G.get("reality443", ""),
-                   "sni_split": G.get("sni_split", ""),
+                   "sni_split": G.get("sni_split", ""), "smux": G.get("smux", ""),
                    "sb": sb_names, "xray": xr_names},
                   open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
@@ -5555,7 +5755,7 @@ def main_menu():
             print(f"  \033[1;31m⚠ TLS 证书{_cert_left_text(_left)}"
                   f"——进 15 修复，否则节点和订阅会一起连不上\033[0m")
             print("-" * 60)
-        print("  1. 安装（已装则问是否重装节点，y 重装 / n 返回）")
+        print("  1. 节点安装（已装则可只加新协议 / 全部重装 / 删除协议）")
         print("  2. 节点链接 / 订阅")
         print("  3. 聚合节点链接（连机VPS合并多台VPS节点）")
         print("  4. 更换伪装域名（reality 借用的 SNI·带连通检测，不用重装）")
@@ -5696,6 +5896,101 @@ def _ports_in_cfgs():
                 used.add(p)
     return used
 
+HY2_HOP_WIDTH = 1000        # 「自动挑一段」时用的宽度
+
+def _udp_ports_in_use(include_own=True):
+    """当前被 UDP 占用的端口 → {端口: 谁在用}。
+
+       只查 UDP：端口跳跃的 DNAT 是 `-p udp`（见 setup_port_hopping），
+       TCP 服务落在跳跃段里【完全不受影响】，把它们也报出来纯属虚惊一场。
+
+       include_own=False 用于全新安装——本脚本自己的节点马上要重建，
+       现在还在监听的那些不算冲突，否则每次重装都会误报一堆。"""
+    used = {}
+    if include_own:
+        for core in _CORE_META:
+            label, _b, _p, table, _m = _CORE_META[core]
+            for ib in _load_core_cfg(core)[1]:
+                # 据注册表认 UDP 协议（按 tag 反查）：以后加 UDP 新协议只改表就行。
+                # 改过名认不出来的漏网之鱼，下面的 ss -lnup 还会再兜一次底。
+                if table.get(_ib_proto(ib), {}).get("udp"):
+                    p = _cfg_port(ib)
+                    if p:
+                        used[p] = f"{label} 的 {ib.get('tag', '?')}"
+    for line in (sh("ss -lnup 2>/dev/null", check=False) or "").splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        m = re.search(r":(\d+)$", f[4])
+        if not m:
+            continue
+        who = re.search(r'users:\(\("([^"]+)"', line)
+        name = who.group(1) if who else "未知程序"
+        if not include_own and name in ("sing-box", "xray"):
+            continue
+        used.setdefault(int(m.group(1)), f"{name}（正在监听 UDP）")
+    return used
+
+def _hop_conflicts(rng, include_own=True):
+    """跳跃段里有哪些 UDP 端口会被 DNAT 劫走 → [(端口, 谁)]，按端口排序。"""
+    try:
+        lo, hi = (int(x) for x in rng.split("-"))
+    except (ValueError, AttributeError):
+        return []
+    return sorted((p, who) for p, who in _udp_ports_in_use(include_own).items()
+                  if lo <= p <= hi)
+
+def _auto_hop_range(include_own=True, width=HY2_HOP_WIDTH):
+    """随机挑一段宽 width 的空闲 UDP 区间；实在挑不到返回 ''。
+       在 20000-60000 里挑：低端留给系统服务，高端留出余量装得下整段。"""
+    for _ in range(300):
+        start = secrets.randbelow(60000 - width - 20000) + 20000
+        rng = f"{start}-{start + width}"
+        if not _hop_conflicts(rng, include_own):
+            return rng
+    return ""
+
+def ask_hy2_range(cur="", include_own=True):
+    """问 hy2 跳跃范围，撞车就当场拦下来。返回要写进 G['hy2_ports'] 的值。
+
+       为什么值得专门做这一环：端口跳跃是把【整段 UDP】DNAT 给 hy2，段内任何别的
+       UDP 服务都会被悄悄劫走——tuic、WireGuard、DNS 都算。它的表现是「那个服务
+       忽然连不上」，两边日志干干净净，没人会往端口跳跃上想。装之前拦住，
+       比事后排查便宜得多。"""
+    RED, GRN, OFF = "\033[1;31m", "\033[1;32m", "\033[0m"
+    while True:
+        tip = f"回车沿用上次的 {cur}" if cur else f"回车=默认 {HY2_PORTS}"
+        raw = (_ask(f"  hy2 端口跳跃范围 起-止（{tip}，输 n 不用跳跃）: ").strip() or cur)
+        if raw.lower() in ("off", "n", "no", "none"):
+            return "n"
+        rng = raw if re.match(r"^\d+-\d+$", raw) else HY2_PORTS
+        lo, hi = (int(x) for x in rng.split("-"))
+        if lo >= hi or hi > 65535:
+            print(f"{RED}  ✗ {rng} 不是合法区间（要 起<止 且 ≤65535），重填。{OFF}")
+            cur = ""
+            continue
+        conflicts = _hop_conflicts(rng, include_own)
+        if not conflicts:
+            return rng
+        print(f"{RED}  ✗ 跳跃段 {rng} 和下面这些 UDP 服务重叠。整段 UDP 会被 DNAT 劫给 hy2，"
+              f"它们会悄无声息地连不上：{OFF}")
+        for p, who in conflicts:
+            print(f"{RED}      {p}   {who}{OFF}")
+        print(f"  1. 自动挑一段空闲的（宽 {HY2_HOP_WIDTH}）")
+        print("  2. 我自己重填")
+        print("  0. 不用端口跳跃（hy2 走固定单端口）")
+        c = _ask("  选择 [1/2/0]（回车=1）: ").strip() or "1"
+        if c == "0":
+            return "n"
+        if c == "1":
+            auto = _auto_hop_range(include_own)
+            if auto:
+                print(f"{GRN}  ✓ 已挑到空闲段 {auto}{OFF}")
+                return auto
+            print(f"{RED}  ✗ 20000-60000 里没找到连续 {HY2_HOP_WIDTH} 个都空闲的段，"
+                  f"请自己指定或选 0 关掉跳跃。{OFF}")
+        cur = ""          # 重填时不再默认沿用旧值，免得一回车又撞回原来那段
+
 def _installed_state():
     """读上次安装记录 → (state dict, sb 协议名 list, xray 协议名 list)。
        顺带把历史旧协议名映射成现名，免得「已装」判断漏掉老节点。"""
@@ -5746,7 +6041,7 @@ def add_protocols_flow(st, have_sb, have_xr):
     # 而旧节点的 path 只存在于运行中的配置里，重建容易出错（sni-split 还多一层 stream）。
     # 与其冒险改坏正在用的 443，不如在这里挡掉，让用户走全部重装那条路。
     if _nginx_front():
-        blocked = [n for n in pick_sb if n in _WS_FAMILY]
+        blocked = proto_pick("ws_front", pick_sb)
         if blocked:
             print(f"\n  ⚠ 跳过 {', '.join(blocked)}：这些协议现在藏在 nginx 443 后面，"
                   f"新增要改动 nginx 反代表，增量模式不碰它。要加请选『全部重新安装』。")
@@ -5754,6 +6049,12 @@ def add_protocols_flow(st, have_sb, have_xr):
     if not pick_sb and not pick_xr:
         print("  没有可增量添加的协议，返回。")
         return
+
+    # 首装时是【按选中的协议】决定问不问那几项的：没装 hy2 就没问过跳跃范围，
+    # 没装 reality 也可能没认真挑过借用目标。这次新选了它们，就得补问一遍——
+    # 不问等于替用户默默做主，hy2 尤其糟：不问会直接按默认段去配 iptables DNAT。
+    # 问哪几项完全由注册表里的 asks 决定，以后加协议不用回来改这里。
+    run_asks("add", pick_sb, pick_xr)
 
     # 新 reality 一律走随机端口：443 已经有主的话抢不得；没有主的话绑 443 还要动
     # nginx/证书布局，那是重装该干的事。
@@ -5765,6 +6066,8 @@ def add_protocols_flow(st, have_sb, have_xr):
         print("  新增 sing-box:", ", ".join(pick_sb))
     if pick_xr:
         print("  新增 xray:    ", ", ".join(pick_xr))
+    for label, value in recap_lines(pick_sb, pick_xr):
+        print("  " + _pad(label + ":", 14) + str(value))
     print("  现有节点:    ", f"sing-box {len(have_sb)} 个 / xray {len(have_xr)} 个（保持不动）")
     print("  订阅地址:    ", "不变（客户端重拉一次订阅即多出新节点）")
     print("-" * 60)
@@ -5853,7 +6156,8 @@ def add_protocols_flow(st, have_sb, have_xr):
     except Exception as e:
         print("  ⚠ 订阅刷新失败（节点已装好，可到配置菜单点『更新配置』重试）:", e)
 
-    st.update({"sb": have_sb, "xray": have_xr})
+    st.update({"sb": have_sb, "xray": have_xr, "sni": G["sni"],
+               "hy2_ports": G.get("hy2_ports", ""), "smux": G.get("smux", "")})
     try:
         json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
@@ -5865,6 +6169,232 @@ def add_protocols_flow(st, have_sb, have_xr):
     print("\n".join(new_links))
     print("\n订阅地址没变，客户端重拉一次订阅即可看到新节点：")
     print(sub_urls_text())
+
+# ============================================================================ 删除协议
+# 删比加难：加只是往配置里塞一条，删要把【散落各处的副作用】一起收回来——
+# 端口跳跃的 iptables DNAT、nginx 前置的 location 反代、分享链接、订阅、状态记录。
+# 漏掉任何一样都不会报错，只会留下一个安静的坑：
+#   · DNAT 不删 → 整段 UDP 继续转给一个已经不存在的端口，连带劫走以后装在那段里的服务
+#   · nginx location 不删 → 443 上那条 path 反代到死端口，客户端拿到 502
+#   · 链接不删 → 订阅里留着连不上的死节点，客户端每次都去测它
+
+def _link_core_proto(u):
+    """分享链接 → (协议名, 归属核心)。两核心同名协议靠尾标区分：¹=sing-box、²=xray；
+       没有尾标说明只有一个核心装了它，核心位返回 ''。认不出返回 ('','')。"""
+    _, seg = _split_tag(_link_name(u))
+    if not seg:
+        return "", ""
+    core = "sb" if seg.endswith("¹") else ("xray" if seg.endswith("²") else "")
+    return seg.rstrip(_TAG_MARKS), core
+
+def _ib_proto(ib):
+    """inbound 的 tag → 协议名（去掉前缀和尾标）。"""
+    _, seg = _split_tag(ib.get("tag", ""))
+    return (seg or "").rstrip(_TAG_MARKS)
+
+def _rebuild_nginx_ws_from_cfg():
+    """从现有 sing-box 配置还原 nginx 前置的 ws 反代表。
+       前置模式下 ws 家族监听 127.0.0.1 且带 transport.path，据此能完整重建。"""
+    NGINX_WS.clear()
+    for ib in _load_core_cfg("sb")[1]:
+        if ib.get("listen") != "127.0.0.1":
+            continue
+        path, port = (ib.get("transport") or {}).get("path"), _cfg_port(ib)
+        if path and port:
+            NGINX_WS.append({"path": path, "port": port})
+    return list(NGINX_WS)
+
+def _nginx_backed(names):
+    """这些 sb 协议里，哪些的入站是挂在 nginx 后面的（监听 127.0.0.1）。
+
+       从运行中的配置读，不靠名字猜：ws 家族前置、sni-split 的 reality 后端都是
+       这个形态，以后再多一种也自动认得。"""
+    local = {_ib_proto(ib) for ib in _load_core_cfg("sb")[1] if ib.get("listen") == "127.0.0.1"}
+    return [n for n in names if n in local]
+
+def _drop_hy2_dnat():
+    """删掉端口跳跃的 DNAT 规则，返回删了几条。"""
+    n = 0
+    for ipt in ("iptables", "ip6tables"):
+        if not have(ipt):
+            continue
+        for line in (sh(f"{ipt} -t nat -S PREROUTING", check=False) or "").splitlines():
+            if line.startswith("-A") and "portHopping" in line:
+                sh(f"{ipt} -t nat " + line.replace("-A", "-D", 1), check=False)
+                n += 1
+    if n:
+        sh("netfilter-persistent save", check=False)
+    return n
+
+def del_protocols_flow(st, have_sb, have_xr):
+    """删除已装协议：只动选中的那几个，其余节点的端口/UUID/订阅地址全不变。"""
+    RED, OFF = "\033[1;31m", "\033[0m"
+    if not have_sb and not have_xr:
+        print("\n  还没装任何协议。")
+        return
+    _restore_state_to_G(st)
+    print("\n" + "=" * 60)
+    print("  删除协议")
+    print("=" * 60)
+    if have_sb:
+        print("  已装 sing-box:", ", ".join(have_sb))
+    if have_xr:
+        print("  已装 xray:    ", ", ".join(have_xr))
+    print("-" * 60)
+    print("  1. 选择删除")
+    print("  2. 全部删除")
+    print("  0. 返回")
+    c = (_ask("选择 [1/2/0]（回车=0 返回）: ") or "0").strip()
+    if c == "0":
+        return
+    if c == "2":
+        del_sb, del_xr = list(have_sb), list(have_xr)
+    elif c == "1":
+        del_sb = _pick("【sing-box 删哪些】", have_sb, default=[]) if have_sb else []
+        del_xr = _pick("【xray 删哪些】", have_xr, default=[]) if have_xr else []
+    else:
+        print("  无效选择，返回。")
+        return
+    if not del_sb and not del_xr:
+        print("  没选任何协议，返回。")
+        return
+
+    # sni-split 下 nginx 是 stream 分流 + 本地 https server 两层，443 的走向依赖具体后端；
+    # 删了它的后端再去重建这套结构，出错就是整个 443 崩掉。挡住，让走重装。
+    if G.get("sni_split"):
+        backing = _nginx_backed(del_sb)
+        if backing:
+            print(f"{RED}  ✗ 本机开着 nginx SNI 分流，443 的走向依赖 "
+                  f"{', '.join(backing)} 做后端。{OFF}")
+            print("    删它们要重建整套 nginx 结构，增量模式不碰。请走『全部重新安装』。")
+            return
+
+    # 要清哪些副作用，全问注册表要（teardown）。加新协议时只要在表里填上 teardown，
+    # 这里的确认框和下面的真动手都自动带上它，不会像以前那样漏掉一处。
+    teardowns = _proto_fns("teardown", del_sb, del_xr)
+    left_sb = [n for n in have_sb if n not in del_sb]
+    left_xr = [n for n in have_xr if n not in del_xr]
+
+    print("\n" + "-" * 60)
+    if del_sb:
+        print("  删除 sing-box:", ", ".join(del_sb))
+    if del_xr:
+        print("  删除 xray:    ", ", ".join(del_xr))
+    print("  删除后剩下:   ", f"sing-box {len(left_sb)} 个 / xray {len(left_xr)} 个")
+    for td in teardowns:
+        what = td(plan=True)
+        if what:
+            print("  连带清理:     ", what)
+    if not left_sb:
+        print(f"{RED}  ⚠ sing-box 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
+    if not left_xr and have_xr:
+        print(f"{RED}  ⚠ xray 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
+    print("  订阅地址:      不变（客户端重拉一次订阅，被删的节点就消失了）")
+    print(f"{RED}  ⚠ 删掉的节点无法恢复，客户端里手动选中过它的要改回分组{OFF}")
+    print("-" * 60)
+    if (_ask("确认删除? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+
+    removed = []
+    for core, dels, left in (("sb", del_sb, left_sb), ("xray", del_xr, left_xr)):
+        if not dels:
+            continue
+        name, binpath, path, _tbl, _mk = _CORE_META[core]
+        cfg, ibs = _load_core_cfg(core)
+        if cfg is None:
+            continue
+        keep = [ib for ib in ibs if _ib_proto(ib) not in dels]
+        gone = [ib for ib in ibs if _ib_proto(ib) in dels]
+        if not gone:
+            print(f"  {name}: 配置里没找到要删的入站，跳过。")
+            continue
+        cfg["inbounds"] = keep
+        backup = path + ".bak"
+        try:
+            shutil.copyfile(path, backup)
+        except OSError:
+            backup = ""
+        json.dump(cfg, open(path, "w"), indent=2)
+        ok, msg = core_check(binpath, path)
+        if not ok:                                   # 删出来的配置都过不了校验 → 原样退回
+            if backup:
+                shutil.copyfile(backup, path)
+                os.remove(backup)
+            print(f"\n  ✗ {name} 配置校验失败，已回滚，什么都没删：\n{msg}")
+            return
+        try:
+            if keep:
+                sh(f"systemctl restart {name}")
+            else:
+                # 没有入站的核心留着只会空转（甚至起不来反复重启），停掉更干净；
+                # 以后再装协议时 write_service 会重新 enable，不用手动恢复。
+                sh(f"systemctl disable --now {name}", check=False)
+                print(f"  {name} 已无入站 → 服务已停止并禁用开机自启")
+        except Exception as e:
+            if backup:
+                shutil.copyfile(backup, path)
+                os.remove(backup)
+                sh(f"systemctl restart {name}", check=False)
+            print(f"\n  ✗ {name} 重启失败，已回滚：{e}")
+            return
+        if backup:
+            os.remove(backup)
+        removed += [ib.get("tag", "?") for ib in gone]
+
+    if not removed:
+        print("  没有删掉任何入站。")
+        return
+
+    # 入站已经删掉了，副作用清理再失败也不该把整个删除判为失败——逐个 try，
+    # 失败只红字报出来，让用户知道具体哪一样要手工收尾。
+    for td in teardowns:
+        try:
+            done = td()
+            if done:
+                print("  " + done)
+        except Exception as e:
+            print(f"{RED}  ⚠ 善后清理失败（{getattr(td, '__name__', td)}），"
+                  f"可能有残留，需手工确认：{e}{OFF}")
+
+    # 摘掉对应的分享链接（CDN 节点的协议段是 CDN·xxx，天然不会命中，不受影响）
+    targets = {("sb", p) for p in del_sb} | {("xray", p) for p in del_xr}
+    def _hit(u):
+        pr, co = _link_core_proto(u)
+        if not pr:
+            return False
+        return (co, pr) in targets if co else any(pr == q for _, q in targets)
+    links, tail = _node_file_parts()
+    kept = [u for u in links if not _hit(u)]
+    dropped = len(links) - len(kept)
+    with open(NODE_FILE, "w") as f:
+        f.write("\n".join(kept) + ("\n" if kept else ""))
+        if tail:
+            f.write(tail if tail.startswith("\n") else "\n" + tail)
+    try:
+        if read_saved_links():
+            build_subscription(read_saved_links(), new_token=False)
+        else:
+            print("  已无任何节点，订阅内容为空（订阅服务和地址保留）。")
+    except Exception as e:
+        print("  ⚠ 订阅刷新失败（节点已删，可到配置菜单点『更新配置』重试）:", e)
+
+    st.update({"sb": left_sb, "xray": left_xr})
+    try:
+        json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+    print("\n" + "=" * 60)
+    print(f"  已删除 {len(removed)} 个节点，摘掉 {dropped} 条分享链接")
+    print("=" * 60)
+    for t in removed:
+        print("   -", t)
+    if left_sb or left_xr:
+        print("\n  剩下的节点端口/UUID/订阅地址全部没动，客户端重拉一次订阅即可。")
+    else:
+        print("\n  本机已无代理节点。想重新装回来：主菜单 1 → 按向导走一遍。")
+        print("  （脚本本体、订阅服务、证书、CDN 节点都还在，没有卸载任何东西）")
 
 def install_flow():
     # 已装过：先把装了什么摆出来，再让用户选「只加新的」还是「全部重来」。
@@ -5884,13 +6414,18 @@ def install_flow():
         print("-" * 60)
         print("  1. 只添加新协议   老节点的端口/UUID/密码/订阅地址全部不变，推荐")
         print("  2. 全部重新安装   所有节点重新生成，订阅地址也会换，客户端要重新导入")
+        print("  3. 删除协议       只删选中的，其余节点不动（含清理 DNAT / nginx 反代）")
         print("  0. 返回")
-        # 回车默认 0：这两条都会动正在跑的节点，不该靠误按回车触发
-        ans = (_ask("选择 [1/2/0] (回车=0 返回): ") or "0").strip()
+        # 回车默认 0：这几条都会动正在跑的节点，不该靠误按回车触发
+        ans = (_ask("选择 [1/2/3/0] (回车=0 返回): ") or "0").strip()
         if ans == "0":
             print("已取消，返回主菜单。"); return
-        if ans != "2":
+        if ans == "3":
+            del_protocols_flow(st, have_sb, have_xr); return
+        if ans == "1":
             add_protocols_flow(st, have_sb, have_xr); return
+        if ans != "2":
+            print("无效选择，返回主菜单。"); return
         if (_ask("  全部重新安装会让现有客户端全部失效，确认? y 确认 / 回车取消: ")
                 or "n").strip().lower() not in ("y", "yes"):
             print("已取消，返回主菜单。"); return
@@ -5921,25 +6456,23 @@ def install_flow():
     _sni_rand = secrets.choice(REALITY_SNI_POOL)         # 回车就用这个随机挑的（不同机器各不同，不扎堆）
     sni = _ask(f"reality 借用目标站 SNI (回车=随机挑，本次随机到 {_sni_rand}): ") or _sni_rand
     prefix = _ask_free("节点名称前缀（如 🇺🇸/🇯🇵/家宽，回车=无前缀）：")
-    hy2p = ""
-    if "hy2" in sb_names:
-        hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000，自定义直接输数字，输 n 不用端口跳跃): ")
-    smux = ""
-    if _WS_FAMILY & set(sb_names):     # 只有选了 ws/httpupgrade 节点才问
-        ans = _ask("ws 类开启 smux 多路复用?(网页/小请求更快，大文件下载可能变慢) y开启/n不开(回车=不开): ")
-        smux = "1" if ans.lower() in ("y", "yes") else ""
+    # 各协议自己的设置（hy2 跳跃范围、ws 的 smux …）交给注册表的 asks 去问：
+    # 它们写进 G，所以得先把已经问到的填进 G，再 run_asks，最后读回来。
+    G["domain"], G["email"], G["sni"], G["prefix"] = domain, email, sni, prefix
+    G["nginx"], G["hy2_ports"], G["smux"] = nginx, "", ""
+    run_asks("install", sb_names, xr_names)
+    hy2p, smux = G["hy2_ports"], G["smux"]
     # 抗 GFW 封端口，两档（都让 reality 上 443）：
     #  sni-split（最强，需域名+reality-vision）：nginx SNI 分流，reality+网站/ws 全在 443；
     #  reality-443 直连（次之）：主力 reality 独占 443，nginx 仅留 :80 续期。
     r443 = ""; split = ""
-    if domain and "reality-vision" in sb_names:
+    if domain and SNI_SPLIT_BACKEND in sb_names:
         ans = _ask("用 nginx SNI 分流把 reality+网站全放到 443?(最强抗封锁, 会装 stream 模块) [Y/n]: ")
         split = "" if ans.lower() in ("n", "no") else "1"
     if not split and pick_reality_443(sb_names, xr_names)[0]:
         ans = _ask("把主力 reality 绑到 443 抗封锁?(推荐；会关闭 nginx 前置) [Y/n]: ")
         r443 = "" if ans.lower() in ("n", "no") else "1"
-    G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"] = domain, email, sni, prefix, hy2p
-    G["nginx"], G["reality443"], G["sni_split"], G["smux"] = nginx, r443, split, smux
+    G["reality443"], G["sni_split"] = r443, split
 
     reality443_proto = pick_reality_443(sb_names, xr_names)[0] if r443 else ""
     print("\n" + "-" * 60)
@@ -5954,11 +6487,11 @@ def install_flow():
     else:
         print("  nginx前置:", "是（443伪装站+webroot，ws类走443）" if nginx else "否")
     print("  名称前缀:", prefix or "(无)")
-    if _WS_FAMILY & set(sb_names):
-        print("  ws多路复用:", "开启 smux" if smux else "不开(默认)")
     print("  SNI:     ", sni)
-    if "hy2" in sb_names:
-        print("  hy2跳跃: ", hy2_range() or "关闭（固定单端口）")
+    for label, value in recap_lines(sb_names, xr_names):
+        if label == "借用 SNI":                 # 上面那行已经报过了，别重复
+            continue
+        print("  " + _pad(label + ":", 10) + str(value))
     print("-" * 60)
     if (_ask("确认开始? [Y/n]: ") or "y").lower() in ("n", "no"):
         print("已取消。"); return
