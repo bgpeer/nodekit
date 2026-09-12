@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.95"
+SCRIPT_VERSION = "1.0.96"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -6198,8 +6198,8 @@ def add_protocols_flow(st, have_sb, have_xr):
     print(f"  沿用上次安装的参数：域名 {G['domain'] or '(无，自签+IP)'}   "
           f"SNI {G['sni']}   前缀 {G['prefix'] or '(无)'}")
     if stale_sb or stale_xr:
-        print(f"  ⓘ {', '.join(dict.fromkeys(stale_sb + stale_xr))} 记录里写着、"
-              f"核心配置里却没有（上次多半删到一半被打断），已按【没装】列进可添加。")
+        print(f"  ⓘ {', '.join(dict.fromkeys(stale_sb + stale_xr))} "
+              f"安装记录里有、核心配置里却没有它的入站，已按【没装】列进可添加。")
 
     pick_sb, pick_xr = [], []
     if avail_sb:
@@ -6432,9 +6432,8 @@ def del_protocols_flow(st, have_sb, have_xr):
     if have_xr:
         print("  已装 xray:    ", _mark(have_xr, stale_xr))
     if stale_sb or stale_xr:
-        print("  ⓘ 标『残留』的：安装记录里写着，核心配置里却没有它的入站——上次多半"
-              "删到一半被打断了。\n"
-              "     删它会把订阅和记录里的残留一起清掉；也可以直接从『1 只添加新协议』"
+        print("  ⓘ 标『残留』的：安装记录里有，核心配置里却没有它的入站。\n"
+              "     删它会把订阅和记录里剩下的部分清掉；也可以直接从『1 只添加新协议』"
               "把它装回来。")
     print("-" * 60)
     print("  1. 选择删除")
@@ -6527,8 +6526,8 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
         if not gone:
             # 配置里本来就没有 ≠ 没事可做：记录和订阅里多半还留着它（上次删到一半
             # 被打断就是这样）。这里【不能 return】，否则那个协议永远删不掉也加不回来。
-            print(f"  {name}: 配置里没找到要删的入站——多半是上次删到一半被打断了，"
-                  f"这次把订阅和安装记录一起收拾干净。")
+            print(f"  {name}: 该协议的入站配置里已经没有了，"
+                  f"这次清理订阅和安装记录里剩下的部分。")
             stale += dels
             continue
         cfg["inbounds"] = keep
@@ -6605,7 +6604,7 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
     print(f"  已删除 {len(removed)} 个节点，摘掉 {dropped} 条分享链接")
     if stale:
         print(f"  （其中 {', '.join(dict.fromkeys(stale))} 的入站配置里本来就没有，"
-              f"这次是把残留的记录/链接清掉）")
+              f"这次清掉的是订阅和记录）")
     print("=" * 60)
     for t in removed:
         print("   -", t)
