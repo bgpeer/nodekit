@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, urllib.r
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.87"
+SCRIPT_VERSION = "1.0.88"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -5696,6 +5696,99 @@ def _ports_in_cfgs():
                 used.add(p)
     return used
 
+HY2_HOP_WIDTH = 1000        # 「自动挑一段」时用的宽度
+
+def _udp_ports_in_use(include_own=True):
+    """当前被 UDP 占用的端口 → {端口: 谁在用}。
+
+       只查 UDP：端口跳跃的 DNAT 是 `-p udp`（见 setup_port_hopping），
+       TCP 服务落在跳跃段里【完全不受影响】，把它们也报出来纯属虚惊一场。
+
+       include_own=False 用于全新安装——本脚本自己的节点马上要重建，
+       现在还在监听的那些不算冲突，否则每次重装都会误报一堆。"""
+    used = {}
+    if include_own:
+        for core in _CORE_META:
+            label = _CORE_META[core][0]
+            for ib in _load_core_cfg(core)[1]:
+                if ib.get("type") in ("hysteria2", "tuic"):      # sing-box 的 UDP 入站
+                    p = _cfg_port(ib)
+                    if p:
+                        used[p] = f"{label} 的 {ib.get('tag', '?')}"
+    for line in (sh("ss -lnup 2>/dev/null", check=False) or "").splitlines():
+        f = line.split()
+        if len(f) < 5:
+            continue
+        m = re.search(r":(\d+)$", f[4])
+        if not m:
+            continue
+        who = re.search(r'users:\(\("([^"]+)"', line)
+        name = who.group(1) if who else "未知程序"
+        if not include_own and name in ("sing-box", "xray"):
+            continue
+        used.setdefault(int(m.group(1)), f"{name}（正在监听 UDP）")
+    return used
+
+def _hop_conflicts(rng, include_own=True):
+    """跳跃段里有哪些 UDP 端口会被 DNAT 劫走 → [(端口, 谁)]，按端口排序。"""
+    try:
+        lo, hi = (int(x) for x in rng.split("-"))
+    except (ValueError, AttributeError):
+        return []
+    return sorted((p, who) for p, who in _udp_ports_in_use(include_own).items()
+                  if lo <= p <= hi)
+
+def _auto_hop_range(include_own=True, width=HY2_HOP_WIDTH):
+    """随机挑一段宽 width 的空闲 UDP 区间；实在挑不到返回 ''。
+       在 20000-60000 里挑：低端留给系统服务，高端留出余量装得下整段。"""
+    for _ in range(300):
+        start = secrets.randbelow(60000 - width - 20000) + 20000
+        rng = f"{start}-{start + width}"
+        if not _hop_conflicts(rng, include_own):
+            return rng
+    return ""
+
+def ask_hy2_range(cur="", include_own=True):
+    """问 hy2 跳跃范围，撞车就当场拦下来。返回要写进 G['hy2_ports'] 的值。
+
+       为什么值得专门做这一环：端口跳跃是把【整段 UDP】DNAT 给 hy2，段内任何别的
+       UDP 服务都会被悄悄劫走——tuic、WireGuard、DNS 都算。它的表现是「那个服务
+       忽然连不上」，两边日志干干净净，没人会往端口跳跃上想。装之前拦住，
+       比事后排查便宜得多。"""
+    RED, GRN, OFF = "\033[1;31m", "\033[1;32m", "\033[0m"
+    while True:
+        tip = f"回车沿用上次的 {cur}" if cur else f"回车=默认 {HY2_PORTS}"
+        raw = (_ask(f"  hy2 端口跳跃范围 起-止（{tip}，输 n 不用跳跃）: ").strip() or cur)
+        if raw.lower() in ("off", "n", "no", "none"):
+            return "n"
+        rng = raw if re.match(r"^\d+-\d+$", raw) else HY2_PORTS
+        lo, hi = (int(x) for x in rng.split("-"))
+        if lo >= hi or hi > 65535:
+            print(f"{RED}  ✗ {rng} 不是合法区间（要 起<止 且 ≤65535），重填。{OFF}")
+            cur = ""
+            continue
+        conflicts = _hop_conflicts(rng, include_own)
+        if not conflicts:
+            return rng
+        print(f"{RED}  ✗ 跳跃段 {rng} 和下面这些 UDP 服务重叠。整段 UDP 会被 DNAT 劫给 hy2，"
+              f"它们会悄无声息地连不上：{OFF}")
+        for p, who in conflicts:
+            print(f"{RED}      {p}   {who}{OFF}")
+        print(f"  1. 自动挑一段空闲的（宽 {HY2_HOP_WIDTH}）")
+        print("  2. 我自己重填")
+        print("  0. 不用端口跳跃（hy2 走固定单端口）")
+        c = _ask("  选择 [1/2/0]（回车=1）: ").strip() or "1"
+        if c == "0":
+            return "n"
+        if c == "1":
+            auto = _auto_hop_range(include_own)
+            if auto:
+                print(f"{GRN}  ✓ 已挑到空闲段 {auto}{OFF}")
+                return auto
+            print(f"{RED}  ✗ 20000-60000 里没找到连续 {HY2_HOP_WIDTH} 个都空闲的段，"
+                  f"请自己指定或选 0 关掉跳跃。{OFF}")
+        cur = ""          # 重填时不再默认沿用旧值，免得一回车又撞回原来那段
+
 def _installed_state():
     """读上次安装记录 → (state dict, sb 协议名 list, xray 协议名 list)。
        顺带把历史旧协议名映射成现名，免得「已装」判断漏掉老节点。"""
@@ -5764,9 +5857,7 @@ def add_protocols_flow(st, have_sb, have_xr):
             G["sni"] = ans
         precheck_sni(pick_sb, pick_xr)                  # 连通性预检，只警告不阻断
     if "hy2" in pick_sb:
-        cur = (G.get("hy2_ports") or "").strip()
-        tip = f"回车沿用上次的 {cur}" if cur else f"回车=默认 {HY2_PORTS}"
-        G["hy2_ports"] = _ask(f"  hy2 端口跳跃范围 起-止（{tip}，输 n 不用跳跃）: ").strip() or cur
+        G["hy2_ports"] = ask_hy2_range((G.get("hy2_ports") or "").strip(), include_own=True)
         if hy2_hop_on():
             print(f"  ⚠ 跳跃段 {hy2_range()} 的 \033[1mUDP 整段\033[0m 要在云厂商防火墙里放行，"
                   f"否则跳到的端口连不上（GCE/阿里云这类默认只放行你列过的端口）。")
@@ -5951,7 +6042,8 @@ def install_flow():
     prefix = _ask_free("节点名称前缀（如 🇺🇸/🇯🇵/家宽，回车=无前缀）：")
     hy2p = ""
     if "hy2" in sb_names:
-        hy2p = _ask("hy2 端口跳跃范围 起-止(回车=30000-31000，自定义直接输数字，输 n 不用端口跳跃): ")
+        # include_own=False：本脚本自己的节点马上要重建，现在监听着的不算冲突
+        hy2p = ask_hy2_range("", include_own=False)
     smux = ""
     if _WS_FAMILY & set(sb_names):     # 只有选了 ws/httpupgrade 节点才问
         ans = _ask("ws 类开启 smux 多路复用?(网页/小请求更快，大文件下载可能变慢) y开启/n不开(回车=不开): ")
