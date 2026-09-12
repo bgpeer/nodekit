@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.97"
+SCRIPT_VERSION = "1.0.98"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -164,6 +164,7 @@ CORE_CRON_LOG  = "/var/log/bgpeer-coreupdate.log"
 CERT_FIX_LOG   = "/var/log/bgpeer-certfix.log"   # 证书修复日志（转后台跑，SSH 断了也查得到）
 NODE_OP_LOG    = "/var/log/bgpeer-nodeop.log"    # 装/加/删协议日志（同上，转后台跑）
 NODE_OP_PLAN   = BGP_DIR + "/nodeop.json"        # 交互里选好的方案，交给后台那半程去执行
+CERT_META      = BGP_DIR + "/cert.json"          # 证书的事实来源（见 cert_meta）
 
 # ---------------------------------------------------------------------------- 基础工具
 def sh(cmd, check=True):
@@ -300,10 +301,18 @@ def _save_sub_port(p):
         pass                                    # 写不进（非 root 只读操作等）就靠服务文件兜底
 
 def public_ip():
+    """本机公网 IP；外网查不到就退回本地网卡；都拿不到返回 ''（不抛异常）。
+
+       别再 .split()[0] 直接取——出网被墙 + hostname -I 是空的时候那是 IndexError，
+       崩在调用方一脸茫然，而真实原因只是「这台机现在查不到自己的 IP」。"""
     try:
-        return urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode()
+        ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
+        if ip:
+            return ip
     except Exception:
-        return sh("hostname -I").split()[0]
+        pass
+    local = (sh("hostname -I", check=False) or "").split()
+    return local[0] if local else ""
 
 def new_uuid():   return str(uuid.uuid4())          # RFC4122 v4，两核心都接受
 def new_pw(n=16): return secrets.token_urlsafe(n)
@@ -5617,6 +5626,461 @@ def _cert_left_text(secs):
         return f"今天就到期（还剩 {max(secs // 3600, 1)} 小时）"
     return f"还剩 {d} 天到期"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 证书信息：把「这张证书到底什么情况」一次问清楚
+# ══════════════════════════════════════════════════════════════════════════════
+# 证书是全机共用的一块地基：节点(sing-box/xray)、订阅服务(xy-sub)、nginx 443、
+# AdGuard 的 DoT 都指着 /etc/ssl/sb/acme.crt。它一过期就是全部一起挂，而且谁都
+# 不会报「证书过期」，只会「连不上」。所以这里把每一环都查出来摆到面板上。
+
+def _sub_service_text():
+    """xy-sub 的 service 文件内容（读不到返回 ''）。用来判断订阅服务是不是在吃这张证书——
+       比调 _sub_https() 便宜得多，后者要查公网 IP，为画一行面板联一次网不值。"""
+    for p in ("/etc/systemd/system/xy-sub.service", "/lib/systemd/system/xy-sub.service"):
+        try:
+            return open(p).read()
+        except OSError:
+            continue
+    return ""
+
+def cert_meta():
+    """证书的事实来源：{domain, wildcard, mode}。
+
+       为什么单独存一份，而不是继续读 state.json：state.json 是【装节点时】才写的，
+       而证书可以先于节点装（也该允许）。没有 cert.json 时就从磁盘上的证书 + 安装记录
+       现推一份出来并落盘，老机器升级上来不用手工补。"""
+    try:
+        m = json.load(open(CERT_META))
+        if m.get("domain"):
+            return m
+    except Exception:
+        pass
+    m = {"domain": "", "wildcard": False, "mode": ""}
+    names = cert_names(ACME_CRT)
+    if names:
+        wild = [n for n in names if n.startswith("*.")]
+        m["wildcard"] = bool(wild)
+        m["domain"] = (wild[0][2:] if wild else names[0])
+        m["mode"] = _acme_mode(m["domain"]) or ("dns-cf" if wild else "standalone")
+    else:                                        # 没有 acme 证书 → 看看安装记录里有没有域名
+        try:
+            m["domain"] = json.load(open(STATE_FILE)).get("domain", "")
+        except Exception:
+            pass
+    if m["domain"]:
+        save_cert_meta(**m)
+    return m
+
+def save_cert_meta(**kw):
+    """更新 cert.json（只覆盖传进来的字段）。"""
+    try:
+        cur = json.load(open(CERT_META))
+    except Exception:
+        cur = {}
+    cur.update(kw)
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        json.dump(cur, open(CERT_META, "w"), ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return cur
+
+def cert_names(path=None):
+    """证书覆盖哪些域名（SAN 列表，含 *.x 泛域名）。读不出返回 []。"""
+    path = path or ACME_CRT
+    if not os.path.exists(path):
+        return []
+    out = sh(f"openssl x509 -in {path} -noout -text 2>/dev/null", check=False) or ""
+    m = re.search(r"Subject Alternative Name:\s*\n\s*(.+)", out)
+    if not m:
+        return []
+    return [x.strip()[4:] for x in m.group(1).split(",") if x.strip().startswith("DNS:")]
+
+_CA_NAMES = [("let's encrypt", "Let's Encrypt"), ("zerossl", "ZeroSSL"),
+             ("buypass", "Buypass"), ("google trust", "Google Trust Services"),
+             ("cloudflare", "Cloudflare"), ("digicert", "DigiCert"),
+             ("sectigo", "Sectigo"), ("amazon", "Amazon"), ("globalsign", "GlobalSign")]
+
+def cert_issuer(path=None):
+    """谁签的这张证书 → 人话名字；自签返回「自签」；读不出返回 ''。"""
+    path = path or ACME_CRT
+    if not os.path.exists(path):
+        return ""
+    iss = sh(f"openssl x509 -in {path} -noout -issuer 2>/dev/null", check=False) or ""
+    sub = sh(f"openssl x509 -in {path} -noout -subject 2>/dev/null", check=False) or ""
+    if iss[7:].strip() and iss[7:].strip() == sub[8:].strip():   # issuer == subject
+        return "自签"
+    low = iss.lower()
+    for key, name in _CA_NAMES:
+        if key in low:
+            return name
+    m = re.search(r"\bO\s*=\s*([^,/]+)", iss)              # 认不出就把 O= 原样报出来
+    return m.group(1).strip() if m else ""
+
+def cert_key_ok(crt, key):
+    """私钥和证书是不是一对（公钥指纹比对）。任一读不出都返回 False。"""
+    a = sh(f"openssl x509 -in {crt} -noout -pubkey 2>/dev/null", check=False)
+    b = sh(f"openssl pkey -in {key} -pubout 2>/dev/null", check=False)
+    return bool(a) and a.strip() == (b or "").strip()
+
+def _acme_conf(dom):
+    """acme.sh 里这个域名的记录文件（ecc 优先）；找不到返回 ''。"""
+    base = os.path.expanduser("~/.acme.sh")
+    for d in (f"{base}/{dom}_ecc/{dom}.conf", f"{base}/{dom}/{dom}.conf"):
+        if os.path.exists(d):
+            return d
+    return ""
+
+def _acme_mode(dom):
+    """acme.sh 记着的验证方式：dns-cf / webroot / standalone；没记录返回 ''。"""
+    c = _acme_conf(dom)
+    if not c:
+        return ""
+    try:
+        txt = open(c).read()
+    except OSError:
+        return ""
+    m = re.search(r"^Le_Webroot=['\"]?([^'\"\n]*)", txt, re.M)
+    v = (m.group(1) if m else "").strip()
+    if v.startswith("dns_"):
+        return "dns-cf" if v == "dns_cf" else v          # 别的 DNS 插件原样报出来
+    return "webroot" if v and v != "no" else "standalone"
+
+def _acme_hook_ok(dom):
+    """acme.sh 里这个域名记没记 reloadcmd。没记 = 续期后服务不会重读证书。"""
+    c = _acme_conf(dom)
+    if not c:
+        return False
+    try:
+        return bool(re.search(r"^Le_ReloadCmd=['\"]?.+", open(c).read(), re.M))
+    except OSError:
+        return False
+
+def _acme_cron_ok():
+    """acme.sh 的每日续期任务在不在 crontab 里。"""
+    return "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or "")
+
+def _emby_cert():
+    """Emby 那张证书（自建 Emby 用的是 /etc/nginx/certs/<域名>.crt）→ (域名, 剩余秒)。
+       没装 Emby 或没配域名返回 ('', None)。"""
+    for envf in ("/opt/emby-stack/.env", "/opt/media-stack/.env"):
+        try:
+            m = re.search(r"^DOMAIN=(.*)$", open(envf).read(), re.M)
+        except OSError:
+            continue
+        dom = (m.group(1).strip().strip('"\'') if m else "")
+        if dom:
+            return dom, _cert_secs_left(f"/etc/nginx/certs/{dom}.crt")
+    return "", None
+
+def cert_info():
+    """把证书的方方面面查出来，给面板用。纯读，不改任何东西。"""
+    meta = cert_meta()
+    dom = meta.get("domain", "")
+    names = cert_names()
+    secs = _cert_secs_left()
+    emby_dom, emby_secs = _emby_cert()
+    return {
+        "domain": dom,
+        "wildcard": any(n.startswith("*.") for n in names),
+        "names": names,
+        "issuer": cert_issuer(),
+        "secs": secs,
+        "exists": os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY),
+        "key_ok": cert_key_ok(ACME_CRT, ACME_KEY) if os.path.exists(ACME_KEY) else False,
+        "mode": meta.get("mode") or (_acme_mode(dom) if dom else ""),
+        "cron_ok": _acme_cron_ok(),
+        "hook_ok": _acme_hook_ok(dom) if dom else False,
+        "emby_domain": emby_dom,
+        "emby_secs": emby_secs,
+        "selfsigned": os.path.exists(CERT) and not os.path.exists(ACME_CRT),
+    }
+
+_MODE_TEXT = {"standalone": "HTTP-01 独占 80 端口", "webroot": "HTTP-01 走 nginx webroot",
+              "dns-cf": "DNS-01 Cloudflare（可签泛域名，不占端口）"}
+
+def _left_color(secs):
+    """剩余天数的颜色：>30 绿 / 7-30 黄 / <7 或已过期 红。"""
+    if secs is None:
+        return "\033[1;31m"
+    d = secs / 86400
+    return "\033[1;32m" if d > 30 else ("\033[1;33m" if d >= 7 else "\033[1;31m")
+
+def cert_panel(info=None):
+    """把证书状况摆出来。只读，不改任何东西。"""
+    C, Y, R, B, N = "\033[1;36m", "\033[1;33m", "\033[1;31m", "\033[1m", "\033[0m"
+    i = info or cert_info()
+    print("\n" + "=" * 60)
+    print("  证书管理")
+    print("=" * 60)
+    if not i["exists"]:
+        if i["selfsigned"]:
+            print(f"  {Y}当前：自签证书{N}（没有域名）。自签能用，但客户端要开 allowInsecure，")
+            print("        且自签本身就是明显特征。有域名的话建议装一张真证书。")
+        else:
+            print(f"  {Y}当前：还没有证书。{N}")
+        print("-" * 60)
+        return i
+    lc = _left_color(i["secs"])
+    print(f"  域名:      {B}{i['domain'] or '(读不出)'}{N}"
+          + (f"   {C}泛域名{N}" if i["wildcard"] else ""))
+    print(f"  颁发机构:  {B}{i['issuer'] or '(读不出)'}{N}")
+    print(f"  有效期:    {lc}{_cert_left_text(i['secs'])}{N}")
+    mode = _MODE_TEXT.get(i["mode"], i["mode"] or "(读不出)")
+    auto = i["cron_ok"] and i["hook_ok"]
+    print(f"  续期模式:  {'自动' if auto else Y + '不完整' + N}   {mode}")
+    if not i["cron_ok"]:
+        print(f"    {R}✗ crontab 里没有 acme.sh 的每日续期任务 —— 到期不会自动重签{N}")
+    if not i["hook_ok"]:
+        print(f"    {R}✗ acme.sh 没记 reloadcmd —— 就算重签了，节点/订阅也不会重读新证书{N}")
+    if not i["key_ok"]:
+        print(f"    {R}✗ 私钥和证书对不上 —— 握手会直接失败{N}")
+    if i["names"]:
+        print(f"  覆盖域名:  {', '.join(i['names'])}")
+    users = [n for n, ok in (("sing-box", os.path.exists(SB_BIN)),
+                             ("xray", os.path.exists(XRAY_BIN)),
+                             ("订阅服务", ACME_CRT in _sub_service_text()),
+                             ("nginx", os.path.exists(NGINX_CONF)),
+                             ("AdGuard", os.path.exists("/opt/AdGuardHome/AdGuardHome"))) if ok]
+    if users:
+        print(f"  正在使用:  {', '.join(users)}")
+    if i["emby_domain"]:
+        ec = _left_color(i["emby_secs"])
+        same = i["emby_domain"] in (i["names"] or []) or (
+            i["wildcard"] and i["emby_domain"].endswith("." + i["domain"]))
+        print(f"  Emby 证书: {i['emby_domain']}   {ec}{_cert_left_text(i['emby_secs'])}{N}"
+              + (f"   {C}已被本证书覆盖{N}" if same else "   （另一张，独立续期）"))
+    print("-" * 60)
+    return i
+
+def cert_validate(crt, key, domain):
+    """新签出来的证书能不能用 → (ok, 说明)。装上去之前必须全过，一条不过就别碰现有的。
+
+       四件事都要查，少一件就可能把一台好机器换成连不上：
+         ① 文件在不在、解析得开        ② 覆盖不覆盖这个域名（含泛域名）
+         ③ 是不是已经过期              ④ 私钥跟证书配不配对
+       ④ 尤其阴：签发中断时很容易留下新证书配旧私钥，握手直接失败，
+       但文件看着一切正常、日期也没问题。"""
+    if not (os.path.exists(crt) and os.path.exists(key)):
+        return False, "证书或私钥文件没生成"
+    names = cert_names(crt)
+    if not names:
+        return False, "证书解析不开（文件损坏或不是证书）"
+    if not _name_covers(names, domain):
+        return False, f"这张证书覆盖的是 {', '.join(names)}，不含 {domain}"
+    secs = _cert_secs_left(crt)
+    if secs is None:
+        return False, "读不出有效期"
+    if secs <= 0:
+        return False, "签出来就是过期的"
+    if not cert_key_ok(crt, key):
+        return False, "私钥和证书对不上（握手会直接失败）"
+    return True, f"覆盖 {', '.join(names)}，{_cert_left_text(secs)}"
+
+def _name_covers(names, domain):
+    """SAN 列表覆不覆盖这个域名（泛域名只顶一级，跟浏览器/客户端的判定一致）。"""
+    d = (domain or "").lower().strip(".")
+    for n in [x.lower().strip(".") for x in names]:
+        if n == d:
+            return True
+        if n.startswith("*.") and d.endswith(n[1:]) and "." not in d[:-len(n[1:])]:
+            return True
+    return False
+
+def _cert_consumers():
+    """吃 /etc/ssl/sb/acme.crt 的服务，换完证书要让它们重读。"""
+    return [n for n in ("nginx", "sing-box", "xray", "xy-sub", "AdGuardHome")
+            if os.path.exists(f"/etc/systemd/system/{n}.service")
+            or os.path.exists(f"/lib/systemd/system/{n}.service")]
+
+def cert_install_flow(info):
+    """菜单 15 → 1 安装证书。交互问完，真动手那半程转后台（重启核心会掐断 SSH）。"""
+    Y, R, N = "\033[1;33m", "\033[1;31m", "\033[0m"
+    if info["exists"]:
+        print(f"\n  已经装着 {info['domain']} 的证书了（{_cert_left_text(info['secs'])}）。")
+        print("  想重新签一张：选『2 强制重签』。")
+        print("  想换成别的域名：这一步还没做，先走『1 节点安装 → 2 全部重新安装』填新域名。")
+        _ask("  按回车返回...")
+        return
+    dom = _ask("\n  域名（要先把 A 记录解析到本机公网 IP）: ").strip().lower().rstrip(".")
+    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
+        print("  域名格式不对，已取消。")
+        return
+    print("\n  验证方式：")
+    print("   1 HTTP-01（默认）  用 80 端口验证，只签这一个域名，不用任何密钥")
+    print("   2 DNS-01 泛域名    用 Cloudflare API 验证，签 *." + dom + "，不占端口，")
+    print("                      Emby / 子域名都能共用同一张")
+    w = (_ask("  选择 [1/2]（回车=1）: ") or "1").strip()
+    cf_token = ""
+    wildcard = (w == "2")
+    if wildcard:
+        if _acme_has_cf():
+            print("  ✓ acme.sh 里已经存着 Cloudflare 凭据，直接用。")
+        else:
+            print("  需要一个 Cloudflare API Token（后台 → 我的个人资料 → API 令牌 →")
+            print("  创建令牌 → 用「编辑区域 DNS」模板，区域选这个域名）")
+            cf_token = _ask("  粘贴 Token: ").strip()
+            if not cf_token:
+                print("  没填 Token，已取消。")
+                return
+    # 解析检查只对 HTTP-01 有意义：DNS-01 不需要域名指向本机
+    if not wildcard:
+        try:
+            got = sorted({x[4][0] for x in socket.getaddrinfo(dom, None)})
+        except Exception:
+            got = []
+        mine = public_ip()
+        if mine not in got:
+            print(f"{R}  ✗ {dom} 解析到 {', '.join(got) or '(查不到)'}，不是本机 {mine}。{N}")
+            print("    HTTP-01 验证要求域名指向本机，先改好解析再来。")
+            return
+        print(f"  ✓ 解析检查通过：{dom} → {mine}")
+    print("\n" + "-" * 60)
+    print(f"  域名:      {dom}" + ("   （泛域名 *." + dom + "）" if wildcard else ""))
+    print(f"  验证方式:  {_MODE_TEXT['dns-cf' if wildcard else 'standalone']}")
+    print(f"  签发机构:  Let's Encrypt")
+    print(f"  装到:      {ACME_CRT}")
+    print(f"  完成后:    {'、'.join(_cert_consumers()) or '(暂无服务)'} 会重读证书")
+    print(f"{Y}  ⚠ 重启这些服务会掐断代理链路，挂着本机代理连的 SSH 会断——"
+          f"不用管，后台会跑完。{N}")
+    print("-" * 60)
+    if (_ask("确认签发? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消。")
+        return
+    plan = {"op": "cert-install", "domain": dom, "wildcard": wildcard,
+            "cf_token": cf_token, "G": dict(G)}
+    _node_op_dispatch(plan, lambda: cert_install_apply(dom, wildcard, cf_token))
+
+def _acme_has_cf():
+    """acme.sh 的 account.conf 里存没存过 Cloudflare 凭据。"""
+    for c in (os.path.expanduser("~/.acme.sh/account.conf"), "/root/.acme.sh/account.conf"):
+        try:
+            if re.search(r"^SAVED_CF_(Token|Key)=.+", open(c).read(), re.M):
+                return True
+        except OSError:
+            continue
+    return False
+
+def cert_install_apply(dom, wildcard, cf_token):
+    """真正签发+安装（非交互，后台跑）。装上去之前先验，验不过绝不碰现有证书。"""
+    G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print("  正在安装 acme.sh…")
+        sh("curl -s https://get.acme.sh | sh -s email=" + (G.get("email") or "a@a.com"),
+           check=False)
+    if not os.path.exists(acme):
+        print(f"{R}  ✗ acme.sh 装不上（检查能不能访问 get.acme.sh），已放弃，"
+              f"现有证书没动。{N}")
+        return
+    sh(f"{acme} --register-account -m {G.get('email') or 'a@a.com'} --server letsencrypt",
+       check=False)
+    sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
+
+    env = dict(os.environ)
+    if cf_token:
+        env["CF_Token"] = cf_token
+    if wildcard:
+        issue = (f"{acme} --issue --dns dns_cf --keylength ec-256 "
+                 f"-d '{dom}' -d '*.{dom}' --server letsencrypt")
+    else:
+        hooks = ""
+        owner = _port80_owner()
+        if owner and "nginx" not in owner:
+            print(f"{R}  ✗ 80 端口被 {owner} 占着，HTTP-01 验证进不来。先停掉它。{N}")
+            return
+        if owner:
+            # 让 acme 自己停一下 nginx，别去改用户的 nginx 配置——那份 conf 可能同时装着
+            # 443 伪装站 / ws 反代 / Emby，重写它比证书过期还糟。hook 会被记进域名记录，
+            # 以后自动续期也照做。
+            hooks = " --pre-hook 'systemctl stop nginx' --post-hook 'systemctl start nginx'"
+            print("  80 端口被 nginx 占着 → 验证时自动停一下 nginx（约 10 秒）")
+        issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256{hooks}"
+    print("  正在签发…（走 acme.sh，可能要十几秒到一分钟）")
+    r = subprocess.run(issue, shell=True, text=True, capture_output=True, env=env, timeout=600)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    # acme.sh 在证书仍有效时会以退出码 2「跳过签发」，那不是错误；能导出就算成功。
+    skipped = any(k in out for k in ("Domains not changed", "Skipping", "Next renewal time",
+                                     "Cert success"))
+    if r.returncode and not skipped:
+        print(f"{R}  ✗ 签发失败，现有证书没动：{N}\n" + out[-1200:])
+        return
+
+    # 先导到临时路径验一遍，验过了才动真的——这一步是「不可用就回退」的关键
+    tmpc, tmpk = ACME_CRT + ".new", ACME_KEY + ".new"
+    os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
+    sh(f"{acme} --install-cert -d {dom} --ecc "
+       f"--fullchain-file {tmpc} --key-file {tmpk}", check=False)
+    ok, why = cert_validate(tmpc, tmpk, dom)
+    if not ok:
+        for p in (tmpc, tmpk):
+            try: os.remove(p)
+            except OSError: pass
+        print(f"{R}  ✗ 新证书没通过校验（{why}），已丢弃，现有证书没动。{N}")
+        return
+    print(f"  ✓ 新证书校验通过：{why}")
+    _cert_swap_in(tmpc, tmpk, dom, wildcard)
+
+def _cert_swap_in(tmpc, tmpk, dom, wildcard):
+    """把验过的新证书换上去，顺带记 reloadcmd、补续期任务、让吃证书的服务重读。
+       换的过程带备份：任一步失败就把旧的放回去并重启回来。"""
+    G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
+    bak = {}
+    for src, dst in ((tmpc, ACME_CRT), (tmpk, ACME_KEY)):
+        if os.path.exists(dst):
+            bak[dst] = dst + ".bak"
+            shutil.copyfile(dst, bak[dst])
+        shutil.move(src, dst)
+    try:
+        # reloadcmd 记进 acme.sh：没有它，以后自动续期换了磁盘上的证书，
+        # sing-box/xray/xy-sub 还捏着启动时读进内存的旧证书，90 天一到全挂。
+        sh(f"{os.path.expanduser('~/.acme.sh/acme.sh')} --install-cert -d {dom} --ecc "
+           f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
+        _ensure_cron_running()
+        if not _acme_cron_ok():
+            sh(f"{os.path.expanduser('~/.acme.sh/acme.sh')} --install-cronjob", check=False)
+        save_cert_meta(domain=dom, wildcard=wildcard,
+                       mode="dns-cf" if wildcard else _acme_mode(dom) or "standalone")
+        svcs = _cert_consumers()
+        if svcs:
+            print(f"  让这些服务重读证书：{'、'.join(svcs)}")
+            for svc in svcs:
+                sh(f"systemctl restart {svc}", check=False)
+    except Exception as e:
+        for dst, b in bak.items():
+            shutil.copyfile(b, dst)
+        for svc in _cert_consumers():
+            sh(f"systemctl restart {svc}", check=False)
+        print(f"{R}  ✗ 换证书过程出错（{e}），已还原成原来那张并重启回来。{N}")
+        return
+    for b in bak.values():
+        try: os.remove(b)
+        except OSError: pass
+    i = cert_info()
+    print(f"\n{G_OK}  ✓ 证书已装好{N}")
+    print(f"    域名 {i['domain']}" + ("（泛域名）" if i["wildcard"] else ""))
+    print(f"    签发 {i['issuer']}   {_cert_left_text(i['secs'])}")
+    print(f"    自动续期 {'已配好' if i['cron_ok'] and i['hook_ok'] else '仍不完整，回面板看提示'}")
+    if not _installed_state()[1] and not _installed_state()[2]:
+        print("    还没装节点：去『1 节点安装』，向导会认出这张证书直接用，不再重复申请。")
+
+def cert_menu():
+    """菜单 15：证书管理。"""
+    while True:
+        i = cert_panel()
+        print(f"  1 安装证书      当前：{'已安装' if i['exists'] else '未安装'}")
+        print("  2 强制重签      重新签一张并让所有服务重读（到期前后、或怀疑证书坏了时用）")
+        print("  0 返回")
+        c = (_ask("选择 [1/2/0]（回车=0 返回）: ") or "0").strip()
+        if c == "0" or c == "":
+            return
+        if c == "1":
+            cert_install_flow(i)
+        elif c == "2":
+            cert_fix()
+        else:
+            print("  无效选择。")
+
 def cert_fix_run():
     """真正干活的那部分（非交互）。菜单入口把它派到独立会话里跑，见 cert_fix()。
 
@@ -5797,7 +6261,8 @@ def _node_op_dispatch(plan, fallback):
 
 def node_op_run():
     """CLI 子命令 node-op：读出落盘的方案，真正执行装/加/删。见 _node_op_dispatch。"""
-    _TITLE = {"install": "全新安装", "add": "添加协议", "del": "删除协议"}
+    _TITLE = {"install": "全新安装", "add": "添加协议", "del": "删除协议",
+              "cert-install": "安装证书"}
     try:
         plan = json.load(open(NODE_OP_PLAN))
     except Exception as e:
@@ -5809,7 +6274,9 @@ def node_op_run():
     print("=" * 60)
     G.update(plan.get("G") or {})
     try:
-        if plan["op"] == "install":
+        if plan["op"] == "cert-install":
+            cert_install_apply(plan["domain"], plan["wildcard"], plan.get("cf_token", ""))
+        elif plan["op"] == "install":
             run(plan["sb"], plan["xray"])
         else:
             st, have_sb, have_xr = _installed_state()
@@ -5896,7 +6363,7 @@ def main_menu():
         print("  12. 网络优化（BBR/QoS 内核调优）")
         print("  13. 自建DNS（AdGuard Home·全设备去广告）")
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
-        print("  15. 修复 TLS 证书（续期 + 重启吃证书的服务·90天到期前后用）")
+        print("  15. 证书管理（查看状态 / 安装证书 / 强制重签·节点和 Emby 都吃它）")
         print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
         print("  18. 更新脚本（不影响节点）")
@@ -5922,7 +6389,7 @@ def main_menu():
         elif c == "12":  net_optimize_menu()
         elif c == "13":  adguard_menu()
         elif c == "14":  ghrelay_menu()
-        elif c == "15":  cert_fix()
+        elif c == "15":  cert_menu()
         elif c == "16":  media_stack_menu()
         elif c == "17":  vps_check_menu()
         elif c == "18":  update_script()
@@ -6699,7 +7166,18 @@ def install_flow():
     if not sb_names and not xr_names:
         print("没选任何协议，退出。"); return
 
-    domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
+    # 证书可能是先在『15 证书管理』里装好的（那边不需要先有节点）。这里认出来，
+    # 把域名直接摆上、回车即用，免得手打错一个字符就变成重新申请一张。
+    _ci = cert_info()
+    if _ci["exists"] and _ci["domain"]:
+        print(f"\n  \033[1;32m✓ 检测到已安装证书\033[0m：{_ci['domain']}"
+              + ("（泛域名）" if _ci["wildcard"] else "")
+              + f"   {_ci['issuer']}   {_cert_left_text(_ci['secs'])}")
+        print("    节点直接用它，不会重新申请。回车即用这个域名；想换别的就直接输。")
+        domain = _ask(f"域名（回车=用 {_ci['domain']}，输 n = 不用域名走自签）: ").strip()
+        domain = _ci["domain"] if not domain else ("" if domain.lower() == "n" else domain)
+    else:
+        domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
     email = ""   # 证书自动续期、默认占位邮箱即可签发，不再交互问；想指定用命令行 --email
     nginx = ""
     if domain:
