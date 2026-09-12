@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.93"
+SCRIPT_VERSION = "1.0.94"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -162,6 +162,8 @@ SELF_LOCAL     = BGP_DIR + "/xy-installer.py"    # 本地脚本副本（cron 调
 CORE_CRON_FILE = "/etc/cron.d/bgpeer-coreupdate" # 每月定点更新内核的 cron
 CORE_CRON_LOG  = "/var/log/bgpeer-coreupdate.log"
 CERT_FIX_LOG   = "/var/log/bgpeer-certfix.log"   # 证书修复日志（转后台跑，SSH 断了也查得到）
+NODE_OP_LOG    = "/var/log/bgpeer-nodeop.log"    # 装/加/删协议日志（同上，转后台跑）
+NODE_OP_PLAN   = BGP_DIR + "/nodeop.json"        # 交互里选好的方案，交给后台那半程去执行
 
 # ---------------------------------------------------------------------------- 基础工具
 def sh(cmd, check=True):
@@ -3033,17 +3035,40 @@ def detect_existing():
         found.append((f[:-8], exe))
     return found
 
-def takeover_cleanup():
-    """检测到别人装的节点就卸掉、由本脚本接管。破坏性操作，需确认（--yes 免交互）。"""
-    units = detect_existing()
-    dirs  = [p for p in ("/etc/v2ray-agent",) if os.path.isdir(p)]   # mack-a 目录
+def takeover_targets():
+    """本机有哪些『别人搭建』的代理残留 → (systemd 单元, 目录)。"""
+    return detect_existing(), [p for p in ("/etc/v2ray-agent",) if os.path.isdir(p)]
+
+def takeover_confirm():
+    """前台问一次要不要卸载接管；同意返回 True。没有残留也返回 True（无事可问）。
+
+       为什么要单独拆出来：安装那半程是转后台跑的（见 _node_op_dispatch），后台没有
+       控制终端，这个问题问不出来。所以在前台问掉，同意了就置 G['force']，
+       后台跑到 takeover_cleanup 时直接动手、不再问。"""
+    units, dirs = takeover_targets()
     if not units and not dirs:
-        return
+        return True
+    _print_takeover_targets(units, dirs)
+    ans = _ask("卸载它们、由本脚本接管？删除后不可恢复。同意删除并继续安装[y]，放弃则不安装[N]: ")
+    if ans.lower() not in ("y", "yes"):
+        print("已放弃：保留现有安装，未做任何改动，退出。")
+        return False
+    G["force"] = "1"
+    return True
+
+def _print_takeover_targets(units, dirs):
     print("\n检测到本机已有『别人搭建』的代理安装：")
     for u, path in units:
         print(f"  - 服务 {u}.service  →  {path}")
     for p in dirs:
         print(f"  - 目录 {p}（疑似 mack-a / v2ray-agent）")
+
+def takeover_cleanup():
+    """检测到别人装的节点就卸掉、由本脚本接管。破坏性操作，需确认（--yes 免交互）。"""
+    units, dirs = takeover_targets()
+    if not units and not dirs:
+        return
+    _print_takeover_targets(units, dirs)
     if not G.get("force"):
         ans = _ask("卸载它们、由本脚本接管？删除后不可恢复。同意删除并继续安装[y]，放弃则不安装[N]: ")
         if ans.lower() not in ("y", "yes"):
@@ -3551,6 +3576,7 @@ def _xray_heal_minclientver(restart=True):
 
 CORE_DONE_MARK = "本次更新结束"     # 前台跟随日志时用它判断后台已跑完
 CERT_DONE_MARK = "本次证书修复结束"  # 同上，证书修复用
+NODE_OP_MARK   = "本次节点操作结束"  # 同上，装/加/删协议用
 
 def update_cores_auto(only=None):
     """非交互更新已安装的内核到最新并重启。起不来会记进日志。
@@ -5674,6 +5700,134 @@ def cert_fix_run():
         print("  ⚠ 续期后证书仍不正常。常见原因：域名解析没指向本机、80 端口被占（standalone 验证要用）。")
     print(CERT_DONE_MARK)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 转后台执行：凡是会重启 sing-box / xray 的操作，都得脱离 SSH 的控制终端跑
+# ══════════════════════════════════════════════════════════════════════════════
+# 你多半是【挂着本机代理在管这台机】的：手机上开着代理，SSH 也走同一条隧道。
+# 核心一重启，隧道当场断，SSH 跟着断，前台这个 python 进程收到 SIGHUP 就死在半路。
+# 表现最难看的是删除：入站已经从 config.json 里摘掉、服务也重启了，但摘分享链接、
+# 刷订阅、写 state.json 这几步还没跑——下次进来一看「协议还在列表里，节点却没了」。
+#
+# start_new_session=True 起一个新会话（setsid），进程脱离控制终端，SIGHUP 打不到它，
+# SSH 断了服务端照样跑完。前台只是【跟日志】，跟丢了无所谓，重连 tail 一下就看得到。
+
+def _log_size(path):
+    try:
+        return os.path.getsize(path) if os.path.exists(path) else 0
+    except OSError:
+        return 0
+
+def _self_script():
+    """能拿来重新调起本脚本的真实文件路径；没有就返回 ''（调用方据此退回前台）。
+
+       优先当前正在跑的这个文件（bgpeer 快捷命令 exec 的就是 SELF_LOCAL，天然最新），
+       其次本地副本。`curl … | python3` 这种管道跑法没有真实文件，两个都落空——
+       那是【首次安装】的场景，本机还没有代理，SSH 不会被自己掐断，前台跑正合适。"""
+    try:
+        p = os.path.abspath(__file__)
+        if os.path.isfile(p):
+            return p
+    except NameError:
+        pass
+    return SELF_LOCAL if os.path.isfile(SELF_LOCAL) else ""
+
+def _spawn_detached(subcmd, log):
+    """把本脚本的某个子命令派到独立会话里跑，输出追加进 log。返回是否派出去了。"""
+    script = _self_script()
+    if not script:
+        print("  本机没有脚本副本（管道直接运行），无法转后台。")
+        return False
+    try:
+        subprocess.Popen(                         # -u：不缓冲，日志逐行落盘前台才跟得上
+            f"python3 -u {script} {subcmd} >> {log} 2>&1",
+            shell=True, start_new_session=True,
+            # stdin 也要掐掉：后台没有终端，万一有哪一步想问点什么，
+            # 得当场 EOF 走兜底，而不是挂在一个已经死掉的 SSH 上干等。
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        print("  转后台失败:", e)
+        return False
+
+def _follow_log(log, start, mark, minutes=5):
+    """从 start 处实时跟随日志，看到 mark 就收工。断了/等烦了都不影响后台。"""
+    pos, deadline = start, time.time() + minutes * 60
+    try:
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                if os.path.getsize(log) <= pos:
+                    continue
+                with open(log, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+            except OSError:
+                continue
+            text = chunk.decode("utf-8", "replace")
+            print("  " + text.rstrip("\n").replace("\n", "\n  "))
+            if mark in text:
+                return True
+        print(f"\n  等了 {minutes} 分钟还没跑完，后台仍在继续。稍后看日志: tail {log}")
+    except KeyboardInterrupt:
+        print(f"\n  已退出跟随，后台继续执行。稍后看日志: tail {log}")
+    return False
+
+def _node_op_dispatch(plan, fallback):
+    """把交互里选好的方案落盘 → 派到后台跑 → 前台跟日志。
+
+       fallback 是派不出去时的兜底：宁可断线，也不能把活儿做一半。"""
+    os.makedirs(BGP_DIR, exist_ok=True)
+    try:
+        json.dump(plan, open(NODE_OP_PLAN, "w"), ensure_ascii=False, indent=2)
+    except OSError as e:
+        print("  方案写不进磁盘，改在前台直接执行:", e)
+        fallback()
+        return
+    start = _log_size(NODE_OP_LOG)
+    if not _spawn_detached("node-op", NODE_OP_LOG):
+        print("  改在前台直接执行（要是断线了，重连进来看一眼结果）：")
+        fallback()
+        return
+    print(f"\n  已转入后台执行（断开 SSH 也会在服务端跑完）。日志: {NODE_OP_LOG}")
+    print("  ⚠ 重启核心会掐断代理链路，你挂着本机代理连的 SSH 多半就断在这一步——")
+    print("    不用管，后台会把整件事做完。重连进来 tail 上面这个文件就能看到结果。\n")
+    _follow_log(NODE_OP_LOG, start, NODE_OP_MARK)
+
+def node_op_run():
+    """CLI 子命令 node-op：读出落盘的方案，真正执行装/加/删。见 _node_op_dispatch。"""
+    _TITLE = {"install": "全新安装", "add": "添加协议", "del": "删除协议"}
+    try:
+        plan = json.load(open(NODE_OP_PLAN))
+    except Exception as e:
+        print("  读不出待执行的方案:", e)
+        print(NODE_OP_MARK)
+        return
+    print("\n" + "=" * 60)
+    print(f"  {time.strftime('%Y-%m-%d %H:%M:%S')}  {_TITLE.get(plan.get('op'), '?')}")
+    print("=" * 60)
+    G.update(plan.get("G") or {})
+    try:
+        if plan["op"] == "install":
+            run(plan["sb"], plan["xray"])
+        else:
+            st, have_sb, have_xr = _installed_state()
+            if plan["op"] == "del":
+                _del_apply(st, plan["del_sb"], plan["del_xr"], have_sb, have_xr)
+            else:
+                _add_apply(st, plan["pick_sb"], plan["pick_xr"], have_sb, have_xr)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print("  ✗ 执行出错:", e)
+    finally:
+        try:
+            os.remove(NODE_OP_PLAN)               # 别留着，免得下次误跑一遍旧方案
+        except OSError:
+            pass
+        print(NODE_OP_MARK)
+
 def cert_fix():
     """菜单入口：确认后把修复派到独立会话里跑，前台只负责跟日志。
 
@@ -5699,41 +5853,14 @@ def cert_fix():
     if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
         print("  已取消。")
         return
-    try:
-        start = os.path.getsize(CERT_FIX_LOG) if os.path.exists(CERT_FIX_LOG) else 0
-    except OSError:
-        start = 0
-    try:
-        subprocess.Popen(                                # -u：不缓冲，日志逐行落盘才跟得上
-            f"python3 -u {SELF_LOCAL} cert-fix >> {CERT_FIX_LOG} 2>&1",
-            shell=True, start_new_session=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        print("\n  转后台失败，改在前台直接修:", e)      # 兜底：宁可断线，也不能不修
+    start = _log_size(CERT_FIX_LOG)
+    if not _spawn_detached("cert-fix", CERT_FIX_LOG):
+        print("  改在前台直接修。")                      # 兜底：宁可断线，也不能不修
         cert_fix_run()
         return
     print(f"\n  已转入后台执行（断开 SSH 也会在服务端跑完）。日志: {CERT_FIX_LOG}")
     print("  下面实时跟随进度，断了就断了，重连后 tail 这个文件即可：\n")
-    pos, deadline = start, time.time() + 300
-    try:
-        while time.time() < deadline:
-            time.sleep(1)
-            try:
-                if os.path.getsize(CERT_FIX_LOG) <= pos:
-                    continue
-                with open(CERT_FIX_LOG, "rb") as f:
-                    f.seek(pos)
-                    chunk = f.read()
-                    pos = f.tell()
-            except OSError:
-                continue
-            text = chunk.decode("utf-8", "replace")
-            print("  " + text.rstrip("\n").replace("\n", "\n  "))
-            if CERT_DONE_MARK in text:
-                return
-        print(f"\n  等了 5 分钟还没跑完，后台仍在继续。稍后看日志: tail {CERT_FIX_LOG}")
-    except KeyboardInterrupt:
-        print(f"\n  已退出跟随，后台继续执行。稍后看日志: tail {CERT_FIX_LOG}")
+    _follow_log(CERT_FIX_LOG, start, CERT_DONE_MARK)
 
 def main_menu():
     # 一次性自愈：xray 26.7.11+ 默认 minClientVer=26.3.27 会拒旧客户端(mihomo 硬编码 1.8.2 等)，
@@ -5808,7 +5935,11 @@ def main_menu():
 
 # ============================================================================ 交互菜单
 def _ask(prompt=""):
-    """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。"""
+    """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。
+
+       两头都读不到就返回空串（= 回车）。转后台跑的那些活儿（见 _node_op_dispatch）
+       没有控制终端、stdin 也被掐成 /dev/null，真有哪一步漏了个问题没在前台问掉，
+       也该当场走默认值继续，而不是抛 EOFError 把整件事炸在半路。"""
     try:
         with open("/dev/tty", "r") as t:
             print(prompt, end="", flush=True)
@@ -5817,7 +5948,12 @@ def _ask(prompt=""):
                 raise EOFError
             return line.rstrip("\n").strip()
     except (OSError, EOFError):
+        pass
+    try:
         return input(prompt).strip()
+    except (OSError, EOFError):
+        print(prompt + "(无终端，按默认继续)")
+        return ""
 
 def _ask_free(prompt):
     """要打中文/emoji 的自由文本输入（前缀之类）：提示语单独占一行，输入从下一行的 > 开始。
@@ -6076,6 +6212,13 @@ def add_protocols_flow(st, have_sb, have_xr):
         print("已取消。")
         return
 
+    # 跟删除同理：建完入站要 systemctl restart 核心，代理一断 SSH 跟着断，
+    # 前台进程被 SIGHUP 打死的话，节点建出来了但链接没进订阅文件。转后台跑。
+    _node_op_dispatch({"op": "add", "pick_sb": pick_sb, "pick_xr": pick_xr, "G": dict(G)},
+                      lambda: _add_apply(st, pick_sb, pick_xr, have_sb, have_xr))
+
+def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
+    """真正执行增量添加（非交互）。由后台那半程调用，见 _node_op_dispatch / node_op_run。"""
     ensure_deps()
     _USED_PORTS.clear()
     _USED_PORTS.update(_ports_in_cfgs())        # 避开现有节点的端口
@@ -6307,6 +6450,17 @@ def del_protocols_flow(st, have_sb, have_xr):
         print("  已取消。")
         return
 
+    # 真动手的那半程转后台：最后一步是 systemctl restart/disable 核心，代理链路一断
+    # SSH 跟着断，前台这个进程会被 SIGHUP 打死在半路——入站删了、订阅还没刷，最难收拾。
+    _node_op_dispatch({"op": "del", "del_sb": del_sb, "del_xr": del_xr, "G": dict(G)},
+                      lambda: _del_apply(st, del_sb, del_xr, have_sb, have_xr))
+
+def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
+    """真正执行删除（非交互）。由后台那半程调用，见 _node_op_dispatch / node_op_run。"""
+    RED, OFF = "\033[1;31m", "\033[0m"
+    teardowns = _proto_fns("teardown", del_sb, del_xr)
+    left_sb = [n for n in have_sb if n not in del_sb]
+    left_xr = [n for n in have_xr if n not in del_xr]
     removed = []
     for core, dels, left in (("sb", del_sb, left_sb), ("xray", del_xr, left_xr)):
         if not dels:
@@ -6508,7 +6662,12 @@ def install_flow():
     print("-" * 60)
     if (_ask("确认开始? [Y/n]: ") or "y").lower() in ("n", "no"):
         print("已取消。"); return
-    run(sb_names, xr_names)
+    if not takeover_confirm():        # 唯一还会发问的一步，必须在前台问完
+        return
+    # 装到最后同样要起/重启核心；全部重装更是会把正在用的节点整个换掉，
+    # 挂着本机代理连的 SSH 一定断在那一步。转后台，断线也能装完。
+    _node_op_dispatch({"op": "install", "sb": sb_names, "xray": xr_names, "G": dict(G)},
+                      lambda: run(sb_names, xr_names))
 
 # ============================================================================ CLI
 if __name__ == "__main__":
@@ -6521,6 +6680,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "cert-fix":        # 菜单 15 转后台调这个（脱离 SSH，重启核心也断不掉）
         cert_fix_run()
+        sys.exit(0)
+    if sys.argv[1] == "node-op":         # 装/加/删协议转后台调这个（同上）
+        node_op_run()
         sys.exit(0)
     if sys.argv[1] == "selfdns-toggle":  # adguard 菜单调用：开关"自建DNS写入订阅"
         selfdns_toggle()
