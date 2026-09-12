@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.0.94"
+SCRIPT_VERSION = "1.0.95"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -6137,6 +6137,37 @@ def _installed_state():
     fix = lambda lst: [_PROTO_ALIASES.get(n, n) for n in (lst or [])]
     return st, fix(st.get("sb")), fix(st.get("xray"))
 
+def _stale_protos(have_sb, have_xr):
+    """安装记录里写着、但核心配置里根本没有的协议 → (sb 残留, xray 残留)。
+
+       怎么来的：删到一半被打断（入站已摘、记录还没写就断了 SSH）、手工改过
+       config.json、核心被外面卸过。必须单独认出来，否则这些协议会【卡死】——
+       去删它「配置里没找到，跳过」，去加它「记录说已经装了，不在可添加列表里」，
+       两条路都走不通，只能整机重装。
+
+       配置文件读不出来（核心压根没装/文件坏了）时保守处理：不当残留。
+       那种情况交给删除流程里 cfg is None 那一支去收拾记录。"""
+    out = []
+    for core, want in (("sb", have_sb), ("xray", have_xr)):
+        cfg, ibs = _load_core_cfg(core)
+        if cfg is None:
+            out.append([])
+            continue
+        live = {_ib_proto(ib) for ib in ibs}
+        out.append([n for n in want if n not in live])
+    return out[0], out[1]
+
+def _link_hits(u, sb_protos, xr_protos):
+    """这条分享链接属不属于这些协议。
+
+       两核心同名协议靠尾标区分（¹=sing-box ²=xray）；没有尾标说明当时只有一个核心
+       装了它，核心位对不上也算命中。CDN 节点的协议段是 CDN·xxx，天然不会命中。"""
+    pr, co = _link_core_proto(u)
+    if not pr:
+        return False
+    targets = {("sb", p) for p in sb_protos} | {("xray", p) for p in xr_protos}
+    return (co, pr) in targets if co else any(pr == q for _, q in targets)
+
 def _restore_state_to_G(st):
     """把上次安装的参数灌回 G，保证新加的节点跟老节点同域名/同 SNI/同前缀。"""
     G["domain"]     = st.get("domain", "")
@@ -6151,8 +6182,11 @@ def _restore_state_to_G(st):
 
 def add_protocols_flow(st, have_sb, have_xr):
     """只添加新协议：现有节点一个都不动。"""
-    avail_sb = [n for n in SB   if n not in have_sb]
-    avail_xr = [n for n in XRAY if n not in have_xr]
+    # 记录里写着、配置里却没有的（上次删到一半被打断等），按【没装】算 —— 否则它既
+    # 删不掉又加不回来，人就卡死了。见 _stale_protos。
+    stale_sb, stale_xr = _stale_protos(have_sb, have_xr)
+    avail_sb = [n for n in SB   if n not in have_sb or n in stale_sb]
+    avail_xr = [n for n in XRAY if n not in have_xr or n in stale_xr]
     if not avail_sb and not avail_xr:
         print("\n  两个核心的协议都已经装齐了，没有可添加的。")
         return
@@ -6163,6 +6197,9 @@ def add_protocols_flow(st, have_sb, have_xr):
     print("=" * 60)
     print(f"  沿用上次安装的参数：域名 {G['domain'] or '(无，自签+IP)'}   "
           f"SNI {G['sni']}   前缀 {G['prefix'] or '(无)'}")
+    if stale_sb or stale_xr:
+        print(f"  ⓘ {', '.join(dict.fromkeys(stale_sb + stale_xr))} 记录里写着、"
+              f"核心配置里却没有（上次多半删到一半被打断），已按【没装】列进可添加。")
 
     pick_sb, pick_xr = [], []
     if avail_sb:
@@ -6290,6 +6327,14 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
 
     # 追加链接 + 刷新订阅（不换 token：客户端里那条订阅地址继续有效）
     links, tail = _node_file_parts()
+    # 先摘掉这几个协议的旧链接：正常情况下压根没有（协议没装过），但残留场景下会有
+    # 一条早就连不上的。不摘就会在订阅里留下两个同名节点，客户端只能挨个去试。
+    fresh_sb = [n for n in pick_sb]
+    fresh_xr = [n for n in pick_xr]
+    stale_links = [u for u in links if _link_hits(u, fresh_sb, fresh_xr)]
+    if stale_links:
+        print(f"  顺手摘掉 {len(stale_links)} 条同协议的旧链接（残留的死节点）")
+        links = [u for u in links if u not in stale_links]
     links += [l for l in new_links if l not in links]
     with open(NODE_FILE, "w") as f:
         f.write("\n".join(links) + ("\n" if links else ""))
@@ -6381,10 +6426,17 @@ def del_protocols_flow(st, have_sb, have_xr):
     print("\n" + "=" * 60)
     print("  删除协议")
     print("=" * 60)
+    stale_sb, stale_xr = _stale_protos(have_sb, have_xr)
+    _mark = lambda lst, stale: ", ".join(n + ("（残留）" if n in stale else "") for n in lst)
     if have_sb:
-        print("  已装 sing-box:", ", ".join(have_sb))
+        print("  已装 sing-box:", _mark(have_sb, stale_sb))
     if have_xr:
-        print("  已装 xray:    ", ", ".join(have_xr))
+        print("  已装 xray:    ", _mark(have_xr, stale_xr))
+    if stale_sb or stale_xr:
+        print("  ⓘ 标『残留』的：安装记录里写着，核心配置里却没有它的入站——上次多半"
+              "删到一半被打断了。\n"
+              "     删它会把订阅和记录里的残留一起清掉；也可以直接从『1 只添加新协议』"
+              "把它装回来。")
     print("-" * 60)
     print("  1. 选择删除")
     print("  2. 全部删除")
@@ -6461,18 +6513,24 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
     teardowns = _proto_fns("teardown", del_sb, del_xr)
     left_sb = [n for n in have_sb if n not in del_sb]
     left_xr = [n for n in have_xr if n not in del_xr]
-    removed = []
+    removed, stale = [], []          # removed: 这轮真摘掉的入站；stale: 配置里本来就没有的
     for core, dels, left in (("sb", del_sb, left_sb), ("xray", del_xr, left_xr)):
         if not dels:
             continue
         name, binpath, path, _tbl, _mk = _CORE_META[core]
         cfg, ibs = _load_core_cfg(core)
         if cfg is None:
+            print(f"  {name}: 读不到配置文件（核心没装或文件坏了），只清记录和订阅。")
+            stale += dels
             continue
         keep = [ib for ib in ibs if _ib_proto(ib) not in dels]
         gone = [ib for ib in ibs if _ib_proto(ib) in dels]
         if not gone:
-            print(f"  {name}: 配置里没找到要删的入站，跳过。")
+            # 配置里本来就没有 ≠ 没事可做：记录和订阅里多半还留着它（上次删到一半
+            # 被打断就是这样）。这里【不能 return】，否则那个协议永远删不掉也加不回来。
+            print(f"  {name}: 配置里没找到要删的入站——多半是上次删到一半被打断了，"
+                  f"这次把订阅和安装记录一起收拾干净。")
+            stale += dels
             continue
         cfg["inbounds"] = keep
         backup = path + ".bak"
@@ -6507,7 +6565,7 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
             os.remove(backup)
         removed += [ib.get("tag", "?") for ib in gone]
 
-    if not removed:
+    if not removed and not stale:
         print("  没有删掉任何入站。")
         return
 
@@ -6523,14 +6581,8 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
                   f"可能有残留，需手工确认：{e}{OFF}")
 
     # 摘掉对应的分享链接（CDN 节点的协议段是 CDN·xxx，天然不会命中，不受影响）
-    targets = {("sb", p) for p in del_sb} | {("xray", p) for p in del_xr}
-    def _hit(u):
-        pr, co = _link_core_proto(u)
-        if not pr:
-            return False
-        return (co, pr) in targets if co else any(pr == q for _, q in targets)
     links, tail = _node_file_parts()
-    kept = [u for u in links if not _hit(u)]
+    kept = [u for u in links if not _link_hits(u, del_sb, del_xr)]
     dropped = len(links) - len(kept)
     with open(NODE_FILE, "w") as f:
         f.write("\n".join(kept) + ("\n" if kept else ""))
@@ -6552,6 +6604,9 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
 
     print("\n" + "=" * 60)
     print(f"  已删除 {len(removed)} 个节点，摘掉 {dropped} 条分享链接")
+    if stale:
+        print(f"  （其中 {', '.join(dict.fromkeys(stale))} 的入站配置里本来就没有，"
+              f"这次是把残留的记录/链接清掉）")
     print("=" * 60)
     for t in removed:
         print("   -", t)
