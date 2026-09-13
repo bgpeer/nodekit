@@ -38,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.96"
+SCRIPT_VERSION = "1.5.97"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8225,7 +8225,13 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 HEAL_DAY_MB  = 2048      # heal 每天的流量上限（MB）。用满就停，明天接着
 HEAL_MB_EACH = 7         # 估一个条目要拉多少 MB（现场实测约 6.7）——只在读不到网卡计数时用
 HEAL_GIVEUP = 3          # 连续探失败几次就放弃
-HEAL_GIVEUP_DAYS = 30    # 放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
+HEAL_GIVEUP_DAYS = 30    # 第一次放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
+# 【再试的间隔要越来越长，不能永远 30 天】固定 30 天的话，一个【永远探不出来】的库
+# 每个月都会被完整重探一遍——2697 条 × 约 6.7 MB = 18 GB/月，而且永远这样下去。
+# 那不是"放弃"，只是把"一直探"从每小时改成了每月。
+# 所以按放弃次数翻倍：30 → 60 → 120 → 240 → 封顶。修好过的源头一次成功就把
+# 记录抹掉、计数归零，不会被这个退避拖住。
+HEAL_GIVEUP_MAX_DAYS = 360
 HEAL_FAIL_MAX = 40000    # 失败表最多记这么多条，超了丢掉最老的，别把状态文件撑爆
 HEAL_RETRY_MIN = 3       # 后台两轮之间隔几分钟。太密会撞网盘限流，反而更难成
 HEAL_BG_BUDGET = 1800    # 后台整体封顶（秒）。用满收工，剩下的交给每小时那轮
@@ -8382,6 +8388,14 @@ def heal_fail_table():
     t = ms_state().get("heal_fail")
     return t if isinstance(t, dict) else {}
 
+def heal_retry_days(cnt):
+    """放弃了这么多次之后，隔几天才再给一次机会。见 HEAL_GIVEUP_MAX_DAYS。
+
+       30 → 60 → 120 → 240 → 360(封顶)。一个永远探不出来的条目，一年里只会被
+       碰 4 次左右，而不是 12 次。"""
+    n = max(0, int(cnt) - HEAL_GIVEUP)          # 0 = 第一次放弃
+    return min(HEAL_GIVEUP_DAYS * (2 ** min(n, 20)), HEAL_GIVEUP_MAX_DAYS)
+
 def heal_given_up(tab, iid, now=None):
     """这个条目是不是已经放弃了（失败够多次、且还没到再试的日子）。"""
     v = tab.get(str(iid))
@@ -8390,7 +8404,7 @@ def heal_given_up(tab, iid, now=None):
     cnt, ts = v[0], v[1]
     if cnt < HEAL_GIVEUP:
         return False
-    return (now or time.time()) - ts < HEAL_GIVEUP_DAYS * 86400
+    return (now or time.time()) - ts < heal_retry_days(cnt) * 86400
 
 def heal_fail_record(results):
     """把这一轮的结果记进失败表。results: [(条目id, 成不成功)] 或 [(id, 成不成功, 确定失败)]。
@@ -8412,7 +8426,11 @@ def heal_fail_record(results):
         if good:
             tab.pop(k, None)
         elif dead:
-            tab[k] = [HEAL_GIVEUP, now]
+            # 【要在原来的次数上往前走，不能写死】写死 HEAL_GIVEUP 的话，同一个条目
+            # 第二次、第三次被判定"确定没有"时计数不涨，退避就永远停在第一档 30 天，
+            # 于是这个库每个月都被完整重探一遍——等于没放弃。
+            cnt = tab.get(k, [0, 0])[0] if isinstance(tab.get(k), list) else 0
+            tab[k] = [max(int(cnt) + 1, HEAL_GIVEUP), now]
         else:
             cnt = tab.get(k, [0, 0])[0] if isinstance(tab.get(k), list) else 0
             tab[k] = [cnt + 1, now]
