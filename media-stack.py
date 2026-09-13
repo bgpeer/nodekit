@@ -38,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.95"
+SCRIPT_VERSION = "1.5.96"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8217,6 +8217,13 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 而结果永远是同一个失败。现场实测：2727 个条目里 2697 个（98%）缺音视频轨，
 # 28 天探了 93868 次、单个条目最多探 135 次、跨 7 天，一次都没成功，白烧 30 GB/天。
 # 所以记一个持久的失败计数：连续失败到这个次数就不再提供给 heal。
+# 【每天花多少流量是有硬上限的】上面那些（放弃名单、轮转、时间预算）都是"尽量少探"，
+# 但没有一条给得出【承诺】。而这台机是按月计费的，"尽量"不够用——超了就是超了。
+# 所以再加一道按字节算的闸：当天用满就停，明天自动清零接着来。
+# 记账用的是本机物理网卡的接收字节差（播放走 302 直链、根本不经过 VPS，所以这段时间
+# 的接收量基本就是 heal 自己拉的），读不到 /proc/net/dev 才退回按次数估。
+HEAL_DAY_MB  = 2048      # heal 每天的流量上限（MB）。用满就停，明天接着
+HEAL_MB_EACH = 7         # 估一个条目要拉多少 MB（现场实测约 6.7）——只在读不到网卡计数时用
 HEAL_GIVEUP = 3          # 连续探失败几次就放弃
 HEAL_GIVEUP_DAYS = 30    # 放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
 HEAL_FAIL_MAX = 40000    # 失败表最多记这么多条，超了丢掉最老的，别把状态文件撑爆
@@ -8316,6 +8323,60 @@ def set_heal_pace(throttled):
     return new
 
 
+def _host_rx_bytes():
+    """本机物理网卡收了多少字节。读不到返回 None。
+
+       只算物理口：docker0 / br-* / veth* 是容器之间的往返，算进来会把同一段
+       流量数两遍；lo 更是纯本地。"""
+    tot = 0
+    try:
+        for ln in open("/proc/net/dev"):
+            if ":" not in ln:
+                continue
+            name, rest = ln.split(":", 1)
+            name = name.strip()
+            if name == "lo" or name.startswith(("docker", "br-", "veth", "tun", "sing")):
+                continue
+            tot += int(rest.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return tot
+
+def heal_budget():
+    """今天 heal 还剩多少额度 → (剩余 MB, 已用 MB)。跨天自动清零。"""
+    st = ms_state().get("heal_day") or {}
+    used = float(st.get("mb") or 0) if st.get("date") == time.strftime("%Y-%m-%d") else 0.0
+    return max(0.0, HEAL_DAY_MB - used), used
+
+def heal_budget_spend(mb, probes=0):
+    """记一笔账。跨天先清零再记。"""
+    today = time.strftime("%Y-%m-%d")
+    st = ms_state().get("heal_day") or {}
+    if st.get("date") != today:
+        st = {"date": today, "mb": 0.0, "probes": 0}
+    st["mb"] = round(float(st.get("mb") or 0) + max(0.0, float(mb)), 1)
+    st["probes"] = int(st.get("probes") or 0) + int(probes)
+    save_ms_state(heal_day=st)
+
+def heal_daily_diff(pending, gave_up):
+    """跟上一天比一比：待探的涨了还是落了、放弃名单新增多少。返回要打印的那几行。
+
+       为什么值得单独记一笔：待探数是个【余额】，它不动不代表没干活 —— 可能今天
+       探好了 20 个、同时又新扫进来 20 个。只盯余额会以为 heal 根本没在工作。
+
+       两个数都是现成的，不再多问 Emby 一次：pending 是这一轮算出来的待探数，
+       gave_up 是放弃名单的大小。每天记一次（同一天内反复跑不会覆盖掉基准）。"""
+    today = time.strftime("%Y-%m-%d")
+    old = ms_state().get("heal_seen") or {}
+    if old.get("date") != today:
+        save_ms_state(heal_seen={"date": today, "pending": pending, "gave_up": gave_up})
+    if not old or old.get("date") == today or old.get("pending") is None:
+        return []
+    d_pend = pending - int(old.get("pending") or 0)
+    d_give = gave_up - int(old.get("gave_up") or 0)
+    return [f"跟 {old.get('date')} 比：待探 {d_pend:+d}（现在 {pending} 个），"
+            f"放弃名单 {d_give:+d}（现在 {gave_up} 个）"]
+
 def heal_fail_table():
     """{条目id: [连续失败次数, 上次失败时间戳]}。读不出返回空表。"""
     t = ms_state().get("heal_fail")
@@ -8384,6 +8445,7 @@ def heal_media_info(d, key, budget=None):
     allpend = items_without_duration(key)
     if not allpend:
         return
+    _raw_pend = len(allpend)             # 真实待探数（含已放弃的），给每日增减用
     # 【放弃过的不再探】见 HEAL_GIVEUP 那段：探不出来的无限重试就是白烧流量。
     # 只在 heal 这里滤掉，体检那边照旧报真实待探数 —— 那是给人看的诊断，不该被藏起来。
     _tab, _now = heal_fail_table(), time.time()
@@ -8393,6 +8455,13 @@ def heal_media_info(d, key, budget=None):
               f"的条目（{HEAL_GIVEUP_DAYS} 天后自动再试）{RST}")
     allpend = _keep
     if not allpend:
+        return
+    _left, _used = heal_budget()
+    if _left <= 0:
+        print()
+        info(f"今天补时长已经用掉约 {_used:.0f} MB（上限 {HEAL_DAY_MB} MB），这轮不探了")
+        print(f"  {DIM}明天零点自动清零接着探。还有 {len(allpend)} 个排队。"
+              f"想调上限改 HEAL_DAY_MB。{RST}")
         return
     # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
     # 条目怎么探都探不出来（网盘上是残缺文件、格式 Emby 不认），每轮都从头取
@@ -8405,6 +8474,11 @@ def heal_media_info(d, key, budget=None):
     # 不夹到总数的话 (allpend+allpend) 在待探数少于一批时会把同一批切两遍。
     _pace = heal_pace()
     take = min(max(HEAL_LIMIT, len(allpend) // 8), _pace, len(allpend))
+    # 【再按今天剩下的额度夹一刀】不夹的话最后一轮会一次性冲过头——
+    # 一批 300 个 × 约 7 MB = 2 GB，等于把上限当摆设。
+    _cap = max(1, int(_left / HEAL_MB_EACH))
+    if _cap < take:
+        take = _cap
     # 【新片插队，但只占一半名额】刚扫进来的条目在 Emby 里是 0B / 0bps，时长为 0，
     # 于是进度条记不住 —— 而那正是用户此刻最想看的那一部。让它跟三个月前就在队里的
     # 老片按同一个顺序排，是把优先级排反了。
@@ -8450,6 +8524,7 @@ def heal_media_info(d, key, budget=None):
     done = hit = 0
     todo_items = list(pend)
     t_all = time.monotonic()
+    _rx0 = _host_rx_bytes()              # 这一轮到底花了多少流量，用网卡计数实测
     budget = HEAL_BUDGET if budget is None else budget
     for rnd in range(1, HEAL_ROUNDS + 1):
         if not todo_items or time.monotonic() - t_all > budget:
@@ -8468,8 +8543,26 @@ def heal_media_info(d, key, budget=None):
             # 时整轮都探不到 —— 再打一轮只是把上游按得更久。
             print(f"  {YELLOW}上游在限量（这一轮撞了 {_t} 次），本轮到此为止{RST}")
             break
+    # 【记账要在报数之前】—— 这轮花了多少，用物理网卡的接收字节差实测。
+    # 播放走 302 直链、根本不经过 VPS，所以这段时间的接收量基本就是 heal 拉的。
+    # 读不到计数（容器里、非 Linux）才退回按次数估。
+    _rx1 = _host_rx_bytes()
+    if _rx0 is not None and _rx1 is not None and _rx1 >= _rx0:
+        _spent = (_rx1 - _rx0) / 1048576.0
+        _how = "实测"
+    else:
+        _spent = len(pend) * HEAL_MB_EACH
+        _how = "估算"
+    heal_budget_spend(_spent, len(pend))
     _new = set_heal_pace(hit >= HEAL_429_STOP)
     _heal_summary(done, len(pend))
+    _left2, _used2 = heal_budget()
+    print(f"  {DIM}这轮花了约 {_spent:.0f} MB（{_how}）；今天累计 {_used2:.0f} MB / "
+          f"上限 {HEAL_DAY_MB} MB，还剩 {_left2:.0f} MB{RST}")
+    if _left2 <= 0:
+        print(f"  {YELLOW}今天的额度用完了，后面几轮不再探，明天零点自动清零。{RST}")
+    for _ln in heal_daily_diff(_raw_pend, len(heal_fail_table())):
+        print(f"  {DIM}{_ln}{RST}")
     # 【把时间花在哪儿说出来】原来一轮跑完只报"补上几个"，于是"慢"没有任何可查的
     # 东西：到底是每个都要 3 分钟，还是大多数很快、少数拖死，从屏幕上看不出来。
     _el = time.monotonic() - t_all
