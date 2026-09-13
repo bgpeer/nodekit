@@ -14,7 +14,7 @@
 # 同时量物理网卡和每个容器，谁在跑一目了然。
 set -u
 
-TOOL_VER="2026-09-14d"
+TOOL_VER="2026-09-14e"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -153,6 +153,34 @@ if [ -f "$LOGM" ]; then
     }' "$LOGM"
 else
   echo "    （找不到 $LOGM）"
+fi
+
+sec "④e strm 文件是不是被改过：Emby 重探老片只有这两个原因"
+echo -e "  ${D}Emby 只会重探【它认为变了】的文件。所以 mtime 能把原因一刀切开："
+echo -e "  大批 mtime 是今天 → 有东西在重写 strm，Emby 因此重探（该修脚本）；"
+echo -e "  mtime 都是很久以前 → strm 没动过，是 Emby 自己在重探（该改 Emby 设置）。${X}"
+STRM_ROOT=""
+for r in "$DIR"/media/strm "$DIR"/strm; do [ -d "$r" ] && STRM_ROOT="$r" && break; done
+if [ -n "$STRM_ROOT" ]; then
+  echo "  strm 根目录：$STRM_ROOT"
+  find "$STRM_ROOT" -name '*.strm' -printf '%T@ %p\n' 2>/dev/null | awk -v now="$(date +%s)" '
+    { age = (now - $1) / 86400
+      if (age < 1)       k = "今天改过"
+      else if (age < 2)  k = "昨天改过"
+      else if (age < 8)  k = "一周内"
+      else if (age < 31) k = "一个月内"
+      else               k = "一个月以上"
+      n[k]++; tot++
+      # 顺带按第一层目录分，看是不是集中在某个盘
+      split($2, a2, "/"); for (i=1; i<=length(a2); i++) if (a2[i] != "" && i > 4) { lib[a2[i]]++; break }
+    }
+    END { if (!tot) {print "    一个 strm 都没找到"; exit}
+          printf "    共 %d 个 strm\n", tot
+          for (k in n) printf "      %-12s %6d 个 (%.0f%%)\n", k, n[k], n[k]*100/tot
+          print "    按盘分（前 6 个）："
+          c = 0; for (l in lib) { printf "      %-28s %6d\n", substr(l,1,26), lib[l]; if (++c >= 6) break } }'
+else
+  echo "    （找不到 strm 目录，在 $DIR/media/strm 或 $DIR/strm 下面）"
 fi
 
 sec "④c Emby 自己的定时任务最近跑了什么"
