@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.7"
+SCRIPT_VERSION = "1.2.0"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -6204,10 +6204,12 @@ def cert_want_names(dom, wildcard, emby_dom=""):
         names.append(nd)
     return list(dict.fromkeys(names))
 
-def cert_install_apply(dom, wildcard, cf_token, names=None):
+def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
     """真正签发+安装（非交互，后台跑）。装上去之前先验，验不过绝不碰现有证书。
+       成功返回 True，任一步没成返回 False（换域名流程要靠它决定回不回滚）。
 
-       names：这次要签的完整域名列表，不给就按 dom/wildcard 推。"""
+       names：这次要签的完整域名列表，不给就按 dom/wildcard 推。
+       node_dom：节点【将要】用的域名，给换域名流程用——见 _cert_swap_in 的说明。"""
     G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
@@ -6217,7 +6219,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None):
     if not os.path.exists(acme):
         print(f"{R}  ✗ acme.sh 装不上（检查能不能访问 get.acme.sh），已放弃，"
               f"现有证书没动。{N}")
-        return
+        return False
     sh(f"{acme} --register-account -m {G.get('email') or 'a@a.com'} --server letsencrypt",
        check=False)
     sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
@@ -6235,7 +6237,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None):
         owner = _port80_owner()
         if owner and "nginx" not in owner:
             print(f"{R}  ✗ 80 端口被 {owner} 占着，HTTP-01 验证进不来。先停掉它。{N}")
-            return
+            return False
         if owner:
             # 让 acme 自己停一下 nginx，别去改用户的 nginx 配置——那份 conf 可能同时装着
             # 443 伪装站 / ws 反代 / Emby，重写它比证书过期还糟。hook 会被记进域名记录，
@@ -6251,7 +6253,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None):
                                      "Cert success"))
     if r.returncode and not skipped:
         print(f"{R}  ✗ 签发失败，现有证书没动：{N}\n" + out[-1200:])
-        return
+        return False
 
     # 先导到临时路径验一遍，验过了才动真的——这一步是「不可用就回退」的关键
     tmpc, tmpk = ACME_CRT + ".new", ACME_KEY + ".new"
@@ -6264,19 +6266,23 @@ def cert_install_apply(dom, wildcard, cf_token, names=None):
             try: os.remove(p)
             except OSError: pass
         print(f"{R}  ✗ 新证书没通过校验（{why}），已丢弃，现有证书没动。{N}")
-        return
+        return False
     print(f"  ✓ 新证书校验通过：{why}")
-    _cert_swap_in(tmpc, tmpk, dom, wildcard)
+    return _cert_swap_in(tmpc, tmpk, dom, wildcard, node_dom)
 
-def _cert_swap_in(tmpc, tmpk, dom, wildcard):
+def _cert_swap_in(tmpc, tmpk, dom, wildcard, node_dom=None):
     """把验过的新证书换上去，顺带记 reloadcmd、补续期任务、让吃证书的服务重读。
-       换的过程带备份：任一步失败就把旧的放回去并重启回来。"""
+       换的过程带备份：任一步失败就把旧的放回去并重启回来。成功返回 True。
+
+       node_dom：下面那道闸要对着「节点【将要】用的域名」校验。平时它就是
+       node_domain()；但【换域名】流程里，state.json 这时还写着旧域名，
+       照着它校验会把唯一正确的那张新证书拦下来。所以那条路显式传新域名进来。"""
     G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
     # 最后一道闸：这张证书是全机共用的地基，节点正在用的域名【一定】要盖得住。
     # 只校验「盖不盖得住你刚才输的域名」是不够的——输错一个字符（llj 打成 ly），
     # 新证书对它自己完全合法，装上去却让所有吃证书的节点被客户端当场拒绝
     # （tls: bad certificate），而 reality 照常通，看起来就像「随机几个节点坏了」。
-    nd = node_domain()
+    nd = node_domain() if node_dom is None else node_dom
     if nd and not _name_covers(cert_names(tmpc), nd):
         for p in (tmpc, tmpk):
             try: os.remove(p)
@@ -6286,7 +6292,7 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard):
         print(f"{R}    装上去会让所有吃证书的节点被客户端拒绝，已丢弃，"
               f"现有证书一个字节没动。{N}")
         print(f"    域名是不是打错了？节点在用的是 {nd}。")
-        return
+        return False
     bak = {}
     for src, dst in ((tmpc, ACME_CRT), (tmpk, ACME_KEY)):
         if os.path.exists(dst):
@@ -6314,7 +6320,7 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard):
         for svc in _cert_consumers():
             sh(f"systemctl restart {svc}", check=False)
         print(f"{R}  ✗ 换证书过程出错（{e}），已还原成原来那张并重启回来。{N}")
-        return
+        return False
     for b in bak.values():
         try: os.remove(b)
         except OSError: pass
@@ -6325,9 +6331,10 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard):
     print(f"    自动续期 {'已配好' if i['cron_ok'] and i['hook_ok'] else '仍不完整，回面板看提示'}")
     if not _installed_state()[1] and not _installed_state()[2]:
         print("    还没装节点：去『1 节点安装』，向导会认出这张证书直接用，不再重复申请。")
+    return True
 
 def emby_share_flow(i):
-    """菜单 15 → 3：让 Emby 跟节点共用同一张证书。
+    """菜单 15 → 4：让 Emby 跟节点共用同一张证书。
 
        为什么值得做：两张证书签的是同一个域名家族、各自 90 天、各自续期，
        等于把「证书过期全挂」这个风险配了两份，而且续期链断掉的那份不会有人发现
@@ -6445,7 +6452,7 @@ _ACME_STATUS_COLOR = {"抢占中": "\033[1;31m", "没人用": "\033[1;33m",
                       "别处在用": "\033[1;36m"}
 
 def cert_clean_flow():
-    """菜单 15 → 4：清理 acme.sh 里没用的旧证书记录。
+    """菜单 15 → 5：清理 acme.sh 里没用的旧证书记录。
 
        为什么值得有：acme.sh 是「登记了就一直续」的，换域名、换用途之后旧记录
        没人删。轻则占地方，重则抢占——它存着的安装路径还指着节点的证书文件，
@@ -6529,18 +6536,499 @@ def cert_clean_flow():
               f"把节点的证书重签回来。{N}")
     _ask("  按回车返回...")
 
+# ============================================================ 换域名（菜单 15 → 2）
+#
+# 域名散落在这台机的下面这些地方，漏掉任何一处的后果都长得一样：
+# 某天一半节点连不上，而日志里只有一句「连不上」，没人会往域名上想。
+#
+#   state.json 的 host / domain     所有读 G["domain"] 的地方、下次进安装向导
+#   sub.host                        订阅 URL / GitHub 中转 / 自建 DNS 的 DoH 地址都读它
+#   xy-nodes.txt                    每条分享链接的 @域名:端口 和 sni= / host=
+#   sing-box config.json            非 reality 入站的 tls.server_name、h2/httpupgrade 的 host
+#   xray config.json                tlsSettings.serverName、xhttpSettings.host
+#   nginx bgpeer.conf               三处 server_name（80 跳转 / 443 伪装站 / 本地 https）
+#   /etc/ssl/sb/acme.crt            证书本身
+#   acme.sh 里旧域名那条记录        不撤掉的话它的每日 cron 半夜把证书覆盖回旧域名那张
+#   Emby 的 .env + nginx + 证书     Emby 对外是 <子域>.<域名>
+#
+# ⚠ 最容易写错的一处：reality 的 sni= 是【借用的第三方站】（s0.awsstatic.com 之类），
+#   跟你自己的域名没有半点关系。跟着换 = reality 全挂，而且是静默的握手失败，
+#   现象还偏偏是「另外几个节点好好的」。所以带 security=reality 的链接只动 @host，
+#   query 一个字不碰；两个核心的配置里也整块跳过 reality 入站。
+
+def _relink_domain(link, old, new):
+    """把一条分享链接里【属于本机域名】的地方换成 new。认不出来就原样返回。
+
+       只改值等于 old 的字段，其余字节不动——端口/uuid/密码/路径/short-id 全程不变，
+       换完客户端刷一次订阅就行，不用重新导入。"""
+    if not (old and new) or old == new or not link:
+        return link
+    if link.startswith("vmess://"):
+        b = link[8:]
+        try:
+            j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        except Exception:
+            return link
+        hit = False
+        for k in ("add", "host", "sni"):                 # ps(节点名)/id/path 不动
+            if str(j.get(k, "")).strip() == old:
+                j[k] = new; hit = True
+        return vmess_link(j) if hit else link
+    try:
+        P = urllib.parse.urlsplit(link)
+    except ValueError:
+        return link
+    netloc = P.netloc
+    if (P.hostname or "").lower() == old.lower():
+        # 只换主机名那一段：userinfo（uuid/密码，可能带 @ 和 :）和端口原样保留
+        at = netloc.rfind("@")
+        ui, hp = (netloc[:at + 1], netloc[at + 1:]) if at >= 0 else ("", netloc)
+        i = hp.rfind(":")
+        netloc = ui + new + (hp[i:] if i >= 0 else "")
+    query = P.query
+    if "security=reality" not in query:                  # ← reality 的 sni 是借用站，不能动
+        segs = []
+        for s in query.split("&"):
+            k, eq, v = s.partition("=")
+            if eq and urllib.parse.unquote(v) == old:
+                v = new                                  # 域名本身不含需要转义的字符
+            segs.append(k + eq + v)
+        query = "&".join(segs)
+    return urllib.parse.urlunsplit((P.scheme, netloc, P.path, query, P.fragment))
+
+def _links_set_domain(text, old, new):
+    """整份 xy-nodes.txt 的域名改写。『# 订阅链接:』那段尾注原样保留。"""
+    out, tail = [], False
+    for ln in text.split("\n"):
+        if ln.strip().startswith("#"):
+            tail = True
+        if not tail and "://" in ln:
+            ln = _relink_domain(ln.strip(), old, new)
+        out.append(ln)
+    return "\n".join(out)
+
+def _sb_set_domain(data, old, new):
+    """sing-box 入站里凡是等于 old 的域名字段换成 new，返回改了几处。
+       reality 入站整块跳过——它的 server_name / handshake.server 是借用站。"""
+    n = 0
+    for ib in data.get("inbounds", []):
+        tls = ib.get("tls") or {}
+        if tls.get("reality"):
+            continue
+        if tls.get("server_name") == old:
+            tls["server_name"] = new; n += 1
+        tr = ib.get("transport") or {}
+        h = tr.get("host")
+        if h == old:                                     # httpupgrade：字符串
+            tr["host"] = new; n += 1
+        elif isinstance(h, list) and old in h:           # h2：列表
+            tr["host"] = [new if x == old else x for x in h]; n += 1
+        hd = tr.get("headers") or {}
+        if hd.get("Host") == old:
+            hd["Host"] = new; n += 1
+    return n
+
+def _xr_set_domain(data, old, new):
+    """xray 入站的同一件事。同样整块跳过 reality。"""
+    n = 0
+    for ib in data.get("inbounds", []):
+        st = ib.get("streamSettings") or {}
+        if st.get("security") == "reality" or st.get("realitySettings"):
+            continue
+        tl = st.get("tlsSettings") or {}
+        if tl.get("serverName") == old:
+            tl["serverName"] = new; n += 1
+        for key in ("xhttpSettings", "wsSettings", "httpupgradeSettings", "httpSettings"):
+            s = st.get(key) or {}
+            if s.get("host") == old:
+                s["host"] = new; n += 1
+            elif isinstance(s.get("host"), list) and old in s["host"]:
+                s["host"] = [new if x == old else x for x in s["host"]]; n += 1
+            hd = s.get("headers") or {}
+            if hd.get("Host") == old:
+                hd["Host"] = new; n += 1
+    return n
+
+_SRVNAME_RE = r'(?m)^(\s*server_name\s+)%s(\s*;)'
+
+def _nginx_sub_domain(txt, old, new):
+    """nginx 配置里的 server_name 改写（只认完全等于 old 的那条）。"""
+    return re.sub(_SRVNAME_RE % re.escape(old), lambda m: m.group(1) + new + m.group(2), txt)
+
+def _domain_targets(old):
+    """这次换域名会动到哪些文件 → [(路径, 说明)]。只列真的存在、真的含旧域名的。
+       给确认框用：让你在按下去之前看到完整清单，而不是事后猜它动了什么。"""
+    out = []
+    for p, why in ((STATE_FILE, "安装记录（域名/前缀/协议表）"),
+                   (HOST_FILE, "订阅 host（订阅 URL / GitHub 中转 / 自建 DNS 都读它）"),
+                   (NODE_FILE, "分享链接"),
+                   (f"{SB_DIR}/config.json", "sing-box 入站"),
+                   (f"{XRAY_DIR}/config.json", "xray 入站"),
+                   (NGINX_CONF, "nginx server_name")):
+        try:
+            if old in open(p, encoding="utf-8", errors="replace").read():
+                out.append((p, why))
+        except OSError:
+            pass
+    return out
+
+def _domain_resolves_here(dom):
+    """新域名解析到不到本机公网 IP → (ok, 说明)。
+
+       这一步不能省：换完之后客户端连的就是它。解析还没生效就换，等于把所有节点
+       一次性打死，而且是在你已经改完一切、服务也重启完之后才发现。"""
+    try:
+        got = sorted({i[4][0] for i in socket.getaddrinfo(dom, None)})
+    except Exception as e:
+        return False, f"解析不到（{type(e).__name__}）"
+    mine = public_ip()
+    if not mine:
+        return True, f"解析到 {', '.join(got)}（本机公网 IP 查不到，没法比对，按通过算）"
+    if mine in got:
+        return True, f"解析到 {mine}，正是本机"
+    return False, f"解析到 {', '.join(got)}，而本机是 {mine}"
+
+def _acme_forget(dom):
+    """让 acme.sh 不再跟踪这个域名（只停止续期，不删磁盘上的任何文件）。
+
+       换完域名【必须】做这一步。旧域名那条记录里存着「装到哪个文件、装完跑什么」，
+       它的每日 cron 照常跑，续完就把节点正在用的证书覆盖成旧域名那张，还顺手按
+       记录里的 reloadcmd 重启了核心。发作在半夜、你什么都没做，第二天一半节点
+       连不上、reality 好好的。
+
+       真撤掉了才返回 True —— 调用方据此决定要不要打那行「已经撤掉了」，
+       别声称做了一件其实没做的事。"""
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        return False
+    for d in (dom, f"*.{dom}"):
+        sh(f"{acme} --remove -d '{d}' --ecc", check=False)
+        sh(f"{acme} --remove -d '{d}'", check=False)
+    return True
+
+def _emby_env_files():
+    return [p for p in ("/opt/emby-stack/.env", "/opt/media-stack/.env") if os.path.exists(p)]
+
+_EMBY_NGX = "/etc/nginx/conf.d/media-stack.conf"
+
+def _emby_set_domain(old, new, shared):
+    """Emby 跟着换域名：.env 的 DOMAIN、nginx 的 server_name/证书路径、证书软链。
+       nginx -t 不过就整体还原。返回成功与否。"""
+    Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
+    bak, made = {}, []
+    def snap(p):
+        try: bak[p] = open(p, "rb").read()
+        except OSError: pass
+    def undo():
+        for p, b in bak.items():
+            try: open(p, "wb").write(b)
+            except OSError: pass
+        for p in made:
+            try: os.remove(p)
+            except OSError: pass
+    for envf in _emby_env_files():
+        snap(envf)
+        txt = open(envf, encoding="utf-8").read()
+        open(envf, "w", encoding="utf-8").write(
+            re.sub(r"(?m)^(DOMAIN=)['\"]?" + re.escape(old) + r"['\"]?\s*$", r"\g<1>" + new, txt))
+    if os.path.exists(_EMBY_NGX):
+        snap(_EMBY_NGX)
+        txt = open(_EMBY_NGX, encoding="utf-8").read()
+        # 这份 conf 是 media-stack 生成的，域名只出现在 server_name 和证书路径两处，
+        # 整体替换是安全的；不放心也没关系——下面 nginx -t 不过就原样还原。
+        open(_EMBY_NGX, "w", encoding="utf-8").write(txt.replace(old, new))
+    # 证书：本来就是跟节点共用（软链）的，就在新名字下重建软链；
+    # 各用各的则不擅自动它——那张是旧域名的证书，盖不住新域名，得重签。
+    if shared:
+        for src, dst in ((ACME_CRT, _emby_crt(new)), (ACME_KEY, _emby_key(new))):
+            try:
+                if os.path.lexists(dst):
+                    os.remove(dst)
+                os.symlink(src, dst); made.append(dst)
+            except OSError as e:
+                undo(); print(f"{R}  ✗ Emby 证书软链建不起来（{e}），Emby 那侧已还原。{N}")
+                return False
+    chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+    if chk.returncode:
+        undo()
+        print(f"{R}  ✗ Emby 的 nginx 校验没过，那一侧已整体还原：{N}\n   "
+              + (chk.stderr or chk.stdout).strip().replace("\n", "\n   "))
+        return False
+    for p in (_emby_crt(old), _emby_key(old)):        # 旧名字的软链留着只会误导
+        if os.path.islink(p):
+            try: os.remove(p)
+            except OSError: pass
+    print(f"  {GRN}Emby 也换好了{N}：{old} → {new}"
+          + ("（证书继续跟节点共用一张）" if shared else ""))
+    if not shared:
+        print(f"{Y}    ⚠ Emby 的证书原来是独立一张、签的是 {old}，盖不住 {new}。"
+              f"去菜单 15『4 Emby 共用本证书』并成一张，或自己给它重签。{N}")
+    return True
+
+def cert_change_domain_apply(new, cf_token="", emby_new=""):
+    """换域名（非交互，后台跑）。成功返回 True。
+
+       顺序是有讲究的，反了会出人命：
+
+         1. 先改两个核心的配置 + nginx，各自跑校验。纯本地、可回滚，而且这时候
+            服务还没重启，写坏了也没有任何东西是坏的。
+         2. 校验全过了才去签证书。反过来的话：证书已经换成新域名、配置却因为
+            校验不过回滚回了旧域名 —— 节点用旧域名、证书是新域名，所有吃证书的
+            节点当场被客户端拒绝（tls: bad certificate），而 reality 照常通，
+            现象就是「随机几个节点坏了」，最难查的那一种。
+         3. 证书也拿到了，才动 state.json / sub.host / 分享链接 / 订阅。
+         4. 最后撤掉旧域名的 acme 记录再重启。"""
+    G_OK, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    old = node_domain()
+    if not old:
+        print(f"{R}  ✗ 本机没有域名（自签 + IP 直连），没有域名可换。{N}")
+        return False
+    if old == new:
+        print("  新旧域名一样，没什么可做的。")
+        return False
+    print(f"\n  {old}  →  {new}\n")
+
+    bak = {}
+    def snap(p):
+        try: bak[p] = open(p, "rb").read()
+        except OSError: pass
+    def restore():
+        for p, b in bak.items():
+            try: open(p, "wb").write(b)
+            except OSError: pass
+
+    # ── 1. 两个核心的入站配置 ───────────────────────────────────────────
+    cores = []
+    for cfg, binp, svc, setter in (
+            (f"{SB_DIR}/config.json",   SB_BIN,   "sing-box", _sb_set_domain),
+            (f"{XRAY_DIR}/config.json", XRAY_BIN, "xray",     _xr_set_domain)):
+        if not os.path.exists(cfg):
+            continue
+        try:
+            data = json.load(open(cfg))
+        except Exception as e:
+            print(f"{R}  ✗ {svc} 的配置读不出来（{e}），已放弃，一个字节都没改。{N}")
+            restore(); return False
+        snap(cfg)
+        n = setter(data, old, new)
+        json.dump(data, open(cfg, "w"), indent=2)
+        print(f"  {svc}: 改了 {n} 处（reality 入站整块没动——它指的是借用站）")
+        cores.append((cfg, binp, svc))
+    errs = []
+    for cfg, binp, svc in cores:
+        if os.path.exists(binp):
+            ok, msg = core_check(binp, cfg)
+            if not ok:
+                errs.append((svc, msg))
+    if errs:
+        restore()
+        print(f"{R}  ✗ 配置校验没过，已整体回滚、服务一个都没重启（节点照常）：{N}")
+        for svc, msg in errs:
+            print(f"    {svc}: {(msg or '').splitlines()[-1] if msg else '校验失败'}")
+        return False
+
+    # ── 2. nginx ───────────────────────────────────────────────────────
+    if os.path.exists(NGINX_CONF):
+        snap(NGINX_CONF)
+        txt = open(NGINX_CONF, encoding="utf-8").read()
+        open(NGINX_CONF, "w", encoding="utf-8").write(_nginx_sub_domain(txt, old, new))
+        chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+        if chk.returncode:
+            restore()
+            print(f"{R}  ✗ nginx 校验没过，已整体回滚（含两个核心的配置）：{N}\n   "
+                  + (chk.stderr or chk.stdout).strip().replace("\n", "\n   "))
+            return False
+        print("  nginx: server_name 已改，nginx -t 通过")
+
+    # ── 3. 证书（到这一步才动，前面全是可回滚的本地改动）─────────────────
+    names = [new, f"*.{new}"]
+    if emby_new and not _name_covers(names, "x." + emby_new):
+        names += [emby_new, f"*.{emby_new}"]
+    have = cert_names()
+    if _name_covers(have, new) and _name_covers(have, "x." + new) and \
+            (not emby_new or _name_covers(have, "x." + emby_new)):
+        print(f"  现有证书已经盖得住 {new} 和 *.{new}，不用重签。")
+    elif not cert_install_apply(new, True, cf_token, names=names, node_dom=new):
+        restore()
+        print(f"{R}  ✗ 新域名的证书没拿到，整件事已回滚 —— 两个核心的配置和 nginx "
+              f"都还是 {old}，节点照常跑着。{N}")
+        return False
+
+    # ── 4. 安装记录 / 订阅 host / 分享链接 / 三格式订阅 ───────────────────
+    for p in (STATE_FILE, HOST_FILE, NODE_FILE):
+        snap(p)
+    try:
+        st = json.load(open(STATE_FILE))
+    except Exception:
+        st = {}
+    st["domain"] = new
+    if (st.get("host") or "") in (old, ""):
+        st["host"] = new
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    try:
+        if open(HOST_FILE).read().strip() == old:
+            open(HOST_FILE, "w").write(new)
+    except OSError:
+        pass
+    try:
+        txt = open(NODE_FILE, encoding="utf-8").read()
+        open(NODE_FILE, "w", encoding="utf-8").write(_links_set_domain(txt, old, new))
+        print("  分享链接已改写（端口/uuid/密码/路径/short-id 一个字节没动）")
+    except OSError as e:
+        print(f"{Y}  ⚠ 分享链接没改成（{e}）{N}")
+    G["domain"] = new
+    G["host"] = _host()
+    try:
+        build_subscription(read_saved_links(), new_token=False)
+        print("  三格式订阅已按新域名重新渲染")
+    except Exception as e:
+        print(f"{Y}  ⚠ 订阅刷新失败（{e}）—— 节点本身已经是新域名了，"
+              f"回面板点一次『更新配置』补上即可。{N}")
+
+    # ── 5. Emby ────────────────────────────────────────────────────────
+    emby_old = _emby_cert()[0]
+    if emby_new and emby_old and emby_new != emby_old:
+        _emby_set_domain(emby_old, emby_new, _emby_shared(emby_old))
+
+    # ── 6. 撤掉旧域名的 acme 记录（见 _acme_forget 的说明，这步不能省）──────
+    if _acme_forget(old):
+        print(f"  已让 acme.sh 不再跟踪 {old}（不撤的话它的每日续期会覆盖掉节点证书）")
+    else:
+        print(f"{Y}  ⚠ 没找到 acme.sh，{old} 的续期记录没能撤掉。要是它还在，"
+              f"半夜会把证书覆盖回旧域名那张 —— 回面板『5 清理旧证书』看一眼。{N}")
+
+    # ── 7. 让吃证书的服务重读，顺带把新配置加载进去 ──────────────────────
+    svcs = _cert_consumers() or [s for _, _, s in cores]
+    print(f"\n{G_OK}  ✓ 域名已换成 {new}{N}")
+    print(f"    重启：{'、'.join(svcs)}")
+    print(f"{Y}    ⚠ 订阅地址的 host 跟着变了，客户端要【重新导入】一次订阅：{N}")
+    try:
+        print(f"      {_sub_service_text() or '回面板 2 看订阅地址'}")
+    except Exception:
+        print("      回面板『2 节点链接 / 订阅』看新地址")
+    restart_services(*svcs)
+    return True
+
+def _emby_default_base(new):
+    """Emby 对外是 <子域>.<域名>，而节点域名是一个完整主机名。节点换到 jp2.example.net
+       时 Emby 多半该跟到 example.net（跟现在 jp.example.net / example.net 的关系一样）。
+       只是个默认值，问的时候可以改。"""
+    parts = new.split(".")
+    return ".".join(parts[1:]) if len(parts) >= 3 else new
+
+def cert_change_domain_flow(i):
+    """菜单 15 → 2 更换域名。交互问完 + 把要动的东西全摆出来，确认后转后台。"""
+    Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
+    old = node_domain()
+    if not old:
+        print(f"\n  本机是{Y}自签证书 + IP 直连{N}，没有域名可换。")
+        print("  想用域名：先『1 安装证书』装一张，再重装节点。")
+        _ask("  按回车返回...")
+        return
+    print("\n" + "=" * 60)
+    print(f"  更换域名　　当前：{GRN}{old}{N}")
+    print("=" * 60)
+    print("  换的是【你自己的域名】——客户端连的那个、证书签的那个。")
+    print(f"  {Y}不是{N} reality 借用的伪装站（那个在菜单 4，现在是 {G.get('sni') or '(未设)'}）。")
+    print("-" * 60)
+    new = _ask("  新域名（要先把 A 记录解析到本机公网 IP）: ").strip().lower().rstrip(".")
+    if not new:
+        print("  已取消。"); return
+    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", new):
+        print("  域名格式不对，已取消。"); return
+    if new == old:
+        print("  跟现在一样，没什么可换的。"); return
+
+    ok, why = _domain_resolves_here(new)
+    print(f"  解析检测: {(GRN + '通过') if ok else (R + '不对')} · {why}{N}")
+    if not ok:
+        print(f"{R}  换完之后客户端连的就是这个域名，解析不到本机 = 所有节点一起断。{N}")
+        if (_ask("  仍要继续? y 继续 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+            print("  已取消，一个字节都没改。"); return
+
+    # ── 证书：够用就不重签 ──────────────────────────────────────────
+    have = cert_names()
+    covered = _name_covers(have, new) and _name_covers(have, "x." + new)
+    cf_token = ""
+    if covered:
+        print(f"  证书:     {GRN}现有证书已经盖得住 {new} 和 *.{new}，不用重签{N}")
+    elif _acme_has_cf():
+        print("  证书:     要重签一张泛域名的（acme.sh 里已存着 Cloudflare 凭据，直接用）")
+    else:
+        print("  证书:     要重签一张泛域名的，需要 Cloudflare API Token")
+        print("            （CF 后台 → 我的个人资料 → API 令牌 → 创建令牌 →")
+        print("             用「编辑区域 DNS」模板，区域选新域名那个）")
+        cf_token = _ask("  粘贴 Token: ").strip()
+        if not cf_token:
+            print("  没填 Token，已取消。"); return
+
+    # ── Emby ──────────────────────────────────────────────────────
+    emby_old, emby_new = i.get("emby_domain") or _emby_cert()[0], ""
+    if emby_old:
+        dft = _emby_default_base(new)
+        print(f"\n  本机有自建 Emby，它现在的域名是 {GRN}{emby_old}{N}"
+              f"（对外是 <子域>.{emby_old}）")
+        ans = _ask(f"  Emby 也换成（回车 = {dft}，输 n = 不动它）: ").strip().lower().rstrip(".")
+        if ans in ("n", "no"):
+            emby_new = ""
+            print(f"{Y}    Emby 留在 {emby_old}。那它就得自己一张证书、自己一条续期链，"
+                  f"而且旧域名的解析不能撤。{N}")
+        else:
+            emby_new = ans or dft
+            if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", emby_new):
+                print("  域名格式不对，已取消。"); return
+
+    # ── 把要动的东西全摆出来再问 ────────────────────────────────────
+    targets = _domain_targets(old)
+    names = [new, f"*.{new}"]
+    if emby_new and not _name_covers(names, "x." + emby_new):
+        names += [emby_new, f"*.{emby_new}"]
+    print("\n" + "-" * 60)
+    print(f"  换域名:    {old}  →  {new}")
+    if emby_new:
+        print(f"  Emby:      {emby_old}  →  {emby_new}")
+    if not covered:
+        print(f"  要签的证书: {', '.join(names)}")
+    print(f"  会动这些文件（{len(targets)} 个）:")
+    for p, whyt in targets:
+        print(f"      {p}\n        {whyt}")
+    print(f"  不会动:    reality 的借用站（{G.get('sni') or '(未设)'}）、"
+          f"端口 / uuid / 密码 / 路径 / short-id")
+    print(f"             CDN 套用那几个节点（它们走自己的域名，见菜单 9）")
+    print(f"  安全网:    先改配置再跑两个核心自带的校验，任一不过整体回滚、"
+          f"服务一个都不重启；")
+    print(f"             nginx -t 不过连核心一起回滚；这些全过了才去签证书，"
+          f"证书没拿到也整体回滚。")
+    print(f"{Y}  ⚠ 订阅地址的 host 会跟着变，客户端要【重新导入】一次订阅"
+          f"（不是刷新，是重新导入）。{N}")
+    print(f"{Y}  ⚠ 重启核心会掐断代理链路，挂着本机代理连的 SSH 会断——"
+          f"不用管，后台会跑完。{N}")
+    print("-" * 60)
+    if (_ask("确认更换? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+        print("  已取消，一个字节都没改。")
+        return
+    plan = {"op": "cert-domain", "domain": new, "cf_token": cf_token,
+            "emby_new": emby_new, "G": dict(G)}
+    _node_op_dispatch(plan,
+                      lambda: cert_change_domain_apply(new, cf_token, emby_new))
+
 def cert_menu():
     """菜单 15：证书管理。"""
     while True:
         i = cert_panel()
         print(f"  1 安装证书      当前：{'已安装' if i['exists'] else '未安装'}")
-        print("  2 强制重签      重新签一张并让所有服务重读（到期前后、或怀疑证书坏了时用）")
+        _nd = node_domain()
+        print("  2 更换域名      " +
+              (f"当前：{_nd}（连证书、节点链接、订阅一起换）" if _nd
+               else "本机没有域名（自签 + IP）"))
+        print("  3 强制重签      重新签一张并让所有服务重读（到期前后、或怀疑证书坏了时用）")
         if i["emby_domain"]:
-            print("  3 Emby 共用本证书  " +
+            print("  4 Emby 共用本证书  " +
                   ("当前：已共用（选它可还原成两张）" if i["emby_shared"] else
                    "当前：各用各的（两张证书、两条续期链）"))
         _can = [r for r in acme_records() if r["removable"]]
-        print("  4 清理旧证书    " +
+        print("  5 清理旧证书    " +
               (f"\033[1;33m有 {len(_can)} 个没用/抢占的记录\033[0m" if _can else "都是有主的"))
         print("  0 返回")
         c = (_ask("选择（回车=0 返回）: ") or "0").strip()
@@ -6549,10 +7037,12 @@ def cert_menu():
         if c == "1":
             cert_install_flow(i)
         elif c == "2":
+            cert_change_domain_flow(i)
+        elif c == "3":
             cert_fix()
-        elif c == "3" and i["emby_domain"]:
+        elif c == "4" and i["emby_domain"]:
             emby_unshare(i["emby_domain"]) if i["emby_shared"] else emby_share_flow(i)
-        elif c == "4":
+        elif c == "5":
             cert_clean_flow()
         else:
             print("  无效选择。")
@@ -6753,7 +7243,7 @@ def _node_op_dispatch(plan, fallback):
 def node_op_run():
     """CLI 子命令 node-op：读出落盘的方案，真正执行装/加/删。见 _node_op_dispatch。"""
     _TITLE = {"install": "全新安装", "add": "添加协议", "del": "删除协议",
-              "cert-install": "安装证书"}
+              "cert-install": "安装证书", "cert-domain": "更换域名"}
     try:
         plan = json.load(open(NODE_OP_PLAN))
     except Exception as e:
@@ -6768,6 +7258,9 @@ def node_op_run():
         if plan["op"] == "cert-install":
             cert_install_apply(plan["domain"], plan["wildcard"],
                                plan.get("cf_token", ""), plan.get("names"))
+        elif plan["op"] == "cert-domain":
+            cert_change_domain_apply(plan["domain"], plan.get("cf_token", ""),
+                                     plan.get("emby_new", ""))
         elif plan["op"] == "install":
             run(plan["sb"], plan["xray"])
         else:
@@ -6855,7 +7348,7 @@ def main_menu():
         print("  12. 网络优化（BBR/QoS 内核调优）")
         print("  13. 自建DNS（AdGuard Home·全设备去广告）")
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
-        print("  15. 证书管理（状态 / 安装 / 重签）")
+        print("  15. 证书管理（状态 / 安装 / 换域名 / 重签）")
         print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
         print("  18. 更新脚本（不影响节点）")
