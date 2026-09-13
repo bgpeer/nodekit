@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.8"
+SCRIPT_VERSION = "1.1.10"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -337,10 +337,16 @@ def ensure_self_signed():
     sh(f'openssl req -new -x509 -days 3650 -key {KEY} -out {CERT} -subj "/CN={G["sni"]}"')
 
 def cert_covers(path, domain):
-    """现有证书是否就是给这个域名签的（换域名重装时避免复用旧域名的证书）。"""
+    """现有证书【真的顶得住】这个域名吗（换域名重装时避免复用旧域名的证书）。
+
+       原来是拿 openssl 的整段文本做子串匹配，两头都会错：
+         · 漏判成「盖得住」：一张纯 *.a.com 的证书，文本里含有 a.com 这串字符，
+           于是被当成盖得住 a.com —— 可泛域名【不顶自己】，装上去裸域名直接握手失败。
+         · 也可能反过来：b.a.com 的证书文本里同样含 a.com。
+       改成走 SAN 列表 + 正经的覆盖判定（泛域名只顶一级，跟客户端的判定一致）。"""
     if not domain or not os.path.exists(path):
         return False
-    return domain in sh(f"openssl x509 -in {path} -noout -text 2>/dev/null", check=False)
+    return _name_covers(cert_names(path), domain)
 
 # acme.sh 续期后要执行的重载命令。它会被 acme.sh 记进该域名的 conf、每次续期自动跑。
 # 为什么非有不可：sing-box / xray / xy-sub 都是【启动时把证书读进内存】的，不会回头看文件。
@@ -375,6 +381,32 @@ def _ensure_acme_reload_hook():
     sh(f"{acme} --install-cert -d {G['domain']} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
 
+def _wildcard_wanted():
+    """这台机是不是【本来就该有】一张泛域名证书 → (要不要, 为什么)。
+
+       重签之前必须问一次这个。HTTP-01 签不出泛域名（Let's Encrypt 的硬规定，
+       泛域名只能走 DNS-01），而下面那条常规路径就是 HTTP-01 —— 所以什么都不问
+       直接重签，等于每重装一次就把泛域名【静默】降级成单域名。
+
+       后果不是「证书差一点」，是 Emby 当场被拆：它对外是 <子域>.<域名>，
+       只有 *.<域名> 顶得住。合并好的共用关系会退回两张证书、两条续期链，
+       而且全程不吭一声，等你发现时已经是几周之后。"""
+    try:
+        if cert_meta().get("wildcard"):
+            return True, "上次装的就是泛域名证书"
+    except Exception:
+        pass
+    _d = G.get("domain") or ""
+    if _d and _name_covers(cert_names(), "x." + _d):
+        return True, "磁盘上现有的这张就是泛域名"
+    try:
+        ed = _emby_cert()[0]
+        if ed and _emby_shared(ed):
+            return True, f"Emby（{ed}）正跟节点共用这张证书，它服务的是子域名"
+    except Exception:
+        pass
+    return False, ""
+
 def ensure_acme():
     """给了 --domain 就用 acme.sh standalone 签真证书；否则回落自签。"""
     if not G["domain"]:
@@ -394,10 +426,28 @@ def ensure_acme():
         sh(f"{acme} --register-account -m {G['email'] or 'a@a.com'} "
            f"--server letsencrypt", check=False)
         sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
-        # nginx 模式走 webroot（复用 nginx 的 80，不用腾端口）；否则 standalone
-        if G.get("nginx"):
+        Y_, R_, N_ = "\033[1;33m", "\033[1;31m", "\033[0m"
+        wild, why = _wildcard_wanted()
+        if wild and _acme_has_cf():
+            # 泛域名只能走 DNS-01。acme.sh 里存着 CF 凭据，那就照着原样签回来，
+            # 而不是降级——Emby 的共用关系靠软链指向这个文件，泛域名保住就不会断。
+            print(f"  这台机该用泛域名证书（{why}），改走 DNS-01 签 "
+                  f"{G['domain']} + *.{G['domain']}")
+            issue = (f"{acme} --issue --dns dns_cf -d {G['domain']} -d '*.{G['domain']}' "
+                     f"--keylength ec-256 --server letsencrypt")
+        elif wild:
+            # 只能降级了，但绝不静默：说清楚丢了什么、会坏什么、装完去哪儿补。
+            print(f"{Y_}  ⚠ 这台机该用泛域名证书（{why}），{N_}")
+            print(f"{Y_}    但 acme.sh 里没有 Cloudflare 凭据，泛域名签不出来"
+                  f"（HTTP-01 只能签单域名，这是 Let's Encrypt 的硬规定）。{N_}")
+            print(f"{R_}    这次会签成单域名，后果：Emby 对外是 <子域>.{G['domain']}，"
+                  f"单域名盖不住，共用关系会被拆成两张证书、两条续期链。{N_}")
+            print(f"{Y_}    装完回面板『15 证书管理 → 1 安装证书』用 DNS-01 重签一张"
+                  f"泛域名的，再『4 Emby 证书』合并回去。{N_}")
+            wild = False
+        if not wild and G.get("nginx"):
             issue = f"{acme} --issue -d {G['domain']} --webroot {WEBROOT} --keylength ec-256"
-        else:
+        elif not wild:
             if not port_free(80):
                 raise RuntimeError(
                     "80 端口被占用，acme.sh --standalone 无法验证。"
@@ -413,6 +463,13 @@ def ensure_acme():
             raise RuntimeError("acme 签发失败(检查域名解析是否指向本机、80 端口是否可达):\n" + out)
         os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
         _acme_install_cert(acme)
+        # 记下这次签的是什么，下次重装才知道该不该保泛域名
+        try:
+            save_cert_meta(domain=G["domain"], wildcard=bool(wild),
+                           mode="dns-cf" if wild else
+                                ("webroot" if G.get("nginx") else "standalone"))
+        except Exception:
+            pass
     else:
         # 证书已经在、不用重签，但 reloadcmd 可能【压根没装过】——
         # 这条 hook 是后来才加进脚本的，在它之前装的机器走不到上面那一步，
@@ -5990,7 +6047,7 @@ def cert_panel(info=None):
         print(f"    {R}✗ 这张证书盖不住节点正在用的域名 {i['node_domain']}！{N}")
         print(f"    {R}  所有吃证书的节点都会被客户端拒绝（tls: bad certificate），"
               f"只有 reality 还通。{N}")
-        print(f"    {R}  点『2 强制重签』重签回 {i['node_domain']} 即可。{N}")
+        print(f"    {R}  点『3 强制重签』重签回 {i['node_domain']} 即可。{N}")
     if i["names"]:
         print(f"  覆盖域名:  {', '.join(i['names'])}")
     if i["hijackers"]:
@@ -5998,7 +6055,7 @@ def cert_panel(info=None):
         print(f"    {R}  多半是换域名前留下的旧记录。它每次自动续期都会把这张证书覆盖成"
               f"它自己那张，{N}")
         print(f"    {R}  半夜发作、你什么都没做——吃证书的节点集体挂掉，reality 照常。{N}")
-        print(f"    {R}  点『2 强制重签』会顺手把它们撤掉。{N}")
+        print(f"    {R}  点『3 强制重签』会顺手把它们撤掉。{N}")
     users = [n for n, ok in (("sing-box", os.path.exists(SB_BIN)),
                              ("xray", os.path.exists(XRAY_BIN)),
                              ("订阅服务", ACME_CRT in _sub_service_text()),
@@ -6124,7 +6181,7 @@ def cert_upgrade_flow(i):
     """已经有证书时进『1 安装证书』：能升级成泛域名就给这条路，否则说清楚该走哪儿。
 
        为什么单独有这一步：从单域名升到泛域名【不是重签】——验证方式要从 HTTP-01
-       换成 DNS-01，签的名字也多了 *.域名。走『2 强制重签』沿用的是记录里原来那套，
+       换成 DNS-01，签的名字也多了 *.域名。走『3 强制重签』沿用的是记录里原来那套，
        永远签不出泛域名。没有这条路，装了单域名证书的机器就没法让 Emby 共用。"""
     Y, GRN, C, N = "\033[1;33m", "\033[1;32m", "\033[1;36m", "\033[0m"
     dom = i["domain"]
@@ -6135,9 +6192,9 @@ def cert_upgrade_flow(i):
     print(f"  覆盖：{', '.join(i['names']) or '(读不出)'}")
     if not missing:
         print(f"\n  {GRN}已经是泛域名了，该盖的都盖住了。{N}")
-        print("  想重新签一张：选『2 强制重签』。")
+        print("  想重新签一张：选『3 强制重签』。")
         if emby and not i["emby_shared"]:
-            print(f"  {C}想让 Emby 共用这一张：选『3 Emby 共用本证书』。{N}")
+            print(f"  {C}想让 Emby 共用这一张：选『4 Emby 证书』。{N}")
         _ask("  按回车返回...")
         return
     print(f"\n  可以升级成泛域名，升完会覆盖：{', '.join(want)}")
@@ -6333,31 +6390,97 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard, node_dom=None):
         print("    还没装节点：去『1 节点安装』，向导会认出这张证书直接用，不再重复申请。")
     return True
 
-def emby_share_flow(i):
-    """菜单 15 → 4：让 Emby 跟节点共用同一张证书。
+def emby_cert_menu(i):
+    """菜单 15 → 4：Emby 的证书跟节点【共用一张】还是【各用各的】。
 
-       为什么值得做：两张证书签的是同一个域名家族、各自 90 天、各自续期，
-       等于把「证书过期全挂」这个风险配了两份，而且续期链断掉的那份不会有人发现
-       （Emby 平时不看、真挂了才知道）。合并成一张之后，节点这张的 reloadcmd
-       本来就会 reload nginx，Emby 跟着一起吃到新证书。"""
-    Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
-    dom = i["emby_domain"]
-    if not dom:
-        print("\n  本机没装自建 Emby（或它没配域名），不涉及。")
-        _ask("  按回车返回...")
-        return
-    if i["emby_shared"]:
-        print(f"\n  {GRN}已经是共用的了{N}：/etc/nginx/certs/{dom}.crt → {ACME_CRT}")
-        print("  节点这张续期时会顺带 reload nginx，Emby 跟着吃到新证书。")
-        _ask("  按回车返回...")
-        return
-    if not i["emby_covered"]:
-        print(f"\n{Y}  当前这张证书顶替不了 Emby。{N}")
-        print(f"    Emby 对外是 <子域>.{dom}（emby./mw. 等好几个），要泛域名 *.{dom} 才盖得住；")
-        print(f"    而本机这张覆盖的是：{', '.join(i['names']) or '(读不出)'}")
-        print(f"    先去『1 安装证书』用 DNS-01 重签一张 *.{dom} 的，再回来合并。")
-        _ask("  按回车返回...")
-        return
+       原来这里是个盲切换——按下去它自己决定合并还是拆开，而合并不了的时候
+       只丢一句「顶替不了」就退出来。你看不到当前处在哪一边、能不能改到另一边、
+       改不了是因为什么。现在两个方向并排摆在同一屏上，各自标着状态和原因。"""
+    Y, R, GRN, C, N = ("\033[1;33m", "\033[1;31m", "\033[1;32m",
+                       "\033[1;36m", "\033[0m")
+    while True:
+        dom = i.get("emby_domain") or ""
+        if not dom:
+            print("\n  本机没装自建 Emby（或它没配域名），不涉及证书共用。")
+            _ask("  按回车返回...")
+            return
+        shared = i.get("emby_shared")
+        print("\n" + "=" * 60)
+        print("  Emby 证书")
+        print("=" * 60)
+        if shared:
+            print(f"  当前:      {GRN}共用一张{N}"
+                  f"（Emby 的证书路径是指向节点证书的软链）")
+            print(f"  两边都用:  {ACME_CRT}   {_cert_left_text(i['secs'])}")
+            print(f"             覆盖 {', '.join(i['names']) or '(读不出)'}")
+            print(f"  {GRN}续期一条链{N}：节点这张续期时本来就会 reload nginx，"
+                  f"Emby 自动吃到新证书。")
+        else:
+            print(f"  当前:      {Y}各用各的{N}（两张证书、两条续期链）")
+            print(f"  节点这张:  {i['domain'] or '(读不出)'}   "
+                  f"{_cert_left_text(i['secs'])}")
+            print(f"             {ACME_CRT}")
+            print(f"  Emby 这张: *.{dom}   {_cert_left_text(i['emby_secs'])}")
+            print(f"             {_emby_crt(dom)}")
+            print(f"  {Y}⚠ 两条续期链 = 把「证书过期全挂」的风险配了两份，而且 Emby"
+                  f"那条断了不会有人发现{N}")
+            print(f"    （平时不看，真挂了才知道）。")
+        print("-" * 60)
+        # ① 共用
+        if shared:
+            print(f"  1 共用节点这张证书    {GRN}当前就是{N}")
+        elif i.get("emby_covered"):
+            print(f"  1 共用节点这张证书    {C}可以合并{N}"
+                  f"（两张变一张，少一条会悄悄断掉的续期链）")
+        else:
+            print(f"  1 共用节点这张证书    {R}✗ 不行{N}：节点这张盖不住 "
+                  f"<子域>.{dom}")
+            print(f"                        Emby 对外是 emby./mw. 等好几个子域，"
+                  f"要泛域名 *.{dom} 才顶得住；")
+            print(f"                        节点这张覆盖的是 "
+                  f"{', '.join(i['names']) or '(读不出)'}")
+            print(f"                        {Y}先去『1 安装证书』用 DNS-01 重签一张"
+                  f"泛域名的，再回来合并{N}")
+        # ② 各用各的
+        if shared:
+            print(f"  2 各用各的            Emby 用回它自己那张"
+                  f"（备份还在就放回去）")
+            print(f"                        {Y}⚠ 它在 acme.sh 的续期记录合并时已经撤了，"
+                  f"还原后要去『16 自建 Emby』重签{N}")
+        else:
+            print(f"  2 各用各的            {GRN}当前就是{N}")
+        print("  0 返回")
+        c = (_ask("选择（回车=0 返回）: ") or "0").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            if shared:
+                print(f"\n  {GRN}已经是共用的了{N}：{_emby_crt(dom)} → {ACME_CRT}")
+                _ask("  按回车继续...")
+            elif not i.get("emby_covered"):
+                print(f"\n{R}  合并不了——原因上面写着：节点这张盖不住 <子域>.{dom}。{N}")
+                print(f"  先『1 安装证书』重签一张泛域名的。")
+                _ask("  按回车继续...")
+            else:
+                emby_share_confirm(i, dom)
+                i = cert_info()                      # 状态变了，重读
+        elif c == "2":
+            if not shared:
+                print(f"\n  {GRN}本来就是各用各的{N}，没什么可改。")
+                _ask("  按回车继续...")
+            else:
+                emby_unshare(dom)
+                i = cert_info()
+        else:
+            print("  无效选择。")
+
+def emby_share_confirm(i, dom):
+    """把该说的摆出来再动手。能不能合并由 emby_cert_menu 先判过了，这里只管确认。
+
+       为什么值得合并：两张证书签的是同一个域名家族、各自 90 天、各自续期，
+       等于把「证书过期全挂」这个风险配了两份，而且续期链断掉的那份不会有人
+       发现（Emby 平时不看、真挂了才知道）。合并成一张之后，节点这张的
+       reloadcmd 本来就会 reload nginx，Emby 跟着一起吃到新证书。"""
     print("\n" + "-" * 60)
     print(f"  把 Emby 的证书指到节点这张上（两张变一张）")
     print(f"  Emby 现在用:  {_emby_crt(dom)}   {_cert_left_text(i['emby_secs'])}")
@@ -6367,6 +6490,7 @@ def emby_share_flow(i):
     print(f"  顺带:         让 acme.sh 别再单独续 *.{dom} 那张（避免它续完把软链覆盖掉）")
     print(f"                原证书文件会备份成 .bak，acme.sh 里的记录只是不再跟踪，不删文件")
     print(f"  以后:         节点这张续期时本来就会 reload nginx，Emby 自动吃到新证书")
+    print(f"  改回去:       随时回这一屏选『2 各用各的』")
     print("-" * 60)
     if (_ask("确认合并? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
         print("  已取消。")
@@ -6532,7 +6656,7 @@ def cert_clean_flow():
     left = [x["domain"] for x in acme_records() if x["removable"]]
     print(f"\n  剩下的可删项：{', '.join(left) if left else '无'}")
     if any(r["status"] == "抢占中" for r in picked):
-        print(f"  {Y}刚删掉的里面有『抢占中』的——建议现在点『2 强制重签』，"
+        print(f"  {Y}刚删掉的里面有『抢占中』的——建议现在点『3 强制重签』，"
               f"把节点的证书重签回来。{N}")
     _ask("  按回车返回...")
 
@@ -6762,7 +6886,7 @@ def _emby_set_domain(old, new, shared):
           + ("（证书继续跟节点共用一张）" if shared else ""))
     if not shared:
         print(f"{Y}    ⚠ Emby 的证书原来是独立一张、签的是 {old}，盖不住 {new}。"
-              f"去菜单 15『4 Emby 共用本证书』并成一张，或自己给它重签。{N}")
+              f"去菜单 15『4 Emby 证书』并成一张，或自己给它重签。{N}")
     return True
 
 def _cert_usable_for(names):
@@ -7115,9 +7239,10 @@ def cert_menu():
                else "本机没有域名（自签 + IP）"))
         print("  3 强制重签      重新签一张并让所有服务重读（到期前后、或怀疑证书坏了时用）")
         if i["emby_domain"]:
-            print("  4 Emby 共用本证书  " +
-                  ("当前：已共用（选它可还原成两张）" if i["emby_shared"] else
-                   "当前：各用各的（两张证书、两条续期链）"))
+            print("  4 Emby 证书        " +
+                  ("当前：共用一张" if i["emby_shared"] else
+                   "当前：各用各的（两张证书、两条续期链）")
+                  + "　进去可两边切换")
         _can = [r for r in acme_records() if r["removable"]]
         print("  5 清理旧证书    " +
               (f"\033[1;33m有 {len(_can)} 个没用/抢占的记录\033[0m" if _can else "都是有主的"))
@@ -7132,7 +7257,7 @@ def cert_menu():
         elif c == "3":
             cert_fix()
         elif c == "4" and i["emby_domain"]:
-            emby_unshare(i["emby_domain"]) if i["emby_shared"] else emby_share_flow(i)
+            emby_cert_menu(i)
         elif c == "5":
             cert_clean_flow()
         else:
