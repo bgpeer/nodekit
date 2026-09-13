@@ -38,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.94"
+SCRIPT_VERSION = "1.5.95"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8332,18 +8332,26 @@ def heal_given_up(tab, iid, now=None):
     return (now or time.time()) - ts < HEAL_GIVEUP_DAYS * 86400
 
 def heal_fail_record(results):
-    """把这一轮的结果记进失败表。results: [(条目id, 成不成功)]。
+    """把这一轮的结果记进失败表。results: [(条目id, 成不成功)] 或 [(id, 成不成功, 确定失败)]。
 
        成功就把记录抹掉（下次真坏了还能重新计数）；失败就累加并记下时间。
-       表满了先丢最老的 —— 丢掉只是让它下次还有机会被探，不会弄坏任何东西。"""
+       表满了先丢最老的 —— 丢掉只是让它下次还有机会被探，不会弄坏任何东西。
+
+       第三项「确定失败」是指探测【跑完了】、Emby 明说这个源没有音视频轨。
+       那是个确定的答案，不是线路抖了一下，所以一次就记满 HEAL_GIVEUP ——
+       再探两次只是把同一个答案买三遍，而一遍的价钱是「全库 × 每个几 MB」。"""
     if not results:
         return
     tab = heal_fail_table()
     now = int(time.time())
-    for iid, good in results:
+    for item in results:
+        iid, good = item[0], item[1]
+        dead = item[2] if len(item) > 2 else False
         k = str(iid)
         if good:
             tab.pop(k, None)
+        elif dead:
+            tab[k] = [HEAL_GIVEUP, now]
         else:
             cnt = tab.get(k, [0, 0])[0] if isinstance(tab.get(k), list) else 0
             tab[k] = [cnt + 1, now]
@@ -8527,7 +8535,7 @@ def _heal_one(d, key, _it, base, token):
             return "throttle", name, el(), f"网盘没给出文件头（{why}）"
         return "retry", name, el(), f"网盘没给出文件头（{why}）"
     url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
-    mins, streams = 0, False
+    mins, streams, probed = 0, False, True
     if True:                          # 缩进只是为了让下面这段 try/finally 原样保留
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
@@ -8539,6 +8547,7 @@ def _heal_one(d, key, _it, base, token):
                       f"&StartTimeTicks=0&MaxStreamingBitrate=200000000",
                       key, method="POST", timeout=200)
             except Exception:
+                probed = False    # 探测请求本身没跑成（超时/断开）——【不算这个条目的账】
                 pass          # 探测本身超时也要走到 finally 把文件还原
             # 【核对源的时长，不是条目的】条目的 RunTimeTicks 可能是刮削回填的
             # （TMDb 给的片长）。拿它当探测结果的话，探测明明失败了也会报"✔ 18 分钟"
@@ -8575,7 +8584,14 @@ def _heal_one(d, key, _it, base, token):
         # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
         # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
         return "retry", name, el(), "只探到时长，没有音视频轨（这样点开会 load fail）"
-    return "retry", name, el(), "Emby 没探出时长"
+    if probed:
+        # 【探测跑完了、Emby 什么都没找到 = 确定的答案，不是线路抖了一下】
+        # 这种再探两次只是把同一个答案买三遍，而一遍的价钱是「全库 × 每个几 MB」。
+        # 现场实测一个 2727 条的库：一遍 18 GB。所以这一种一次就判放弃。
+        # 判错的代价很小：体检那边照旧如实报它，HEAL_GIVEUP_DAYS 天后自动再给一次
+        # 机会，想立刻重来还有 heal-reset。
+        return "dead", name, el(), "Emby 探完了，这个源没有音视频轨"
+    return "retry", name, el(), "探测请求没跑成（超时），下一轮再试"
 
 
 def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
@@ -8635,8 +8651,9 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
                         stop.set()
                         break
                 else:
-                    again.append(_it)
-                    fails.append((_it[1], False))
+                    if res != "dead":            # dead 是确定答案，同一轮里也别再试
+                        again.append(_it)
+                    fails.append((_it[1], False, res == "dead"))
                     print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
                           f"{name[:26]}  {YELLOW}{note or 'Emby 没探出时长'}{RST}"
                           f"  {DIM}{sec:.0f}s{RST}")
@@ -10275,6 +10292,19 @@ def _apply_dir_cache(d, stores, want, quiet=False):
     return n
 
 
+_OL_NOOP = ("have enabled", "have disabled", "already enabled", "already disabled")
+
+def _ol_already_there(msg):
+    """OpenList 回「这个盘已经是启用/停用状态了」—— 那正是我们要的结果，不是失败。
+
+       为什么非判不可：enable 这一步要向网盘的接口要一次令牌（夸克是
+       open-api-drive.quark.cn），跨境线路上经常要几十秒。客户端 90 秒超时了、
+       服务端其实做完了 —— 重试进来就撞上这句话，于是屏上报「重新加载失败」，
+       而你去 OpenList 网页一看盘明明好好地开着。报一个不存在的故障，比不报更糟：
+       你会去动一个本来是好的东西。"""
+    m = (msg or "").lower()
+    return any(x in m for x in _OL_NOOP)
+
 def reload_storages(d, mounts):
     """把这几个挂载点的存储【停用再启用】—— 等于只清掉它们的目录缓存。返回清了几个。
 
@@ -10307,7 +10337,7 @@ def reload_storages(d, mounts):
     for sid, mp in ids:
         try:
             r = _ol_api(f"/api/admin/storage/disable?id={sid}", {}, tok, timeout=60)
-            if r.get("code") != 200:
+            if r.get("code") != 200 and not _ol_already_there(r.get("message")):
                 raise RuntimeError(str(r.get("message") or "disable"))
             # 【enable 必须重试】这两步是停用 + 启用。停用成了、启用挂了的话，这个盘就
             # 停在【停用】上 —— 之后 AutoFilm 去列目录当然什么都没有，而屏上只有一句
@@ -10318,7 +10348,8 @@ def reload_storages(d, mounts):
             for i in range(3):
                 try:
                     r = _ol_api(f"/api/admin/storage/enable?id={sid}", {}, tok, timeout=90)
-                    why = "" if r.get("code") == 200 else str(r.get("message") or "enable")
+                    why = ("" if r.get("code") == 200 or _ol_already_there(r.get("message"))
+                           else str(r.get("message") or "enable"))
                 except Exception as e:
                     why = _short_err(e)
                 if not why:
