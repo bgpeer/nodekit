@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.6"
+SCRIPT_VERSION = "1.1.7"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -1525,10 +1525,44 @@ def build(table, names, pinned=None, dup=None, mark=""):
     return inbounds, links
 
 # ============================================================================ 订阅
+# YAML 标量：除了真数字和这两个布尔字面量，字符串一律加引号。
+#
+# 不加引号会出事，而且是在别人的客户端里出事。reality 的 short-id 是 8 位随机 hex，
+# 随机到 38e92059 这种「数字 e 数字」的形状时，按 YAML 1.2 的浮点规则它是 38×10^92059
+# —— 远超双精度上限，解析出来直接是 Infinity。客户端接着要把配置 JSON 化时就炸了
+# （ClashMi: Converting object to an encodable object failed: Infinity）。
+#
+# 最难查的是各家解析器口径还不一样，同一份配置有的能用有的不能：
+#   Go(mihomo)  ParseFloat 溢出报错 → 回退成字符串，没事
+#   PyYAML      走 YAML 1.1，浮点必须带小数点 → 当字符串，没事（所以在服务端自测扫不出来）
+#   Dart / JS   走 YAML 1.2 → Infinity，炸
+#
+# 所以这里不做「这个值像不像数字」的判断——正是这种判断在各家 YAML 版本之间不一致。
+# 反过来做白名单：只有真 int/float/bool 和下面这两个字面量裸写，其余全部带引号。
+# 代价只是配置里多一堆引号，换来的是任何随机值都不会再被谁读成别的类型。
+_YAML_BARE = ("true", "false")
+
+def _yq(s):
+    """字符串 → YAML 双引号标量（按双引号规则转义，节点名里带引号/反斜杠也不会破格式）。"""
+    out = ['"']
+    for ch in s:
+        if   ch == "\\": out.append("\\\\")
+        elif ch == '"':  out.append('\\"')
+        elif ch == "\n": out.append("\\n")
+        elif ch == "\r": out.append("\\r")
+        elif ch == "\t": out.append("\\t")
+        elif ord(ch) < 0x20: out.append("\\x%02x" % ord(ch))
+        else: out.append(ch)
+    out.append('"')
+    return "".join(out)
+
 def _yfmt(v):
     if isinstance(v, dict): return "{" + ", ".join(f"{k}: {_yfmt(x)}" for k, x in v.items()) + "}"
     if isinstance(v, list): return "[" + ", ".join(_yfmt(x) for x in v) + "]"
-    return str(v)
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, (int, float)): return str(v)
+    s = str(v)
+    return s if s in _YAML_BARE else _yq(s)
 
 # X25519MLKEM768 后量子 KEX 需要新核心：sing-box>=1.12.0、xray>=25.5.16。
 # 客户端主动发起该握手，若服务端核心太旧会直接握手失败，故装机核心太旧时不下发此字段。
@@ -1569,8 +1603,9 @@ def link_to_proxy(u):
     sch, host, port = P.scheme, P.hostname, P.port
     uq = urllib.parse.unquote
     def nm(default):
-        # 名称直接用链接里的 #备注（已含用户前缀+协议）；不再硬编码国旗
-        return '"' + (uq(P.fragment) if P.fragment else default) + '"'
+        # 名称直接用链接里的 #备注（已含用户前缀+协议）；不再硬编码国旗。
+        # 不在这里拼引号——渲染 YAML 时由 _yfmt 统一加并转义。
+        return uq(P.fragment) if P.fragment else default
     insec = qs.get("insecure") == "1" or qs.get("allowInsecure") == "1" or qs.get("allow_insecure") == "1"
     if sch == "vless":
         net = qs.get("type", "tcp"); sec = qs.get("security", "none")
@@ -1630,7 +1665,7 @@ def link_to_proxy(u):
         return d
     if sch == "vmess":
         b = u[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
-        name = '"' + j.get("ps", "vmess") + '"'
+        name = j.get("ps", "vmess")
         d = {"name": name, "type": "vmess", "server": j["add"], "port": int(j["port"]), "uuid": j["id"],
              "alterId": int(j.get("aid", 0)), "cipher": j.get("scy", "auto"), "udp": "true"}
         if j.get("tls") == "tls": d["tls"] = "true"; d["servername"] = j.get("sni") or j.get("host")
@@ -1857,7 +1892,7 @@ def mihomo_to_sb_outbound(key, d):
        不支持的类型(如 xhttp)返回 None，由调用方跳过。"""
     if key not in PROTO_TO_SBTAG:
         return None                                      # xhttp 等 → 不写进 sing-box
-    tag = d.get("name", "").strip('"') or key            # 统一用节点池名称（含服务器端前缀）
+    tag = d.get("name", "") or key                       # 统一用节点池名称（含服务器端前缀）
     srv = d["server"]; sni = d.get("servername") or d.get("sni") or srv
     insec = bool(d.get("skip-cert-verify"))
     utls = {"enabled": True, "fingerprint": "chrome"}
@@ -2232,7 +2267,7 @@ def _sr_fill_names(tpl, frag):
 def build_shadowrocket_sub(nodes, tpl_url):
     lines, names_list = [], []
     for key, d in nodes:
-        name = d.get("name", "").strip('"') or key       # 统一用节点池名称（含服务器端前缀）
+        name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
         try:
             s = shadowrocket_line(name, d)
             if s: lines.append(s); names_list.append(name)
@@ -2253,8 +2288,8 @@ def build_shadowrocket_sub(nodes, tpl_url):
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
 def _node_names(nodes):
-    """从解析后的节点取名字列表（去引号），供国家检测用。"""
-    return [d.get("name", "").strip('"') or k for k, d in nodes]
+    """从解析后的节点取名字列表，供国家检测用。"""
+    return [d.get("name", "") or k for k, d in nodes]
 
 _GNAME_RE = re.compile(r'''name:[ \t]*(?:"([^"]*)"|'([^']*)'|([^,}\n]+))''')
 
