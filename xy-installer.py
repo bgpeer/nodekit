@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.4"
+SCRIPT_VERSION = "1.1.6"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -4654,7 +4654,14 @@ def _cycle_start(reset_day, today):
     return datetime.date(y, m, min(reset_day, calendar.monthrange(y, m)[1]))
 
 def _vnstat_cycle_usage(iface, start, mode):
-    """从 vnstat 日表累加账单周期用量（字节）。mode: sum=双向相加 / max=单向取大。"""
+    """从 vnstat 日表累加账单周期用量（字节）。
+
+       mode: sum=双向相加 / max=单向取大 / out=只计出站 / in=只计入站。
+
+       「只计出站」不是「单向取大」：不少机房（含一部分日本/欧洲小鸡）只按上传计费，
+       下载白送。这种机器上 max 会取到下载那一边——媒体库探测、镜像拉取这类活儿
+       下载远大于上传，于是面板报出十几倍于真实账单的数字，看着像要爆了，其实离
+       配额还差得远。反过来只计入站的也有（少见），一并支持。"""
     import datetime
     sel = f"-i {iface} " if iface else ""
     j = json.loads(sh(f"vnstat {sel}--json d 62", check=False))
@@ -4663,7 +4670,7 @@ def _vnstat_cycle_usage(iface, start, mode):
         dt = datetime.date(e["date"]["year"], e["date"]["month"], e["date"]["day"])
         if dt >= start:
             rx += e["rx"]; tx += e["tx"]
-    return (rx + tx) if mode == "sum" else max(rx, tx)
+    return {"sum": rx + tx, "max": max(rx, tx), "out": tx, "in": rx}.get(mode, rx + tx)
 
 def traffic_setup():
     """设置流量套餐：机房重置日 / 月配额 / 计费方式 / 一次性校准到机房当前读数。"""
@@ -4675,8 +4682,13 @@ def traffic_setup():
     q = _ask(f"  月流量配额 GB（回车={cfg.get('quota_gb') or '不设，只显示用量'}）: ").strip()
     try: quota = float(q) if q else cfg.get("quota_gb")
     except ValueError: quota = cfg.get("quota_gb")
-    m = _ask(f"  计费方式 1 双向相加 / 2 单向取大（回车={'2' if cfg.get('mode') == 'max' else '1'}）: ").strip()
-    mode = "max" if m == "2" or (not m and cfg.get("mode") == "max") else "sum"
+    _MODES = {"1": "sum", "2": "max", "3": "out", "4": "in"}
+    _cur = {v: k for k, v in _MODES.items()}.get(cfg.get("mode", "sum"), "1")
+    print("  计费方式：1 双向相加   2 单向取大   3 只计出站(上传)   4 只计入站(下载)")
+    print("            只按上传计费的机房选 3——那种机器上选 2 会取到下载那一边，")
+    print("            面板数字会比真实账单大很多倍。")
+    m = _ask(f"  选择 1-4（回车={_cur}）: ").strip()
+    mode = _MODES.get(m or _cur, "sum")
     cfg.update({"reset_day": reset_day, "quota_gb": quota, "mode": mode})
 
     # 校准：vnstat 只统计装机之后的量，本周期装机前的用量抄一次机房面板即可对齐；
@@ -4710,14 +4722,17 @@ def traffic_line():
             used = _vnstat_cycle_usage(iface, start, cfg.get("mode", "sum"))
             if cfg.get("calib_cycle") == start.isoformat():   # 校准只在本周期生效
                 used = max(used + int(cfg.get("calib_bytes", 0)), 0)
-            tag = "双向" if cfg.get("mode", "sum") == "sum" else "单向"
+            tag = {"sum": "双向", "max": "单向取大",
+                   "out": "只计出站", "in": "只计入站"}.get(cfg.get("mode", "sum"), "双向")
             quota = cfg.get("quota_gb")
             if quota:
                 left = max(quota * 1024 ** 3 - used, 0)
+                _t = tag + ("计" if tag in ("双向", "单向取大") else "")
                 return (f"  📊 本周期已用: {_fmt_traffic(used)} / {quota:g} GB"
-                        f"（剩 {_fmt_traffic(left)}，每月 {cfg['reset_day']} 号重置，{tag}计）")
+                        f"（剩 {_fmt_traffic(left)}，每月 {cfg['reset_day']} 号重置，{_t}）")
+            _t = tag + ("计" if tag in ("双向", "单向取大") else "")
             return (f"  📊 本周期已用: {_fmt_traffic(used)}"
-                    f"（每月 {cfg['reset_day']} 号重置，{tag}计，{iface}）")
+                    f"（每月 {cfg['reset_day']} 号重置，{_t}，{iface}）")
         v = _vnstat_stats(iface)
         if v:
             mrx, mtx, drx, dtx = v
