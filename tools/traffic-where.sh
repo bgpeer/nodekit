@@ -14,7 +14,7 @@
 # 同时量物理网卡和每个容器，谁在跑一目了然。
 set -u
 
-TOOL_VER="2026-09-14e"
+TOOL_VER="2026-09-14f"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -161,6 +161,7 @@ echo -e "  大批 mtime 是今天 → 有东西在重写 strm，Emby 因此重�
 echo -e "  mtime 都是很久以前 → strm 没动过，是 Emby 自己在重探（该改 Emby 设置）。${X}"
 STRM_ROOT=""
 for r in "$DIR"/media/strm "$DIR"/strm; do [ -d "$r" ] && STRM_ROOT="$r" && break; done
+export STRM_ROOT
 if [ -n "$STRM_ROOT" ]; then
   echo "  strm 根目录：$STRM_ROOT"
   find "$STRM_ROOT" -name '*.strm' -printf '%T@ %p\n' 2>/dev/null | awk -v now="$(date +%s)" '
@@ -181,6 +182,38 @@ if [ -n "$STRM_ROOT" ]; then
           c = 0; for (l in lib) { printf "      %-28s %6d\n", substr(l,1,26), lib[l]; if (++c >= 6) break } }'
 else
   echo "    （找不到 strm 目录，在 $DIR/media/strm 或 $DIR/strm 下面）"
+fi
+
+sec "④f AutoFilm 实际部署的那份配置：overwrite 是不是 false"
+echo -e "  ${D}模板里现在是 overwrite: false，但配置是【装机那天】写下的——"
+echo -e "  老版本装的机器可能还是 true，那就每天把全部 strm 重写一遍，"
+echo -e "  Emby 看到 mtime 全变就重新探测全库。${X}"
+AF=""
+for f in "$DIR"/autofilm/config/config.yaml "$DIR"/autofilm/config.yaml; do
+  [ -f "$f" ] && AF="$f" && break
+done
+if [ -n "$AF" ]; then
+  echo "  配置：$AF"
+  grep -nE "^\s*(id|overwrite|cron|source_dir):" "$AF" 2>/dev/null \
+    | sed 's/^/    /' | head -40
+  BAD=$(grep -cE "^\s*overwrite:\s*[Tt]rue" "$AF" 2>/dev/null || echo 0)
+  OKN=$(grep -cE "^\s*overwrite:\s*[Ff]alse" "$AF" 2>/dev/null || echo 0)
+  echo
+  if [ "${BAD:-0}" -gt 0 ]; then
+    echo -e "  ${R}✗ 有 $BAD 个任务是 overwrite: true —— 就是它每天把 strm 全重写一遍。${X}"
+    echo -e "  ${Y}    进菜单 16 点『7 更新』会按新模板重写这份配置（overwrite 改成 false）。${X}"
+  elif [ "${OKN:-0}" -gt 0 ]; then
+    echo -e "  ${G}✓ $OKN 个任务都是 overwrite: false${X}"
+    echo -e "  ${Y}    那 strm 的 mtime 还天天变就是别的东西在写，看 ④e 的分布和下面的时刻。${X}"
+  fi
+else
+  echo "    （找不到 AutoFilm 配置）"
+fi
+echo
+echo "  最近被改过的 strm，改在什么时刻（看是不是都挤在 AutoFilm 那一轮）："
+if [ -n "${STRM_ROOT:-}" ]; then
+  find "$STRM_ROOT" -name '*.strm' -newermt '-26 hours' -printf '%TH\n' 2>/dev/null \
+    | sort | uniq -c | awk '{printf "    %s 时  %d 个\n", $2, $1}'
 fi
 
 sec "④c Emby 自己的定时任务最近跑了什么"
