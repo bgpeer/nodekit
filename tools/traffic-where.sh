@@ -14,7 +14,7 @@
 # 同时量物理网卡和每个容器，谁在跑一目了然。
 set -u
 
-TOOL_VER="2026-09-14c"
+TOOL_VER="2026-09-14d"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -120,6 +120,37 @@ if [ -f "$LOGM" ]; then
             for (i=0;i<w;i++) bar=bar"#"
             printf "    %s 时  %5d 次  %6.2f GB  %s\n", k, n[k], b[k]/1073741824, bar }
         }' "$LOGM"
+else
+  echo "    （找不到 $LOGM）"
+fi
+
+sec "④d 这些探测打在哪些文件上：是在循环，还是在走全库"
+echo -e "  ${D}同一批文件被反复探 = 有东西在循环（每小时重来一遍）；"
+echo -e "  几乎每个文件只出现一两次 = 在走全库（扫描/刷新那一类）。${X}"
+if [ -f "$LOGM" ]; then
+  awk -v d="$(date +%d/%b/%Y)" '
+    index($0, d) == 0 {next}
+    tolower($0) ~ /lavf\/|ffmpeg/ {
+      p = $7; sub(/\?.*/, "", p)      # 去掉 ?sign=… 那截，不然同一文件算成多个
+      n[p]++; tot++
+      if (match($0, d":[0-9][0-9]")) { h = substr($0, RSTART+length(d)+1, 2); hs[p" "h]=1 }
+    }
+    END {
+      if (!tot) {print "    今天没有 ffprobe 记录"; exit}
+      u = 0; rep = 0
+      for (p in n) { u++; if (n[p] > 1) rep++ }
+      printf "    探了 %d 次，落在 %d 个不同文件上（平均每个 %.1f 次）\n", tot, u, tot/u
+      printf "    被探过不止一次的：%d 个（占 %.0f%%）\n", rep, rep*100/u
+      # 跨了几个小时 = 更像循环，而不是一次扫描里的重试
+      for (k in hs) { split(k, a2, " "); span[a2[1]]++ }
+      m = 0; for (p in span) if (span[p] >= 3) m++
+      printf "    跨 3 个以上不同小时被探的：%d 个 %s\n", m,
+             (m > u/10 ? "← 像是在循环" : "← 不像循环")
+      print "    探得最多的前 8 个："
+      c = 0
+      for (p in n) if (n[p] > 1) { printf "      %3d 次  %s\n", n[p], substr(p, 1, 64); if (++c >= 8) break }
+      if (!c) print "      （没有一个文件被探过两次——说明是在走全库，不是循环）"
+    }' "$LOGM"
 else
   echo "    （找不到 $LOGM）"
 fi
