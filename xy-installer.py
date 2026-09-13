@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -6765,6 +6765,49 @@ def _emby_set_domain(old, new, shared):
               f"去菜单 15『4 Emby 共用本证书』并成一张，或自己给它重签。{N}")
     return True
 
+def _cert_usable_for(names):
+    """磁盘上【正在用的】那张证书，能不能顶住这些域名 → (ok, 说明)。
+
+       跟 cert_validate 是同一套四条判据（解析得开 / 覆盖得到 / 没过期 / 私钥配对），
+       只是对象是现役的 ACME_CRT 而不是刚签出来的临时文件。
+
+       为什么要单独有这一道：换域名时如果现有证书【已经】盖得住新域名，流程会
+       跳过重签——可「盖得住」不等于「能用」。它可能还有三天到期，也可能是上次
+       签发中断留下的「新证书配旧私钥」（文件看着一切正常、日期也没问题，握手
+       直接失败）。跳过重签又不验一遍，等于把这两种情况原样带进新域名。"""
+    return cert_validate(ACME_CRT, ACME_KEY, names)
+
+def _domain_switch_notice(new, emby_new=""):
+    """换完域名之后，哪些【对外地址】跟着变了、去哪儿看新值。
+
+       证书是全机共用的地基，吃它的东西各自对外报一个地址：订阅、节点、
+       自建 DNS 的 DoH、GitHub 中转、Emby。换完不逐个说清楚，你只会发现
+       「某个东西忽然连不上」，然后挨个去猜。"""
+    out = []
+    try:
+        t = _sub_service_text()
+        if t:
+            out.append(("订阅地址", t, "面板 2　⚠ host 变了，客户端要【重新导入】，不是刷新"))
+    except Exception:
+        out.append(("订阅地址", "(读不出)", "面板 2　⚠ host 变了，客户端要重新导入"))
+    out.append(("节点链接", f"@{new}:端口", "面板 2　单条分享链接发给别人过的，要重发"))
+    try:
+        doh = _selfdns_doh()
+        if doh:
+            out.append(("自建 DNS 的 DoH", doh,
+                        "面板 13　手机「专用DNS」/ 路由器里填的那个要改"))
+    except Exception:
+        pass
+    try:
+        gh = _ghrelay_prefix()
+        if gh:
+            out.append(("GitHub 中转", gh, "面板 14　订阅里自动换好了；手工引用过的要改"))
+    except Exception:
+        pass
+    if emby_new:
+        out.append(("Emby", f"https://<子域>.{emby_new}", "面板 16　App / 客户端里存的地址要改"))
+    return out
+
 def cert_change_domain_apply(new, cf_token="", emby_new=""):
     """换域名（非交互，后台跑）。成功返回 True。
 
@@ -6844,15 +6887,40 @@ def cert_change_domain_apply(new, cf_token="", emby_new=""):
     names = [new, f"*.{new}"]
     if emby_new and not _name_covers(names, "x." + emby_new):
         names += [emby_new, f"*.{emby_new}"]
+    need = [new, f"*.{new}"] + ([f"x.{emby_new}"] if emby_new else [])
     have = cert_names()
     if _name_covers(have, new) and _name_covers(have, "x." + new) and \
             (not emby_new or _name_covers(have, "x." + emby_new)):
-        print(f"  现有证书已经盖得住 {new} 和 *.{new}，不用重签。")
+        # 「盖得住」不等于「能用」：可能快到期了，也可能是新证书配旧私钥。
+        # 跳过重签就必须在这儿补上这一验，否则等于把坏证书原样带进新域名。
+        ok, why = _cert_usable_for(need)
+        if not ok:
+            restore()
+            print(f"{R}  ✗ 证书不可用：{why}{N}")
+            print(f"{R}    现有证书虽然名字上盖得住 {new}，但它本身有问题，"
+                  f"换过去所有吃证书的节点会当场被客户端拒绝。{N}")
+            print(f"{R}    整件事已回滚，两个核心的配置和 nginx 都还是 {old}，"
+                  f"节点照常跑着。{N}")
+            print(f"    先回面板『3 强制重签』把证书修好，再来换域名。")
+            return False
+        print(f"  证书: 现有这张已经盖得住 {new} 和 *.{new}，"
+              f"且校验通过（{why}），不用重签。")
     elif not cert_install_apply(new, True, cf_token, names=names, node_dom=new):
         restore()
         print(f"{R}  ✗ 新域名的证书没拿到，整件事已回滚 —— 两个核心的配置和 nginx "
               f"都还是 {old}，节点照常跑着。{N}")
         return False
+    # 不管走了哪条路，最后都拿【现役的那张】再验一遍。签发那条路里
+    # cert_install_apply 验的是临时文件，换上去之后没人再看一眼。
+    ok, why = _cert_usable_for(need)
+    if not ok:
+        restore()
+        print(f"{R}  ✗ 换上去的证书通不过最终校验：{why}{N}")
+        print(f"{R}    两个核心的配置和 nginx 已回滚到 {old}；但证书文件这时候"
+              f"可能已经换过了。{N}")
+        print(f"{R}    立刻回面板『3 强制重签』，把 {old} 的证书重签回来。{N}")
+        return False
+    print(f"  {G_OK}✓ 证书最终校验通过：{why}{N}")
 
     # ── 4. 安装记录 / 订阅 host / 分享链接 / 三格式订阅 ───────────────────
     for p in (STATE_FILE, HOST_FILE, NODE_FILE):
@@ -6902,11 +6970,13 @@ def cert_change_domain_apply(new, cf_token="", emby_new=""):
     svcs = _cert_consumers() or [s for _, _, s in cores]
     print(f"\n{G_OK}  ✓ 域名已换成 {new}{N}")
     print(f"    重启：{'、'.join(svcs)}")
-    print(f"{Y}    ⚠ 订阅地址的 host 跟着变了，客户端要【重新导入】一次订阅：{N}")
-    try:
-        print(f"      {_sub_service_text() or '回面板 2 看订阅地址'}")
-    except Exception:
-        print("      回面板『2 节点链接 / 订阅』看新地址")
+    print(f"\n{Y}  ⚠ 下面这些对外地址跟着变了，都要去改：{N}")
+    print("-" * 60)
+    for what, val, where in _domain_switch_notice(new, emby_new):
+        print(f"  {Y}{what}{N}")
+        print(f"      {val}")
+        print(f"      {where}")
+    print("-" * 60)
     restart_services(*svcs)
     return True
 
@@ -7000,12 +7070,18 @@ def cert_change_domain_flow(i):
           f"服务一个都不重启；")
     print(f"             nginx -t 不过连核心一起回滚；这些全过了才去签证书，"
           f"证书没拿到也整体回滚。")
-    print(f"{Y}  ⚠ 订阅地址的 host 会跟着变，客户端要【重新导入】一次订阅"
-          f"（不是刷新，是重新导入）。{N}")
+    print("-" * 60)
+    print(f"{Y}  ⚠ 证书是全机共用的地基，吃它的每一样东西对外报的地址都要跟着改：{N}")
+    for _what, _v, _where in _domain_switch_notice(new, emby_new):
+        print(f"{Y}      · {_what}　→　{_where}{N}")
+    print(f"{Y}    换完会把每一条的【新值】打出来，照着去各自的配置里改一遍。{N}")
+    print(f"{Y}  ⚠ 订阅地址的 host 会变，客户端要【重新导入】一次订阅，不是刷新。{N}")
     print(f"{Y}  ⚠ 重启核心会掐断代理链路，挂着本机代理连的 SSH 会断——"
           f"不用管，后台会跑完。{N}")
     print("-" * 60)
-    if (_ask("确认更换? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
+    # 换域名会动到全机每一样吃证书的东西，故意不接受 y —— 必须完整打出 yes，避免手滑
+    print(f"  {R}输入 yes 确认{N}；回车 / n / 其它任何输入都是取消。")
+    if _ask("  > ").strip() != "yes":
         print("  已取消，一个字节都没改。")
         return
     plan = {"op": "cert-domain", "domain": new, "cf_token": cf_token,
