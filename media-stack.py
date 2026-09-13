@@ -38,7 +38,7 @@ import zipfile
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.97"
+SCRIPT_VERSION = "1.5.98"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5507,6 +5507,44 @@ def pull_via_mirror(image):
     return ""
 
 
+def _versions_settle(d, tries=8, gap=5):
+    """重启之后等各组件起来，再问一次版本。
+
+       Emby 起来要十几秒，太早问只会拿到空串，然后屏上打出「?→?」——
+       那比不打更糟：看着像是版本丢了。所以问到 Emby 有值为止，
+       实在等不到就返回当前这份（该空的空着，不编）。"""
+    last = {}
+    for i in range(tries):
+        last = stack_versions(read_emby_api_key(d) or "")
+        if last.get("Emby"):
+            return last
+        if i < tries - 1:
+            time.sleep(gap)
+    return last
+
+def _print_version_diff(before, after):
+    """把更新前后的组件版本并排打出来。没变的也列，但标出来。
+
+       为什么要有：拉的全是 :latest，拉完屏上只说「镜像已更新」——
+       到底更到了哪一版一个字都没有。出了问题想回溯"那天更了什么"，
+       除了猜没有别的办法。"""
+    keys = [k for k in ("Emby", "OpenList", "MediaWarp", "AutoFilm")
+            if before.get(k) or after.get(k)]
+    if not keys:
+        return
+    print(f"  {BOLD}组件版本{RST}")
+    for k in keys:
+        b, a = before.get(k, ""), after.get(k, "")
+        if not a:
+            print(f"    {k:<10} {DIM}（这次没问到）{RST}")
+        elif not b:
+            # 更新【前】没问到，就只报现在是什么——不知道变没变，别说"没变"
+            print(f"    {k:<10} {a}")
+        elif b != a:
+            print(f"    {k:<10} {DIM}{b}{RST}  →  {GREEN}{a}{RST}  {GREEN}有更新{RST}")
+        else:
+            print(f"    {k:<10} {a}   {DIM}（没变）{RST}")
+
 def pull_images(compose, env_file):
     """拉镜像：先走正常渠道，失败了再逐个走镜像站兜底。全部成功返回 True。"""
     info("拉取最新镜像...")
@@ -5727,6 +5765,9 @@ def do_update(from_menu=False):
 
     # 镜像拉不动就跳过，不再 return —— 跨境网络本来就时好时坏，
     # 而下面重刷配置才是修 bug 的那一步，不该被一次拉取失败连坐掉。
+    # 【拉之前先记一份版本】拉完再问就没有对照物了 —— 而"这次到底更了什么"
+    # 正是出问题时最想知道的一件事。
+    _ver_before = stack_versions(read_emby_api_key(d) or "")
     if not pull_images(compose, env_file):
         warn("镜像没拉全，跳过换镜像，继续刷新配置。")
     else:
@@ -5737,6 +5778,7 @@ def do_update(from_menu=False):
             warn("用新镜像重启失败，看上面的报错；配置照常刷新。")
         else:
             ok("镜像已更新")
+            _print_version_diff(_ver_before, _versions_settle(d))
             sh("docker image prune -f", timeout=300)
 
     # 再把脚本生成的那几份配置按当前版本重刷一遍。
