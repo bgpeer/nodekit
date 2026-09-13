@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.8"
+SCRIPT_VERSION = "1.1.9"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -337,10 +337,16 @@ def ensure_self_signed():
     sh(f'openssl req -new -x509 -days 3650 -key {KEY} -out {CERT} -subj "/CN={G["sni"]}"')
 
 def cert_covers(path, domain):
-    """现有证书是否就是给这个域名签的（换域名重装时避免复用旧域名的证书）。"""
+    """现有证书【真的顶得住】这个域名吗（换域名重装时避免复用旧域名的证书）。
+
+       原来是拿 openssl 的整段文本做子串匹配，两头都会错：
+         · 漏判成「盖得住」：一张纯 *.a.com 的证书，文本里含有 a.com 这串字符，
+           于是被当成盖得住 a.com —— 可泛域名【不顶自己】，装上去裸域名直接握手失败。
+         · 也可能反过来：b.a.com 的证书文本里同样含 a.com。
+       改成走 SAN 列表 + 正经的覆盖判定（泛域名只顶一级，跟客户端的判定一致）。"""
     if not domain or not os.path.exists(path):
         return False
-    return domain in sh(f"openssl x509 -in {path} -noout -text 2>/dev/null", check=False)
+    return _name_covers(cert_names(path), domain)
 
 # acme.sh 续期后要执行的重载命令。它会被 acme.sh 记进该域名的 conf、每次续期自动跑。
 # 为什么非有不可：sing-box / xray / xy-sub 都是【启动时把证书读进内存】的，不会回头看文件。
@@ -375,6 +381,32 @@ def _ensure_acme_reload_hook():
     sh(f"{acme} --install-cert -d {G['domain']} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
 
+def _wildcard_wanted():
+    """这台机是不是【本来就该有】一张泛域名证书 → (要不要, 为什么)。
+
+       重签之前必须问一次这个。HTTP-01 签不出泛域名（Let's Encrypt 的硬规定，
+       泛域名只能走 DNS-01），而下面那条常规路径就是 HTTP-01 —— 所以什么都不问
+       直接重签，等于每重装一次就把泛域名【静默】降级成单域名。
+
+       后果不是「证书差一点」，是 Emby 当场被拆：它对外是 <子域>.<域名>，
+       只有 *.<域名> 顶得住。合并好的共用关系会退回两张证书、两条续期链，
+       而且全程不吭一声，等你发现时已经是几周之后。"""
+    try:
+        if cert_meta().get("wildcard"):
+            return True, "上次装的就是泛域名证书"
+    except Exception:
+        pass
+    _d = G.get("domain") or ""
+    if _d and _name_covers(cert_names(), "x." + _d):
+        return True, "磁盘上现有的这张就是泛域名"
+    try:
+        ed = _emby_cert()[0]
+        if ed and _emby_shared(ed):
+            return True, f"Emby（{ed}）正跟节点共用这张证书，它服务的是子域名"
+    except Exception:
+        pass
+    return False, ""
+
 def ensure_acme():
     """给了 --domain 就用 acme.sh standalone 签真证书；否则回落自签。"""
     if not G["domain"]:
@@ -394,10 +426,28 @@ def ensure_acme():
         sh(f"{acme} --register-account -m {G['email'] or 'a@a.com'} "
            f"--server letsencrypt", check=False)
         sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
-        # nginx 模式走 webroot（复用 nginx 的 80，不用腾端口）；否则 standalone
-        if G.get("nginx"):
+        Y_, R_, N_ = "\033[1;33m", "\033[1;31m", "\033[0m"
+        wild, why = _wildcard_wanted()
+        if wild and _acme_has_cf():
+            # 泛域名只能走 DNS-01。acme.sh 里存着 CF 凭据，那就照着原样签回来，
+            # 而不是降级——Emby 的共用关系靠软链指向这个文件，泛域名保住就不会断。
+            print(f"  这台机该用泛域名证书（{why}），改走 DNS-01 签 "
+                  f"{G['domain']} + *.{G['domain']}")
+            issue = (f"{acme} --issue --dns dns_cf -d {G['domain']} -d '*.{G['domain']}' "
+                     f"--keylength ec-256 --server letsencrypt")
+        elif wild:
+            # 只能降级了，但绝不静默：说清楚丢了什么、会坏什么、装完去哪儿补。
+            print(f"{Y_}  ⚠ 这台机该用泛域名证书（{why}），{N_}")
+            print(f"{Y_}    但 acme.sh 里没有 Cloudflare 凭据，泛域名签不出来"
+                  f"（HTTP-01 只能签单域名，这是 Let's Encrypt 的硬规定）。{N_}")
+            print(f"{R_}    这次会签成单域名，后果：Emby 对外是 <子域>.{G['domain']}，"
+                  f"单域名盖不住，共用关系会被拆成两张证书、两条续期链。{N_}")
+            print(f"{Y_}    装完回面板『15 证书管理 → 1 安装证书』用 DNS-01 重签一张"
+                  f"泛域名的，再『4 Emby 共用本证书』合并回去。{N_}")
+            wild = False
+        if not wild and G.get("nginx"):
             issue = f"{acme} --issue -d {G['domain']} --webroot {WEBROOT} --keylength ec-256"
-        else:
+        elif not wild:
             if not port_free(80):
                 raise RuntimeError(
                     "80 端口被占用，acme.sh --standalone 无法验证。"
@@ -413,6 +463,13 @@ def ensure_acme():
             raise RuntimeError("acme 签发失败(检查域名解析是否指向本机、80 端口是否可达):\n" + out)
         os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
         _acme_install_cert(acme)
+        # 记下这次签的是什么，下次重装才知道该不该保泛域名
+        try:
+            save_cert_meta(domain=G["domain"], wildcard=bool(wild),
+                           mode="dns-cf" if wild else
+                                ("webroot" if G.get("nginx") else "standalone"))
+        except Exception:
+            pass
     else:
         # 证书已经在、不用重签，但 reloadcmd 可能【压根没装过】——
         # 这条 hook 是后来才加进脚本的，在它之前装的机器走不到上面那一步，
