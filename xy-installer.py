@@ -22,7 +22,7 @@ import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicoded
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.1.8"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -7002,7 +7002,17 @@ def cert_change_domain_flow(i):
     print("  换的是【你自己的域名】——客户端连的那个、证书签的那个。")
     print(f"  {Y}不是{N} reality 借用的伪装站（那个在菜单 4，现在是 {G.get('sni') or '(未设)'}）。")
     print("-" * 60)
-    new = _ask("  新域名（要先把 A 记录解析到本机公网 IP）: ").strip().lower().rstrip(".")
+    _ip = public_ip()
+    print(f"{Y}  ⚠ 动手之前，新域名这两件事必须先做好，否则证书根本签不出来：{N}")
+    print(f"{Y}     ① A 记录指向本机公网 IP　{N}"
+          + (f"{GRN}{_ip}{N}" if _ip else f"{R}(本机公网 IP 查不到，自己确认){N}"))
+    print(f"       没这条：证书签得出来，但客户端连不上——等于把所有节点一次性打死。")
+    print(f"{Y}     ② 这个域名要在 Cloudflare 的区域里（DNS 托管在 CF）{N}")
+    print(f"       泛域名证书走 DNS-01，acme 要用 CF 的 API 往区域里写一条 TXT 验证记录。")
+    print(f"       域名不在 CF 名下，Token 权限再对也签不出来。")
+    print(f"     解析改完【等生效】再来——DNS 有缓存，改完立刻查多半还是旧值。")
+    print("-" * 60)
+    new = _ask("  新域名（上面两条都做好了再填，回车取消）: ").strip().lower().rstrip(".")
     if not new:
         print("  已取消。"); return
     if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", new):
@@ -7014,6 +7024,11 @@ def cert_change_domain_flow(i):
     print(f"  解析检测: {(GRN + '通过') if ok else (R + '不对')} · {why}{N}")
     if not ok:
         print(f"{R}  换完之后客户端连的就是这个域名，解析不到本机 = 所有节点一起断。{N}")
+        print(f"     去 DNS 服务商那边把 {new} 的 A 记录指到 "
+              f"{_ip or '本机公网 IP'}，等生效（几分钟到几十分钟）再回来。")
+        print(f"     本机查一下：dig +short {new}　或　nslookup {new}")
+        print(f"     {Y}走 CF 小黄云代理的话这里会查到 CF 的 IP，那是正常的——"
+              f"但节点不能套 CF，请先关掉小黄云改成【仅 DNS】。{N}")
         if (_ask("  仍要继续? y 继续 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
             print("  已取消，一个字节都没改。"); return
 
