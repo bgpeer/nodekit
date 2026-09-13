@@ -14,7 +14,7 @@
 # 同时量物理网卡和每个容器，谁在跑一目了然。
 set -u
 
-TOOL_VER="2026-09-14b"
+TOOL_VER="2026-09-14c"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -102,6 +102,56 @@ done
 [ -f /var/log/nginx/media-stack.access.log ] || \
   echo -e "  ${Y}找不到 /var/log/nginx/media-stack.access.log —— 媒体那侧的日志就在这个文件，"\
           "\n  别拿 access.log（那是节点订阅那侧的，跟媒体流量无关）。${X}"
+
+sec "④b 今天的探测是什么形状：一阵猛扫，还是全天在循环"
+echo -e "  ${D}这一栏才分得出「是谁在探」：集中在一两个小时 = 某次扫描/重启触发的；"
+echo -e "  每小时都有 = 有东西挂在定时任务上一直探。${X}"
+LOGM=/var/log/nginx/media-stack.access.log
+if [ -f "$LOGM" ]; then
+  awk -v d="$(date +%d/%b/%Y)" '
+    index($0, d) == 0 {next}
+    tolower($0) ~ /lavf\/|ffmpeg/ {
+      # 时间戳形如 [14/Sep/2026:03:21:07 +0000]，取小时
+      if (match($0, d":[0-9][0-9]")) { h = substr($0, RSTART+length(d)+1, 2); n[h]++; b[h]+=$10+0 }
+    }
+    END { if (!length(n)) {print "    今天没有 ffprobe 记录"; exit}
+          for (h=0; h<24; h++) { k=sprintf("%02d",h); if (!(k in n)) continue
+            bar=""; w=int(n[k]/20); if (w>40) w=40
+            for (i=0;i<w;i++) bar=bar"#"
+            printf "    %s 时  %5d 次  %6.2f GB  %s\n", k, n[k], b[k]/1073741824, bar }
+        }' "$LOGM"
+else
+  echo "    （找不到 $LOGM）"
+fi
+
+sec "④c Emby 自己的定时任务最近跑了什么"
+python3 - <<'PY' 2>/dev/null || echo "  （问不到 Emby，跳过）"
+import json, os, re, urllib.request
+cfg = "/opt/media-stack/mediawarp/config/config.yaml"
+key = ""
+try:
+    m = re.search(r"^\s*auth:\s*([^\s#]+)", open(cfg).read(), re.M)
+    key = m.group(1) if m else ""
+except OSError:
+    pass
+if not key:
+    raise SystemExit(1)
+url = f"http://127.0.0.1:8096/ScheduledTasks?api_key={key}"
+tasks = json.load(urllib.request.urlopen(url, timeout=20))
+rows = []
+for t in tasks:
+    lr = t.get("LastExecutionResult") or {}
+    end = (lr.get("EndTimeUtc") or "")[:16].replace("T", " ")
+    rows.append((end, t.get("Name", "?"), lr.get("Status", ""), t.get("State", "")))
+rows.sort(reverse=True)
+print("  最近跑过的（时间倒序，只列前 8 个）：")
+for end, nm, st, state in rows[:8]:
+    run = "  ← 正在跑" if state == "Running" else ""
+    print(f"    {end or '(没跑过)':17} {nm[:34]:34} {st}{run}")
+print()
+print("  ⚠ 对 strm 库来说，会去【读视频文件】的任务只有扫描媒体库那一类。")
+print("    它一跑就是几千次 ffprobe —— 每次都要从网盘拉一段文件头。")
+PY
 
 sec "⑤ 补时长（heal）自己记的账"
 python3 - <<'PY' 2>/dev/null || echo "  （读不到 /etc/bgpeer/media-stack.json）"
