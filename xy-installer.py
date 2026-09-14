@@ -2307,8 +2307,17 @@ def _sr_country_groups(names_list, existing=()):
             gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f",{g}" for g in gnames)
 
+_SR_NAMES_RE = re.compile(r",?__XY_NAMES__(,?)")   # 锚点连同前后可有可无的逗号一起吃
 def _sr_fill_names(tpl, frag):
     """展开 __XY_NAMES__（国家组名），但跳过该行已经写死的名字。
+
+       逗号归模板管：模板写成 `...,♻️全部随机,__XY_NAMES__,policy-regex-filter=...`，
+       锚点只负责填名字，不再自带前导逗号——这样模板本身就是一份读得通的成员列表。
+
+       两种写法都认：锚点前的逗号可有可无（老模板、以及照老模板改的自定义模板是
+       `♻️全部随机__XY_NAMES__` 粘在一起写的）。统一"把前面那个逗号吃掉、自己补
+       回来"，新旧模板渲染结果一致。没名字可填时（国家组已在模板里写死，或压根没
+       检出国家）则连同紧邻的一个逗号一起吃掉，免得留下 ",," 或行尾多一个逗号。
 
        为什么要按行去重：模板可以把常见国家组直接写进成员列表（现在的小火箭模板
        就是这么写的，配 policy-regex-filter 让客户端自己收拢节点）。这种组
@@ -2317,8 +2326,13 @@ def _sr_fill_names(tpl, frag):
        模板写死的照旧，只有模板里没有的国家（英国、德国、🎲其他随机…）才追加进去。"""
     names = [n for n in frag.split(",") if n]
     def one(line):
-        add = "".join(f",{n}" for n in names if n not in line)
-        return line.replace("__XY_NAMES__", add)
+        add = ",".join(n for n in names if n not in line)
+        def rep(m):
+            tail = m.group(1)                                  # 锚点后面原本有没有逗号
+            if not add:                                        # 没东西可填：前后只留一个逗号
+                return tail                                    # （行尾就一个都不留）
+            return ("," if m.start() else "") + add + tail
+        return _SR_NAMES_RE.sub(rep, line)
     return re.sub(r"(?m)^.*__XY_NAMES__.*$", lambda m: one(m.group(0)), tpl)
 
 def build_shadowrocket_sub(nodes, tpl_url):
