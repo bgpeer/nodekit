@@ -21,10 +21,11 @@
     "strategy": "prefer_ipv4",
     "disable_cache": false,
     "cache_capacity": 4096,
-    "optimistic": true
+    "optimistic": true,
+    "timeout": "10s"
   },
   "experimental": {
-    "cache_file": {"enabled": true, "path": "cache.db", "store_fakeip": true, "store_dns": true},
+    "cache_file": {"enabled": true, "path": "cache.db", "store_fakeip": true, "store_dns": true, "buffer_size": "1mb", "flush_interval": "30s"},
     "clash_api": {"external_controller": "127.0.0.1:9091", "secret": "88888888", "default_mode": "规则", "access_control_allow_origin": ["*"], "access_control_allow_private_network": true}
   },
   "inbounds": [
@@ -37,6 +38,7 @@
       "interface_name": "singbox",
       "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
       "mtu": 1500,
+      "dns_mode": "hijack",
       "auto_route": true,
       "strict_route": true,
       "route_address": ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"],
@@ -44,7 +46,10 @@
       "route_exclude_address_set": ["private-ip"],
       "platform": { "http_proxy": { "enabled": true, "server": "127.0.0.1", "server_port": 7898 } },
       "exclude_package": ["com.android.captiveportallogin"],
-      "udp_timeout": "5m"
+      "udp_timeout": "5m",
+      "udp_mapping": "endpoint_independent",
+      "udp_filtering": "endpoint_independent",
+      "multi_queue": true
     }
   ],
   "outbounds": [
