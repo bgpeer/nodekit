@@ -2412,8 +2412,11 @@ def _mihomo_country(names, existing=()):
 
 def _fill_block(tpl, anchor, block):
     """按整行替换独占一行的块锚点：连同该行的前导缩进一起换成 block（block 自带缩进）。
-       这样锚点顶格或缩进都行——避免用户给 __XY_NODES__/__XY_GROUPS__ 缩两格导致 YAML 缩进错乱。"""
-    return re.sub(r"(?m)^[ \t]*" + re.escape(anchor) + r"[ \t]*$", lambda m: block, tpl)
+       这样锚点顶格或缩进都行——避免用户给 __XY_NODES__/__XY_GROUPS__ 缩两格导致 YAML 缩进错乱。
+
+       前面的 "- " 也一起吃掉：mihomo 模板把锚点写成 `  - __XY_NODES__` 这样的列表项，
+       模板本身就是一份能解析的 YAML；不写 "- "（老模板、照老模板改的自定义模板）同样认。"""
+    return re.sub(r"(?m)^[ \t]*(?:-[ \t]+)?" + re.escape(anchor) + r"[ \t]*$", lambda m: block, tpl)
 
 _SELF_IP_CACHE = None
 def _self_ip():
@@ -2791,6 +2794,21 @@ def _sr_direct_ip(path, targets):
     else:
         open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + "\n".join(new), 1))
 
+# 三种写法都认，按顺序试：新模板的 `,"__XY_NAMES__"`、单独成项的 `"__XY_NAMES__"`、
+# 老模板粘在上一个成员后面的裸 `__XY_NAMES__`。注意裸锚点那条不能去吃前面的引号——
+# `"🎯直连"__XY_NAMES__` 里那个引号是「直连」的收尾，吃掉就把上一个成员拆了。
+_MH_NAMES_RE = re.compile(r',[ \t]*"__XY_NAMES__"|"__XY_NAMES__"|__XY_NAMES__')
+def _mihomo_fill_names(tpl, frag):
+    """把 __XY_NAMES__ 换成国家组名（frag 形如 ', "🇯🇵日本", "🇺🇸美国"'）。
+
+       模板写成 `["🌍全球加速","♻️全部随机","🎯直连","__XY_NAMES__"]`——锚点是个正常的
+       带引号列表项，逗号归模板管，这样模板本身就是一份能解析的 YAML。老模板、以及照
+       老模板改的自定义模板是 `"🎯直连"__XY_NAMES__` 粘在一起写的，逗号藏在 frag 里，
+       两种都认：把锚点连同前面的逗号和引号一起吃掉，再由 frag 自己补上逗号。
+
+       没检出国家时 frag 为空，锚点连同那个逗号一起消失，列表不会多出一个空成员。"""
+    return _MH_NAMES_RE.sub(lambda m: frag, tpl)
+
 def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _ghrelay_rewrite(fetch_url(tpl_url))               # 规则/图标链接：开启则改走本机 GitHub 中转
     # 国家检测要看"全部节点"：注入的订阅节点 + 用户手写进模板的静态节点。
@@ -2801,7 +2819,7 @@ def gen_mihomo(ylines, nodes, tpl_url):
     # 块锚点(独占一行)整行替换，缩进容错：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组
     tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
     tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
-    tpl = tpl.replace("__XY_NAMES__", names_frag)          # 行内锚点：引用组名，原样替换
+    tpl = _mihomo_fill_names(tpl, names_frag)                  # 行内锚点：填国家组名
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
     tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
     open(CFG_FILE, "w").write(tpl)
