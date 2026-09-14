@@ -73,6 +73,14 @@ _RAW         = "https://raw.githubusercontent.com/bgpeer/nodekit/main/"
 TEMPLATE_URL = _RAW + "sub-template.yaml"           # mihomo 模板
 SBOX_TPL_URL = _RAW + "subbox-template.json"        # sing-box 模板
 SR_TPL_URL   = _RAW + "shadowrocket-template.conf"  # Shadowrocket 模板
+
+# 模板锚点：短名字，_ + 三个大写字母 + _。
+#   _NOD_  建节点        _GRP_  建国家策略组        _NAM_  引用国家组名（可带 :<正则>）
+# 老名字 __XY_NODES__ / __XY_GROUPS__ / __XY_NAMES__ 仍然认——自定义模板多半还是老写法，
+# 拉下来先在 fetch_tpl 里统一换成短名，后面的代码只认短的。
+A_NODES, A_GROUPS, A_NAMES = "_NOD_", "_GRP_", "_NAM_"
+_ANCHOR_OLD = {"__XY_NODES__": A_NODES, "__XY_GROUPS__": A_GROUPS, "__XY_NAMES__": A_NAMES}
+
 # 订阅三格式：扩展名 → 客户端
 SUB_EXTS = {"yaml": "mihomo/clash", "json": "sing-box", "conf": "Shadowrocket"}
 
@@ -2037,7 +2045,7 @@ def sb_dumps(v, ind=0):
 
 # ============================================================================ 国家随机分组
 # 扫模板注入的节点名，按国家自动建 url-test 随机组（命中≥阈值才建）；搬自 Mihomo-fx 复写脚本。
-# 三格式共用同一套检测；各格式生成器按自己语法在 __XY_GROUPS__ / __XY_GROUP_NAMES__ 锚点渲染。
+# 三格式共用同一套检测；各格式生成器按自己语法在 _GRP_ / _NAM_ 锚点渲染。
 COUNTRY_THRESHOLD = 2               # 某国节点数 < 该值则不建该组（1=有就建, 2=至少2个）
 OTHER_GROUP = "🎲其他随机"          # 未归入任何国家组的漏网节点收进这里（有漏网才建）
 # sing-box 出站里"是节点"的类型（用来从模板抽用户手写的静态节点，排除 selector/urltest/direct 等分组）
@@ -2134,9 +2142,9 @@ def _sb_country_groups(tags, existing=()):
     return objs, names
 
 def build_singbox_sub(nodes, tpl_url):
-    """对象级替换锚点：__XY_NODES__ 换节点对象、__XY_GROUPS__ 换国家组、
-       __XY_NAMES__ / <正则> / __XY_NAMES__:<正则> 展开策略组成员，再按手写风格序列化。"""
-    cfg = json.loads(_ghrelay_rewrite(fetch_url(tpl_url)))    # 规则/图标链接：开启则改走本机 GitHub 中转
+    """对象级替换锚点：_NOD_ 换节点对象、_GRP_ 换国家组、
+       _NAM_ / <正则> / _NAM_:<正则> 展开策略组成员，再按手写风格序列化。"""
+    cfg = json.loads(fetch_tpl(tpl_url))                      # 中转改写 + 老锚点名归一
     objs = []
     for key, d in nodes:
         try:
@@ -2162,9 +2170,9 @@ def build_singbox_sub(nodes, tpl_url):
     def expand_list(lst):
         """展开策略组成员。三种写法可拆解组合（前缀管建不建国家组，冒号后的正则管带不带节点）：
 
-             __XY_NAMES__        只列国家组名，不带节点
+             _NAM_        只列国家组名，不带节点
              <正则>              只带命中的节点名，不列国家组      例：.*  或  🇺🇸|US
-             __XY_NAMES__:<正则> 两个都要：国家组名 + 命中的节点名
+             _NAM_:<正则> 两个都要：国家组名 + 命中的节点名
 
            裸正则怎么跟字面 tag 名区分：先查 known_tags，是已知出站就当字面量，
            否则才按正则去匹配节点名。所以 "DIRECT"、"🎯直连" 这些照常原样保留，
@@ -2174,11 +2182,11 @@ def build_singbox_sub(nodes, tpl_url):
            sing-box 会照常报 "outbound not found"，一眼能看出问题；静默丢掉反而查不出来。"""
         out = []
         for x in lst:
-            if x == "__XY_NAMES__":
+            if x == A_NAMES:
                 out += country_names                                 # 只国家组名
-            elif isinstance(x, str) and x.startswith("__XY_NAMES__:"):
+            elif isinstance(x, str) and x.startswith(A_NAMES + ":"):
                 out += country_names                                 # 国家组名 + 命中节点名
-                out += [t for t in tags if re.search(x[len("__XY_NAMES__:"):], t)]
+                out += [t for t in tags if re.search(x[len(A_NAMES) + 1:], t)]
             elif isinstance(x, str) and x not in known_tags:
                 try:
                     hit = [t for t in tags if re.search(x, t)]       # 裸正则 → 只匹配节点名
@@ -2194,9 +2202,9 @@ def build_singbox_sub(nodes, tpl_url):
         return out
     new_ob = []
     for x in cfg.get("outbounds", []):
-        if x == "__XY_NODES__":
+        if x == A_NODES:
             new_ob += objs                                           # 节点锚点 → 节点对象
-        elif x == "__XY_GROUPS__":
+        elif x == A_GROUPS:
             new_ob += country_objs                                   # 分组锚点 → 国家 urltest 组
         elif isinstance(x, dict) and isinstance(x.get("outbounds"), list):
             x["outbounds"] = expand_list(x["outbounds"]); new_ob.append(x)
@@ -2274,7 +2282,7 @@ def _sr_static_names(tpl):
 
 def _sr_group_names(tpl):
     """抽取 shadowrocket 模板 [Proxy Group] 段里用户手写的策略组名。
-       注意带 __XY_NAMES__ 的行会被跳过——那种行是模板自带的组、名字里不含国家组名，
+       注意带 _NAM_ 的行会被跳过——那种行是模板自带的组、名字里不含国家组名，
        跳过它们不影响判断，反倒避免把锚点当成组名。"""
     return _sr_section_keys(tpl, "Proxy Group")
 
@@ -2307,15 +2315,15 @@ def _sr_country_groups(names_list, existing=()):
             gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f",{g}" for g in gnames)
 
-_SR_NAMES_RE = re.compile(r",?__XY_NAMES__(,?)")   # 锚点连同前后可有可无的逗号一起吃
+_SR_NAMES_RE = re.compile(r",?" + A_NAMES + r"(,?)")   # 锚点连同前后可有可无的逗号一起吃
 def _sr_fill_names(tpl, frag):
-    """展开 __XY_NAMES__（国家组名），但跳过该行已经写死的名字。
+    """展开 _NAM_（国家组名），但跳过该行已经写死的名字。
 
-       逗号归模板管：模板写成 `...,♻️全部随机,__XY_NAMES__,policy-regex-filter=...`，
+       逗号归模板管：模板写成 `...,♻️全部随机,_NAM_,policy-regex-filter=...`，
        锚点只负责填名字，不再自带前导逗号——这样模板本身就是一份读得通的成员列表。
 
        两种写法都认：锚点前的逗号可有可无（老模板、以及照老模板改的自定义模板是
-       `♻️全部随机__XY_NAMES__` 粘在一起写的）。统一"把前面那个逗号吃掉、自己补
+       `♻️全部随机_NAM_` 粘在一起写的）。统一"把前面那个逗号吃掉、自己补
        回来"，新旧模板渲染结果一致。没名字可填时（国家组已在模板里写死，或压根没
        检出国家）则连同紧邻的一个逗号一起吃掉，免得留下 ",," 或行尾多一个逗号。
 
@@ -2333,7 +2341,7 @@ def _sr_fill_names(tpl, frag):
                 return tail                                    # （行尾就一个都不留）
             return ("," if m.start() else "") + add + tail
         return _SR_NAMES_RE.sub(rep, line)
-    return re.sub(r"(?m)^.*__XY_NAMES__.*$", lambda m: one(m.group(0)), tpl)
+    return re.sub(r"(?m)^.*" + A_NAMES + r".*$", lambda m: one(m.group(0)), tpl)
 
 def build_shadowrocket_sub(nodes, tpl_url):
     lines, names_list = [], []
@@ -2346,14 +2354,14 @@ def build_shadowrocket_sub(nodes, tpl_url):
             pass
     if not lines:
         return
-    tpl = _ghrelay_rewrite(fetch_url(tpl_url))               # 规则/图标链接：开启则改走本机 GitHub 中转
+    tpl = fetch_tpl(tpl_url)                                 # 中转改写 + 老锚点名归一
     # 国家检测/成员池 = 注入节点 + 用户手写进模板 [Proxy] 段的静态节点（"名 = 协议,..." 行）
     static = _sr_static_names(tpl)
     # 模板 [Proxy Group] 段里已有的组名：同名的国家组不再生成，避免同段两条同名定义
     groups_txt, names_frag = _sr_country_groups(names_list + static, _sr_group_names(tpl))
     out = tpl
-    out = _fill_block(out, "__XY_NODES__", "\n".join(lines))    # 块锚点整行替换，缩进容错
-    out = _fill_block(out, "__XY_GROUPS__", groups_txt)
+    out = _fill_block(out, A_NODES, "\n".join(lines))           # 块锚点整行替换，缩进容错
+    out = _fill_block(out, A_GROUPS, groups_txt)
     out = _sr_fill_names(out, names_frag)                       # 行内锚点（按行去重）
     open(SR_FILE, "w").write(out)
 
@@ -2412,9 +2420,9 @@ def _mihomo_country(names, existing=()):
 
 def _fill_block(tpl, anchor, block):
     """按整行替换独占一行的块锚点：连同该行的前导缩进一起换成 block（block 自带缩进）。
-       这样锚点顶格或缩进都行——避免用户给 __XY_NODES__/__XY_GROUPS__ 缩两格导致 YAML 缩进错乱。
+       这样锚点顶格或缩进都行——避免用户给 _NOD_/_GRP_ 缩两格导致 YAML 缩进错乱。
 
-       前面的 "- " 也一起吃掉：mihomo 模板把锚点写成 `  - __XY_NODES__` 这样的列表项，
+       前面的 "- " 也一起吃掉：mihomo 模板把锚点写成 `  - _NOD_` 这样的列表项，
        模板本身就是一份能解析的 YAML；不写 "- "（老模板、照老模板改的自定义模板）同样认。"""
     return re.sub(r"(?m)^[ \t]*(?:-[ \t]+)?" + re.escape(anchor) + r"[ \t]*$", lambda m: block, tpl)
 
@@ -2565,6 +2573,14 @@ def _ghrelay_rewrite(text):
         return text
     text = _GH_URL_RE.sub(lambda m: p + m.group(1), text)
     return text.replace("https://gh-proxy.com/", p)
+
+
+def fetch_tpl(url):
+    """拉模板：GitHub 链接中转改写 + 老锚点名归一。三个格式的生成器都走这里。"""
+    t = _ghrelay_rewrite(fetch_url(url))
+    for old, new in _ANCHOR_OLD.items():
+        t = t.replace(old, new)
+    return t
 
 def selfdns_clientid():
     """AdGuard ClientID：DoH 地址的末段（.../dns-query/<id>）。没有就生成一个存下来。
@@ -2794,31 +2810,31 @@ def _sr_direct_ip(path, targets):
     else:
         open(path, "w").write(tpl.replace("[Rule]", "[Rule]\n" + "\n".join(new), 1))
 
-# 三种写法都认，按顺序试：新模板的 `,"__XY_NAMES__"`、单独成项的 `"__XY_NAMES__"`、
-# 老模板粘在上一个成员后面的裸 `__XY_NAMES__`。注意裸锚点那条不能去吃前面的引号——
-# `"🎯直连"__XY_NAMES__` 里那个引号是「直连」的收尾，吃掉就把上一个成员拆了。
-_MH_NAMES_RE = re.compile(r',[ \t]*"__XY_NAMES__"|"__XY_NAMES__"|__XY_NAMES__')
+# 三种写法都认，按顺序试：新模板的 `,"_NAM_"`、单独成项的 `"_NAM_"`、
+# 老模板粘在上一个成员后面的裸 `_NAM_`。注意裸锚点那条不能去吃前面的引号——
+# `"🎯直连"_NAM_` 里那个引号是「直连」的收尾，吃掉就把上一个成员拆了。
+_MH_NAMES_RE = re.compile(r',[ \t]*"%s"|"%s"|%s' % (A_NAMES, A_NAMES, A_NAMES))
 def _mihomo_fill_names(tpl, frag):
-    """把 __XY_NAMES__ 换成国家组名（frag 形如 ', "🇯🇵日本", "🇺🇸美国"'）。
+    """把 _NAM_ 换成国家组名（frag 形如 ', "🇯🇵日本", "🇺🇸美国"'）。
 
-       模板写成 `["🌍全球加速","♻️全部随机","🎯直连","__XY_NAMES__"]`——锚点是个正常的
+       模板写成 `["🌍全球加速","♻️全部随机","🎯直连","_NAM_"]`——锚点是个正常的
        带引号列表项，逗号归模板管，这样模板本身就是一份能解析的 YAML。老模板、以及照
-       老模板改的自定义模板是 `"🎯直连"__XY_NAMES__` 粘在一起写的，逗号藏在 frag 里，
+       老模板改的自定义模板是 `"🎯直连"_NAM_` 粘在一起写的，逗号藏在 frag 里，
        两种都认：把锚点连同前面的逗号和引号一起吃掉，再由 frag 自己补上逗号。
 
        没检出国家时 frag 为空，锚点连同那个逗号一起消失，列表不会多出一个空成员。"""
     return _MH_NAMES_RE.sub(lambda m: frag, tpl)
 
 def gen_mihomo(ylines, nodes, tpl_url):
-    tpl = _ghrelay_rewrite(fetch_url(tpl_url))               # 规则/图标链接：开启则改走本机 GitHub 中转
+    tpl = fetch_tpl(tpl_url)                                 # 中转改写 + 老锚点名归一
     # 国家检测要看"全部节点"：注入的订阅节点 + 用户手写进模板的静态节点。
     # 静态节点名取 proxy-groups 段之前的 name:（策略组名在 proxy-groups 里，且不含国旗，不会误检）。
     static = re.findall(r'name:\s*"([^"]*)"', tpl.split("proxy-groups:")[0])
     groups_yaml, names_frag = _mihomo_country(_node_names(nodes) + static,
                                               tpl_group_names(tpl))   # 模板里已手写的同名组不再自动生成
-    # 块锚点(独占一行)整行替换，缩进容错：__XY_NODES__ 建节点 / __XY_GROUPS__ 建国家组
-    tpl = _fill_block(tpl, "__XY_NODES__", "\n".join(ylines))
-    tpl = _fill_block(tpl, "__XY_GROUPS__", groups_yaml)
+    # 块锚点(独占一行)整行替换，缩进容错：_NOD_ 建节点 / _GRP_ 建国家组
+    tpl = _fill_block(tpl, A_NODES, "\n".join(ylines))
+    tpl = _fill_block(tpl, A_GROUPS, groups_yaml)
     tpl = _mihomo_fill_names(tpl, names_frag)                  # 行内锚点：填国家组名
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
     tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
