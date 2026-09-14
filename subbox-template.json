@@ -48,8 +48,7 @@
       "exclude_package": ["com.android.captiveportallogin"],
       "udp_timeout": "5m",
       "udp_mapping": "endpoint_independent",
-      "udp_filtering": "endpoint_independent",
-      "multi_queue": true
+      "udp_filtering": "endpoint_independent"
     }
   ],
   "outbounds": [
