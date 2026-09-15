@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.99"
+SCRIPT_VERSION = "1.5.100"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1601,6 +1601,19 @@ KEEPALIVE_CRON = "/etc/cron.d/media-stack-keepalive"
 SYNC_CRON      = "/etc/cron.d/media-stack-sync"
 WARM_CRON      = "/etc/cron.d/media-stack-warm"
 SELFUP_CRON    = "/etc/cron.d/media-stack-selfupdate"
+TRAFFIC_CRON   = "/etc/cron.d/media-stack-traffic"
+
+# ---- 全天流量账本 ----
+# 为什么非得常驻记账：临时采样（traffic-where.sh 第①栏）只能看见【运行那一刻】在跑的
+# 东西。而吃流量的几件事全是间歇性的 —— AutoFilm 一天扫一轮、Emby 扫库在凌晨、heal
+# 一轮几分钟。白天随手跑一次采样，大概率什么都看不到，然后误以为"没人在用网"。
+# 实测就撞上过：网卡一天 ↓4.86 GiB，采样那 30 秒只有 0.05 MB/s。
+#
+# 所以改成每 5 分钟记一笔差值，落成按天一个文件。谁在什么时刻吃了多少，事后都查得到。
+TRAFFIC_DIR       = "/var/log/media-stack"
+TRAFFIC_PREV      = TRAFFIC_DIR + "/.traffic-prev.json"   # 上一次的累计计数
+TRAFFIC_EVERY_MIN = 5
+TRAFFIC_KEEP_DAYS = 14                                     # 每天约 300 行、几十 KB
 # 每几小时热一次「继续观看」的直链。必须【小于】MediaWarp 的 alist_api_ttl(2h)，
 # 否则缓存会在两次预热之间过期，等于白跑。1 小时留了一倍余量。
 WARM_EVERY_H   = 1
@@ -1669,6 +1682,8 @@ CRON_TIMEOUT   = {
     "heal":      HEAL_BG_BUDGET_T,
     "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
     "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
+    # 只读 /proc + 每个容器两条 docker 命令，几十毫秒的事；给 60 秒够宽了
+    "traffic-sample": 60,
 }
 
 
@@ -2264,6 +2279,246 @@ def install_warm_cron(install_dir):
         warn(f"装预热定时任务失败（不影响使用）：{e}")
         return False
 
+
+def _nic_counters():
+    """物理网卡的累计收发字节。排除 lo / docker / br- / veth / tun / sing —— 只要
+       真正出网的那一口，跟 traffic-where.sh 第②栏、跟 vnstat 口径一致。"""
+    rx = tx = 0
+    try:
+        for line in open("/proc/net/dev"):
+            if ":" not in line:
+                continue
+            name, _, rest = line.partition(":")
+            name = name.strip()
+            if name == "lo" or name.startswith(("docker", "br-", "veth", "tun", "sing")):
+                continue
+            f = rest.split()
+            rx += int(f[0]); tx += int(f[8])
+    except Exception:
+        return None, None
+    return rx, tx
+
+def _container_counters():
+    """每个运行中容器的累计收发字节，从它自己网络命名空间的 /proc/<pid>/net/dev 读。
+
+       注意这个数【包含容器之间的流量】：emby 找 nginx 要文件头也走 veth，也算在
+       emby 头上。所以容器加起来可能比物理网卡还多，两者不是"分摊"关系。真正出过
+       网的只有物理网卡那一份，容器数是用来看"谁在忙"的。"""
+    out = {}
+    try:
+        names = subprocess.run(["docker", "ps", "--format", "{{.Names}}"],
+                               capture_output=True, text=True, timeout=20).stdout.split()
+    except Exception:
+        return out
+    for c in names:
+        try:
+            pid = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", c],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            if not pid or pid == "0":
+                continue
+            for line in open(f"/proc/{pid}/net/dev"):
+                if ":" not in line:
+                    continue
+                name, _, rest = line.partition(":")
+                if name.strip() == "lo":
+                    continue
+                f = rest.split()
+                out[c] = (int(f[0]), int(f[8]))
+                break
+        except Exception:
+            continue
+    return out
+
+def _traffic_delta(now, prev):
+    """两次采样之间的增量。计数器重启会清零（容器重建、机器重启），所以
+       now < prev 时不能相减 —— 那会得到一个巨大的负数，或者被 max(0) 吞成 0。
+       重启后 now 本身就是"重启到现在"的量，直接拿它当增量最接近真相。"""
+    return now if now < prev else now - prev
+
+def do_traffic_sample():
+    """cron 每 TRAFFIC_EVERY_MIN 分钟调一次：记一笔增量，落进当天的账本。
+
+       故意做得很轻：两次 /proc 读 + 每个容器两条 docker 命令，几十毫秒，不碰网络、
+       不碰 Emby API。它唯一的职责是"把这一格的量记下来"。"""
+    nic_rx, nic_tx = _nic_counters()
+    if nic_rx is None:
+        return
+    cons = _container_counters()
+    try:
+        prev = json.load(open(TRAFFIC_PREV))
+    except Exception:
+        prev = {}
+    cur = {"ts": int(time.time()), "nic": [nic_rx, nic_tx],
+           "con": {k: list(v) for k, v in cons.items()}}
+    os.makedirs(TRAFFIC_DIR, exist_ok=True)
+    try:
+        os.chmod(TRAFFIC_DIR, 0o700)          # 里面是这台机器的用网画像，不给别人看
+    except OSError:
+        pass
+    write_atomic(TRAFFIC_PREV, json.dumps(cur), 0o600)
+    if not prev.get("nic"):
+        return                                 # 第一次只存基准，没有上一格可减
+    gap = cur["ts"] - int(prev.get("ts") or 0)
+    # 只在【时钟倒退】和【断档太久】时丢格。gap == 0 是正常的（同一秒内连采两次，
+    # 计数器确实动了就该记）——原来写成 gap <= 0，把这种情况一并丢掉了。
+    # 断档太久那一格必须丢：cron 停了半天再恢复，那一格会把几个小时的量堆成一格，
+    # 按小时看就变成某个时刻凭空冒出几个 GB，正是这张表最该避免的误导。
+    if gap < 0 or gap > TRAFFIC_EVERY_MIN * 60 * 6:
+        return
+    d_rx = _traffic_delta(nic_rx, prev["nic"][0])
+    d_tx = _traffic_delta(nic_tx, prev["nic"][1])
+    parts = []
+    for c, (rx, tx) in sorted(cons.items()):
+        p = prev.get("con", {}).get(c)
+        drx = _traffic_delta(rx, p[0]) if p else rx
+        dtx = _traffic_delta(tx, p[1]) if p else tx
+        if drx or dtx:
+            parts.append(f"{c}:{drx}:{dtx}")
+    row = "\t".join([str(cur["ts"]), str(d_rx), str(d_tx)] + parts) + "\n"
+    day = time.strftime("%Y-%m-%d", time.localtime(cur["ts"]))
+    try:
+        with open(f"{TRAFFIC_DIR}/traffic-{day}.tsv", "a") as f:
+            f.write(row)
+        os.chmod(f"{TRAFFIC_DIR}/traffic-{day}.tsv", 0o600)
+    except OSError:
+        return
+    _traffic_prune()
+
+def _traffic_prune():
+    """只留最近 TRAFFIC_KEEP_DAYS 天。一天几十 KB，留半个月也就几百 KB。"""
+    try:
+        keep = {time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
+                for i in range(TRAFFIC_KEEP_DAYS)}
+        for n in os.listdir(TRAFFIC_DIR):
+            if n.startswith("traffic-") and n.endswith(".tsv") and n[8:-4] not in keep:
+                os.remove(os.path.join(TRAFFIC_DIR, n))
+    except OSError:
+        pass
+
+def traffic_install_cron():
+    """装账本的 cron。跟别的定时任务一样，「7 更新」会按当前版本重装。"""
+    try:
+        txt = ("# media-stack 流量账本：每 %d 分钟记一笔网卡和各容器的增量。\n"
+               "# 临时采样只看得见当下在跑的东西，而吃流量的几件事都是间歇性的，\n"
+               "# 随手采 30 秒多半什么都看不到 —— 所以常驻记账，事后能回查任意时刻。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               "*/%d * * * * root %s >/dev/null 2>&1\n"
+               % (TRAFFIC_EVERY_MIN, TRAFFIC_EVERY_MIN, cron_cmd("traffic-sample")))
+        with open(TRAFFIC_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(TRAFFIC_CRON, 0o644)
+        return True
+    except OSError as e:
+        warn(f"装流量账本定时任务失败（不影响使用）：{e}")
+        return False
+
+def _traffic_read(day):
+    """读某一天的账本 → (总收, 总发, {容器: [收, 发]}, {小时: [收, 发]}, 行数)。"""
+    rx = tx = 0
+    per = {}
+    hours = {}
+    rows = 0
+    try:
+        fh = open(f"{TRAFFIC_DIR}/traffic-{day}.tsv")
+    except OSError:
+        return 0, 0, {}, {}, 0
+    with fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 3:
+                continue
+            try:
+                ts, a, b = int(f[0]), int(f[1]), int(f[2])
+            except ValueError:
+                continue
+            rows += 1
+            rx += a; tx += b
+            h = time.strftime("%H", time.localtime(ts))
+            hh = hours.setdefault(h, [0, 0])
+            hh[0] += a; hh[1] += b
+            for part in f[3:]:
+                bits = part.rsplit(":", 2)
+                if len(bits) != 3:
+                    continue
+                try:
+                    c_rx, c_tx = int(bits[1]), int(bits[2])
+                except ValueError:
+                    continue
+                e = per.setdefault(bits[0], [0, 0])
+                e[0] += c_rx; e[1] += c_tx
+    return rx, tx, per, hours, rows
+
+def _gb(n):
+    return f"{n / 1073741824:.2f} GB" if n >= 1073741824 else f"{n / 1048576:.0f} MB"
+
+def traffic_report(day=None):
+    """把某一天的账本摊开：总账 / 按来源 / 按小时。"""
+    day = day or time.strftime("%Y-%m-%d")
+    rx, tx, per, hours, rows = _traffic_read(day)
+    print("\n" + "=" * 60)
+    print(f"  {BOLD}流量账本  {day}{RST}")
+    print("=" * 60)
+    if not rows:
+        if not os.path.exists(TRAFFIC_CRON):
+            warn("账本还没开始记 —— 定时任务没装。")
+            print(f"  {DIM}跑一次「7 更新」会自动补上，之后每 {TRAFFIC_EVERY_MIN} "
+                  f"分钟记一笔。{RST}")
+        else:
+            info(f"这一天没有记录（刚装上？每 {TRAFFIC_EVERY_MIN} 分钟才记一笔）")
+        return
+    cover = rows * TRAFFIC_EVERY_MIN
+    print(f"  记了 {rows} 格，覆盖约 {cover // 60} 小时 {cover % 60} 分")
+    print(f"  {BOLD}物理网卡  ↓{_gb(rx)}  ↑{_gb(tx)}{RST}"
+          f"   {DIM}← 只有这一份是真出过网的{RST}")
+    print("-" * 60)
+    print(f"  {BOLD}按来源（容器自己的网口，含容器之间的流量，加起来可能比网卡多）{RST}")
+    if per:
+        for c, (a, b) in sorted(per.items(), key=lambda kv: -kv[1][0]):
+            pct = f"{a * 100 / rx:.0f}%" if rx else "-"
+            print(f"    {c:<14} ↓{_gb(a):>9}  ↑{_gb(b):>9}   {DIM}占网卡下行 {pct}{RST}")
+    else:
+        print(f"    {DIM}这一天没有容器在跑{RST}")
+    ol = per.get("openlist", [0, 0])[0]
+    if rx:
+        print("-" * 60)
+        print(f"  {BOLD}openlist 从网盘拉了 {_gb(ol)}，占网卡下行 {ol * 100 / rx:.0f}%{RST}")
+        print(f"  {DIM}它是整条链路上唯一真正出境拉数据的一环。这个占比就是"
+              f"「流量到底是 Emby 吃的、还是节点吃的」的答案：{RST}")
+        print(f"  {DIM}  占比高 → Emby 这边（探测 / 补时长 / 扫库）；"
+              f"占比低 → 剩下的是代理节点转发的。{RST}")
+    print("-" * 60)
+    print(f"  {BOLD}按小时（网卡下行）{RST}")
+    peak = max((v[0] for v in hours.values()), default=0)
+    for h in sorted(hours):
+        a, b = hours[h]
+        bar = "#" * int(a * 28 / peak) if peak else ""
+        print(f"    {h} 时   ↓{_gb(a):>9}  ↑{_gb(b):>9}  {bar}")
+    print("-" * 60)
+    print(f"  {DIM}账本在 {TRAFFIC_DIR}/traffic-{day}.tsv，留最近 "
+          f"{TRAFFIC_KEEP_DAYS} 天。{RST}")
+
+def traffic_menu():
+    """菜单入口：默认看今天，也能翻前几天。"""
+    while True:
+        traffic_report()
+        try:
+            days = sorted(n[8:-4] for n in os.listdir(TRAFFIC_DIR)
+                          if n.startswith("traffic-") and n.endswith(".tsv"))
+        except OSError:
+            days = []
+        print(f"\n  1 看别的日期（现有 {len(days)} 天）    0 返回")
+        c = ask("请选择").strip()
+        if c != "1":
+            return
+        if not days:
+            warn("还没有任何一天的账本。"); continue
+        for i, d in enumerate(days, 1):
+            print(f"    {i}) {d}")
+        n = ask("看第几个").strip()
+        if n.isdigit() and 1 <= int(n) <= len(days):
+            traffic_report(days[int(n) - 1])
+            ask("回车继续")
 
 def do_warm():
     """cron 每小时调的：先把新内容拉齐，再预热直链。安静跑。
@@ -5851,6 +6106,7 @@ def do_update(from_menu=False):
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
+    traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
     install_selfupdate_cron(d)
@@ -5959,7 +6215,7 @@ def do_uninstall():
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
-              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON):
+              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, TRAFFIC_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -6194,6 +6450,7 @@ DOMAIN={cfg['domain']}
     install_keepalive(cfg["install_dir"])
     install_sync_cron(cfg["install_dir"])
     install_warm_cron(cfg["install_dir"])
+    traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
     save_ms_state(cfg["install_dir"], scan_spec=cfg["scan_spec"])
@@ -8272,7 +8529,14 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 记账用的是本机物理网卡的接收字节差（播放走 302 直链、根本不经过 VPS，所以这段时间
 # 的接收量基本就是 heal 自己拉的），读不到 /proc/net/dev 才退回按次数估。
 HEAL_DAY_MB  = 2048      # heal 每天的流量上限（MB）。用满就停，明天接着
-HEAL_MB_EACH = 7         # 估一个条目要拉多少 MB（现场实测约 6.7）——只在读不到网卡计数时用
+# 一个条目要拉多少 MB。【注意这是上游口径】——nginx 日志里看到的约 6.7 MB 是
+# 「交付给 ffprobe」的量，而 openlist 为了给出这 6.7 MB 要从网盘拉约 2.8 倍。
+# 预算 HEAL_DAY_MB 是拿物理网卡的接收差实测的，也是上游口径，两边必须对齐。
+#
+# 【这里曾经写的是 7】于是配额算成 2048/7 = 292 个，而每个实际 18 MB ——
+# 一轮就能花掉 5 GB，上限等于摆设。实测那天：探了 144 次、花了 2596 MB
+# （正好 18.0 MB/次），而上限是 2048。
+HEAL_MB_EACH = 18
 HEAL_GIVEUP = 3          # 连续探失败几次就放弃
 HEAL_GIVEUP_DAYS = 30    # 第一次放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
 # 【再试的间隔要越来越长，不能永远 30 天】固定 30 天的话，一个【永远探不出来】的库
@@ -8396,6 +8660,23 @@ def _host_rx_bytes():
     except (OSError, ValueError, IndexError):
         return None
     return tot
+
+def heal_mb_each():
+    """一个条目实际要花多少 MB（上游口径）。优先用【今天自己测出来的】。
+
+       为什么不钉死一个数：每个网盘、每条线路的放大倍数都不一样（文件头多大、
+       要不要回源、有没有 Range 支持），钉死的那个数注定在某些机器上偏得离谱，
+       而偏小就意味着日上限拦不住。今天已经探过几个了就拿实测值，够用又自校准。
+
+       夹在 [4, 60]：太小会让配额虚高（上限形同虚设），太大会让配额缩到探不动。
+       今天还没探过（每天第一轮）就用常量兜底。"""
+    st = ms_state().get("heal_day") or {}
+    if st.get("date") == time.strftime("%Y-%m-%d"):
+        probes = int(st.get("probes") or 0)
+        mb = float(st.get("mb") or 0)
+        if probes >= 5 and mb > 0:
+            return min(60.0, max(4.0, mb / probes))
+    return float(HEAL_MB_EACH)
 
 def heal_budget():
     """今天 heal 还剩多少额度 → (剩余 MB, 已用 MB)。跨天自动清零。"""
@@ -8543,7 +8824,7 @@ def heal_media_info(d, key, budget=None):
     take = min(max(HEAL_LIMIT, len(allpend) // 8), _pace, len(allpend))
     # 【再按今天剩下的额度夹一刀】不夹的话最后一轮会一次性冲过头——
     # 一批 300 个 × 约 7 MB = 2 GB，等于把上限当摆设。
-    _cap = max(1, int(_left / HEAL_MB_EACH))
+    _cap = max(1, int(_left / heal_mb_each()))
     if _cap < take:
         take = _cap
     # 【新片插队，但只占一半名额】刚扫进来的条目在 Emby 里是 0B / 0bps，时长为 0，
@@ -8618,7 +8899,7 @@ def heal_media_info(d, key, budget=None):
         _spent = (_rx1 - _rx0) / 1048576.0
         _how = "实测"
     else:
-        _spent = len(pend) * HEAL_MB_EACH
+        _spent = len(pend) * heal_mb_each()
         _how = "估算"
     heal_budget_spend(_spent, len(pend))
     _new = set_heal_pace(hit >= HEAL_429_STOP)
@@ -14622,6 +14903,22 @@ def do_healthcheck():
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
 
+    if os.path.exists(TRAFFIC_CRON):
+        _rx, _tx, _per, _hh, _rows = _traffic_read(time.strftime("%Y-%m-%d"))
+        if _rows:
+            _ol = _per.get("openlist", [0, 0])[0]
+            _hint = (f"，openlist 占 {_ol * 100 / _rx:.0f}%" if _rx else "")
+            _hc("流量账本", "ok",
+                f"今天已记 {_rows} 格，网卡 ↓{_gb(_rx)}{_hint}"
+                f"{DIM}　详细看「8 流量账本」{RST}")
+        else:
+            _hc("流量账本", "skip",
+                f"已装，今天还没记到（每 {TRAFFIC_EVERY_MIN} 分钟一格）")
+    else:
+        _hc("流量账本", "warn", "没装 —— 流量跑超了只能靠临时采样猜")
+        todo.append(("流量账本定时任务没装，事后查不了「谁在什么时刻吃了流量」",
+                     "跑一次「7 更新」会自动补上"))
+
     if os.path.exists(WARM_CRON):
         wm = warm_state(d)
         if not wm:
@@ -14862,7 +15159,8 @@ def main_menu():
         print("  5. 生成媒体库（网盘挂好、或在网盘里整理过片子之后点这个）")
         print("  6. 链路体检（卡住 / 不出片子时先跑这个）")
         print("  7. 更新（拉最新镜像 + 按新版本刷新配置）")
-        print("  8. 卸载")
+        print("  8. 流量账本（谁在什么时刻吃了流量·全天记账）")
+        print("  9. 卸载")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -14884,6 +15182,9 @@ def main_menu():
         elif c == "7":
             do_update(from_menu=True)
         elif c == "8":
+            traffic_menu()
+            continue          # 子菜单自己管停顿
+        elif c == "9":
             do_uninstall()
         else:
             print("无效选择。")
@@ -14918,6 +15219,12 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("warm"):
                 do_warm()
+        elif arg == "traffic-sample":     # cron 每 5 分钟调的流量记账
+            require_root()
+            if take_task_lock("traffic-sample"):
+                do_traffic_sample()
+        elif arg == "traffic":            # 手动看账本
+            traffic_report(sys.argv[2] if len(sys.argv) > 2 else None)
         elif arg == "heal":               # 「4」扔后台的补时长；手动敲也走这条
             require_root()
             if take_task_lock("heal"):

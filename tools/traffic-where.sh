@@ -14,7 +14,7 @@
 # 同时量物理网卡和每个容器，谁在跑一目了然。
 set -u
 
-TOOL_VER="2026-09-14f"
+TOOL_VER="2026-09-15a"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -196,8 +196,11 @@ if [ -n "$AF" ]; then
   echo "  配置：$AF"
   grep -nE "^\s*(id|overwrite|cron|source_dir):" "$AF" 2>/dev/null \
     | sed 's/^/    /' | head -40
-  BAD=$(grep -cE "^\s*overwrite:\s*[Tt]rue" "$AF" 2>/dev/null || echo 0)
-  OKN=$(grep -cE "^\s*overwrite:\s*[Ff]alse" "$AF" 2>/dev/null || echo 0)
+  # 【别写成 `grep -c ... || echo 0`】没匹配到时 grep 自己已经打了个 "0" 且退出码是 1，
+  # 于是 || 又补一个 "0"，变量成了两行的 "0\n0"，后面 [ -gt ] 直接报
+  # "integer expression expected"。管道给 head 既保证只有一行，退出码也永远是 0。
+  BAD=$(grep -cE "^\s*overwrite:\s*[Tt]rue" "$AF" 2>/dev/null | head -1)
+  OKN=$(grep -cE "^\s*overwrite:\s*[Ff]alse" "$AF" 2>/dev/null | head -1)
   echo
   if [ "${BAD:-0}" -gt 0 ]; then
     echo -e "  ${R}✗ 有 $BAD 个任务是 overwrite: true —— 就是它每天把 strm 全重写一遍。${X}"
