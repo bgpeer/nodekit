@@ -36,9 +36,16 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+# 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
+# vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
+# GitHub、jsDelivr、公共反代、ip-api 都看得到。换成最常见的 curl 串：不自报家门，
+# 而且脚本里 urllib 和 curl 两条路发出去的请求看起来是一致的，不会一台机器两副面孔。
+# 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
+HTTP_UA = "curl/8.5.0"
+
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.98"
+SCRIPT_VERSION = "1.5.99"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -919,7 +926,7 @@ def openlist_api_addr(cfg):
         return internal
     try:
         req = urllib.request.Request(pub + "/api/public/settings",
-                                     headers={"User-Agent": "media-stack"})
+                                     headers={"User-Agent": HTTP_UA})
         with urllib.request.urlopen(req, timeout=10) as r:
             return pub if r.status == 200 else internal
     except Exception:
@@ -5582,7 +5589,7 @@ SELF_API = ("https://api.github.com/repos/bgpeer/nodekit/contents/"
 def _no_cache_get(url, timeout=20, accept=""):
     """带上不缓存的请求头去取。CDN 认这两个头，不认自造的 ?_t= 查询参数。"""
     sep = "&" if "?" in url else "?"
-    hdr = {"User-Agent": "media-stack",
+    hdr = {"User-Agent": HTTP_UA,
            "Cache-Control": "no-cache, no-store, max-age=0",
            "Pragma": "no-cache"}
     if accept:
@@ -10750,7 +10757,7 @@ def _metatube_fetch_plugin(d):
         METATUBE_API,
         headers={"Accept": "application/vnd.github+json",
                  # GitHub 的 API 不带 UA 会直接 403
-                 "User-Agent": "media-stack"})
+                 "User-Agent": HTTP_UA})
     with urllib.request.urlopen(req, timeout=60) as r:
         rel = json.load(r)
     asset = next((a for a in rel.get("assets") or []
@@ -10764,7 +10771,7 @@ def _metatube_fetch_plugin(d):
     os.makedirs(dst, exist_ok=True)
     tmp = os.path.join(dst, ".metatube.zip.part")
     req = urllib.request.Request(asset["browser_download_url"],
-                                 headers={"User-Agent": "media-stack"})
+                                 headers={"User-Agent": HTTP_UA})
     with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
         shutil.copyfileobj(r, f)
     written = []

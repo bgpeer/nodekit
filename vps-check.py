@@ -10,6 +10,13 @@
 # ============================================================================
 import json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, concurrent.futures as cf
 
+# 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
+# vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
+# GitHub、jsDelivr、公共反代、ip-api 都看得到。换成最常见的 curl 串：不自报家门，
+# 而且脚本里 urllib 和 curl 两条路发出去的请求看起来是一致的，不会一台机器两副面孔。
+# 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
+HTTP_UA = "curl/8.5.0"
+
 C = {"g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "c": "\033[36m",
      "b": "\033[1m", "d": "\033[2m", "n": "\033[0m"}
 if not sys.stdout.isatty():
@@ -265,7 +272,7 @@ def traceroute(ip, maxhop=30, timeout=120):
 # ---------------------------------------------------------------- IP 画像
 def http_json(url, timeout=8):
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "vps-check"})
+        req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
         return json.load(urllib.request.urlopen(req, timeout=timeout))
     except Exception:
         return None
@@ -273,7 +280,7 @@ def http_json(url, timeout=8):
 def my_ip():
     for u in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "vps-check"})
+            req = urllib.request.Request(u, headers={"User-Agent": HTTP_UA})
             ip = urllib.request.urlopen(req, timeout=8).read().decode().strip()
             if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip): return ip
         except Exception:
