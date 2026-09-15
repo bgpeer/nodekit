@@ -1910,6 +1910,46 @@ def load_tokens():
     except Exception: return {}
 def save_tokens(t):
     os.makedirs(BGP_DIR, exist_ok=True); json.dump(t, open(TOKENS_FILE, "w"))
+    harden_perms()                # 刚落地是 0644，当场收紧，别留窗口
+
+# 只该 root 看的东西。默认 umask 下 os.makedirs / open 造出来的是 0755 / 0644 ——
+# /etc/bgpeer 里存着三个格式的订阅 token、中转 token、安装参数；/etc/bgpeer/sub 里
+# 连【文件名】都是 token；/etc/ssl/sb 里是 TLS 私钥。这台机器上任何非 root 进程
+# （nginx 的 www-data、Docker 里的 openlist / emby、AdGuard）都读得到。订阅 token
+# 一漏，别人就能拉走你全部节点的地址、UUID 和密码。
+#
+# 收紧是安全的：读这些的全是 root —— sing-box / xray / nginx 主进程 / xy-sub /
+# AdGuard 都以 root 跑，units 里没有 User=。
+#
+# 【不要图省事改成全局 umask 077】试过就知道会炸两处：nginx 要以 www-data 读
+# WEBROOT/index.html（伪装站变 403），acme.sh 继承我们的 umask 去写
+# webroot 的 .well-known 挑战文件（nginx 读不到 → 签证书直接失败）。
+# 所以只收这张白名单上的路径。
+_PRIV_DIRS  = lambda: (BGP_DIR, SUB_DIR, "/etc/ssl/sb")
+_PRIV_FILES = lambda: (TOKENS_FILE, GHRELAY_TOKEN_FILE, STATE_FILE, PEERS_FILE,
+                       GHDL_RELAYS, CUSTPL_FILE, TPLSRC_FILE, SUBPORT_FILE,
+                       HOST_FILE, NODE_FILE, CFG_FILE, SBOX_FILE, SR_FILE,
+                       ACME_KEY, KEY)
+
+def harden_perms():
+    """把只该 root 看的目录/文件收成 root-only。幂等、极快，每次入口都过一遍。
+
+       为什么是「每次都过」而不是「写的时候设好」：写这些文件的地方有二十多处，
+       漏一处就白做；而且老安装是带着 0644 升上来的，光管新写的没用。"""
+    for d in _PRIV_DIRS():
+        try:
+            if os.path.isdir(d):
+                os.chmod(d, 0o700)
+        except OSError:
+            pass
+    for f in list(_PRIV_FILES()) + (
+            [os.path.join(SUB_DIR, n) for n in os.listdir(SUB_DIR)]
+            if os.path.isdir(SUB_DIR) else []):
+        try:
+            if os.path.exists(f) and not os.path.isdir(f):
+                os.chmod(f, 0o600)           # 跟随软链：SUB_DIR 里是指向成品配置的链接
+        except OSError:
+            pass
 
 def _is_ip(h):
     return bool(re.match(r"^\d+\.\d+\.\d+\.\d+$", h)) or ":" in h   # v4 或 v6 都当 IP
@@ -2040,6 +2080,8 @@ def serve_sub(reset=False):
     """SUB_DIR 放 <token>.<ext> 软链指向各格式配置文件；每格式独立 token（存 TOKENS_FILE）。
        reset=True 换全部 token + 换新随机端口；否则复用已有、只给新格式补 token、端口不动。"""
     os.makedirs(SUB_DIR, exist_ok=True)
+    # 这个目录里【文件名就是 token】，列一次目录就全曝光；空 index.html 挡住列目录，
+    # harden_perms 再把目录本身收成 0700。两道都要，少一道都漏。
     if reset:
         renew_sub_port()                        # 重装换节点：端口随 token 一起换新
     toks = {} if reset else load_tokens()
@@ -2683,6 +2725,7 @@ def _ghrelay_token():
     t = secrets.token_urlsafe(12)
     os.makedirs(BGP_DIR, exist_ok=True)
     open(GHRELAY_TOKEN_FILE, "w").write(t)
+    harden_perms()                # 刚落地是 0644，当场收紧，别留窗口
     return t
 
 def _ghrelay_prefix():
@@ -4207,6 +4250,7 @@ def ghrelay_menu():
             if not on:
                 print("  当前用的是 gh-proxy，先『1』开启本机中转再刷 token。"); continue
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))   # 换新 token，旧的立即失效
+            harden_perms()                # 刚落地是 0644，当场收紧，别留窗口
             print("  正在换 token 并刷新订阅…")
             if _ghrelay_regen():
                 print(f"  ✓ 已换新 token，旧中转地址立即失效。新前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
@@ -4245,6 +4289,7 @@ def ghrelay_menu():
                 continue
             set_sub_port(newp)
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))
+            harden_perms()                # 刚落地是 0644，当场收紧，别留窗口
             print("  正在换端口 + token 并刷新订阅…")
             if _ghrelay_regen():
                 print(f"  ✓ 新订阅端口：\033[1;32m{sub_port()}\033[0m　新中转前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
@@ -8766,6 +8811,7 @@ def install_flow():
 # ============================================================================ CLI
 if __name__ == "__main__":
     import sys
+    harden_perms()                  # 每次进来先把 token/私钥收成 root-only（幂等）
     if len(sys.argv) == 1:          # 不带参数 → 管理面板（bgpeer 也走这里）
         main_menu()
         sys.exit(0)
