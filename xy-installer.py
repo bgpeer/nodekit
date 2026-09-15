@@ -82,6 +82,13 @@ A_NODES, A_GROUPS, A_NAMES = "_NOD_", "_GRP_", "_NAM_"
 _ANCHOR_OLD = {"__XY_NODES__": A_NODES, "__XY_GROUPS__": A_GROUPS, "__XY_NAMES__": A_NAMES}
 
 # 订阅三格式：扩展名 → 客户端
+# 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
+# vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
+# GitHub、jsDelivr、公共反代、ip-api 都看得到。换成最常见的 curl 串：不自报家门，
+# 而且脚本里 urllib 和 curl 两条路发出去的请求看起来是一致的，不会一台机器两副面孔。
+# 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
+HTTP_UA = "curl/8.5.0"
+
 SUB_EXTS = {"yaml": "mihomo/clash", "json": "sing-box", "conf": "Shadowrocket"}
 
 # nginx 前置（可选，需域名）：nginx 在 443 终结 TLS + 伪装站 + 按 path 反代 ws 家族；
@@ -569,6 +576,7 @@ def _nginx_ws_locations():
 def _nginx_80_server():
     """:80——acme webroot 验证 + 跳转到 https。"""
     return (f"server {{\n  listen 80;\n  listen [::]:80;\n  server_name {G['domain']};\n"
+            f"  server_tokens off;\n"                 # 别报 nginx/1.24.0，只回 nginx
             f"  location /.well-known/acme-challenge/ {{ root {WEBROOT}; }}\n"
             f"  location / {{ return 301 https://$host$request_uri; }}\n}}\n")
 
@@ -576,6 +584,7 @@ def _nginx_https_server(listen):
     """https 伪装站 + ws 反代；listen 为监听指令（公网 443 或本地 127.0.0.1:8443）。"""
     return (f"server {{\n{listen}"
             f"  server_name {G['domain']};\n"
+            f"  server_tokens off;\n"                 # 同上：伪装站也别把版本号摆出来
             f"  ssl_certificate {ACME_CRT};\n  ssl_certificate_key {ACME_KEY};\n"
             f"  ssl_protocols TLSv1.2 TLSv1.3;\n"
             f"{_nginx_ws_locations()}"
@@ -1886,7 +1895,7 @@ def fetch_url(url):
     for rd in range(2):                                 # 两轮，轮间退避
         for u in _mirrors(url):
             try:
-                req = urllib.request.Request(u, headers={"User-Agent": "xy-installer"})
+                req = urllib.request.Request(u, headers={"User-Agent": HTTP_UA})
                 return urllib.request.urlopen(req, timeout=15).read().decode()
             except Exception as e:
                 last = e
@@ -1949,6 +1958,19 @@ key  = sys.argv[5] if len(sys.argv) > 5 else ''
 ALLOW = ('raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com', 'codeload.github.com',
          'gist.github.com', 'gist.githubusercontent.com')
 class H(http.server.SimpleHTTPRequestHandler):
+    # 别报家门：Python 默认会回 `Server: SimpleHTTP/0.6 Python/3.11.2`，还有一张一眼
+    # 认得出的 http.server 错误页。扫到这个端口的人据此就知道「这是个自建的小服务」，
+    # 配上非常规端口，基本等于挂牌说明这里托管着订阅。报 nginx 混进大多数机器里。
+    server_version = 'nginx'
+    sys_version = ''
+    def version_string(self):
+        # 不能只靠 server_version + sys_version：父类是 `版本 + ' ' + 系统版本` 拼的，
+        # sys_version 置空会留下 `Server: nginx ` 这么个带尾空格的串——真 nginx 不长这样，
+        # 尾空格本身就是个破绽。直接把整串定死。
+        return 'nginx'
+    error_message_format = ('<html><head><title>%(code)d</title></head>'
+                            '<body><center><h1>%(code)d %(message)s</h1></center>'
+                            '<hr><center>nginx</center></body></html>')
     timeout = 30                     # 读请求超时：卡住的客户端不会永久占着线程
     def __init__(self, *a, **k):
         super().__init__(*a, directory=directory, **k)
@@ -1977,7 +1999,9 @@ class H(http.server.SimpleHTTPRequestHandler):
         if host not in ALLOW:            # 非 GitHub 主机一律拒，杜绝开放代理滥用
             self.send_error(403); return
         try:
-            req = urllib.request.Request(target, headers={'User-Agent': 'xy-sub'})
+            # UA 跟主脚本一致（见 HTTP_UA）：这是中转服务端替别人去 GitHub 取件，
+            # 报 'xy-sub' 等于替对方向沿途声明「这条链路上跑着 nodekit」。
+            req = urllib.request.Request(target, headers={'User-Agent': 'curl/8.5.0'})
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = r.read(); ct = r.headers.get('Content-Type', 'application/octet-stream')
             self.send_response(200)
@@ -3029,7 +3053,7 @@ def save_peers(peers):
 
 def _fetch_text(url, timeout=15):
     """普通拉取任意 URL 文本（成员机 .links 端点用；不走 github 镜像逻辑）。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
+    req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
     return urllib.request.urlopen(req, timeout=timeout).read().decode(errors="ignore")
 
 def peer_status(url):
@@ -3037,7 +3061,7 @@ def peer_status(url):
 
        原来所有失败都压成一个「不通」，到底是机器没开、端口被墙、证书过期还是
        token 换了，全看不出来，只能一台台上去翻——分清楚这几类，一眼就知道去哪查。"""
-    req = urllib.request.Request(url, headers={"User-Agent": "xy-installer"})
+    req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
     try:
         return True, str(urllib.request.urlopen(req, timeout=8).status)
     except urllib.error.HTTPError as e:
@@ -4067,7 +4091,7 @@ def _relay_probe(prefix):
     """拿这条中转真去拉一个小文件，看通不通。返回 (是否通, 说明)。"""
     probe = "https://raw.githubusercontent.com/bgpeer/nodekit/main/sub-template.yaml"
     try:
-        req = urllib.request.Request(prefix + probe, headers={"User-Agent": "xy-installer"})
+        req = urllib.request.Request(prefix + probe, headers={"User-Agent": HTTP_UA})
         body = urllib.request.urlopen(req, timeout=12).read()
     except urllib.error.HTTPError as e:
         if e.code == 403:
@@ -5518,7 +5542,7 @@ def _pref_port(nodes, cfg):
 def _cf_cidrs():
     """拉 CF 官方公布的 IPv4 段，返回 (段列表, 是否官方最新)。拉不到用内置兜底。"""
     try:
-        req = urllib.request.Request(CF_IPS_URL, headers={"User-Agent": "xy-installer"})
+        req = urllib.request.Request(CF_IPS_URL, headers={"User-Agent": HTTP_UA})
         txt = urllib.request.urlopen(req, timeout=10).read().decode()
         out = [l.strip() for l in txt.splitlines() if re.fullmatch(r"[\d.]+/\d+", l.strip())]
         if out:
