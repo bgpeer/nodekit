@@ -823,14 +823,83 @@ def arch_tag():
         raise SystemExit(f"不支持的 CPU 架构: {m}（sing-box/xray 预编译包仅支持 x86_64 / aarch64）")
     return t
 
+# ============================================================================
+# 从 GitHub 取件：三个域、各自独立的可达性
+#
+#   raw.githubusercontent.com          脚本 / 订阅模板 / 规则文件
+#   api.github.com                     查最新版本号
+#   github.com/<o>/<r>/releases/…      sing-box、xray 的二进制包
+#
+# 关键点：这三个域**通不通是分开的**。不少线路 raw 通而 releases 不通（IPv6-only、
+# 或 ISP 只封了一个），所以不能拿「raw 能拉到」当「二进制也能拉到」。原来这里二进制是
+# 一条裸 curl，遇上就直接装不了，报错还只是 curl 的退出码，查不出所以然。
+GH_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/",
+              "https://ghproxy.net/", "https://hub.gitmirror.com/")
+_GH_RE = re.compile(r"https://(raw\.githubusercontent\.com|api\.github\.com|github\.com)/")
+
+def _bad_archive(path):
+    """收到的到底是不是个压缩包：按扩展名对魔数。不是就返回一句人话，让上层换下一个源。
+
+       为什么需要：反代自己也会出错（限流页、"镜像维护中"的 HTML），那种响应是 200，
+       curl -f 拦不住，文件也非空。不看一眼的话，错误会拖到 tar/unzip 才爆出来，
+       而且那时已经不会再换源重试了。"""
+    try:
+        if os.path.getsize(path) == 0:
+            return "拿到的是空文件"
+        head = open(path, "rb").read(4)
+    except Exception as e:
+        return f"读不出下载到的文件：{e}"
+    want = (b"\x1f\x8b", "gzip") if path.endswith((".tgz", ".tar.gz")) else \
+           (b"PK\x03\x04", "zip") if path.endswith(".zip") else (None, "")
+    if want[0] and not head.startswith(want[0]):
+        return (f"拿到的不是 {want[1]} 包（开头是 {head[:4]!r}），"
+                f"多半是反代返回的错误页 / 限流页")
+    return ""
+
+def _dl_gh(url, dest):
+    """下载 GitHub 上的文件（内核二进制包）。直连先试，不行才逐个试公共反代。
+       成功返回真正用上的 URL；全都不通则抛出，错误里逐条列出试过谁、败在哪。
+
+       为什么加 -f：原来是 `curl -Lo`，没有 -f 的话 404 页面会被**当成文件存下来**，
+       接着 tar/unzip 报一个跟真实原因八竿子打不着的错。-f 让 curl 在 HTTP 错误时直接失败。
+
+       完整性说明：反代是第三方，理论上能掉包。做不到端到端签名校验（上游没发布校验和），
+       能做到的三条都做了——① 直连永远排第一，反代只是兜底；② 装完必校版本号
+       （见 _verify_core，截断/换包都会露馅）；③ 一旦用了反代就明着打印出来，不闷声走。"""
+    errs = []
+    for i, u in enumerate(_mirrors(url)):
+        try:
+            sh(f"curl -fsSL --connect-timeout 10 --max-time 300 -o '{dest}' '{u}'")
+            bad = _bad_archive(dest)
+            if bad:
+                errs.append(f"{u[:72]}…\n        {bad}")
+                continue
+            if i:
+                print(f"  ⓘ GitHub 直连不通，本次改用中转下载：{u[:len(u) - len(url)] or u}")
+            return u
+        except Exception as e:
+            errs.append(f"{u[:72]}…\n        {str(e).strip().splitlines()[-1][:90]}")
+    raise RuntimeError("从 GitHub 下载失败，直连和所有中转都不通：\n      "
+                       + "\n      ".join(errs)
+                       + "\n    （机器出不去网？换个能通的线路，或先手动把包放到 " + dest + "）")
+
+def _verify_core(binpath, ver, what):
+    """装完校版本：`<bin> version` 里必须能看到期望的版本号。
+       走过反代时这是唯一能自查的一道——包被截断、被换成别的版本都会在这儿露馅。"""
+    out = sh(f"{binpath} version", check=False)
+    if ver not in out:
+        raise RuntimeError(f"{what} 装完版本对不上：期望 {ver}，实际输出：\n{out[:200]}\n"
+                           f"    包可能不完整或来源有问题，已中止。重跑一次；"
+                           f"持续如此说明这条线路拿到的包不可信。")
+
 def latest_gh_release(repo, fallback):
     """取 GitHub 最新正式版 tag（去掉前导 v）。取不到就用 fallback。
-       和 mack-a 一样跟随 latest —— 否则钉死旧版会缺协议（如 anytls 需 1.12）。"""
+       和 mack-a 一样跟随 latest —— 否则钉死旧版会缺协议（如 anytls 需 1.12）。
+
+       走 fetch_url 而不是裸 urlopen：这样 api 域被墙时也能经反代问到版本号。
+       原来问不到就悄悄退回代码里钉死的 SB_VER，内核从此停在 1.12.0 再也推不动。"""
     try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases/latest",
-            headers={"User-Agent": "xy-installer", "Accept": "application/vnd.github+json"})
-        tag = json.loads(urllib.request.urlopen(req, timeout=15).read())["tag_name"]
+        tag = json.loads(fetch_url(f"https://api.github.com/repos/{repo}/releases/latest"))["tag_name"]
         return tag.lstrip("v") or fallback
     except Exception:
         return fallback
@@ -858,10 +927,7 @@ def newest_gh_release(repo, fallback):
        **并行维护**，而 1.14.0-beta.7 的版本号是大于 1.13.16 的，取最大会把人送上 beta 线，
        跨小版本换配置 schema，节点可能直接起不来。"""
     try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{repo}/releases?per_page=20",
-            headers={"User-Agent": "xy-installer", "Accept": "application/vnd.github+json"})
-        rels = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        rels = json.loads(fetch_url(f"https://api.github.com/repos/{repo}/releases?per_page=20"))
         tags = [str(r["tag_name"]).lstrip("v") for r in rels
                 if isinstance(r, dict) and r.get("tag_name") and not r.get("draft")]
         return max(tags, key=_ver_key) if tags else fallback
@@ -875,8 +941,10 @@ def install_singbox():
     a = arch_tag()
     url = (f"https://github.com/SagerNet/sing-box/releases/download/"
            f"v{ver}/sing-box-{ver}-linux-{a}.tar.gz")
-    sh(f"curl -Lo /tmp/sb.tgz {url} && tar -xzf /tmp/sb.tgz -C /tmp")
+    _dl_gh(url, "/tmp/sb.tgz")
+    sh("tar -xzf /tmp/sb.tgz -C /tmp")
     sh(f"install -m755 /tmp/sing-box-{ver}-linux-{a}/sing-box {SB_BIN}")
+    _verify_core(SB_BIN, ver, "sing-box")
     os.makedirs(SB_DIR, exist_ok=True)
 
 def install_xray():
@@ -887,8 +955,10 @@ def install_xray():
     zmap = {"amd64": "64", "arm64": "arm64-v8a"}
     url = (f"https://github.com/XTLS/Xray-core/releases/download/"
            f"v{ver}/Xray-linux-{zmap[a]}.zip")
-    sh(f"curl -Lo /tmp/xray.zip {url} && unzip -o /tmp/xray.zip -d /tmp/xray")
+    _dl_gh(url, "/tmp/xray.zip")
+    sh("unzip -o /tmp/xray.zip -d /tmp/xray")
     sh(f"install -m755 /tmp/xray/xray {XRAY_BIN}")
+    _verify_core(XRAY_BIN, ver, "xray")
     os.makedirs(XRAY_DIR, exist_ok=True)
 
 def reality_keys(binpath, cmd):
@@ -924,6 +994,7 @@ def write_service(name, binpath, cfg):
             f"或先卸载现有 {name}（systemctl disable --now {name} 并删除该 unit）。")
     unit = (f"[Unit]\nAfter=network.target nss-lookup.target\n"
             f"[Service]\nExecStart={binpath} run -c {cfg}\n"
+            f"{UNIT_RELOAD_LINE}"
             f"Restart=on-failure\nRestartSec=3\nLimitNOFILE=1000000\n"
             f"[Install]\nWantedBy=multi-user.target\n")
     open(unit_path, "w").write(unit)
@@ -1747,13 +1818,18 @@ def link_to_proxy(u):
     return None
 
 def _mirrors(url):
-    """raw.githubusercontent 常被限流(429)，补上 jsDelivr 镜像作兜底。"""
+    """GitHub 三个域各自的兜底链，**直连永远排第一**，后面的只在前面失败时才轮到：
+         raw.githubusercontent.com   → jsDelivr 两个节点 → 公共反代前缀
+         api.github.com / github.com → 公共反代前缀（jsDelivr 只发 raw，不发这两类）
+       raw 常被限流(429)，releases 则是整域不通的情况居多，两者都得有退路。"""
     urls = [url]
     m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)", url)
     if m:
         o, repo, br, path = m.groups()
         urls.append(f"https://cdn.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
         urls.append(f"https://fastly.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
+    if _GH_RE.match(url):
+        urls += [pfx + url for pfx in GH_MIRRORS]
     return urls
 
 def fetch_url(url):
@@ -4356,13 +4432,60 @@ def smux_current_state():
         return None
     return any(ib.get("multiplex") for ib in ws)
 
+# ============================================================================
+# 应用新配置：sing-box 走 SIGHUP 热重载，xray 只能重启
+#
+# 为什么区别对待：sing-box 的 cmd/sing-box/cmd_run.go 里 SIGHUP 是这么处理的——
+# 先自己 check() 一遍新配置，**不过就只记一行错、继续用旧配置跑**；过了才关掉旧实例
+# 重建。而 systemctl restart 遇上坏配置是进程直接退出，再被 Restart=on-failure
+# 拖进重启循环，节点全掉。同一份坏配置，热重载顶多是「没生效」，重启则是「全挂」。
+#
+# xray 没这个待遇：main/run.go 里只 signal.Notify 了 SIGINT 和 SIGTERM，不认 SIGHUP，
+# 发过去等于没发（或按默认行为被杀），所以 xray 一律老老实实 restart。
+#
+# 别误会热重载能保连接：sing-box 收到 SIGHUP 还是会 instance.Close() 再重建，
+# **现有连接照样断**。省掉的是进程重建、以及「新配置有错就没得救」这两件事。
+RELOADABLE = {"sing-box"}
+UNIT_RELOAD_LINE = "ExecReload=/bin/kill -HUP $MAINPID\n"
+
+def _unit_can_reload(name):
+    """这个服务现在能不能热重载：只对 sing-box、unit 里得有 ExecReload、且服务正在跑。
+
+       老版本装出来的 unit 没有 ExecReload（那会儿只写了 ExecStart），这里顺手补上——
+       只在缺的时候写一次，补完 daemon-reload 让 systemd 认账。补不了就照常返回 False，
+       调用方退回 restart，绝不因为补 unit 失败就把「应用配置」这件事搞砸。"""
+    if name not in RELOADABLE:
+        return False
+    try:
+        up = f"/etc/systemd/system/{name}.service"
+        if not os.path.exists(up):
+            return False
+        txt = open(up).read()
+        if "ExecReload=" not in txt:
+            txt = txt.replace("[Service]\n", "[Service]\n" + UNIT_RELOAD_LINE, 1)
+            if "ExecReload=" not in txt:            # 没有 [Service] 段？那就不碰它
+                return False
+            open(up, "w").write(txt)
+            sh("systemctl daemon-reload", check=False)
+        return sh(f"systemctl is-active {name}", check=False) == "active"
+    except Exception:
+        return False
+
 def restart_services(*names):
-    """后台异步重启核心：--no-block 交给 systemd 执行，本进程不阻塞、立即返回。
+    """后台异步应用新配置：能热重载的热重载，不能的重启，都带 --no-block 立即返回。
        这样即便你挂着本机代理来管理、重启会掐断 SSH，操作也已在服务端完成
-       （所有配置/状态必须在调用本函数之前就落盘）。"""
-    svc = " ".join(n for n in names if n)
-    if svc:
-        sh(f"systemctl restart --no-block {svc}", check=False)
+       （所有配置/状态必须在调用本函数之前就落盘）。
+
+       为什么先判断能不能 reload、而不是先 reload 失败再退回 restart：--no-block 的
+       命令本来就拿不到结果，而且这函数常常跑在「下一秒 SSH 就断」的处境里，没有
+       第二次出手的机会。所以是**事前**决定走哪条路，一条命令定生死。"""
+    todo = [n for n in names if n]
+    hot = [n for n in todo if _unit_can_reload(n)]
+    cold = [n for n in todo if n not in hot]
+    if hot:
+        sh(f"systemctl reload --no-block {' '.join(hot)}", check=False)
+    if cold:
+        sh(f"systemctl restart --no-block {' '.join(cold)}", check=False)
 
 def smux_apply(on):
     """开/关 smux：改 sing-box 入站 multiplex + 同步链接标记 + 刷新订阅，最后后台重启。"""
