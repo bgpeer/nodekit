@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.101"
+SCRIPT_VERSION = "1.5.102"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2396,6 +2396,71 @@ def do_traffic_sample():
         return
     _traffic_prune()
 
+def traffic_mark(task, t0, note=""):
+    """记一笔「某个定时任务在这段时间跑过」。和 5 分钟一格的账本配套：
+
+       格子只知道"几点跑了多少"，说不出"那是谁"。而用户真正想问的恰恰是
+       「凌晨那次自动对齐扣了多少」。有了起止时刻，就能把落在窗口里的格子挑出来。
+
+       只记时刻，不记流量 —— 流量由格子算，任务自己估的数会跟网卡对不上。
+       例外是 heal：它本来就拿网卡差实测过自己那一轮，那个数比格子准，走 note 带出来。"""
+    try:
+        os.makedirs(TRAFFIC_DIR, exist_ok=True)
+        day = time.strftime("%Y-%m-%d", time.localtime(t0))
+        f = f"{TRAFFIC_DIR}/tasks-{day}.tsv"
+        with open(f, "a") as fh:
+            fh.write(f"{int(t0)}\t{int(time.time())}\t{task}\t{note}\n")
+        os.chmod(f, 0o600)
+    except OSError:
+        pass
+
+def _timed(name, fn, note=None):
+    """跑一个定时任务，顺手把起止时刻记进当天的任务账。
+
+       包在 cron 分发那一层而不是钻进每个 do_xxx：一处管全部，将来加任务也不会漏；
+       而且**无论任务成功还是抛异常都要记**——跑挂了的那一次同样烧了流量，
+       恰恰是最该被看见的那种。"""
+    t0 = time.time()
+    try:
+        fn()
+    finally:
+        try:
+            traffic_mark(name, t0, note() if callable(note) else (note or ""))
+        except Exception:
+            pass
+
+def _traffic_tasks(day):
+    """读某天的任务记录 → [(起, 止, 任务名, 备注)]，按开始时刻排序。"""
+    out = []
+    try:
+        for line in open(f"{TRAFFIC_DIR}/tasks-{day}.tsv"):
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 3:
+                continue
+            try:
+                out.append((int(f[0]), int(f[1]), f[2], f[3] if len(f) > 3 else ""))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return sorted(out)
+
+def _traffic_rows(day):
+    """某天的原始格子 [(ts, 收, 发)]，给任务归因用。"""
+    rows = []
+    try:
+        for line in open(f"{TRAFFIC_DIR}/traffic-{day}.tsv"):
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 3:
+                continue
+            try:
+                rows.append((int(f[0]), int(f[1]), int(f[2])))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return rows
+
 def _traffic_prune():
     """只留最近 TRAFFIC_KEEP_DAYS 天。一天几十 KB，留半个月也就几百 KB。"""
     try:
@@ -2461,6 +2526,12 @@ def _traffic_read(day):
                 e[0] += c_rx; e[1] += c_tx
     return rx, tx, per, hours, rows
 
+def _padw(text, cols):
+    """按【显示宽度】补空格到 cols 列。中文一个字占两列却只算一个字符，
+       用 f"{x:<10}" 那种按字符数补的写法会把中英混排的列顶歪。"""
+    w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in text)
+    return text + " " * max(1, cols - w)
+
 def _gb(n):
     """给人看的字节数。
 
@@ -2514,8 +2585,7 @@ def traffic_report(day=None):
     h_rx, h_tx = max(0, rx - c_rx), max(0, tx - c_tx)
     # 中文是双宽，:<14 按【字符数】补空格会把这一行顶歪（容器名都是 ASCII，按 14 列排）。
     _lab = "宿主机·非容器"          # 短到能排进 14 列；"不在容器里"在下面那句里讲
-    _w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in _lab)
-    print(f"    {_lab}{' ' * max(1, 15 - _w)}↓{_gb(h_rx):>9}  ↑{_gb(h_tx):>9}   "
+    print(f"    {_padw(_lab, 15)}↓{_gb(h_rx):>9}  ↑{_gb(h_tx):>9}   "
           f"{DIM}至少这么多{RST}")
     print(f"  {DIM}宿主机这一行主要是【代理节点】sing-box / xray —— 它们是 systemd 服务，"
           f"不在容器里；{RST}")
@@ -2529,6 +2599,25 @@ def traffic_report(day=None):
               f"「流量到底是 Emby 吃的、还是节点吃的」的答案：{RST}")
         print(f"  {DIM}  占比高 → Emby 这边（探测 / 补时长 / 扫库）；"
               f"占比低 → 剩下的是代理节点转发的。{RST}")
+    tasks = _traffic_tasks(day)
+    if tasks:
+        rows = _traffic_rows(day)
+        print("-" * 60)
+        print(f"  {BOLD}按任务（定时任务各跑在什么时候，那段时间网卡跑了多少）{RST}")
+        for t0, t1, name, note in tasks:
+            # 一格覆盖的是"上一格到这一格"这段，所以窗口要往后放一格才盖得住
+            win = [r for r in rows if t0 <= r[0] <= t1 + TRAFFIC_EVERY_MIN * 60]
+            w_rx = sum(r[1] for r in win)
+            dur = max(0, t1 - t0)
+            when = time.strftime("%H:%M", time.localtime(t0))
+            span = f"{dur // 60} 分" if dur >= 60 else f"{dur} 秒"
+            tail = f"   {DIM}{note}{RST}" if note else ""
+            print(f"    {when}  {_padw(name, 13)}跑了 {span:<6} "
+                  f"窗口内网卡 ↓{_gb(w_rx)}{tail}")
+        print(f"  {DIM}「窗口内网卡」是把落在这段时间里的格子加起来，"
+              f"里面也含同一时段别的活动（比如你正好在用代理），只能当上限看。{RST}")
+        print(f"  {DIM}heal 那行括号里的数是它自己拿网卡差实测的，比这个准。{RST}")
+
     print("-" * 60)
     print(f"  {BOLD}按小时（网卡下行）{RST}")
     peak = max((v[0] for v in hours.values()), default=0)
@@ -15248,29 +15337,31 @@ if __name__ == "__main__":
         # 而没人拦的后果实测过，是十个进程叠在一起把内存吃穿。锁在自己手里更稳。
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
-                do_keepalive()
+                _timed("链路保活", do_keepalive)
         elif arg == "precache":           # cron 调的：开扫前刷一次目录缓存
             require_root()
             if take_task_lock("precache"):
-                do_precache()
+                _timed("目录缓存", do_precache)
         elif arg == "sync":               # cron 调的每日对齐，同样不交互
             require_root()
             if take_task_lock("sync"):
-                do_sync()
+                _timed("每日对齐", do_sync)
         elif arg == "warm":               # cron 调的直链预热
             require_root()
             if take_task_lock("warm"):
-                do_warm()
+                _timed("直链预热", do_warm)
         elif arg == "traffic-sample":     # cron 每 5 分钟调的流量记账
             require_root()
             if take_task_lock("traffic-sample"):
-                do_traffic_sample()
+                do_traffic_sample()      # 它自己就是记账的，不用再给自己记一笔
         elif arg == "traffic":            # 手动看账本
             traffic_report(sys.argv[2] if len(sys.argv) > 2 else None)
         elif arg == "heal":               # 「4」扔后台的补时长；手动敲也走这条
             require_root()
             if take_task_lock("heal"):
-                do_heal()
+                # heal 自己拿网卡差实测过这一轮花了多少，比格子准 —— 带进备注里
+                _timed("补时长heal", do_heal,
+                       note=lambda: f"（自测 {(ms_state().get('heal_day') or {}).get('mb', 0):.0f} MB/天累计）")
             elif has_tty():
                 # 【抢不到锁要说话】原来是一声不吭直接退出 —— 用户敲完命令屏幕上
                 # 什么都没有，和"跑完了"长得一模一样。cron 那条不说，是因为没人看。
