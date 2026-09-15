@@ -626,7 +626,13 @@ CI 检测到比已发布的高就直接用它，不再自动 +1。
 |--------|------|
 | 你 VPS 的出口 IP | 直连 GitHub 时 GitHub 也看得见，区别是这回多一个第三方 |
 | 你在下载 sing-box / xray | 据此能推断「这台机器是代理服务端」 |
-| User-Agent `xy-installer` | 能认出用的是哪套脚本 |
+
+**User-Agent 不报家门**：所有出网请求（urllib 和 curl 两条路）统一用 `curl/8.5.0`。
+以前各脚本各报各的（`xy-installer` / `media-stack` / `vps-check` / `net-optimize` / `xy-sub`），
+等于主动告诉沿途每一个人「这台机器在跑 nodekit」。
+
+> 别指望它防指纹：TLS 握手特征、请求头顺序这些照样能认出是 Python。这一步只是不主动声明身份，不是隐身。
+> `media-stack` 里那个 `BROWSER_UA` 是**故意**伪装成 Chrome 去绕网盘的 UA 封锁，不在此列。
 
 **带凭据的链接不会给第三方**：私有仓库 raw 链接、对象存储的签名地址（`?token=`、
 `?access_token=`、`?X-Amz-Signature=` 这类）一律跳过公共反代，只走直连和自己人的中转。
@@ -635,6 +641,16 @@ CI 检测到比已发布的高就直接用它，不再自动 +1。
 > 另有一条**和取件无关、但更值得在意**的：菜单 14 的本机中转关掉时，客户端配置里
 > 规则/图标的链接会指向 `gh-proxy.com`，于是**你和家人的家宽 IP** 会直接去访问它。
 > 本机中转默认是开的，开着就没这回事——那些链接指向你自己的域名。
+
+#### 订阅端口被扫到时看起来像什么
+
+订阅和中转是同一个 Python 小服务，Python 默认会回 `Server: SimpleHTTP/0.6 Python/3.11.2`
+外加一张一眼认得出的 `http.server` 错误页——扫到这个端口的人据此就知道「这是个自建的小服务」，
+配上非常规端口，基本等于挂牌说明这里托管着订阅。现在一律回 `Server: nginx`，错误页也换成
+nginx 样式；nginx 那两个 server 块也加了 `server_tokens off`，两边口径一致、都不报版本号。
+
+根路径早就放了个空的 `index.html`——没有它 `SimpleHTTPRequestHandler` 会**列出目录**，
+把所有 `<token>.yaml` 文件名（= 你的订阅 token）一次性摆出来。
 
 #### 公共反代那层的完整性
 

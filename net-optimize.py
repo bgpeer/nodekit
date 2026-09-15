@@ -59,6 +59,13 @@ import time
 import urllib.request
 from datetime import datetime, timezone
 
+# 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
+# vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
+# GitHub、jsDelivr、公共反代、ip-api 都看得到。换成最常见的 curl 串：不自报家门，
+# 而且脚本里 urllib 和 curl 两条路发出去的请求看起来是一致的，不会一台机器两副面孔。
+# 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
+HTTP_UA = "curl/8.5.0"
+
 VERSION = "4.2.0"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
@@ -445,7 +452,7 @@ def _mirror_urls(url):
 def fetch_url(url, timeout=10):
     for u in _mirror_urls(url):
         try:
-            req = urllib.request.Request(u, headers={"User-Agent": "net-optimize"})
+            req = urllib.request.Request(u, headers={"User-Agent": HTTP_UA})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except Exception:  # noqa
