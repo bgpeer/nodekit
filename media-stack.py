@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.103"
+SCRIPT_VERSION = "1.5.104"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8693,6 +8693,7 @@ HEAL_DAY_MB  = 2048      # heal 每天的流量上限（MB）。用满就停，�
 # 一轮就能花掉 5 GB，上限等于摆设。实测那天：探了 144 次、花了 2596 MB
 # （正好 18.0 MB/次），而上限是 2048。
 HEAL_MB_EACH = 18
+HEAL_MB_CHECK_EVERY = 10   # 轮内每探这么多个，查一次已经花了多少
 HEAL_GIVEUP = 3          # 连续探失败几次就放弃
 HEAL_GIVEUP_DAYS = 30    # 第一次放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
 # 【再试的间隔要越来越长，不能永远 30 天】固定 30 天的话，一个【永远探不出来】的库
@@ -8816,6 +8817,29 @@ def _host_rx_bytes():
     except (OSError, ValueError, IndexError):
         return None
     return tot
+
+def _heal_meter():
+    """返回 (读数函数, 口径名)：读数函数给出「到此刻为止拉了多少字节」。
+
+       优先用 openlist 容器自己的收字节。heal 的开销实质就是 openlist 替 ffprobe
+       去网盘拉文件头，这个口径最贴近真相。
+
+       【为什么不直接用物理网卡】网卡是全机的，会把【同一时段你在用代理】的流量也
+       算进来。以前只在轮末结账，算多了顶多是账面虚高；现在要拿它当【刹车】，算多了
+       就是你一看片 heal 就被判定超额、当场停工，积压永远补不完。
+
+       pid 在开轮时解析一次，之后每次只读一个 /proc 文件，几乎不花时间。
+       解析不到（没装 docker、容器没起）就退回网卡 —— 有个粗的刹车也好过没有。"""
+    try:
+        pid = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", "openlist"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        if pid and pid != "0":
+            path = f"/proc/{pid}/net/dev"
+            if _netdev_first(path):
+                return (lambda: (_netdev_first(path) or [None])[0]), "openlist"
+    except Exception:
+        pass
+    return _host_rx_bytes, "网卡"
 
 def heal_mb_each():
     """一个条目实际要花多少 MB（上游口径）。优先用【今天自己测出来的】。
@@ -9028,8 +9052,10 @@ def heal_media_info(d, key, budget=None):
     done = hit = 0
     todo_items = list(pend)
     t_all = time.monotonic()
-    _rx0 = _host_rx_bytes()              # 这一轮到底花了多少流量，用网卡计数实测
+    _meter, _how_m = _heal_meter()       # 这一轮到底花了多少流量，实测
+    _rx0 = _meter()
     budget = HEAL_BUDGET if budget is None else budget
+    _over = False                        # 轮内刹车踩没踩
     for rnd in range(1, HEAL_ROUNDS + 1):
         if not todo_items or time.monotonic() - t_all > budget:
             break
@@ -9038,10 +9064,13 @@ def heal_media_info(d, key, budget=None):
                   f"（第 {rnd}/{HEAL_ROUNDS} 轮）{RST}")
             time.sleep(HEAL_GAP)
         again = []
-        _d, _t = _heal_round(d, key, todo_items, base, token, again, t_all, budget)
+        _d, _t, _over = _heal_round(d, key, todo_items, base, token, again,
+                                    t_all, budget, _meter, _rx0, _left)
         done += _d
         hit += _t
         todo_items = again
+        if _over:
+            break                        # 额度用完了，重试轮更不该跑
         if _t >= HEAL_429_STOP:
             # 【撞满了就别再打第二轮】第二轮是给"这一下没探到"准备的，而被限量
             # 时整轮都探不到 —— 再打一轮只是把上游按得更久。
@@ -9050,10 +9079,10 @@ def heal_media_info(d, key, budget=None):
     # 【记账要在报数之前】—— 这轮花了多少，用物理网卡的接收字节差实测。
     # 播放走 302 直链、根本不经过 VPS，所以这段时间的接收量基本就是 heal 拉的。
     # 读不到计数（容器里、非 Linux）才退回按次数估。
-    _rx1 = _host_rx_bytes()
+    _rx1 = _meter()
     if _rx0 is not None and _rx1 is not None and _rx1 >= _rx0:
         _spent = (_rx1 - _rx0) / 1048576.0
-        _how = "实测"
+        _how = f"实测·{_how_m}"
     else:
         _spent = len(pend) * heal_mb_each()
         _how = "估算"
@@ -9063,8 +9092,11 @@ def heal_media_info(d, key, budget=None):
     _left2, _used2 = heal_budget()
     print(f"  {DIM}这轮花了约 {_spent:.0f} MB（{_how}）；今天累计 {_used2:.0f} MB / "
           f"上限 {HEAL_DAY_MB} MB，还剩 {_left2:.0f} MB{RST}")
-    if _left2 <= 0:
+    if _over or _left2 <= 0:
         print(f"  {YELLOW}今天的额度用完了，后面几轮不再探，明天零点自动清零。{RST}")
+        if _over:
+            print(f"  {DIM}（这轮是【探到一半】被额度拉停的 —— 排队没轮到的一个都没发，"
+                  f"它们明天接着排。）{RST}")
     for _ln in heal_daily_diff(_raw_pend, len(heal_fail_table())):
         print(f"  {DIM}{_ln}{RST}")
     # 【把时间花在哪儿说出来】原来一轮跑完只报"补上几个"，于是"慢"没有任何可查的
@@ -9191,16 +9223,23 @@ def _heal_one(d, key, _it, base, token):
     return "retry", name, el(), "探测请求没跑成（超时），下一轮再试"
 
 
-def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
-    """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流)。
+def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
+                meter=None, rx0=None, mb_left=None):
+    """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流, 是否额度用完)。
 
     【并行】一个条目里绝大部分时间是干等网络，串着跑等于把几条独立的等待排成一队。
     并行度见 heal_workers()：撞过限流就退回 1 个。
 
     【撞限流要立刻拉停整轮】排队还没轮到的一个都不发出去 —— 上游限的是整体请求量，
     这时候还往外发，只会把它按得更久。
+
+    【额度也要轮内检查】原来只在开轮前查一次、跑完才结账，于是一轮就能冲过头：
+    现场 00~02 时花了约 2.8 GB，而上限是 2048 MB，超了四成。现在每探
+    HEAL_MB_CHECK_EVERY 个就量一次实际花销，超了当场拉停 —— 复用 429 那条 stop
+    通道，排队还没轮到的一个都不发出去。
     """
     done = hit = 0
+    over = False
     # 本轮每个条目的成败，轮末一次性落盘。只记【条目自己的】成败：
     # throttle 是上游在限流、skip 是本地没这个文件，都不是"这个条目探不出来"的证据，
     # 拿它们去累加失败次数会把好条目误判成放弃。
@@ -9230,6 +9269,18 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
                 with lock:
                     n += 1
                     idx = n
+                    # 【轮内刹车】每 HEAL_MB_CHECK_EVERY 个量一次。meter 读的是
+                    # openlist 的收字节（退化时才是网卡），口径见 _heal_meter。
+                    # 【mb_left 要跟 None 比，别写 `and mb_left`】额度正好剩 0
+                    # 的时候 0 是假值，刹车反而整个失效 —— 最该停的那一刻不停。
+                    if (not over and meter and rx0 is not None
+                            and mb_left is not None
+                            and n % HEAL_MB_CHECK_EVERY == 0):
+                        _now = meter()
+                        if _now is not None and _now >= rx0:
+                            _mb = (_now - rx0) / 1048576.0
+                            if _mb >= mb_left:
+                                over = True
                 if res == "ok":
                     done += 1
                     fails.append((_it[1], True))
@@ -9247,6 +9298,12 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
                               f"再打下去只会把上游按得更久{RST}")
                         stop.set()
                         break
+                if over:
+                    print(f"  {YELLOW}今天的流量额度用完了（这一轮已经拉了约 "
+                          f"{(meter() - rx0) / 1048576.0:.0f} MB），当场收工 —— "
+                          f"排队没轮到的一个都不发{RST}")
+                    stop.set()
+                    break
                 else:
                     if res != "dead":            # dead 是确定答案，同一轮里也别再试
                         again.append(_it)
@@ -9267,7 +9324,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None):
             for f2 in futs:
                 f2.cancel()
     heal_fail_record(fails)
-    return done, hit
+    return done, hit, over
 
 
 def _heal_summary(done, total):
