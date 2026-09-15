@@ -110,6 +110,7 @@ SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid" # AdGuard ClientID（DoH 地址末段；填进「允许的客户端」即可只放行自己）
 GHRELAY_OFF    = BGP_DIR + "/ghrelay.off"        # 开关：规则/图标走本机 GitHub 中转（默认开；存在此文件=用户手动关了）
 GHRELAY_TOKEN_FILE = BGP_DIR + "/ghrelay.token"  # 本机中转的 token（防别人蹭；在 BGP_DIR 不在 SUB_DIR，不会被下载）
+GHDL_RELAYS  = BGP_DIR + "/gh-relays.json"   # 取件用的【自己人】中转前缀（从别的机器菜单 14 复制来的）
 
 # 网络优化脚本已并入本仓库（net-optimize.py，BBR/QoS 等内核调优，依赖工具自动安装）；
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
@@ -856,6 +857,38 @@ def _bad_archive(path):
                 f"多半是反代返回的错误页 / 限流页")
     return ""
 
+def own_relays():
+    """自己人的 GitHub 中转前缀列表（从别的机器菜单 14 抄来的，形如
+       https://域名:端口/<token>/gh/）。取件时排在公共反代前面。
+
+       为什么不是用【本机自己】那个中转：它就跑在这台机器上，出网走的是同一条路。
+       本机连不上 GitHub，本机的中转照样连不上，多绕一跳纯属白费。有用的是**别的
+       机器**上的中转——那台能通 GitHub，就能替这台把东西转过来。"""
+    try:
+        v = json.load(open(GHDL_RELAYS))
+    except Exception:
+        return []
+    out = []
+    for x in v if isinstance(v, list) else []:
+        x = str(x).strip()
+        if x.startswith(("http://", "https://")):
+            out.append(x if x.endswith("/") else x + "/")
+    return out
+
+def save_own_relays(lst):
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump(lst, open(GHDL_RELAYS, "w"), ensure_ascii=False, indent=2)
+
+def _relay_kind(u, url):
+    """这条候选是谁家的：直连 / jsDelivr / 自己的中转 / 公共反代。只用来把话说清楚。"""
+    if u == url:
+        return "直连"
+    if any(u.startswith(p) for p in own_relays()):
+        return "自己的中转"
+    if "jsdelivr" in u:
+        return "jsDelivr"
+    return "公共反代（第三方）"
+
 def _dl_gh(url, dest):
     """下载 GitHub 上的文件（内核二进制包）。直连先试，不行才逐个试公共反代。
        成功返回真正用上的 URL；全都不通则抛出，错误里逐条列出试过谁、败在哪。
@@ -863,9 +896,12 @@ def _dl_gh(url, dest):
        为什么加 -f：原来是 `curl -Lo`，没有 -f 的话 404 页面会被**当成文件存下来**，
        接着 tar/unzip 报一个跟真实原因八竿子打不着的错。-f 让 curl 在 HTTP 错误时直接失败。
 
-       完整性说明：反代是第三方，理论上能掉包。做不到端到端签名校验（上游没发布校验和），
-       能做到的三条都做了——① 直连永远排第一，反代只是兜底；② 装完必校版本号
-       （见 _verify_core，截断/换包都会露馅）；③ 一旦用了反代就明着打印出来，不闷声走。"""
+       顺序：直连 → jsDelivr(仅 raw) → **自己人的中转**（own_relays，别的机器上那个）
+       → 公共反代。自己的排在第三方前面，配了就基本轮不到第三方。
+
+       完整性说明：公共反代是第三方，理论上能掉包。做不到端到端签名校验（上游没发布
+       校验和），能做到的三条都做了——① 直连和自己人的排在前面，第三方只是最后兜底；
+       ② 装完必校版本号（见 _verify_core，截断/换包都会露馅）；③ 用了谁明着打印出来。"""
     errs = []
     for i, u in enumerate(_mirrors(url)):
         try:
@@ -875,7 +911,8 @@ def _dl_gh(url, dest):
                 errs.append(f"{u[:72]}…\n        {bad}")
                 continue
             if i:
-                print(f"  ⓘ GitHub 直连不通，本次改用中转下载：{u[:len(u) - len(url)] or u}")
+                print(f"  ⓘ GitHub 直连不通，本次走 {_relay_kind(u, url)}："
+                      f"{u[:len(u) - len(url)] or u}")
             return u
         except Exception as e:
             errs.append(f"{u[:72]}…\n        {str(e).strip().splitlines()[-1][:90]}")
@@ -1829,6 +1866,7 @@ def _mirrors(url):
         urls.append(f"https://cdn.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
         urls.append(f"https://fastly.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
     if _GH_RE.match(url):
+        urls += [pfx + url for pfx in own_relays()]     # 自己人的中转排在第三方前面
         urls += [pfx + url for pfx in GH_MIRRORS]
     return urls
 
@@ -4015,6 +4053,89 @@ def _ghrelay_regen():
     G["host"] = _host(); ensure_deps()
     return build_subscription(read_saved_links())
 
+def _relay_probe(prefix):
+    """拿这条中转真去拉一个小文件，看通不通。返回 (是否通, 说明)。"""
+    probe = "https://raw.githubusercontent.com/bgpeer/nodekit/main/sub-template.yaml"
+    try:
+        req = urllib.request.Request(prefix + probe, headers={"User-Agent": "xy-installer"})
+        body = urllib.request.urlopen(req, timeout=12).read()
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return False, "403 —— token 不对（对方刷过 token？去那台机器菜单 14 重新复制前缀）"
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"连不上：{str(e)[:60]}"
+    if b"proxy-groups" not in body:
+        return False, f"通了但内容不对（拿到 {len(body)} 字节，不像模板）"
+    return True, f"通，拉到 {len(body)} 字节"
+
+def ghdl_relay_menu():
+    """备用取件中转：本机拉不到 GitHub 时，借【别的机器】上的中转把东西转过来。
+
+       为什么不用本机自己那个：本机中转就跑在本机上，出网同一条路。本机连不上
+       GitHub，它也连不上，多绕一跳没有任何意义。所以这里填的必须是别的机器。"""
+    while True:
+        lst = own_relays()
+        print("\n" + "=" * 60 + "\n备用取件中转（自己人的，优先于公共反代）\n" + "=" * 60)
+        print("  用途：这台机器拉不到 GitHub（内核二进制 / 模板 / 版本号）时，")
+        print("        借你另一台能通的机器把东西转过来，不用把包交给第三方反代。")
+        print("  怎么拿：去那台能通 GitHub 的机器，菜单 14 顶上就印着它的中转地址前缀，整条复制过来。")
+        print("-" * 60)
+        if lst:
+            for i, u in enumerate(lst, 1):
+                print(f"  {i}) {u}")
+        else:
+            print("  （还没配。没配也不影响——直连不通时会退到公共反代，只是那是第三方。）")
+        print("-" * 60)
+        print("  1 添加一条    2 删除一条    3 逐条测试连通    0 返回")
+        c = _ask("选择: ").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            u = _ask("  粘贴中转前缀（形如 https://域名:端口/<token>/gh/，回车取消）: ").strip()
+            if not u:
+                continue
+            if not u.startswith(("http://", "https://")):
+                print("  \033[1;31m✗ 要一条完整的 http(s) 地址。\033[0m"); continue
+            u = u if u.endswith("/") else u + "/"     # 先补斜杠再查 /gh/：
+            if "/gh/" not in u:                       # 手抖把末尾那道斜杠删了不该被判成格式错
+                print("  \033[1;31m✗ 看着不像中转前缀——正经的那条里有 /gh/。"
+                      "去那台机器菜单 14 顶上整条复制。\033[0m"); continue
+            try:
+                host = urllib.parse.urlsplit(u).hostname or ""
+            except Exception:
+                host = ""
+            if host and host == (_host() or "").strip():
+                print("  \033[1;31m⚠ 这是【本机】自己的中转地址。\033[0m")
+                print("    它就跑在这台机器上，出网走同一条路——本机连不上 GitHub，它也连不上，")
+                print("    绕这一跳不会让你多拉到任何东西。要填的是【另一台】能通 GitHub 的机器。")
+                if _ask("    还是要加？(y/N): ").strip().lower() != "y":
+                    continue
+            ok, why = _relay_probe(u)
+            print(("  \033[1;32m✓ " if ok else "  \033[1;31m✗ ") + why + "\033[0m")
+            if not ok and _ask("  测不通，仍然加进去？(y/N): ").strip().lower() != "y":
+                continue
+            if u in lst:
+                print("  已经在列表里了。"); continue
+            save_own_relays(lst + [u])
+            print("  ✓ 已添加。取件时会排在公共反代前面。")
+        elif c == "2":
+            if not lst:
+                print("  列表是空的。"); continue
+            n = _ask("  删第几条（回车取消）: ").strip()
+            if not n.isdigit() or not (1 <= int(n) <= len(lst)):
+                print("  序号不对。"); continue
+            gone = lst.pop(int(n) - 1); save_own_relays(lst)
+            print(f"  ✓ 已删：{gone}")
+        elif c == "3":
+            if not lst:
+                print("  列表是空的。"); continue
+            for u in lst:
+                ok, why = _relay_probe(u)
+                print(("  \033[1;32m✓ " if ok else "  \033[1;31m✗ ") + f"{u}  —— {why}" + "\033[0m")
+        else:
+            print("  无效选择。")
+
 def ghrelay_menu():
     """GitHub 中转：规则/图标走【本机中转】还是 gh-proxy.com（别人的）。默认本机中转。
        支持开/关 + 刷新中转 token（防别人蹭，旧地址立即失效，配置随之刷新）。需域名+真证书。"""
@@ -4032,8 +4153,12 @@ def ghrelay_menu():
         print(f"  1 本机中转 写入配置（开/关）   [当前：{'开' if on else '关（用 gh-proxy）'}]")
         print("  2 刷新中转 token（防别人蹭：旧地址立即失效 + 刷新订阅；订阅端口不变、客户端自动更新即可）")
         print("  3 刷新 token + 换端口（更狠：连订阅端口一起换随机·自动避开节点端口）")
+        print(f"  4 备用取件中转（本机拉不到 GitHub 时，借别的机器转）  "
+              f"[已配 {len(own_relays())} 条]")
         print("  0 返回")
         c = _ask("选择: ").strip()
+        if c == "4":
+            ghdl_relay_menu(); continue
         if c in ("1", "2", "3") and not read_saved_links():
             print("  还没有节点，先『1.安装』。"); continue
         if c == "1":
