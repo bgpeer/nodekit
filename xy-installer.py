@@ -889,6 +889,15 @@ def _relay_kind(u, url):
         return "jsDelivr"
     return "公共反代（第三方）"
 
+# 链接里带凭据的形态：GitHub 私有仓库的 raw 链接、以及 release 资产 302 之后那种
+# 带签名的对象存储地址，都是靠查询串里的 token 授权的。这类链接**不能交给公共反代**
+# ——那等于把凭据原样送给第三方。自己人的中转不受限（那是自己的机器）。
+# 典型来源：用户把自定义模板放在自己的私有仓库里，直连又不通。
+_SECRET_Q = re.compile(r"[?&](token|access_token|key|sig|signature|x-amz-[a-z-]+)=", re.I)
+
+def _has_secret(url):
+    return bool(_SECRET_Q.search(url))
+
 def _dl_gh(url, dest):
     """下载 GitHub 上的文件（内核二进制包）。直连先试，不行才逐个试公共反代。
        成功返回真正用上的 URL；全都不通则抛出，错误里逐条列出试过谁、败在哪。
@@ -1867,7 +1876,8 @@ def _mirrors(url):
         urls.append(f"https://fastly.jsdelivr.net/gh/{o}/{repo}@{br}/{path}")
     if _GH_RE.match(url):
         urls += [pfx + url for pfx in own_relays()]     # 自己人的中转排在第三方前面
-        urls += [pfx + url for pfx in GH_MIRRORS]
+        if not _has_secret(url):                        # 带凭据的链接不交给第三方
+            urls += [pfx + url for pfx in GH_MIRRORS]
     return urls
 
 def fetch_url(url):
