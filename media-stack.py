@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.100"
+SCRIPT_VERSION = "1.5.101"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2298,6 +2298,24 @@ def _nic_counters():
         return None, None
     return rx, tx
 
+def _netdev_first(path):
+    """从一份 /proc/net/dev 里取第一个非 lo 网口的 (收字节, 发字节)。取不到返回 None。
+
+       单独拆出来是为了能拿假文件测 —— 容器那一路要先 docker inspect 拿 pid，
+       没法在沙箱里跑，而真正容易写错的恰恰是这几行解析（表头两行、字段第 1 和第 9）。"""
+    try:
+        for line in open(path):
+            if ":" not in line:
+                continue                      # 跳过开头那两行表头
+            name, _, rest = line.partition(":")
+            if name.strip() == "lo":
+                continue
+            f = rest.split()
+            return int(f[0]), int(f[8])       # bytes 在收、发两段的第一个字段
+    except Exception:
+        return None
+    return None
+
 def _container_counters():
     """每个运行中容器的累计收发字节，从它自己网络命名空间的 /proc/<pid>/net/dev 读。
 
@@ -2316,15 +2334,9 @@ def _container_counters():
                                  capture_output=True, text=True, timeout=10).stdout.strip()
             if not pid or pid == "0":
                 continue
-            for line in open(f"/proc/{pid}/net/dev"):
-                if ":" not in line:
-                    continue
-                name, _, rest = line.partition(":")
-                if name.strip() == "lo":
-                    continue
-                f = rest.split()
-                out[c] = (int(f[0]), int(f[8]))
-                break
+            got = _netdev_first(f"/proc/{pid}/net/dev")
+            if got:
+                out[c] = got
         except Exception:
             continue
     return out
@@ -2450,7 +2462,19 @@ def _traffic_read(day):
     return rx, tx, per, hours, rows
 
 def _gb(n):
-    return f"{n / 1073741824:.2f} GB" if n >= 1073741824 else f"{n / 1048576:.0f} MB"
+    """给人看的字节数。
+
+       【必须有 KB 这一档】第一版只有 MB / GB 且 MB 是 :.0f —— 于是 300 KB 打出来是
+       "0 MB"。现场第一次看账本就撞上了：六个容器全是一水儿的 "0 MB"，看着像"计数
+       根本没在工作"，实际只是各自跑了几百 KB 的心跳。一个让人误判成"坏了"的显示，
+       比数字难看严重得多。"""
+    if n >= 1073741824:
+        return f"{n / 1073741824:.2f} GB"
+    if n >= 1048576:
+        return f"{n / 1048576:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f} KB"
+    return f"{n} B"
 
 def traffic_report(day=None):
     """把某一天的账本摊开：总账 / 按来源 / 按小时。"""
@@ -2479,6 +2503,24 @@ def traffic_report(day=None):
             print(f"    {c:<14} ↓{_gb(a):>9}  ↑{_gb(b):>9}   {DIM}占网卡下行 {pct}{RST}")
     else:
         print(f"    {DIM}这一天没有容器在跑{RST}")
+    # 【宿主机那一行不能省】代理节点（sing-box / xray）是 systemd 服务，跑在宿主机上、
+    # 不在任何容器里 —— 它的流量永远不会出现在上面几行。少了这一行，用户看到"容器全是
+    # 0、网卡却跑了 43 MB"只会觉得这张表坏了。现场第一次看就是这个反应。
+    #
+    # 用减法是有偏差的：容器之间的流量（emby 找 nginx 要文件头）算进了容器、却没经过
+    # 网卡，会把这个差值压小，极端情况压成负数 —— 所以夹到 0，并且措辞是"至少"。
+    c_rx = sum(v[0] for v in per.values())
+    c_tx = sum(v[1] for v in per.values())
+    h_rx, h_tx = max(0, rx - c_rx), max(0, tx - c_tx)
+    # 中文是双宽，:<14 按【字符数】补空格会把这一行顶歪（容器名都是 ASCII，按 14 列排）。
+    _lab = "宿主机·非容器"          # 短到能排进 14 列；"不在容器里"在下面那句里讲
+    _w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in _lab)
+    print(f"    {_lab}{' ' * max(1, 15 - _w)}↓{_gb(h_rx):>9}  ↑{_gb(h_tx):>9}   "
+          f"{DIM}至少这么多{RST}")
+    print(f"  {DIM}宿主机这一行主要是【代理节点】sing-box / xray —— 它们是 systemd 服务，"
+          f"不在容器里；{RST}")
+    print(f"  {DIM}另外还有系统更新、证书续期、docker pull。这一格算法是"
+          f"「网卡 − 各容器」，容器之间的流量会把它压小，所以只说「至少」。{RST}")
     ol = per.get("openlist", [0, 0])[0]
     if rx:
         print("-" * 60)
