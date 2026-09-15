@@ -11,6 +11,13 @@
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
 import os, re, ast, sys, json, time, ipaddress, subprocess, urllib.request, urllib.error
 
+# 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
+# vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
+# GitHub、jsDelivr、公共反代、ip-api 都看得到。换成最常见的 curl 串：不自报家门，
+# 而且脚本里 urllib 和 curl 两条路发出去的请求看起来是一致的，不会一台机器两副面孔。
+# 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
+HTTP_UA = "curl/8.5.0"
+
 SB_DIR  = "/etc/sing-box"
 SB_BIN  = "/usr/local/bin/sing-box"
 BGP_DIR = "/etc/bgpeer"
@@ -84,7 +91,7 @@ def fetch_url(url):
     for rd in range(2):
         for u in _mirrors(url):
             try:
-                req = urllib.request.Request(u, headers={"User-Agent": "xy-installer"})
+                req = urllib.request.Request(u, headers={"User-Agent": HTTP_UA})
                 return urllib.request.urlopen(req, timeout=15).read().decode()
             except Exception as e:
                 last = e
@@ -108,7 +115,7 @@ def cnblock_save(d):
 
 def _http_code(url):
     """HEAD 探测 HTTP 状态码。不走 shell（url 可能含外部内容，避免注入）。"""
-    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xy-installer"})
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": HTTP_UA})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return str(r.status)
