@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.102"
+SCRIPT_VERSION = "1.5.103"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2599,6 +2599,20 @@ def traffic_report(day=None):
               f"「流量到底是 Emby 吃的、还是节点吃的」的答案：{RST}")
         print(f"  {DIM}  占比高 → Emby 这边（探测 / 补时长 / 扫库）；"
               f"占比低 → 剩下的是代理节点转发的。{RST}")
+    # heal 是唯一自己量过流量的任务（拿网卡接收差实测），而它又是最大的单项开销，
+    # 所以单独给一行：一眼看出今天用了多少、有没有超上限。
+    if day == time.strftime("%Y-%m-%d"):
+        _hd = ms_state().get("heal_day") or {}
+        if _hd.get("date") == day and float(_hd.get("mb") or 0) > 0:
+            _used = float(_hd["mb"])
+            _over = _used > HEAL_DAY_MB
+            _tag = f"{YELLOW}超了{RST}" if _over else f"{GREEN}没超{RST}"
+            print("-" * 60)
+            print(f"  {BOLD}补时长 heal 今天自测用掉 {_used:.0f} MB / 上限 "
+                  f"{HEAL_DAY_MB} MB{RST}（{_tag}，探了 {int(_hd.get('probes') or 0)} 次）")
+            print(f"  {DIM}这个数是 heal 自己拿网卡接收差量的，比下面「窗口内网卡」准。"
+                  f"想调上限改 HEAL_DAY_MB。{RST}")
+
     tasks = _traffic_tasks(day)
     if tasks:
         rows = _traffic_rows(day)
@@ -5250,7 +5264,18 @@ def align_library(d, key, heal=True, migrate=True):
         # 但必须让人知道它失败了。
         warn(f"按规则文件对齐媒体库的刮削器/语言失败：{_short_err(e)}")
     if heal:
-        heal_media_info(d, key)       # 条目级：补时长
+        # 【这一步必须单独记账】heal 在这儿是嵌在 align_library 里跑的，而 align_library
+        # 被每小时的 do_warm 调用 —— 于是账本里它顶着"直链预热"的名字，看不出真身。
+        # 现场数据：账本里一条 heal 都没有，而"直链预热"跑了 22 分、窗口 973 MB，
+        # 一度让人以为预热本身在烧流量（README 里写的是 15 MB/天）。
+        _h_t0 = time.time()
+        try:
+            heal_media_info(d, key)   # 条目级：补时长
+        finally:
+            _h_st = ms_state().get("heal_day") or {}
+            traffic_mark("补时长heal", _h_t0,
+                         f"（当天自测累计 {float(_h_st.get('mb') or 0):.0f} MB / "
+                         f"上限 {HEAL_DAY_MB} MB，{int(_h_st.get('probes') or 0)} 次）")
     normalize_strm_files(d)           # heal 中途被打断的兜底
     # 剧集 strm 改名成带季集编号的。【必须排在 scan_if_grown 之前】——
     # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
@@ -15349,7 +15374,9 @@ if __name__ == "__main__":
         elif arg == "warm":               # cron 调的直链预热
             require_root()
             if take_task_lock("warm"):
-                _timed("直链预热", do_warm)
+                # 别叫"直链预热"：它其实是 align_library（含补时长 heal）+ 预热直链，
+                # 预热只占一小角。叫错名字会把 heal 的账记到预热头上。
+                _timed("小时对齐", do_warm)
         elif arg == "traffic-sample":     # cron 每 5 分钟调的流量记账
             require_root()
             if take_task_lock("traffic-sample"):
