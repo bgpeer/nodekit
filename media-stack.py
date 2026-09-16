@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.105"
+SCRIPT_VERSION = "1.5.106"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8733,7 +8733,13 @@ HEAL_DAY_MB  = 2048      # heal 每天的流量上限（MB）。用满就停，�
 # 一轮就能花掉 5 GB，上限等于摆设。实测那天：探了 144 次、花了 2596 MB
 # （正好 18.0 MB/次），而上限是 2048。
 HEAL_MB_EACH = 18
-HEAL_MB_CHECK_EVERY = 10   # 轮内每探这么多个，查一次已经花了多少
+# 轮内每探这么多个，查一次已经花了多少。
+# 【为什么是 1 而不是 10】这个数就是刹车的行程：查得越稀，超额之后还能再跑越多个。
+# 写 10 的时候，最坏情况是发现超额前又探了 9 个 × 18 MB ≈ 160 MB 冲过头，而每天
+# 的上限统共才 2048 MB。而查一次的代价只是读一个 /proc/<pid>/net/dev（见
+# _heal_meter：pid 开轮时解析一次，之后纯文件读），比一次探测便宜好几个数量级。
+# 既然如此就没有理由攒着查 —— 每探完一个就结一次账。
+HEAL_MB_CHECK_EVERY = 1
 HEAL_GIVEUP = 3          # 连续探失败几次就放弃
 HEAL_GIVEUP_DAYS = 30    # 第一次放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
 # 【再试的间隔要越来越长，不能永远 30 天】固定 30 天的话，一个【永远探不出来】的库
@@ -9280,6 +9286,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
     """
     done = hit = 0
     over = False
+    spent_mb = 0.0            # 刹车那一刻量到的实际花销，只给下面那句提示用
     # 本轮每个条目的成败，轮末一次性落盘。只记【条目自己的】成败：
     # throttle 是上游在限流、skip 是本地没这个文件，都不是"这个条目探不出来"的证据，
     # 拿它们去累加失败次数会把好条目误判成放弃。
@@ -9320,7 +9327,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                         if _now is not None and _now >= rx0:
                             _mb = (_now - rx0) / 1048576.0
                             if _mb >= mb_left:
-                                over = True
+                                over, spent_mb = True, _mb
                 if res == "ok":
                     done += 1
                     fails.append((_it[1], True))
@@ -9339,8 +9346,12 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                         stop.set()
                         break
                 if over:
+                    # 【用刹车当时量到的那个数，别再 meter() 一次】重读一次既可能
+                    # 返回 None（容器刚好重启）把这一行炸成 TypeError、连带整轮
+                    # 中断，也可能读出一个跟判定时不一样的数，屏上说的和实际刹车
+                    # 依据对不上。
                     print(f"  {YELLOW}今天的流量额度用完了（这一轮已经拉了约 "
-                          f"{(meter() - rx0) / 1048576.0:.0f} MB），当场收工 —— "
+                          f"{spent_mb:.0f} MB），当场收工 —— "
                           f"排队没轮到的一个都不发{RST}")
                     stop.set()
                     break
