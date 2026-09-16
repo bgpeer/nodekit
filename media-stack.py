@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.104"
+SCRIPT_VERSION = "1.5.105"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2461,6 +2461,37 @@ def _traffic_rows(day):
         return []
     return rows
 
+def _traffic_hour_src(day):
+    """按小时 × 按来源的收字节 → {小时: {容器名: 收}}。
+
+       为什么单开一张表：原来"按小时"只有网卡总数，"按来源"只有全天合计，
+       两张表交叉不起来 —— 于是「每小时稳定 110 MB、一直在跑」这种问题，
+       账本能看见却答不出"是谁"。现场就卡在这儿。数据本来每格都记着，缺的只是这一步。"""
+    out = {}
+    try:
+        fh = open(f"{TRAFFIC_DIR}/traffic-{day}.tsv")
+    except OSError:
+        return out
+    with fh:
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 3:
+                continue
+            try:
+                h = time.strftime("%H", time.localtime(int(f[0])))
+            except ValueError:
+                continue
+            bucket = out.setdefault(h, {})
+            for part in f[3:]:
+                bits = part.rsplit(":", 2)
+                if len(bits) != 3:
+                    continue
+                try:
+                    bucket[bits[0]] = bucket.get(bits[0], 0) + int(bits[1])
+                except ValueError:
+                    continue
+    return out
+
 def _traffic_prune():
     """只留最近 TRAFFIC_KEEP_DAYS 天。一天几十 KB，留半个月也就几百 KB。"""
     try:
@@ -2633,12 +2664,21 @@ def traffic_report(day=None):
         print(f"  {DIM}heal 那行括号里的数是它自己拿网卡差实测的，比这个准。{RST}")
 
     print("-" * 60)
-    print(f"  {BOLD}按小时（网卡下行）{RST}")
+    print(f"  {BOLD}按小时（网卡下行 · 后面是这一小时的大头是谁）{RST}")
     peak = max((v[0] for v in hours.values()), default=0)
+    hsrc = _traffic_hour_src(day)
     for h in sorted(hours):
         a, b = hours[h]
-        bar = "#" * int(a * 28 / peak) if peak else ""
-        print(f"    {h} 时   ↓{_gb(a):>9}  ↑{_gb(b):>9}  {bar}")
+        bar = "#" * int(a * 12 / peak) if peak else ""
+        # 这一小时谁占大头：容器按收字节排前两名，再补一个"宿主机"（网卡减各容器）。
+        # 有了这一栏，「每小时稳定 110 MB」这种问题当场就能定位到人。
+        src = hsrc.get(h, {})
+        top = sorted(src.items(), key=lambda kv: -kv[1])[:2]
+        host = max(0, a - sum(src.values()))
+        who = "  ".join(f"{n} {_gb(v)}" for n, v in top if v > 0)
+        if host > 0:
+            who = (who + "  " if who else "") + f"宿主机 {_gb(host)}"
+        print(f"    {h} 时   ↓{_gb(a):>9}  ↑{_gb(b):>9}  {bar:<12} {DIM}{who}{RST}")
     print("-" * 60)
     print(f"  {DIM}账本在 {TRAFFIC_DIR}/traffic-{day}.tsv，留最近 "
           f"{TRAFFIC_KEEP_DAYS} 天。{RST}")
