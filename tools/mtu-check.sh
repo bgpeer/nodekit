@@ -23,8 +23,11 @@
 # 【输出里的公网 IP 会打码】方便你直接截图贴出来问人。
 set -u
 
-TOOL_VER="2026-09-17a"
-echo "  ${0##*/}  版本 $TOOL_VER"
+TOOL_VER="2026-09-17b"
+# 【别用 $0】这个脚本的正常用法就是 curl ... | bash，那时候 $0 是 "bash"，
+# 标题会变成「bash 版本 ...」、下面的用法提示会变成「bash bash <IP>」。
+SELF="mtu-check.sh"
+echo "  $SELF  版本 $TOOL_VER"
 
 EXTRA="${1:-}"
 B="\033[1m"; D="\033[2m"; G="\033[32m"; Y="\033[33m"; R="\033[31m"; X="\033[0m"
@@ -43,10 +46,27 @@ have() { command -v "$1" >/dev/null 2>&1; }
 if ! have ping; then
   echo -e "${R}没有 ping，装一下：apt install -y iputils-ping${X}"; exit 1
 fi
-# -M do（设 DF 位、不许分片）是 iputils 独有的，busybox 的 ping 没有。
-# 没有它就只能量网卡、量不了路径 —— 得说清楚，不能默默给个假结果。
+
+# -M do（设 DF 位、不许分片）只有 iputils 版的 ping 有；Debian 的 inetutils-ping
+# 和 busybox 的都没有。
+#
+# 【不能只试 PATH 里的那一个】两种实现可以同时装着：iputils 在 /bin/ping，
+# inetutils 在 /usr/bin/ping，谁在 PATH 前面纯看运气。上一版试了第一个就放弃，
+# 于是在一台明明装了 iputils 的机器上整节报「量不了」。挨个试，有一个能用就行。
+PING=""
+# MTU_PING=/path/to/ping 可以直接指定用哪个（装了好几个实现、或者装在怪地方时用）
+for c in ${MTU_PING:+"$MTU_PING"} ping /bin/ping /usr/bin/ping /usr/sbin/ping; do
+  command -v "$c" >/dev/null 2>&1 || continue
+  "$c" -M do -s 64 -c 1 -W 2 -n 127.0.0.1 >/dev/null 2>&1 && { PING="$c"; break; }
+done
 PMTU_OK=1
-ping -M do -s 64 -c 1 -W 2 -n 127.0.0.1 >/dev/null 2>&1 || PMTU_OK=0
+if [ -z "$PING" ]; then
+  PMTU_OK=0
+  PING=ping
+  # 【把真实报错打出来】"不支持 -M do" 和 "到 127.0.0.1 的 ICMP 被挡了" 是两回事，
+  # 上一版都归成前者，于是给的处方可能完全不对症。
+  PING_ERR=$(ping -M do -s 64 -c 1 -W 2 -n 127.0.0.1 2>&1 | head -2)
+fi
 
 sec "① 本机网卡的 MTU"
 echo -e "  ${D}物理口不是 1500 的话，多半是机房套了隧道 —— 那是事实不是故障。${X}"
@@ -90,11 +110,11 @@ fi
 probe() {  # probe <目标> <4|6> <包大小> -> 通了返回 0
   local host=$1 fam=$2 size=$3 ov
   [ "$fam" = 6 ] && ov=48 || ov=28
-  ping -"$fam" -M do -s "$((size - ov))" -c 1 -W 2 -n "$host" >/dev/null 2>&1
+  "$PING" -"$fam" -M do -s "$((size - ov))" -c 1 -W 2 -n "$host" >/dev/null 2>&1
 }
 pmtu() {   # pmtu <目标> <4|6> -> 打印能过的最大包，不可达打印空
   local host=$1 fam=$2 lo=1000 hi=9000 mid best=0
-  ping -"$fam" -c 1 -W 2 -n "$host" >/dev/null 2>&1 || { echo ""; return; }
+  "$PING" -"$fam" -c 1 -W 2 -n "$host" >/dev/null 2>&1 || { echo ""; return; }
   probe "$host" "$fam" "$lo" || { echo "<$lo"; return; }
   best=$lo
   while [ "$lo" -le "$hi" ]; do
@@ -105,16 +125,32 @@ pmtu() {   # pmtu <目标> <4|6> -> 打印能过的最大包，不可达打印�
   echo "$best"
 }
 
+MIN4=""
 sec "③ 出网方向的路径 MTU（DF 位二分，每个目标十来个包）"
 if [ "$PMTU_OK" = 0 ]; then
-  echo -e "  ${Y}这个 ping 不支持 -M do（busybox 版），量不了路径 MTU。${X}"
-  echo -e "  ${D}装一下：apt install -y iputils-ping${X}"
+  echo -e "  ${Y}这台机的 ping 用不了 -M do，二分量不了。${X}"
+  [ -n "${PING_ERR:-}" ] && echo -e "  ${D}它的原话：$(echo "$PING_ERR" | tr '\n' ' ' | mask)${X}"
+  echo -e "  ${D}多半是装的 inetutils-ping / busybox 版（只有 iputils 版有 -M）。${X}"
+  echo
+  # 【先别让人去装东西】tracepath 直接就会打出 pmtu，很多机器上本来就有。
+  # 能用现成的就别开口要 apt install —— 装东西这件事在别人生产机上是有成本的。
+  if have tracepath; then
+    echo -e "  ${D}改用 tracepath（它自己会打出 pmtu）：${X}"
+    for t in 1.1.1.1 8.8.8.8; do
+      r=$(tracepath -n "$t" 2>/dev/null | grep -o 'pmtu [0-9]*' | tail -1 | awk '{print $2}')
+      printf "  %-22s %s\n" "$(echo "$t" | mask)" "${r:-没打出 pmtu}"
+      case "${r:-}" in ''|*[!0-9]*) ;; *) { [ -z "${MIN4:-}" ] || [ "$r" -lt "$MIN4" ]; } && MIN4=$r ;; esac
+    done
+  else
+    echo -e "  ${D}想量的话二选一：${X}"
+    echo "    apt install -y iputils-ping        # 装完重跑这个脚本"
+    echo "    apt install -y iputils-tracepath   # 或者用 tracepath，本脚本会自动认"
+  fi
 else
   echo -e "  ${D}下面的数是【整个 IP 包】的字节数，可以直接跟网卡 MTU 比。${X}"
   echo
   V4="1.1.1.1 8.8.8.8 9.9.9.9"
   [ -n "$EXTRA" ] && V4="$V4 $EXTRA"
-  MIN4=""
   for t in $V4; do
     printf "  %-22s " "$(echo "$t" | mask)"
     r=$(pmtu "$t" 4)
@@ -164,7 +200,7 @@ fi
 
 if [ -z "$MIN4" ]; then
   echo -e "  ${D}路径 MTU 一个都没量到（公网 ICMP 常被整段挡掉）。这【不代表】有问题。"
-  echo -e "  换个目标再试：bash ${0##*/} <一个你确定会回 ICMP 的 IP>${X}"
+  echo -e "  换个目标再试：bash $SELF <一个你确定会回 ICMP 的 IP>${X}"
 elif [ "$MIN4" -ge "$BASE" ]; then
   echo -e "  ${G}路径 MTU 和网卡一致（都是 $BASE），这条路没有额外缩水，也没有黑洞。${X}"
   echo
