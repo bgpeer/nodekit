@@ -23,7 +23,7 @@
 # 【输出里的公网 IP 会打码】方便你直接截图贴出来问人。
 set -u
 
-TOOL_VER="2026-09-17b"
+TOOL_VER="2026-09-17c"
 # 【别用 $0】这个脚本的正常用法就是 curl ... | bash，那时候 $0 是 "bash"，
 # 标题会变成「bash 版本 ...」、下面的用法提示会变成「bash bash <IP>」。
 SELF="mtu-check.sh"
@@ -181,7 +181,55 @@ if have nft; then
 fi
 [ "$FOUND" = 0 ] && echo -e "  ${D}没有。路径就是 1500 的话不需要；有黑洞才需要。${X}"
 
-sec "⑤ 怎么读这份报告"
+sec "⑤ 反方向：客户端 → 这台机 那一段有多宽"
+# 【这一段才是真正决定客户端 TUN 的】③ 量的是出网方向，而客户端 TUN 受制的是
+# 手机到这台机的那条路 —— 方向相反，而且家宽出口基本都不回 ICMP，从这头 ping
+# 不过去。
+#
+# 但不用 ping 也能知道：TCP 握手时双方各报一个 MSS，报的就是「我这条路的 MTU
+# 减 40」。内核把对端报的数记在 socket 上，ss -i 的 mss: 就是按它算的发送 MSS。
+# 也就是说【现在连着的那些客户端】早就把答案告诉这台机了，翻出来看就行。
+#
+#   mss 1460 -> 对端那条路约 1500（最常见）
+#   mss 1452 -> 1492，PPPoE 拨号
+#   mss 1360 -> 1400 上下，一些移动网络
+#
+# 【本地端口一个都不打】端口是节点参数。这份报告是拿去截图问人的，对端 IP 和
+# 本机端口都不该出现在屏上 —— 少一个字段不影响判断，漏一个收不回来。
+MSS_MIN=""
+if ! have ss; then
+  echo -e "  ${D}没有 ss 命令（apt install -y iproute2），这一段跳过。${X}"
+else
+  # ss -tin 是两行一条：第一行地址，第二行一堆 xxx:N 指标。
+  # 只留外部来的：去掉 127./::1 和 RFC1918 容器网段，剩下的才是真·客户端。
+  SS_TAB=$(ss -tin state established 2>/dev/null | awk '
+      /^[^ \t]/ { peer = $NF; next }
+      {
+        mss = ""
+        for (i = 1; i <= NF; i++) if ($i ~ /^mss:/) mss = substr($i, 5)
+        if (mss == "" || peer == "") next
+        if (peer ~ /^\[?(127\.|::1)/) next
+        if (peer ~ /^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168\.)/) next
+        n[mss]++
+      }
+      END { for (m in n) printf "%s %s\n", m, n[m] }' | sort -k2 -rn)
+  if [ -z "$SS_TAB" ]; then
+    echo -e "  ${D}现在没有外部客户端连着（只有本机 / 容器之间的连接）。${X}"
+    echo -e "  ${D}拿手机连上节点、随便开个网页，再跑一次这个脚本。${X}"
+  else
+    while read -r m c; do
+      [ -n "$m" ] || continue
+      printf "  mss %-6s %-4s 条连接   -> 对端那条路的 MTU 约 %s\n" "$m" "$c" "$((m + 40))"
+      # 【写成 if，别写 A || B && C】那个组合在 shell 里是 (A||B)&&C，
+      # 这里恰好也对，但下次谁改一下顺序就会静悄悄地错。
+      if [ -z "$MSS_MIN" ] || [ "$m" -lt "$MSS_MIN" ]; then MSS_MIN=$m; fi
+    done <<EOF_SS
+$SS_TAB
+EOF_SS
+  fi
+fi
+
+sec "⑥ 怎么读这份报告"
 PHY=$(ip -o link show "${DEV4:-}" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}')
 echo "  物理口 MTU：${PHY:-没读到}    出网实测最小路径 MTU：${MIN4:-没量到}"
 echo
@@ -226,7 +274,17 @@ else
   echo "      -j TCPMSS --clamp-mss-to-pmtu"
 fi
 echo
-echo -e "  ${D}最后再说一遍：这份报告判的是【VPS 这头要不要 MSS clamp】。"
-echo -e "  客户端 TUN 的 MTU 是另一码事 —— sing-box 把 TCP 在客户端本地就终结了，"
-echo -e "  再另开一条连接出去，那条的 MSS 由手机物理网卡和 PMTUD 决定。${X}"
+if [ -n "${MSS_MIN:-}" ]; then
+  IN_MTU=$((MSS_MIN + 40))
+  if [ "$IN_MTU" -ge 1500 ]; then
+    echo -e "  ${G}反方向（客户端 → 这台机）最窄的一条也有 $IN_MTU —— 两个方向都是满的。${X}"
+  else
+    echo -e "  ${Y}反方向最窄的一条只有 $IN_MTU（mss $MSS_MIN）—— 有客户端的路更窄。${X}"
+    echo -e "  ${D}这是【那个客户端所在网络】的事，换个网络就变了，不是这台机的毛病。${X}"
+  fi
+  echo
+fi
+echo -e "  ${D}客户端 TUN 的 MTU 和这里量的还是两码事 —— sing-box 把 TCP 在客户端"
+echo -e "  本地就终结了，再另开一条连接出去，那条的 MSS 由手机自己的网卡和 PMTUD"
+echo -e "  决定。⑤ 只是让你知道那条路实际有多宽，好判断当初那个数是不是为它定的。${X}"
 echo
