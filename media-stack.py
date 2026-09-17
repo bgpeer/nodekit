@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.106"
+SCRIPT_VERSION = "1.5.108"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2642,7 +2642,7 @@ def traffic_report(day=None):
             print(f"  {BOLD}补时长 heal 今天自测用掉 {_used:.0f} MB / 上限 "
                   f"{HEAL_DAY_MB} MB{RST}（{_tag}，探了 {int(_hd.get('probes') or 0)} 次）")
             print(f"  {DIM}这个数是 heal 自己拿网卡接收差量的，比下面「窗口内网卡」准。"
-                  f"想调上限改 HEAL_DAY_MB。{RST}")
+                  f"账本在菜单「8 流量账本」。{RST}")
 
     tasks = _traffic_tasks(day)
     if tasks:
@@ -5404,11 +5404,11 @@ def do_sync():
         if not key:
             rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
         else:
-            rec["nodur_before"] = len(items_without_duration(key))
+            rec["nodur_before"] = len(items_without_duration(key, "all"))
             tune_strm_libraries(key)   # 扫描前先调好，新条目一进来就是对的
             emby_scan_wait(key, timeout=900, label="每日对齐的扫描")
             align_library(d, key)      # 和小时级那轮同一份，不会飘
-            rec["nodur_after"] = len(items_without_duration(key))
+            rec["nodur_after"] = len(items_without_duration(key, "all"))
             rec["missing"] = len(strm_not_in_emby(d, key))
             rec["ok"] = True
     except Exception as e:
@@ -7307,6 +7307,46 @@ def split_shared_identities(d, key):
 
 
 HEAL_FRESH_H = 24        # 进库这么多小时内的算「新片」，补探测让它们插队
+# 【只补你点开过的】补时长的唯一用途是进度条和续播记忆 —— 而没点开过的条目，
+# 补出来的进度条给谁用？库里两千多部，点开过的几十部：这一条把每天的流量从 GB 压到 MB。
+#
+# 【它不会让人少看一部片】没探到的条目照样能播：Emby 在你点播放那一刻会现场探一次
+# （见 items_without_duration 的说明）。代价只是开播前多等几秒。而那一次点开【本身】
+# 就把它放进了播放记录，下一轮就补上 —— 需要进度条的那一刻，进度条就在。
+#
+# 【曾经写成"继续观看 + 收藏 + 最近 7 天加进来的"】那是个漏洞：刚建完库的那一刻全库
+# 都是"最近加进来的"，于是那一档等于全库都补，省流量的承诺当场落空。而"收藏"也不是
+# "看过"。判据只有一个：你点开过它没有。
+
+
+def _played_ids(key):
+    """所有账号里【点开过】的条目 id：继续观看 + 已看完。
+
+    【必须遍历每个账号】一台机器上电视一个号、手机一个号是常态，只认第一个号会漏掉
+    一半 —— 那半边的片子永远等不到进度条。
+
+    【只问 Emby，不碰网盘】读的是 Emby 自己的库，一个字节都不出境，所以每轮无脑跑一次。
+    """
+    out = set()
+    try:
+        users = _emby("/Users", key) or []
+    except Exception:
+        return out
+    for u in users:
+        uid = (u or {}).get("Id") or ""
+        if not uid:
+            continue
+        for path in (f"/Users/{uid}/Items/Resume?Limit=500"
+                     f"&IncludeItemTypes=Movie,Episode,Video",
+                     f"/Users/{uid}/Items?Recursive=true&Filters=IsPlayed&Limit=2000"
+                     f"&IncludeItemTypes=Movie,Episode,Video"):
+            try:
+                for i in (_emby(path, key) or {}).get("Items") or []:
+                    if i.get("Id"):
+                        out.add(str(i["Id"]))
+            except Exception:
+                continue
+    return out
 
 
 def _is_fresh_item(i):
@@ -7315,20 +7355,32 @@ def _is_fresh_item(i):
     读不出来【必须当成老的】：当成新的话，一旦某个 Emby 版本不给这个字段，
     所有条目都变成"新片"，插队就退化成"没有插队"，而且是静默的。
     """
-    v = str(i.get("DateCreated") or "")[:19]
-    if not v:
-        return False
-    try:
-        t = time.mktime(time.strptime(v, "%Y-%m-%dT%H:%M:%S"))
-    except ValueError:
-        return False
+    t = _item_created_ts(i)
     # DateCreated 是 UTC，而 mktime 按本地时区解释 —— 差的那几个小时对
     # 「24 小时内」这个粒度无所谓，不值得为它引一套时区换算
-    return (time.time() - t) < HEAL_FRESH_H * 3600 + time.timezone
+    return bool(t) and (time.time() - t) < HEAL_FRESH_H * 3600 + time.timezone
 
 
-def items_without_duration(key):
+def _item_created_ts(i):
+    """条目的 DateCreated 换成 unix 秒；读不出来返回 0。
+
+    抽出来是因为「是不是新片」和「是不是最近 N 天进来的」要用同一份解析 ——
+    两处各写一遍，哪天 Emby 换了格式就只改一处。
+    """
+    v = str(i.get("DateCreated") or "")[:19]
+    if not v:
+        return 0
+    try:
+        return time.mktime(time.strptime(v, "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return 0
+
+
+def items_without_duration(key, scope=None):
     """Emby 里还没探测出时长的影视条目 [(id, 名字), ...]。
+
+    scope 只有两个取值，而且【都不是用户设的】：默认只给出【你点开过的】那批
+    （见 _played_ids）；"all" 是整个库，只给体检和账本报总数用。
 
     枚举方式照抄 Emby 网页端自己发的请求：ParentId 填【媒体库条目 id】、带 Recursive 和
     IncludeItemTypes。少了 IncludeItemTypes 的话 Emby 会把媒体库节点本身当结果返回，看起来
@@ -7371,6 +7423,8 @@ def items_without_duration(key):
         pass
     if not uid:
         return out
+    # 【筛选只问 Emby，不碰网盘】播放记录读的是 Emby 自己的库，一个字节都不出境。
+    want = None if scope == "all" else _played_ids(key)
     for lb in libs:
         pid = lb.get("ItemId")
         # 和其它几处保持一致：只看指向本脚本 strm 目录的媒体库。用户自己建的本地库
@@ -7394,12 +7448,15 @@ def items_without_duration(key):
             # MediaStreams 常常是空的，所以条目顶层那份也认 —— 两处都空才算没有。
             no_streams = not ((i.get("MediaStreams") or [])
                               or any(s.get("MediaStreams") for s in srcs))
-            if no_dur or no_streams:
-                # 第四位 =【是不是刚进库的】。补探测靠它让新片插队 ——
-                # 刚加进来的片子正是此刻最想看的那一部，不该跟三个月前就在
-                # 队里的老片按同一个顺序排。见 heal_media_info。
-                out.append((uid, i.get("Id"), i.get("Name") or "?",
-                            _is_fresh_item(i)))
+            if not (no_dur or no_streams):
+                continue
+            if want is not None and str(i.get("Id")) not in want:
+                continue          # 没点开过，补出来的进度条给谁用
+            # 第四位 =【是不是刚进库的】。补探测靠它让新片插队 ——
+            # 刚加进来的片子正是此刻最想看的那一部，不该跟三个月前就在
+            # 队里的老片按同一个顺序排。见 heal_media_info。
+            out.append((uid, i.get("Id"), i.get("Name") or "?",
+                        _is_fresh_item(i)))
     return out
 
 
@@ -8724,7 +8781,10 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 所以再加一道按字节算的闸：当天用满就停，明天自动清零接着来。
 # 记账用的是本机物理网卡的接收字节差（播放走 302 直链、根本不经过 VPS，所以这段时间
 # 的接收量基本就是 heal 自己拉的），读不到 /proc/net/dev 才退回按次数估。
-HEAL_DAY_MB  = 2048      # heal 每天的流量上限（MB）。用满就停，明天接着
+# 【兜底闸门，不是菜单项】日常已经由"只补点开过的"压到几十 MB，这个数是给意外情况
+# 留的保险（比如一口气看了一百部、或者哪天判据又出漏洞）。不做成可调的：多一个旋钮
+# 就多一份"设错了怎么办"。
+HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）。用满就停，明天接着
 # 一个条目要拉多少 MB。【注意这是上游口径】——nginx 日志里看到的约 6.7 MB 是
 # 「交付给 ffprobe」的量，而 openlist 为了给出这 6.7 MB 要从网盘拉约 2.8 倍。
 # 预算 HEAL_DAY_MB 是拿物理网卡的接收差实测的，也是上游口径，两边必须对齐。
@@ -9035,7 +9095,7 @@ def heal_media_info(d, key, budget=None):
         print()
         info(f"今天补时长已经用掉约 {_used:.0f} MB（上限 {HEAL_DAY_MB} MB），这轮不探了")
         print(f"  {DIM}明天零点自动清零接着探。还有 {len(allpend)} 个排队。"
-              f"想调上限改 HEAL_DAY_MB。{RST}")
+              f"只补你点开过的，所以队列不会一直涨。{RST}")
         return
     # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
     # 条目怎么探都探不出来（网盘上是残缺文件、格式 Emby 不认），每轮都从头取
@@ -15008,7 +15068,9 @@ def do_healthcheck():
                 elif _tot:
                     _hc("剧集缩略图", "ok", f"{_tot} 个都有自己的图")
 
-            nodur = items_without_duration(key)
+            # 【体检报全库，不报"这一轮会探的那批"】用户来体检是想知道"还差多少"，
+            # 而不是"下一批探几个"。范围设成只补一部分时，下面会把这件事说明白。
+            nodur = items_without_duration(key, "all")
             # 【留给「每日对齐」那一行用】那一行印的是上次跑完时记下的数字，
             # 印之前得先跟现在的实际情况对一下 —— 不然会出现「条目时长 ✔ 都有」
             # 和「还有 8 个没时长」同屏打架，用户没法判断该信哪个。
@@ -15030,8 +15092,17 @@ def do_healthcheck():
                 _hc("条目时长", "bad",
                     f"{names}  {YELLOW}没探到媒体信息（时长或音视频轨）—— "
                     f"缺时长的进度条记不住；缺轨道的每次点开都要现场探一次{RST}")
-                print(f"    {' ':<20}{DIM}后台每小时补一批（这次一批 {_per} 个），"
-                      f"照这个速度还要约 {_hrs} 小时补完{RST}")
+                # 【范围不是"全库"时必须说出来】不然屏上写着 2583 个没时长，而后台
+                # 每轮只挑几十个在补，用户会以为它卡住了 —— 其实是它按设置只补
+                # 「你可能会点开的那批」，剩下的是【故意不补】的。
+                # 【这个数是全库的，而补的只是你点开过的那批】不说清楚的话，屏上
+                # 写着还差两千多个、而后台每轮只动几个，看着就像卡住了 —— 其实剩下
+                # 那些是【故意不补】的：没点开过的条目，补出来的进度条给谁用。
+                _inb = len(items_without_duration(key))
+                print(f"    {' ':<20}{DIM}其中你点开过的有 {_inb} 个，补的就是这批"
+                      f"（一批 {_per} 个）{RST}")
+                print(f"    {' ':<20}{DIM}剩下的不补：点开照样能播（现场探一次，"
+                      f"慢几秒），而那一次点开就会把它排进来{RST}")
                 todo.append((f"{len(nodur)} 个条目没探到媒体信息。只缺时长的，"
                              f"看一半退出会被当成看完；【连音视频轨都没有】的更麻烦 —— "
                              f"Emby 只能在你点播放那一刻现场探一次，源那会儿给得出数据"
