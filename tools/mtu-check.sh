@@ -23,7 +23,7 @@
 # 【输出里的公网 IP 会打码】方便你直接截图贴出来问人。
 set -u
 
-TOOL_VER="2026-09-17c"
+TOOL_VER="2026-09-17d"
 # 【别用 $0】这个脚本的正常用法就是 curl ... | bash，那时候 $0 是 "bash"，
 # 标题会变成「bash 版本 ...」、下面的用法提示会变成「bash bash <IP>」。
 SELF="mtu-check.sh"
@@ -183,49 +183,59 @@ fi
 
 sec "⑤ 反方向：客户端 → 这台机 那一段有多宽"
 # 【这一段才是真正决定客户端 TUN 的】③ 量的是出网方向，而客户端 TUN 受制的是
-# 手机到这台机的那条路 —— 方向相反，而且家宽出口基本都不回 ICMP，从这头 ping
-# 不过去。
+# 手机到这台机那条路 —— 方向相反，家宽出口基本都不回 ICMP，从这头 ping 不过去。
+# 但内核为每条 TCP 连接都记着一个 pmtu，现在连着的客户端早就把答案送到了。
 #
-# 但不用 ping 也能知道：TCP 握手时双方各报一个 MSS，报的就是「我这条路的 MTU
-# 减 40」。内核把对端报的数记在 socket 上，ss -i 的 mss: 就是按它算的发送 MSS。
-# 也就是说【现在连着的那些客户端】早就把答案告诉这台机了，翻出来看就行。
+# 【看 pmtu，别拿 mss 去减 40】上一版按 mss+40 折算，结果全错：
 #
-#   mss 1460 -> 对端那条路约 1500（最常见）
-#   mss 1452 -> 1492，PPPoE 拨号
-#   mss 1360 -> 1400 上下，一些移动网络
+#   ss 的 mss 是【扣掉 TCP 选项之后】能装多少数据，不是 MTU-40。
+#     mss 1448 + 12（时间戳选项）+ 40（IPv4+TCP 头）= 1500   ← 完全正常
+#     mss 1428 + 12             + 60（IPv6+TCP 头）= 1500   ← 也正常
+#   按 +40 折算，这两个会被报成 1488 / 1468，凭空少掉十几个字节；一台正常机器
+#   看上去处处缩水。而 pmtu 是内核自己记的路径 MTU，一个字节都不用换算。
 #
-# 【本地端口一个都不打】端口是节点参数。这份报告是拿去截图问人的，对端 IP 和
-# 本机端口都不该出现在屏上 —— 少一个字段不影响判断，漏一个收不回来。
-MSS_MIN=""
+# 【还要挡掉不是客户端的那些】上一版把回环（mss 65483）和几个奇怪的 socket
+# （mss 48/128/256）一起算进去，于是"最窄的一条"报出个 88 —— 荒谬到一眼假，
+# 但如果碰巧落在 1300 附近就会被当真。所以：地址按【第 5 列】取（$NF 会取到
+# timer:(...) 那一段，对端就丢了），再滤掉回环 / 内网 / 明显不可能的小值。
+#
+# 【本地端口一个都不打】端口是节点参数，这份报告是拿去截图问人的。
+MTU_IN=""
 if ! have ss; then
   echo -e "  ${D}没有 ss 命令（apt install -y iproute2），这一段跳过。${X}"
 else
-  # ss -tin 是两行一条：第一行地址，第二行一堆 xxx:N 指标。
-  # 只留外部来的：去掉 127./::1 和 RFC1918 容器网段，剩下的才是真·客户端。
   SS_TAB=$(ss -tin state established 2>/dev/null | awk '
-      /^[^ \t]/ { peer = $NF; next }
+      # 表头（State Recv-Q ...）不是数据
+      /^State/ { next }
+      # 地址行：peer 固定在第 5 列。不能用 $NF —— 带 timer:(keepalive,...)
+      # 的连接会把它挤掉，peer 就变成了 timer 那一串。
+      /^[^ \t]/ { peer = (NF >= 5 ? $5 : ""); next }
       {
-        mss = ""
-        for (i = 1; i <= NF; i++) if ($i ~ /^mss:/) mss = substr($i, 5)
-        if (mss == "" || peer == "") next
-        if (peer ~ /^\[?(127\.|::1)/) next
+        if (peer == "") next
+        # 回环、内网、链路本地：都不是客户端
+        if (peer ~ /^\[?(127\.|::1|fe80:)/) next
         if (peer ~ /^(10\.|172\.1[6-9]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168\.)/) next
-        n[mss]++
+        pm = ""
+        for (i = 1; i <= NF; i++) if ($i ~ /^pmtu:/) pm = substr($i, 6)
+        if (pm == "" || pm + 0 < 576) next    # 读不到、或小到不可能是真路径
+        n[pm]++
       }
       END { for (m in n) printf "%s %s\n", m, n[m] }' | sort -k2 -rn)
   if [ -z "$SS_TAB" ]; then
-    echo -e "  ${D}现在没有外部客户端连着（只有本机 / 容器之间的连接）。${X}"
+    echo -e "  ${D}现在没有外部客户端连着（或这个内核不报 per-socket pmtu）。${X}"
     echo -e "  ${D}拿手机连上节点、随便开个网页，再跑一次这个脚本。${X}"
   else
     while read -r m c; do
       [ -n "$m" ] || continue
-      printf "  mss %-6s %-4s 条连接   -> 对端那条路的 MTU 约 %s\n" "$m" "$c" "$((m + 40))"
-      # 【写成 if，别写 A || B && C】那个组合在 shell 里是 (A||B)&&C，
-      # 这里恰好也对，但下次谁改一下顺序就会静悄悄地错。
-      if [ -z "$MSS_MIN" ] || [ "$m" -lt "$MSS_MIN" ]; then MSS_MIN=$m; fi
+      if [ "$m" -ge 1500 ]; then tag="满的"; else tag="窄一点"; fi
+      printf "  pmtu %-6s %-4s 条连接   （%s）\n" "$m" "$c" "$tag"
+      if [ -z "$MTU_IN" ] || [ "$m" -lt "$MTU_IN" ]; then MTU_IN=$m; fi
     done <<EOF_SS
 $SS_TAB
 EOF_SS
+    echo
+    echo -e "  ${D}pmtu 是内核为这条连接记的路径 MTU，不用换算。1280 是 IPv6 的下限，"
+    echo -e "  出现几条很正常；绝大多数是 1500 就说明客户端那边的路是满的。${X}"
   fi
 fi
 
@@ -274,13 +284,13 @@ else
   echo "      -j TCPMSS --clamp-mss-to-pmtu"
 fi
 echo
-if [ -n "${MSS_MIN:-}" ]; then
-  IN_MTU=$((MSS_MIN + 40))
-  if [ "$IN_MTU" -ge 1500 ]; then
-    echo -e "  ${G}反方向（客户端 → 这台机）最窄的一条也有 $IN_MTU —— 两个方向都是满的。${X}"
+if [ -n "${MTU_IN:-}" ]; then
+  if [ "$MTU_IN" -ge 1500 ]; then
+    echo -e "  ${G}反方向（客户端 → 这台机）最窄的一条也有 $MTU_IN —— 两个方向都是满的。${X}"
   else
-    echo -e "  ${Y}反方向最窄的一条只有 $IN_MTU（mss $MSS_MIN）—— 有客户端的路更窄。${X}"
-    echo -e "  ${D}这是【那个客户端所在网络】的事，换个网络就变了，不是这台机的毛病。${X}"
+    echo -e "  ${Y}反方向最窄的一条是 $MTU_IN。${X}"
+    echo -e "  ${D}这是【那个客户端所在网络】的事，换个网络就变了，不是这台机的毛病。"
+    echo -e "  1280 尤其不用管，那是 IPv6 规定的下限，本来就会有。${X}"
   fi
   echo
 fi
