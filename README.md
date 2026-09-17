@@ -1196,6 +1196,18 @@ xray 承载的 ws、reality/vision/QUIC 等一概不动。
 | sing-box | [`subbox-template.json`](https://github.com/bgpeer/nodekit/blob/main/subbox-template.json) |
 | Shadowrocket（小火箭）| [`shadowrocket-template.conf`](https://github.com/bgpeer/nodekit/blob/main/shadowrocket-template.conf) |
 
+> **sing-box 模板要 1.15+，1.14 装不上**（这是**有意的**，不是待修的 bug）。
+> 卡住的只有 `experimental.cache_file` 的 `buffer_size` / `flush_interval` 两个字段——
+> sing-box 的配置解码开了 `DisallowUnknownFields`，**未知字段不是忽略而是直接启动失败**，
+> 1.14.1 上报 `json: unknown field "buffer_size"`，整份配置加载不了。实测去掉这两个
+> 1.14.1 就能过，也就是说整份模板只卡在这两处。
+>
+> 换句话说：**看到 1.14 报这个错，别去删那两个字段**——要么升到 1.15，要么自己 fork 一份模板。
+>
+> 另外 TUN 段**故意不写 `mtu`**。sing-box 的默认值是分平台的（Network Extension 4064、
+> Android 9000、桌面 65535），一份订阅喂三个平台，写死任何一个数都会坑到另外两个；
+> 尤其别写 9000——源码注释明说 iOS 上超过 4064 性能会显著下降。
+
 ### 三个锚点（三格式同名，各按自己语法渲染）
 
 | 锚点 | 作用 | 展开成 | 放哪 |
