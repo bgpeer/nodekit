@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.4.3"
+VERSION = "4.5.0"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1961,6 +1961,24 @@ NGINX_OFFICIAL_LIST = "/etc/apt/sources.list.d/nginx-official.list"
 NGINX_PIN = "/etc/apt/preferences.d/99-nginx-official"
 NGINX_CRON = "/etc/cron.d/net-optimize-nginx-update"
 
+# 【谁在用这份 nginx】nginx 在这套东西里是共用件，但"共用"这件事以前只写在文档里，
+# 机器上看不出来。这里按各家【实际会落盘的固定文件名】判断 —— 名字都是写死的，
+# 不含域名，所以这份报告可以直接截图发人。
+#
+# 一个程序可能落好几个文件（节点就有伪装站和 SNI 分流两份），所以按程序分组、
+# 按程序计数 —— 用户问的是"几个程序在用"，不是"几个文件"。
+NGINX_CONSUMERS = (
+    ("节点（伪装站 / ws 反代）", "/etc/nginx/conf.d/bgpeer.conf"),
+    ("节点（SNI 分流 stream）", "/etc/nginx/bgpeer-stream.conf"),
+    ("Emby 那套（443 反代）", "/etc/nginx/conf.d/media-stack.conf"),
+)
+# 上面每一项归属哪个程序（前缀相同的算同一个）
+NGINX_CONSUMER_GROUP = {
+    "/etc/nginx/conf.d/bgpeer.conf": "节点",
+    "/etc/nginx/bgpeer-stream.conf": "节点",
+    "/etc/nginx/conf.d/media-stack.conf": "Emby",
+}
+
 
 def cmd_nginx_upgrade():
     """nginx 安装/升级（原 net-optimize-nginx-upgrade 脚本，输出进日志）。"""
@@ -3340,8 +3358,40 @@ def cmd_check():
                 yellow("⚠️ 未运行")
         else:
             echo("  ℹ️ 未安装")
+        if os.path.isfile(NGINX_OFFICIAL_LIST):
+            green("✅ nginx.org 官方源已配置")
+        if os.path.isfile(NGINX_PIN):
+            green("✅ Pin=1001（官方源优先于系统源）")
         if os.path.isfile(NGINX_CRON):
-            green("✅ 自动更新 cron 已配置")
+            green("✅ 月度自动升级 cron 已配置（每月 1 号 03:10 北京时间）")
+        elif have_cmd("nginx"):
+            yellow("⚠️ 装了 nginx 但没挂月度升级 —— 跑一次本模块会补上")
+
+        # --- 谁在用这份 nginx ---
+        echo("  —— 在用这份 nginx 的 ——")
+        progs = set()
+        for label, path in NGINX_CONSUMERS:
+            if os.path.isfile(path):
+                green(f"  ✅ {label}")
+                echo(f"       {path}")
+                progs.add(NGINX_CONSUMER_GROUP.get(path, label))
+            else:
+                echo(f"  ➖ {label}（未配置）")
+        # AdGuard 不写 nginx 配置，只共用证书 + reload —— 单独说，别混进计数
+        if os.path.isfile("/opt/AdGuardHome/AdGuardHome.yaml"):
+            echo("  ℹ️ AdGuardHome：只共用证书并 reload nginx，不写 nginx 配置（不计入）")
+        # 【别名】其它 conf.d 文件只报个数，不报文件名 —— 那些名字常常就是域名，
+        # 而这份报告是拿去截图问人的。想看是哪些，自己 ls 一眼就行。
+        known = {path for _, path in NGINX_CONSUMERS}
+        others = [f for f in glob.glob("/etc/nginx/conf.d/*.conf")
+                  if f not in known and os.path.basename(f) != "default.conf"]
+        if others:
+            echo(f"  ℹ️ 另有 {len(others)} 个非本仓库的 conf.d 配置也在用"
+                 "（文件名可能含域名，这里不打印；ls /etc/nginx/conf.d/ 自己看）")
+        if progs:
+            green(f"  合计：{len(progs)} 个本仓库程序在共用（{' + '.join(sorted(progs))}）")
+        elif have_cmd("nginx"):
+            yellow("  ⚠️ 装了 nginx，但本仓库没有任何程序在用它")
 
     # === [12] 系统信息 ===
     c_sep()
