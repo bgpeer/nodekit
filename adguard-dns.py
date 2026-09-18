@@ -13,7 +13,7 @@
 #   - 卸载(菜单2)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
 #     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 8 里的「删除 DoT」
 #     只撤泛域名证书这一项，AdGuard 本体继续跑。
-import os, re, sys, time, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
+import os, re, sys, time, json, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
@@ -908,6 +908,181 @@ def _yaml_list(txt, key):
             break
     return items
 
+# ============================== 国内外上游分流 ==============================
+# 【为什么要分】AdGuard 跑在境外 VPS 上。手机开了「专用 DNS」之后，连百度、B 站这种
+# 国内域名的解析也会绕到这台机器 —— 而国内站点的 CDN 是按【递归解析器的出口 IP】
+# 挑节点的。用境外上游（Cloudflare/Google）解析，权威 NS 看到的是境外 IP，就会返回
+# 境外或次优的节点；手机在国内直连这个 IP，反而比不开代理还慢。
+#
+# 把国内域名交给国内递归（223.5.5.5 这类），权威 NS 看到的就是国内出口，返回的才是
+# 国内节点。注意：这解决的是"解析器在哪"，不是"你在哪" —— 效果比不上手机直接用
+# 国内 DNS（那个能精确到省），但比全都走境外好得多。
+CN_UPSTREAM = "223.5.5.5"                  # 阿里公共 DNS（国内递归）
+CN_SPLIT_STATE = AGH_DIR + "/.upstream-split.json"   # 记下自己写进去的那几行
+
+# 走国内上游的域名。[/cn/] 覆盖整个 .cn；其余是常见的 .com/.net 国内站，
+# 它们的 CDN 调度对解析器位置最敏感。不求全 —— 覆盖日常高频即可，
+# 剩下的用户可以自己在后台那一栏继续加。
+CN_SPLIT_DOMAINS = (
+    "cn", "baidu.com", "bdstatic.com", "qq.com", "gtimg.com", "tencent.com",
+    "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "alipay.com",
+    "jd.com", "360buyimg.com", "bilibili.com", "hdslb.com", "weibo.com",
+    "163.com", "126.net", "sohu.com", "iqiyi.com", "youku.com",
+    "douyin.com", "douyinstatic.com", "bytedance.com", "byteimg.com",
+    "toutiao.com", "xiaohongshu.com", "zhihu.com", "zhimg.com", "csdn.net",
+    "mi.com", "xiaomi.com", "huawei.com", "hicloud.com", "oppo.com",
+    "meituan.com", "meituan.net", "dianping.com", "ctrip.com", "tripcdn.com",
+    "kuaishou.com", "douban.com", "sogou.com", "so.com", "ximalaya.com",
+    "netease.com", "pinduoduo.com", "yangkeduo.com", "lianjia.com",
+)
+
+
+def _cn_split_lines(upstream):
+    """要写进 upstream_dns 的那几行。一行一个域名，AdGuardHome 的域名限定语法。"""
+    return [f"[/{d}/]{upstream}" for d in CN_SPLIT_DOMAINS]
+
+
+def _yaml_set_list(txt, key, items):
+    """把 YAML 里 key 那个列表整个换掉；找不到 key 返回 None。
+
+       只动这一个块：定位 key 行的缩进，往下吃掉所有更深缩进的 "- " 行，
+       其余原样保留 —— AdGuardHome.yaml 里别的段不能碰。"""
+    m = re.search(rf'(?m)^(\s*){re.escape(key)}:[ \t]*(\[[ \t]*\])?[ \t]*$', txt)
+    if not m:
+        return None
+    indent = len(m.group(1))
+    end, item_indent = m.end(), None
+    for line in txt[m.end():].splitlines(keepends=True):
+        st = line.strip()
+        if not st:
+            end += len(line); continue
+        cur = len(line) - len(line.lstrip())
+        if st.startswith("- ") and cur > indent:
+            end += len(line)
+            if item_indent is None:
+                item_indent = cur          # 【沿用原有条目的缩进】别自己定一个
+        else:
+            break
+    # 原来写死 +4，而 AdGuardHome.yaml 里是 +2 —— YAML 两种都合法，但写出来的文件
+    # 跟自己其余部分对不齐，人看着像被改坏了。没有现成条目可参照时按 +2（AGH 的风格）。
+    pad = " " * (item_indent if item_indent is not None else indent + 2)
+    body = "".join(f"{pad}- {it}\n" for it in items)
+    head = f"{' ' * indent}{key}:\n" if items else f"{' ' * indent}{key}: []\n"
+    return txt[:m.start()] + head + body + txt[end:]
+
+
+def _cn_split_on():
+    """分流是否已由本脚本写入 → (是否开启, 写进去的行数)。"""
+    try:
+        st = json.load(open(CN_SPLIT_STATE))
+        lines = st.get("lines") or []
+    except Exception:
+        return False, 0
+    cur = _yaml_list(open(_agh_yaml()).read(), "upstream_dns") or []
+    live = [x for x in lines if x in cur]
+    return bool(live), len(live)
+
+
+def cn_upstream_menu():
+    """国内外上游分流：国内域名交给国内递归，其余走你原来的上游。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return
+    yaml_path = _agh_yaml()
+    try:
+        txt = open(yaml_path).read()
+    except OSError:
+        print("  读不到 AdGuard 配置文件。"); return
+    cur = _yaml_list(txt, "upstream_dns")
+    if cur is None:
+        print("  配置里没有 upstream_dns 这一项，保险起见不自动改。")
+        print("  请在后台『设置 → DNS设置 → 上游DNS服务器』先填一个上游再回来。")
+        return
+
+    on, n = _cn_split_on()
+    plain = [x for x in cur if not x.startswith("[/")]      # 没带域名限定的 = 默认上游
+    print("\n  === 国内外上游分流 ===")
+    print(f"  当前默认（境外）上游：{('、'.join(plain) if plain else '（空）')}")
+    print(f"  国内分流：{f'已开启（{n} 条域名规则 → {CN_UPSTREAM}）' if on else '未开启'}")
+    print()
+    print("  国内域名（百度/B站/淘宝…）的 CDN 是按【递归解析器的出口 IP】挑节点的。")
+    print("  全走境外上游的话，权威 NS 看到的是境外 IP，返回的是境外或次优节点，")
+    print("  手机在国内直连这个 IP 反而更慢。分流之后国内域名交给国内递归。")
+    print()
+    print("  1 开启分流" if not on else "  1 重写分流规则（按最新域名表）")
+    print("  2 关闭分流（只撤本脚本写进去的那几行，你自己加的不动）")
+    print("  0 返回")
+    c = _ask("  选择: ").strip()
+    if c not in ("1", "2"):
+        return
+
+    if c == "1":
+        if not plain:
+            print("  默认上游是空的 —— 先在后台填一个境外上游（比如")
+            print("  https://dns.cloudflare.com/dns-query），否则国外域名没人解析。")
+            return
+        try:
+            old = json.load(open(CN_SPLIT_STATE)).get("lines") or []
+        except Exception:
+            old = []
+        # 先摘掉上一轮写的，再按最新域名表写一遍 —— 否则域名表增删之后会留下孤儿行
+        keep = [x for x in cur if x not in old]
+        new = keep + _cn_split_lines(CN_UPSTREAM)
+        lines = _cn_split_lines(CN_UPSTREAM)
+        what = f"已开启：{len(lines)} 条国内域名 → {CN_UPSTREAM}"
+    else:
+        try:
+            old = json.load(open(CN_SPLIT_STATE)).get("lines") or []
+        except Exception:
+            old = []
+        if not old:
+            print("  没有本脚本写入的分流规则，无需关闭。"); return
+        new, lines = [x for x in cur if x not in old], []
+        what = "已关闭：本脚本写入的分流规则都撤掉了"
+
+    out = _yaml_set_list(txt, "upstream_dns", new)
+    if out is None:
+        print("  没能定位 upstream_dns 块，未改动。"); return
+    open(yaml_path, "w").write(out)
+    try:
+        json.dump({"upstream": CN_UPSTREAM, "lines": lines},
+                  open(CN_SPLIT_STATE, "w"))
+        os.chmod(CN_SPLIT_STATE, 0o600)
+    except OSError:
+        pass
+    sh("systemctl restart AdGuardHome")
+    # 【改完一定要验一次能不能解析】上游写坏了 AGH 照样能起来，但所有查询都失败，
+    # 而这台机是全家的 DNS —— 起来了不等于好了，得真问一次
+    ok = False
+    for _ in range(12):
+        time.sleep(1)
+        if _running():
+            ok = True; break
+    if ok and _resolve_ok("www.baidu.com"):
+        print(f"\n  ✓ {what}")
+        print("  ▸ 后台『设置 → DNS设置 → 上游DNS服务器』能看到这些行，可以继续自己加。")
+        print("  ▸ 注意：在后台点了「保存」之后 AdGuard 会按网页上的内容重写配置，")
+        print("    本脚本写的行如果被你在网页上删掉了，这边的开关状态也会跟着变。")
+    else:
+        open(yaml_path, "w").write(txt)                     # 回滚
+        sh("systemctl restart AdGuardHome")
+        print("\n  ❌ 改完之后 AdGuard 没起来或解析不通，已回滚到改动前（DNS 仍可用）。")
+
+
+def _resolve_ok(name, timeout=5):
+    """本机 53 能不能把 name 解出来。只判通不通，不看具体 IP。"""
+    try:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.settimeout(timeout)
+        sk.sendto(_dns_packet(name), ("127.0.0.1", 53))
+        data, _ = sk.recvfrom(2048)
+        sk.close()
+        return len(data) > 12 and (data[3] & 0x0F) == 0     # RCODE=0
+    except Exception:
+        return False
+
+
 def _dns_packet(name):
     pkt = struct.pack(">HHHHHH", secrets.randbelow(65536), 0x0100, 1, 0, 0, 0)
     for part in name.split("."):
@@ -1268,6 +1443,24 @@ def selfcheck():
     print(f"    {Y}提醒：本机没拦 ≠ 外面能连。{N}云商（DMIT/甲骨文等）的安全组是另一层，")
     print( "       上面 4/6 全绿但手机连不上，那就一定是安全组没放行。")
 
+    # ---- 上游分流（只读报状态，不判对错：没开也完全能用）----
+    print("\n  【上游】")
+    try:
+        _ups = _yaml_list(open(_agh_yaml()).read(), "upstream_dns") or []
+    except OSError:
+        _ups = []
+    _plain = [x for x in _ups if not x.startswith("[/")]
+    _split_on, _split_n = _cn_split_on()
+    print(f"    {ok if _plain else warn} 默认上游：{'、'.join(_plain) if _plain else '（空——国外域名没人解析）'}")
+    if _split_on:
+        print(f"    {ok} 国内分流：已开启（{_split_n} 条 → {CN_UPSTREAM}）")
+    else:
+        print(f"    {warn} 国内分流：未开启")
+        # 【为什么这值得提一句】手机开了「专用 DNS」之后国内域名的解析也绕到这台
+        # 境外机器，而国内 CDN 是按递归解析器的出口 IP 挑节点的 —— 直连反而更慢。
+        fix.append("国内域名的解析也走了境外上游，直连国内站点可能变慢；"
+                   "菜单 9 可以开国内分流")
+
     # ---- 结论 ----
     print("\n  " + "-" * 56)
     if fix:
@@ -1300,6 +1493,7 @@ def menu():
         print("  6 把自建DNS写入订阅配置（开/关：第一次写入·再点移除，自动刷新）")
         print("  7 自检（服务/端口/证书/解析/访问控制 一次查清，只读不改）")
         print("  8 让 DoT 也能带 ClientID（签泛域名证书；设了白名单后安卓专用DNS仍可用）")
+        print("  9 国内外上游分流（国内域名走国内递归，避免 CDN 解析到境外节点）")
         print("  0 退出")
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -1310,6 +1504,7 @@ def menu():
         elif c == "6": _selfdns_toggle()
         elif c == "7": selfcheck()
         elif c == "8": dot_clientid()
+        elif c == "9": cn_upstream_menu()
         elif c in ("0", ""):
             return
 
