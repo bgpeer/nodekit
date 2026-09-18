@@ -611,9 +611,40 @@ def _nginx_https_server(listen):
             f"{_nginx_ws_locations()}"
             f"  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
 
+def nginx_http2_listen(base):
+    """按 nginx 版本给出 listen 行 —— 1.25.1 起 `listen ... http2` 被弃用。
+
+    【必须按版本二选一，不能一刀切】`http2 on;` 在 1.25.1 之前是未知指令，会让
+    nginx -t 直接失败；而 `listen ... ssl http2` 在新版上虽然还能跑，nginx -t 会
+    每次都吐一条 deprecated 警告，而且官方已经宣布要移除。
+
+    现场撞到的就是后一种：nginx.org 源换上 1.30.5 之后，
+      nginx: [warn] the "listen ... http2" directive is deprecated ... bgpeer.conf:9
+    media-stack 那边早就有这个判断（nginx_supports_http2_directive），
+    只有这里一直写死，两个脚本对着同一个 nginx 各写各的。
+
+    base 形如 "443 ssl" / "[::]:443 ssl" / "127.0.0.1:8443 ssl"，
+    返回完整的一行（含缩进和换行）。
+    """
+    v = subprocess.run("nginx -v", shell=True, text=True, capture_output=True)
+    m = re.search(r"/(\d+)\.(\d+)\.(\d+)", (v.stdout or "") + (v.stderr or ""))
+    new = bool(m) and tuple(int(x) for x in m.groups()) >= (1, 25, 1)
+    return f"  listen {base};\n" if new else f"  listen {base} http2;\n"
+
+
+def nginx_http2_on():
+    """新版才需要单独的 `http2 on;`；旧版返回空串（写了会让 nginx -t 失败）。"""
+    v = subprocess.run("nginx -v", shell=True, text=True, capture_output=True)
+    m = re.search(r"/(\d+)\.(\d+)\.(\d+)", (v.stdout or "") + (v.stderr or ""))
+    new = bool(m) and tuple(int(x) for x in m.groups()) >= (1, 25, 1)
+    return "  http2 on;\n" if new else ""
+
+
 def write_nginx_conf():
     """签好证书、收集完 ws 家族后，写完整 conf：80 跳转 + 443 伪装站 + ws 按 path 反代。"""
-    listen = "  listen 443 ssl http2;\n  listen [::]:443 ssl http2;\n"
+    listen = (nginx_http2_listen("443 ssl")
+              + nginx_http2_listen("[::]:443 ssl")
+              + nginx_http2_on())
     open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
     nginx_reload()
 
@@ -717,7 +748,8 @@ def sni_split_preflight():
 def write_nginx_sni_split():
     """写 sni-split 的 http(本地 https 网站+ws) + stream(443 SNI 分流)配置并生效；
        nginx -t 不过则整体回滚（还原 nginx.conf、删 stream 配置），返回 False。"""
-    listen = f"  listen 127.0.0.1:{SNI_HTTPS_PORT} ssl http2;\n"
+    listen = (nginx_http2_listen(f"127.0.0.1:{SNI_HTTPS_PORT} ssl")
+              + nginx_http2_on())
     open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
     open(NGINX_STREAM_CONF, "w").write(_stream_conf_text())
     _nginxconf_add_stream()
