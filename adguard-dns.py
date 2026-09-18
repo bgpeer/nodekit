@@ -959,7 +959,16 @@ def _yaml_list(txt, key):
 # config.go 的 loadUpstreams）：设了这个键就【完全取代】upstream_dns，按行读、
 # 支持 # 注释。所以把默认上游和国内分流一起写进这个文件，upstream_dns 原样不动 ——
 # 关闭时只要把这个键清空，不用去动用户那一栏。
-CN_UPSTREAM = "223.5.5.5"                       # 国内递归（阿里公共 DNS）
+# 【为什么是一串候选而不是钉死 223.5.5.5】AdGuard 跑在境外 VPS 上，而它到国内
+# 公共 DNS 的 UDP 53 未必通：有的机房对国内方向丢包，有的被对端按境外来源限流。
+# 钉死一个，一旦那条不通，整个国内域名全解析不出来 —— 而且从外面看只是「改完
+# AdGuard 解析不通」，根本不知道是上游的事。所以给一串，用前先逐个探，用能通的。
+CN_UPSTREAMS = (
+    "223.5.5.5",                                # 阿里公共 DNS
+    "119.29.29.29",                             # DNSPod
+    "180.76.76.76",                             # 百度
+)
+CN_UPSTREAM = CN_UPSTREAMS[0]                   # 只作默认显示用，实际用哪个见文件里
 CN_UPSTREAM_FILE = AGH_DIR + "/cn-split-upstream.txt"
 CN_LIST_URLS = (
     "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/"
@@ -986,14 +995,14 @@ def _cn_domains():
     return []
 
 
-def _write_cn_file(plain, domains):
+def _write_cn_file(plain, domains, upstream=CN_UPSTREAM):
     """写 upstream_dns_file：默认上游在前，国内分流在后。"""
     L = ["# 本文件由「自建DNS → 9 国内外上游分流」生成，手改会在下次开关时被覆盖。",
          "# AdGuardHome 设了 upstream_dns_file 就只读这个文件，网页后台那一栏会被忽略。",
          "", "# 默认上游（没有匹配到下面任何域名时用）"]
     L += list(plain)
-    L += ["", f"# 国内域名 → {CN_UPSTREAM}（来自 dnsmasq-china-list，{len(domains)} 条）"]
-    L += [f"[/{d}/]{CN_UPSTREAM}" for d in domains]
+    L += ["", f"# 国内域名 → {upstream}（来自 dnsmasq-china-list，{len(domains)} 条）"]
+    L += [f"[/{d}/]{upstream}" for d in domains]
     os.makedirs(os.path.dirname(CN_UPSTREAM_FILE), exist_ok=True)
     open(CN_UPSTREAM_FILE, "w").write("\n".join(L) + "\n")
 
@@ -1011,6 +1020,17 @@ def _yaml_set_scalar(txt, key, value, near):
         return None
     ind = n.group(1)
     return txt[:n.start()] + f"{ind}{key}: {_yaml_quote(value)}\n" + txt[n.start():]
+
+
+def _cn_file_upstream():
+    """分流文件里实际用的是哪个国内上游（可能不是默认那个）。读不到返回默认值。"""
+    try:
+        for ln in open(CN_UPSTREAM_FILE):
+            if ln.startswith("[/"):
+                return ln.rsplit("]", 1)[1].strip() or CN_UPSTREAM
+    except OSError:
+        pass
+    return CN_UPSTREAM
 
 
 def _cn_split_on():
@@ -1067,17 +1087,48 @@ def _mem_avail_mb():
     return 0
 
 
-def _agh_restart_ok(wait=40):
+# 【探针为什么不能用 www.baidu.com】第三次线上失败就栽在这：AGH 明明起来了、
+# 日志里 53/853 全绑好在跑 listener loop，却被判成「没起来或解析不通」回滚。
+# 原因是探针用的 www.baidu.com 正是这次被改道的域名 —— 它走的是新配的国内上游。
+# 于是「AGH 活没活」和「新上游通不通」两件事被搅成一件：国内上游一慢，健康的
+# AGH 也被当成起不来。探针必须挑【不受这次改动影响】的域名。
+PROBE_CANDIDATES = ("example.com", "iana.org", "rfc-editor.org")
+
+
+def _pick_probe(domains):
+    """挑一个肯定不在国内域名表里的探针域名（连同它的各级后缀一起排除）。"""
+    ds = set(domains or ())
+    for cand in PROBE_CANDIDATES:
+        parts = cand.split(".")
+        if not any(".".join(parts[i:]) in ds for i in range(len(parts))):
+            return cand
+    return PROBE_CANDIDATES[0]
+
+
+def _pick_cn_upstream(probe="www.qq.com", tries=2, timeout=3):
+    """在候选里挑一个这台机【真的能直接问通】的国内递归。都不通返回 None。
+
+       放在改配置【之前】探：不通就当场说清楚，不用先改坏再回滚 —— 回滚要重启
+       两次，DNS 会抖两下，而且日志里全是正常的启动记录，等于什么线索都没有。"""
+    for ip in CN_UPSTREAMS:
+        for _ in range(tries):
+            if _resolve_ok(probe, timeout=timeout, server=ip):
+                return ip
+    return None
+
+
+def _agh_restart_ok(wait=40, probe="example.com"):
     """重启 AGH 并确认【真的能解析】。
 
        【不能只看 systemctl is-active】它在进程刚拉起来那一刻就返回 active，而
        AdGuardHome 还要读配置、绑 53 —— 第一版在 active 之后只试了一次解析就判失败，
        配置明明是好的也会被回滚。所以是在整个窗口里反复试，能解析才算成功。
-       上游条数多的时候启动更慢，窗口给到 40 秒。"""
+       上游条数多的时候启动更慢，窗口给到 40 秒；每次给 3 秒 —— 刚起来第一条查询
+       要现连 DoH 上游，2 秒常常不够。"""
     sh("systemctl restart AdGuardHome")
     for _ in range(wait):
         time.sleep(1)
-        if _running() and _resolve_ok("www.baidu.com", timeout=2):
+        if _running() and _resolve_ok(probe, timeout=3):
             return True
     return False
 
@@ -1103,7 +1154,7 @@ def cn_upstream_menu():
 
     print("\n  === 国内外上游分流 ===")
     print(f"  当前默认（境外）上游：{('、'.join(plain) if plain else '（空）')}")
-    print(f"  国内分流：{f'已开启（{n} 条国内域名 → {CN_UPSTREAM}）' if on else '未开启'}")
+    print(f"  国内分流：{f'已开启（{n} 条国内域名 → {_cn_file_upstream()}）' if on else '未开启'}")
     print()
     print("  国内域名的 CDN 是按【递归解析器的出口 IP】挑节点的。全走境外上游的话，")
     print("  权威 NS 看到境外 IP，返回境外或次优节点，手机在国内直连反而更慢。")
@@ -1141,10 +1192,24 @@ def cn_upstream_menu():
             print("  ⚠ 可用内存偏少，装不上会自动回滚，但服务会抖一下。")
             if _ask("    仍然继续？(y/N): ").strip().lower() not in ("y", "yes"):
                 print("  已取消，未改动。"); return
+        # 【先探上游，再动配置】境外机到国内公共 DNS 的 UDP 53 不一定通。不先探
+        # 就写下去，结果是 AGH 起得来但国内域名全解不出，然后被回滚 —— 白抖两次
+        # 服务，还查不出原因。
+        print("  正在探国内上游通不通...")
+        cn_ip = _pick_cn_upstream()
+        if not cn_ip:
+            print(f"  ❌ 这台机直接问 {'、'.join(CN_UPSTREAMS)} 都没回应，未改动。")
+            print("     国内域名要交给国内递归才有意义，上游不通就没法开。")
+            print("     多半是机房对国内方向的 UDP 53 不通。可以在这台机上自己试一下：")
+            print(f"       dig +short +time=3 www.qq.com @{CN_UPSTREAMS[0]}")
+            print("     有能用的国内 DNS 的话告诉我，加进候选里。")
+            return
+        print(f"  ✓ 国内上游用 {cn_ip}"
+              + ("" if cn_ip == CN_UPSTREAMS[0] else f"（{CN_UPSTREAMS[0]} 不通，自动换的）"))
         _rss0 = _agh_rss_mb()
-        _write_cn_file(plain, doms)
+        _write_cn_file(plain, doms, cn_ip)
         out = _yaml_set_scalar(txt, "upstream_dns_file", CN_UPSTREAM_FILE, "upstream_dns")
-        what = f"已开启：{len(doms)} 条国内域名 → {CN_UPSTREAM}"
+        what = f"已开启：{len(doms)} 条国内域名 → {cn_ip}"
     else:
         if not on:
             print("  分流本来就没开，无需关闭。"); return
@@ -1155,7 +1220,19 @@ def cn_upstream_menu():
     if out is None:
         print("  没能定位 upstream_dns，未改动。"); return
     open(yaml_path, "w").write(out)
-    if _agh_restart_ok():
+    # 探针挑不受这次改动影响的域名：要判的是「AGH 活没活」，不是「新上游快不快」
+    probe = _pick_probe(doms) if c == "1" else "example.com"
+    alive = _agh_restart_ok(probe=probe)
+    # 活过来了再单独验一次国内域名 —— 两件事分开报，失败时才知道该修哪个
+    cn_ok = _resolve_ok("www.qq.com", timeout=5) if (alive and c == "1") else True
+    if alive and not cn_ok:
+        open(yaml_path, "w").write(txt)                 # 回滚
+        print("\n  ❌ AdGuard 起来了，但国内域名解析不出来，已回滚。")
+        print(f"     境外域名（{probe}）能解，说明服务本身没问题，是国内上游 {cn_ip}")
+        print("     在这台机上问不通 —— 探的时候还是通的，可能只是瞬时丢包，可以再试一次。")
+        sh("systemctl restart AdGuardHome")
+        return
+    if alive:
         if c == "2":
             try: os.remove(CN_UPSTREAM_FILE)
             except OSError: pass
@@ -1172,19 +1249,19 @@ def cn_upstream_menu():
             print("    重写一次（这边会把那一栏的内容原样搬进文件）。")
     else:
         open(yaml_path, "w").write(txt)                 # 回滚
-        print("\n  ❌ 改完之后 AdGuard 没起来或解析不通，正在回滚…")
+        print(f"\n  ❌ 改完之后 AdGuard 没起来（{probe} 也解不出来），正在回滚…")
         print("     AdGuardHome 日志最后几行：")
         _agh_why_failed()
         sh("systemctl restart AdGuardHome")
         print("  ✓ 已回滚到改动前（DNS 仍可用）。把上面几行发出来就能定位。")
 
 
-def _resolve_ok(name, timeout=5):
-    """本机 53 能不能把 name 解出来。只判通不通，不看具体 IP。"""
+def _resolve_ok(name, timeout=5, server="127.0.0.1"):
+    """server 的 53 能不能把 name 解出来。只判通不通，不看具体 IP。"""
     try:
         sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sk.settimeout(timeout)
-        sk.sendto(_dns_packet(name), ("127.0.0.1", 53))
+        sk.sendto(_dns_packet(name), (server, 53))
         data, _ = sk.recvfrom(2048)
         sk.close()
         return len(data) > 12 and (data[3] & 0x0F) == 0     # RCODE=0
@@ -1562,7 +1639,7 @@ def selfcheck():
     _split_on, _split_n = _cn_split_on()
     print(f"    {ok if _plain else warn} 默认上游：{'、'.join(_plain) if _plain else '（空——国外域名没人解析）'}")
     if _split_on:
-        print(f"    {ok} 国内分流：已开启（{_split_n} 条国内域名 → {CN_UPSTREAM}）")
+        print(f"    {ok} 国内分流：已开启（{_split_n} 条国内域名 → {_cn_file_upstream()}）")
         print(f"      {Y}上游按 {CN_UPSTREAM_FILE} 走，后台那一栏当前被忽略{N}")
     else:
         print(f"    {warn} 国内分流：未开启")
