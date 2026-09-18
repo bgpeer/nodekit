@@ -1041,6 +1041,32 @@ def _agh_why_failed():
             print("     " + ln.strip()[:150])
 
 
+def _agh_rss_mb():
+    """AdGuardHome 当前占多少内存（MB）。读不到返回 0。"""
+    pid = sh("systemctl show AdGuardHome -p MainPID --value")
+    if not pid.isdigit() or pid == "0":
+        return 0
+    try:
+        for ln in open(f"/proc/{pid}/status"):
+            if ln.startswith("VmRSS:"):
+                return int(ln.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
+def _mem_avail_mb():
+    """本机可用内存（MB）。用 MemAvailable 而不是 MemFree —— 后者不算可回收的缓存，
+       在任何跑着服务的机器上都偏小得离谱，拿它判断会一直误报。"""
+    try:
+        for ln in open("/proc/meminfo"):
+            if ln.startswith("MemAvailable:"):
+                return int(ln.split()[1]) // 1024
+    except OSError:
+        pass
+    return 0
+
+
 def _agh_restart_ok(wait=40):
     """重启 AGH 并确认【真的能解析】。
 
@@ -1102,27 +1128,27 @@ def cn_upstream_menu():
             print("     这台机出网不通 GitHub 的话，可以先跑一次节点的 GitHub 中转设置。")
             return
         print(f"  ✓ 拿到 {len(doms)} 条国内域名")
-        # 【小内存机要先问一句】十一万条上游 AdGuardHome 是全部读进内存的，实测文件
-        # 就有 2.7 MB。装了 Emby 的那种机器本来就紧张，宁可让人自己决定，也别默默
-        # 把它推到 OOM 边上 —— 虽然下面失败了会回滚，但那是在服务已经抖过一次之后。
-        _mem = 0
-        try:
-            for ln in open("/proc/meminfo"):
-                if ln.startswith("MemTotal:"):
-                    _mem = int(ln.split()[1]) // 1024; break
-        except OSError:
-            pass
-        if _mem and _mem < 1536:
-            print(f"  ⚠ 本机内存只有 {_mem} MB，而这 {len(doms)} 条上游 AdGuardHome 会全部")
-            print("    读进内存。装不上会自动回滚，但服务会抖一下。")
+        # 【内存开销有多大：按数据结构算，不是拍脑袋】dnsproxy 解析上游时按地址去重
+        # （proxy/upstreams.go 的 upstreamsIndex）—— 十一万行全指向同一个
+        # 223.5.5.5，只会建【一个】上游对象，剩下的是一张 map[string][]Upstream。
+        # 十一万个 key，每个约一百来字节，量级在 10~20 MB，不是会把机器压垮的东西。
+        # 所以默认不拦，只在【可用内存真的很少】的时候问一句。
+        _avail = _mem_avail_mb()
+        est = max(8, len(doms) * 110 // 1048576 + 8)
+        print(f"  ℹ️ 这 {len(doms)} 条大约会让 AdGuardHome 多占 {est}~{est * 2} MB"
+              f"（当前可用 {_avail} MB）")
+        if _avail and _avail < 200:
+            print("  ⚠ 可用内存偏少，装不上会自动回滚，但服务会抖一下。")
             if _ask("    仍然继续？(y/N): ").strip().lower() not in ("y", "yes"):
                 print("  已取消，未改动。"); return
+        _rss0 = _agh_rss_mb()
         _write_cn_file(plain, doms)
         out = _yaml_set_scalar(txt, "upstream_dns_file", CN_UPSTREAM_FILE, "upstream_dns")
         what = f"已开启：{len(doms)} 条国内域名 → {CN_UPSTREAM}"
     else:
         if not on:
             print("  分流本来就没开，无需关闭。"); return
+        _rss0 = _agh_rss_mb()
         out = _yaml_set_scalar(txt, "upstream_dns_file", "", "upstream_dns")
         what = "已关闭：恢复使用后台『上游DNS服务器』那一栏"
 
@@ -1135,6 +1161,11 @@ def cn_upstream_menu():
             except OSError: pass
         print(f"\n  ✓ {what}")
         if c == "1":
+            # 【实测比估算有说服力】上面那个估算是按数据结构算的，这里给真数
+            _rss1 = _agh_rss_mb()
+            if _rss0 and _rss1:
+                print(f"  ▸ AdGuardHome 内存：{_rss0} MB → {_rss1} MB"
+                      f"（多占 {max(0, _rss1 - _rss0)} MB，可用还剩 {_mem_avail_mb()} MB）")
             print(f"  ▸ 分流表：{CN_UPSTREAM_FILE}")
             print("  ▸ 注意：开着的时候 AdGuardHome【只读这个文件】，网页后台『上游DNS")
             print("    服务器』那一栏会被忽略。想换境外上游：先在后台改那一栏，再回来点 1")
