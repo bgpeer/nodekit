@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.2.2"
+VERSION = "4.3.0"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -617,15 +617,42 @@ def sysctl_file_hits_keys(path):
     return False
 
 
-def backup_and_disable_sysctl_file(path):
+DISABLED_MARK = "# net-optimize disabled: "
+
+
+def neutralize_sysctl_conflicts(path):
+    """只把冲突的那几行注释掉，文件里其余设置原样保留。
+
+    【为什么不再整份禁用】上一版命中任一 SYSCTL_KEYS 就把整个文件改名禁用。可那些
+    文件里往往还有别的东西 —— kernel.*、fs.inotify.*、容器或 K8s 的调优 —— 一起被
+    关掉了，而且屏上只说"已禁用某文件"，没人看得出顺带关了什么。装个网络优化顺手
+    关掉别人半个 sysctl 配置，代价远大于收益。
+
+    【而且整份禁用本来就是多余的】last-wins 已经由 zzz-net-optimize-override.conf
+    保证（zzz- 在 /etc/sysctl.d 里排最后），收敛的第 4 步还会逐个 write_proc 强制
+    落地兜底。禁用整个文件解决不了任何这两步解决不了的问题。
+
+    改动前照旧整份备份到 SYSCTL_BACKUP_DIR，--reset 时按标记逐行还原。
+    """
     if not os.path.isfile(path) or not sysctl_file_hits_keys(path):
+        return
+    content = orig = read_text(path)
+    hit_keys = []
+    for k in SYSCTL_KEYS:
+        new_content, n = re.subn(rf"^(\s*{re.escape(k)}\s*=.*)$",
+                                 DISABLED_MARK + r"\1", content, flags=re.M)
+        if n:
+            content = new_content
+            hit_keys.append(k)
+    if content == orig:
         return
     os.makedirs(SYSCTL_BACKUP_DIR, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    echo(f"🧯 发现冲突 sysctl 文件：{path}")
     shutil.copy2(path, f"{SYSCTL_BACKUP_DIR}/{os.path.basename(path)}.bak-{ts}")
-    os.rename(path, f"{path}.disabled-by-net-optimize-{ts}")
-    echo(f"  ✅ 已备份并禁用：{path}")
+    write_text(path, content)
+    echo(f"🧯 冲突 sysctl 文件：{path}")
+    # 【把注释掉了哪几行说出来】整份禁用那版只说"已禁用"，看不出动了什么
+    echo(f"  ✅ 已注释掉冲突项（文件其余设置保留）：{', '.join(hit_keys)}")
 
 
 def converge_sysctl_authority():
@@ -652,18 +679,18 @@ def converge_sysctl_authority():
     write_text(SYSCTL_OVERRIDE_FILE, "\n".join(lines) + "\n")
     echo(f"✅ 写入 override：{SYSCTL_OVERRIDE_FILE}")
 
-    # 2) 禁用 /etc/sysctl.d 里冲突文件（保留 main + override）
+    # 2) 注释掉 /etc/sysctl.d 里的冲突项（保留 main + override，也保留别人文件的其余设置）
     for f in sorted(glob.glob("/etc/sysctl.d/*.conf")):
         if f in (SYSCTL_AUTH_FILE, SYSCTL_OVERRIDE_FILE):
             continue
-        backup_and_disable_sysctl_file(f)
+        neutralize_sysctl_conflicts(f)
 
     # 3) /etc/sysctl.conf 冲突项注释掉
     if os.path.isfile("/etc/sysctl.conf"):
         content, hit = read_text("/etc/sysctl.conf"), False
         for k in SYSCTL_KEYS:
             new = re.sub(rf"^\s*({re.escape(k)}\s*=.*)$",
-                         r"# net-optimize disabled: \1", content, flags=re.M)
+                         DISABLED_MARK + r"\1", content, flags=re.M)
             if new != content:
                 content, hit = new, True
         if hit:
@@ -2408,20 +2435,25 @@ def cmd_reset():
               "/etc/sysctl.d/98-net-optimize-mptcp.conf"):
         _rm(f)
     echo("  ✅ 已删除 sysctl 配置文件")
+    # 老版本整份改名禁用过的文件：改回来（4.3.0 之前的装机才有）
     for f in sorted(glob.glob("/etc/sysctl.d/*.disabled-by-net-optimize-*")):
         orig = re.sub(r"\.disabled-by-net-optimize-.*$", "", f)
         if not os.path.isfile(orig):
             os.rename(f, orig)
-            echo(f"  ✅ 已恢复: {orig}")
+            echo(f"  ✅ 已恢复（老版整份禁用的）: {orig}")
         else:
             _rm(f)
             echo(f"  🗑 已删除残留: {f}")
-    if os.path.isfile("/etc/sysctl.conf"):
-        content = read_text("/etc/sysctl.conf")
-        restored = content.replace("# net-optimize disabled: ", "")
+    # 【4.3.0 起是逐行注释，所以这里也要逐行还原】只还原带我们标记的那几行，
+    # 别人自己注释掉的不碰。/etc/sysctl.d 和 /etc/sysctl.conf 同一套处理。
+    for f in sorted(glob.glob("/etc/sysctl.d/*.conf")) + ["/etc/sysctl.conf"]:
+        if not os.path.isfile(f) or f in (SYSCTL_AUTH_FILE, SYSCTL_OVERRIDE_FILE):
+            continue
+        content = read_text(f)
+        restored = content.replace(DISABLED_MARK, "")
         if restored != content:
-            write_text("/etc/sysctl.conf", restored)
-            echo("  ✅ 已恢复 /etc/sysctl.conf 中被注释的行")
+            write_text(f, restored)
+            echo(f"  ✅ 已还原被注释的冲突项: {f}")
     run(["sysctl", "--system"], timeout=60)
     echo("  ✅ sysctl 已重新加载")
 
