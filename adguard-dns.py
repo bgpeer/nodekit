@@ -890,6 +890,29 @@ def _https_panel():
     p = int(_yaml_val(tb, "port_https") or 0)
     return (dom, p) if p else None
 
+def _yaml_quote(v):
+    """写进 YAML 列表时一律加单引号。
+
+    【踩过】分流规则形如 [/cn/]223.5.5.5，裸写进列表是【语法错误】——YAML 里 [ 是
+    流式序列的起始符，PyYAML 直接报 ParserError while parsing a block collection。
+    AdGuardHome 解析不了配置就起不来；现场就是这么被回滚的。
+
+    不做"看情况才加引号"的聪明判断：需要引号的字符一大串（[ { & * # ! % @ ` , : 开头
+    的数字样式…），漏一个就又是一次线上回滚。一律加，代价只是文件里多两个撇号，
+    而 AdGuardHome 自己保存时也会按它的规则重写。
+    """
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def _yaml_unquote(v):
+    """把 _yaml_quote 加的引号脱掉；没加引号的原样返回。"""
+    v = v.strip()
+    for q in ("'", '"'):
+        if len(v) >= 2 and v[0] == q and v[-1] == q:
+            return v[1:-1].replace(q * 2, q)
+    return v
+
+
 def _yaml_list(txt, key):
     """读 YAML 里的一个列表；键不存在返回 None，空列表返回 []。"""
     m = re.search(rf'(?m)^(\s*){re.escape(key)}:[ \t]*(\[[ \t]*\])?[ \t]*$', txt)
@@ -903,7 +926,9 @@ def _yaml_list(txt, key):
             continue
         cur, st = len(line) - len(line.lstrip()), line.strip()
         if st.startswith("- ") and cur > indent:
-            items.append(st[2:].strip())
+            # 【脱引号】写进去的是 '[/cn/]223.5.5.5'，读回来得是 [/cn/]223.5.5.5，
+            # 否则跟状态文件里记的对不上、关闭时一条都删不掉
+            items.append(_yaml_unquote(st[2:]))
         elif cur <= indent:
             break
     return items
@@ -966,7 +991,7 @@ def _yaml_set_list(txt, key, items):
     # 原来写死 +4，而 AdGuardHome.yaml 里是 +2 —— YAML 两种都合法，但写出来的文件
     # 跟自己其余部分对不齐，人看着像被改坏了。没有现成条目可参照时按 +2（AGH 的风格）。
     pad = " " * (item_indent if item_indent is not None else indent + 2)
-    body = "".join(f"{pad}- {it}\n" for it in items)
+    body = "".join(f"{pad}- {_yaml_quote(it)}\n" for it in items)
     head = f"{' ' * indent}{key}:\n" if items else f"{' ' * indent}{key}: []\n"
     return txt[:m.start()] + head + body + txt[end:]
 
