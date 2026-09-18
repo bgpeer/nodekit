@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.0"
+VERSION = "4.5.1"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1133,6 +1133,32 @@ def setup_conntrack():
 
 
 # === 网卡 Offload 优化（GRO/GSO/TSO + UDP GRO 转发 + LRO off）===
+def apply_offload_runtime(iface):
+    """把 offload 真正打到网卡上。返回 (开成功几项, UDP GRO 转发是否开上)。
+
+    【单独抽出来是为了让 --boot 也能调】原来开机恢复完全指望那条 udev 规则，而
+    cmd_boot_apply 里压根没有 offload 这一步。现场两台机器一对比就露馅了：
+    ens3 那台重启后 UDP GRO 是 on，eth0 那台是 off —— 同一份规则、同一个版本。
+
+    最可能的原因是规则用了 NAME== 匹配：udev 里 NAME 只有在接口【被改过名】时
+    才有值。ens3 是 systemd 预测命名改出来的（有值 → 命中），eth0 是内核直接给的
+    （无值 → 不命中）。这条我在本地验证不了，所以不赌它 —— udev 规则照样写（还补上
+    KERNEL== 那一路），但开机恢复不再只靠它。
+    """
+    n = 0
+    for feature in ("gro", "gso", "tso", "sg", "rx", "tx"):
+        if run(["ethtool", "-K", iface, feature, "on"], timeout=5).returncode == 0:
+            n += 1
+    run(["ethtool", "-K", iface, "tx-nocache-copy", "on"], timeout=5)
+    # 关闭 LRO：本机开启了 ip_forward，LRO 合并后的包无法安全转发
+    run(["ethtool", "-K", iface, "lro", "off"], timeout=5)
+    # UDP GRO 转发 + 发送端分段：QUIC/Hysteria2/TUIC 降 CPU（内核 5.4+/6.x）
+    ugro = run(["ethtool", "-K", iface, "rx-udp-gro-forwarding", "on"],
+               timeout=5).returncode == 0
+    run(["ethtool", "-K", iface, "tx-udp-segmentation", "on"], timeout=5)
+    return n, ugro
+
+
 def setup_nic_offload():
     if not Cfg.ENABLE_NIC_OFFLOAD:
         echo("⏭️ 跳过网卡 offload 优化")
@@ -1148,21 +1174,11 @@ def setup_nic_offload():
 
     # 直接逐项尝试开启并统计成功数（v3.8.0 用 grep 短名匹配 ethtool -k 长名
     # 输出永远不命中，实际从未触发开启；此处修正为直接尝试，行为只增不减）
-    applied = 0
-    for feature in ("gro", "gso", "tso", "sg", "rx", "tx"):
-        if run(["ethtool", "-K", iface, feature, "on"], timeout=5).returncode == 0:
-            applied += 1
-    run(["ethtool", "-K", iface, "tx-nocache-copy", "on"], timeout=5)
-
-    # 关闭 LRO：本机开启了 ip_forward，LRO 合并后的包无法安全转发
-    run(["ethtool", "-K", iface, "lro", "off"], timeout=5)
-
-    # UDP GRO 转发 + 发送端分段：QUIC/Hysteria2/TUIC 降 CPU（内核 5.4+/6.x）
-    if run(["ethtool", "-K", iface, "rx-udp-gro-forwarding", "on"], timeout=5).returncode == 0:
+    applied, ugro = apply_offload_runtime(iface)
+    if ugro:
         echo("  ✅ UDP GRO 转发已开启（QUIC/UDP 代理加速）")
     else:
         echo("  ℹ️ UDP GRO 转发：网卡不支持或内核版本不足，已跳过")
-    run(["ethtool", "-K", iface, "tx-udp-segmentation", "on"], timeout=5)
 
     # 激进模式：加大发送队列 + ring buffer
     if Cfg.AGGRESSIVE_MODE:
@@ -1187,16 +1203,22 @@ def setup_nic_offload():
     echo(f"  ✅ 出口网卡: {iface}，offload 已检查（成功开启 {applied} 项）")
 
     # 持久化：udev 规则开机自动应用
-    udev = ["# Net-Optimize: NIC offload 持久化",
-            f'ACTION=="add", SUBSYSTEM=="net", NAME=="{iface}", '
+    # 【NAME 和 KERNEL 都写一条】udev 里 NAME 只有在接口被改过名时才有值：ens3 这种
+    # systemd 预测命名的有值，eth0 这种内核直接给的没有 —— 只写 NAME== 的话后者永远
+    # 不命中，重启后 offload 就没了。两条都命中也无妨，ethtool 这几下是幂等的。
+    udev = ["# Net-Optimize: NIC offload 持久化"]
+    for key in ("NAME", "KERNEL"):
+        udev += [
+            f'ACTION=="add", SUBSYSTEM=="net", {key}=="{iface}", '
             f'RUN+="/usr/sbin/ethtool -K {iface} gro on gso on tso on sg on '
             f'tx-nocache-copy on lro off"',
-            f'ACTION=="add", SUBSYSTEM=="net", NAME=="{iface}", '
+            f'ACTION=="add", SUBSYSTEM=="net", {key}=="{iface}", '
             f"RUN+=\"/bin/sh -c '/usr/sbin/ethtool -K {iface} "
-            f"rx-udp-gro-forwarding on tx-udp-segmentation on 2>/dev/null || true'\""]
-    if Cfg.AGGRESSIVE_MODE:
-        udev.append(f'ACTION=="add", SUBSYSTEM=="net", NAME=="{iface}", '
-                    f'RUN+="/usr/sbin/ip link set {iface} txqueuelen 10000"')
+            f"rx-udp-gro-forwarding on tx-udp-segmentation on 2>/dev/null || true'\"",
+        ]
+        if Cfg.AGGRESSIVE_MODE:
+            udev.append(f'ACTION=="add", SUBSYSTEM=="net", {key}=="{iface}", '
+                        f'RUN+="/usr/sbin/ip link set {iface} txqueuelen 10000"')
     write_text("/etc/udev/rules.d/99-net-optimize-offload.rules", "\n".join(udev) + "\n")
     echo("  ✅ offload 持久化：/etc/udev/rules.d/99-net-optimize-offload.rules")
 
@@ -2301,6 +2323,16 @@ def cmd_boot_apply():
 
     # conntrack 触发（INVALID -> DROP + 出站触发计数）
     conntrack_invalid_drop_rules()
+
+    # 【网卡 offload：开机也要自己打一遍，别只指望 udev】现场对比出来的：
+    # ens3 那台重启后 UDP GRO 是 on，eth0 那台是 off —— 同一份 udev 规则、同一个版本。
+    # 见 apply_offload_runtime 的注释。这一步幂等，多打一遍没有副作用。
+    if Cfg.ENABLE_NIC_OFFLOAD and have_cmd("ethtool"):
+        _if = detect_outbound_iface()
+        if _if:
+            _n, _ugro = apply_offload_runtime(_if)
+            logger_msg(f"boot: offload {_if} 开了 {_n} 项，UDP GRO 转发="
+                       f"{'on' if _ugro else 'off'}")
     if have_cmd("curl"):
         run(["curl", "-4I", "https://1.1.1.1", "--max-time", "3"], timeout=10)
         run(["curl", "-4I", "https://www.google.com", "--max-time", "3"], timeout=10)
@@ -3403,10 +3435,20 @@ def cmd_check():
     echo(f"  {'可用':<10}: {meminfo_kb('MemAvailable') // 1024} MB")
     up = run(["uptime", "-p"], timeout=5).stdout.strip()
     echo(f"  {'运行':<10}: {up or '?'}")
+    # 【两个版本要分开报】上面横幅打的是【正在跑的这份】的 VERSION，而这里读的是
+    # 【装在 /usr/local/sbin 的那份】。菜单跑的是 /etc/bgpeer 下的缓存副本，只有完整
+    # 优化流程才会 self_install 把它同步过去 —— 所以 --check 很容易看到两个不同的号。
+    # 这不是显示错乱：常驻的 boot 服务、QoS 守护、月度 nginx cron 执行的都是【装着的
+    # 那份】。两者不一致 = 那几个常驻的东西还在跑旧代码，得说出来。
+    green(f"✅ 正在跑的版本：v{VERSION}")
     if os.path.isfile(SCRIPT_PATH):
         m = re.search(r'VERSION = "([^"]+)"', read_text(SCRIPT_PATH))
-        if m:
-            green(f"✅ 脚本版本：v{m.group(1)}")
+        if m and m.group(1) != VERSION:
+            yellow(f"⚠️ 已安装的版本：v{m.group(1)}（{SCRIPT_PATH}）—— 和上面不一致")
+            echo("   开机恢复 / QoS 守护 / 月度 nginx 升级跑的是【已安装的那份】。")
+            echo("   跑一次完整优化（菜单 12 选 1/2/3）就会同步过去。")
+        elif m:
+            green(f"✅ 已安装的版本：v{m.group(1)}（一致）")
     elif os.path.isfile("/usr/local/sbin/net-optimize-ultimate.sh"):
         m = re.search(r"v\d+\.\d+\.\d+",
                       read_text("/usr/local/sbin/net-optimize-ultimate.sh"))
