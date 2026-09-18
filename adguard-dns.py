@@ -79,12 +79,26 @@ def _domain():
     h = _host()
     return h if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", h or "") else ""
 
+# 出网一律用中性 UA：默认的 Python-urllib/3.x 等于告诉沿途每一跳「这是个脚本」。
+# 仓库里别的脚本早就统一过，这一份当时漏了。
+HTTP_UA = "curl/8.5.0"
+
+
+def _fetch(url, timeout=20):
+    """GET 一个 URL，返回 bytes；失败返回 None。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
 def _public_ip():
     for u in ("https://api.ipify.org", "https://ifconfig.me/ip"):
-        try:
-            return urllib.request.urlopen(u, timeout=8).read().decode().strip()
-        except Exception:
-            pass
+        b = _fetch(u, timeout=8)
+        if b:
+            return b.decode(errors="replace").strip()
     out = sh("hostname -I")
     return out.split()[0] if out else "本机IP"
 
@@ -934,78 +948,112 @@ def _yaml_list(txt, key):
     return items
 
 # ============================== 国内外上游分流 ==============================
-# 【为什么要分】AdGuard 跑在境外 VPS 上。手机开了「专用 DNS」之后，连百度、B 站这种
-# 国内域名的解析也会绕到这台机器 —— 而国内站点的 CDN 是按【递归解析器的出口 IP】
-# 挑节点的。用境外上游（Cloudflare/Google）解析，权威 NS 看到的是境外 IP，就会返回
-# 境外或次优的节点；手机在国内直连这个 IP，反而比不开代理还慢。
+# 【为什么要分】AdGuard 跑在境外 VPS 上。国内站点的 CDN 是按【递归解析器的出口 IP】
+# 挑节点的：用境外上游解析，权威 NS 看到境外 IP，返回境外或次优节点；手机在国内
+# 直连这个 IP 反而更慢。把国内域名交给国内递归，权威 NS 看到的才是国内出口。
 #
-# 把国内域名交给国内递归（223.5.5.5 这类），权威 NS 看到的就是国内出口，返回的才是
-# 国内节点。注意：这解决的是"解析器在哪"，不是"你在哪" —— 效果比不上手机直接用
-# 国内 DNS（那个能精确到省），但比全都走境外好得多。
-CN_UPSTREAM = "223.5.5.5"                  # 阿里公共 DNS（国内递归）
-CN_SPLIT_STATE = AGH_DIR + "/.upstream-split.json"   # 记下自己写进去的那几行
-
-# 走国内上游的域名。[/cn/] 覆盖整个 .cn；其余是常见的 .com/.net 国内站，
-# 它们的 CDN 调度对解析器位置最敏感。不求全 —— 覆盖日常高频即可，
-# 剩下的用户可以自己在后台那一栏继续加。
-CN_SPLIT_DOMAINS = (
-    "cn", "baidu.com", "bdstatic.com", "qq.com", "gtimg.com", "tencent.com",
-    "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "alipay.com",
-    "jd.com", "360buyimg.com", "bilibili.com", "hdslb.com", "weibo.com",
-    "163.com", "126.net", "sohu.com", "iqiyi.com", "youku.com",
-    "douyin.com", "douyinstatic.com", "bytedance.com", "byteimg.com",
-    "toutiao.com", "xiaohongshu.com", "zhihu.com", "zhimg.com", "csdn.net",
-    "mi.com", "xiaomi.com", "huawei.com", "hicloud.com", "oppo.com",
-    "meituan.com", "meituan.net", "dianping.com", "ctrip.com", "tripcdn.com",
-    "kuaishou.com", "douban.com", "sogou.com", "so.com", "ximalaya.com",
-    "netease.com", "pinduoduo.com", "yangkeduo.com", "lianjia.com",
+# 【为什么用 upstream_dns_file 而不是往 upstream_dns 里塞】
+# 第一版手写了 49 个域名 —— 覆盖面太窄，不解决问题。真正要的是整份国内域名表
+# （dnsmasq-china-list 有八万多条），而那个量塞进 yaml 列表会让配置文件和网页后台
+# 的输入框都没法看。AdGuardHome 支持 upstream_dns_file（internal/dnsforward/
+# config.go 的 loadUpstreams）：设了这个键就【完全取代】upstream_dns，按行读、
+# 支持 # 注释。所以把默认上游和国内分流一起写进这个文件，upstream_dns 原样不动 ——
+# 关闭时只要把这个键清空，不用去动用户那一栏。
+CN_UPSTREAM = "223.5.5.5"                       # 国内递归（阿里公共 DNS）
+CN_UPSTREAM_FILE = AGH_DIR + "/cn-split-upstream.txt"
+CN_LIST_URLS = (
+    "https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/"
+    "accelerated-domains.china.conf",
+    "https://cdn.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/"
+    "accelerated-domains.china.conf",
+    "https://fastly.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/"
+    "accelerated-domains.china.conf",
 )
+_CN_LINE_RE = re.compile(rb"(?m)^server=/([^/\s]+)/")
 
 
-def _cn_split_lines(upstream):
-    """要写进 upstream_dns 的那几行。一行一个域名，AdGuardHome 的域名限定语法。"""
-    return [f"[/{d}/]{upstream}" for d in CN_SPLIT_DOMAINS]
+def _cn_domains():
+    """拉国内域名表 → 去重排序后的域名列表；拉不到返回 []。
+
+       raw.githubusercontent 常被限流/不通，所以补两个 jsDelivr 镜像。"""
+    for u in CN_LIST_URLS:
+        data = _fetch(u, timeout=30)
+        if not data:
+            continue
+        got = sorted({m.decode(errors="replace") for m in _CN_LINE_RE.findall(data)})
+        if len(got) > 1000:                     # 拿到半截/错页就别用
+            return got
+    return []
 
 
-def _yaml_set_list(txt, key, items):
-    """把 YAML 里 key 那个列表整个换掉；找不到 key 返回 None。
+def _write_cn_file(plain, domains):
+    """写 upstream_dns_file：默认上游在前，国内分流在后。"""
+    L = ["# 本文件由「自建DNS → 9 国内外上游分流」生成，手改会在下次开关时被覆盖。",
+         "# AdGuardHome 设了 upstream_dns_file 就只读这个文件，网页后台那一栏会被忽略。",
+         "", "# 默认上游（没有匹配到下面任何域名时用）"]
+    L += list(plain)
+    L += ["", f"# 国内域名 → {CN_UPSTREAM}（来自 dnsmasq-china-list，{len(domains)} 条）"]
+    L += [f"[/{d}/]{CN_UPSTREAM}" for d in domains]
+    os.makedirs(os.path.dirname(CN_UPSTREAM_FILE), exist_ok=True)
+    open(CN_UPSTREAM_FILE, "w").write("\n".join(L) + "\n")
 
-       只动这一个块：定位 key 行的缩进，往下吃掉所有更深缩进的 "- " 行，
-       其余原样保留 —— AdGuardHome.yaml 里别的段不能碰。"""
-    m = re.search(rf'(?m)^(\s*){re.escape(key)}:[ \t]*(\[[ \t]*\])?[ \t]*$', txt)
-    if not m:
+
+def _yaml_set_scalar(txt, key, value, near):
+    """把 dns 段里的 key 设成 value；没有这个键就插在 near 那一行前面（同缩进）。
+
+       插在 near（upstream_dns）前面是为了保证落在 dns: 段【里面】—— 直接找
+       dns: 再往下数缩进太脆，而 upstream_dns 一定在 dns 段内。"""
+    m = re.search(rf'(?m)^(\s*){re.escape(key)}:[ \t]*.*$', txt)
+    if m:
+        return txt[:m.start()] + f"{m.group(1)}{key}: {_yaml_quote(value)}" + txt[m.end():]
+    n = re.search(rf'(?m)^(\s*){re.escape(near)}:', txt)
+    if not n:
         return None
-    indent = len(m.group(1))
-    end, item_indent = m.end(), None
-    for line in txt[m.end():].splitlines(keepends=True):
-        st = line.strip()
-        if not st:
-            end += len(line); continue
-        cur = len(line) - len(line.lstrip())
-        if st.startswith("- ") and cur > indent:
-            end += len(line)
-            if item_indent is None:
-                item_indent = cur          # 【沿用原有条目的缩进】别自己定一个
-        else:
-            break
-    # 原来写死 +4，而 AdGuardHome.yaml 里是 +2 —— YAML 两种都合法，但写出来的文件
-    # 跟自己其余部分对不齐，人看着像被改坏了。没有现成条目可参照时按 +2（AGH 的风格）。
-    pad = " " * (item_indent if item_indent is not None else indent + 2)
-    body = "".join(f"{pad}- {_yaml_quote(it)}\n" for it in items)
-    head = f"{' ' * indent}{key}:\n" if items else f"{' ' * indent}{key}: []\n"
-    return txt[:m.start()] + head + body + txt[end:]
+    ind = n.group(1)
+    return txt[:n.start()] + f"{ind}{key}: {_yaml_quote(value)}\n" + txt[n.start():]
 
 
 def _cn_split_on():
-    """分流是否已由本脚本写入 → (是否开启, 写进去的行数)。"""
+    """分流是否开着 → (是否开启, 文件里的国内域名条数)。"""
     try:
-        st = json.load(open(CN_SPLIT_STATE))
-        lines = st.get("lines") or []
-    except Exception:
+        txt = open(_agh_yaml()).read()
+    except OSError:
         return False, 0
-    cur = _yaml_list(open(_agh_yaml()).read(), "upstream_dns") or []
-    live = [x for x in lines if x in cur]
-    return bool(live), len(live)
+    m = re.search(r'(?m)^\s*upstream_dns_file:[ \t]*(.*)$', txt)
+    if not m or _yaml_unquote(m.group(1)) != CN_UPSTREAM_FILE:
+        return False, 0
+    try:
+        n = sum(1 for ln in open(CN_UPSTREAM_FILE) if ln.startswith("[/"))
+    except OSError:
+        return False, 0
+    return n > 0, n
+
+
+def _agh_why_failed():
+    """AGH 没起来/解析不通时，把真正的原因打出来。
+
+       【原来只说「没起来或解析不通」】那句话等于什么都没说 —— 现场连着两次失败
+       都只能靠猜。日志里 AdGuardHome 会明说是 yaml 解析错、还是端口被占、还是别的。"""
+    out = sh("journalctl -u AdGuardHome -n 12 --no-pager 2>/dev/null") \
+        or sh("systemctl status AdGuardHome --no-pager -l 2>/dev/null")
+    for ln in (out or "").splitlines()[-12:]:
+        if ln.strip():
+            print("     " + ln.strip()[:150])
+
+
+def _agh_restart_ok(wait=40):
+    """重启 AGH 并确认【真的能解析】。
+
+       【不能只看 systemctl is-active】它在进程刚拉起来那一刻就返回 active，而
+       AdGuardHome 还要读配置、绑 53 —— 第一版在 active 之后只试了一次解析就判失败，
+       配置明明是好的也会被回滚。所以是在整个窗口里反复试，能解析才算成功。
+       上游条数多的时候启动更慢，窗口给到 40 秒。"""
+    sh("systemctl restart AdGuardHome")
+    for _ in range(wait):
+        time.sleep(1)
+        if _running() and _resolve_ok("www.baidu.com", timeout=2):
+            return True
+    return False
 
 
 def cn_upstream_menu():
@@ -1024,19 +1072,19 @@ def cn_upstream_menu():
         print("  配置里没有 upstream_dns 这一项，保险起见不自动改。")
         print("  请在后台『设置 → DNS设置 → 上游DNS服务器』先填一个上游再回来。")
         return
-
+    plain = [x for x in cur if not x.startswith("[/")]
     on, n = _cn_split_on()
-    plain = [x for x in cur if not x.startswith("[/")]      # 没带域名限定的 = 默认上游
+
     print("\n  === 国内外上游分流 ===")
     print(f"  当前默认（境外）上游：{('、'.join(plain) if plain else '（空）')}")
-    print(f"  国内分流：{f'已开启（{n} 条域名规则 → {CN_UPSTREAM}）' if on else '未开启'}")
+    print(f"  国内分流：{f'已开启（{n} 条国内域名 → {CN_UPSTREAM}）' if on else '未开启'}")
     print()
-    print("  国内域名（百度/B站/淘宝…）的 CDN 是按【递归解析器的出口 IP】挑节点的。")
-    print("  全走境外上游的话，权威 NS 看到的是境外 IP，返回的是境外或次优节点，")
-    print("  手机在国内直连这个 IP 反而更慢。分流之后国内域名交给国内递归。")
+    print("  国内域名的 CDN 是按【递归解析器的出口 IP】挑节点的。全走境外上游的话，")
+    print("  权威 NS 看到境外 IP，返回境外或次优节点，手机在国内直连反而更慢。")
+    print(f"  开启后国内域名交给 {CN_UPSTREAM}，其余照旧走上面那几个。")
     print()
-    print("  1 开启分流" if not on else "  1 重写分流规则（按最新域名表）")
-    print("  2 关闭分流（只撤本脚本写进去的那几行，你自己加的不动）")
+    print("  1 " + ("重新拉取域名表并重写" if on else "开启分流"))
+    print("  2 关闭分流（清掉 upstream_dns_file，恢复用后台那一栏）")
     print("  0 返回")
     c = _ask("  选择: ").strip()
     if c not in ("1", "2"):
@@ -1047,52 +1095,57 @@ def cn_upstream_menu():
             print("  默认上游是空的 —— 先在后台填一个境外上游（比如")
             print("  https://dns.cloudflare.com/dns-query），否则国外域名没人解析。")
             return
+        print("  正在拉取国内域名表（dnsmasq-china-list）...")
+        doms = _cn_domains()
+        if not doms:
+            print("  ❌ 域名表拉不下来（raw 和两个 jsDelivr 镜像都没通），未改动。")
+            print("     这台机出网不通 GitHub 的话，可以先跑一次节点的 GitHub 中转设置。")
+            return
+        print(f"  ✓ 拿到 {len(doms)} 条国内域名")
+        # 【小内存机要先问一句】十一万条上游 AdGuardHome 是全部读进内存的，实测文件
+        # 就有 2.7 MB。装了 Emby 的那种机器本来就紧张，宁可让人自己决定，也别默默
+        # 把它推到 OOM 边上 —— 虽然下面失败了会回滚，但那是在服务已经抖过一次之后。
+        _mem = 0
         try:
-            old = json.load(open(CN_SPLIT_STATE)).get("lines") or []
-        except Exception:
-            old = []
-        # 先摘掉上一轮写的，再按最新域名表写一遍 —— 否则域名表增删之后会留下孤儿行
-        keep = [x for x in cur if x not in old]
-        new = keep + _cn_split_lines(CN_UPSTREAM)
-        lines = _cn_split_lines(CN_UPSTREAM)
-        what = f"已开启：{len(lines)} 条国内域名 → {CN_UPSTREAM}"
+            for ln in open("/proc/meminfo"):
+                if ln.startswith("MemTotal:"):
+                    _mem = int(ln.split()[1]) // 1024; break
+        except OSError:
+            pass
+        if _mem and _mem < 1536:
+            print(f"  ⚠ 本机内存只有 {_mem} MB，而这 {len(doms)} 条上游 AdGuardHome 会全部")
+            print("    读进内存。装不上会自动回滚，但服务会抖一下。")
+            if _ask("    仍然继续？(y/N): ").strip().lower() not in ("y", "yes"):
+                print("  已取消，未改动。"); return
+        _write_cn_file(plain, doms)
+        out = _yaml_set_scalar(txt, "upstream_dns_file", CN_UPSTREAM_FILE, "upstream_dns")
+        what = f"已开启：{len(doms)} 条国内域名 → {CN_UPSTREAM}"
     else:
-        try:
-            old = json.load(open(CN_SPLIT_STATE)).get("lines") or []
-        except Exception:
-            old = []
-        if not old:
-            print("  没有本脚本写入的分流规则，无需关闭。"); return
-        new, lines = [x for x in cur if x not in old], []
-        what = "已关闭：本脚本写入的分流规则都撤掉了"
+        if not on:
+            print("  分流本来就没开，无需关闭。"); return
+        out = _yaml_set_scalar(txt, "upstream_dns_file", "", "upstream_dns")
+        what = "已关闭：恢复使用后台『上游DNS服务器』那一栏"
 
-    out = _yaml_set_list(txt, "upstream_dns", new)
     if out is None:
-        print("  没能定位 upstream_dns 块，未改动。"); return
+        print("  没能定位 upstream_dns，未改动。"); return
     open(yaml_path, "w").write(out)
-    try:
-        json.dump({"upstream": CN_UPSTREAM, "lines": lines},
-                  open(CN_SPLIT_STATE, "w"))
-        os.chmod(CN_SPLIT_STATE, 0o600)
-    except OSError:
-        pass
-    sh("systemctl restart AdGuardHome")
-    # 【改完一定要验一次能不能解析】上游写坏了 AGH 照样能起来，但所有查询都失败，
-    # 而这台机是全家的 DNS —— 起来了不等于好了，得真问一次
-    ok = False
-    for _ in range(12):
-        time.sleep(1)
-        if _running():
-            ok = True; break
-    if ok and _resolve_ok("www.baidu.com"):
+    if _agh_restart_ok():
+        if c == "2":
+            try: os.remove(CN_UPSTREAM_FILE)
+            except OSError: pass
         print(f"\n  ✓ {what}")
-        print("  ▸ 后台『设置 → DNS设置 → 上游DNS服务器』能看到这些行，可以继续自己加。")
-        print("  ▸ 注意：在后台点了「保存」之后 AdGuard 会按网页上的内容重写配置，")
-        print("    本脚本写的行如果被你在网页上删掉了，这边的开关状态也会跟着变。")
+        if c == "1":
+            print(f"  ▸ 分流表：{CN_UPSTREAM_FILE}")
+            print("  ▸ 注意：开着的时候 AdGuardHome【只读这个文件】，网页后台『上游DNS")
+            print("    服务器』那一栏会被忽略。想换境外上游：先在后台改那一栏，再回来点 1")
+            print("    重写一次（这边会把那一栏的内容原样搬进文件）。")
     else:
-        open(yaml_path, "w").write(txt)                     # 回滚
+        open(yaml_path, "w").write(txt)                 # 回滚
+        print("\n  ❌ 改完之后 AdGuard 没起来或解析不通，正在回滚…")
+        print("     AdGuardHome 日志最后几行：")
+        _agh_why_failed()
         sh("systemctl restart AdGuardHome")
-        print("\n  ❌ 改完之后 AdGuard 没起来或解析不通，已回滚到改动前（DNS 仍可用）。")
+        print("  ✓ 已回滚到改动前（DNS 仍可用）。把上面几行发出来就能定位。")
 
 
 def _resolve_ok(name, timeout=5):
@@ -1478,7 +1531,8 @@ def selfcheck():
     _split_on, _split_n = _cn_split_on()
     print(f"    {ok if _plain else warn} 默认上游：{'、'.join(_plain) if _plain else '（空——国外域名没人解析）'}")
     if _split_on:
-        print(f"    {ok} 国内分流：已开启（{_split_n} 条 → {CN_UPSTREAM}）")
+        print(f"    {ok} 国内分流：已开启（{_split_n} 条国内域名 → {CN_UPSTREAM}）")
+        print(f"      {Y}上游按 {CN_UPSTREAM_FILE} 走，后台那一栏当前被忽略{N}")
     else:
         print(f"    {warn} 国内分流：未开启")
         # 【为什么这值得提一句】手机开了「专用 DNS」之后国内域名的解析也绕到这台
