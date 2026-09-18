@@ -512,8 +512,29 @@ def clean_stale_nginx():
                 print(f"移除残留 nginx 配置(引用已删证书): {fp}")
                 sh(f"rm -f {fp}", check=False)
 
+def nginx_install_shared():
+    """装 nginx 时走网络优化那一份，让两边共用同一个源、同一条月度升级 cron。
+
+    【为什么不直接 apt install】nginx 在这套东西里是共用件：节点要它做伪装站和
+    SNI 分流，Emby 那套要它做 443 反代，而 net-optimize 那边管着 nginx.org 官方源
+    （Pin=1001）和每月 1 号的自动升级。各装各的话，谁先装决定了拿到哪个版本
+    （系统源 1.22 还是官方源的新版），而且只有点过「12 网络优化」的人才有升级保护
+    —— 真正在公网跑 nginx 的反而可能没有。走同一个入口就没这问题。
+
+    拿不到脚本 / 跑不起来返回 False，调用方退回系统源直接装 —— 不能因为这个可选的
+    优化路径不通，就把节点装不上。
+    """
+    if have("nginx"):
+        return True
+    if not ensure_remote_script(NETOPT_URL, NETOPT_LOCAL):
+        return False
+    print("  装 nginx（走网络优化的官方源，并挂上每月自动升级）...")
+    subprocess.run(f"python3 {NETOPT_LOCAL} --nginx-ensure", shell=True)
+    return have("nginx")
+
+
 def ensure_nginx():
-    if not have("nginx"):
+    if not have("nginx") and not nginx_install_shared():
         sh("apt-get update -y", check=False)
         sh("DEBIAN_FRONTEND=noninteractive apt-get install -y nginx", check=False)
     clean_stale_nginx()                                  # 先清掉别人残留的坏块，保证 nginx -t 能过
@@ -655,7 +676,7 @@ def sni_split_preflight():
     """真正改动前先探测：装 stream 模块，用一份『结构等价』的测试 stream 配置跑 nginx -t。
        通过才敢走 sni-split；不通过返回 False，让调用方退回 reality-443 直连模式。
        全过程可回滚，绝不把用户能用的 nginx 改坏。"""
-    if not have("nginx"):
+    if not have("nginx") and not nginx_install_shared():
         sh("apt-get update -y", check=False)
         sh("DEBIAN_FRONTEND=noninteractive apt-get install -y nginx", check=False)
     if not have("nginx"):

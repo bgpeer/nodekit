@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.3.0"
+VERSION = "4.4.0"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1985,7 +1985,25 @@ def cmd_nginx_upgrade():
     logf.close()
 
 
-def fix_nginx_repo():
+def fix_nginx_repo(install_if_missing=False):
+    """配 nginx.org 官方源；已装 nginx 就升级并挂月度自动升级。
+
+    【nginx 在这套东西里是共用件】真正用它的是节点（伪装站 80/443、SNI 分流的
+    stream+ssl_preread）和 Emby 那套（443 反代）。谁先需要谁装，但都走这一个函数，
+    于是无论先装节点还是先跑网络优化，拿到的都是同一个源的同一份 nginx，也都挂上
+    同一个月度升级。
+
+    install_if_missing：
+      False（网络优化主流程）—— 没装 nginx 就只把源配好，不主动安装。往一台
+            只想调内核参数的机器上塞一个监听 80 的 web 服务，不是用户点「网络优化」
+            时预期的事；而源配好了不装任何东西、也不起任何服务，纯粹是为了后面
+            真要装的时候能拿到官方版本。
+      True （--nginx-ensure，由 xy-installer 在真的需要 nginx 时调用）——
+            没装就装上。这时候是「有功能需要它」，装才是对的。
+
+    【月度 cron 只在 nginx 真的装了之后才写】不然那条 cron 每月会把 nginx 装上来，
+    等于把上面这条克制绕过去了。
+    """
     if not Cfg.ENABLE_NGINX_REPO:
         echo("⏭️ 跳过 Nginx 管理")
         return
@@ -2064,24 +2082,32 @@ def fix_nginx_repo():
     else:
         echo("ℹ️ 非 Ubuntu 系统，跳过 ondrej/nginx PPA 检查")
 
-    # 4) 每次执行主脚本，都立即安装或升级一次
+    # 4) 装了才升级；没装且调用方没要求装，就到此为止
+    if not have_cmd("nginx") and not install_if_missing:
+        echo("ℹ️ 本机没有 nginx —— 官方源已配好，但不主动安装")
+        echo("  真正需要 nginx 的是节点的伪装站 / SNI 分流、以及 Emby 的 443 反代；")
+        echo("  装它们的时候会自己把 nginx 装上，并挂上每月自动升级。")
+        _rm(NGINX_CRON)      # 之前版本可能留了一条，会每月自作主张把 nginx 装回来
+        return
+
     echo("🔄 执行本次 Nginx 安装/升级检查...")
     cmd_nginx_upgrade()
 
-    # 5) 不执行主脚本时，每月 1 号北京时间 03:10 自动更新
-    write_text(NGINX_CRON,
-               "SHELL=/bin/bash\n"
-               "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
-               "CRON_TZ=Asia/Shanghai\n"
-               "# Net-Optimize: monthly nginx install/upgrade, nginx.org Pin=1001\n"
-               f"10 3 1 * * root {PYTHON_BIN} {SCRIPT_PATH} --nginx-upgrade\n")
-    echo("✅ 已配置 Nginx 自动更新 cron：北京时间每月 1 号 03:10")
-
+    # 5) 不执行主脚本时，每月 1 号北京时间 03:10 自动更新。
+    #    【只在 nginx 确实装上了之后才写】装失败还挂 cron 的话，等于每月重试安装。
     if have_cmd("nginx"):
+        write_text(NGINX_CRON,
+                   "SHELL=/bin/bash\n"
+                   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+                   "CRON_TZ=Asia/Shanghai\n"
+                   "# Net-Optimize: monthly nginx upgrade, nginx.org Pin=1001\n"
+                   f"10 3 1 * * root {PYTHON_BIN} {SCRIPT_PATH} --nginx-upgrade\n")
+        echo("✅ 已配置 Nginx 自动更新 cron：北京时间每月 1 号 03:10")
         ver = run(["nginx", "-v"], timeout=5).stderr.strip().split("/")[-1]
         echo(f"✅ 当前 Nginx 版本：{ver}")
     else:
-        echo(f"⚠️ 当前仍未检测到 Nginx，请查看：{NGINX_LOG}")
+        # 【装失败就别挂 cron】挂了只是每月重试安装，而且是在没人看的时候重试
+        echo(f"⚠️ Nginx 仍未安装成功，不挂月度升级 cron，请查看：{NGINX_LOG}")
     echo(f"🔎 查看日志：tail -n 80 {NGINX_LOG}")
 
 
@@ -3260,6 +3286,9 @@ def main():
                    help="自适应 QoS 守护进程（由 systemd 服务调用）")
     g.add_argument("--nginx-upgrade", action="store_true",
                    help="Nginx 安装/升级（由 cron 调用，输出到日志）")
+    g.add_argument("--nginx-ensure", action="store_true",
+                   help="确保 nginx 可用：配官方源 + 没装就装上 + 挂月度自动升级"
+                        "（由 xy-installer 在真的需要 nginx 时调用，实现共用）")
     g.add_argument("--reapply-initcwnd", action="store_true",
                    help="重新应用 initcwnd（由 networkd-dispatcher 钩子调用）")
     g.add_argument("--check", action="store_true",
@@ -3282,6 +3311,13 @@ def main():
     elif getattr(args, "nginx_upgrade"):
         require_root()
         cmd_nginx_upgrade()
+    elif getattr(args, "nginx_ensure"):
+        # 「有功能真的需要 nginx」的入口：配源 + 没装就装 + 挂月度升级。
+        # 走这里而不是让调用方自己 apt install，是为了让所有人拿到【同一个源的
+        # 同一份 nginx】，并且不管谁先装，月度升级都只有这一条 cron。
+        require_root()
+        self_install()          # 月度 cron 指向 SCRIPT_PATH，得先把自己落到那儿
+        fix_nginx_repo(install_if_missing=True)
     elif getattr(args, "reapply_initcwnd"):
         require_root()
         cmd_reapply_initcwnd()
