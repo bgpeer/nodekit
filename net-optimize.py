@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1366,11 +1366,52 @@ def setup_initcwnd():
 
 
 # === 路径 MTU 探测（DF 置位 ping 从大到小试探）===
-def probe_path_mtu():
+def _ping_with_df():
+    """返回一个支持 -M do（设 DF 位、不许分片）的 ping 路径；没有返回 ""。
+
+    【不能只试 PATH 里那一个】-M 只有 iputils 版的 ping 有；Debian 的
+    inetutils-ping 和 busybox 的都没有，而两种实现可以同时装着（iputils 在
+    /bin/ping、inetutils 在 /usr/bin/ping），谁排在 PATH 前面纯看运气。
+
+    【这条踩过】现场一台 Debian：PATH 里是 inetutils 版，每次 `ping -M do`
+    都返回"invalid option -- 'M'"，于是 probe_path_mtu 一路失败返回 0，
+    MSS 回落到默认 1452（等于认定路径 MTU 是 1492 的 PPPoE），而那台机的
+    路径 MTU 其实是满的 1500、该用 1460 —— 每个包白扔 8 字节，而且屏上报的
+    原因是"ICMP 不通"，跟真实原因完全无关，照着查根本查不出来。
+    """
+    for c in ("ping", "/bin/ping", "/usr/bin/ping", "/usr/sbin/ping"):
+        if not have_cmd(c) and not os.path.exists(c):
+            continue
+        if run([c, "-M", "do", "-s", "64", "-c1", "-W2", "127.0.0.1"],
+               timeout=6).returncode == 0:
+            return c
+    return ""
+
+
+def _tracepath_mtu(targets=("1.1.1.1", "8.8.8.8")):
+    """没有能用的 ping 时的兜底：tracepath 自己会打出 pmtu。返回 0 表示没问到。"""
+    if not have_cmd("tracepath"):
+        return 0
+    best = 0
+    for t in targets:
+        r = run(["tracepath", "-n", t], timeout=30)
+        m = re.findall(r"pmtu (\d+)", (r.stdout or "") + (r.stderr or ""))
+        if m:
+            v = int(m[-1])
+            best = v if not best else min(best, v)
+    return best
+
+
+def probe_path_mtu(ping_cmd=None):
     # payload 1472→MTU1500(裸线路) 1452→1480(PPPoE) 1424→1452 1392→1420(WG/隧道)
+    p = ping_cmd if ping_cmd is not None else _ping_with_df()
+    if not p:
+        # 【别把"ping 不支持 -M"说成"ICMP 不通"】见 _ping_with_df 的注释：
+        # 两者的处方完全不同，报错报歪了会把人带去查防火墙。
+        return _tracepath_mtu()
     for size in (1472, 1452, 1424, 1392):
         for target in ("1.1.1.1", "8.8.8.8"):
-            r = run(["ping", "-c1", "-W2", "-M", "do", "-s", str(size), target],
+            r = run([p, "-c1", "-W2", "-M", "do", "-s", str(size), target],
                     timeout=10)
             if r.returncode == 0:
                 return size + 28
@@ -1406,10 +1447,17 @@ def setup_mss_clamping():
     # MSS 自动探测：按实际路径 MTU 推导（MTU-40），显式指定或探测失败保持原值
     mss = Cfg.MSS_VALUE
     if Cfg.MSS_AUTO and not Cfg.MSS_USER_SET and have_cmd("ping"):
-        mtu = probe_path_mtu()
+        _p = _ping_with_df()
+        mtu = probe_path_mtu(_p)
         if mtu:
             mss = mtu - 40
             echo(f"✅ 路径 MTU 探测: {mtu} → MSS={mss}")
+        elif not _p:
+            # 【这两种原因要分开说】"ping 不支持 -M" 和 "ICMP 被挡" 的处方完全不同：
+            # 前者装个 iputils-ping 就好，后者要去看防火墙。混成一句会把人带偏。
+            echo(f"ℹ️ 这台机的 ping 用不了 -M do（多半是 inetutils/busybox 版），"
+                 f"也没有 tracepath 兜底，使用默认 MSS={mss}")
+            echo(f"   想让它自动探准：apt install -y iputils-ping 后重跑本模块")
         else:
             echo(f"ℹ️ 路径 MTU 探测失败（ICMP 不通），使用默认 MSS={mss}")
     Cfg.MSS_VALUE = mss
@@ -2546,9 +2594,15 @@ def iface_root_qdisc(iface):
 
 
 def probe_path_mtu_quick():
-    """检测版快速探测：-W1 仅打 1.1.1.1（与 check.sh 一致）。"""
+    """检测版快速探测：-W1 仅打 1.1.1.1（与 check.sh 一致）。
+
+    和 probe_path_mtu 一样要先挑一个支持 -M do 的 ping —— 否则在
+    inetutils-ping 的机器上永远返回 0，体检会报"探测失败"而实际线路好得很。"""
+    p = _ping_with_df()
+    if not p:
+        return _tracepath_mtu(("1.1.1.1",))
     for size in (1472, 1452, 1424, 1392):
-        if run(["ping", "-c1", "-W1", "-M", "do", "-s", str(size), "1.1.1.1"],
+        if run([p, "-c1", "-W1", "-M", "do", "-s", str(size), "1.1.1.1"],
                timeout=6).returncode == 0:
             return size + 28
     return 0
@@ -2983,6 +3037,12 @@ def cmd_check():
                 else:
                     yellow(f"  ⚠️ 配置 MSS={rule_mss} ≠ 理想值 {ideal}"
                            f"（重跑主脚本可自动校正）")
+        elif not _ping_with_df() and not have_cmd("tracepath"):
+            # 【同一条要分开说】体检这边照旧：把"ping 不支持 -M"说成"ICMP 不通"，
+            # 会让人对着一条好线路去查防火墙。
+            echo("  🔹 这台机的 ping 用不了 -M do、也没有 tracepath，"
+                 "量不出路径 MTU，跳过 MSS 匹配检查")
+            echo("     想让它能量：apt install -y iputils-ping")
         else:
             echo("  🔹 路径 MTU 探测失败（ICMP 不通），跳过 MSS 匹配检查")
     if os.path.isfile(CONFIG_FILE):
