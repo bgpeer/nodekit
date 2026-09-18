@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.4.0"
+VERSION = "4.4.1"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -678,6 +678,19 @@ def converge_sysctl_authority():
     lines += [f"{k} = {want[k]}" for k in SYSCTL_KEYS if k in want]
     write_text(SYSCTL_OVERRIDE_FILE, "\n".join(lines) + "\n")
     echo(f"✅ 写入 override：{SYSCTL_OVERRIDE_FILE}")
+
+    # 【先把老版整份禁用的文件放回来】4.3.0 之前命中冲突就把整个文件改名禁用，
+    # 里面无关的设置（kernel.* / fs.* / 容器调优）也跟着失效了。新版既然只注释冲突行，
+    # 就该顺手把它们放回来 —— 否则用户「跑一次网络优化」并不能真的对上，得先卸载
+    # 再装一遍才行，而没人会想到要这么做。放回来之后走下面同一套逐行注释。
+    for f in sorted(glob.glob("/etc/sysctl.d/*.disabled-by-net-optimize-*")):
+        orig = re.sub(r"\.disabled-by-net-optimize-.*$", "", f)
+        if os.path.isfile(orig):
+            _rm(f)                      # 原名已经有文件了，这份是残留
+            continue
+        os.rename(f, orig)
+        echo(f"🔁 老版整份禁用的文件已放回：{orig}")
+        echo("  （下面只会注释掉冲突那几行，文件里其余设置恢复生效）")
 
     # 2) 注释掉 /etc/sysctl.d 里的冲突项（保留 main + override，也保留别人文件的其余设置）
     for f in sorted(glob.glob("/etc/sysctl.d/*.conf")):
