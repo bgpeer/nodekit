@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.108"
+SCRIPT_VERSION = "1.5.109"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -13413,6 +13413,22 @@ def latest_items(key, uid, limit=5):
     return out
 
 
+def proxy_only_mounts(d):
+    """没有 CDN 直链可换的盘：驱动本来就没有（WebDAV/FTP/…），或者被切成了本机代理。
+
+    这两种在 MediaWarp 那头是同一回事 —— 302 出去的是 OpenList 自己的地址，
+    本地算出来的、不过期。预热对它们是零收益，而代价是上游的请求配额。
+    """
+    out = set()
+    for _sid, mp, drv, _add, cols in _storage_rows(d):
+        if not mp or mp == "/":
+            continue
+        if (_truthy(cols.get("web_proxy"))
+                or str(drv or "").lower() in PROXY_ONLY_DRIVERS):
+            out.add(mp)
+    return out
+
+
 def warm_links(d, key, limit=None):
     """给「继续观看」和最近新加的片子提前接好线路。返回 (成功数, 总数)。
 
@@ -13472,6 +13488,23 @@ def warm_links(d, key, limit=None):
             seen.add(str(it[0]))
     if nxt != cur:
         save_ms_state(warm_cursor=nxt)
+    if not cut:
+        return 0, 0
+    # 【代理型的盘没有直链可热，热它只是在抢上游的请求配额】
+    # 预热的全部意义是"提前把直链换好放缓存，第一次点开不用现换"。而 WebDAV/FTP/SFTP/
+    # SMB/local/crypt 这几类在网盘侧压根没有 CDN 直链 —— MediaWarp 302 出去的永远是
+    # OpenList 自己的地址，本地算出来的、不过期、也没什么可"换"。
+    # 代价却是实打实的：经 OpenList 回源真拉 64 KB，更要命的是【一次请求配额】。
+    # 实测那个 WebDAV 源按频率限流（8 发里 3 发 429/500）、带宽只够勉强播一部 ——
+    # 预热每 4 秒打一个，用户点播放时就是在跟自己的后台任务抢，抢输了就是转圈。
+    _noswap = proxy_only_mounts(d)
+    if _noswap:
+        _drop = [n for _i, n, p, _s in cut if drive_of_strm(p or "") in _noswap]
+        cut = [x for x in cut if drive_of_strm(x[2] or "") not in _noswap]
+        if _drop:
+            print(f"  {DIM}跳过 {len(_drop)} 部：它们在"
+                  f"{'、'.join(sorted(_noswap))} 这类盘上 —— 没有 CDN 直链可换，"
+                  f"热它只会占掉上游的请求配额{RST}")
     if not cut:
         return 0, 0
     # 【正在播的一律不碰】这是回退逻辑的致命处：光看"续播点动了没有"，分不清是预热推的还是
