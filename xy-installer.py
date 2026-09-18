@@ -4574,6 +4574,23 @@ def _fmt_mb(mb):
         return "?"
     return str(int(round(mb))) if abs(mb - round(mb)) < 0.05 else f"{mb:.1f}"
 
+def _netopt_version():
+    """网络优化脚本的版本号；读不到返回 ""。
+
+    【优先报「装在机器上的那份」】/usr/local/sbin/net-optimize.py 才是开机恢复、
+    自适应 QoS 守护、月度 nginx 升级实际执行的那份。/etc/bgpeer 下的只是菜单每次
+    拉新的缓存副本 —— 报它的话，屏上写着新版、常驻的东西却还在跑旧代码。
+    """
+    for f in ("/usr/local/sbin/net-optimize.py", NETOPT_LOCAL):
+        try:
+            m = re.search(r'^VERSION = "([^"]+)"', open(f, encoding="utf-8").read(), re.M)
+        except OSError:
+            continue
+        if m:
+            return m.group(1)
+    return ""
+
+
 def net_optimize_menu():
     """网络优化（本仓库 net-optimize.py：BBR/QoS/缓冲区等内核调优，依赖工具自动安装）。"""
     G, N, MARK = "\033[1;32m", "\033[0m", "  \033[1;32m← 当前\033[0m"
@@ -4594,8 +4611,10 @@ def net_optimize_menu():
         m2 = MARK if (mode == "adaptive" and mb is not None and not is_10) \
             or mode == "fixed_burst" else ""
         m3 = MARK if mode == "fixed_cake" else ""
+        _v = _netopt_version()
         print("\n" + "=" * 60)
-        print("  网络优化（BBR / QoS 内核调优，依赖工具自动安装）")
+        print("  网络优化（BBR / QoS 内核调优，依赖工具自动安装）"
+              + (f"  {G}v{_v}{N}" if _v else "  （未安装）"))
         print("=" * 60)
         print(f"  当前档位: {G}{cur}{N}")
         print("-" * 60)
