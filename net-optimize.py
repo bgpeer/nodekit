@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.4.1"
+VERSION = "4.4.2"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1455,16 +1455,36 @@ def _ping_with_df():
 
 
 def _tracepath_mtu(targets=("1.1.1.1", "8.8.8.8")):
-    """没有能用的 ping 时的兜底：tracepath 自己会打出 pmtu。返回 0 表示没问到。"""
+    """没有能用的 ping 时的兜底：tracepath 自己会打出 pmtu。返回 0 表示没问到。
+
+    【必须限跳数】tracepath 默认走满 30 跳，路上只要有几跳不回包就一路干等，
+    很容易超过超时。而 run() 在超时那一刻会把【已经拿到的输出整个丢掉】，返回
+    空串 —— 于是这里什么也匹配不到，静默返回 0，调用方就回落到默认 MSS。
+    现场撞到的就是这个：机器上装着 tracepath、手动跑也确实能打出 pmtu 1500，
+    但从这里调就永远是 0。
+
+    【为什么限 12 跳够用】pmtu 是由路上最窄的那一跳宣告的，而收窄通常发生在
+    靠近本端的接入段（隧道、PPPoE）。走满 30 跳只是为了看清远端拓扑，对量 MTU
+    没有额外收益，却把耗时拉长一个量级。
+
+    【超时就当没量到，不拿半截输出凑数】半截输出里最后一个 pmtu 可能只是本机
+    网卡那条（第一行就是），后面更窄的跳还没走到。拿它去做 MSS clamp 是【往大了
+    报】—— 而 MSS 报大了会直接造成黑洞，比报小了坏得多。所以宁可返回 0 走默认值。
+    """
     if not have_cmd("tracepath"):
         return 0
     best = 0
     for t in targets:
-        r = run(["tracepath", "-n", t], timeout=30)
-        m = re.findall(r"pmtu (\d+)", (r.stdout or "") + (r.stderr or ""))
-        if m:
-            v = int(m[-1])
-            best = v if not best else min(best, v)
+        # 老版本的 tracepath 不认 -m 就退回不带参数的写法
+        for args in (["-n", "-m", "12", t], ["-n", t]):
+            r = run(["tracepath"] + args, timeout=60)
+            if r.returncode == 124:          # 超时：见上面「不拿半截凑数」
+                continue
+            m = re.findall(r"pmtu (\d+)", (r.stdout or "") + (r.stderr or ""))
+            if m:
+                v = int(m[-1])
+                best = v if not best else min(best, v)
+                break
     return best
 
 
@@ -1519,11 +1539,19 @@ def setup_mss_clamping():
             mss = mtu - 40
             echo(f"✅ 路径 MTU 探测: {mtu} → MSS={mss}")
         elif not _p:
-            # 【这两种原因要分开说】"ping 不支持 -M" 和 "ICMP 被挡" 的处方完全不同：
-            # 前者装个 iputils-ping 就好，后者要去看防火墙。混成一句会把人带偏。
+            # 【这几种原因要分开说】"ping 不支持 -M"、"有 tracepath 但也没量出来"、
+            # "ICMP 被挡" 的处方完全不同，混成一句会把人带偏。
+            # 【现场踩过】机器上装着 tracepath，却照样打"也没有 tracepath 兜底" ——
+            # 照着这句去装 tracepath，装了也没用，因为它本来就在。
             echo(f"ℹ️ 这台机的 ping 用不了 -M do（多半是 inetutils/busybox 版），"
-                 f"也没有 tracepath 兜底，使用默认 MSS={mss}")
-            echo(f"   想让它自动探准：apt install -y iputils-ping 后重跑本模块")
+                 f"使用默认 MSS={mss}")
+            if have_cmd("tracepath"):
+                echo("   tracepath 在，但也没量出 pmtu。手动跑一下看它说什么：")
+                echo("     tracepath -n -m 12 1.1.1.1")
+            else:
+                echo("   也没有 tracepath 兜底。二选一：")
+                echo("     apt install -y iputils-ping        # 装完重跑本模块")
+                echo("     apt install -y iputils-tracepath   # 或者用 tracepath")
         else:
             echo(f"ℹ️ 路径 MTU 探测失败（ICMP 不通），使用默认 MSS={mss}")
     Cfg.MSS_VALUE = mss
