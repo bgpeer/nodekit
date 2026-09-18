@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.2.1"
+VERSION = "4.2.2"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -79,7 +79,11 @@ ADAPTIVE_CONF = f"{CONFIG_DIR}/adaptive-qos.conf"
 SYSCTL_AUTH_FILE = "/etc/sysctl.d/99-net-optimize.conf"
 SYSCTL_OVERRIDE_FILE = "/etc/sysctl.d/zzz-net-optimize-override.conf"
 SYSCTL_BACKUP_DIR = f"{CONFIG_DIR}/sysctl-backup"
-CONNTRACK_MODULES_CONF = "/etc/modules-load.d/conntrack.conf"
+# 【必须带 net-optimize 前缀】这个文件名以前是通用的 conntrack.conf：别的软件
+# 只要也用这个名字，装本模块就会把人家的盖掉，--reset 还会无条件删掉它 ——
+# 删的是一个我们可能压根没创建过的文件。其余所有落盘文件都带前缀，就它没带。
+CONNTRACK_MODULES_CONF = "/etc/modules-load.d/net-optimize-conntrack.conf"
+CONNTRACK_MODULES_CONF_OLD = "/etc/modules-load.d/conntrack.conf"  # 老装机遗留，迁移用
 BOOT_SERVICE = "net-optimize"
 ADAPTIVE_QOS_SERVICE = "net-optimize-adaptive-qos"
 NGINX_LOG = "/var/log/nginx-auto-upgrade.log"
@@ -1065,6 +1069,10 @@ def setup_conntrack():
                "# Net-Optimize: conntrack/nat modules\n" +
                "".join(f"{m}\n" for m in CONNTRACK_MODULES))
     echo(f"  ✅ 已写入开机模块加载: {CONNTRACK_MODULES_CONF}")
+    # 老装机留下的通用名那份：只有确认是本模块写的才删，别人的同名文件不碰
+    if "Net-Optimize" in read_text(CONNTRACK_MODULES_CONF_OLD):
+        _rm(CONNTRACK_MODULES_CONF_OLD)
+        echo(f"  🧹 已清理旧文件名：{CONNTRACK_MODULES_CONF_OLD}")
     write_text(MODULES_FILE, "".join(f"{m}\n" for m in sorted(set(CONNTRACK_MODULES))))
     run(["systemctl", "restart", "systemd-modules-load"], timeout=30)
 
@@ -1311,9 +1319,18 @@ def setup_mptcp():
 
 # === 自动检测线路质量 + initcwnd 调整 ===
 def ping_avg_rtt(target):
-    r = run(["ping", "-c", "3", "-W", "2", target], timeout=20)
-    m = re.search(r"= [\d.]+/([\d.]+)/", r.stdout)
-    return float(m.group(1)) if m else 0.0
+    """到 target 的平均 RTT（毫秒）。量不到返回 0.0。
+
+    【-W 不是所有 ping 都有】和 -M 一样：iputils 有，inetutils / busybox 不一定。
+    带 -W 被拒的话整条命令失败、一个 RTT 都量不到，而调用方会把这个 0 当成
+    「RTT 真的很低」。所以退一步用不带 -W 的形式再试一次 —— timeout= 那层
+    本来就兜着，不会卡住。"""
+    for extra in (["-W", "2"], []):
+        r = run(["ping", "-c", "3"] + extra + [target], timeout=20)
+        m = re.search(r"=\s*[\d.]+/([\d.]+)/", r.stdout)
+        if m:
+            return float(m.group(1))
+    return 0.0
 
 
 def apply_initcwnd_routes(cwnd):
@@ -1347,13 +1364,22 @@ def setup_initcwnd():
     if Cfg.AGGRESSIVE_MODE:
         initcwnd = 64
         echo("  ⚡ 激进模式: initcwnd=64（最大初始窗口）")
+    elif not rtts:
+        # 【量不到 ≠ RTT 很低】原来两种都归成 avg_rtt=0，于是屏上打「平均 RTT: 0ms」
+        # 看着像量出来的，而实际是三个目标一个都没通（ICMP 被挡、或这台机的 ping
+        # 不认 -W）—— 而 0 恰好落进「<50ms」那一档，静默取了最保守的 20。
+        # 说实话，并且取中间档：不知道线路好坏时，30 比 20 更不容易吃亏。
+        initcwnd = 30
+        echo("  ⚠️ 三个目标的 RTT 一个都没量到（ICMP 被挡，或这台机的 ping 不认 -W）")
+        echo(f"  ℹ️ 按中间档取 initcwnd={initcwnd}（不是测出来的，只是默认值）")
     elif avg_rtt > 150:
         initcwnd = 50
     elif avg_rtt > 50:
         initcwnd = 30
     else:
         initcwnd = 20
-    echo(f"  ℹ️ 平均 RTT: {avg_rtt}ms → initcwnd={initcwnd}")
+    if rtts:
+        echo(f"  ℹ️ 平均 RTT: {avg_rtt}ms（{len(rtts)}/3 个目标通）→ initcwnd={initcwnd}")
 
     got4, got6 = apply_initcwnd_routes(initcwnd)
     if got4:
@@ -2412,6 +2438,9 @@ def cmd_reset():
     # [6] conntrack
     echo("🔧 [6] 清理 conntrack 配置...")
     _rm(CONNTRACK_MODULES_CONF)
+    # 老装机的通用名那份：确认是本模块写的才删 —— 无条件删会误伤别人的同名文件
+    if "Net-Optimize" in read_text(CONNTRACK_MODULES_CONF_OLD):
+        _rm(CONNTRACK_MODULES_CONF_OLD)
     _rm("/etc/modprobe.d/net-optimize-conntrack.conf")
     echo("  ✅ 已删除 conntrack 开机加载 / hashsize 配置")
 
