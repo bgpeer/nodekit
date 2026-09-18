@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.109"
+SCRIPT_VERSION = "1.5.110"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10886,8 +10886,10 @@ LINK_SWITCHES = (
     ("link_method", "画质",
      (("download",  "原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                                "跨境线路上 4K 原盘经常拉不动"),
-      ("streaming", "转码流",   "网盘自己转码后的流，码率低一个量级，卡的时候选它；"
-                               "转码在网盘那边做，不吃本机 CPU"))),
+      ("streaming", "转码流",   "⚠ Emby 里播不了（只对 OpenList 网页播放器有用）："
+                               "转码流是 m3u8，分片写的是相对路径，播放器会把它拼到"
+                               "/emby/Videos/<id>/ 上，分片请求全打回 Emby → 401 → "
+                               "一直转圈。实测日志里每秒好几条 401"))),
     ("download_api", "取直链的接口",
      (("official",    "官方接口",   "网盘官方的下载接口，最稳；有的账号会被它限速"),
       ("crack",       "非官方接口", "绕开官方那条，速度常常快一截；网盘一改就失效"),
@@ -12361,13 +12363,17 @@ def apply_drive_defaults(d, quiet=False):
 
     默认值不是拍脑袋定的，是从驱动的实现里推出来的：
 
-      · 夸克 / UC 的 TV 驱动 → 转码流。QuarkTV 的 Link() 里留了个岔路口，
-        link_method=streaming 时直接返回转码流；跨境线路上这个开关经常是决定性的 ——
-        同一个 4K 文件原画拉不动、转码流很流畅。
       · WebDAV / local / crypt → 本机代理 + 伪装成浏览器。这三类在网盘侧压根没有
         CDN 直链，本机代理是它们唯一的路；而字节一旦经过本机，Emby 的探测（ffmpeg
         的 UA）就会被上游按 UA 挡掉，条目永远探不到音视频轨、点开 load fail。
-      · 阿里：OpenList 的默认（原画直链 · 开放平台接口）就是对的，不动。
+      · 有 CDN 直链的盘（夸克、阿里、115）：OpenList 自己的默认就是对的，不动。
+
+    【曾经把夸克默认设成转码流，那是个错的默认值】理由是"跨境线路上原画拉不动、
+    转码流很流畅"，而那个结论来自 OpenList 的【网页播放器】。Emby 这条路上
+    转码流【根本走不通】：302 过去的是 m3u8，而 m3u8 里的分片是相对路径，播放器
+    会把它拼到自己以为的基址（`/emby/Videos/<id>/`）上，于是分片请求全打回 Emby，
+    一路 401，播放器一直转圈。见 QUALITY_KEYS 那段的警告。
+    拿 A 场景的实测结论去定 B 场景的默认值，而且没验证过 B —— 这个教训写在这儿。
 
     【只在第一次见到时设】设完把挂载点记进状态文件，以后这个盘不管被改成什么都不再碰。
     替用户做一次选择是帮忙，反复把他的选择改回来是耍流氓。
@@ -12376,13 +12382,10 @@ def apply_drive_defaults(d, quiet=False):
     rows = [r for r in _storage_rows(d) if r[1] and r[1] != "/" and r[1] not in seen]
     if not rows:
         return 0
-    trans, proxy, ua, said = [], [], [], []
+    proxy, ua, said = [], [], []
     for sid, mp, drv, add, cols in rows:
         low = str(drv or "").lower()
         did = []
-        if add.get("link_method") not in (None, "streaming"):
-            trans.append((sid, mp))
-            did.append("转码流")
         if low in PROXY_ONLY_DRIVERS and not _truthy(cols.get("web_proxy")):
             proxy.append((sid, mp))
             did.append("本机代理")
@@ -12403,8 +12406,6 @@ def apply_drive_defaults(d, quiet=False):
         for mp, did in said:
             print(f"  {DIM}·{RST} {pad(mp, 18)}{CYAN}{' · '.join(did)}{RST}")
         print(f"  {DIM}这几档是实测能播的那一套。想换：4 挂载路径 → 选盘 → 3 直链方式。{RST}")
-    if trans:
-        _write_addition(d, trans, {"link_method": "streaming"})
     if proxy:
         _write_storage(d, proxy, columns={"web_proxy": 1,
                                           "webdav_policy": "native_proxy"})
@@ -14618,6 +14619,22 @@ def do_healthcheck():
     lms = link_method_storages(d)
     if lms:
         cur = lms[0][3]
+        # 【转码流在 Emby 里是播不了的，必须报出来】这个症状在客户端上只有"一直转圈"，
+        # 而真相埋在日志里：m3u8 的分片是相对路径，被播放器拼回 /emby/Videos/<id>/，
+        # 于是每秒好几条 401。不看日志根本联想不到画质开关。
+        _hls = [mp for _s, mp, _d, add, _c in _storage_rows(d)
+                if str(add.get("link_method") or "") == "streaming"]
+        if _hls:
+            _hc("画质开关", "bad",
+                f"{'、'.join(_hls)} 设的是{YELLOW}转码流{RST}  "
+                f"{YELLOW}Emby 里播不了，一直转圈{RST}")
+            todo.append((
+                f"{'、'.join(_hls)} 的画质开关是「转码流」——那条路 Emby 走不通",
+                "转码流给出的是 m3u8，而 m3u8 里的分片写的是相对路径；播放器会把它拼到"
+                "「/emby/Videos/<条目id>/」上，于是分片请求全打回 Emby，一路 401，"
+                "客户端表现就是一直转圈（日志里每秒好几条 401 能看到）。"
+                "它只对 OpenList 网页播放器有用——那边基址就是网盘，解析得对。"
+                "改法：4 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链"))
         _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
                              f"{DIM}（卡顿就去 4 挂载路径 → 选那个盘 → 2 切换）{RST}")
     if key:
