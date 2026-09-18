@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.4.2"
+VERSION = "4.4.3"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1398,7 +1398,11 @@ def setup_initcwnd():
 
     rtts = [r for r in (ping_avg_rtt(t) for t in ("1.1.1.1", "8.8.8.8", "9.9.9.9"))
             if r > 0]
-    avg_rtt = int(sum(rtts) / len(rtts)) if rtts else 0
+    # 【显示留一位小数】LA 这类机房到 1.1.1.1 不到 1ms，int() 截完就是 0，
+    # 屏上打「平均 RTT: 0ms」跟"一个都没量到"长得一模一样，看的人分不出来。
+    # 分档还是用整数，只是别让显示骗人。
+    avg_f = (sum(rtts) / len(rtts)) if rtts else 0.0
+    avg_rtt = int(avg_f)
 
     # 普通模式: <50ms→20 / 50-150ms→30 / >150ms→50；激进模式一律 64
     if Cfg.AGGRESSIVE_MODE:
@@ -1419,7 +1423,7 @@ def setup_initcwnd():
     else:
         initcwnd = 20
     if rtts:
-        echo(f"  ℹ️ 平均 RTT: {avg_rtt}ms（{len(rtts)}/3 个目标通）→ initcwnd={initcwnd}")
+        echo(f"  ℹ️ 平均 RTT: {avg_f:.1f}ms（{len(rtts)}/3 个目标通）→ initcwnd={initcwnd}")
 
     got4, got6 = apply_initcwnd_routes(initcwnd)
     if got4:
@@ -2026,6 +2030,53 @@ def cmd_nginx_upgrade():
     logf.close()
 
 
+_APT_SRC_EXT = (".list", ".sources")
+_DISABLED_SUFFIX_RE = re.compile(r"(\.disabled\.[0-9-]+)+$")
+
+
+def _apt_ondrej_nginx_files():
+    """还在【生效中】的 ondrej/nginx 源文件。
+
+    【只认 .list / .sources】apt 只读这两种后缀；禁用过的文件叫
+    xxx.sources.disabled.<ts>，本来就不该再被算进来。
+
+    【原来这里是个会自己撑爆的 bug】老版用 *ondrej*nginx* 一把捞，把已经禁用的
+    也捞了回来 —— 于是 has_ondrej 永远为真、每跑一次就再给同一个文件接一截
+    .disabled.<ts>，文件名一次长 24 个字符。现场那台堆到第九层撞上 255 字节上限，
+    os.rename 抛 ENAMETOOLONG，把整个优化流程打断在 nginx 这一步。
+    """
+    out = []
+    for f in sorted(glob.glob("/etc/apt/sources.list.d/*")):
+        if not f.endswith(_APT_SRC_EXT):
+            continue
+        b = os.path.basename(f)
+        if ("ondrej" in b and "nginx" in b) or \
+                "ppa.launchpadcontent.net/ondrej/nginx" in read_text(f):
+            out.append(f)
+    return out
+
+
+def _tidy_disabled_apt_sources():
+    """把历史上反复改名堆出来的超长文件名收回单层（只留最早那次的时间戳）。
+
+    glob 修好之后不会再长，但已经长出来的那个名字会一直挂在那儿 —— 而且只要它还
+    在，任何再对它做 rename 的代码都会继续撞 ENAMETOOLONG。
+    """
+    for f in glob.glob("/etc/apt/sources.list.d/*.disabled.*"):
+        marks = re.findall(r"\.disabled\.[0-9-]+", f)
+        if len(marks) <= 1:
+            continue                                   # 已经是单层
+        tidy = _DISABLED_SUFFIX_RE.sub(marks[0], f)     # 留最早那次
+        try:
+            if os.path.exists(tidy):
+                _rm(f)
+            else:
+                os.rename(f, tidy)
+                echo(f"  🧹 收拢重复的禁用后缀：{os.path.basename(tidy)}")
+        except OSError as e:
+            echo(f"  ⚠️ 收拢 {os.path.basename(f)[:40]}... 失败：{e}")
+
+
 def fix_nginx_repo(install_if_missing=False):
     """配 nginx.org 官方源；已装 nginx 就升级并挂月度自动升级。
 
@@ -2100,28 +2151,31 @@ def fix_nginx_repo(install_if_missing=False):
             echo("✅ 已设置 nginx.org Pin=1001，官方源优先")
 
     # 3) ondrej/nginx PPA：可用保留，失效禁用（仅 Ubuntu）
-    if distro == "ubuntu":
-        has_ondrej = bool(glob.glob("/etc/apt/sources.list.d/*ondrej*nginx*"))
-        if not has_ondrej:
-            for f in glob.glob("/etc/apt/sources.list.d/*"):
-                if "ppa.launchpadcontent.net/ondrej/nginx" in read_text(f):
-                    has_ondrej = True
-                    break
-        if has_ondrej:
-            ppa_codename = run(["lsb_release", "-sc"], timeout=10).stdout.strip() or codename
-            url = (f"https://ppa.launchpadcontent.net/ondrej/nginx/ubuntu/"
-                   f"dists/{ppa_codename}/Release")
-            if sh(f"curl -fsSL --max-time 8 {shlex.quote(url)} >/dev/null",
-                  timeout=15).returncode == 0:
-                echo("ℹ️ 已检测到 ondrej/nginx PPA 源，可用，共存保留")
-            else:
-                for f in glob.glob("/etc/apt/sources.list.d/*ondrej*nginx*"):
-                    os.rename(f, f"{f}.disabled.{ts}")
-                echo("ℹ️ ondrej/nginx PPA 已失效，已自动禁用，避免污染 apt update")
-        else:
-            echo("ℹ️ 未检测到 ondrej/nginx PPA，仅使用 nginx.org 官方源 + 系统源")
-    else:
+    # 【整段包起来】这一步纯属给 apt 清场，出什么岔子都不该把整个内核调优打断 ——
+    # 现场就是在这儿抛 ENAMETOOLONG，把后面几步全带停了。
+    if distro != "ubuntu":
         echo("ℹ️ 非 Ubuntu 系统，跳过 ondrej/nginx PPA 检查")
+    else:
+        try:
+            _tidy_disabled_apt_sources()
+            actives = _apt_ondrej_nginx_files()
+            if not actives:
+                echo("ℹ️ 未检测到生效中的 ondrej/nginx PPA，仅用 nginx.org 官方源 + 系统源")
+            else:
+                ppa_codename = run(["lsb_release", "-sc"],
+                                   timeout=10).stdout.strip() or codename
+                url = (f"https://ppa.launchpadcontent.net/ondrej/nginx/ubuntu/"
+                       f"dists/{ppa_codename}/Release")
+                if sh(f"curl -fsSL --max-time 8 {shlex.quote(url)} >/dev/null",
+                      timeout=15).returncode == 0:
+                    echo("ℹ️ 已检测到 ondrej/nginx PPA 源，可用，共存保留")
+                else:
+                    for f in actives:
+                        os.rename(f, f"{f}.disabled.{ts}")
+                    echo(f"ℹ️ ondrej/nginx PPA 已失效，已禁用 {len(actives)} 个源文件，"
+                         "避免污染 apt update")
+        except Exception as e:  # noqa
+            echo(f"⚠️ 处理 ondrej/nginx PPA 时出错，已跳过（不影响其余优化）：{e}")
 
     # 4) 装了才升级；没装且调用方没要求装，就到此为止
     if not have_cmd("nginx") and not install_if_missing:
