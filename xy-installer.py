@@ -110,7 +110,7 @@ CNBLOCK_FILE   = BGP_DIR + "/cnblock.json"       # cn-block.py 存的状态（�
 CN_BLOCK_LOCAL = BGP_DIR + "/cn-block.py"        # 本地缓存的 cn-block.py
 CN_BLOCK_URL   = _RAW + "cn-block.py"            # 仓库里的 cn-block.py（每次尽量拉最新）
 ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.py
-ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（去广告 DNS·AdGuard Home）
+ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（自建 DNS·AdGuard Home）
 MEDIA_LOCAL    = BGP_DIR + "/media-stack.py"     # 本地缓存的 media-stack.py
 MEDIA_URL      = _RAW + "media-stack.py"         # 仓库里的 media-stack.py（自建 Emby·网盘直链）
 SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
@@ -4079,7 +4079,7 @@ def _uninstall_core():
     sh(f"rm -f {NGINX_STREAM_CONF}", check=False)
     if have("nginx"):
         sh("nginx -t && systemctl reload nginx", check=False)
-    if os.path.exists("/opt/AdGuardHome/AdGuardHome"):   # 去广告 DNS（AdGuard Home）一并撤掉——它的 DoT 靠 /etc/ssl/sb 证书，证书这里会删
+    if os.path.exists("/opt/AdGuardHome/AdGuardHome"):   # 自建 DNS（AdGuard Home）一并撤掉——它的 DoT 靠 /etc/ssl/sb 证书，证书这里会删
         sh("/opt/AdGuardHome/AdGuardHome -s uninstall", check=False)
         sh("systemctl stop AdGuardHome", check=False)
         sh("rm -rf /opt/AdGuardHome", check=False)
@@ -4161,7 +4161,7 @@ def cn_block_menu():
     subprocess.run(f"python3 {CN_BLOCK_LOCAL}", shell=True)
 
 def adguard_menu():
-    """打开独立的 adguard-dns.py 交互菜单（去广告 DNS · AdGuard Home）。"""
+    """打开独立的 adguard-dns.py 交互菜单（自建 DNS · AdGuard Home）。"""
     if not ensure_remote_script(ADGUARD_URL, ADGUARD_LOCAL):
         print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
     subprocess.run(f"python3 {ADGUARD_LOCAL}", shell=True)
@@ -8009,7 +8009,7 @@ def main_menu():
         print("  10. 屏蔽中国域名和IP（可做白名单放行）")
         print("  11. BT/PT 下载屏蔽（防 VPS 被投诉封机）")
         print("  12. 网络优化（BBR/QoS 内核调优）")
-        print("  13. 自建DNS（AdGuard Home·全设备去广告）")
+        print("  13. 自建DNS（AdGuard Home·自己的解析服务器，兼带广告过滤）")
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
         print("  15. 证书管理（状态 / 安装 / 换域名 / 重签）")
         print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
