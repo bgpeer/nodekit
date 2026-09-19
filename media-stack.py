@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.118"
+SCRIPT_VERSION = "1.5.119"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11207,6 +11207,16 @@ SOURCE_MODES = (
      {"web_proxy": 1, "webdav_policy": "native_proxy"}),
 )
 
+# 【这一句是给"为什么这个盘没有 302 直链可选"准备的】
+# WebDAV / FTP / SFTP / SMB / local / crypt 这几类，凭据是跟着请求头走的，
+# 播放器发不出那个头 —— 所以不是"我们没做"，是发不出一条播放器拿得走的地址。
+# 三句话要答全，因为人问的就是这三件事：为什么没得选、是不是哪次改动弄的、还有没有别的路。
+PROXY_ONLY_WHY = (
+    "这个盘没得选：凭据跟在请求头里，播放器发不出，拿不到能直连的地址，"
+    "字节只能经 VPS 转手。从挂上它那天起就这样，不是哪次改动弄的。"
+    "要省流量：换个有 CDN 直链的源；或先跑 tools/dav-upstream.sh 看上游给不给 302"
+)
+
 
 # 【这一项是 nginx 层的，不写进 OpenList 的库】它决定 Emby 的探测（ffprobe）在上游
 # 眼里长什么样。开关按盘存在脚本自己的状态文件里，见 ua_spoof_mounts。
@@ -11291,8 +11301,20 @@ def drive_links(d, mp, drv=""):
                     tuple((k, n, w) for k, (n, w, _p) in ALIPAN_TYPES.items()),
                     str(add.get("alipan_type") or "default")))
     if any(k in cols for k in ("web_proxy", "webdav_policy")):
-        out.append(("__source__", "source", "回源方式",
-                    tuple((k, n, w) for k, n, w, _u in SOURCE_MODES),
+        # 【没得选的盘，就别把选项摆在那儿】WebDAV / FTP / SFTP / SMB / local / crypt
+        # 的凭据在 Authorization 头里，播放器发不出那个头，所以 OpenList 根本发不出
+        # 一条能用的公网地址 —— 对这些盘「302 直链」不是"更省流量的一档"，
+        # 是"选了就播不了"。摆着它等于给一个假开关，而这个函数正下方那段注释
+        # （UA 开关那段）写的就是这条规矩：宁可少给，绝不给一个假的。
+        #
+        # 但也【不能整项藏掉】—— 藏了人只会以为这个盘没这个功能，跑去别处找，
+        # 或者以为是哪次升级弄丢的。所以留下能用的那一个，把"为什么没得选"
+        # 写进它的说明，人点进去看见的是答案，不是陷阱。
+        _po = str(drv2 or drv or "").lower() in PROXY_ONLY_DRIVERS
+        _src = tuple((k, n, PROXY_ONLY_WHY if _po and k == "proxy" else w)
+                     for k, n, w, _u in SOURCE_MODES
+                     if not (_po and k == "direct"))
+        out.append(("__source__", "source", "回源方式", _src,
                     "proxy" if _truthy(cols.get("web_proxy")) else "direct"))
     # 【只给代理型的盘】视频字节经本机 nginx 流向上游的，才有"换 UA"这回事。
     # 夸克、阿里这类有 CDN 直链的盘，Emby 是跟着 302 直接去网盘 CDN 的 ——
