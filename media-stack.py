@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.111"
+SCRIPT_VERSION = "1.5.112"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10920,11 +10920,10 @@ QUALITY_KEYS = ("link_method", "use_transcoding_address")
 # 和在播放器里走的是两条不同的路，出了问题根本对不上。
 SOURCE_MODES = (
     ("direct", "302 直链",
-     "视频从播放器直连网盘，不经过 VPS 带宽（默认；这套东西的意义就在这儿）",
+     "播放器直连网盘，不占你的带宽（默认）",
      {"web_proxy": 0, "webdav_policy": "302_redirect"}),
     ("proxy", "本机代理",
-     "每个字节先过你的 VPS 再转给播放器：吃双份带宽、也更慢。"
-     "但直链绑 IP / 绑 UA 的盘只有这条路能播",
+     "字节先过 VPS 再转给播放器；直链绑 IP / 绑 UA 的盘只有这条路能播",
      {"web_proxy": 1, "webdav_policy": "native_proxy"}),
 )
 
@@ -10943,21 +10942,26 @@ UA_SPOOF_MODES = (
 )
 
 
-# 【哪些选项要在名字后面直接挂一句黄字】
-# 写在说明里不算数 —— 那几行人会跳过。而「这一项要花你的流量」「这一项 Emby 里播
-# 不了」属于【选下去之前必须看见】的那类。仓库主人的原话：「不提示人家的流量少消耗
-# 完了会找麻烦的」。
+# 【选项名后面直接挂一小句，好的坏的都挂】
+# 写在说明里不算数 —— 那几行人会跳过。而「这一项要花你的流量」属于【选下去之前必须
+# 看见】的那类。仓库主人的原话：「不提示人家的流量少消耗完了会找麻烦的」。
 #
-# 挂在两处：选项列表里（选之前），和当前值那一行（选完之后回头看）。
-OPT_WARN = {
-    ("__source__", "proxy"):     "走 VPS 流量",
-    ("link_method", "streaming"): "Emby 里播不了",
+# 【两边都要挂】只给「本机代理」挂警告、另一边空着，那另一边就成了"不知道"——
+# 人得自己推。两边各一句，一眼就能比。
+#
+# 挂三处：选项列表（选之前）、当前值那一行（选完回头看）、挂载路径那一屏
+# （几个盘并排，那才是"我这几个盘各是什么情况"的地方）。
+OPT_TAG = {
+    ("__source__", "direct"):     (GREEN,  "不走 VPS 流量"),
+    ("__source__", "proxy"):      (YELLOW, "⚠ 走 VPS 流量"),
+    ("link_method", "streaming"): (YELLOW, "⚠ Emby 里播不了"),
 }
 
 
-def opt_warn(key, val):
-    """这个开关的这个取值要不要当场挂一句黄字。没有就返回空串。"""
-    return OPT_WARN.get((key, val), "")
+def opt_tag(key, val):
+    """屏上挂的那一小句，已经带好颜色。没有就返回空串。"""
+    col, txt = OPT_TAG.get((key, val), ("", ""))
+    return f"  {col}{txt}{RST}" if txt else ""
 
 
 def drive_links(d, mp, drv=""):
@@ -12436,12 +12440,8 @@ def apply_drive_defaults(d, quiet=False):
         # 没有 CDN 直链），可"没得选"不等于"不用告诉人家"。等别人流量跑光了才发现
         # 是这套脚本替他做的决定，那是我们的锅。
         if proxy:
-            print(f"  {YELLOW}⚠ 本机代理 = 这个盘的视频【全程走你的 VPS 出口流量】"
-                  f"{RST}")
-            print(f"  {DIM}这类驱动（WebDAV 源 / 本地目录 / 加密层）在网盘侧根本没有"
-                  f"CDN 直链，OpenList 只能自己转 —— 不是为了快，是不这样播不了。{RST}")
-            print(f"  {DIM}有 CDN 直链的盘（夸克 / 阿里 / 115）一律保持直连网盘，"
-                  f"不占你的流量。{RST}")
+            print(f"  {YELLOW}⚠ 本机代理 = 视频全程走你的 VPS 流量{RST}"
+                  f"{DIM}（这类驱动在网盘侧没有 CDN 直链，只有这一条路）{RST}")
         print(f"  {DIM}想换：4 挂载路径 → 选盘 → 3 直链方式。{RST}")
     if proxy:
         _write_storage(d, proxy, columns={"web_proxy": 1,
@@ -12464,9 +12464,8 @@ def _one_drive_link_menu(d, mp):
             ask("按回车返回...")
             return
         for i, (_k, _w, title, opts, cur) in enumerate(sw, 1):
-            _wt = opt_warn(_k, cur)
             print(f"  {i:>2}. {pad(title, 20)}当前：{CYAN}{_opt_name(opts, cur)}{RST}"
-                  + (f"  {YELLOW}⚠ {_wt}{RST}" if _wt else ""))
+                  + opt_tag(_k, cur))
         print("   0. 返回")
         print("-" * 60)
         c = ask("改哪一项").strip()
@@ -12483,9 +12482,7 @@ def _one_drive_link_menu(d, mp):
         print()
         for v, name, why in opts:
             star = f"  {GREEN}← 现在{RST}" if v == cur else ""
-            _wt = opt_warn(key, v)
-            print(f"  {DIM}·{RST} {BOLD}{name}{RST}"
-                  + (f"  {YELLOW}⚠ {_wt}{RST}" if _wt else "") + star)
+            print(f"  {DIM}·{RST} {BOLD}{name}{RST}" + opt_tag(key, v) + star)
             print(f"      {DIM}{why}{RST}")
         print()
         for j, (_v, name, _w) in enumerate(opts, 1):
@@ -12534,11 +12531,8 @@ def _one_drive_link_menu(d, mp):
             # 【这一步不能静默】切过去之后每一个字节都走他的 VPS 出口，而流量是要
             # 花钱的、也是会被跑光的。名字后面那句黄字是给"选之前"看的，这里再拦
             # 一道是给"真的按下去"那一刻看的。
-            warn(f"{mp} 切成本机代理之后，这个盘的视频会【全程走你的 VPS 出口流量】。")
-            print(f"  {DIM}看一部 1.5 GB 的片，就是 1.5 GB 出境流量。"
-                  f"流量包有限的话先算一下。{RST}")
-            print(f"  {DIM}换来的是：直链绑 IP / 绑 UA 的盘能播了、"
-                  f"客户端到网盘那一段的慢也绕开了。{RST}")
+            warn(f"{mp} 的视频会全程走你的 VPS 出口流量 —— 看一部 1.5 GB 的片，"
+                 f"就是 1.5 GB 出境。")
             if not ask_yn(f"确定把 {mp} 切成本机代理？", False):
                 print("没有改动。")
                 continue
@@ -12927,10 +12921,17 @@ def mount_paths_menu():
         # 【必须带挂载点，光有驱动名认不出是哪个盘】驱动名不唯一：挂两个 WebDAV
         # （一个公益源、一个自己的）时，这一列就是两行一模一样的「WebDAV」，
         # 点进去才知道是哪个。挂载点是用户自己在 OpenList 里起的名字，那才是他认得的那个。
+        # 【流量提示要在这一屏，不能非点进去才看见】这一屏才是"我这几个盘各是
+        # 什么情况"的地方。走不走 VPS 流量是选盘时最该一眼看到的事。
+        _vps = {m2: (_truthy(c2.get("web_proxy"))
+                     or str(d2 or "").lower() in PROXY_ONLY_DRIVERS)
+                for _s2, m2, d2, _a2, c2 in _storage_rows(d)}
         for i, (mp, drv, _st) in enumerate(stores, 1):
             where = _scan_of(mp)
             col = CYAN if where != "未加路径" else DIM
-            print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 30)}{col}{where}{RST}")
+            print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 26)}"
+                  f"{col}{pad(where, 18)}{RST}"
+                  + opt_tag("__source__", "proxy" if _vps.get(mp) else "direct"))
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
