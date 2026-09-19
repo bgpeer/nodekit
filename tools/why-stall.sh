@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19i"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19j"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -1034,6 +1034,81 @@ for label, u, hdr in routes:
             print(f"    {D}代理这条路上这笔钱能压：OpenList 设置 → 全局 → "
                   f"代理缓冲区大小（proxy buffer size）调大，它一次向上游多要一点、"
                   f"少要几次。调完回来再跑一遍这个脚本，看这个秒数有没有降。{X}")
+
+
+# ================= ④b 换个 UA，速度会不会变 =================
+# 【症状是"通了但慢一百倍"，不是"被拒"】cant-play.sh 的 ⑧ 按 UA 测过，可它量的是
+# 状态码；而这里所有 UA 大概率都回 206，只看状态码一点异常都看不出来。要量速度。
+UAS = (("浏览器（脚本一直用的）", UA),
+       ("Emby 的 ffprobe", "Lavf/59.27.100"),
+       ("Emby 安卓客户端", "Emby/1.4 (Android 13; ExoPlayerLib/2.18.1)"),
+       ("VLC / Infuse 那一类", "VLC/3.0.18 LibVLC/3.0.18"),
+       ("不带 UA", ""))
+
+
+def ua_speed(url, start, ua, secs=6, cap=4 << 20):
+    """拿这个 UA 拉一小段，量 Mbps。拿到 cap 或到点就撒手。"""
+    hdr = {"Range": f"bytes={start}-{start + cap - 1}"}
+    if ua:
+        hdr["User-Agent"] = ua
+    req = urllib.request.Request(url, headers=hdr)
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as rr:
+            got = 0
+            while time.time() - t0 < secs and got < cap:
+                b = rr.read(1 << 16)
+                if not b:
+                    break
+                got += len(b)
+            el = max(0.1, time.time() - t0)
+            return rr.status, got * 8 / el / 1e6
+    except urllib.error.HTTPError as e:
+        return e.code, 0.0
+    except Exception as e:
+        return str(e)[:22], 0.0
+
+
+_cdn = [(lb, u, h) for lb, u, h in routes
+        if not re.match(r"^[a-z]+://(127\.|localhost|openlist)", u)]
+if _cdn:
+    sec("④b 同一条直链，换几个 UA 各拉一次（比速度，不只看通不通）")
+    print(f"  {D}「脚本拉得动、手机拉不动」只剩两个变量：谁去拉（IP）、戴什么脸"
+          f"（User-Agent）。UA 这一条当场就能测 —— 五发各拉几秒，一共 20 MB。{X}")
+    _lb, _u, _h = _cdn[0]
+    _st = int((ol_size or (1 << 30)) * 0.2)
+    _res = []
+    for who, ua_s in UAS:
+        code, mbps = ua_speed(_u, _st, ua_s)
+        _res.append((who, code, mbps))
+        col = G if code in (200, 206) else R
+        print(f"    {who:<22}{col}{code}{X}  {C}{mbps:5.1f} Mbps{X}")
+        time.sleep(2)
+    _ok = [(w, m) for w, c, m in _res if c in (200, 206) and m > 0]
+    if len(_ok) >= 2:
+        _fast, _slow = max(_ok, key=lambda x: x[1]), min(_ok, key=lambda x: x[1])
+        if _fast[1] > _slow[1] * 3:
+            print(f"  {R}✖ 上游按 User-Agent 区别对待{X}"
+                  f"  {D}最快「{_fast[0]}」{_fast[1]:.1f}，"
+                  f"最慢「{_slow[0]}」{_slow[1]:.1f} —— 差 "
+                  f"{_fast[1] / max(_slow[1], 0.01):.0f} 倍{X}")
+            print(f"  {D}那就不是片子重、也不是线路慢，是它认脸。"
+                  f"能动的地方：这个盘的「探测 UA 改写」开关"
+                  f"（4 挂载路径 → 这个盘 → 伪装成浏览器），"
+                  f"它会把出去的 UA 换成浏览器那个。{X}")
+        else:
+            print(f"  {G}✔ 几个 UA 速度差不多{X}"
+                  f"  {D}（{_slow[1]:.1f} ～ {_fast[1]:.1f} Mbps）{X}")
+            print(f"  {B}那「脚本拉得动、手机拉不动」就只剩【谁去拉】这一个变量了{X}")
+            print(f"  {D}这条直链是 MediaWarp 在【你的 VPS 上】换来的。很多网盘的"
+                  f"下载链是认来源的：换链的那个 IP 拉得飞快，别的 IP 拿去就被限速。"
+                  f"手机是另一个 IP —— 这正好解释了为什么一改本机代理就流畅："
+                  f"那等于让换链的人和用链的人变成同一台机器。{X}")
+            print(f"  {D}这个脚本只有 VPS 这一个出口，验证不了 IP 那一头。"
+                  f"要自己验：手机浏览器打开挂载页面直接下同一个文件，"
+                  f"快 = 不认 IP，慢 = 认。{X}")
+    print(f"  {D}顺带：以前「转码流 + 302」能跑满，是因为转码流码率低一个量级 ——"
+          f"就算被限速也够播。那不代表这条链没被限，只代表限了也看不出来。{X}")
 
 
 # ================= ⑤ 结论 =================
