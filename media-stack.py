@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.113"
+SCRIPT_VERSION = "1.5.114"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -86,6 +86,17 @@ STRM_SUBDIR    = "cloud"
 STRM_PATH      = "/data/strm/" + STRM_SUBDIR
 
 # 服务子域名 → 本地端口。Emby 走 MediaWarp，不是 8096。
+# ── 转码流分片重定向（见 do_hls_fix 的说明）────────────────────────────────
+# 只在有盘设成转码流时才起。127.0.0.1 上监听，只有 nginx 够得着。
+HLS_PORT = 9010
+HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
+# 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
+# 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
+HLS_BASE_TTL = 300
+# 【只认长得像分片的】nginx 那条 location 用的是同一套后缀。多认一种就多一类
+# 请求被拉进这个服务，而这个服务的本分是"少管闲事"。
+HLS_SEG_EXT = ("ts", "m4s")
+
 SUBDOMAINS = [
     ("home", 3000,           "homepage",   "首页入口"),
     ("emby", MEDIAWARP_PORT, "emby",       "Emby"),
@@ -1249,6 +1260,11 @@ def gen_nginx_site(cfg):
     # 于是所有盘一起换脸：探测是过了上游的 UA 那一关，可紧接着一股脑打过去，上游
     # 改用频率限（体检那行从 403 变成 429），那个源上的一切都被限住，挂载页面跟着
     # 连不上。名单空的时候这一整段【一个字都不生成】—— 也就是回到没这个功能之前。
+    # 有没有盘在用转码流 —— 决定要不要生成那条分片 location（见下面 hls）
+    try:
+        hls_on = bool(hls_wanted(ms_install_dir()))
+    except Exception:
+        hls_on = False
     spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
     if spoof:
         # 两级判断，两个都成立才换：
@@ -1301,6 +1317,20 @@ def gen_nginx_site(cfg):
         ua = ("        # 只有开了开关的那几个盘 + 探测类 UA 才换，见文件开头的 map\n"
               "        proxy_set_header User-Agent       $ms_ua;\n"
               if sub == "list" and spoof else "")
+        # 【转码流的分片：本该去网盘，却被客户端拼回了 Emby】
+        # m3u8 里的分片写的是相对路径，Emby 客户端把它拼到自己请求的那个地址上
+        # （/emby/Videos/<id>/），于是全打回 Emby → 401 → 一直转圈。
+        # 这条 location 只拦【以 .ts/.m4s 结尾】的那一类，交给本机的小服务回一个
+        # 302 指回网盘 —— 视频字节仍然是客户端直连网盘拉的，VPS 只出一个头。
+        # 【没有盘用转码流就整段不生成】不给不用的人留一条指向不存在服务的路。
+        hls = (f"""
+    # 转码流的分片（见 media-stack.py 的 do_hls_fix）：只回 302，不过视频字节
+    location ~* ^/(?:emby/)?videos/[0-9]+/[^/]+\\.(?:ts|m4s)$ {{
+        proxy_pass http://127.0.0.1:{HLS_PORT};
+        proxy_set_header Host $host;
+        proxy_redirect off;
+    }}
+""" if sub == "emby" and hls_on else "")
         out.append(f"""
 server {{
 {listen_line}
@@ -1316,7 +1346,7 @@ server {{
     access_log {NGX_ACCESS_LOG};
 
     client_max_body_size 0;
-{a}
+{a}{hls}
     location / {{
         proxy_pass http://127.0.0.1:{port};
         proxy_http_version 1.1;
@@ -1725,6 +1755,150 @@ def heal_mediawarp_token():
     r = subprocess.run(["docker", "restart", "mediawarp"],
                        capture_output=True, timeout=120)
     return r.returncode == 0
+
+
+def hls_wanted(d):
+    """有没有盘设成转码流。没有就不该留这个服务。"""
+    try:
+        return [mp for _s, mp, _d, add, _c in _storage_rows(d)
+                if str(add.get("link_method") or "") == "streaming"]
+    except Exception:
+        return []
+
+
+def do_hls_fix():
+    """转码流的分片重定向：把被 Emby 客户端拼错的分片地址指回网盘。
+
+    【它补的是哪一环】转码流的 302 给的是 m3u8，而 m3u8 里的分片是【相对路径】。
+    Emby 客户端把相对路径拼到【它自己请求的那个地址】上（/emby/Videos/<id>/），
+    而不是拼到重定向之后的网盘地址上 —— 于是分片请求全打回 Emby，一路 401。
+
+    【为什么不去改写 m3u8】那得由 VPS 代取播放列表，而列表里的分片地址很可能按
+    【取列表的那个 IP】签发（夸克的下载直链就是这么绑的：同一条链 VPS 拉 8.3 Mbps、
+    手机拉 0.85 Mbps）。VPS 代取轻则签名对不上，重则每个字节都要再转一遍 ——
+    那就回到"吃 VPS 流量"了，等于白做。
+
+    所以这里【一个视频字节都不碰】：播放列表仍由客户端自己去网盘取（它自己的 IP，
+    签名对得上），本服务只在分片请求上回一个 302。VPS 全程只出几个头。
+
+    【坏了也不会更糟】拿不到地址就回 404 —— 跟今天的 401 一个结果。
+    """
+    import http.server
+
+    d = ms_install_dir()
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth") or ""
+    cache, lock = {}, threading.Lock()
+
+    def base_of(vid):
+        """这个条目的 m3u8 在哪个目录。问一次 MediaWarp，缓存 HLS_BASE_TTL 秒。"""
+        now = time.time()
+        with lock:
+            hit = cache.get(vid)
+            if hit and now - hit[1] < HLS_BASE_TTL:
+                return hit[0]
+        base = ""
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
+                f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
+                headers={"User-Agent": HTTP_UA})
+            op = urllib.request.build_opener(_NoRedirect)
+            try:
+                op.open(req, timeout=30).close()
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location") or ""
+                # 【只认 m3u8】原画那条 302 指的是一个完整文件，没有"同目录的分片"
+                # 这回事 —— 那种情况下什么都不该做，让它按 404 收场。
+                if ".m3u8" in loc.lower():
+                    head = loc.split("?", 1)[0]
+                    base = head[:head.rfind("/") + 1]
+        except Exception:
+            base = ""
+        with lock:
+            cache[vid] = (base, now)
+        return base
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "nginx"        # 不自报家门，跟别处口径一致
+        sys_version = ""
+
+        def log_message(self, *_a):
+            pass                        # 日志走 nginx 那份，这里不另堆
+
+        def _go(self):
+            m = re.match(r"^/(?:[Ee]mby/)?[Vv]ideos/(\d+)/(.+)$", self.path)
+            tail = m.group(2) if m else ""
+            ext = tail.split("?", 1)[0].rsplit(".", 1)[-1].lower()
+            if not m or ext not in HLS_SEG_EXT:
+                # 【不是分片就不接】nginx 本来就只把分片转进来；真漏进来别的，
+                # 回 404 也比瞎猜强 —— 这个服务的本分是少管闲事。
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            base = base_of(m.group(1))
+            if not base:
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(302)
+            self.send_header("Location", base + tail)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_HEAD = _go
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", HLS_PORT), H)
+    srv.daemon_threads = True
+    srv.serve_forever()
+
+
+def sync_hls_service(d, quiet=True):
+    """按"有没有盘用转码流"装上或停掉这个服务。返回它现在开着没有。
+
+    【按需装卸】不用转码流的人不该多一个常驻进程 —— 多一个进程就多一个故障点、
+    多一件要解释的事。
+    """
+    want = bool(hls_wanted(d))
+    have = os.path.exists(HLS_UNIT)
+    if want and not have:
+        try:
+            with open(HLS_UNIT, "w") as f:
+                f.write(f"""[Unit]
+Description=media-stack HLS segment redirector
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {os.path.realpath(__file__)} hlsfix
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+""")
+            sh("systemctl daemon-reload", timeout=60)
+            sh(f"systemctl enable --now {os.path.basename(HLS_UNIT)}", timeout=60)
+            if not quiet:
+                info("已起转码流分片重定向服务（只在有盘用转码流时存在）")
+        except Exception as e:
+            warn(f"装分片重定向服务失败（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
+            return False
+    elif not want and have:
+        try:
+            sh(f"systemctl disable --now {os.path.basename(HLS_UNIT)}", timeout=60)
+            os.remove(HLS_UNIT)
+            sh("systemctl daemon-reload", timeout=60)
+        except Exception:
+            pass
+        return False
+    elif want and have:
+        sh(f"systemctl restart {os.path.basename(HLS_UNIT)}", timeout=60)
+    return want
 
 
 def keepalive_state(d):
@@ -9929,6 +10103,13 @@ def do_strm(only=None):
     # 本来就要重启这些东西，而且人在屏幕前看着。
     apply_drive_defaults(d)
 
+    # 【顺手对一次转码流的分片重定向】有盘用转码流就该有这个服务，没有就不该留。
+    # 挂在这条路上：用户手点、本来就在重启这些东西，而且人在屏幕前看着。
+    try:
+        sync_hls_service(d)
+    except Exception:
+        pass
+
     # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
     # 之后再删再建，中间那段时间用户点进去就是 load fail。
     collapse_bluray_folders(d, only=only)
@@ -12558,6 +12739,20 @@ def _one_drive_link_menu(d, mp):
                            columns=next(u for k, _n, _w, u in SOURCE_MODES if k == val))
         else:
             _write_storage(d, [(sid, mp)], addition={key: val})
+            # 【切了画质就要跟着装/拆那个分片重定向服务】转码流在 Emby 里能不能播
+            # 全靠它；而不用转码流的人不该多一个常驻进程。nginx 那条 location 也
+            # 是跟着有没有盘用转码流生成的，所以两边一起刷。
+            if key == "link_method":
+                on = sync_hls_service(d)
+                cfg3 = rebuild_cfg_from_disk(d)
+                if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
+                    apply_nginx_site(cfg3)
+                if val == "streaming":
+                    if on:
+                        info("转码流的分片重定向已就绪 —— Emby 里现在能播转码流了")
+                    else:
+                        warn("分片重定向没起来，Emby 里播转码流还会转圈；"
+                             "挂载页面和外部播放器不受影响")
 
 
 def _scan_of(mp):
@@ -15642,6 +15837,8 @@ if __name__ == "__main__":
         # 三条 cron 子命令都先抢锁。cron.d 里已经用 flock -n 拦了一层，这里是
         # 第二层：flock 属于 util-linux，正常系统都有，但少了它就没人拦 ——
         # 而没人拦的后果实测过，是十个进程叠在一起把内存吃穿。锁在自己手里更稳。
+        elif arg == "hlsfix":             # systemd 起的常驻：转码流分片重定向
+            do_hls_fix()
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
                 _timed("链路保活", do_keepalive)
