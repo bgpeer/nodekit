@@ -30,13 +30,26 @@
 # 同一个文件还会走【两条路】各拉一遍 —— 网盘 CDN 直链、和经过你 VPS 的本机代理 ——
 # 好回答那个真正要决定的问题：这部片到底该走哪条。
 #
+# 【④ 那一段单独量"换一段要多少钱"，它比时间轴更要紧】上面这个模拟播放器缓冲有
+# 12 秒，足够把每次换段的等待盖过去 —— 它自己不卡，可真播放器缓冲小得多，而且
+# 开播探测、拖进度条、每次续缓冲都要重发请求，每发一次就交一次这个钱。所以④
+# 只量【从发出请求到第一个字节回来】用了多久，并且分两个维度看它贵在哪：
+#
+#   同样 8 MiB，换三个位置要 → 越靠后越慢 = 上游不支持真 Range，在空转到那个位置
+#   同样位置，换三种大小要   → 越大越慢   = 上游要把整段备齐才发
+#   两个都无关               → 这是【每发一次请求就交一次】的固定开销
+#
+# 最后那种最常见也最隐蔽：带宽明明够，可播放器每 4 秒要一段、每次停 2 秒，
+# 就只有三分之二的时间在传数据；要是客户端一次只要 1 秒的量，直接只剩三分之一。
+# 这一段只要首字节就撒手，六次加起来不到 1 MB。
+#
 # 只读，不改任何东西。
 #
 # 【要花多少流量】按播放码率拉，不是全速拉，所以大致就是「片子码率 × 秒数」。
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-18a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -465,12 +478,29 @@ def play(url, label, need, total_secs):
             "ttfb": tank.ttfb}
 
 
+def med(xs):
+    return sorted(xs)[len(xs) // 2] if xs else 0.0
+
+
 def verdict(rs, need):
     """把时间轴的形状翻译成一句人话。"""
     if not rs["started"]:
         return R, "这条路根本起不了播 —— 连 2 秒的缓冲都攒不满"
     dry = [i for i, (recv, left, on) in enumerate(rs["samples"])
            if on and recv == 0]
+    t = med(rs["ttfb"])
+    # 【"换段要等"这一条必须排在"没卡过"前面，这是上一版最坏的错】上一版把它压在
+    # stalls > 0 里面，于是出现过这样一屏：首字节中位 2.06 秒明明白白印在上面，
+    # 结论却是"全程没卡过"。原因是这个模拟播放器的缓冲上限有 12 秒 —— 12 秒的缓冲
+    # 足够把每次 2 秒的等待盖过去，它自己不卡，可真正的播放器缓冲小得多、而且
+    # 开播探测、拖进度条、每次续缓冲都要重发请求，每发一次就交一次这个钱。
+    # 换句话说：这一项【量到了】而【没报出来】，比没量还坏。
+    if t > 1.0:
+        # 一次请求拿到约 4 秒的量，所以每 4 秒就要交一次这个等待。
+        waste = t / (t + 4.0)
+        return Y, (f"带宽够，但【每换一段就要等 {t:.1f} 秒】—— 光这一项就吃掉 "
+                   f"{waste * 100:.0f}% 的时间。播放器缓冲比这个脚本小，"
+                   f"还要为开播探测和拖进度条反复重发请求，每发一次交一次")
     if rs["stalls"] == 0:
         return G, "全程没卡过 —— 这条路供得上这部片"
     if rs["avg"] < need / 1e6 * 0.8:
@@ -488,8 +518,6 @@ def verdict(rs, need):
                        f"每次断 {len(dry) // len(starts)} 秒左右 —— "
                        f"源在按令牌桶限速，均速够也没用")
         return Y, f"断断续续：{SECS} 秒里有 {len(dry)} 秒完全没有数据进来"
-    if rs["ttfb"] and sorted(rs["ttfb"])[len(rs["ttfb"]) // 2] > 1.5:
-        return Y, "每要一段新的都要等一两秒 —— 卡在「换段」上，不是卡在带宽上"
     return Y, f"卡了 {rs['stalls']} 秒，均速勉强够 —— 高码率段落顶不住"
 
 
@@ -503,16 +531,111 @@ for label, u in routes:
         print(f"  {D}歇 5 秒再测下一条，免得撞上源的频率限制（那个 429 是自己造的）{X}")
         time.sleep(5)
 
-# ================= ④ 结论 =================
-sec("④ 结论")
+# ================= ④ 换一段要多少钱 =================
+def ttfb_probe(url, start, want):
+    """只量【从发出请求到第一个字节回来】用了多久，拿到就撒手。
+
+    整个测试里最便宜也最说明问题的一项：一次几十 KB，六次加起来不到 1 MB。
+    """
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Range": f"bytes={start}-{start + want - 1}"})
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as rr:
+            el = time.time() - t0
+            rr.read(1 << 16)
+            return rr.status, el
+    except urllib.error.HTTPError as e:
+        return e.code, time.time() - t0
+    except Exception as e:
+        return str(e)[:26], time.time() - t0
+
+
+sec("④ 换一段要多少钱")
+print(f"  {D}上面那条时间轴是【一个缓冲 12 秒的播放器】看到的样子，它能把每次换段的"
+      f"等待盖过去。可真播放器缓冲小得多，而且开播探测、拖进度条、每次续缓冲都要"
+      f"重发请求 —— 每发一次就交一次这个钱。这一段就是去量这笔钱有多大、以及它"
+      f"【跟什么有关】。{X}")
+print(f"  {D}只要首字节就撒手，六次加起来不到 1 MB。{X}")
+SIZES = (("512 KiB", 512 << 10), ("8 MiB", 8 << 20), ("32 MiB", 32 << 20))
+for label, u in routes:
+    print()
+    print(f"  {B}{label}{X}")
+    base = ol_size or (1 << 30)
+    print(f"    {D}同样要 8 MiB，从三个位置各要一次：{X}")
+    bypos = []
+    for pct in (10, 50, 90):
+        st, el = ttfb_probe(u, int(base * pct / 100), 8 << 20)
+        bypos.append((pct, st, el))
+        col = G if st in (200, 206) else R
+        print(f"      {pct:>3}%　{col}{st}{X}　{el:.2f} 秒")
+        time.sleep(2)
+    print(f"    {D}同样从 50%，要三种大小：{X}")
+    bysize = []
+    for nm, n in SIZES:
+        st, el = ttfb_probe(u, int(base * 0.5), n)
+        bysize.append((nm, st, el))
+        col = G if st in (200, 206) else R
+        print(f"      {nm:>8}　{col}{st}{X}　{el:.2f} 秒")
+        time.sleep(2)
+
+    okp = [e for _p, s, e in bypos if s in (200, 206)]
+    oks = [e for _n, s, e in bysize if s in (200, 206)]
+    if len(okp) < 2 or len(oks) < 2:
+        print(f"    {R}→ 请求被拒了好几次，这一段没测成{X}"
+              f"  {D}（拒的那几个码就在上面，429/500 = 源在限流或掐连接）{X}")
+        continue
+    cost = med(okp + oks)
+    if cost < 0.5:
+        print(f"    {G}→ 换段几乎不要钱（{cost:.2f} 秒）—— 卡不在这里{X}")
+        continue
+    # 【三种"贵法"，处置完全不同】
+    #   跟位置有关 → 上游不支持真 Range，OpenList 只能从头空转到那个位置
+    #   跟大小有关 → 上游要把整段准备好才开始发（打包/解密/转存那一类）
+    #   都无关     → 每发一次请求就交一次的固定开销（建连 + TLS + 上游找文件）
+    grow_pos = okp[-1] > okp[0] * 2 + 0.5
+    grow_size = oks[-1] > oks[0] * 2 + 0.5
+    if grow_pos:
+        print(f"    {R}→ 位置越靠后等得越久（{okp[0]:.2f} → {okp[-1]:.2f} 秒）{X}")
+        print(f"    {D}上游【不支持真正的 Range】：要中间那一段，它得从头把前面的"
+              f"字节空转掉。表现就是越往后拖越久，拖到片尾直接超时。{X}")
+        print(f"    {D}这个改不掉 —— 是上游那台服务器的事。要拖进度条的片别放这个源。{X}")
+    elif grow_size:
+        print(f"    {Y}→ 要得越多等得越久（{oks[0]:.2f} → {oks[-1]:.2f} 秒）{X}")
+        print(f"    {D}上游要把整段准备好才开始发。那就【要小段】—— 但请求数会变多，"
+              f"又会撞上限流，两头为难。{X}")
+    else:
+        print(f"    {Y}→ 跟位置和大小都无关：这 {cost:.1f} 秒是【每发一次请求就交一次】"
+              f"的固定开销{X}")
+        print(f"    {D}建连 + TLS + 上游找文件，每次重来。这一条的算法很直白：{X}")
+        chunk_s = 4.0
+        print(f"    {D}  播放器每要一段（约 {chunk_s:.0f} 秒的量）就停 {cost:.1f} 秒 → "
+              f"实际只有 {chunk_s / (chunk_s + cost) * 100:.0f}% 的时间在传数据{X}")
+        print(f"    {D}  要是播放器一次只要 1 秒的量（很多客户端就是这样，"
+              f"Emby 开播探测更是连发好几个小请求）→ 只剩 "
+              f"{1 / (1 + cost) * 100:.0f}%，必卡{X}")
+        print(f"    {B}这就是「能播、但过几秒卡一下」的来源：不是带宽不够，"
+              f"是【要得太频繁】{X}")
+        if "本机代理" in label or "VPS" in label:
+            print(f"    {D}代理这条路上这笔钱能压：OpenList 设置 → 全局 → "
+                  f"代理缓冲区大小（proxy buffer size）调大，它一次向上游多要一点、"
+                  f"少要几次。调完回来再跑一遍这个脚本，看这个秒数有没有降。{X}")
+
+
+# ================= ⑤ 结论 =================
+sec("⑤ 结论")
 for rs in done:
     col, why = verdict(rs, need_bps)
+    rs["col"] = col
     print(f"  {col}{'✔' if col == G else '✖' if col == R else '⚠'}{X} "
           f"{B}{rs['label']}{X}")
     print(f"    {col}{why}{X}")
 
-ok = [r for r in done if r["started"] and r["stalls"] == 0]
-bad = [r for r in done if r not in ok]
+# 【"这条路行不行"要跟上面那句结论一致】原来这里另算一遍（只看 stalls），于是
+# 出现过结论说"每换一段要等 2 秒"、下面却接着说"几条路都供得上"，自己打自己。
+# 判定只留一份，就是 verdict() 给的那个颜色。
+ok = [r for r in done if r["col"] == G]
+bad = [r for r in done if r["col"] != G]
 print()
 if len(done) > 1 and ok and bad:
     print(f"  {B}两条路结果不一样 —— 这就是可以直接动手的地方{X}")
@@ -536,10 +659,10 @@ else:
     print(f"  {D}上面每条路的那一句已经分了类；同一类的处置：{X}")
     print(f"  {D}  · 带宽不够 → 这个源只适合放码率低的片，大码率的换个盘放{X}")
     print(f"  {D}  · 周期性断流 → 源在限速，改配置改不掉；错开时间、或换盘{X}")
-    print(f"  {D}  · 换段就要等 → 直链在反复重定向，看上面每一跳的耗时{X}")
+    print(f"  {D}  · 每换一段要等 → 看上面 ④，它已经把「贵在哪」分好类了{X}")
 
-# ================= ⑤ 真实播放留下的痕迹 =================
-sec("⑤ 这部片最近【真被人播】的时候，日志里发生了什么")
+# ================= ⑥ 真实播放留下的痕迹 =================
+sec("⑥ 这部片最近【真被人播】的时候，日志里发生了什么")
 print(f"  {D}上面测的都是脚本自己造的请求。这一段看的是真实播放 —— "
       f"客户端可能走了完全不同的路（转码、或者压根没走 MediaWarp）。{X}")
 print()
@@ -547,20 +670,35 @@ try:
     log = open(MWLOG, encoding="utf-8", errors="replace").read().splitlines()
 except OSError:
     log = []
+# 【颜色码必须先剥掉】MediaWarp 用的是 gin，容器开了 tty 时状态码外面裹着一层
+# ANSI（\x1b[97;42m 200 \x1b[0m），"| 200 |" 这个形状就对不上了。实测栽过一次：
+# 找到 95 条这个条目的请求，状态码一个都没数出来，屏上只剩一句"最近 95 条请求："
+# 后面空空如也 —— 而"那 95 条里有多少是 401/500"恰恰是这一段唯一要回答的问题。
+ANSI = re.compile(r"\033\[[0-9;]*m")
+log = [ANSI.sub("", ln) for ln in log]
 mine = [ln for ln in log if f"/videos/{iid}/" in ln.lower()]
 if not mine:
     print(f"  {Y}MediaWarp 日志里没有这个条目的播放记录{X}")
     print(f"  {D}要么最近没人点过它，要么客户端根本没走 MediaWarp"
           f"（转码就是这样 —— Emby 自己去拉，不经过 302）。{X}")
 else:
+    # 两种写法都认：gin 那行的 "| 200 |"，和有些版本写成 " 200 " 紧跟时间的。
     codes = {}
     for ln in mine:
-        m = re.search(r"\|\s*(\d{3})\s*\|", ln)
+        m = (re.search(r"\|\s*(\d{3})\s*\|", ln)
+             or re.search(r"(?:^|\s)(\d{3})\s*\|", ln)
+             or re.search(r"\|\s*(\d{3})(?:\s|$)", ln))
         if m:
             codes[m.group(1)] = codes.get(m.group(1), 0) + 1
-    print(f"  {D}最近 {len(mine)} 条请求：{X}"
-          + "　".join(f"{G if c.startswith('2') or c.startswith('3') else R}"
-                      f"{c}×{n}{X}" for c, n in sorted(codes.items())))
+    if not codes:
+        # 【数不出来就要把原样摆出来，不能只报个总数】
+        print(f"  {Y}找到 {len(mine)} 条这个条目的请求，但这份日志的格式认不出状态码{X}")
+        print(f"  {D}原样一条（已打码）：{safe(mine[-1])[:150]}{X}")
+        print(f"  {D}把这一行发给维护者，下一版就能认了。{X}")
+    else:
+        print(f"  {D}最近 {len(mine)} 条请求：{X}"
+              + "　".join(f"{G if c.startswith('2') or c.startswith('3') else R}"
+                          f"{c}×{n}{X}" for c, n in sorted(codes.items())))
     if codes.get("401"):
         print(f"  {R}✖ 有 {codes['401']} 条 401{X}")
         print(f"  {D}401 打在 /emby/Videos/<id>/ 上，几乎只有一个来路：这个盘设的是"
@@ -589,11 +727,24 @@ if os.path.isfile(NGXLOG):
         print(f"  {D}nginx 那侧最近 {len(pd)} 条 /p/ /d/ 请求：{X}"
               + "　".join(f"{G if c.startswith('2') else R}{c}×{n}{X}"
                           for c, n in sorted(cc.items())))
-        bad_n = sum(n for c, n in cc.items() if not c.startswith("2"))
-        if bad_n and bad_n > len(pd) * 0.1:
-            print(f"  {R}✖ 一成以上不是 2xx —— 代理这条路本身在掉{X}")
+        # 【302 不算掉】那是正常的直链跳转，混进"失败"里会把比例算虚高。
+        bad_n = sum(n for c, n in cc.items() if c[0] not in ("2", "3"))
+        if bad_n and bad_n > len(pd) * 0.05:
+            print(f"  {R}✖ {bad_n}/{len(pd)} 条没要到数据 —— 代理这条路在掉{X}")
             print(f"  {D}这些是【客户端真的在要数据】却没要到的那些，"
-                  f"比上面任何一个测出来的数字都直接。{X}")
+                  f"比上面任何一个测出来的数字都直接：脚本造的请求一次只有一个，"
+                  f"而真播放是好几个并着来。{X}")
+            # 【429 和 500 是两件事，处置不同】
+            if cc.get("429"):
+                print(f"  {Y}  · {cc['429']} 条 429 —— 源按【请求次数】限流{X}")
+                print(f"  {D}    要得越频繁越撞。这正好跟 ④ 那一段对得上："
+                      f"换段贵 → 播放器只好要得更勤 → 更容易撞限流 → 更卡。{X}")
+            if cc.get("500"):
+                print(f"  {Y}  · {cc['500']} 条 500 —— 连接被掐在半路{X}")
+                print(f"  {D}    OpenList 已经开始往回发了，上游那边断了。"
+                      f"播放器表现就是播着播着停住、或者拖过去之后连不稳。{X}")
+            if cc.get("403"):
+                print(f"  {Y}  · {cc['403']} 条 403 —— 被拒（UA 或签名）{X}")
 else:
     print()
     print(f"  {D}（找不到 {NGXLOG}，nginx 那侧跳过）{X}")
