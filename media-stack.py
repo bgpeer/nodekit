@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.117"
+SCRIPT_VERSION = "1.5.118"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1697,7 +1697,12 @@ PRECACHE_HOUR_CST = "05:10"
 SELFUP_HOUR_CST = "05:15"
 # 每 20 分钟一次 ≈ 72 次/天。别为了"让链路更热"去调小它 —— 实测耗时和空闲时间
 # 不相关，理由见 do_keepalive() 的文档字符串。
-KEEPALIVE_MIN  = 20
+# 【一小时一次就够，而且要轮流打】这个探测是【真实】列目录（带 refresh），
+# 20 分钟一次就是 72 次/天，而且一直盯着同一个盘。这台机器上那个盘正好是按请求
+# 频率抽风的 WebDAV 源（实测 nginx 那侧 429+500 占一成多）。而"保温能消掉第一次
+# 播放的转圈"这个原始理由早被实测推翻（见 do_keepalive），留着它只是给体检一个
+# "链路最近通没通"的心跳 —— 心跳一小时一次完全够。
+KEEPALIVE_MIN  = 60
 
 # ---- 定时任务的互斥和超时 ----------------------------------------------------
 # cron 的规矩是"到点就起，不管上一轮跑完没有"。三条任务原来都是裸命令，于是任何一轮
@@ -1713,7 +1718,7 @@ CRON_LOCK_DIR  = "/run/lock"
 # 超时都压在【下一次触发之前】：宁可这轮少做点，也不能和下一轮撞上。
 # 三条任务本身都是幂等 + 带预算的，砍掉的部分下一轮会接着做。
 CRON_TIMEOUT   = {
-    "keepalive": KEEPALIVE_MIN * 60 - 120,   # 20 分钟一次 → 18 分钟
+    "keepalive": KEEPALIVE_MIN * 60 - 120,   # 一小时一次 → 58 分钟
     "warm":      WARM_EVERY_H * 3600 - 300,  # 每小时一次 → 55 分钟
     "sync":      3 * 3600,                   # 每天一次，给足
     # 后台补时长。比自己的预算多留一截 —— timeout 是防吊死的最后一道，
@@ -1974,8 +1979,16 @@ def do_keepalive():
     第二快，空闲 30 秒出了最慢的一次：耗时和空闲时间【不相关】，波动来自跨境线路
     本身（晚高峰单次能飙到 120 秒，过了高峰又回到 3 秒）。
 
-    所以别改 KEEPALIVE_MIN。留着它是因为成本极低（72 次/天）、能给体检提供一个
-    "链路最近通没通"的心跳，不是因为它能保温。输出写 json，不往日志里堆东西。
+    留着它是因为成本低、能给体检提供一个"链路最近通没通"的心跳，不是因为它能保温。
+    输出写 json，不往日志里堆东西。
+
+    【所以它该轻，而且不该总打同一个盘】20 分钟一次 = 72 次/天，全压在 scan_paths[0]
+    上。而那一个盘很可能正是按请求频率抽风的那种（WebDAV 源实测 429+500 占一成多），
+    等于我们自己在给最脆弱的那条链加压。两处改过了：
+      · 频率降到一小时一次（KEEPALIVE_MIN）
+      · 【轮着打】每次挑一个盘，下次换下一个。单个盘挨到的频率再降 N 倍，而且
+        每个盘都有了心跳 —— 原来只有第一个盘被测，别的盘通不通根本不知道，
+        既把压力全压在一个盘上，覆盖面又最小。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -1992,7 +2005,12 @@ def do_keepalive():
             raise RuntimeError("登录失败")
         # refresh: true 是必须的 —— 不加的话 OpenList 直接返回目录缓存、根本不联网,
         # 记录下来的耗时永远是 0.0 秒,当心跳用毫无意义(测的是本地缓存命中率)。
-        p = (cfg["scan_paths"] or ["/"])[0]
+        # 【轮流挑一个，别老打第一个】游标记在状态文件里，跨进程也接得上。
+        _paths = cfg["scan_paths"] or ["/"]
+        _i = int(ms_state().get("keepalive_cursor") or 0) % len(_paths)
+        p = _paths[_i]
+        save_ms_state(keepalive_cursor=(_i + 1) % len(_paths))
+        rec["path"] = p          # 历史曲线要看得出是哪个盘在抖
         r = _ol_api("/api/fs/list", {"path": p, "password": "", "page": 1,
                                      "per_page": 1, "refresh": True},
                     tok, timeout=180)
@@ -2319,6 +2337,18 @@ def reap_stale_tasks():
     return found
 
 
+def _ka_cron():
+    """保活的 cron 时间字段。
+
+    【别写 */60】分钟位上的 */60 只会落到 0 分 —— 能跑，但看着像笔误，而且
+    KEEPALIVE_MIN 一旦调到 90、120 之类，*/90 就直接是个非法字段了。
+    """
+    if KEEPALIVE_MIN < 60:
+        return f"*/{KEEPALIVE_MIN} * * * *"
+    h = max(1, KEEPALIVE_MIN // 60)
+    return "0 * * * *" if h == 1 else f"0 */{h} * * *"
+
+
 def install_keepalive(install_dir):
     """装保活定时任务。用 cron.d 而不是 crontab -e：这样卸载时删一个文件就干净了。"""
     try:
@@ -2326,7 +2356,7 @@ def install_keepalive(install_dir):
                f"# 把 token 和连接热着，避免第一次播放卡在「换直链」上转圈。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               f"*/{KEEPALIVE_MIN} * * * * root {cron_cmd('keepalive')} "
+               f"{_ka_cron()} root {cron_cmd('keepalive')} "
                ">/dev/null 2>&1\n")
         with open(KEEPALIVE_CRON, "w") as f:
             f.write(txt)
@@ -12675,26 +12705,56 @@ def apply_drive_defaults(d, quiet=False):
     一路 401，播放器一直转圈。见 QUALITY_KEYS 那段的警告。
     拿 A 场景的实测结论去定 B 场景的默认值，而且没验证过 B —— 这个教训写在这儿。
 
-    【只在第一次见到时设】设完把挂载点记进状态文件，以后这个盘不管被改成什么都不再碰。
+    【规则分两类，这是这个函数唯一重要的事】
+
+      必需项   没有它这个盘【根本不能用】。WebDAV / local / crypt 在网盘侧压根没有
+               CDN 直链，不开本机代理就播不了 —— 那不是偏好，是能不能用的问题。
+               → 任何时候都对，老机器升上来也补。补了不会伤害任何人。
+
+      偏好项   "我觉得这样更好"。当年那条「夸克默认转码流」就是这一类。
+               → 只对【真正新挂】的盘。而且 drive_defaults 这个键不存在时
+                 （= 老机器刚升上来）一律跳过，只记账不动手。
+
+    【为什么要这么分】"状态文件里没有"不等于"第一次见到这个盘"。drive_defaults
+    这个键本身是后加的，所以每台老机器升级到加它的那一版，它上面每一个盘都满足
+    "不在 seen 里"，全被按默认值重设一遍 —— 用户自己调好的设置被静默覆盖。
+    真实后果：有人的 /quark 本来是原画直链、好好地 302 播着，升级后被自动改成
+    转码流，而转码流当时在 Emby 里根本走不通，从此一点播放就转圈；撤掉那个默认值
+    也救不回来，因为设置已经落盘了。
+
+    偏好项现在【是空的】。这个分类留着，是为了让下一个想往里加东西的人先撞到这堵墙。
     替用户做一次选择是帮忙，反复把他的选择改回来是耍流氓。
     """
-    seen = set(ms_state().get("drive_defaults") or [])
-    rows = [r for r in _storage_rows(d) if r[1] and r[1] != "/" and r[1] not in seen]
+    _st = ms_state()
+    _known = _st.get("drive_defaults")
+    _fresh = _known is None          # 老机器刚升上来：偏好项一律不碰
+    _all = [r for r in _storage_rows(d) if r[1] and r[1] != "/"]
+    seen = set(_known or [])
+    # 必需项对【所有】盘判一遍（不受 first-seen 约束）；偏好项只看新盘。
+    # 升级那一轮（键不存在）把所有盘都过一遍，好把必需项补上；之后只看新挂的。
+    rows = _all if _fresh else [r for r in _all if r[1] not in seen]
     if not rows:
         return 0
     proxy, said = [], []
+    # ── 必需项 ────────────────────────────────────────────────────
+    # 【也只判一次】升级那一轮 rows = 全部盘，所以老机器该补的会补上；补完就记账，
+    # 以后再不碰。不能每轮都判 —— 那就成了"反复把用户的选择改回来"，正是这个函数
+    # 的 docstring 骂的那件事。用户真把某个 WebDAV 的代理关了，那是他的事。
     for sid, mp, drv, add, cols in rows:
         low = str(drv or "").lower()
-        did = []
         if low in PROXY_ONLY_DRIVERS and not _truthy(cols.get("web_proxy")):
             proxy.append((sid, mp))
-            did.append("本机代理")
-        if did:
-            said.append((mp, did))
+            said.append((mp, ["本机代理"]))
+    # ── 偏好项：只对真正新挂的盘，而且老机器升上来那一轮（_fresh）一律跳过 ──
+    # 【现在一条都没有】往这里加任何东西之前，先问一句："不这样这个盘还能用吗？"
+    # 能用，就说明它是偏好，而偏好不该替别人做决定 —— 当年那条「夸克默认转码流」
+    # 就是这么把人家好好的 302 原画直链改坏的。
+    if not _fresh:
+        pass
     # 【不管有没有改，都记下来】"看过了、按驱动不用改"和"改过了"对下一轮是同一件事：
     # 别再碰它。只记改过的话，默认值就是对的那些盘会被反复重新判断，用户以后自己
     # 关掉某一项，下一轮又被打开。
-    save_ms_state(drive_defaults=sorted(seen | {r[1] for r in rows}))
+    save_ms_state(drive_defaults=sorted(seen | {r[1] for r in _all}))
     if not said:
         return 0
     if not quiet:
