@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.110"
+SCRIPT_VERSION = "1.5.111"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10937,9 +10937,27 @@ UA_SPOOF_MODES = (
      "探测就永远拿不到音视频轨，条目点开 load fail"),
     ("spoof", "伪装成浏览器",
      "本机 nginx 把探测类 UA（Lavf/ffmpeg/Python-urllib 这些）换成浏览器 UA 再送出去。"
-     "上游按 UA 挡的话这条能救活；但探测量大，上游也可能转而按频率限整个源 —— "
-     "一个盘一个盘地开，开完去挂载页面播一部确认没被限"),
+     "只在上游【真的按 UA 挡人】（不开就 403）时才开 —— 实测过两个源，浏览器那张脸"
+     "反而是最慢的一张（夸克：浏览器超时 / VLC 16 Mbps；七米蓝：浏览器 8 / VLC 32），"
+     "所以不再默认开。先跑 tools/why-stall.sh 的 ④b 看这个源到底认不认脸、认哪张"),
 )
+
+
+# 【哪些选项要在名字后面直接挂一句黄字】
+# 写在说明里不算数 —— 那几行人会跳过。而「这一项要花你的流量」「这一项 Emby 里播
+# 不了」属于【选下去之前必须看见】的那类。仓库主人的原话：「不提示人家的流量少消耗
+# 完了会找麻烦的」。
+#
+# 挂在两处：选项列表里（选之前），和当前值那一行（选完之后回头看）。
+OPT_WARN = {
+    ("__source__", "proxy"):     "走 VPS 流量",
+    ("link_method", "streaming"): "Emby 里播不了",
+}
+
+
+def opt_warn(key, val):
+    """这个开关的这个取值要不要当场挂一句黄字。没有就返回空串。"""
+    return OPT_WARN.get((key, val), "")
 
 
 def drive_links(d, mp, drv=""):
@@ -12363,10 +12381,22 @@ def apply_drive_defaults(d, quiet=False):
 
     默认值不是拍脑袋定的，是从驱动的实现里推出来的：
 
-      · WebDAV / local / crypt → 本机代理 + 伪装成浏览器。这三类在网盘侧压根没有
-        CDN 直链，本机代理是它们唯一的路；而字节一旦经过本机，Emby 的探测（ffmpeg
-        的 UA）就会被上游按 UA 挡掉，条目永远探不到音视频轨、点开 load fail。
+      · WebDAV / local / crypt → 本机代理。这三类在网盘侧压根没有 CDN 直链，
+        本机代理是它们唯一的路 —— 不是为了快，是不这样根本播不了。
+        代价要说清楚：这类盘的视频【全程走 VPS 出口流量】，而这一档没得选。
       · 有 CDN 直链的盘（夸克、阿里、115）：OpenList 自己的默认就是对的，不动。
+        尤其【不许】默认切成本机代理 —— 那会把本来直连网盘的流量全揽到 VPS 上。
+
+    【曾经还默认开「伪装成浏览器」，那也是个错的默认值】理由是"上游按 UA 挡 ffmpeg，
+    不开就 403、条目永远探不到音视频轨"。那是真事，但它是【某些源】的毛病，不是通例。
+    实测在两个完全不同的源上各量了一遍同一条直链、五种 UA 的速度：
+
+        夸克     浏览器 超时 0.0 Mbps   ffprobe 0.3    VLC 16.1   差 47 倍
+        七米蓝   浏览器 8.4 Mbps        ffprobe 14.9   VLC 32.5   差 4 倍
+
+    两个源上【浏览器那张脸都是最慢的】，而 ffprobe 两边都拿到 206 —— 它们根本不挡
+    UA，只是给不同的脸不同的速度。默认开这个开关，等于自动把探测换成最慢的那张脸。
+    开关留着给真的 403 的源用，但不再默认开。
 
     【曾经把夸克默认设成转码流，那是个错的默认值】理由是"跨境线路上原画拉不动、
     转码流很流畅"，而那个结论来自 OpenList 的【网页播放器】。Emby 这条路上
@@ -12382,16 +12412,13 @@ def apply_drive_defaults(d, quiet=False):
     rows = [r for r in _storage_rows(d) if r[1] and r[1] != "/" and r[1] not in seen]
     if not rows:
         return 0
-    proxy, ua, said = [], [], []
+    proxy, said = [], []
     for sid, mp, drv, add, cols in rows:
         low = str(drv or "").lower()
         did = []
         if low in PROXY_ONLY_DRIVERS and not _truthy(cols.get("web_proxy")):
             proxy.append((sid, mp))
             did.append("本机代理")
-        if low in PROXY_ONLY_DRIVERS and mp not in ua_spoof_mounts():
-            ua.append(mp)
-            did.append("伪装成浏览器")
         if did:
             said.append((mp, did))
     # 【不管有没有改，都记下来】"看过了、按驱动不用改"和"改过了"对下一轮是同一件事：
@@ -12405,18 +12432,20 @@ def apply_drive_defaults(d, quiet=False):
         info("新挂的网盘按驱动设了直链方式（只在第一次见到它的时候设）：")
         for mp, did in said:
             print(f"  {DIM}·{RST} {pad(mp, 18)}{CYAN}{' · '.join(did)}{RST}")
-        print(f"  {DIM}这几档是实测能播的那一套。想换：4 挂载路径 → 选盘 → 3 直链方式。{RST}")
+        # 【设了本机代理就必须当场说它要花流量】这一档是没得选的（这类驱动在网盘侧
+        # 没有 CDN 直链），可"没得选"不等于"不用告诉人家"。等别人流量跑光了才发现
+        # 是这套脚本替他做的决定，那是我们的锅。
+        if proxy:
+            print(f"  {YELLOW}⚠ 本机代理 = 这个盘的视频【全程走你的 VPS 出口流量】"
+                  f"{RST}")
+            print(f"  {DIM}这类驱动（WebDAV 源 / 本地目录 / 加密层）在网盘侧根本没有"
+                  f"CDN 直链，OpenList 只能自己转 —— 不是为了快，是不这样播不了。{RST}")
+            print(f"  {DIM}有 CDN 直链的盘（夸克 / 阿里 / 115）一律保持直连网盘，"
+                  f"不占你的流量。{RST}")
+        print(f"  {DIM}想换：4 挂载路径 → 选盘 → 3 直链方式。{RST}")
     if proxy:
         _write_storage(d, proxy, columns={"web_proxy": 1,
                                           "webdav_policy": "native_proxy"})
-    if ua:
-        for mp in ua:
-            set_ua_spoof(mp, True)
-        cfg2 = rebuild_cfg_from_disk(d)
-        if cfg2.get("has_domain") and os.path.exists(cfg2.get("crt") or ""):
-            apply_nginx_site(cfg2)
-        elif not quiet:
-            warn("没有域名或证书，nginx 站点没重新生成 —— 伪装成浏览器暂时不生效。")
     return len(said)
 
 
@@ -12435,7 +12464,9 @@ def _one_drive_link_menu(d, mp):
             ask("按回车返回...")
             return
         for i, (_k, _w, title, opts, cur) in enumerate(sw, 1):
-            print(f"  {i:>2}. {pad(title, 20)}当前：{CYAN}{_opt_name(opts, cur)}{RST}")
+            _wt = opt_warn(_k, cur)
+            print(f"  {i:>2}. {pad(title, 20)}当前：{CYAN}{_opt_name(opts, cur)}{RST}"
+                  + (f"  {YELLOW}⚠ {_wt}{RST}" if _wt else ""))
         print("   0. 返回")
         print("-" * 60)
         c = ask("改哪一项").strip()
@@ -12452,7 +12483,9 @@ def _one_drive_link_menu(d, mp):
         print()
         for v, name, why in opts:
             star = f"  {GREEN}← 现在{RST}" if v == cur else ""
-            print(f"  {DIM}·{RST} {BOLD}{name}{RST}{star}")
+            _wt = opt_warn(key, v)
+            print(f"  {DIM}·{RST} {BOLD}{name}{RST}"
+                  + (f"  {YELLOW}⚠ {_wt}{RST}" if _wt else "") + star)
             print(f"      {DIM}{why}{RST}")
         print()
         for j, (_v, name, _w) in enumerate(opts, 1):
@@ -12497,6 +12530,18 @@ def _one_drive_link_menu(d, mp):
             else:
                 warn("没有域名或证书，nginx 站点没有重新生成 —— 这个开关暂时不生效。")
             continue
+        if where == "source" and val == "proxy":
+            # 【这一步不能静默】切过去之后每一个字节都走他的 VPS 出口，而流量是要
+            # 花钱的、也是会被跑光的。名字后面那句黄字是给"选之前"看的，这里再拦
+            # 一道是给"真的按下去"那一刻看的。
+            warn(f"{mp} 切成本机代理之后，这个盘的视频会【全程走你的 VPS 出口流量】。")
+            print(f"  {DIM}看一部 1.5 GB 的片，就是 1.5 GB 出境流量。"
+                  f"流量包有限的话先算一下。{RST}")
+            print(f"  {DIM}换来的是：直链绑 IP / 绑 UA 的盘能播了、"
+                  f"客户端到网盘那一段的慢也绕开了。{RST}")
+            if not ask_yn(f"确定把 {mp} 切成本机代理？", False):
+                print("没有改动。")
+                continue
         if where == "source":
             if val == "proxy":
                 warn("本机代理：视频的每个字节都要经过你的 VPS，来回两份流量。")
