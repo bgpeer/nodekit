@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19d"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19e"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -677,6 +677,19 @@ def med(xs):
 
 def verdict(rs, need):
     """把时间轴的形状翻译成一句人话。"""
+    codes = set(rs["codes"])
+    if codes and codes <= {403}:
+        # 【没试过的路不能判死刑】OpenList 的 /p/ 只对开了本机代理的存储开放，
+        # 没开就是 0 秒一个 403。上一版把这判成"根本起不了播"，于是夸克和阿里
+        # 各被凭空判了一条死路 —— 而那条路压根没被试过。
+        return C, ("这条路没测成：OpenList 不让代理这个盘（/p/ 只对开了"
+                   "「本机代理」的存储开放），不是它不行")
+    if 200 in codes and 206 not in codes:
+        # 【回 200 不是"成功"，是"我不认 Range"】要中间那一段，它从头给你一条流。
+        # 播放器没法 seek，而 Emby 开播第一件事就是 seek。转码流的典型长相。
+        return R, ("服务器不认 Range：要中间那一段，它从头给一条流 —— "
+                   "播放器没法 seek，而 Emby 开播第一件事就是 seek。"
+                   "转码流就是这样")
     if not rs["started"]:
         return R, "这条路根本起不了播 —— 连 2 秒的缓冲都攒不满"
     dry = [i for i, (recv, left, on) in enumerate(rs["samples"])
@@ -770,6 +783,7 @@ for _lb, _u, _h in routes:
     if (hn, pt) not in _hosts:
         _hosts.append((hn, pt))
 _v6bad = False
+CONN = {}          # 主机 → 最快的那次 TCP 建连耗时。④ 要拿它跟首字节比
 if not _hosts:
     print(f"  {D}这条路只连本机（127.0.0.1），没有外部主机要测。{X}")
     print(f"  {D}但 OpenList 自己要去连上游 —— 那一跳这里量不到，"
@@ -783,6 +797,9 @@ for hn, pt in _hosts:
         print(f"    {lb}　{col}{msg}{X}　{el:.2f} 秒")
     v4 = next((r for r in rows_c if r[0] == "IPv4"), None)
     v6 = next((r for r in rows_c if r[0] == "IPv6"), None)
+    _oks = [r[2] for r in rows_c if r[3]]
+    if _oks:
+        CONN[hn] = min(_oks)
     if v6 and v6[1] != "没有这类地址" and not v6[3] and v4 and v4[3]:
         _v6bad = True
         print(f"    {R}✖ 有 IPv6 地址、但连不上；IPv4 是通的{X}")
@@ -876,7 +893,14 @@ for label, u, hdr in routes:
               f"说明它给的【不是原文件】。转码流就是这样。{X}")
     if len(okp) < 2 or len(oks) < 2:
         if 403 in codes_seen:
-            print(f"    {R}→ 403：没通过鉴权，这一段没测成{X}")
+            # 【带了登录凭据还是 0.00 秒就回 403 —— 那是策略拒绝，不是鉴权失败】
+            # OpenList 的 /p/ 只对【开了「本机代理」的存储】开放。所以这条路是
+            # 【没测成】，不是"不行"。上一版把它算成不行，等于凭空给夸克和阿里
+            # 各判了一条死路 —— 而那条路压根没被试过。
+            print(f"    {Y}→ 403，而且是 0 秒就回的 —— 这不是慢，是 OpenList "
+                  f"【不让代理这个盘】{X}")
+            print(f"    {D}/p/ 只对开了「本机代理」的存储开放。这条路【没测成】，"
+                  f"不是它不行 —— 要真试，先去 4 挂载路径 → 这个盘 → 打开本机代理。{X}")
         else:
             print(f"    {R}→ 请求被拒了好几次，这一段没测成{X}"
                   f"  {D}（拒的那几个码就在上面，429/500 = 源在限流或掐连接）{X}")
@@ -903,7 +927,24 @@ for label, u, hdr in routes:
     else:
         print(f"    {Y}→ 跟位置和大小都无关：这 {cost:.1f} 秒是【每发一次请求就交一次】"
               f"的固定开销{X}")
-        print(f"    {D}建连 + TLS + 上游找文件，每次重来。这一条的算法很直白：{X}")
+        # 【这笔钱花在哪一层，决定往哪儿使劲】②b 已经量过 TCP 握手要多久。
+        # 握手快而首字节慢，说明钱不在网络上，在上游那台服务器准备数据上 ——
+        # 本机怎么调路由、改 MTU、关 IPv6 都碰不到它，只能【少开口】。
+        # 反过来握手就很慢，那才是这台机器的网络配置问题。
+        _hn = re.sub(r"^[a-z]+://([^/:]+).*", r"\1", u)
+        _ct = CONN.get(_hn)
+        if _ct is not None:
+            if cost > _ct * 5 + 0.3:
+                print(f"    {B}钱不在建连上{X}  {D}TCP 握手只要 {_ct:.2f} 秒，"
+                      f"第一个字节却要 {cost:.1f} 秒 —— 差 {cost / max(_ct, 0.01):.0f} 倍。"
+                      f"慢的是【上游那台服务器准备数据】，不是这条网络。{X}")
+                print(f"    {D}所以改路由、关 IPv6、调 MTU 都碰不到它。"
+                      f"能动的只有一件事：少开口（每次多要一点）。{X}")
+            else:
+                print(f"    {R}钱就在建连上{X}  {D}TCP 握手 {_ct:.2f} 秒，"
+                      f"首字节 {cost:.1f} 秒 —— 两个数差不多，说明光是"
+                      f"把连接建起来就这么久。这是这台机器到那边的网络问题。{X}")
+        print(f"    {D}算法很直白：{X}")
         chunk_s = 4.0
         print(f"    {D}  播放器每要一段（约 {chunk_s:.0f} 秒的量）就停 {cost:.1f} 秒 → "
               f"实际只有 {chunk_s / (chunk_s + cost) * 100:.0f}% 的时间在传数据{X}")
@@ -931,9 +972,15 @@ for rs in done:
 # 出现过结论说"每换一段要等 2 秒"、下面却接着说"几条路都供得上"，自己打自己。
 # 判定只留一份，就是 verdict() 给的那个颜色。
 ok = [r for r in done if r["col"] == G]
-bad = [r for r in done if r["col"] != G]
+bad = [r for r in done if r["col"] not in (G, C)]
+untested = [r for r in done if r["col"] == C]
 print()
-if len(done) > 1 and ok and bad:
+if not ok and not bad:
+    # 【一条都没测成的时候别往下判】下面那几支都是在比"哪条行哪条不行"，
+    # 而这时候一条都没试过。早期版本会直接掉进最后那支，打出"几条路都不行" ——
+    # 一句凭空的死刑。
+    print(f"  {Y}几条路都没测成 —— 上面每条都写了为什么{X}")
+elif len(done) > 1 and ok and bad:
     print(f"  {B}两条路结果不一样 —— 这就是可以直接动手的地方{X}")
     if "本机代理" in ok[0]["label"]:
         print(f"  {G}走你的 VPS 稳，走网盘 CDN 卡{X}")
@@ -943,7 +990,9 @@ if len(done) > 1 and ok and bad:
         print(f"  {G}走网盘 CDN 稳，走你的 VPS 卡{X}")
         print(f"  {D}说明瓶颈在 VPS 到网盘这一段，别开本机代理。{X}")
 elif ok and not bad:
-    print(f"  {G}几条路都供得上{X}")
+    print(f"  {G}测成的几条都供得上{X}" if untested else f"  {G}几条路都供得上{X}")
+    if untested:
+        print(f"  {D}（另有 {len(untested)} 条没测成，见上面）{X}")
     print(f"  {D}那卡的原因【不在取流这一段】。剩下的可能性按概率排：{X}")
     print(f"  {D}  1. Emby 在转码 —— 播的时候跑 bash playing.sh，"
           f"看到 Transcode 就是它（转码要先把片子拉下来再转，2 核机器必卡）{X}")
