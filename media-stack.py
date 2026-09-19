@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.116"
+SCRIPT_VERSION = "1.5.117"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11137,11 +11137,9 @@ LINK_SWITCHES = (
     ("link_method", "画质",
      (("download",  "原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                                "跨境线路上 4K 原盘经常拉不动"),
-      ("streaming", "转码流",   "网盘转码后的流，码率低、走的是【播放通道】—— 实测比原画"
-                               "快几十倍（挂载页面 10.9 MB/s 对 306 KB/s）。挂载页面和"
-                               "外部播放器现在就能用；只有 Emby 那条还没修好：MediaWarp "
-                               "只是 302 过去，而 m3u8 里的分片是相对路径，Emby 客户端会"
-                               "拼错 → 401。这是本脚本待修的一环，不是转码流的毛病"))),
+      ("streaming", "转码流",   "走网盘的播放通道，实测比原画快几十倍"
+                               "（10.9 MB/s 对 306 KB/s）；Emby 里要装分片重定向才能播，"
+                               "「7 更新」会自动装"))),
     ("download_api", "取直链的接口",
      (("official",    "官方接口",   "网盘官方的下载接口，最稳；有的账号会被它限速"),
       ("crack",       "非官方接口", "绕开官方那条，速度常常快一截；网盘一改就失效"),
@@ -11206,12 +11204,28 @@ UA_SPOOF_MODES = (
 OPT_TAG = {
     ("__source__", "direct"):     (GREEN,  "不走 VPS 流量"),
     ("__source__", "proxy"):      (YELLOW, "⚠ 走 VPS 流量"),
-    ("link_method", "streaming"): (YELLOW, "⚠ Emby 那条还没修好"),
 }
+
+
+def hls_ready():
+    """转码流的分片重定向装上了没有。装了转码流在 Emby 里就能播。
+
+    【看 unit 文件在不在就够】systemd 那边是 Restart=always，unit 在就等于它在跑；
+    而菜单渲染里不该去 fork 一个 systemctl。
+    """
+    return os.path.exists(HLS_UNIT)
 
 
 def opt_tag(key, val):
     """屏上挂的那一小句，已经带好颜色。没有就返回空串。"""
+    if key == "link_method" and val == "streaming":
+        # 【这一句必须照实说，两个方向都不能写死】
+        # 写死"还没修好"：修好之后就成了假话，而且会把人赶回【慢 36 倍】的原画
+        #   （实测同一部片 306 KB/s 对 10.92 MB/s）—— 仓库主人当场指出来的。
+        # 写死"已修好"：分片重定向是按需装的服务，没装 / 装失败 / 版本旧的机器上
+        #   转码流照样播不了，那是另一个方向的假话，而且更坑（人会去查别的地方）。
+        # 所以按服务在不在说：在就什么都不挂（这一档现在是好的），不在才提醒。
+        return "" if hls_ready() else f"  {YELLOW}⚠ 要装分片重定向{RST}"
     col, txt = OPT_TAG.get((key, val), ("", ""))
     return f"  {col}{txt}{RST}" if txt else ""
 
@@ -14936,23 +14950,23 @@ def do_healthcheck():
         # 于是每秒好几条 401。不看日志根本联想不到画质开关。
         _hls = [mp for _s, mp, _d, add, _c in _storage_rows(d)
                 if str(add.get("link_method") or "") == "streaming"]
-        if _hls:
-            # 【措辞要分清"谁的毛病"】转码流本身没问题 —— 实测挂载页面跑 10.9 MB/s，
-            # 而同一部片走原画只有 306 KB/s（播放通道不限速、下载通道限速）。
-            # 播不了的是【我们这一环】：MediaWarp 只是 302 过去，没管 m3u8 里的
-            # 相对路径。把它写成"转码流播不了"，等于把自己没修好的东西说成别人的
-            # 毛病，还会把人赶去换一个更慢的档。
+        if _hls and hls_ready():
+            # 【修好了就别再报警】转码流走的是网盘的播放通道，实测比原画快几十倍
+            # （10.9 MB/s 对 306 KB/s）。装了分片重定向之后 Emby 里就能播 ——
+            # 这时候还报 warn，只会把人赶回慢 36 倍的那一档。
+            _hc("画质开关", "ok",
+                f"{'、'.join(_hls)} 走{CYAN}转码流{RST}"
+                f"{DIM}（分片重定向已装，比原画快几十倍）{RST}")
+        elif _hls:
             _hc("画质开关", "warn",
                 f"{'、'.join(_hls)} 设的是{CYAN}转码流{RST}  "
-                f"{YELLOW}Emby 那条还没修好{RST}")
+                f"{YELLOW}但分片重定向没装，Emby 里播不了{RST}")
             todo.append((
-                f"{'、'.join(_hls)} 用的是转码流 —— 挂载页面和外部播放器没问题，"
-                f"只有 Emby 那条本脚本还没修好",
-                "转码流走的是网盘的【播放通道】，实测比原画（下载通道）快几十倍。"
-                "卡在我们这一环：MediaWarp 只是 302 过去，而 m3u8 里的分片写的是"
-                "相对路径，Emby 客户端会把它拼到「/emby/Videos/<条目id>/」上 → 401。"
-                "在修好之前，Emby 里要能播就先切「原画直链」"
-                "（4 挂载路径 → 选这个盘 → 3 直链方式）；挂载页面照样用转码流最快"))
+                f"{'、'.join(_hls)} 用的是转码流，但分片重定向服务没装上",
+                "转码流走网盘的播放通道，比原画快几十倍；Emby 里要靠分片重定向"
+                "把分片地址指回网盘（m3u8 里写的是相对路径，客户端会拼到 "
+                "/emby/Videos/<条目id>/ 上 → 401）。跑一次「7 更新」会自动装；"
+                "装不上时屏上会写原因（端口占满 / 没有 systemctl）"))
         _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
                              f"{DIM}（卡顿就去 4 挂载路径 → 选那个盘 → 2 切换）{RST}")
     if key:
