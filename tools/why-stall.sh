@@ -49,15 +49,14 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
+# 【不填也能跑】原来这里没填就直接退出，只留一句带尖括号的用法 —— 而尖括号在
+# bash 里是重定向，照着敲就是 syntax error。现在不填就进去列出有哪些盘，
+# 再告诉你怎么挑，不用自己想一个片名。
 Q="${1:-}"
 SECS="${2:-45}"
-if [ -z "$Q" ]; then
-  echo "用法：bash why-stall.sh <片名的一部分> [拉多少秒，默认 45]"
-  exit 1
-fi
 DIR="${MS_DIR:-/opt/media-stack}"
 
 KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
@@ -173,28 +172,126 @@ def bg_tasks():
     return out
 
 
-# ================= ① 这部片，以及它每秒要多少 =================
+# ---------------------------------------------------------------- 挑哪一部
+# 【为什么要能"按盘挑"】要查的往往不是某一部片，而是【某个盘】——"夸克到底行不行"。
+# 逼人先想出一个片名是多余的一步，而且会出岔子：给出去的例子只要带尖括号，
+# 照着敲就是 bash 的重定向、当场 syntax error。所以填挂载点（/quark）也行，
+# 什么都不填就把有哪些盘列出来。
+STRM_ROOT = os.path.join(DATA_ROOT, "strm")
+
+
+def walk_strm():
+    """本地所有 strm：[(宿主机路径, 里面写的网盘路径), ...]。文件都很小，走一遍很快。"""
+    out = []
+    for dirpath, _dirs, files in os.walk(STRM_ROOT):
+        for fn in files:
+            if not fn.endswith(".strm"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                line = open(p, encoding="utf-8", errors="replace").read().strip()
+            except OSError:
+                continue
+            if line:
+                out.append((p, line))
+    return out
+
+
+def drives_here(rows):
+    """这些 strm 分布在哪几个盘上：{挂载点: 有几部}。"""
+    d = {}
+    for _p, line in rows:
+        if line.startswith("/"):
+            mp = "/" + line.lstrip("/").split("/", 1)[0]
+            d[mp] = d.get(mp, 0) + 1
+    return d
+
+
+def item_for(cpath):
+    """按【宿主机上的 strm 路径】找回它在 Emby 里的那一条。"""
+    rel = os.path.relpath(cpath, STRM_ROOT)
+    want = "/data/strm/" + rel.replace(os.sep, "/")
+    stem = os.path.splitext(os.path.basename(cpath))[0]
+    for term in (stem, stem[:12], os.path.basename(os.path.dirname(cpath))):
+        if not term:
+            continue
+        try:
+            res = emby(f"/Items?Recursive=true&SearchTerm={urllib.parse.quote(term)}"
+                       f"&IncludeItemTypes=Movie,Episode,Video&Limit=30"
+                       f"&Fields=Path,MediaSources,MediaStreams")
+        except Exception:
+            return None
+        for i in res.get("Items") or []:
+            if str(i.get("Path") or "") == want:
+                return i
+    return None
+
+
 sec("① 这部片，以及它每秒要多少")
-try:
-    res = emby(f"/Items?Recursive=true&SearchTerm={urllib.parse.quote(Q)}"
-               f"&IncludeItemTypes=Movie,Episode,Video&Limit=30"
-               f"&Fields=Path,MediaSources,MediaStreams")
-except Exception as e:
-    print(f"  {R}✖ 连不上 Emby：{safe(e)}{X}")
-    raise SystemExit(1)
-hit = [i for i in (res.get("Items") or []) if str(i.get("Path") or "").endswith(".strm")]
-if not hit:
-    print(f"  {R}✖ 库里找不到带 strm 的条目：{Q}{X}")
-    print(f"  {D}换个更短的关键词再试；或者这部片压根没进库。{X}")
-    raise SystemExit(1)
-try:
-    pick = int(os.environ.get("MS_N") or "1")
-except ValueError:
-    pick = 1
-pick = pick if 1 <= pick <= len(hit) else 1
-it = hit[pick - 1]
-if len(hit) > 1:
-    print(f"  {D}找到 {len(hit)} 个，这次查第 {pick} 个（换别的：MS_N=2 ...）{X}")
+rows = walk_strm()
+if not Q:
+    have = drives_here(rows)
+    print(f"  {Y}没说要查哪一部{X}")
+    if have:
+        print(f"  {D}这台机器上有这几个盘（括号里是片数）：{X}")
+        for mp, n in sorted(have.items(), key=lambda kv: -kv[1]):
+            print(f"      {C}{mp}{X}  {D}{n} 部{X}")
+        first = sorted(have.items(), key=lambda kv: -kv[1])[0][0]
+        print()
+        print(f"  {B}查整个盘（脚本自己挑一部）：{X}")
+        print(f"      bash why-stall.sh {first}")
+        print(f"  {B}查某一部：{X}")
+        print(f"      bash why-stall.sh 片名的一部分")
+    else:
+        print(f"  {D}{STRM_ROOT} 下面一个 strm 都没有 —— 先点「5 生成媒体库」。{X}")
+    raise SystemExit(0)
+
+it = None
+if Q.startswith("/"):
+    # 按盘挑：从这个盘里随便挑一部能对上 Emby 条目的
+    mp = "/" + Q.strip("/").split("/", 1)[0]
+    cand = [p for p, line in rows if line == mp or line.startswith(mp + "/")]
+    if not cand:
+        have = drives_here(rows)
+        print(f"  {R}✖ {mp} 这个盘下面一部片都没有{X}")
+        if have:
+            print(f"  {D}有的是：{'、'.join(sorted(have))}{X}")
+        raise SystemExit(1)
+    import random
+    random.shuffle(cand)
+    print(f"  {D}{mp} 下面有 {len(cand)} 部，随便挑一部来测{X}")
+    for p in cand[:6]:
+        it = item_for(p)
+        if it:
+            break
+    if not it:
+        print(f"  {R}✖ 挑了几部，都在 Emby 库里找不到对应条目{X}")
+        print(f"  {D}点一次「5 生成媒体库」再回来。{X}")
+        raise SystemExit(1)
+else:
+    try:
+        res = emby(f"/Items?Recursive=true&SearchTerm={urllib.parse.quote(Q)}"
+                   f"&IncludeItemTypes=Movie,Episode,Video&Limit=30"
+                   f"&Fields=Path,MediaSources,MediaStreams")
+    except Exception as e:
+        print(f"  {R}✖ 连不上 Emby：{safe(e)}{X}")
+        raise SystemExit(1)
+    hit = [i for i in (res.get("Items") or [])
+           if str(i.get("Path") or "").endswith(".strm")]
+    if not hit:
+        print(f"  {R}✖ 库里找不到带 strm 的条目：{Q}{X}")
+        _have = sorted(drives_here(rows))
+        print(f"  {D}换个更短的关键词；或者直接填挂载点"
+              f"（比如 {_have[0] if _have else '/某个盘'}），脚本自己挑一部。{X}")
+        raise SystemExit(1)
+    try:
+        pick = int(os.environ.get("MS_N") or "1")
+    except ValueError:
+        pick = 1
+    pick = pick if 1 <= pick <= len(hit) else 1
+    it = hit[pick - 1]
+    if len(hit) > 1:
+        print(f"  {D}找到 {len(hit)} 个，这次查第 {pick} 个（换别的：MS_N=2 ...）{X}")
 
 iid = str(it.get("Id") or "")
 cpath = str(it.get("Path") or "")
@@ -260,20 +357,59 @@ if not tok:
     print(f"  {R}✖ 没有 OpenList 令牌，测不了{X}  {D}读不到 {DATA_ROOT}/../.secrets{X}")
     raise SystemExit(1)
 
+def ol_post(path, payload, timeout=120):
+    try:
+        req = urllib.request.Request(
+            f"{OL}{path}", data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "Authorization": tok},
+            method="POST")
+        return json.load(urllib.request.urlopen(req, timeout=timeout))
+    except Exception as e:
+        return {"code": -1, "message": str(e)}
+
+
 raw, sign, ol_size = "", "", 0
-try:
-    req = urllib.request.Request(
-        f"{OL}/api/fs/get",
-        data=json.dumps({"path": body, "password": ""}).encode(),
-        headers={"Content-Type": "application/json", "Authorization": tok},
-        method="POST")
-    r = json.load(urllib.request.urlopen(req, timeout=120))
-except Exception as e:
-    print(f"  {R}✖ 问 OpenList 失败：{safe(e)}{X}")
-    raise SystemExit(1)
+r = ol_post("/api/fs/get", {"path": body, "password": ""})
 if r.get("code") != 200:
-    print(f"  {R}✖ OpenList 不认这条路径{X}  {D}{safe(r.get('message'))[:120]}{X}")
-    raise SystemExit(1)
+    msg = str(r.get("message") or "")
+    print(f"  {R}✖ OpenList 这一次没给出直链{X}  {D}{safe(msg)[:120]}{X}")
+    # 【"找不到"分两种，而且这件事【本身】就可能是要找的答案】
+    #   · 上游真的删了/改名了       → 本地这条 strm 是废的，重建媒体库
+    #   · 这一轮撞上限流 / 没列全   → 文件好好的，过一会儿自己就好
+    # 后一种最要命：它【不是稳定复现的故障】，而 MediaWarp 在播放那一刻要是撞上
+    # 同一下，就是拿不到直链 → 客户端一直转圈。也就是说"偶尔才有"正是症状本身，
+    # 不是测试没测准。所以这里不直接退出，先去把它分开。
+    if "not found" in msg.lower():
+        parent = os.path.dirname(body)
+        want = os.path.basename(body)
+        print(f"  {D}去列一次它的父目录（带 refresh，绕开缓存）看名字还在不在...{X}")
+        rl = ol_post("/api/fs/list", {"path": parent, "password": "", "page": 1,
+                                      "per_page": 0, "refresh": True}, timeout=180)
+        names = [str(x.get("name") or "")
+                 for x in ((rl.get("data") or {}).get("content") or [])]
+        if rl.get("code") != 200:
+            print(f"  {R}父目录也列不出来{X}  {D}{safe(rl.get('message'))[:100]}{X}")
+            print(f"  {D}整个存储这会儿都不通 —— 播放当然也拿不到直链。{X}")
+        elif want in names:
+            print(f"  {Y}⚠ 文件【在】—— 刚才那下是这个源自己抽了一下{X}")
+            print(f"  {B}这就是症状本身，不是测试没测准{X}")
+            print(f"  {D}MediaWarp 在你点播放的那一刻要是撞上同一下，就拿不到直链，"
+                  f"客户端表现正是一直转圈；隔一会儿再点又好了 —— "
+                  f"「有时能播有时不能」就是这么来的。{X}")
+            print(f"  {D}这类源按请求频率抽风，所以【少打扰它】是唯一的办法："
+                  f"预热已经跳过这类盘（v1.5.109 起），补探测也只补点开过的"
+                  f"（v1.5.108 起）。跑测试前 systemctl stop cron 能再少一批。{X}")
+            print(f"  {D}再要一次直链...{X}")
+            time.sleep(3)
+            r = ol_post("/api/fs/get", {"path": body, "password": ""})
+            if r.get("code") == 200:
+                print(f"  {G}✔ 这次给了 —— 果然是间歇性的{X}")
+        else:
+            print(f"  {R}✖ 父目录里确实没有这个名字了{X}")
+            print(f"  {D}上游把它删了或改名了，本地这条 strm 是废的。"
+                  f"点一次「5 生成媒体库」。{X}")
+    if r.get("code") != 200:
+        raise SystemExit(1)
 dat = r.get("data") or {}
 raw = str(dat.get("raw_url") or "")
 sign = str(dat.get("sign") or "")
