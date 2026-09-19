@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.124"
+SCRIPT_VERSION = "1.5.125"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1505,6 +1505,9 @@ case "${1:-info}" in
   restart [服务]  重启，省略服务名则全部重启
   strm            立刻跑一次 strm 生成并跟日志
   heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
+  heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
+                  (只在确实修好过源头之后才有意义，见屏上提示)
+  check           链路体检(等同菜单里的「6 链路体检」)
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
   selfupdate      只把脚本换成仓库里的最新版(不动镜像、不重启容器)
@@ -1638,6 +1641,20 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     exec python3 "$S" heal ;;
+  check|doctor|healthcheck)
+    # 【一路都在让人"跑 6 链路体检"，而命令行敲不到】Python 那边
+    # `elif arg in ("check", "doctor", "healthcheck")` 早就有，壳里一直没有。
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" check ;;
+  heal-reset)
+    # 【壳里必须有它】heal 那一档的输出会告诉人"敲 media-stack heal-reset"，
+    # 而上一版这个壳的 case 里没有这一条 —— 落进 *) 未知命令。
+    # 也就是说屏上指的那条出路，在这个壳里根本走不通，而它出现的场合恰恰是
+    # "一批条目被放弃了、最快还要等几十天"——最需要这条出路的时候。
+    S="/etc/bgpeer/media-stack.py"
+    [[ -f "$S" ]] || { echo "找不到 $S"; exit 1; }
+    exec python3 "$S" heal-reset ;;
   302)
     echo "跟踪 MediaWarp 日志。现在去播放一集，看到 302 就说明直链生效:"
     docker logs -f --tail 20 mediawarp ;;
@@ -9719,6 +9736,23 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                               f"再打下去只会把上游按得更久{RST}")
                         stop.set()
                         break
+                else:
+                    # 【这个 else 属于上面那条 res 判断链，不属于 `if over`】
+                    # 上一版它挂在 `if over:` 底下，于是【每一个 over 为假的条目】
+                    # ——正常情况下的每一个——都会再走一遍这里。后果三样：
+                    #   · 屏上每个条目打两行，"成功数"能超过总数（实测 2/1）
+                    #   · 成功的条目被塞进 again 再探一轮 —— 对按频率限流的源来说
+                    #     等于把请求量凭空翻倍，而 heal 本来就踩着配额在走
+                    #   · 成功的条目被记成一次失败：fails 里先进 (id, True) 再进
+                    #     (id, False)，而 heal_fail_record 按顺序处理，先 pop 掉
+                    #     再写回一条失败 —— 每探成功一次就攒一次失败计数，
+                    #     攒够 HEAL_GIVEUP 就被放弃 30 天起。等于自己诬告自己。
+                    if res != "dead":            # dead 是确定答案，同一轮里也别再试
+                        again.append(_it)
+                    fails.append((_it[1], False, res == "dead"))
+                    print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
+                          f"{name[:26]}  {YELLOW}{note or 'Emby 没探出时长'}{RST}"
+                          f"  {DIM}{sec:.0f}s{RST}")
                 if over:
                     # 【用刹车当时量到的那个数，别再 meter() 一次】重读一次既可能
                     # 返回 None（容器刚好重启）把这一行炸成 TypeError、连带整轮
@@ -9729,13 +9763,6 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                           f"排队没轮到的一个都不发{RST}")
                     stop.set()
                     break
-                else:
-                    if res != "dead":            # dead 是确定答案，同一轮里也别再试
-                        again.append(_it)
-                    fails.append((_it[1], False, res == "dead"))
-                    print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
-                          f"{name[:26]}  {YELLOW}{note or 'Emby 没探出时长'}{RST}"
-                          f"  {DIM}{sec:.0f}s{RST}")
                 # 预算是【这一轮里也要看】的：一个条目最坏要等 3 分钟，光靠每轮之间
                 # 那次判断根本刹不住 —— 而这任务是挂在每小时的 cron 上的。
                 if t_all is not None and time.monotonic() - t_all > lim:
