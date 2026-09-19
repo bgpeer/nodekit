@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.122"
+SCRIPT_VERSION = "1.5.123"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1819,7 +1819,7 @@ def hls_wanted(d):
     """
     try:
         return [mp for _s, mp, _d, add, _c in _storage_rows(d, strict=True)
-                if str(add.get("link_method") or "") == "streaming"]
+                if is_hls_mode(add)]
     except Exception:
         return None
 
@@ -11295,6 +11295,39 @@ OPT_TAG = {
 }
 
 
+# 【「转码流」在不同驱动里叫不同的名字，但是同一件事】
+#   夸克   link_method             = "streaming"
+#   115    use_transcoding_address = True
+# 两者网盘回的都是 m3u8，而 m3u8 里的分片写的是【相对路径】—— Emby 客户端把它拼到
+# /emby/Videos/<条目id>/ 上，于是分片请求全打回 Emby → 401 → 一直转圈。
+# 都要靠分片重定向（do_hls_fix）才能在 Emby 里播。
+#
+# 【判据只写这一处】认这件事的有三个地方：装不装服务（hls_wanted）、菜单上那句提示
+# （opt_tag）、体检那一行。上一版三处全都只认夸克那个字段名，于是 115 切到转码流之后
+# 服务不装、菜单不提示、体检不报，点开就是转圈而屏上一个字都没有 —— 比夸克当初还糟，
+# 夸克至少有提示。以后再冒出第三个叫法，只改这一行。
+HLS_MODE_KEYS = (("link_method", "streaming"), ("use_transcoding_address", True))
+
+
+def is_hls_val(key, val):
+    """这个开关的这个取值，是不是「转码流」。
+
+    【布尔那一档走 _truthy】OpenList 把 addition 存成 JSON，这个字段可能是 true，
+    也可能是 "true"（换个版本就变，_truthy 的说明里记着这条教训）。用 is True 判
+    会在后一种情况下静默失效 —— 而静默失效正是这个 bug 本来的样子。
+    """
+    for k, v in HLS_MODE_KEYS:
+        if k != key:
+            continue
+        return _truthy(val) if v is True else str(val or "") == v
+    return False
+
+
+def is_hls_mode(add):
+    """这个盘的「画质」是不是设成了转码流 —— 不管它的驱动把这个字段叫什么。"""
+    return any(k in add and is_hls_val(k, add.get(k)) for k, _v in HLS_MODE_KEYS)
+
+
 def hls_ready():
     """转码流的分片重定向装上了没有。装了转码流在 Emby 里就能播。
 
@@ -11306,7 +11339,7 @@ def hls_ready():
 
 def opt_tag(key, val):
     """屏上挂的那一小句，已经带好颜色。没有就返回空串。"""
-    if key == "link_method" and val == "streaming":
+    if is_hls_val(key, val):
         # 【这一句必须照实说，两个方向都不能写死】
         # 写死"还没修好"：修好之后就成了假话，而且会把人赶回【慢 36 倍】的原画
         #   （实测同一部片 306 KB/s 对 10.92 MB/s）—— 仓库主人当场指出来的。
@@ -15097,7 +15130,7 @@ def do_healthcheck():
         # 而真相埋在日志里：m3u8 的分片是相对路径，被播放器拼回 /emby/Videos/<id>/，
         # 于是每秒好几条 401。不看日志根本联想不到画质开关。
         _hls = [mp for _s, mp, _d, add, _c in _storage_rows(d)
-                if str(add.get("link_method") or "") == "streaming"]
+                if is_hls_mode(add)]
         if _hls and hls_ready():
             # 【修好了就别再报警】转码流走的是网盘的播放通道，实测比原画快几十倍
             # （10.9 MB/s 对 306 KB/s）。装了分片重定向之后 Emby 里就能播 ——
