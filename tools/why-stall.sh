@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # 「能播，但过几秒卡一下」专用 —— 不用你去点播放，脚本自己当一回播放器把这部片拉一遍。
 #
-#   bash why-stall.sh 龙虎门          拉 45 秒
+#   bash why-stall.sh                【每个盘都查一遍】，各随机挑一部 —— 不用想片名
+#   bash why-stall.sh /quark          只查这个盘，脚本自己挑一部
+#   bash why-stall.sh 龙虎门          只查这一部，拉 45 秒
 #   bash why-stall.sh 龙虎门 90       拉 90 秒
 #   MS_N=2 bash why-stall.sh 龙虎门   同名的有好几个时，查第 2 个
+#   MS_SECS=60 bash why-stall.sh      不填参数时每个盘拉多少秒（默认 30）
+#
+# 【不填参数是主用法】"到底哪个盘有问题"本来就得几个盘并排看才谈得上比较，
+# 而逼人先想出一个片名、或者先挑一个盘，都只是在中间多加一道来回。
 #
 # 【为什么要重写一个，cant-play.sh 不够用】cant-play.sh 回答的是「能不能拉到数据」，
 # 它最多连着拉 4 秒、而且是【全速】拉。可是"卡一下"根本不是拉不到数据 ——
@@ -49,12 +55,12 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19b"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19c"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
-# 【不填也能跑】原来这里没填就直接退出，只留一句带尖括号的用法 —— 而尖括号在
-# bash 里是重定向，照着敲就是 syntax error。现在不填就进去列出有哪些盘，
-# 再告诉你怎么挑，不用自己想一个片名。
+# 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
+# 尖括号在 bash 里是重定向，照着敲就是 syntax error。后来改成列个菜单让人再敲
+# 一次，还是不对：人要的是结论，不是菜单。现在不填就自己跑完所有盘。
 Q="${1:-}"
 SECS="${2:-45}"
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -73,10 +79,13 @@ DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 # 【日志走临时文件，不能用管道】python3 - <<'PY' 是从 stdin 读程序，
 # 再往 stdin 里灌日志，两边抢同一个口子。link-history.sh 上栽过一次。
 MWLOG="$(mktemp)"
-trap 'rm -f "$MWLOG"' EXIT
+# 【程序也落成文件，因为要跑不止一次】不填参数时每个盘都要跑一遍，
+# 而 heredoc 只能喂给 stdin 一次。
+PYF="$(mktemp)"
+trap 'rm -f "$MWLOG" "$PYF"' EXIT
 docker logs --tail 4000 mediawarp >"$MWLOG" 2>&1 || : >"$MWLOG"
 
-python3 - "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$SECS" "$Q" "$MWLOG" <<'PY'
+cat >"$PYF" <<'PY'
 import json, os, re, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
@@ -227,21 +236,25 @@ def item_for(cpath):
     return None
 
 
+# 【机器读的那一档】外面那层 bash 拿它来决定要跑哪几个盘。一行一个挂载点，
+# 片多的排前面，不带颜色也不带别的话。
+if Q == "--drives":
+    for mp, _n in sorted(drives_here(walk_strm()).items(), key=lambda kv: -kv[1]):
+        print(mp)
+    raise SystemExit(0)
+
 sec("① 这部片，以及它每秒要多少")
 rows = walk_strm()
 if not Q:
+    # 【不该在这里停下来让人再敲一次】上一版这里打的是"有这几个盘、你去挑一个"，
+    # 于是又多一个来回 —— 而人要的从来不是一份菜单，是【结论】。现在外面那层
+    # bash 不填参数时会自己把每个盘都跑一遍，这个分支只在它没起作用时兜底。
     have = drives_here(rows)
-    print(f"  {Y}没说要查哪一部{X}")
+    print(f"  {Y}没说要查哪一部，也没人替我挑{X}")
     if have:
-        print(f"  {D}这台机器上有这几个盘（括号里是片数）：{X}")
-        for mp, n in sorted(have.items(), key=lambda kv: -kv[1]):
-            print(f"      {C}{mp}{X}  {D}{n} 部{X}")
-        first = sorted(have.items(), key=lambda kv: -kv[1])[0][0]
-        print()
-        print(f"  {B}查整个盘（脚本自己挑一部）：{X}")
-        print(f"      bash why-stall.sh {first}")
-        print(f"  {B}查某一部：{X}")
-        print(f"      bash why-stall.sh 片名的一部分")
+        print(f"  {D}这台机器上有：{'、'.join(f'{m}（{n} 部）' for m, n in sorted(have.items(), key=lambda kv: -kv[1]))}{X}")
+        print(f"  {B}挑一个盘跑：{X}"
+              f"  bash why-stall.sh {sorted(have.items(), key=lambda kv: -kv[1])[0][0]}")
     else:
         print(f"  {D}{STRM_ROOT} 下面一个 strm 都没有 —— 先点「5 生成媒体库」。{X}")
     raise SystemExit(0)
@@ -889,3 +902,38 @@ print()
 print(f"  {D}还想往下查：转码用 playing.sh，历次被指去了哪用 link-history.sh，"
       f"整条链通不通用 cant-play.sh。{X}")
 PY
+
+run_one() {   # $1 = 片名或挂载点   $2 = 拉多少秒
+  python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$2" "$1" "$MWLOG"
+}
+
+if [ -n "$Q" ]; then
+  run_one "$Q" "$SECS"
+  exit $?
+fi
+
+# 【不填参数 = 把每个盘都跑一遍，一次跑完】
+# 上一版这里是列个菜单让人再敲一次 —— 而人要的从来不是菜单，是结论；
+# 何况"到底哪个盘有问题"本来就得几个盘并排看才谈得上比较。
+EACH="${MS_SECS:-30}"
+DRV="$(python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$EACH" "--drives" "$MWLOG")"
+if [ -z "$DRV" ]; then
+  echo "  ✖ 一个盘都没找到（$DATA_ROOT/strm 下面没有 strm）—— 先点「5 生成媒体库」"
+  exit 1
+fi
+N="$(printf '%s\n' "$DRV" | grep -c .)"
+echo
+echo "  没指定查哪个 —— 那就【每个盘都查一遍】，共 $N 个。"
+echo "  每个盘随机挑一部、拉 $EACH 秒，加上探测大约 $((N + N / 2 + 1)) 分钟。"
+echo "  想只查一个：bash ${0##*/} 那个盘的挂载点"
+printf '%s\n' "$DRV" | while IFS= read -r MP; do
+  [ -n "$MP" ] || continue
+  echo
+  echo "════════════════════════════════════════════════════════════"
+  echo "  $MP"
+  echo "════════════════════════════════════════════════════════════"
+  run_one "$MP" "$EACH" || echo "  （这个盘没测完，接着下一个）"
+done
+echo
+echo "  全部跑完。把这一整屏发出去就行 —— 几个盘并排看才分得出是"
+echo "  某个盘的毛病，还是这台机器/这条线路的毛病。"
