@@ -86,7 +86,11 @@ def jwt_days(t):
 
 
 def get(url, timeout=45):
-    req = urllib.request.Request(url, headers={"User-Agent": "media-stack"})
+    # 【中性 UA】这条请求是发给【第三方】令牌续期 API 的，不是打给本机。
+    # 原来写的是 "media-stack" —— 等于主动告诉那个第三方"这台机器在跑 media-stack"，
+    # 正是仓库规矩第一条点名不许的那种自报家门（和 xy-installer 并列举的例子）。
+    # 它换不来任何功能，纯白送。
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
 

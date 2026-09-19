@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19k"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19l"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -88,7 +88,7 @@ docker logs --tail 4000 mediawarp >"$MWLOG" 2>&1 || : >"$MWLOG"
 MWSTART="$(docker inspect -f '{{.State.StartedAt}}' mediawarp 2>/dev/null || true)"
 
 cat >"$PYF" <<'PY'
-import json, os, re, socket, sys, threading, time
+import json, os, re, socket, subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 KEY, OLPW, DATA_ROOT, DOMAIN, SECS, Q, MWLOG = sys.argv[1:8]
@@ -1043,7 +1043,10 @@ UAS = (("浏览器（脚本一直用的）", UA),
        ("Emby 的 ffprobe", "Lavf/59.27.100"),
        ("Emby 安卓客户端", "Emby/1.4 (Android 13; ExoPlayerLib/2.18.1)"),
        ("VLC / Infuse 那一类", "VLC/3.0.18 LibVLC/3.0.18"),
-       ("不带 UA", ""))
+       # 【这一张的名字要照实写】不设 User-Agent 头，urllib 会自己补一个
+       # Python-urllib/3.x 上去 —— 所以它不是"没有脸"，是"另一张脸"。
+       # 写成"不带 UA"会让人以为存在一种"什么都不发"的选项，那是假的。
+       ("不设 UA（urllib 默认）", ""))
 
 
 def ua_speed(url, start, ua, secs=6, cap=4 << 20):
@@ -1129,12 +1132,20 @@ if _cdn:
                   f"快 = 不认 IP，慢 = 认。{X}")
     # 【"换张脸能不能救"只有真拉一遍才算答上】上面那五发各拉几秒，量的是瞬时速度；
     # 而"卡不卡"要看一条完整的时间轴 —— 缓冲撑不撑得住、换段费降不降。
-    if (len(_ok) >= 2 and _fast is not None and _fast[2]
-            and _fast[1] > _slow[1] * 3):
+    # 【别因为最快的那张脸是"不设 UA"就悄悄不测】上一版的条件里带着 _fast[2]，
+    # 而"不设 UA"这一张的 UA 串就是空的 —— 只要它跑赢（实测夸克上它是第二快的
+    # 10.3 Mbps，跑赢完全可能），整个复测就被静默跳过：屏上前面刚说完"最快的
+    # 那张脸是它"，后面却没有任何复测，人拿不到"换了到底还卡不卡"这个答案。
+    # 空 UA 不是"没有选项"，它就是一个选项 —— 照 ua_speed 的做法【把这个头去掉】，
+    # 而不是把它设成空串（设成空串发出去的是 `User-Agent:`，跟量的时候不是一回事）。
+    if len(_ok) >= 2 and _fast is not None and _fast[1] > _slow[1] * 3:
+        _h2 = {k: v for k, v in _h.items() if k.lower() != "user-agent"}
+        if _fast[2]:
+            _h2["User-Agent"] = _fast[2]
         print()
         print(f"  {B}换成最快的那张脸，再当一回播放器 ——{X}")
         _rs2 = play(_u, f"同一条路，戴「{_fast[0]}」那张脸", need_bps,
-                    min(SECS, 30), dict(_h, **{"User-Agent": _fast[2]}))
+                    min(SECS, 30), _h2)
         _rs2["label"] = f"同一条路，戴「{_fast[0]}」那张脸"
         done.append(_rs2)
         _base = next((r for r in done if r is not _rs2), None)
@@ -1220,30 +1231,182 @@ print(f"  {D}要抓现行：在手机上点开让它转着，然后立刻跑这�
 #   Transcode    整条视频在本机重编码：先从跨境网盘拉下来、转完再发给客户端。
 #                302 等于白设，而 2 核的机器边拉边转供不上，表现正是
 #                「转一会儿像连不上一样就断开」
+def _fps(ms):
+    """这条视频流一秒多少帧。Emby 两个字段都可能缺，也可能写成 "24000/1001"。"""
+    for k in ("AverageFrameRate", "RealFrameRate"):
+        v = ms.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+        if isinstance(v, str) and "/" in v:
+            try:
+                a, b = v.split("/", 1)
+                if float(b):
+                    return float(a) / float(b)
+            except ValueError:
+                pass
+    return 0.0
+
+
+def _ffmpeg_cpu():
+    """此刻 ffmpeg 一共吃掉多少 CPU（百分比，100 = 一个核吃满）。
+
+    【在宿主机上 ps 就看得到容器里的 ffmpeg】Emby 跑在 docker 里，但进程表是宿主
+    机的，不用 docker exec —— 少一层依赖，Emby 容器名换了也照样能量。
+    """
+    try:
+        out = subprocess.run(["ps", "-eo", "pcpu,args"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except Exception:
+        return None, 0
+    tot, n = 0.0, 0
+    for ln in out.splitlines()[1:]:
+        ln = ln.strip()
+        if "ffmpeg" not in ln or "ps -eo" in ln:
+            continue
+        head = ln.split(None, 1)
+        try:
+            tot += float(head[0])
+        except (ValueError, IndexError):
+            continue
+        n += 1
+    return (tot, n) if n else (None, 0)
+
+
 try:
     _sess = emby("/Sessions") or []
 except Exception:
     _sess = []
 _live = [x for x in _sess if x.get("NowPlayingItem")]
 if not _live:
-    print(f"  {D}（此刻没人在播，PlayMethod 这一项跳过）{X}")
+    print(f"  {Y}此刻没人在播 —— 这一段是整个脚本里唯一能回答"
+          f"「点了播放却不出画面」的地方，空着等于没测。{X}")
+    print(f"  {D}抓现行：在播放器里点开那部片，【让它转着别退】，"
+          f"然后回到这里再跑一次这个脚本。{X}")
 else:
     for _s in _live:
-        _n = (_s.get("NowPlayingItem") or {}).get("Name") or "?"
+        _item = _s.get("NowPlayingItem") or {}
+        _n = _item.get("Name") or "?"
         _m = str((_s.get("PlayState") or {}).get("PlayMethod") or "")
         _tr = _s.get("TranscodingInfo") or {}
         print()
         print(f"  {B}正在播：{_n}{X}  {D}{_s.get('Client') or '?'}"
               f"（{_s.get('DeviceName') or '?'}）{X}")
+
+        # ---- 先把"画面到底出没出来"落成事实，别靠截图 ----
+        # 【这是"能不能播"和"播得顺不顺"的分界线】进度还在 0，后面所有关于
+        # 带宽、卡顿的话都不适用 —— 那些说的是"播着播着"，而这里根本没播起来。
+        _pos = (_s.get("PlayState") or {}).get("PositionTicks") or 0
+        try:
+            _pos = int(_pos) / 1e7
+        except (TypeError, ValueError):
+            _pos = 0.0
+        _stuck = _pos < 1.0
+        if _stuck:
+            print(f"  {R}进度还在 0:00 —— 画面没出来{X}")
+        else:
+            print(f"  {D}进度 {int(_pos) // 60}:{int(_pos) % 60:02d}"
+                  f"（画面已经出来了，下面说的是顺不顺）{X}")
+
         if _m == "DirectPlay":
             print(f"  {G}✔ 直接播放{X}  {D}视频没经过这台机器，302 是真生效的{X}")
+            if _stuck:
+                # 【直接播放 + 不出画面 = 客户端在从头啃整个文件】
+                # MP4 的索引（moov）在文件尾，而服务端不认 Range 的时候，播放器
+                # 只能从头拉到尾才拿得到它。表现正是"流量巨大、一帧都没有"。
+                print(f"  {Y}但画面没出来，而视频压根没过这台机器 —— "
+                      f"那卡在客户端和网盘之间，这个脚本量不到那一段。{X}")
+                print(f"  {D}最常见的一种：文件的索引（MP4 的 moov）在文件尾，"
+                      f"而那一头不认 Range，播放器只能从头啃到尾才拿得到索引 —— "
+                      f"流量哗哗跑、一帧画面都没有。上面 ⑤ 里如果有哪条路写了"
+                      f"「服务器不认 Range」，就是它。{X}")
         elif _m == "DirectStream":
             print(f"  {Y}⚠ 直接流{X}  {D}只换了容器，视频流还是经过这台机器转手{X}")
         elif _m == "Transcode":
             print(f"  {R}✖ 在转码{X}")
             print(f"  {D}这台机器要先把片子从网盘拉下来、转完再发给客户端 —— "
-                  f"302 等于白设。跨境拉 + 本机转码，供不上就断，"
-                  f"客户端上就是「转一会儿像连不上一样」。{X}")
+                  f"302 等于白设。{X}")
+
+            # ---- 【这一段是这一节的重点】转码是"边拉边转"：
+            # 拉是满速的，转出来的帧却按 CPU 的速度走。所以完全可能
+            # 流量跑到 30 M/s、而进度条一直挂在 0:00 —— 而且直链修得越好，
+            # 流量数字越漂亮，越容易被当成网络问题去查。
+            # 判据只有一个数：转码帧率 ÷ 源帧率。
+            _src = 0.0
+            for _ms in (_item.get("MediaStreams") or []):
+                if str(_ms.get("Type") or "").lower() == "video":
+                    _src = _fps(_ms)
+                    break
+            if not _src and _item.get("Id"):
+                # 【NowPlayingItem 里不一定带 MediaStreams】不同版本的 Emby 给的
+                # 字段不一样。少了它，这一节最要紧的那个数（倍速）就算不出来 ——
+                # 而算不出来的时候屏上只有一句"帧率 Emby 没报"，人什么也没拿到。
+                # 多问一次条目就有了，代价是一次本机请求。
+                try:
+                    _full = emby(f"/Items?Ids={_item['Id']}&Fields=MediaStreams",
+                                 timeout=30) or {}
+                    for _it in (_full.get("Items") or []):
+                        for _ms in (_it.get("MediaStreams") or []):
+                            if str(_ms.get("Type") or "").lower() == "video":
+                                _src = _fps(_ms)
+                                break
+                except Exception:
+                    pass
+            try:
+                _out = float(_tr.get("Framerate") or 0)
+            except (TypeError, ValueError):
+                _out = 0.0
+            if _out > 0 and _src > 0:
+                _rt = _out / _src
+                _c = G if _rt >= 1.3 else (Y if _rt >= 1.0 else R)
+                print(f"  {_c}转码速度 {_rt:.2f} 倍实时{X}  "
+                      f"{D}（转出 {_out:.1f} fps，源片 {_src:.1f} fps）{X}")
+                if _rt < 1.0:
+                    _wait = 1 / _rt if _rt else 0
+                    print(f"  {R}→ 转得比播得慢：客户端每等 {_wait:.1f} 秒"
+                          f"才拿到 1 秒的画面。{X}")
+                    print(f"  {D}这就是「流量很大、画面半天不出来」的机制 —— "
+                          f"拉是满速的，转不动而已。跟网盘、跟直链、"
+                          f"跟带宽都没有关系，往那边查是白查。{X}")
+                elif _rt < 1.3:
+                    print(f"  {Y}→ 只比实时快一点点：能起播，但一遇到打斗、"
+                          f"字幕多的段落就会追不上。{X}")
+            elif _out > 0:
+                print(f"  {D}转出 {_out:.1f} fps（源片帧率 Emby 没报，"
+                      f"比不出倍速）{X}")
+
+            _pct = _tr.get("CompletionPercentage")
+            if isinstance(_pct, (int, float)):
+                print(f"  {D}已经转了 {_pct:.1f}%{X}")
+
+            # 硬解/硬编是决定倍速的大头，报出来才知道还有没有救
+            _dec = _tr.get("VideoDecoder") or ""
+            _enc = _tr.get("VideoEncoder") or ""
+            _hw = bool(_tr.get("VideoDecoderIsHardware")) or \
+                bool(_tr.get("VideoEncoderIsHardware"))
+            if _dec or _enc:
+                print(f"  {D}解码 {_dec or '?'} → 编码 {_enc or '?'}"
+                      f"（{'硬件加速' if _hw else '纯 CPU'}）{X}")
+
+            # 【"转不动"要分两种，处置完全不同】
+            #   CPU 吃满了  → 机器就这个水平，只能别让它转（换播放器 / 换片源）
+            #   CPU 没吃满  → 瓶颈不在 CPU，是 ffmpeg 在等输入（源拉不动）
+            _cpu, _nproc = _ffmpeg_cpu()
+            _cores = os.cpu_count() or 1
+            if _cpu is not None:
+                _sat = _cpu / (_cores * 100.0)
+                print(f"  {D}ffmpeg 此刻吃 {_cpu:.0f}% CPU，这台机器 {_cores} 核"
+                      f"（满载算 {_cores * 100}%）{X}")
+                if _sat >= 0.7:
+                    print(f"  {D}→ CPU 基本吃满了：机器就这个水平，"
+                          f"调参数救不回来。{X}")
+                else:
+                    print(f"  {Y}→ CPU 还有富余，却转不快 —— "
+                          f"那 ffmpeg 多半在等输入，瓶颈在取流那一段"
+                          f"（看上面 ③ ④）。{X}")
+            elif _nproc == 0:
+                print(f"  {Y}⚠ Emby 说在转码，进程表里却找不到 ffmpeg —— "
+                      f"要么刚起还没 fork，要么它转码用的是别的名字。{X}")
+
             _why = _tr.get("TranscodeReasons") or []
             if isinstance(_why, str):
                 _why = [_why]
@@ -1251,7 +1414,9 @@ else:
                 print(f"  {B}Emby 说转码的原因：{'、'.join(_why)}{X}")
             print(f"  {D}这套东西【不该转码】：文件在网盘上，本机手里只有一条 URL。"
                   f"治法在客户端那头 —— 换个能直解的播放器"
-                  f"（Infuse / VidHub / Kodi / 电视盒子），或者换个编码普通的片源。{X}")
+                  f"（Infuse / VidHub / Kodi / 电视盒子），或者换个编码普通的片源。"
+                  f"浏览器里的网页播放器是最容易触发转码的一种，"
+                  f"用它来判断「能不能播」会冤枉整条链路。{X}")
         else:
             print(f"  {Y}⚠ 播放方式：{_m or '(Emby 没报)'}{X}")
 print()
