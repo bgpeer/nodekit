@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19f"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19g"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -1093,6 +1093,49 @@ else:
 sec("⑥ 这部片最近【真被人播】的时候，日志里发生了什么")
 print(f"  {D}上面测的都是脚本自己造的请求。这一段看的是真实播放 —— "
       f"客户端可能走了完全不同的路（转码、或者压根没走 MediaWarp）。{X}")
+print(f"  {D}要抓现行：在手机上点开让它转着，然后立刻跑这个脚本。{X}")
+
+# ---- 现在有没有人在播：Emby 自己的答案，比任何推断都硬 ----
+# 【DirectPlay / DirectStream / Transcode 的区别就是视频走不走这台机器】
+#   DirectPlay   客户端直接吃网盘那个文件 —— 302 是真生效的
+#   DirectStream 只换容器，视频流仍然【经过本机】转手
+#   Transcode    整条视频在本机重编码：先从跨境网盘拉下来、转完再发给客户端。
+#                302 等于白设，而 2 核的机器边拉边转供不上，表现正是
+#                「转一会儿像连不上一样就断开」
+try:
+    _sess = emby("/Sessions") or []
+except Exception:
+    _sess = []
+_live = [x for x in _sess if x.get("NowPlayingItem")]
+if not _live:
+    print(f"  {D}（此刻没人在播，PlayMethod 这一项跳过）{X}")
+else:
+    for _s in _live:
+        _n = (_s.get("NowPlayingItem") or {}).get("Name") or "?"
+        _m = str((_s.get("PlayState") or {}).get("PlayMethod") or "")
+        _tr = _s.get("TranscodingInfo") or {}
+        print()
+        print(f"  {B}正在播：{_n}{X}  {D}{_s.get('Client') or '?'}"
+              f"（{_s.get('DeviceName') or '?'}）{X}")
+        if _m == "DirectPlay":
+            print(f"  {G}✔ 直接播放{X}  {D}视频没经过这台机器，302 是真生效的{X}")
+        elif _m == "DirectStream":
+            print(f"  {Y}⚠ 直接流{X}  {D}只换了容器，视频流还是经过这台机器转手{X}")
+        elif _m == "Transcode":
+            print(f"  {R}✖ 在转码{X}")
+            print(f"  {D}这台机器要先把片子从网盘拉下来、转完再发给客户端 —— "
+                  f"302 等于白设。跨境拉 + 本机转码，供不上就断，"
+                  f"客户端上就是「转一会儿像连不上一样」。{X}")
+            _why = _tr.get("TranscodeReasons") or []
+            if isinstance(_why, str):
+                _why = [_why]
+            if _why:
+                print(f"  {B}Emby 说转码的原因：{'、'.join(_why)}{X}")
+            print(f"  {D}这套东西【不该转码】：文件在网盘上，本机手里只有一条 URL。"
+                  f"治法在客户端那头 —— 换个能直解的播放器"
+                  f"（Infuse / VidHub / Kodi / 电视盒子），或者换个编码普通的片源。{X}")
+        else:
+            print(f"  {Y}⚠ 播放方式：{_m or '(Emby 没报)'}{X}")
 print()
 try:
     log = open(MWLOG, encoding="utf-8", errors="replace").read().splitlines()
@@ -1118,6 +1161,34 @@ else:
              or re.search(r"\|\s*(\d{3})(?:\s|$)", ln))
         if m:
             codes[m.group(1)] = codes.get(m.group(1), 0) + 1
+    # 【只数状态码丢掉了最要紧的那一维】走 302 和走转码，状态码可以一模一样，
+    # 而路径完全不同。上一版 95 条请求摆在屏上，却说不出其中有几条是转码。
+    KINDS = (("转码（Emby 自己在拉，302 白设）",
+              re.compile(r"master\.m3u8|main\.m3u8|/hls\d*/|\.ts(\?|$|\s)", re.I)),
+             ("直接播放（走 302）", re.compile(r"/stream|/original", re.I)),
+             ("开播探测", re.compile(r"playbackinfo", re.I)))
+    kinds = {}
+    for ln in mine:
+        for name, rx in KINDS:
+            if rx.search(ln):
+                kinds[name] = kinds.get(name, 0) + 1
+                break
+    if kinds:
+        print(f"  {D}这些请求要的是什么：{X}")
+        for name, n in sorted(kinds.items(), key=lambda kv: -kv[1]):
+            col = R if name.startswith("转码") else G if name.startswith("直接") else D
+            print(f"    {col}{name}{X}  {D}{n} 条{X}")
+        if kinds.get("转码（Emby 自己在拉，302 白设）"):
+            print(f"  {R}✖ 客户端走的是【转码】那条路{X}")
+            print(f"  {D}那就跟取流快慢没关系了：Emby 要自己把片子从跨境网盘拉下来、"
+                  f"边拉边转再喂给客户端。供不上就断 —— 正是「转一会儿像连不上一样"
+                  f"就断开」。{X}")
+            print(f"  {D}而这套东西【不该转码】：文件在网盘上，本机手里只有一条 URL。{X}")
+            print(f"  {B}治法在客户端那头{X}{D}：换个能直解的播放器"
+                  f"（Infuse / VidHub / Kodi / 电视盒子），或者换个编码普通的片源。"
+                  f"服务器这头怎么调都没用。{X}")
+            print(f"  {D}想知道 Emby 为什么要转：点开让它转着，再跑一次这个脚本，"
+                  f"上面 PlayMethod 那一段会打出 Emby 自己给的原因。{X}")
     if not codes:
         # 【数不出来就要把原样摆出来，不能只报个总数】
         print(f"  {Y}找到 {len(mine)} 条这个条目的请求，但这份日志的格式认不出状态码{X}")
