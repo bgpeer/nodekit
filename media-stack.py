@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.115"
+SCRIPT_VERSION = "1.5.116"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -6528,6 +6528,17 @@ def do_update(from_menu=False):
         dir_cache_auto_apply(d)
     except Exception as e:
         warn(f"调整目录缓存失败（不影响使用）：{_short_err(e)}")
+    # 【转码流的分片重定向要跟着更新走】它是 v1.5.114 才有的东西，而老用户的
+    # 机器上既没有那个 systemd 服务、nginx 里也没有那条 location。只挂在"切画质"
+    # 那一下的话，早就把画质设成转码流的人【永远等不到它】—— 更新完看着版本号是
+    # 新的，播放却还是照旧转圈，而且完全看不出差在哪。所以更新这条路上必须对一次。
+    try:
+        if sync_hls_service(d):
+            ok("转码流的分片重定向已就绪（Emby 里现在能播转码流）")
+        if cfg.get("has_domain") and os.path.exists(cfg.get("crt") or ""):
+            apply_nginx_site(cfg)
+    except Exception as e:
+        warn(f"分片重定向没对上（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
