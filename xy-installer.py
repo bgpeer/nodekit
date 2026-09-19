@@ -4060,6 +4060,28 @@ def _run_core_update_detached(target):
     except KeyboardInterrupt:
         print(f"\n  已退出跟随，后台继续执行。稍后看日志: tail {CORE_CRON_LOG}")
 
+# 【共用件的规矩：只拿自己的】nginx 这一条三家早就做对了（各删各的 conf，
+# 谁都不碰 nginx 本体）。可 /etc/bgpeer 和 /etc/ssl/sb 也是共用的，
+# 而这里原来是无条件 rm -rf —— 卸节点会顺手把 Emby 那套弄坏，且不留一句话。
+MS_STATE_FILE = "/etc/bgpeer/media-stack.json"      # Emby 那套的状态文件
+MS_NGINX_CONF = "/etc/nginx/conf.d/media-stack.conf"  # Emby 那套的站点
+
+
+def _media_stack_installed():
+    """这台机器上的 Emby 那套还在不在。
+
+    判据用【它自己的判据】：状态文件里记着装在哪，那个目录里有 docker-compose.yml
+    才算装着。只看状态文件在不在会把"卸干净了但状态文件还留着"也算成在，
+    那样节点这边就永远删不掉 /etc/bgpeer 了。
+    """
+    try:
+        with open(MS_STATE_FILE, encoding="utf-8") as f:
+            d = json.load(f).get("install_dir") or "/opt/media-stack"
+    except Exception:
+        return False
+    return os.path.exists(os.path.join(d, "docker-compose.yml"))
+
+
 def _uninstall_core():
     """卸载代理主体：sing-box/xray、订阅服务、证书、AdGuard、CDN 节点、命令、cron。
        不含网络优化(BBR/QoS，独立模块)——由调用方决定要不要一起 --reset。"""
@@ -4083,12 +4105,32 @@ def _uninstall_core():
         sh("/opt/AdGuardHome/AdGuardHome -s uninstall", check=False)
         sh("systemctl stop AdGuardHome", check=False)
         sh("rm -rf /opt/AdGuardHome", check=False)
-    for p in (SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, "/etc/ssl/sb", SUB_DIR,
-              "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", "/etc/bgpeer", WEBROOT,
-              # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
-              "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
-              CORE_CRON_FILE, CORE_CRON_LOG):
+    # 【这两样是共用的，得先看有没有别人在用】跟 nginx 一个规矩：只拿自己的。
+    _ms = _media_stack_installed()
+    _keep_cert = _ms and os.path.exists(MS_NGINX_CONF)
+    paths = [SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, SUB_DIR,
+             "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", WEBROOT,
+             # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
+             "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
+             CORE_CRON_FILE, CORE_CRON_LOG]
+    if not _keep_cert:
+        # 证书是节点签的，没人用就跟着走
+        paths.append("/etc/ssl/sb")
+    if not _ms:
+        paths.append("/etc/bgpeer")          # 没人共用，整个目录一起收
+    for p in paths:
         sh(f"rm -rf {p}", check=False)
+    if _ms:
+        # 【目录留着，但节点自己的文件要清干净】留下的只有别人的东西。
+        for p in ("/etc/bgpeer/state.json",):
+            sh(f"rm -f {p}", check=False)
+        print("  ↷ /etc/bgpeer 保留：Emby 那套（media-stack）的状态也存在这里。")
+        print("    里面记着它的安装目录、分片重定向端口、每个盘的探测 UA 开关 ——")
+        print("    删掉的话它会当场显示「未安装」，而且那些开关会静默关掉。")
+    if _keep_cert:
+        print("  ↷ /etc/ssl/sb 保留：Emby 那套的 nginx 站点正用着这里的证书。")
+        print("    删了它那个站点立刻打不开，而这不是「卸载节点」该有的结果。")
+        print("    彻底清掉：先卸 Emby 那套，再 rm -rf /etc/ssl/sb")
 
 def uninstall_all():
     """卸载子菜单：只卸代理主体 / 全部卸载(再带上网络优化) / 返回。
