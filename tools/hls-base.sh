@@ -33,8 +33,11 @@ echo "  ${0##*/}  版本 $TOOL_VER"
 DIR="${MS_DIR:-/opt/media-stack}"
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 [ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
-KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\1/p' \
-       "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
+# 【照抄 why-stall.sh 里那一条，别自己另发明】上一版我写的那个要求"到值就结束"，
+# 行尾有注释或尾随空白就匹配不上，结果这台机器上直接读不到 key。
+# 下面这条是已经在真机上验过的。
+KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
+       "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1 | tr -d "\"'")"
 [ -n "$KEY" ] || { echo "  ✖ 读不到 Emby API Key（$DIR/mediawarp/config/config.yaml 里的 auth）"; exit 1; }
 
 export HB_KEY="$KEY" HB_DATA="$DATA_ROOT" HB_Q="${1:-}" HB_DIR="$DIR"

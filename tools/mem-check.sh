@@ -21,7 +21,7 @@
 # 而这一屏是要截图发人的。
 set -u
 
-TOOL_VER="2026-09-19a"
+TOOL_VER="2026-09-20a"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 python3 - <<'PY'
@@ -29,6 +29,7 @@ import os, re, subprocess
 
 G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"
 D = "\033[2m"; B = "\033[1m"; C = "\033[36m"; X = "\033[0m"
+RSTD = "\033[0m\033[2m"      # 粗体收尾之后回到暗色，省得整句变亮
 
 
 def sec(t):
@@ -170,6 +171,7 @@ print()
 print(f"  {B}宿主机进程（按占用排，只列前 12 个）{X}")
 ps = run(["ps", "-eo", "rss,comm", "--sort=-rss"], timeout=20)
 seen = 0
+top = []          # 【⑤ 的结论要用它】别再写死"最大的是谁"，见下面
 for ln in ps.splitlines()[1:]:
     f = ln.split(None, 1)
     if len(f) < 2:
@@ -180,7 +182,13 @@ for ln in ps.splitlines()[1:]:
         continue
     if rss < 20 << 20:            # 20 MB 以下的不值得占屏
         break
-    print(f"    {f[1][:22]:<24}{C}{gb(rss):>8}{X}")
+    name = f[1][:22]
+    # 【占到整机四分之一就当场点出来】这个体量本身不等于故障，但它就是
+    # "内存去哪儿了"的答案，不该等到用户自己去比。
+    big = rss >= total / 4 if total else False
+    print(f"    {name:<24}{C}{gb(rss):>8}{X}"
+          + (f"  {Y}← 占整机 {rss / total * 100:.0f}%{X}" if big else ""))
+    top.append((name, rss))
     seen += 1
     if seen >= 12:
         break
@@ -209,20 +217,41 @@ else:
 # ================= ⑤ 结论 =================
 sec("⑤ 结论")
 bad = []
+tight = []
 if pct < 10:
     bad.append("能拿回来的不到一成")
+elif pct < 20:
+    # 【一到两成单列一档】原来只有"低于一成"才报，于是 15%、而且已经用掉一截
+    # swap 的机器会被说成"没看出问题" —— 那是漏报。它还没出事，但没有余量了。
+    tight.append(f"能拿回来只剩 {pct:.0f}%")
 if swtot and swused > swtot * 0.5:
     bad.append("swap 用掉一半以上")
 if hits:
     bad.append(f"被 OOM 杀过 {len(hits)} 次")
 if not bad:
-    print(f"  {G}✔ 没看出内存问题{X}")
+    if tight:
+        print(f"  {Y}⚠ 还没出事，但没有余量了：{'；'.join(tight)}{X}")
+    else:
+        print(f"  {G}✔ 没看出内存问题{X}")
     print(f"  {D}还能拿回 {gb(avail)}（{pct:.0f}%），没有换页，没有被杀过。"
           f"面板上那个「Free」小是因为缓存占着 —— 那是好事，说明内存没闲着。{X}")
-    print(f"  {D}真要省：Emby 是这里最大的一块，它的内存随媒体库大小和"
-          f"同时在播的人数涨。库大就是会占，属正常。{X}")
+    # 【别再写死"最大的是谁"】上一版这里印的是「Emby 是这里最大的一块」——
+    # 而实测有的机器上最大的是 MediaWarp（1.13 GB，比 Emby 还多）。
+    # 数据就在 ④ 那一栏，结论却没看它。这类"听起来合理就写死"的话，
+    # 正是这一轮反复在修的东西。
+    if top:
+        n0, r0 = top[0]
+        print(f"  {D}这台机器上最大的一块是 {B}{n0}{RSTD}{D}（{gb(r0)}"
+              f"{f'，占整机 {r0 / total * 100:.0f}%' if total else ''}）。{X}")
+        if r0 >= total / 4:
+            print(f"  {D}占到四分之一以上不一定是故障（Emby 的库大就是会占），"
+                  f"但要是这个名字是个【只做跳转的代理】（比如 MediaWarp），"
+                  f"那就反常了 —— 它不该和媒体服务器一个量级。"
+                  f"隔一天再跑一次这个脚本比大小，涨了就是它在攒东西。{X}")
 else:
     print(f"  {R}✖ 有问题：{'；'.join(bad)}{X}")
+    if top:
+        print(f"  {D}最大的一块是 {B}{top[0][0]}{RSTD}{D}（{gb(top[0][1])}）。{X}")
     print(f"  {D}按上面 ④ 那一栏从大到小看，最大的那个就是要处理的。"
           f"这台机器上最常见的两种：Emby 的库太大、以及转码（转码会把整段视频"
           f"读进内存再编码）。{X}")
