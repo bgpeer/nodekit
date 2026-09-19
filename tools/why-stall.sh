@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19d"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -86,7 +86,7 @@ trap 'rm -f "$MWLOG" "$PYF"' EXIT
 docker logs --tail 4000 mediawarp >"$MWLOG" 2>&1 || : >"$MWLOG"
 
 cat >"$PYF" <<'PY'
-import json, os, re, sys, threading, time
+import json, os, re, socket, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 KEY, OLPW, DATA_ROOT, DOMAIN, SECS, Q, MWLOG = sys.argv[1:8]
@@ -433,6 +433,39 @@ print(f"  {G}✔{X} 文件 {mb(ol_size)}　直链指向 {C}{safe(host)}{X}"
       + (f"  {Y}← OpenList 自己（这盘没有 CDN 直链）{X}" if is_local
          else f"  {G}← 网盘 CDN{X}"))
 
+# 【及格线的分子要用网盘报的大小，不是 Emby 记的】码率 = 大小 × 8 ÷ 时长。
+# 现场撞到过：同一部片 Emby 记 3.69 GB、网盘上是 17.72 GB，差了近五倍 ——
+# 于是整屏的"够不够"全是照着一条低了五倍的及格线判的，"带宽够"这三个字直接作废。
+# Emby 那个数是它探测时记下来的，文件换过、或者压根没探全，它就不会自己更新。
+if ol_size and secs_len:
+    _real = int(ol_size * 8 / secs_len)
+    if need_bps and abs(_real - need_bps) > need_bps * 0.3:
+        print(f"  {Y}⚠ Emby 记的大小和网盘上的对不上{X}"
+              f"  {D}Emby：{mb(size)}　网盘：{mb(ol_size)}{X}")
+        print(f"  {B}及格线按网盘那个重算：{need_bps / 1e6:.1f} → "
+              f"{_real / 1e6:.1f} Mbps{X}")
+        print(f"  {D}Emby 那条媒体信息是旧的（文件换过、或者当初没探全）。"
+              f"后面所有「够不够」都按新的这个判。{X}")
+        need_bps = _real
+    elif not need_bps:
+        need_bps = _real
+
+# 【转码流要当场点名】这条直链的主机名/路径里带着它的出身。转码流在 Emby 里
+# 播不了（302 过去是 m3u8，分片是相对路径，被播放器拼回 /emby/Videos/<id>/ → 401
+# → 一直转圈），而客户端上只有"转圈"两个字，不点名根本想不到是这个开关。
+_lowraw = raw.lower()
+if ("m3u8" in _lowraw or "video-play" in _lowraw or "transcod" in _lowraw
+        or "/hls" in _lowraw):
+    print(f"  {R}✖ 这条直链给的是【转码流】，不是原文件{X}")
+    print(f"  {D}主机/路径里写着（video-play / m3u8 / hls）。也就是说这个盘的"
+          f"「直链方式」还设在转码流上。{X}")
+    print(f"  {D}转码流在 Emby 里播不了：302 过去是 m3u8，而 m3u8 里的分片写的是"
+          f"相对路径，播放器会把它拼到 /emby/Videos/<条目id>/ 上，于是分片请求"
+          f"全打回 Emby → 一路 401 → 一直转圈。{X}")
+    print(f"  {B}改法：media-stack → 4 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链{X}")
+    print(f"  {D}（脚本 v1.5.110 起不再把新装的机器默认设成转码流，但【已经设过的"
+          f"不会自动改回来】—— 得自己动手。）{X}")
+
 # 【要测的是两条路，不是两个地址】
 #   /d/ → 存储怎么配就怎么走（有 CDN 直链就 302 出去）= Emby 现在拿到的那条
 #   /p/ → 强制经过 OpenList 本机代理             = 「改成本机代理」之后的那条
@@ -440,27 +473,38 @@ print(f"  {G}✔{X} 文件 {mb(ol_size)}　直链指向 {C}{safe(host)}{X}"
 # 那个决定（要不要给这个盘开本机代理）以前只能靠猜。
 qpath = urllib.parse.quote(body)
 proxy_url = f"{OL}/p{qpath}" + (f"?sign={sign}" if sign else "")
+# 【/p/ 必须带上登录凭据，不然全是 403 —— 而那个 403 是脚本自己造的】
+# OpenList 的 /p/ 要么认 sign、要么认登录。sign_all 关着的时候 fs/get 回的 sign
+# 是空串，光靠 sign 进不去。上一版就栽在这儿：夸克和阿里的"本机代理"那条路
+# 清一色 403×15，屏上于是写着「这条路根本起不了播」——【测的是我忘了鉴权】，
+# 不是那条路不行。结论错得比没有结论更坏，因为它会让人去改一个没坏的东西。
+BASE_HDR = {"User-Agent": UA}
+PROXY_HDR = dict(BASE_HDR, Authorization=tok)
 routes = []
 if raw and not is_local:
-    routes.append(("网盘 CDN 直链", raw))
-    routes.append(("经过你的 VPS（本机代理）", proxy_url))
+    routes.append(("网盘 CDN 直链", raw, BASE_HDR))
+    routes.append(("经过你的 VPS（本机代理）", proxy_url, PROXY_HDR))
 else:
-    routes.append(("经过你的 VPS（这盘只有这一条）", proxy_url))
+    routes.append(("经过你的 VPS（这盘只有这一条）", proxy_url, PROXY_HDR))
 
 est = need_bps / 8 * SECS * len(routes)
 print(f"  {D}这次要拉 {len(routes)} 条路 × {SECS} 秒 ≈ {mb(est)} 流量{X}")
 
 
 # ================= 播放器模拟 =================
-def follow(url, depth=4):
-    """把 302 跟到底，每一跳记一次耗时。返回 (最终地址, [(码, 秒, 主机), ...])。"""
+def follow(url, hdr, depth=4):
+    """把 302 跟到底，每一跳记一次耗时。返回 (最终地址, [(码, 秒, 主机), ...])。
+
+    【超时收到 15 秒】现场撞到过一跳报了 183.87 秒才吐出 No route to host ——
+    一条通不了的路由不该让整屏干等三分钟，而且那个耗时数字本身没有信息量
+    （它等于系统的连接超时，不等于这条链有多慢）。
+    """
     hops, cur = [], url
     for _ in range(depth):
-        req = urllib.request.Request(cur, headers={"User-Agent": UA,
-                                                   "Range": "bytes=0-1"})
+        req = urllib.request.Request(cur, headers=dict(hdr, Range="bytes=0-1"))
         t0 = time.time()
         try:
-            with NOFOLLOW.open(req, timeout=30) as rr:
+            with NOFOLLOW.open(req, timeout=15) as rr:
                 hops.append((rr.status, time.time() - t0,
                              re.sub(r"^[a-z]+://([^/]+).*", r"\1", cur)))
                 return cur, hops
@@ -500,7 +544,7 @@ class Tank:
         self.errs.append((time.time() - self.t0, msg))
 
 
-def puller(url, tank, start, chunk):
+def puller(url, tank, start, chunk, hdr):
     """一段一段地要，缓冲满了就歇 —— 播放器就是这么干的。
 
     【"缓冲满了就歇"必须照做，不能全速拉】很多源是按连接算令牌的：你一直拉，
@@ -514,8 +558,7 @@ def puller(url, tank, start, chunk):
             time.sleep(0.1)
             continue
         end = pos + chunk - 1
-        req = urllib.request.Request(url, headers={
-            "User-Agent": UA, "Range": f"bytes={pos}-{end}"})
+        req = urllib.request.Request(url, headers=dict(hdr, Range=f"bytes={pos}-{end}"))
         t0 = time.time()
         try:
             with urllib.request.urlopen(req, timeout=30) as rr:
@@ -556,11 +599,11 @@ def bar(sec_left):
     return f"{G}{BARS[4]}{X}"
 
 
-def play(url, label, need, total_secs):
+def play(url, label, need, total_secs, hdr):
     """当一回播放器：先填 2 秒缓冲再"开播"，然后每秒记一次水位。"""
     print()
     print(f"  {B}{label}{X}")
-    final, hops = follow(url)
+    final, hops = follow(url, hdr)
     for code, el, hh in hops:
         tag = (f"{G}{code}{X}" if code in (200, 206)
                else f"{C}{code}{X}" if code in (301, 302, 303, 307, 308)
@@ -571,7 +614,8 @@ def play(url, label, need, total_secs):
     chunk = max(2 << 20, int(bps * 4))  # 一段约 4 秒的量
     start = int(ol_size * 0.1) if ol_size else 0
     tank = Tank(cap)
-    th = threading.Thread(target=puller, args=(final, tank, start, chunk), daemon=True)
+    th = threading.Thread(target=puller, args=(final, tank, start, chunk, hdr),
+                          daemon=True)
     th.start()
 
     prefill = bps * 2
@@ -670,27 +714,119 @@ def verdict(rs, need):
     return Y, f"卡了 {rs['stalls']} 秒，均速勉强够 —— 高码率段落顶不住"
 
 
+# ================= ②b 这台机器连得上那个主机吗 =================
+def conn_probe(host, port):
+    """A 记录和 AAAA 记录各去建一次 TCP，分别计时。
+
+    【为什么这一步值得单独做】④ 能量出"每发一次请求就交一次固定开销"，但说不出
+    【贵在哪一层】。而有一种成因既常见又完全看不见：这台机器的 IPv6 路由半通不通。
+    那样的话每开一条新连接都会【先去试那个到不了的 IPv6 地址】，等超时或等
+    unreachable，再退回 IPv4 —— 正好是一笔跟位置无关、跟大小无关、只跟"开了
+    几次口"有关的钱，和 ④ 量出来的形状严丝合缝。
+
+    现场的两个主机名把这个嫌疑摆到了台面上：
+        video-play-p-zb.drive.quark.cn   → Errno 113 No route to host
+        dl1-v6.aliyundrive.cloud         → 名字里就写着 v6
+    """
+    out = []
+    for fam, label in ((socket.AF_INET, "IPv4"), (socket.AF_INET6, "IPv6")):
+        try:
+            infos = socket.getaddrinfo(host, port, fam, socket.SOCK_STREAM)
+        except OSError:
+            out.append((label, "没有这类地址", 0.0, False))
+            continue
+        if not infos:
+            out.append((label, "没有这类地址", 0.0, False))
+            continue
+        addr = infos[0][4]
+        sk = socket.socket(fam, socket.SOCK_STREAM)
+        sk.settimeout(8)
+        t0 = time.time()
+        try:
+            sk.connect(addr)
+            out.append((label, "通", time.time() - t0, True))
+        except Exception as e:
+            out.append((label, str(e)[:34], time.time() - t0, False))
+        finally:
+            try:
+                sk.close()
+            except OSError:
+                pass
+    return out
+
+
+sec("②b 这台机器连得上那些主机吗（IPv4 / IPv6 各试一次）")
+print(f"  {D}④ 只能说「每发一次请求交一次钱」，说不出贵在哪一层。而最常见又最"
+      f"看不见的一层是：IPv6 路由半通不通 —— 每开一条新连接都先去试那个到不了的"
+      f"地址，等超时，再退回 IPv4。{X}")
+_hosts = []
+for _lb, _u, _h in routes:
+    m = re.match(r"^[a-z]+://([^/:]+)(?::(\d+))?", _u)
+    if not m:
+        continue
+    hn, pt = m.group(1), int(m.group(2) or (443 if _u.startswith("https") else 80))
+    if hn in ("127.0.0.1", "localhost"):
+        continue
+    if (hn, pt) not in _hosts:
+        _hosts.append((hn, pt))
+_v6bad = False
+if not _hosts:
+    print(f"  {D}这条路只连本机（127.0.0.1），没有外部主机要测。{X}")
+    print(f"  {D}但 OpenList 自己要去连上游 —— 那一跳这里量不到，"
+          f"④ 里那笔固定开销有可能就出在它身上。{X}")
+for hn, pt in _hosts:
+    print()
+    print(f"  {C}{safe(hn)}{X}  {D}:{pt}{X}")
+    rows_c = conn_probe(hn, pt)
+    for lb, msg, el, okc in rows_c:
+        col = G if okc else (D if msg == "没有这类地址" else R)
+        print(f"    {lb}　{col}{msg}{X}　{el:.2f} 秒")
+    v4 = next((r for r in rows_c if r[0] == "IPv4"), None)
+    v6 = next((r for r in rows_c if r[0] == "IPv6"), None)
+    if v6 and v6[1] != "没有这类地址" and not v6[3] and v4 and v4[3]:
+        _v6bad = True
+        print(f"    {R}✖ 有 IPv6 地址、但连不上；IPv4 是通的{X}")
+        print(f"    {D}每开一条新连接都要先在这个到不了的 IPv6 上耗掉 "
+              f"{v6[2]:.1f} 秒，才退回 IPv4 —— 这正是 ④ 量到的那笔固定开销。{X}")
+    elif v6 and v6[3] and v4 and v4[3] and v6[2] > v4[2] * 3 + 0.5:
+        _v6bad = True
+        print(f"    {Y}⚠ IPv6 通，但比 IPv4 慢得多（{v6[2]:.1f} vs {v4[2]:.1f} 秒）{X}")
+if _v6bad:
+    print()
+    print(f"  {B}这台机器的 IPv6 出口有问题 —— 而系统默认【优先走 IPv6】{X}")
+    print(f"  {D}先验一句（不改任何东西）：{X}")
+    # 【\\n 要留在命令里，不能变成真换行】这一行是给人照抄进终端的，
+    # 打印时若把它当成换行，粘出去就断成两行、当场跑不了。
+    print(f"      curl -4 -o /dev/null -s -w '%{{time_connect}}\\n' "
+          f"https://{safe(_hosts[0][0])}/")
+    print(f"      curl -6 -o /dev/null -s -w '%{{time_connect}}\\n' "
+          f"https://{safe(_hosts[0][0])}/")
+    print(f"  {D}两个数差一个量级就坐实了。真要动的话是让系统优先 IPv4"
+          f"（/etc/gai.conf 里的 precedence ::ffff:0:0/96），"
+          f"那是全机器的事 —— 先把上面两个数发出来再决定，别急着改。{X}")
+
+
 sec(f"③ 当一回播放器，每条路各拉 {SECS} 秒")
 print(f"  {D}从文件 10% 处开始拉（开头那一段常常被缓存过，测出来偏好看）。"
       f"缓冲上限 12 秒，填满就歇手 —— 播放器就是这么干的。{X}")
 done = []
-for label, u in routes:
-    done.append(play(u, label, need_bps, SECS))
+for label, u, hdr in routes:
+    done.append(play(u, label, need_bps, SECS, hdr))
     if len(done) < len(routes):
         print(f"  {D}歇 5 秒再测下一条，免得撞上源的频率限制（那个 429 是自己造的）{X}")
         time.sleep(5)
 
 # ================= ④ 换一段要多少钱 =================
-def ttfb_probe(url, start, want):
+def ttfb_probe(url, start, want, hdr):
     """只量【从发出请求到第一个字节回来】用了多久，拿到就撒手。
 
     整个测试里最便宜也最说明问题的一项：一次几十 KB，六次加起来不到 1 MB。
     """
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA, "Range": f"bytes={start}-{start + want - 1}"})
+    req = urllib.request.Request(
+        url, headers=dict(hdr, Range=f"bytes={start}-{start + want - 1}"))
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=60) as rr:
+        with urllib.request.urlopen(req, timeout=30) as rr:
             el = time.time() - t0
             rr.read(1 << 16)
             return rr.status, el
@@ -707,14 +843,14 @@ print(f"  {D}上面那条时间轴是【一个缓冲 12 秒的播放器】看到
       f"【跟什么有关】。{X}")
 print(f"  {D}只要首字节就撒手，六次加起来不到 1 MB。{X}")
 SIZES = (("512 KiB", 512 << 10), ("8 MiB", 8 << 20), ("32 MiB", 32 << 20))
-for label, u in routes:
+for label, u, hdr in routes:
     print()
     print(f"  {B}{label}{X}")
     base = ol_size or (1 << 30)
     print(f"    {D}同样要 8 MiB，从三个位置各要一次：{X}")
     bypos = []
     for pct in (10, 50, 90):
-        st, el = ttfb_probe(u, int(base * pct / 100), 8 << 20)
+        st, el = ttfb_probe(u, int(base * pct / 100), 8 << 20, hdr)
         bypos.append((pct, st, el))
         col = G if st in (200, 206) else R
         print(f"      {pct:>3}%　{col}{st}{X}　{el:.2f} 秒")
@@ -722,7 +858,7 @@ for label, u in routes:
     print(f"    {D}同样从 50%，要三种大小：{X}")
     bysize = []
     for nm, n in SIZES:
-        st, el = ttfb_probe(u, int(base * 0.5), n)
+        st, el = ttfb_probe(u, int(base * 0.5), n, hdr)
         bysize.append((nm, st, el))
         col = G if st in (200, 206) else R
         print(f"      {nm:>8}　{col}{st}{X}　{el:.2f} 秒")
@@ -730,9 +866,20 @@ for label, u in routes:
 
     okp = [e for _p, s, e in bypos if s in (200, 206)]
     oks = [e for _n, s, e in bysize if s in (200, 206)]
+    codes_seen = {s for _a, s, _e in bypos} | {s for _a, s, _e in bysize}
+    if 416 in codes_seen:
+        # 【416 不是"被拒"，是"你要的位置它没有"】偏移是按网盘报的文件大小算的，
+        # 而拿到的这条链【比那个文件短】—— 十有八九它根本不是原文件（转码流的
+        # 长度和原文件对不上）。说成"被限流"会把人带去查一个不存在的限流。
+        print(f"    {Y}→ 回了 416（要的位置超出了它的长度）{X}")
+        print(f"    {D}偏移是按网盘报的 {mb(ol_size)} 算的，而这条链比那短 ——"
+              f"说明它给的【不是原文件】。转码流就是这样。{X}")
     if len(okp) < 2 or len(oks) < 2:
-        print(f"    {R}→ 请求被拒了好几次，这一段没测成{X}"
-              f"  {D}（拒的那几个码就在上面，429/500 = 源在限流或掐连接）{X}")
+        if 403 in codes_seen:
+            print(f"    {R}→ 403：没通过鉴权，这一段没测成{X}")
+        else:
+            print(f"    {R}→ 请求被拒了好几次，这一段没测成{X}"
+                  f"  {D}（拒的那几个码就在上面，429/500 = 源在限流或掐连接）{X}")
         continue
     cost = med(okp + oks)
     if cost < 0.5:
