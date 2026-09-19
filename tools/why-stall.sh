@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19j"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19k"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -1080,25 +1080,45 @@ if _cdn:
     _res = []
     for who, ua_s in UAS:
         code, mbps = ua_speed(_u, _st, ua_s)
-        _res.append((who, code, mbps))
+        _res.append((who, code, mbps, ua_s))
         col = G if code in (200, 206) else R
         print(f"    {who:<22}{col}{code}{X}  {C}{mbps:5.1f} Mbps{X}")
         time.sleep(2)
-    _ok = [(w, m) for w, c, m in _res if c in (200, 206) and m > 0]
+    _ok = [(w, m, u2) for w, c, m, u2 in _res if c in (200, 206) and m > 0]
     if len(_ok) >= 2:
         _fast, _slow = max(_ok, key=lambda x: x[1]), min(_ok, key=lambda x: x[1])
+        _brow = next((x for x in _res if x[0].startswith("浏览器")), None)
         if _fast[1] > _slow[1] * 3:
             print(f"  {R}✖ 上游按 User-Agent 区别对待{X}"
                   f"  {D}最快「{_fast[0]}」{_fast[1]:.1f}，"
                   f"最慢「{_slow[0]}」{_slow[1]:.1f} —— 差 "
                   f"{_fast[1] / max(_slow[1], 0.01):.0f} 倍{X}")
-            print(f"  {D}那就不是片子重、也不是线路慢，是它认脸。"
-                  f"能动的地方：这个盘的「探测 UA 改写」开关"
-                  f"（4 挂载路径 → 这个盘 → 伪装成浏览器），"
-                  f"它会把出去的 UA 换成浏览器那个。{X}")
+            print(f"  {B}这个源上最快的那张脸是「{_fast[0]}」（{_fast[1]:.1f} Mbps）{X}")
+            # 【建议必须跟着数据走，不能写死"改成浏览器"】实测撞到过浏览器 UA
+            # 【最慢】（超时、0 Mbps）而 VLC 最快（16.1）的源。那种情况下
+            # 「伪装成浏览器」这个开关是【反效果】—— 照着做会把能播的弄成播不了。
+            # 一条反向的建议比没有建议坏得多。
+            _bslow = (_brow is not None
+                      and (_brow[1] not in (200, 206) or _brow[2] < _fast[1] / 3))
+            if _bslow:
+                print(f"  {R}⚠ 注意方向：浏览器那张脸在这个源上【最差】"
+                      f"（{_brow[2]:.1f} Mbps）{X}")
+                print(f"  {B}所以这个盘【不要】开「伪装成浏览器」—— 开了等于"
+                      f"从 {_fast[1]:.1f} 掉到 {_brow[2]:.1f}{X}")
+                print(f"  {D}那个开关是给【按 UA 挡 ffmpeg】的源用的（不开就 403）。"
+                      f"这个源不挡，它只是对不同的脸给不同的速度，方向正好相反。{X}")
+            else:
+                print(f"  {D}能动的地方：这个盘的「伪装成浏览器」开关"
+                      f"（4 挂载路径 → 这个盘），它会把出去的 UA 换成浏览器那个。{X}")
+            # 【前面那些数字是戴哪张脸量的，必须说】不说的话，人会拿一个系统性
+            # 偏低的数去做决定 —— 而这正是这次的实际情况：③④ 全程用的是浏览器 UA。
+            if _brow is not None and _brow[2] < _fast[1] / 3:
+                print(f"  {Y}⚠ 上面 ③④ 的速度和换段费，全是戴着浏览器那张脸量的 ——"
+                      f"也就是这个源上最慢的一张。那些数字偏低。{X}")
         else:
             print(f"  {G}✔ 几个 UA 速度差不多{X}"
                   f"  {D}（{_slow[1]:.1f} ～ {_fast[1]:.1f} Mbps）{X}")
+            _fast = None
             print(f"  {B}那「脚本拉得动、手机拉不动」就只剩【谁去拉】这一个变量了{X}")
             print(f"  {D}这条直链是 MediaWarp 在【你的 VPS 上】换来的。很多网盘的"
                   f"下载链是认来源的：换链的那个 IP 拉得飞快，别的 IP 拿去就被限速。"
@@ -1107,6 +1127,26 @@ if _cdn:
             print(f"  {D}这个脚本只有 VPS 这一个出口，验证不了 IP 那一头。"
                   f"要自己验：手机浏览器打开挂载页面直接下同一个文件，"
                   f"快 = 不认 IP，慢 = 认。{X}")
+    # 【"换张脸能不能救"只有真拉一遍才算答上】上面那五发各拉几秒，量的是瞬时速度；
+    # 而"卡不卡"要看一条完整的时间轴 —— 缓冲撑不撑得住、换段费降不降。
+    if (len(_ok) >= 2 and _fast is not None and _fast[2]
+            and _fast[1] > _slow[1] * 3):
+        print()
+        print(f"  {B}换成最快的那张脸，再当一回播放器 ——{X}")
+        _rs2 = play(_u, f"同一条路，戴「{_fast[0]}」那张脸", need_bps,
+                    min(SECS, 30), dict(_h, **{"User-Agent": _fast[2]}))
+        _rs2["label"] = f"同一条路，戴「{_fast[0]}」那张脸"
+        done.append(_rs2)
+        _base = next((r for r in done if r is not _rs2), None)
+        if _base:
+            print(f"  {D}对照：戴浏览器那张脸是 {_base['avg']:.1f} Mbps、"
+                  f"卡了 {_base['stalls']} 秒；换这张脸是 {_rs2['avg']:.1f} Mbps、"
+                  f"卡了 {_rs2['stalls']} 秒{X}")
+            if _rs2["stalls"] == 0 and _base["stalls"] > 0:
+                print(f"  {G}✔ 换张脸就不卡了 —— 这个源的问题就是认脸{X}")
+            elif _rs2["avg"] > _base["avg"] * 1.5:
+                print(f"  {G}✔ 快了 {_rs2['avg'] / max(_base['avg'], 0.01):.1f} 倍{X}")
+
     print(f"  {D}顺带：以前「转码流 + 302」能跑满，是因为转码流码率低一个量级 ——"
           f"就算被限速也够播。那不代表这条链没被限，只代表限了也看不出来。{X}")
 
