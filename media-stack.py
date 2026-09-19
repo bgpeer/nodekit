@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.114"
+SCRIPT_VERSION = "1.5.115"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -88,7 +88,13 @@ STRM_PATH      = "/data/strm/" + STRM_SUBDIR
 # 服务子域名 → 本地端口。Emby 走 MediaWarp，不是 8096。
 # ── 转码流分片重定向（见 do_hls_fix 的说明）────────────────────────────────
 # 只在有盘设成转码流时才起。127.0.0.1 上监听，只有 nginx 够得着。
-HLS_PORT = 9010
+#
+# 【端口不能写死】这台机器上至少三套东西共用同一片端口空间和同一个 nginx：
+# 节点部署、网络优化、媒体栈，谁先装谁装 nginx。写死一个端口就是赌别人没用过它。
+# 撞上了最坏：服务起不来，而 nginx 那条 location 照样生成 —— nginx -t 【不检查
+# 上游活没活】，配置一路通过，表现是播放时 502，而 502 跟"网盘挂了"长得一模一样。
+# 所以：第一次要用的时候挑一个真的空着的，记进状态文件，nginx 和服务共用同一个。
+HLS_PORT_BASE = 9010
 HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
 # 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
@@ -1260,9 +1266,12 @@ def gen_nginx_site(cfg):
     # 于是所有盘一起换脸：探测是过了上游的 UA 那一关，可紧接着一股脑打过去，上游
     # 改用频率限（体检那行从 403 变成 429），那个源上的一切都被限住，挂载页面跟着
     # 连不上。名单空的时候这一整段【一个字都不生成】—— 也就是回到没这个功能之前。
-    # 有没有盘在用转码流 —— 决定要不要生成那条分片 location（见下面 hls）
+    # 有没有盘在用转码流 —— 决定要不要生成那条分片 location（见下面 hls）。
+    # 【挑不到端口就当没有】宁可回到"转码流在 Emby 里播不了"（今天的样子），
+    # 也不能留一条指向死上游的 location —— 那会变成 502，而 502 跟"网盘挂了"
+    # 长得一模一样，排查成本高得多。
     try:
-        hls_on = bool(hls_wanted(ms_install_dir()))
+        hls_on = bool(hls_wanted(ms_install_dir())) and hls_port() > 0
     except Exception:
         hls_on = False
     spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
@@ -1326,7 +1335,7 @@ def gen_nginx_site(cfg):
         hls = (f"""
     # 转码流的分片（见 media-stack.py 的 do_hls_fix）：只回 302，不过视频字节
     location ~* ^/(?:emby/)?videos/[0-9]+/[^/]+\\.(?:ts|m4s)$ {{
-        proxy_pass http://127.0.0.1:{HLS_PORT};
+        proxy_pass http://127.0.0.1:{hls_port()};
         proxy_set_header Host $host;
         proxy_redirect off;
     }}
@@ -1757,6 +1766,37 @@ def heal_mediawarp_token():
     return r.returncode == 0
 
 
+def _port_free(p):
+    """127.0.0.1 的这个端口现在空着没有。"""
+    import socket as _s
+    sk = _s.socket()
+    try:
+        sk.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        sk.bind(("127.0.0.1", p))
+        return True
+    except OSError:
+        return False
+    finally:
+        sk.close()
+
+
+def hls_port():
+    """分片重定向服务用哪个端口。选定就记进状态文件 —— nginx 和服务必须是同一个。
+
+    【选定之后不再重挑】重挑会让 nginx 那条 location 指到一个新端口、而服务还在
+    老端口上，两边对不上，播放当场 502。所以状态文件里有就直接用，哪怕它此刻被
+    占着（那说明多半就是本服务自己占的）。
+    """
+    v = ms_state().get("hls_port")
+    if isinstance(v, int) and 1024 < v < 65536:
+        return v
+    for p in range(HLS_PORT_BASE, HLS_PORT_BASE + 20):
+        if _port_free(p):
+            save_ms_state(hls_port=p)
+            return p
+    return 0          # 一个都挑不到：宁可不装，也不留一条指向死上游的路
+
+
 def hls_wanted(d):
     """有没有盘设成转码流。没有就不该留这个服务。"""
     try:
@@ -1852,9 +1892,22 @@ def do_hls_fix():
 
         do_GET = do_HEAD = _go
 
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", HLS_PORT), H)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", hls_port()), H)
     srv.daemon_threads = True
     srv.serve_forever()
+
+
+def remove_hls_service():
+    """停掉并删掉分片重定向服务。卸载、以及"没有盘再用转码流"时都走这里。"""
+    if not os.path.exists(HLS_UNIT):
+        return
+    unit = os.path.basename(HLS_UNIT)
+    try:
+        sh(f"systemctl disable --now {unit}", timeout=60)
+        os.remove(HLS_UNIT)
+        sh("systemctl daemon-reload", timeout=60)
+    except Exception:
+        pass
 
 
 def sync_hls_service(d, quiet=True):
@@ -1865,6 +1918,13 @@ def sync_hls_service(d, quiet=True):
     """
     want = bool(hls_wanted(d))
     have = os.path.exists(HLS_UNIT)
+    if want and not hls_port():
+        warn("9010~9029 全被占着，分片重定向服务装不了 —— "
+             "Emby 里播转码流还会转圈（挂载页面和外部播放器不受影响）。")
+        return False
+    if want and not shutil.which("systemctl"):
+        warn("这台机器没有 systemctl，分片重定向服务装不了。")
+        return False
     if want and not have:
         try:
             with open(HLS_UNIT, "w") as f:
@@ -1889,12 +1949,7 @@ WantedBy=multi-user.target
             warn(f"装分片重定向服务失败（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
             return False
     elif not want and have:
-        try:
-            sh(f"systemctl disable --now {os.path.basename(HLS_UNIT)}", timeout=60)
-            os.remove(HLS_UNIT)
-            sh("systemctl daemon-reload", timeout=60)
-        except Exception:
-            pass
+        remove_hls_service()
         return False
     elif want and have:
         sh(f"systemctl restart {os.path.basename(HLS_UNIT)}", timeout=60)
@@ -6579,6 +6634,10 @@ def do_uninstall():
 
     if os.path.exists(NGX_SITE):
         os.remove(NGX_SITE)
+        # 【那个常驻服务也归这里管】不删的话，卸完它还在跑、还占着端口 ——
+        # 而这台机器的端口是跟节点、网络优化共用的。别人再装东西撞上去，
+        # 排查的人会在一台"已经卸载干净"的机器上找到一个 media-stack 的进程。
+        remove_hls_service()
         if sh("nginx -t").returncode == 0:
             nginx_reload()
             ok("已移除 nginx 站点配置")
