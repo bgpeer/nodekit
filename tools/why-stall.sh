@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19e"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19f"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -91,6 +91,7 @@ import urllib.error, urllib.parse, urllib.request
 
 KEY, OLPW, DATA_ROOT, DOMAIN, SECS, Q, MWLOG = sys.argv[1:8]
 EMBY, OL = "http://127.0.0.1:8096", "http://127.0.0.1:5244"
+MW = "http://127.0.0.1:9000"          # MediaWarp —— Emby 那条路上唯一算数的那一段
 NGXLOG = "/var/log/nginx/media-stack.access.log"
 B, D, R, G, Y, C, X = ("\033[1m", "\033[2m", "\033[31m", "\033[32m",
                        "\033[33m", "\033[36m", "\033[0m")
@@ -471,6 +472,72 @@ if ("m3u8" in _lowraw or "video-play" in _lowraw or "transcod" in _lowraw
 #   /p/ → 强制经过 OpenList 本机代理             = 「改成本机代理」之后的那条
 # 后者不用真去改配置就能先量一遍，这是这个脚本存在的主要理由：
 # 那个决定（要不要给这个盘开本机代理）以前只能靠猜。
+# ================= ②c MediaWarp 真给客户端的是哪个地址 =================
+# 【这一段才是 Emby 走的那条路，前面那些都不是】上面那个 raw_url 是【脚本自己
+# 在宿主机上用 127.0.0.1 问出来的】。而代理型存储的直链主机名是「谁来问就按谁
+# 用的主机名拼」—— MediaWarp 在容器里用 http://openlist:5244 去问，拿回来的就是
+# openlist:5244，然后把【那个地址】302 给你的手机。手机解析不了 openlist 这个
+# 名字，于是 load fail / 一直转圈。
+#
+# 而整条链的每一步都是"成功"的：strm 对、OpenList 认得、直链拉得动（在 VPS 上），
+# 只有最后那个地址是废的。这就是它极难自己看出来的原因，也是这个脚本一直没测到
+# 七米蓝毛病的原因 —— 我测的是从 VPS 拉 127.0.0.1，那跟客户端拿到的不是一回事。
+sec("②c MediaWarp 真给客户端的是哪个地址")
+print(f"  {D}上面那条直链是脚本自己问出来的。这一步去问 MediaWarp —— "
+      f"它给客户端什么，Emby 那条路上算数的就是什么。{X}")
+mw_url, mw_host, mw_inner = "", "", False
+_mwq = (f"{MW}/Videos/{iid}/stream?MediaSourceId=mediasource_{iid}"
+        f"&Static=true&api_key={KEY}")
+_t0 = time.time()
+try:
+    _rr = NOFOLLOW.open(_mwq, timeout=60)
+    _code, _loc = _rr.status, ""
+except urllib.error.HTTPError as _e:
+    _code, _loc = _e.code, _e.headers.get("Location", "") or ""
+except Exception as _e:
+    _code, _loc = 0, ""
+    print(f"  {R}✖ 问不到 MediaWarp：{safe(_e)}{X}")
+_el = time.time() - _t0
+if _loc:
+    mw_url = _loc
+    mw_host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", _loc)
+    _bare = mw_host.split(":")[0]
+    # 【私网段要按段判，不能按前缀猜】172.x 只有 16-31 那一段是私网，
+    # 172.1.x / 172.9.x 是正经公网地址 —— 按 "172." 开头一刀切会把好地址判成坏的。
+    _p = _bare.split(".")
+    mw_inner = (_bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
+                or _bare.startswith(("127.", "10.", "192.168."))
+                or (len(_p) == 4 and _p[0] == "172" and _p[1].isdigit()
+                    and 16 <= int(_p[1]) <= 31))
+    _inner = mw_inner
+    print(f"  {G}✔ 302{X}  {D}{_el:.1f} 秒{X}  →  {C}{safe(mw_host)}{X}"
+          + (f"  {D}HLS 分片流{X}" if ".m3u8" in _loc.lower() else ""))
+    if _inner:
+        print(f"  {R}✖ 这是个内网地址 —— 你的手机/电视根本连不上{X}")
+        print(f"  {D}代理型存储（WebDAV 源、本地目录）在网盘侧没有 CDN 直链，"
+              f"OpenList 只能回自己的地址；而那个地址的主机名是【谁来问就按谁用的"
+              f"主机名拼】。MediaWarp 在容器里用 http://openlist:5244 去问，"
+              f"拿回来的就是 openlist:5244。{X}")
+        print(f"  {D}整条链每一步都「成功」—— strm 对、OpenList 认得、直链在这台"
+              f"机器上也拉得动 —— 只有最后那个地址是废的。客户端上只有一句 "
+              f"load fail 或者一直转圈。{X}")
+        print(f"  {B}修：media-stack → 7 更新{X}"
+              f"{D}（会把 MediaWarp 问 OpenList 的地址改成对外地址，"
+              f"脚本要 v1.5.58 以上）{X}")
+        print(f"  {D}改完已经缓存的旧地址要等直链缓存过期才换掉；"
+              f"等不及就 docker restart mediawarp。{X}")
+    else:
+        print(f"  {G}是对外地址 —— 客户端至少解析得了{X}")
+        print(f"  {D}下面就拿【这一条】去拉，而不是脚本自己换出来的那条。{X}")
+else:
+    print(f"  {R}✖ 没拿到 302{X}  {D}HTTP {_code}，{_el:.1f} 秒{X}")
+    print(f"  {D}换不到直链，点开就一直转圈。{X}")
+    if _code in (401, 403, 404):
+        print(f"  {B}先试：docker restart mediawarp{X}")
+        print(f"  {D}它只在启动那一刻登录一次 OpenList，OpenList 一重启旧令牌就废了"
+              f" —— 之后每次换直链都被拒。已经缓存过直链的片子照样能放，"
+              f"所以看着像「有的能放有的不能放」。{X}")
+
 qpath = urllib.parse.quote(body)
 proxy_url = f"{OL}/p{qpath}" + (f"?sign={sign}" if sign else "")
 # 【/p/ 必须带上登录凭据，不然全是 403 —— 而那个 403 是脚本自己造的】
@@ -481,7 +548,14 @@ proxy_url = f"{OL}/p{qpath}" + (f"?sign={sign}" if sign else "")
 BASE_HDR = {"User-Agent": UA}
 PROXY_HDR = dict(BASE_HDR, Authorization=tok)
 routes = []
-if raw and not is_local:
+# 【主角是 MediaWarp 真给客户端的那条】拿得到就用它 —— 别的都是旁证。
+# 上一版全程拿脚本自己换出来的地址在拉，那条路在 VPS 上当然通，可它跟客户端
+# 拿到的根本不是同一个地址。七米蓝的毛病就是这么被整整漏掉几轮的。
+if mw_url:
+    routes.append(("MediaWarp 真给客户端的那条", mw_url, BASE_HDR))
+    if raw and not is_local:
+        routes.append(("经过你的 VPS（本机代理）", proxy_url, PROXY_HDR))
+elif raw and not is_local:
     routes.append(("网盘 CDN 直链", raw, BASE_HDR))
     routes.append(("经过你的 VPS（本机代理）", proxy_url, PROXY_HDR))
 else:
@@ -974,6 +1048,15 @@ for rs in done:
 ok = [r for r in done if r["col"] == G]
 bad = [r for r in done if r["col"] not in (G, C)]
 untested = [r for r in done if r["col"] == C]
+# 【这一条要摆在所有分支前面，盖过底下任何一句"供得上"】在这台机器上拉得动，
+# 不等于手机拉得动。早期版本把它塞进"几条路都供得上"那一支里 —— 而 302 指向
+# 内网时那条路根本拉不动，于是压根走不到那一支，这句最要紧的话就再也不出现了。
+if mw_inner:
+    print()
+    print(f"  {R}✖ MediaWarp 给客户端的是内网地址（见 ②c）{X}")
+    print(f"  {D}上面这些都是在这台机器上拉的 —— 手机拿到 {safe(mw_host)} "
+          f"这个地址，连解析都解析不了。取流这一段量得再好也没用。{X}")
+    print(f"  {B}这一条先修：media-stack → 7 更新{X}")
 print()
 if not ok and not bad:
     # 【一条都没测成的时候别往下判】下面那几支都是在比"哪条行哪条不行"，
