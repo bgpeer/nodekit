@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.121"
+SCRIPT_VERSION = "1.5.122"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9381,8 +9381,22 @@ def heal_media_info(d, key, budget=None):
     _tab, _now = heal_fail_table(), time.time()
     _keep = [x for x in allpend if not heal_given_up(_tab, x[1], _now)]
     if len(_keep) < len(allpend):
-        print(f"  {DIM}跳过 {len(allpend) - len(_keep)} 个探了 {HEAL_GIVEUP} 次仍没音视频轨"
-              f"的条目（{HEAL_GIVEUP_DAYS} 天后自动再试）{RST}")
+        # 【天数要按真实的退避算，别写死第一档】退避是翻倍的（30→60→120→240→360），
+        # 写死 HEAL_GIVEUP_DAYS 的话，一个被放弃过四次的条目屏上说 30 天、实际 240 天
+        # —— 人照着这句话等一个不会发生的事。这里报的是这批里【最快】的那一个。
+        _skipped = [x for x in allpend if heal_given_up(_tab, x[1], _now)]
+        _soon = min(
+            (heal_retry_days(_tab[str(x[1])][0]) * 86400 - (_now - _tab[str(x[1])][1])
+             for x in _skipped if isinstance(_tab.get(str(x[1])), list)),
+            default=HEAL_GIVEUP_DAYS * 86400)
+        print(f"  {DIM}跳过 {len(_skipped)} 个探了 {HEAL_GIVEUP} 次仍没音视频轨"
+              f"的条目（最快的还要等 {max(0, _soon) / 86400:.0f} 天才自动再试）{RST}")
+        # 【把出路写在屏上】这个子命令一直都有，可只有读代码的人知道。而它最该被用到
+        # 的场景恰恰是"链路刚整体坏过一段"：那几天 Emby 每探一个都回"没有音视频轨"，
+        # 而那条路径是 dead —— 一次就记满 HEAL_GIVEUP。源头修好了，这批条目也不会
+        # 自己回来，理由却是一个已经不成立的原因。
+        print(f"  {DIM}要是这期间修好过源头（上游不再挡探测、换了网盘、改了格式），"
+              f"敲 {BOLD}media-stack heal-reset{RST}{DIM} 让它们立刻重新排队。{RST}")
     allpend = _keep
     if not allpend:
         return
