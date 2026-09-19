@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19h"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19i"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -1150,7 +1150,39 @@ except OSError:
 # 后面空空如也 —— 而"那 95 条里有多少是 401/500"恰恰是这一段唯一要回答的问题。
 ANSI = re.compile(r"\033\[[0-9;]*m")
 log = [ANSI.sub("", ln) for ln in log]
+
+# 【必须按"这次启动"切开】docker logs 不会因为重启就清掉旧的。混着数的后果是拿
+# 重启之前的旧账去解释现在的故障 —— media-stack.py 的 mediawarp_token_broken()
+# 里早写着这条教训（「修好了还报故障，用户再重启一次，还是报」），这里又踩一遍：
+# 屏上那条原因是 09-17 的，而 MediaWarp 09-19 才重启过。
+TS_RE = re.compile(r"(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)")
+
+
+def _ts(ln):
+    m = TS_RE.search(ln)
+    return f"{m.group(1)} {m.group(2)}" if m else ""
+
+
+_start = ""
+if MWSTART:
+    m = TS_RE.search(MWSTART)
+    if m:
+        _start = f"{m.group(1)} {m.group(2)}"
+
+
+def _after_start(ln):
+    """这一行是不是这次启动【之后】的。没有时间戳的一律算进来（宁可多算）。"""
+    if not _start:
+        return True
+    t = _ts(ln)
+    return (not t) or t >= _start
+
+
+log_all = log
+log = [ln for ln in log_all if _after_start(ln)]
 mine = [ln for ln in log if f"/videos/{iid}/" in ln.lower()]
+mine_old = [ln for ln in log_all
+            if f"/videos/{iid}/" in ln.lower() and not _after_start(ln)]
 if not mine:
     print(f"  {Y}MediaWarp 日志里没有这个条目的播放记录{X}")
     print(f"  {D}要么最近没人点过它，要么客户端根本没走 MediaWarp"
@@ -1212,6 +1244,12 @@ else:
         _n404 = codes["404"]
         _tot = sum(codes.values())
         print(f"  {R}✖ {_n404}/{_tot} 条换不到直链（404）{X}")
+        # 【"现在还在不在发生"是此刻最该回答的问题】人刚把一部片重试着播通了，
+        # 那 404 到底是这一刻还在发生、还是早先攒下的，决定了该不该动手。
+        _t404 = [t for t in (_ts(ln) for ln in mine
+                             if re.search(r"\|\s*404\s*\|", ln)) if t]
+        if _t404:
+            print(f"  {D}这些 404 的时间：{min(_t404)} ～ {max(_t404)}{X}")
         print(f"  {D}点播放 → MediaWarp 去换直链 → 换不到 → 回 404 → 播放器重试 →"
               f" 又 404 → 放弃。客户端上就是「转一会儿像连不上一样就断开」。{X}")
         # 【别在原因之间替人猜】"404"只说了拒绝，没说为什么拒绝，而两个最常见的
@@ -1239,11 +1277,22 @@ else:
             print(f"  {D}日志里说的原因：{X}")
             for name, n in sorted(hits.items(), key=lambda kv: -kv[1]):
                 print(f"    {Y}{name}{X}  {D}{n} 次{X}")
+            # 【原因条数远少于 404 条数，必须说出来】不然人会以为这 39 条都是
+            # 那一个原因。实际是日志里就没有那么多原因行 —— 滚掉了，或者
+            # MediaWarp 对多数 404 压根没记原因。
+            _sum = sum(hits.values())
+            if _sum * 3 < _n404:
+                print(f"  {Y}⚠ 只找到 {_sum} 条原因，却有 {_n404} 条 404 —— "
+                      f"剩下那些日志里没记原因（滚掉了，或者本来就没记）{X}")
+                print(f"  {D}所以下面这个判断是【按找到的这几条推的】，不是全部。{X}")
         for ln in samples:
             print(f"    {D}{safe(ln.strip())[:150]}{X}")
         if MWSTART:
             print(f"  {D}MediaWarp 上次启动：{MWSTART[:19].replace('T', ' ')}"
-                  f"（UTC）{X}")
+                  f"（UTC）　上面这些都是【这次启动之后】的{X}")
+        if mine_old:
+            print(f"  {D}（另有 {len(mine_old)} 条是重启【之前】的旧账，没算进来 ——"
+                  f"docker logs 不会因为重启就清掉它们）{X}")
         if hits.get("令牌作废（OpenList 重启过）"):
             print(f"  {B}→ 令牌作废了。敲：docker restart mediawarp{X}")
             print(f"  {D}MediaWarp 只在【启动那一刻】登录一次 OpenList，OpenList 一"
