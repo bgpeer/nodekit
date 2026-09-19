@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.119"
+SCRIPT_VERSION = "1.5.120"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -12866,6 +12866,24 @@ def _one_drive_link_menu(d, mp):
                           f"套到这类盘上多半帮倒忙。{RST}")
                 print(f"  {DIM}开完去挂载页面播一部片子确认一下；不对劲就回这里关掉。{RST}")
                 if not ask_yn(f"确定给 {mp} 开启？", False):
+                    print("没有改动。")
+                    continue
+            else:
+                # 【关掉也要拦一下，而且拦得比开启还要紧】开启是"多一层伪装"，
+                # 关掉是【可能直接把这个盘弄成播不了】：上游按 UA 挡探测的源，
+                # 关掉之后 Emby 的 ffprobe 就是 403/429，条目有时长、媒体流 0 条、
+                # 点开 load fail。上一版这一支一句话都没有，静默就关了 ——
+                # 实测代价：整个盘当场播不了，而人不知道是这一下造成的。
+                warn("关掉之后，Emby 的探测会用 ffmpeg 的 UA（Lavf/…）去问上游。")
+                print(f"  {DIM}上游要是按 UA 挡探测（403/429），这个盘会变成"
+                      f"「条目有时长、媒体流 0 条、点开 load fail」—— 也就是整个盘"
+                      f"播不了。这个开关本来就是为那种源加的。{RST}")
+                print(f"  {YELLOW}别拿速度数字做这个决定{RST}"
+                      f"{DIM}（why-stall.sh 的 ④b 量的是快慢，不是过不过得去；"
+                      f"而且开着的时候那张表本身就是被改写过的）。{RST}")
+                print(f"  {DIM}关完【立刻去 Emby 里点开一部这个盘的片子】，"
+                      f"播不了就回这里开回来。{RST}")
+                if not ask_yn(f"确定给 {mp} 关闭？", False):
                     print("没有改动。")
                     continue
             set_ua_spoof(mp, val == "spoof")
