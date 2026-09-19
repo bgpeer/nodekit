@@ -28,7 +28,7 @@
 # 把一条能直接下片的链交出去。
 set -u
 
-TOOL_VER="2026-09-19a"
+TOOL_VER="2026-09-19b"
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -36,7 +36,12 @@ OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || { echo "✖ 读不到 OpenList 管理密码（$DIR/.secrets 里的 OPENLIST_PASS）"; exit 1; }
 
-export OL_PW="$OLPW" OL_ONLY="${1:-}"
+# 【strm 那一份现成的答案在哪】生成媒体库时每部片都写了一个 .strm，
+# 里面就是一条 OpenList 路径 —— 比自己去翻目录快得多，也不打那个限流的接口。
+DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
+[ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
+
+export OL_PW="$OLPW" OL_ONLY="${1:-}" OL_DATA_ROOT="$DATA_ROOT"
 python3 - <<'PY'
 import base64, json, os, time, urllib.error, urllib.parse, urllib.request
 
@@ -49,6 +54,7 @@ G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"
 D = "\033[2m"; B = "\033[1m"; C = "\033[36m"; X = "\033[0m"
 pw = os.environ["OL_PW"]
 only = os.environ.get("OL_ONLY") or ""
+STRM_ROOT = os.path.join(os.environ.get("OL_DATA_ROOT") or "", "strm")
 
 
 def api(path, body=None, tok=None, timeout=120, method="POST"):
@@ -127,11 +133,52 @@ if not dav:
     raise SystemExit(0)
 
 
-def find_video(root, budget=25):
+def from_strm(root):
+    """从已经生成的 .strm 里挑一条属于这个盘的路径。找不到返回空串。
+
+    【这是首选，翻目录只是兜底】理由有三个，每个都够硬：
+      · 零次列目录 —— 而列目录接口正是这些源最爱限流的那一个（实测 nginx 那侧
+        28 条请求里 7 条 429）。为了做个检测反而去打它，本末倒置。
+      · 快 —— 读本地文件，不用等跨境接口
+      · 拿到的是【Emby 真的在播的那个文件】，不是随便翻出来的某一个
+
+    翻目录那条路在真实的库上是走不通的：这台机器上的结构是
+    /七米蓝影视/mov/电影/R/人在囧途/[人在囧途]….mp4 —— 六层，而「电影」
+    那一层按首字母铺开几十个目录，广度优先在那一层就把预算烧光，一个文件都碰不到。
+    """
+    if not os.path.isdir(STRM_ROOT):
+        return ""
+    for dirpath, _dirs, files in os.walk(STRM_ROOT):
+        for fn in files:
+            if not fn.lower().endswith(".strm"):
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), encoding="utf-8",
+                          errors="replace") as fh:
+                    line = fh.readline().strip()
+            except OSError:
+                continue
+            # strm 里可能是纯路径，也可能是一条 http 地址（挂载页面那种）
+            if line.startswith("http://") or line.startswith("https://"):
+                line = urllib.parse.unquote(
+                    urllib.parse.urlsplit(line).path or "")
+                for pre in ("/d", "/p"):
+                    if line.startswith(pre + "/"):
+                        line = line[len(pre):]
+                        break
+            if line.startswith(root.rstrip("/") + "/"):
+                return line
+    return ""
+
+
+def find_video(root, budget=120):
     """在这个盘里找一个视频来试。返回 (路径, 没找到的原因)。
 
-    广度优先，别一头扎进「文档」「图片」这种没有视频的岔路就到底
-    （dav-check.sh 上栽过一次，报"没找到视频"而那个盘里明明有片子）。
+    【贴着一条路往下钻，别纯广度】纯广度在「按首字母铺开几十个目录」这种库上
+    必然翻不到文件（上一版就是这么报的"翻了 25 个目录还没翻完"）。这里把新发现的
+    子目录插到队首，等于优先往深处走，同时保留回头路 —— 一头扎进「文档」「图片」
+    这种没有视频的岔路也还能退出来接着找别的（dav-check.sh 上栽过一次，
+    报"没找到视频"而那个盘里明明有片子）。
     不带 refresh —— 只是要个文件名，读缓存足够，没必要去打那个本来就被限流的接口。
     """
     queue, used, seen, err = [root], 0, 0, ""
@@ -150,13 +197,16 @@ def find_video(root, budget=25):
         for i in items:
             if not i.get("is_dir") and str(i.get("name", "")).lower().endswith(VIDEO):
                 return path.rstrip("/") + "/" + i["name"], ""
-        queue += [path.rstrip("/") + "/" + i["name"] for i in items if i.get("is_dir")]
+        # 【插队首 = 优先往深处走】见 docstring：纯广度在真实的影视库上翻不到文件。
+        queue[:0] = [path.rstrip("/") + "/" + i["name"]
+                     for i in items if i.get("is_dir")]
     if err:
         return "", f"列目录没通（{err}）"
     if seen == 0:
         return "", "这个盘是空的"
     if queue:
-        return "", f"翻了 {used} 个目录还没翻完，都没有视频"
+        return "", (f"翻了 {used} 个目录都没翻到视频，而且 {STRM_ROOT} 下面也没有"
+                    f"这个盘的 strm —— 先跑一次「5 生成媒体库」，再回来跑这个脚本")
     return "", f"{seen} 个条目里没有视频文件"
 
 
@@ -165,7 +215,8 @@ def quote(p):
     return urllib.parse.quote(p, safe="/")
 
 
-any_302 = False
+any_302 = 0
+asked = 0          # 【真的问到上游的有几个】末尾那句话必须跟着它走，见下面
 for mp, add in dav:
     print()
     print(f"  {B}{mp}{X}")
@@ -178,7 +229,10 @@ for mp, add in dav:
         continue
     print(f"    {D}上游 {host_of(base)}{X}")
 
-    f, why = find_video(mp)
+    # 【先看磁盘上现成的，再谈翻目录】见 from_strm 的说明
+    f, why = from_strm(mp), ""
+    if not f:
+        f, why = find_video(mp)
     if not f:
         print(f"    {(R if '没通' in why else D)}{why}{X}")
         continue
@@ -201,8 +255,9 @@ for mp, add in dav:
         continue
     el = time.time() - t0
 
+    asked += 1
     if code in (301, 302, 303, 307, 308) and loc:
-        any_302 = True
+        any_302 += 1
         print(f"    {G}✔ 上游回 {code} → {host_of(loc)}{X}  {D}{el:.2f} 秒{X}")
         print(f"    {G}这个盘有救{X}{D}：鉴权在上游做完了，之后是一条公网地址。"
               f"VPS 只要替播放器挨这一下 302，几个 G 的视频一个字节都不用过 VPS。{X}")
@@ -221,12 +276,22 @@ for mp, add in dav:
 
 print()
 print("=" * 62)
-if any_302:
+# 【一个都没问到的时候，不许说任何关于上游的话】
+# 上一版这里只分"有 302"和"没有 302"两档 —— 于是一个视频都没找到、上游一次都没
+# 被问到，屏上照样打出「这些 WebDAV 盘的上游都不给直链」。人照着这句话去换源，
+# 而那是个基于零数据的决定。「没测成」必须单列一档，这条规矩 why-stall.sh 的
+# verdict() 里早就立了（col == C 那一档），这里又犯了一遍。
+if asked == 0:
+    print(f"  {Y}一个上游都没问到 —— 上面每个盘都卡在「找一个视频来试」这一步{X}")
+    print(f"  {D}所以这一轮【什么都没测出来】。这里不会告诉你这些盘有救还是没救，"
+          f"因为根本没量。{X}")
+    print(f"  {D}按上面每个盘那一行的提示办完，再跑一次。{X}")
+elif any_302:
     print(f"  {G}至少有一个 WebDAV 盘的上游是给直链的{X}")
     print(f"  {D}把这一整屏发出去 —— 上游给直链，这套东西就能替它做 302，"
           f"那个盘的 VPS 流量能从「按片子大小一比一」降到几乎为零。{X}")
 else:
-    print(f"  {D}这些 WebDAV 盘的上游都不给直链 —— 它们的流量躲不掉，"
+    print(f"  {D}问到的 {asked} 个 WebDAV 盘，上游都不给直链 —— 它们的流量躲不掉，"
           f"这不是哪次改动造成的，是 WebDAV 这个协议本身的样子。{X}")
     print(f"  {D}真要省这笔流量，只有换个有 CDN 直链的源（夸克 / 阿里 / 115 那一类）。{X}")
 PY

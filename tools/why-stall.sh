@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19l"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19n"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -1049,6 +1049,23 @@ UAS = (("浏览器（脚本一直用的）", UA),
        ("不设 UA（urllib 默认）", ""))
 
 
+# nginx 那边判"这是不是一个探测器"的名单，必须和 media-stack.py 里那个
+# map $http_user_agent $ms_probe 一字不差 —— 对不上就会把"被改写的行"标错，
+# 而标错比不标更坏（人会以为剩下那几行是干净的对照组）。
+PROBE_UA_RE = re.compile(r"^(?:$|Lavf/|Python-urllib|Go-http-client)|ffmpeg|ffprobe",
+                         re.I)
+
+
+def spoofed_mounts():
+    """哪些盘开着「伪装成浏览器」。读 media-stack 自己的状态文件，只读。"""
+    try:
+        with open("/etc/bgpeer/media-stack.json", encoding="utf-8") as f:
+            v = json.load(f).get("ua_spoof")
+        return [str(x) for x in v if str(x).startswith("/")] if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
 def ua_speed(url, start, ua, secs=6, cap=4 << 20):
     """拿这个 UA 拉一小段，量 Mbps。拿到 cap 或到点就撒手。"""
     hdr = {"Range": f"bytes={start}-{start + cap - 1}"}
@@ -1080,14 +1097,31 @@ if _cdn:
           f"（User-Agent）。UA 这一条当场就能测 —— 五发各拉几秒，一共 20 MB。{X}")
     _lb, _u, _h = _cdn[0]
     _st = int((ol_size or (1 << 30)) * 0.2)
+    # 【这条路上有没有人在替我们换脸】开着「伪装成浏览器」的盘，nginx 会把探测类
+    # UA（Lavf / Python-urllib / ffmpeg / 空）换成浏览器 UA 再送出去 —— 而 ④b 拉的
+    # 正是 list 子域上的 /d/<挂载点>/…，一头撞进那个 map。不认出来的话，表上会有
+    # 三行戴着同一张脸却被当成三张脸并排列出来。实测就这么骗过一次，还据此给出了
+    # 「这个盘不要开伪装成浏览器」的建议，照做之后整个盘当场播不了。
+    _mount = "/" + body.lstrip("/").split("/", 1)[0] if body else ""
+    _spoof_on = _mount in spoofed_mounts()
+    if _spoof_on:
+        print(f"  {Y}⚠ 这个盘（{_mount}）开着「伪装成浏览器」{X}")
+        print(f"  {D}nginx 会把探测类 UA 换成浏览器 UA 再送出去，而下面拉的就是"
+              f"那条路 —— 带 ← 的行【实际发出去的是浏览器那张脸】，不是它自己。"
+              f"这张表因此没有干净的对照组，不能拿来判断这个开关该不该开。{X}")
     _res = []
     for who, ua_s in UAS:
         code, mbps = ua_speed(_u, _st, ua_s)
-        _res.append((who, code, mbps, ua_s))
+        # urllib 不设这个头时会自己补 Python-urllib/3.x —— 判"会不会被改写"要按
+        # 真正发出去的那个串来判，按空串判就漏了这一行。
+        _eff = ua_s or "Python-urllib/3.12"
+        _rw = _spoof_on and bool(PROBE_UA_RE.search(_eff))
+        _res.append((who, code, mbps, ua_s, _rw))
         col = G if code in (200, 206) else R
-        print(f"    {who:<22}{col}{code}{X}  {C}{mbps:5.1f} Mbps{X}")
+        print(f"    {who:<22}{col}{code}{X}  {C}{mbps:5.1f} Mbps{X}"
+              + (f"  {Y}← 被换成浏览器脸，这行不算数{X}" if _rw else ""))
         time.sleep(2)
-    _ok = [(w, m, u2) for w, c, m, u2 in _res if c in (200, 206) and m > 0]
+    _ok = [(w, m, u2) for w, c, m, u2, _r in _res if c in (200, 206) and m > 0]
     if len(_ok) >= 2:
         _fast, _slow = max(_ok, key=lambda x: x[1]), min(_ok, key=lambda x: x[1])
         _brow = next((x for x in _res if x[0].startswith("浏览器")), None)
@@ -1101,9 +1135,14 @@ if _cdn:
             # 【最慢】（超时、0 Mbps）而 VLC 最快（16.1）的源。那种情况下
             # 「伪装成浏览器」这个开关是【反效果】—— 照着做会把能播的弄成播不了。
             # 一条反向的建议比没有建议坏得多。
-            _bslow = (_brow is not None
+            _bslow = (_brow is not None and not _spoof_on
                       and (_brow[1] not in (200, 206) or _brow[2] < _fast[1] / 3))
-            if _bslow:
+            if _spoof_on:
+                # 【开着的时候这张表没有对照组，一个字都不许往那个开关上引】
+                print(f"  {D}上面那几行里带 ← 的是被换过脸的，所以这张表"
+                      f"回答不了「这个开关该不该开」。要答那个问题，"
+                      f"看下面这一段。{X}")
+            elif _bslow:
                 print(f"  {R}⚠ 注意方向：浏览器那张脸在这个源上【最差】"
                       f"（{_brow[2]:.1f} Mbps）{X}")
                 print(f"  {B}所以这个盘【不要】开「伪装成浏览器」—— 开了等于"
@@ -1115,7 +1154,9 @@ if _cdn:
                       f"（4 挂载路径 → 这个盘），它会把出去的 UA 换成浏览器那个。{X}")
             # 【前面那些数字是戴哪张脸量的，必须说】不说的话，人会拿一个系统性
             # 偏低的数去做决定 —— 而这正是这次的实际情况：③④ 全程用的是浏览器 UA。
-            if _brow is not None and _brow[2] < _fast[1] / 3:
+            # 开关开着的时候不说这句：那时候"浏览器那一行"和被改写的那几行戴的是
+            # 同一张脸，"最慢的一张"这个判断本身就不成立。
+            if _brow is not None and not _spoof_on and _brow[2] < _fast[1] / 3:
                 print(f"  {Y}⚠ 上面 ③④ 的速度和换段费，全是戴着浏览器那张脸量的 ——"
                       f"也就是这个源上最慢的一张。那些数字偏低。{X}")
         else:
@@ -1130,6 +1171,24 @@ if _cdn:
             print(f"  {D}这个脚本只有 VPS 这一个出口，验证不了 IP 那一头。"
                   f"要自己验：手机浏览器打开挂载页面直接下同一个文件，"
                   f"快 = 不认 IP，慢 = 认。{X}")
+    # 【这一段不管开关开没开都要打】④b 量的是"拉得多快"，而「伪装成浏览器」
+    # 那个开关管的是"过不过得去" —— 两件事。一条能跑 9 Mbps 的路，完全可能在
+    # 【探测】那一发上被上游拒掉，因为探测戴的是另一张脸（Lavf/…）。
+    # 拿一张速度表去决定一个管准入的开关，方向就错了，开关是开是关都一样错。
+    # 实测代价：照着速度表关掉它，整个盘当场播不了 —— 而那个源正是按 UA 挡探测的。
+    print()
+    print(f"  {B}这张表回答的是「哪张脸拉得快」，不是「哪张脸过得去」{X}")
+    print(f"  {D}「伪装成浏览器」那个开关管的是后者：有些源对 ffprobe 的 Lavf/…"
+          f"直接回 403/429，Emby 探测不到音视频轨 → 条目有时长、媒体流 0 条、"
+          f"点开 load fail。那种源上这个开关是【能不能播】的命门，跟快慢无关。{X}")
+    if _spoof_on:
+        print(f"  {D}这个盘现在开着它。要试关掉：关完【先去 Emby 里点开一部片】，"
+              f"播不了就立刻开回来 —— 别靠上面的速度数字做这个决定。{X}")
+    else:
+        print(f"  {D}这个盘现在没开。要判断它需不需要：看 Emby 里这个盘的条目"
+              f"有没有媒体流（有时长、0 条音视频轨 = 探测被拒），"
+              f"或者跑 cant-play.sh。{X}")
+
     # 【"换张脸能不能救"只有真拉一遍才算答上】上面那五发各拉几秒，量的是瞬时速度；
     # 而"卡不卡"要看一条完整的时间轴 —— 缓冲撑不撑得住、换段费降不降。
     # 【别因为最快的那张脸是"不设 UA"就悄悄不测】上一版的条件里带着 _fast[2]，
@@ -1212,11 +1271,31 @@ elif ok and not bad:
           f"量不到你家到 VPS{X}")
     print(f"  {D}  3. 后台任务在抢 —— 上面 ① 那里报了就是{X}")
 else:
-    print(f"  {R}几条路都不行{X}")
+    # 【⚠ 和 ✖ 不是一回事，别合成一句"不行"】⚠ 是"能播，但有代价"（比如每换一段
+    # 要等一秒），✖ 才是"起不了播"。混成一句，人会去干最贵的那件事 —— 换盘、换源
+    # —— 而真正该做的可能只是照 ④ 去降低换段频率。这个脚本存在的全部意义就是把
+    # 客户端上长得一样的几种病分开，最后一句话再合回去等于前面白分了。
+    #
+    # 【条数也要照实说】没有 CDN 直链的盘本来就只测得了一条路，一条路谈不上
+    # "几条路都"。仓库主人那一屏正是：一条 ⚠，屏上却是红字「几条路都不行」。
+    _dead = [r for r in bad if r["col"] == R]
+    _warn = [r for r in bad if r["col"] == Y]
+    _n = "几条路都" if len(bad) > 1 else "这条路"
+    if not _dead:
+        print(f"  {Y}{_n}能播，但有代价{X}")
+        print(f"  {D}上面每条路那一句写的就是代价本身 —— 不是「播不了」，"
+              f"所以先别急着换盘换源。{X}")
+    elif _warn:
+        print(f"  {R}{len(_dead)} 条起不了播{X}"
+              f"{D}，另有 {len(_warn)} 条能播但有代价{X}")
+    else:
+        print(f"  {R}{_n}起不了播{X}")
     print(f"  {D}上面每条路的那一句已经分了类；同一类的处置：{X}")
     print(f"  {D}  · 带宽不够 → 这个源只适合放码率低的片，大码率的换个盘放{X}")
     print(f"  {D}  · 周期性断流 → 源在限速，改配置改不掉；错开时间、或换盘{X}")
-    print(f"  {D}  · 每换一段要等 → 看上面 ④，它已经把「贵在哪」分好类了{X}")
+    print(f"  {D}  · 每换一段要等 → 看上面 ④，它已经把「贵在哪」分好类了。"
+          f"这一类【不用换盘】：换段费是每发一次请求交一次的固定开销，"
+          f"缓冲大的播放器（Infuse / VidHub / Kodi）交得少，网页播放器交得最多{X}")
 
 # ================= ⑥ 真实播放留下的痕迹 =================
 sec("⑥ 这部片最近【真被人播】的时候，日志里发生了什么")

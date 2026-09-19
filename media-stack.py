@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.119"
+SCRIPT_VERSION = "1.5.121"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1270,8 +1270,14 @@ def gen_nginx_site(cfg):
     # 【挑不到端口就当没有】宁可回到"转码流在 Emby 里播不了"（今天的样子），
     # 也不能留一条指向死上游的 location —— 那会变成 502，而 502 跟"网盘挂了"
     # 长得一模一样，排查成本高得多。
+    # 【读不到存储表的时候，沿用"已经装好"这个事实，别把 location 撤掉】
+    # hls_wanted 返回 None = 没问出来（多半是 OpenList 正在写库、撞上了锁）。
+    # 这条 location 一撤，夸克的转码流当场就回到 401 转圈 —— 而把一个正在承载
+    # 播放的东西拆掉，绝不该是"我刚才没读到"这种理由能触发的。
+    # unit 文件在不在是一份可信的旧答案：它只有在真的有盘要用转码流时才会被装上。
     try:
-        hls_on = bool(hls_wanted(ms_install_dir())) and hls_port() > 0
+        _w = hls_wanted(ms_install_dir())
+        hls_on = (hls_ready() if _w is None else bool(_w)) and hls_port() > 0
     except Exception:
         hls_on = False
     spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
@@ -1803,12 +1809,19 @@ def hls_port():
 
 
 def hls_wanted(d):
-    """有没有盘设成转码流。没有就不该留这个服务。"""
+    """有没有盘设成转码流。返回挂载点列表；【读不到存储表时返回 None】。
+
+    【None 和 [] 必须分开】[] 是"问过了，一个都没有"，None 是"没问出来"。
+    上一版两种都返回 []，于是 OpenList 正在写库时撞一次锁，调用方就当成
+    "没有盘用转码流"，把 nginx 那条分片 location 撤掉、连 systemd 服务一起卸 ——
+    夸克的转码流当场全部播不了，而屏上一个字都没有。
+    拿这个返回值做决定的地方都要先判 None，见 gen_nginx_site / sync_hls_service。
+    """
     try:
-        return [mp for _s, mp, _d, add, _c in _storage_rows(d)
+        return [mp for _s, mp, _d, add, _c in _storage_rows(d, strict=True)
                 if str(add.get("link_method") or "") == "streaming"]
     except Exception:
-        return []
+        return None
 
 
 def do_hls_fix():
@@ -1921,8 +1934,17 @@ def sync_hls_service(d, quiet=True):
     【按需装卸】不用转码流的人不该多一个常驻进程 —— 多一个进程就多一个故障点、
     多一件要解释的事。
     """
-    want = bool(hls_wanted(d))
+    _w = hls_wanted(d)
     have = os.path.exists(HLS_UNIT)
+    if _w is None:
+        # 【没问出来就什么都别动】装错了只是多一个进程，卸错了是当场播不了 ——
+        # 两个方向的代价差着数量级，而"不动"在两个方向上都不会把事情弄坏。
+        # 下一次更新、下一次切画质都会再算一遍，不急在这一刻。
+        if not quiet:
+            warn("读不到 OpenList 的存储表，这一轮不动分片重定向服务"
+                 "（保持现状，下次更新会再判一次）。")
+        return have
+    want = bool(_w)
     if want and not hls_port():
         warn("9010~9029 全被占着，分片重定向服务装不了 —— "
              "Emby 里播转码流还会转圈（挂载页面和外部播放器不受影响）。")
@@ -11118,8 +11140,14 @@ def _truthy(v):
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _storage_rows(d):
+def _storage_rows(d, strict=False):
     """读 OpenList 的存储表：[(id, 挂载点, 驱动, addition 字典, 表列字典)]。
+
+    【strict=True 的时候把异常抛出来】默认吞掉异常返回 [] 对大多数调用方是对的
+    （少显示一行，不会把事情弄坏）。但有的调用方拿这个空列表去做【破坏性】决定 ——
+    比如"没有盘用转码流 → 把分片重定向拆了"。对那些地方，"读不到"和"没有"必须分开，
+    否则 OpenList 正在写库时撞一次锁，就能把一个正在承载播放的功能整个拆掉。
+    实测代价：夸克的转码流当场全部播不了，而屏上一个字都没有。
 
     【为什么要连表上的列一起读】"直链方式"有两个存放位置：驱动自己的开关在 addition 这个
     JSON 里（夸克的 link_method、百度的 download_api……），而"视频字节过不过 VPS"是存储表
@@ -11131,6 +11159,8 @@ def _storage_rows(d):
     """
     db = os.path.join(d, "openlist", "config", "data.db")
     if not os.path.exists(db):
+        if strict:
+            raise FileNotFoundError(db)
         return []
     base = ["id", "mount_path", "driver", "addition"]
     try:
@@ -11141,6 +11171,10 @@ def _storage_rows(d):
                            " from x_storages order by mount_path").fetchall()
         con.close()
     except Exception:
+        # 【database is locked 就是从这儿混进"空列表"的】OpenList 一边在写、
+        # 这边一边读，撞上锁是常态，不是异常状况。
+        if strict:
+            raise
         return []
     out = []
     for r in rows:
@@ -12866,6 +12900,24 @@ def _one_drive_link_menu(d, mp):
                           f"套到这类盘上多半帮倒忙。{RST}")
                 print(f"  {DIM}开完去挂载页面播一部片子确认一下；不对劲就回这里关掉。{RST}")
                 if not ask_yn(f"确定给 {mp} 开启？", False):
+                    print("没有改动。")
+                    continue
+            else:
+                # 【关掉也要拦一下，而且拦得比开启还要紧】开启是"多一层伪装"，
+                # 关掉是【可能直接把这个盘弄成播不了】：上游按 UA 挡探测的源，
+                # 关掉之后 Emby 的 ffprobe 就是 403/429，条目有时长、媒体流 0 条、
+                # 点开 load fail。上一版这一支一句话都没有，静默就关了 ——
+                # 实测代价：整个盘当场播不了，而人不知道是这一下造成的。
+                warn("关掉之后，Emby 的探测会用 ffmpeg 的 UA（Lavf/…）去问上游。")
+                print(f"  {DIM}上游要是按 UA 挡探测（403/429），这个盘会变成"
+                      f"「条目有时长、媒体流 0 条、点开 load fail」—— 也就是整个盘"
+                      f"播不了。这个开关本来就是为那种源加的。{RST}")
+                print(f"  {YELLOW}别拿速度数字做这个决定{RST}"
+                      f"{DIM}（why-stall.sh 的 ④b 量的是快慢，不是过不过得去；"
+                      f"而且开着的时候那张表本身就是被改写过的）。{RST}")
+                print(f"  {DIM}关完【立刻去 Emby 里点开一部这个盘的片子】，"
+                      f"播不了就回这里开回来。{RST}")
+                if not ask_yn(f"确定给 {mp} 关闭？", False):
                     print("没有改动。")
                     continue
             set_ua_spoof(mp, val == "spoof")
