@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19g"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-19h"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -84,12 +84,15 @@ MWLOG="$(mktemp)"
 PYF="$(mktemp)"
 trap 'rm -f "$MWLOG" "$PYF"' EXIT
 docker logs --tail 4000 mediawarp >"$MWLOG" 2>&1 || : >"$MWLOG"
+# MediaWarp 上次是什么时候起来的 —— 用来判断"自愈到底跑没跑过"
+MWSTART="$(docker inspect -f '{{.State.StartedAt}}' mediawarp 2>/dev/null || true)"
 
 cat >"$PYF" <<'PY'
 import json, os, re, socket, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 
 KEY, OLPW, DATA_ROOT, DOMAIN, SECS, Q, MWLOG = sys.argv[1:8]
+MWSTART = sys.argv[8] if len(sys.argv) > 8 else ""
 EMBY, OL = "http://127.0.0.1:8096", "http://127.0.0.1:5244"
 MW = "http://127.0.0.1:9000"          # MediaWarp —— Emby 那条路上唯一算数的那一段
 NGXLOG = "/var/log/nginx/media-stack.access.log"
@@ -1206,9 +1209,63 @@ else:
               f" → 一直转圈。{X}")
         print(f"  {B}改法：4 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链{X}")
     if codes.get("404"):
-        print(f"  {Y}有 {codes['404']} 条 404 —— MediaWarp 换直链被拒了{X}")
-        print(f"  {D}它只在启动那一刻登录一次 OpenList，OpenList 一重启旧令牌就作废。"
-              f"敲 docker restart mediawarp。{X}")
+        _n404 = codes["404"]
+        _tot = sum(codes.values())
+        print(f"  {R}✖ {_n404}/{_tot} 条换不到直链（404）{X}")
+        print(f"  {D}点播放 → MediaWarp 去换直链 → 换不到 → 回 404 → 播放器重试 →"
+              f" 又 404 → 放弃。客户端上就是「转一会儿像连不上一样就断开」。{X}")
+        # 【别在原因之间替人猜】"404"只说了拒绝，没说为什么拒绝，而两个最常见的
+        # 原因处置完全相反：令牌作废重启就好，上游抽风重启完照样抽。
+        # 上一版屏上只有一句"敲 docker restart mediawarp" —— 那是把一个猜测写成了
+        # 结论。万一原因是上游抽风，人重启一遍没好，就会觉得整套诊断不管用，
+        # 而真正的原因一直印在日志里没人去读。
+        WHYS = (("令牌作废（OpenList 重启过）",
+                 re.compile(r"token is invalidated|响应状态码:\s*401|\bstatus(?: code)?[: ]+401\b",
+                            re.I)),
+                ("上游/存储这一刻抽风",
+                 re.compile(r"object not found|storage not found|failed to get obj", re.I)),
+                ("超时", re.compile(r"timeout|timed out|context deadline|i/o timeout", re.I)),
+                ("被拒（403/429）", re.compile(r"\b(403|429)\b")))
+        hits, samples = {}, []
+        for ln in log:
+            for name, rx in WHYS:
+                if rx.search(ln):
+                    hits[name] = hits.get(name, 0) + 1
+                    if len(samples) < 3 and name in ("令牌作废（OpenList 重启过）",
+                                                     "上游/存储这一刻抽风"):
+                        samples.append(ln)
+                    break
+        if hits:
+            print(f"  {D}日志里说的原因：{X}")
+            for name, n in sorted(hits.items(), key=lambda kv: -kv[1]):
+                print(f"    {Y}{name}{X}  {D}{n} 次{X}")
+        for ln in samples:
+            print(f"    {D}{safe(ln.strip())[:150]}{X}")
+        if MWSTART:
+            print(f"  {D}MediaWarp 上次启动：{MWSTART[:19].replace('T', ' ')}"
+                  f"（UTC）{X}")
+        if hits.get("令牌作废（OpenList 重启过）"):
+            print(f"  {B}→ 令牌作废了。敲：docker restart mediawarp{X}")
+            print(f"  {D}MediaWarp 只在【启动那一刻】登录一次 OpenList，OpenList 一"
+                  f"重启（更新、切直链方式、改目录缓存、宿主机重启、被 OOM 杀）旧"
+                  f"令牌就作废，而它毫不知情 —— 换直链时拿到 401，整个请求以 404 收场。{X}")
+            print(f"  {D}已经缓存过直链的片子照样能放，所以看着像「有的能放有的不能"
+                  f"放」；等缓存陆续过期就变成「全都打不开」。重启会清空直链缓存，"
+                  f"头几部片第一次点开会慢一点，正常。{X}")
+            print(f"  {D}本来有自愈（保活每 20 分钟查一次令牌，发现作废就重启）。"
+                  f"上面那个启动时间要是很久以前，说明自愈这条线没跑起来 ——"
+                  f"检查 cron 有没有被停掉：systemctl status cron{X}")
+        elif hits.get("上游/存储这一刻抽风"):
+            print(f"  {B}→ 不是令牌的事，重启也没用{X}")
+            print(f"  {D}是 OpenList 向上游要这个文件的时候被拒/找不到。这类源按请求"
+                  f"频率抽风：同一条路径这一刻找不到、过一会儿又好了。{X}")
+            print(f"  {D}能做的只有【少打扰它】：预热已经跳过这类盘、补探测也只补点"
+                  f"开过的；再就是别在扫描/生成媒体库的时候看片。{X}")
+        else:
+            print(f"  {Y}→ 日志里没有现成的原因字样{X}")
+            print(f"  {D}把这几行发出来：{X}")
+            print(f"      docker logs --tail 200 mediawarp 2>&1 | grep -iE "
+                  f"'404|401|error|失败' | tail -20")
 
 if os.path.isfile(NGXLOG):
     try:
@@ -1254,7 +1311,7 @@ print(f"  {D}还想往下查：转码用 playing.sh，历次被指去了哪用 l
 PY
 
 run_one() {   # $1 = 片名或挂载点   $2 = 拉多少秒
-  python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$2" "$1" "$MWLOG"
+  python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$2" "$1" "$MWLOG" "$MWSTART"
 }
 
 if [ -n "$Q" ]; then
@@ -1266,7 +1323,7 @@ fi
 # 上一版这里是列个菜单让人再敲一次 —— 而人要的从来不是菜单，是结论；
 # 何况"到底哪个盘有问题"本来就得几个盘并排看才谈得上比较。
 EACH="${MS_SECS:-30}"
-DRV="$(python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$EACH" "--drives" "$MWLOG")"
+DRV="$(python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$EACH" "--drives" "$MWLOG" "$MWSTART")"
 if [ -z "$DRV" ]; then
   echo "  ✖ 一个盘都没找到（$DATA_ROOT/strm 下面没有 strm）—— 先点「5 生成媒体库」"
   exit 1
