@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.123"
+SCRIPT_VERSION = "1.5.124"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -95,6 +95,10 @@ STRM_PATH      = "/data/strm/" + STRM_SUBDIR
 # 上游活没活】，配置一路通过，表现是播放时 502，而 502 跟"网盘挂了"长得一模一样。
 # 所以：第一次要用的时候挑一个真的空着的，记进状态文件，nginx 和服务共用同一个。
 HLS_PORT_BASE = 9010
+# 【nginx 里认这条 location 的标记】hls_ready() 拿它判"另一半装上没有"。
+# 和 gen_nginx_site 里真正写出去的那一行必须对得上 —— 改了那边就得改这里，
+# 不然 hls_ready() 会永远说"没装好"（或者更坏：永远说"装好了"）。
+HLS_LOC_MARK = "(?:emby/)?videos/"
 HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
 # 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
@@ -10241,10 +10245,26 @@ def do_strm(only=None):
 
     # 【顺手对一次转码流的分片重定向】有盘用转码流就该有这个服务，没有就不该留。
     # 挂在这条路上：用户手点、本来就在重启这些东西，而且人在屏幕前看着。
+    #
+    # 【装完必须紧跟着刷 nginx —— 这一半上一版漏了】分片重定向是两半：systemd 服务
+    # 收分片请求回 302，nginx 的 location 把请求交给它。do_strm 只装了前一半，
+    # 而这条路【正是新用户唯一会走的路】（安装那一步网盘还没挂，hls_wanted 是空的，
+    # 那时候不生成 location 是对的）。结果：挂个转码流的盘、点一下生成媒体库，
+    # 拿到的是"服务在跑、nginx 不指向它"的半成品，Emby 里照样 401 转圈。
+    # do_update 和「切画质」那两条路本来就是装完紧跟着刷的，这里跟它们对齐。
     try:
-        sync_hls_service(d)
-    except Exception:
-        pass
+        if sync_hls_service(d):
+            _cfg_h = rebuild_cfg_from_disk(d)
+            if _cfg_h.get("has_domain") and os.path.exists(_cfg_h.get("crt") or ""):
+                apply_nginx_site(_cfg_h)   # 内部自带 nginx -t + 失败回滚
+                ok("转码流的分片重定向已就绪（Emby 里现在能播转码流）")
+            else:
+                # 【别默默跳过】没域名的机器是靠 IP:8096 直连 Emby 的，没有 nginx
+                # 这一层，那种情况下这半边本来就不需要。但"需要却没刷成"和"不需要"
+                # 长得一样，所以照实说一句，别让人以为装好了。
+                info("分片重定向的服务已起；nginx 那半边等有域名和证书之后自动补上")
+    except Exception as e:
+        warn(f"分片重定向没对上（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
 
     # 【在通知 Emby 之前压原盘】不然 Emby 先把它们建成一批 0B 的"蓝光原盘"条目，
     # 之后再删再建，中间那段时间用户点进去就是 load fail。
@@ -11329,12 +11349,31 @@ def is_hls_mode(add):
 
 
 def hls_ready():
-    """转码流的分片重定向装上了没有。装了转码流在 Emby 里就能播。
+    """转码流的分片重定向【整套】就绪了没有。就绪 = Emby 里能播转码流。
 
-    【看 unit 文件在不在就够】systemd 那边是 Restart=always，unit 在就等于它在跑；
-    而菜单渲染里不该去 fork 一个 systemctl。
+    【两样都要在，少一样就是半成品】这件事有两半：
+
+      · systemd 服务    收分片请求、回 302 指回网盘
+      · nginx 的 location  把 /emby/Videos/<id>/*.ts 这类请求交给它
+
+    上一版只看 unit 文件。可这两半是分开装的：do_strm（生成媒体库）那条路只装了
+    服务、一个字都没碰 nginx —— 于是一个新用户挂个转码流的盘、点一下生成媒体库，
+    拿到的就是"服务在跑、nginx 不指向它"的半成品，Emby 里照样 401 转圈。
+    而 hls_ready() 说"装好了"，菜单那句提醒不挂了、体检打出「分片重定向已装」——
+    【坏掉的东西被报告成健康的，比坏掉本身更难查】。
+
+    systemd 那边是 Restart=always，unit 在就等于它在跑，所以那一半仍然只看文件；
+    nginx 那一半读一次站点配置就够，菜单渲染里不该去 fork 任何东西。
     """
-    return os.path.exists(HLS_UNIT)
+    if not os.path.exists(HLS_UNIT):
+        return False
+    try:
+        with open(NGX_SITE, encoding="utf-8", errors="replace") as f:
+            return HLS_LOC_MARK in f.read()
+    except OSError:
+        # 没有域名的机器根本不生成站点配置。那种机器上 Emby 是靠 IP:8096 直连的，
+        # 压根没有 nginx 这一层 —— 不该因为"文件不在"就说没装好。
+        return not os.path.exists(NGX_SITE)
 
 
 def opt_tag(key, val):
