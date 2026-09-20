@@ -12,7 +12,7 @@
 # 播放的时候跑这个才有东西看 —— 没在播就什么都查不到。
 set -u
 
-TOOL_VER="2026-09-20b"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-20c"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -23,7 +23,13 @@ KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 [ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
 python3 - "$KEY" "$DIR" "$DATA_ROOT" <<'PY'
-import json, os, sys, urllib.request
+import json, os, sys, urllib.error, urllib.parse, urllib.request
+
+
+class _NoRedir(urllib.request.HTTPRedirectHandler):
+    """要的就是 302 本身 —— 跟随了就看不见它指到哪儿去了。"""
+    def redirect_request(self, *a, **k):
+        return None
 
 KEY = sys.argv[1]
 MS_DIR = sys.argv[2] if len(sys.argv) > 2 else "/opt/media-stack"
@@ -93,6 +99,41 @@ def drive_of(item_id):
     elif "link_method" in add or "use_transcoding_address" in add:
         bits.append("原画直链")
     return mp, " · ".join(bits)
+
+
+def served_kind(item_id):
+    """MediaWarp 现在【真给】这个条目什么。返回 (是不是 m3u8, 主机名, 说明)。
+
+    【这一问是这个工具最该做却一直没做的】上面那些都是 Emby 自己的说法 ——
+    它认为文件是 mp4 还是 hls、它打算 DirectStream 还是 Transcode。可真正送到
+    播放器手上的，是 MediaWarp 302 出去的那个地址。两边对不上的时候，播放器
+    拿到的东西和它被告知的不是一回事，表现就是"流量在跑、画面出不来"。
+
+    【不打印地址】那里面带着签名，整条贴出来等于把一条能直接下片的链交出去。
+    只回它是不是 m3u8、以及主机名。
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:9000/Videos/{item_id}/stream"
+        f"?MediaSourceId=mediasource_{item_id}&Static=true&api_key={KEY}",
+        headers={"User-Agent": "curl/8.5.0"})
+    op = urllib.request.build_opener(_NoRedir)
+    loc = ""
+    try:
+        op.open(req, timeout=40).close()
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location") or ""
+        if not loc:
+            return None, "", f"MediaWarp 回了 {e.code}，没给 302"
+    except Exception as e:
+        return None, "", f"问不到 MediaWarp（{type(e).__name__}）"
+    if not loc:
+        return None, "", "MediaWarp 没给 302"
+    head = loc.split("?", 1)[0]
+    try:
+        host = urllib.parse.urlsplit(loc).hostname or "?"
+    except ValueError:
+        host = "?"
+    return (".m3u8" in head.lower()), host, ""
 
 
 def hms(sec):
@@ -217,6 +258,37 @@ for s in live:
             print(f"  {D}平均码率   {Y}没探到{X}"
                   f"{D} —— 转码流的播放列表本来就没有大小和码率这两项，"
                   f"不是真的 0。这一档判不了「够不够快」。{X}")
+
+    # ---- Emby 认为的 vs MediaWarp 真给的 ----
+    # 【这一对才是答案】Emby 的 MediaSources 是探测那一刻记下的，之后不会重探。
+    # 盘的画质后来被改过（原画 ↔ 转码流）的话，老条目手里还是旧格式，而 MediaWarp
+    # 按【现在】的设置发地址 —— 于是 Emby 说"这是个 0.53 GB 的 mp4，按字节范围拉"，
+    # 实际来的却是一份 m3u8 播放列表。播放器拿到的和它被告知的不是一回事。
+    _cont = str((src or {}).get("Container") or "").lower()
+    print(f"  {D}（下面这一问要换一次直链 —— 换直链正是这些源限流最狠的动作，"
+          f"一路只问一次）{X}")
+    _is_m3u8, _host, _why = served_kind(it.get("Id"))
+    if _is_m3u8 is None:
+        print(f"  {Y}MediaWarp 真给的：没问出来{X}  {D}{_why}{X}")
+    else:
+        _kind = "m3u8（转码流）" if _is_m3u8 else "整个文件（原画）"
+        _emby_hls = _cont in ("hls", "m3u8")
+        if _emby_hls == _is_m3u8:
+            print(f"  {G}✔ 对得上{X}  {D}Emby 认为是 {_cont or '?'}，"
+                  f"MediaWarp 真给的也是{_kind}　{_host}{X}")
+        else:
+            # 【这就是"有的能播有的不能"】而且它只出现在"盘的画质被改过"之后
+            # 入库时间早于那次改动的条目上 —— 所以同一个盘里有的好有的坏。
+            print(f"  {R}✖ 对不上{X}  {D}Emby 认为是 {X}{C}{_cont or '?'}{X}{D}，"
+                  f"而 MediaWarp 真给的是 {X}{C}{_kind}{X}{D}　{_host}{X}")
+            print(f"  {D}Emby 的媒体信息是【探测那一刻】记下的，之后不会重探。"
+                  f"这个盘的画质后来改过，而这个条目是改之前入库的 —— 于是 Emby "
+                  f"按旧格式告诉播放器怎么拿，来的却是新格式。{X}")
+            print(f"  {B}这就是「有的能播有的不能」：同一个盘里，改动之前入库的"
+                  f"那批全是这个毛病。{X}")
+            print(f"  {D}修法：让这些条目重新探一次 —— media-stack heal-reset "
+                  f"然后 media-stack heal；heal 补不动的，在 Emby 里对这个媒体库"
+                  f"点「刷新元数据 → 覆盖所有元数据」。{X}")
 
     pos = (ps.get("PositionTicks") or 0) / 1e7
     if pos:
