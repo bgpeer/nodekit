@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.133"
+SCRIPT_VERSION = "1.5.134"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9933,6 +9933,36 @@ def heal_workers():
     return 1 if heal_pace() <= HEAL_PACE_MIN else HEAL_WORKERS
 
 
+def hls_probe_url(iid, key):
+    """这个条目走转码流的话，MediaWarp 会 302 到一份 m3u8 —— 返回那个地址，否则 ""。
+
+    【为什么值得单独问这一次】补时长写进 strm 的是 OpenList 的 /d/ 地址，也就是
+    【原始文件】：ffprobe 要把文件头拉下来才拿得到时长，实测一个条目几 MB 起步
+    （上游口径还要再乘约 2.8）。而转码流的 m3u8 是一份几 KB 的播放列表，每个分片
+    带着 #EXTINF 秒数，时长就在里面，编码信息读一个分片就有。同一个条目，代价
+    差几十倍。
+
+    【问一次 = 换一次直链】所以只在真要探这个条目的时候问，不预先批量问 ——
+    换直链正是这些源限流最狠的动作。
+
+    不是转码流、或者这个文件在网盘那边没有转码版本（夸克对很多电影就没有，会
+    回落成原画），这里就返回 "" —— 调用方照旧走原来那条路，行为不退步。
+    """
+    try:
+        op = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
+            f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}",
+            headers={"User-Agent": HTTP_UA})
+        op.open(req, timeout=60).close()
+        return ""                     # 没给 302 = 走不到转码流那条路
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location") or ""
+    except Exception:
+        return ""
+    return loc if ".m3u8" in loc.split("?", 1)[0].lower() else ""
+
+
 def _heal_one(d, key, _it, base, token):
     """探一个条目。返回 (结局, 名字, 秒数, 附言)。
 
@@ -9980,13 +10010,30 @@ def _heal_one(d, key, _it, base, token):
             return "throttle", name, el(), f"网盘没给出文件头（{why}）"
         return "retry", name, el(), f"网盘没给出文件头（{why}）"
     url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
+    # 【先试 m3u8，探不出来再退回整文件】转码流的盘，MediaWarp 会 302 到一份几 KB
+    # 的播放列表，每个分片带 #EXTINF 秒数 —— ffprobe 读它就拿到时长，编码读一个
+    # 分片就有。而 /d/ 那条要把原始文件的文件头拉下来，实测一个条目几 MB 起步。
+    # 同一个条目，代价差几十倍。
+    # 【退回那一档必须留着】不是每个盘、每个文件都有转码版本（夸克对很多电影就
+    # 没有，会回落成原画）；m3u8 那条探不出来时照旧走原来的路，行为不退步。
+    _routes = []
+    _m3u8 = hls_probe_url(iid, key)
+    if _m3u8:
+        _routes.append(("m3u8", _m3u8))
+    _routes.append(("整文件", url))
     mins, streams, probed = 0, False, True
     streams_hot = False               # 还原【之前】有没有轨道，见下面那一档
-    if True:                          # 缩进只是为了让下面这段 try/finally 原样保留
+    _via = ""
+    # 【每条路各自走完"写URL→探→还原→核对"一整趟】核对必须在还原之后（见下面那段
+    # 注释），所以不能先把两条路都探完再核对 —— 那样又回到"拿还原前的状态下结论"
+    # 那个老毛病上。代价是每条路多一次本机 Emby 读，不碰网盘。
+    for _kind, _u in _routes:
+        _via = _kind
+        probed = True
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
             with open(host, "w", encoding="utf-8") as f:
-                f.write(url)
+                f.write(_u)
             try:
                 _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&IsPlayback=true"
                       f"&AutoOpenLiveStream=true&MediaSourceId=mediasource_{iid}"
@@ -10018,26 +10065,30 @@ def _heal_one(d, key, _it, base, token):
                     f.write(original if original.strip().startswith("/") else p)
             except OSError as e:
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
-    # 【核对必须在还原之后】上一版在还原【之前】读，于是判"成功"用的是一个紧接着
-    # 就被撤销的状态：屏上打「✔ 142 分钟」，而 items_without_duration 那边（在还原
-    # 之后看）看见轨道又没了，下一轮原样把它捞回来 —— 同一批条目在两个名单之间
-    # 来回弹，永远好不了，每弹一次真烧一次网盘流量。
-    # 这个函数自己的注释里就写着同一个教训，只是上一版修的是"核对什么"，
-    # 没注意"什么时候核对"。
-    # 代价：每个条目多一次本机 Emby 请求，不碰网盘。
-    try:
-        got = _emby(f"/Users/{uid}/Items/{iid}"
-                    f"?Fields=MediaSources,MediaStreams", key, timeout=30)
-        srcs = got.get("MediaSources") or []
-        ticks = (min((s.get("RunTimeTicks") or 0) for s in srcs) if srcs
-                 else (got.get("RunTimeTicks") or 0))
-        mins = ticks / 6e8
-        streams = bool((got.get("MediaStreams") or [])
-                       or any(x.get("MediaStreams") for x in srcs))
-    except Exception:
-        mins, streams = 0, False
+        # 【核对必须在还原之后】上一版在还原【之前】读，于是判"成功"用的是一个紧接着
+        # 就被撤销的状态：屏上打「✔ 142 分钟」，而 items_without_duration 那边（在
+        # 还原之后看）看见轨道又没了，下一轮原样把它捞回来 —— 同一批条目在两个
+        # 名单之间来回弹，永远好不了，每弹一次真烧一次网盘流量。
+        # 这个函数自己的注释里就写着同一个教训，只是上一版修的是"核对什么"，
+        # 没注意"什么时候核对"。
+        # 代价：每条路多一次本机 Emby 请求，不碰网盘。
+        try:
+            got = _emby(f"/Users/{uid}/Items/{iid}"
+                        f"?Fields=MediaSources,MediaStreams", key, timeout=30)
+            srcs = got.get("MediaSources") or []
+            ticks = (min((s.get("RunTimeTicks") or 0) for s in srcs) if srcs
+                     else (got.get("RunTimeTicks") or 0))
+            mins = ticks / 6e8
+            streams = bool((got.get("MediaStreams") or [])
+                           or any(x.get("MediaStreams") for x in srcs))
+        except Exception:
+            mins, streams = 0, False
+        if mins and streams:
+            break                     # 这条路成了，别再走下一条（省的就是这一趟）
     if mins and streams:
-        return "ok", name, el(), f"{mins:.0f} 分钟"
+        # 【把走的哪条路写在屏上】这是"省流量"这件事唯一看得见的证据；
+        # 走 m3u8 还是整文件，代价差几十倍，而两种在别的输出里长得一模一样。
+        return "ok", name, el(), f"{mins:.0f} 分钟（{_via}）"
     if streams_hot and not streams:
         # 【探到了，可一还原轨道就没了】这是确定答案，不是线路抖 —— 再探一百遍
         # 还是同一个结果。归 dead（一次就判放弃），别再无限买同一个答案：
