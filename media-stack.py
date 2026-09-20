@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.125"
+SCRIPT_VERSION = "1.5.126"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -103,6 +103,15 @@ HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
 # 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
 HLS_BASE_TTL = 300
+# 【失败不能跟成功一个待遇】见 base_of：换集那一刻要现问一次新条目的直链，而上游
+# 对换链是按频率限流的。把一次 429 当成答案缓存 5 分钟，等于把这一集判死 5 分钟
+# —— 客户端表现就是"连不上"然后退出，过一会儿又好了。
+# 几秒足够挡住并发分片的重复请求（一个播放器同时要好几片），又远不足以判死一集。
+HLS_BASE_FAIL_TTL = 5
+# 429 在这里是常态不是异常，而且退得很快（是个拒绝，不是超时），所以重试在正常
+# 情况下几乎不花时间。客户端在等这个请求，所以总预算压到几秒。
+HLS_BASE_TRIES = 3
+HLS_BASE_GAP = 1.0
 # 【只认长得像分片的】nginx 那条 location 用的是同一套后缀。多认一种就多一类
 # 请求被拉进这个服务，而这个服务的本分是"少管闲事"。
 HLS_SEG_EXT = ("ts", "m4s")
@@ -1870,32 +1879,58 @@ def do_hls_fix():
     cache, lock = {}, threading.Lock()
 
     def base_of(vid):
-        """这个条目的 m3u8 在哪个目录。问一次 MediaWarp，缓存 HLS_BASE_TTL 秒。"""
+        """这个条目的 m3u8 在哪个目录。问 MediaWarp，成功缓存 HLS_BASE_TTL 秒。
+
+        【失败不能跟成功一样缓存】换集 = 换条目 id = 缓存里没有 → 必须现问一次，
+        而上游对换链是按频率限流的（这套东西自己在别处写着：「429 要退避重试，
+        不能一次失败就判死：实测同一个文件连吃三个 429，隔了半分钟才拿到 206」）。
+
+        上一版把 base="" 也写进缓存留 5 分钟 —— 一次 429 就让这一集【整整五分钟】
+        每个分片都 404，客户端表现就是"连不上"然后退出；等缓存自己过期又好了，
+        换下一集则看那一下的运气。仓库主人报的"有时行有时不行"就是这么来的。
+
+        所以：成功留 HLS_BASE_TTL，失败只留 HLS_BASE_FAIL_TTL（几秒，够挡住并发
+        分片的重复请求，不至于把一集判死），并且当场退避重试几次。
+        """
         now = time.time()
         with lock:
             hit = cache.get(vid)
-            if hit and now - hit[1] < HLS_BASE_TTL:
-                return hit[0]
+            if hit:
+                # 【两种答案两种有效期】空的那种只压几秒，不然就是判死
+                ttl = HLS_BASE_TTL if hit[0] else HLS_BASE_FAIL_TTL
+                if now - hit[1] < ttl:
+                    return hit[0]
         base = ""
-        try:
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
-                f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
-                headers={"User-Agent": HTTP_UA})
-            op = urllib.request.build_opener(_NoRedirect)
+        op = urllib.request.build_opener(_NoRedirect)
+        for _i in range(HLS_BASE_TRIES):
+            if _i:
+                # 【客户端在等这个请求】所以间隔和超时都压得很短；429 是个拒绝、
+                # 回得很快，正常情况下这几次重试几乎不花时间。
+                time.sleep(HLS_BASE_GAP)
             try:
-                op.open(req, timeout=30).close()
-            except urllib.error.HTTPError as e:
-                loc = e.headers.get("Location") or ""
-                # 【只认 m3u8】原画那条 302 指的是一个完整文件，没有"同目录的分片"
-                # 这回事 —— 那种情况下什么都不该做，让它按 404 收场。
-                if ".m3u8" in loc.lower():
-                    head = loc.split("?", 1)[0]
-                    base = head[:head.rfind("/") + 1]
-        except Exception:
-            base = ""
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
+                    f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
+                    headers={"User-Agent": HTTP_UA})
+                try:
+                    op.open(req, timeout=15 if _i == 0 else 8).close()
+                except urllib.error.HTTPError as e:
+                    loc = e.headers.get("Location") or ""
+                    # 【只认 m3u8】原画那条 302 指的是一个完整文件，没有"同目录的
+                    # 分片"这回事 —— 那种情况下什么都不该做，让它按 404 收场。
+                    if ".m3u8" in loc.lower():
+                        head = loc.split("?", 1)[0]
+                        base = head[:head.rfind("/") + 1]
+                    elif loc:
+                        # 拿到的是别的东西（原画那条完整文件）—— 这是【确定的答案】，
+                        # 再问两遍也是同一个，别白打上游。
+                        break
+            except Exception:
+                base = ""
+            if base:
+                break
         with lock:
-            cache[vid] = (base, now)
+            cache[vid] = (base, time.time())
         return base
 
     class H(http.server.BaseHTTPRequestHandler):
