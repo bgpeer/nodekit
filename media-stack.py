@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.126"
+SCRIPT_VERSION = "1.5.127"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5581,11 +5581,27 @@ def do_heal():
             if full:
                 ok("补完了。")
             return                      # 全补齐了
+        _before = len(pend)
         heal_media_info(d, key, budget=(HEAL_BUDGET * 3 if full else None))
         seen += HEAL_LIMIT
-        if not items_without_duration(key):
+        _left = items_without_duration(key)
+        if not _left:
             if full:
                 ok("补完了。")
+            return
+        # 【没有进展就停 —— 这一条不依赖任何判据】在终端下这个循环是 `while full`，
+        # 无条件转到队列空为止。只要判据出一点错（比如把"还原前那一瞬间"当成成功），
+        # 队列就永远不空，而每转一圈都真的从网盘拉一遍文件头 —— 实测一轮 100~270 MB。
+        # 待补数没减少就是【没有进展】，这是比任何判据都硬的证据，当场停。
+        # 任何"转到好为止"的循环都得能证明自己在前进，这个闸本该一开始就有。
+        if len(_left) >= _before:
+            warn(f"这一轮跑完，待补的还是 {len(_left)} 个（跑之前 {_before} 个）"
+                 f"—— 一个都没减少。")
+            print(f"  {DIM}再转下去只是把同一批条目反复从网盘拉一遍，白烧流量。"
+                  f"先停在这儿。{RST}")
+            print(f"  {DIM}常见原因：这批条目探到的轨道存不住（屏上会写"
+                  f"「一还原成路径形式音视频轨就没了」），或者上游一直在限流。"
+                  f"前一种换重试也没用，后一种过几小时自己会好。{RST}")
             return
         # 【歇一下再来】隔太密只会连着撞同一段抽风的线路，还容易被网盘限流
         if not full and time.monotonic() - t0 + HEAL_RETRY_MIN * 60 >= HEAL_BG_BUDGET:
@@ -9637,6 +9653,7 @@ def _heal_one(d, key, _it, base, token):
         return "retry", name, el(), f"网盘没给出文件头（{why}）"
     url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
     mins, streams, probed = 0, False, True
+    streams_hot = False               # 还原【之前】有没有轨道，见下面那一档
     if True:                          # 缩进只是为了让下面这段 try/finally 原样保留
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
@@ -9654,22 +9671,17 @@ def _heal_one(d, key, _it, base, token):
             # （TMDb 给的片长）。拿它当探测结果的话，探测明明失败了也会报"✔ 18 分钟"
             # —— 谎报成功比报失败坏得多：这个条目从此被当成已修好，再也不会重试，
             # 而进度条依然是坏的。判据必须和 items_without_duration 保持一致。
+            # 【这一次读的是"还原之前"的样子】只用来分辨一种情况：探是探到了，
+            # 可一还原成路径形式轨道就没了。那种情况下再探一百遍也是同一个结果，
+            # 属于确定答案，不该进重试名单。真正算数的核对在 finally 之后。
             try:
-                got = _emby(f"/Users/{uid}/Items/{iid}"
-                            f"?Fields=MediaSources,MediaStreams", key, timeout=30)
-                srcs = got.get("MediaSources") or []
-                ticks = (min((s.get("RunTimeTicks") or 0) for s in srcs) if srcs
-                         else (got.get("RunTimeTicks") or 0))
-                mins = ticks / 6e8
-                # 【时长进去了不等于探到了】时长在容器头里，最容易拿到；而客户端要能
-                # 播，靠的是【音视频轨】。上一版只核对时长，一有值就判成功、从重试名单
-                # 里划掉 —— 于是轨道一直是空的，条目却被当成修好了。
-                # 而 items_without_duration 那边（判据已经含轨道）下一轮又把它捞回来，
-                # 两个名单之间来回弹，永远好不了，屏上一路打的还都是「✔ 97 分钟」。
-                streams = ((got.get("MediaStreams") or [])
-                           or any(x.get("MediaStreams") for x in srcs))
+                _hot = _emby(f"/Users/{uid}/Items/{iid}"
+                             f"?Fields=MediaSources,MediaStreams", key, timeout=30)
+                streams_hot = bool((_hot.get("MediaStreams") or [])
+                                   or any(x.get("MediaStreams")
+                                          for x in (_hot.get("MediaSources") or [])))
             except Exception:
-                mins, streams = 0, False
+                streams_hot = False
         finally:
             # 还原必须发生：留在 URL 形式上的话，这个条目的播放就绕过了直链缓存，
             # 每次开播都要现换一次直链（实测 7.5~47 秒）
@@ -9678,8 +9690,33 @@ def _heal_one(d, key, _it, base, token):
                     f.write(original if original.strip().startswith("/") else p)
             except OSError as e:
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
+    # 【核对必须在还原之后】上一版在还原【之前】读，于是判"成功"用的是一个紧接着
+    # 就被撤销的状态：屏上打「✔ 142 分钟」，而 items_without_duration 那边（在还原
+    # 之后看）看见轨道又没了，下一轮原样把它捞回来 —— 同一批条目在两个名单之间
+    # 来回弹，永远好不了，每弹一次真烧一次网盘流量。
+    # 这个函数自己的注释里就写着同一个教训，只是上一版修的是"核对什么"，
+    # 没注意"什么时候核对"。
+    # 代价：每个条目多一次本机 Emby 请求，不碰网盘。
+    try:
+        got = _emby(f"/Users/{uid}/Items/{iid}"
+                    f"?Fields=MediaSources,MediaStreams", key, timeout=30)
+        srcs = got.get("MediaSources") or []
+        ticks = (min((s.get("RunTimeTicks") or 0) for s in srcs) if srcs
+                 else (got.get("RunTimeTicks") or 0))
+        mins = ticks / 6e8
+        streams = bool((got.get("MediaStreams") or [])
+                       or any(x.get("MediaStreams") for x in srcs))
+    except Exception:
+        mins, streams = 0, False
     if mins and streams:
         return "ok", name, el(), f"{mins:.0f} 分钟"
+    if streams_hot and not streams:
+        # 【探到了，可一还原轨道就没了】这是确定答案，不是线路抖 —— 再探一百遍
+        # 还是同一个结果。归 dead（一次就判放弃），别再无限买同一个答案：
+        # 上一版正是在这儿打转，每转一圈真烧一次网盘流量。
+        return ("dead", name, el(),
+                "探到了，但 strm 一还原成路径形式音视频轨就没了 —— "
+                "这套办法对这个条目无效，不是网盘的问题")
     if mins:
         # 【这一种要单独说】时长有、轨道没有 = 探测中途断了（源限流、超时、
         # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
