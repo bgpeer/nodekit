@@ -12,7 +12,7 @@
 # 播放的时候跑这个才有东西看 —— 没在播就什么都查不到。
 set -u
 
-TOOL_VER="2026-09-20a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-20b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -20,10 +20,14 @@ KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
         "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
 [ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（$DIR/mediawarp/config/config.yaml）"; exit 1; }
 
-python3 - "$KEY" <<'PY'
+DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
+[ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
+python3 - "$KEY" "$DIR" "$DATA_ROOT" <<'PY'
 import json, os, sys, urllib.request
 
 KEY = sys.argv[1]
+MS_DIR = sys.argv[2] if len(sys.argv) > 2 else "/opt/media-stack"
+DATA_ROOT = sys.argv[3] if len(sys.argv) > 3 else os.path.join(MS_DIR, "media")
 BASE = "http://127.0.0.1:8096"
 G = "\033[32m"; Y = "\033[33m"; R = "\033[31m"; C = "\033[36m"
 D = "\033[2m";  B = "\033[1m"; X = "\033[0m"
@@ -34,6 +38,61 @@ def api(path):
     u = f"{BASE}{path}{sep}api_key={KEY}"
     with urllib.request.urlopen(u, timeout=30) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def drive_of(item_id):
+    """这个条目落在哪个网盘挂载点上，以及那个盘怎么设的。
+
+    【"哪个盘"是这一屏最要紧的一栏】同一台机器上，夸克走 302 直链、七米蓝走本机
+    代理、115 可能是转码流 —— 它们的快慢、限流、字节走不走 VPS 全都不一样。
+    不说是哪个盘，"有的能播有的不能"这条线索就断在这儿了。
+
+    全是本地只读：条目 → Path → 本地 strm → 网盘路径 → 挂载点 → OpenList 的库。
+    读不出来就返回空，绝不猜。
+    """
+    try:
+        det = (api(f"/Items?Ids={item_id}&Fields=Path").get("Items") or [{}])[0]
+        cp = str(det.get("Path") or "")
+    except Exception:
+        return "", ""
+    if not cp.startswith("/data/strm/"):
+        return "", ""
+    hp = os.path.join(DATA_ROOT, "strm", cp[len("/data/strm/"):])
+    try:
+        line = open(hp, encoding="utf-8", errors="replace").readline().strip()
+    except OSError:
+        return "", ""
+    if not line.startswith("/"):
+        return "", ""
+    mp = "/" + line.lstrip("/").split("/", 1)[0]
+
+    db = os.path.join(MS_DIR, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return mp, ""
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = con.execute("select addition, web_proxy from x_storages "
+                          "where mount_path = ?", (mp,)).fetchone()
+        con.close()
+    except Exception:
+        return mp, ""
+    if not row:
+        return mp, ""
+    try:
+        add = json.loads(row[0] or "{}")
+    except Exception:
+        add = {}
+    # 回源方式：这一项决定字节走不走 VPS，是整屏最要紧的一个字
+    proxy = str(row[1] or "").lower() in ("1", "true")
+    bits = ["本机代理（字节过 VPS）" if proxy else "302 直链（不过 VPS）"]
+    # 画质：转码流在夸克叫 link_method、在 115 叫 use_transcoding_address
+    if str(add.get("link_method") or "") == "streaming" or \
+            str(add.get("use_transcoding_address") or "").lower() in ("true", "1"):
+        bits.append("转码流")
+    elif "link_method" in add or "use_transcoding_address" in add:
+        bits.append("原画直链")
+    return mp, " · ".join(bits)
 
 
 def hms(sec):
@@ -86,12 +145,27 @@ for s in live:
     #   DirectPlay   播放器直接吃原文件 —— 302 之后流量在播放器和网盘之间
     #   DirectStream 只换容器，视频流仍然【经过本机】转手一遍
     #   Transcode    整条视频在本机重编码，最吃 CPU、也最慢
+    # 【先说在哪个盘】这一栏摆在播放方式前面 —— 因为字节走不走 VPS 由它决定，
+    # 而不是由 Emby 报的 PlayMethod 决定。
+    _mp, _how = drive_of(it.get("Id"))
+    if _mp:
+        print(f"  {D}所在网盘   {X}{C}{_mp}{X}"
+              + (f"  {D}（{_how}）{X}" if _how else ""))
+    else:
+        print(f"  {D}所在网盘   读不出来（这个条目不是 strm，或者库里没有那个盘）{X}")
+
     if method == "DirectPlay":
         print(f"  {G}✔ 直接播放{X}（DirectPlay）"
               f"{D} —— 视频没经过这台机器，302 是真生效的{X}")
     elif method == "DirectStream":
+        # 【别说过头】上一版写死"视频流还是经过这台机器"。可 MediaWarp 是在 Emby
+        # 前面把 /Videos/{id}/stream 拦下来直接 302 的 —— Emby 报的 PlayMethod 是
+        # 【它自己的打算】，不等于字节真的从它身上过。真正决定字节走哪的是上面
+        # 那一栏（这个盘的回源方式）：302 直链就不过 VPS，本机代理才过。
         print(f"  {Y}⚠ 直接流{X}（DirectStream）"
-              f"{D} —— 只换了容器，但视频流【还是经过这台机器】转手{X}")
+              f"{D} —— Emby 打算只换容器、不重编码{X}")
+        print(f"  {D}             这是 Emby 的【打算】，不等于字节从它身上过 ——"
+              f"MediaWarp 会在它前面把请求 302 走。字节走哪看上面「所在网盘」那一栏。{X}")
     elif method == "Transcode":
         print(f"  {R}✖ 转码{X}（Transcode）"
               f"{D} —— 这台机器要先从网盘把片子拉下来、转完再发给播放器。"
@@ -137,6 +211,12 @@ for s in live:
             print(f"  {D}平均码率   {X}{C}{bit / 1e6:.1f} Mbps{X}"
                   f"{D}（≈ {bit / 8 / 1024 ** 2:.1f} MB/s，"
                   f"拉不到这个速度就会卡）{X}")
+        else:
+            # 【0 不是码率，是"没探到"】转码流的 MediaSource 本来就没有 size/bitrate。
+            # 印成「0.0 Mbps（拉不到这个速度就会卡）」等于拿一个不存在的数当及格线。
+            print(f"  {D}平均码率   {Y}没探到{X}"
+                  f"{D} —— 转码流的播放列表本来就没有大小和码率这两项，"
+                  f"不是真的 0。这一档判不了「够不够快」。{X}")
 
     pos = (ps.get("PositionTicks") or 0) / 1e7
     if pos:
