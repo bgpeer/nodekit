@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.132"
+SCRIPT_VERSION = "1.5.133"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3142,8 +3142,23 @@ def do_heal_tick():
         save_ms_state(heal_tick_seen=ts)
     # 日志读不到时退回只看 Emby —— 不是无条件跑。否则问不到 docker 的机器会每轮
     # 都去列一次全库，"闸在前面所以几乎没有代价"这个前提就整个作废了。
-    if ts is not None and not moved and not ids:
-        return                            # 两边都说这一轮没人点过播放
+    # 【刚按下播放的那几条排在最前面，而且绕开放弃名单】
+    # 仓库主人：「我的意思是直接在播放的时候能补上」。日志里那几个 id 就是他刚点的
+    # 那几部 —— 这是最新鲜、最强的信号，比一条上周记下的"探了三次没成"有力得多。
+    # 上一版加了更勤快的触发，却没意识到被触发的那个队列【早就把这一条排除了】
+    # （放弃名单在它前面），于是点多少次播放都没用。
+    # 先筛掉已经补齐的：绝大多数条目早就好了，不筛就是每看一集白拉一次文件头。
+    hot = strm_items_need_heal(key, ids or [])
+    if hot:
+        heal_media_info(d, key, budget=max(60, HEAL_TICK_MIN * 60 // 2), items=hot)
+        save_ms_state(heal_tick=int(time.time()))
+        return                            # 这一轮就干这个 —— 队列交给下一轮
+    # 【刚点开的那几条都齐了，而 Emby 那边也没有新的播放完成 → 没有理由列全库】
+    # 这一条是"平时几乎没有代价"的全部依据：连着看片的时候日志里一直有 id，
+    # 要是不看"它们缺不缺"就照跑，等于每 10 分钟列一次全库 —— 而那正是这条轮子
+    # 想省掉的开销。任一边说"不知道"时照旧往下跑（ts 为 None 就走不到这儿）。
+    if ts is not None and not moved:
+        return
     # 【这一轮要有自己的预算】默认预算是 HEAL_BUDGET(600 秒)，而这条 cron 每
     # HEAL_TICK_MIN 分钟就触发一次、timeout 压在下一次触发之前 —— 用默认预算会被
     # 从中间砍掉，而砍掉的那一刻 strm 正可能停在【URL 形式】上（还原写在 finally
@@ -7929,6 +7944,47 @@ def mediawarp_played_ids(minutes):
     if p.returncode != 0 and not txt:
         return None
     return set(re.findall(r"/videos/(\d+)/", txt, re.I))
+
+
+def strm_items_need_heal(key, ids):
+    """这些条目 id 里，还缺媒体信息的那几个 → [(uid, id, 名字, 是不是新片), ...]。
+
+    【非得再筛一道不可】每一次点播放都会被 MediaWarp 记进日志，而库里绝大多数条目
+    早就补齐了。不筛的话，每看一集都要去网盘白拉一次文件头 —— 那正是要避免的事。
+    判据和 items_without_duration 一致：时长和音视频轨，缺一不可。
+
+    【不看点没点开过，也不看放弃名单】能走到这儿，就是因为你【刚按下播放】。
+    那是最新鲜、最强的信号，比一条上周记下的"探了三次没成"有力得多。
+    """
+    out = []
+    if not ids:
+        return out
+    try:
+        users = _emby("/Users", key)
+    except Exception:
+        return out
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return out
+    want = [str(i) for i in ids][:HEAL_BY_NAME_MAX]
+    try:
+        d = _emby(f"/Users/{uid}/Items?Ids={','.join(want)}"
+                  f"&Fields=Path,MediaSources,MediaStreams,DateCreated", key)
+    except Exception:
+        return out
+    for i in d.get("Items") or []:
+        # 只管这个脚本生成的 strm —— 本地文件 Emby 自己就探得到，碰它没意义
+        if not str(i.get("Path") or "").startswith(STRM_PATH):
+            continue
+        srcs = i.get("MediaSources") or []
+        no_dur = (any(not (x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+                  else not (i.get("RunTimeTicks") or 0))
+        no_streams = not ((i.get("MediaStreams") or [])
+                          or any(x.get("MediaStreams") for x in srcs))
+        if no_dur or no_streams:
+            out.append((uid, i.get("Id"), i.get("Name") or "?",
+                        _is_fresh_item(i)))
+    return out
 
 
 def find_strm_items(key, q):
