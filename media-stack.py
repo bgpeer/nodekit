@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.127"
+SCRIPT_VERSION = "1.5.128"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5931,6 +5931,27 @@ def link_ttl_of(d):
     if mins >= 60 and mins % 60 == 0:
         return f"{mins // 60}h", mins
     return f"{mins}m", mins
+
+
+def ttl_squeezed_by(d):
+    """把全局直链缓存压短的是哪几个盘。返回 [(挂载点, 驱动, 直链活几分钟), ...]。
+
+    【为什么要单列出来】link_ttl_of 只给一个数字。人看到"9m"是不知道该找谁的 ——
+    而这件事的修法恰恰是"把某个盘从 Emby 媒体库里拿出来"，不指名道姓那条建议就
+    无从下手。筛法和 link_ttl_of 一致：挂着、【进了 Emby】、而且直链短命。
+    """
+    scanned = read_yaml_all(os.path.join(d, "autofilm", "config", "config.yaml"),
+                            "source_dir") or []
+    out = []
+    for mp, drv, _st, _root, _mode in openlist_storages(d):
+        life = LINK_LIFE_MIN.get(str(drv).lower())
+        if not life or not mp:
+            continue
+        root = mp.rstrip("/")
+        if not any(p == root or p.startswith(root + "/") for p in scanned):
+            continue
+        out.append((mp, str(drv), life))
+    return sorted(out, key=lambda x: x[2])
 
 
 def storage_token_days(d):
@@ -14100,6 +14121,36 @@ def warm_links(d, key, limit=None):
     # 全库扫描的时候再插进去是往拥堵里加车：热出来的多半是超时（白打一轮还占着重试名额），
     # 更糟的是把用户此刻真正想看的那一部挤慢了 —— 实测撞过：同一条路径 20.5 秒，扫描过去之后
     # 立刻再打是 0.4 秒。预热是每小时一轮的锦上添花，让一轮毫无代价。
+    # 【缓存活不到下一轮，预热就是白打接口】预热的全部意义是"提前把直链换好放进
+    # MediaWarp 的缓存，第一次点开不用现换"。而那个缓存的时长（alist_api_ttl）不是
+    # 常数 —— 它按【进了 Emby 的盘】里最短命的那家算（见 link_ttl_of）。阿里的直链
+    # 只活 15 分钟，一旦它进了媒体库，全局就被压到 9 分钟，而这里一小时才跑一轮：
+    # 热完 9 分钟就凉了，剩下 51 分钟照样要现换 —— 命中率不到两成，代价却是每轮
+    # 十几次真实的换直链请求，全打在风控较严的接口上（WARM_GAP 和 AutoFilm 的
+    # wait_time: 0.2 都是为这个留的）。这笔账不划算，整轮不做。
+    # 【这不是报错，是取舍】所以要把是谁压的、怎么换回来一并说清楚。
+    _ttl_txt, _ttl_min = link_ttl_of(d)
+    if _ttl_min < WARM_EVERY_H * 60:
+        _who = ttl_squeezed_by(d)
+        print()
+        info(f"这轮预热跳过 —— 直链缓存只有 {_ttl_txt}，撑不到下一轮"
+             f"（{WARM_EVERY_H} 小时后）")
+        print(f"  {DIM}热完 {_ttl_txt} 就凉了，剩下的时间照样要现换直链。"
+              f"命中率不到两成，代价却是每轮十几次真实的换直链请求，"
+              f"全打在风控较严的网盘接口上 —— 不划算。{RST}")
+        if _who:
+            _mp, _drv, _life = _who[0]
+            print(f"  {DIM}这个值按【进了 Emby 的盘】里最短命的那家算："
+                  f"{_mp}（{_drv}）的直链只活 {_life} 分钟，于是全局被压到 "
+                  f"{_ttl_txt} —— 别的盘（夸克的 auth_key 实测约 30 小时）"
+                  f"本来能撑 {LINK_TTL_H} 小时。{RST}")
+            print(f"  {DIM}代价不只是预热：缓存一过期，再点开同一部片就要重新换一条"
+                  f"直链，而换到的 CDN 节点好不好是随机的 —— "
+                  f"「同一部片早上能播、下午播不了」就是这么来的。{RST}")
+            print(f"  {DIM}要换回来：把 {_mp} 从 Emby 的扫描范围里拿出来"
+                  f"（「4 挂载路径」里改），它在 OpenList 挂载页面照样能用；"
+                  f"改完跑一次「7 更新」重算这个值。{RST}")
+        return 0, 0
     busy = netdisk_load(d, key)
     if busy:
         print()
@@ -14123,10 +14174,15 @@ def warm_links(d, key, limit=None):
     # 靠后的永远轮不到，等于没热。
     cur = int(ms_state().get("warm_cursor") or 0)
     more, nxt, total = rest_items(key, uid, WARM_REST, cur)
-    if total > WARM_ROTATE_MAX:
-        print(f"  {DIM}库里 {total} 部，超过轮转的意义范围（{WARM_ROTATE_MAX} 部）——"
+    # 【门槛要按【实际】缓存时长算，不能写死 2 小时】WARM_ROTATE_MAX 那段的账是
+    # "一圈能不能在缓存过期前跑完"，而缓存时长是按已挂的盘现算的（link_ttl_of）。
+    # 拿写死的 2 小时去算，在被压短的机器上门槛会宽一倍，屏上那句"只能管 2 小时"
+    # 也是错的 —— 上面刚读到的 _ttl_txt 才是真的。
+    _rot_max = WARM_REST * max(1, _ttl_min // (WARM_EVERY_H * 60))
+    if total > _rot_max:
+        print(f"  {DIM}库里 {total} 部，超过轮转的意义范围（{_rot_max} 部）——"
               f"只热「继续观看」和新加的。{RST}")
-        print(f"  {DIM}再多热也是白打网盘接口：热一部只能管 {LINK_TTL_H} 小时，"
+        print(f"  {DIM}再多热也是白打网盘接口：热一部只能管 {_ttl_txt}，"
               f"轮一圈要 {total // max(1, WARM_REST)} 小时，轮回来早凉了。{RST}")
     for it in more:
         if str(it[0]) not in seen:
@@ -15209,6 +15265,25 @@ def do_healthcheck():
             f"刚放过的片子能再放（地址还新），搁一阵子的就不行 —— "
             f"表现正是「刚挂好能放，过一会儿又放不了」",
             f"跑一次「7 更新」，它会按已挂的盘把这个值重算成 {_ttl_want}"))
+    elif _ttl_cur and _ttl_min < LINK_TTL_H * 60:
+        # 【值是对的，但这是个取舍，不是"正常"】上一版在这儿打绿勾，于是没人知道
+        # 夸克的缓存被从 2 小时压到了 9 分钟，更没人知道这个取舍可以换回来。
+        # 代价是实打实的：缓存一过期，再点开同一部片就要重新换一条直链，而换到的
+        # CDN 节点好不好是随机的 ——「同一部片早上能播、下午播不了」就是这么来的。
+        _who = ttl_squeezed_by(d)
+        _mp0 = _who[0][0] if _who else "某个盘"
+        _hc("直链缓存", "warn",
+            f"{YELLOW}{_ttl_cur}{RST}  {DIM}被 {_mp0} 压短了"
+            f"（别的盘本来能撑 {LINK_TTL_H} 小时）{RST}")
+        todo.append((
+            f"直链缓存只有 {_ttl_cur} —— 这个值是对的（缓存不能比直链本身活得长，"
+            f"{_mp0} 的直链只活 {_who[0][2] if _who else '?'} 分钟），但它是【全局】的，"
+            f"把别的盘一起压短了。代价：缓存一过期，再点开同一部片就要重新换一条直链，"
+            f"而换到的 CDN 节点好不好是随机的 ——「同一部片早上能播、下午播不了、"
+            f"别的片还可以」就是这么来的。直链预热也因此对不上节奏，会整轮跳过",
+            f"想换回来：把 {_mp0} 从 Emby 的扫描范围里拿出来（「4 挂载路径」里改），"
+            f"它在 OpenList 挂载页面照样能用；改完跑一次「7 更新」重算。"
+            f"不改也行 —— 那就是接受每 {_ttl_cur} 重抽一次直链"))
     elif _ttl_cur:
         _hc("直链缓存", "ok", f"{_ttl_cur}"
             + (f"  {DIM}按 {'、'.join(_shortest)} 的直链有效期定的{RST}"
