@@ -12,7 +12,7 @@
 # 播放的时候跑这个才有东西看 —— 没在播就什么都查不到。
 set -u
 
-TOOL_VER="2026-08-30c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-20a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -21,7 +21,7 @@ KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
 [ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（$DIR/mediawarp/config/config.yaml）"; exit 1; }
 
 python3 - "$KEY" <<'PY'
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 
 KEY = sys.argv[1]
 BASE = "http://127.0.0.1:8096"
@@ -53,6 +53,21 @@ if not live:
     print(f"  {D}这个脚本要在【正在播放】的时候跑才有东西看 —— "
           f"先在播放器里点开一集，再回来跑一次。{X}")
     sys.exit(0)
+
+# 【先数清楚有几路】"连换几部之后画面出不来"这个症状，唯一要回答的就是这个数。
+# Emby 在你切走的时候不会立刻收掉上一路（客户端得先告诉它，而"直接换下一部"
+# 往往来不及说）。于是连换几部之后机器上同时挂着好几路 —— 屏上会摆出几段
+# 一模一样的输出，而人不会自己去数，也不会意识到"这几段本该只有一段"。
+print()
+if len(live) == 1:
+    print(f"  现在 {B}1 路{X} 在播。")
+else:
+    print(f"  {Y}⚠ 现在有 {B}{len(live)} 路{X}{Y} 同时在播{X}")
+    print(f"  {D}连着换片的时候最容易这样：切走的那一路 Emby 没有立刻收掉。"
+          f"要是它们在转码，几个 ffmpeg 分这台机器那点 CPU，"
+          f"【谁都出不来帧】—— 而每一路都在拉源文件，所以流量很好看。{X}")
+    print(f"  {D}处置：在播放器里退回去把多余的那几路停掉，"
+          f"或者等 Emby 自己回收（通常几分钟）。{X}")
 
 for s in live:
     it = s["NowPlayingItem"]
@@ -127,6 +142,48 @@ for s in live:
     if pos:
         print(f"  {D}已播到     {hms(pos)}"
               + ("   ⏸ 暂停中" if ps.get("IsPaused") else "") + X)
+
+# ---------------------------------------------------------------- 真的有几个在转
+# 【这是"转不动"的硬证据】上面 PlayMethod 说的是 Emby 打算怎么播，这里看的是
+# 机器上真的有几个编码器在跑、一共吃掉多少 CPU。几路同时转的时候，帧率上不去
+# 不是因为哪一路有问题，是因为它们在分同一份 CPU。
+#
+# 【只打进程名和数字，不打命令行】argv 里可能带节点的 UUID / 密码 / reality
+# 私钥（仓库规矩第一条），而这一屏是要截图发人的。
+import subprocess
+try:
+    _ps = subprocess.run(["ps", "-eo", "pcpu,comm"], capture_output=True,
+                         text=True, timeout=15).stdout
+except Exception:
+    _ps = ""
+_cpu, _n = 0.0, 0
+for _ln in _ps.splitlines()[1:]:
+    _f = _ln.split(None, 1)
+    if len(_f) < 2 or "ffmpeg" not in _f[1].lower():
+        continue
+    try:
+        _cpu += float(_f[0])
+    except ValueError:
+        continue
+    _n += 1
+_cores = os.cpu_count() or 1
+print()
+if _n:
+    _sat = _cpu / (_cores * 100.0)
+    col = R if _n > 1 or _sat >= 0.7 else Y
+    print(f"  {col}机器上有 {_n} 个 ffmpeg 在跑{X}"
+          f"  {D}一共吃 {_cpu:.0f}% CPU，这台机器 {_cores} 核"
+          f"（满载算 {_cores * 100}%）{X}")
+    if _n > 1:
+        print(f"  {D}几个一起转就是在分同一份 CPU —— 每一路的帧率都会掉到"
+              f"出不来画面。先把多余的那几路停掉再看。{X}")
+    elif _sat >= 0.7:
+        print(f"  {D}CPU 基本吃满了：这台机器转不动这个片源，"
+              f"调参数救不回来。治法在客户端那头（换个能直解的播放器）。{X}")
+else:
+    print(f"  {D}机器上没有 ffmpeg 在跑 —— 没有人在转码。"
+          f"那「流量在跑却出不来画面」就不是转码造成的，"
+          f"改用 why-stall.sh 查取流那一段。{X}")
 
 print()
 print(f"  {D}这里说的是【怎么播】，不是【快不快】。要量速度用 ali-403.sh；"
