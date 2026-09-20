@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.136"
+SCRIPT_VERSION = "1.5.137"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1516,6 +1516,7 @@ case "${1:-info}" in
   heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
   heal <片名>     只补名字对得上的那几个(不走队列、不查放弃名单)
                   没有时长 = Emby 存不住进度条，这条是"就让这一部先好"
+  heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「6 链路体检」)
@@ -1661,6 +1662,12 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     exec python3 "$S" check ;;
+  heal-log)
+    # 【流水里有片名，所以要 root】Python 那边也再拦一道
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" heal-log "$@" ;;
   heal-reset)
     # 【壳里必须有它】heal 那一档的输出会告诉人"敲 media-stack heal-reset"，
     # 而上一版这个壳的 case 里没有这一条 —— 落进 *) 未知命令。
@@ -3148,6 +3155,10 @@ def do_heal_tick():
     # 上一版加了更勤快的触发，却没意识到被触发的那个队列【早就把这一条排除了】
     # （放弃名单在它前面），于是点多少次播放都没用。
     # 先筛掉已经补齐的：绝大多数条目早就好了，不筛就是每看一集白拉一次文件头。
+    # 【标一下这一轮是谁触发的】小结那行要写进流水，而"看片后"和"整队"是两回事：
+    # 前者是你刚点过播放，后者是例行补积压。混在一起的话，翻流水的人分不出
+    # "它是因为我点了播放才补的"还是"刚好轮到它"。
+    os.environ["MS_HEAL_TICK"] = "1"
     hot = strm_items_need_heal(key, ids or [])
     if hot:
         heal_media_info(d, key, budget=max(60, HEAL_TICK_MIN * 60 // 2), items=hot)
@@ -9614,6 +9625,48 @@ def _host_rx_bytes():
 HEAL_METER_CONTAINERS = ("openlist", "emby")
 
 
+HEAL_LOG = TRAFFIC_DIR + "/heal.log"     # 补时长的流水账，root-only
+HEAL_LOG_KEEP = 2000                     # 保留多少行（约几十天），超了丢最老的
+
+
+def heal_log(lines):
+    """把补时长的流水记下来。一行一个条目 / 一行一轮小结。
+
+    【为什么非有不可】仓库主人：「早上醒了他自己补上了，有没有记录能看到他是怎么
+    补上的」。—— 没有。自动那几轮是 cron 调的，输出整个丢进 /dev/null：什么时候跑的、
+    补了哪几个、走的 m3u8 还是整文件、花了多少，一个字都不剩。他那次是靠条目上
+    "126.1 KB" 这个数字反推出走了 m3u8 的，那是运气不是记录。
+
+    【片名写在这儿，不写进体检】体检的输出是拿来截图发出去的（见 mask_host 那段
+    刚栽过的教训）。片名是安装人的内容，只留在这个 root-only 的文件里；体检那行
+    只报数量和路线，不报名字。
+    """
+    if not lines:
+        return
+    try:
+        os.makedirs(TRAFFIC_DIR, exist_ok=True)
+        old = []
+        if os.path.exists(HEAL_LOG):
+            with open(HEAL_LOG, encoding="utf-8", errors="replace") as f:
+                old = f.read().splitlines()
+        keep = (old + list(lines))[-HEAL_LOG_KEEP:]
+        with open(HEAL_LOG, "w", encoding="utf-8") as f:
+            f.write("\n".join(keep) + "\n")
+        # 【root-only】里面有片名
+        os.chmod(HEAL_LOG, 0o600)
+    except OSError:
+        pass                          # 记不上账不该把补时长本身弄挂
+
+
+def heal_log_tail(n=40):
+    """最近 n 行流水。读不到返回空表 —— 调用方要照实说"读不到"，不许当成"没记录"。"""
+    try:
+        with open(HEAL_LOG, encoding="utf-8", errors="replace") as f:
+            return f.read().splitlines()[-n:]
+    except OSError:
+        return []
+
+
 def _heal_meter():
     """返回 (读数函数, 口径名)：读数函数给出「到此刻为止这几个容器一共收了多少字节」。
 
@@ -9927,6 +9980,23 @@ def heal_media_info(d, key, budget=None, items=None):
         _spent = len(pend) * heal_mb_each()
         _how = "估算"
     heal_budget_spend(_spent, len(pend))
+    # 【小结既进流水也进状态】流水给人翻，状态给体检那一行用 —— 体检不带片名，
+    # 因为那一屏是拿来截图发出去的。
+    _via_n = {}
+    for _ln in heal_log_tail(len(pend)):
+        for _k in ("m3u8", "整文件"):
+            if f"  {_k} " in _ln or f"{_k}  " in _ln:
+                _via_n[_k] = _via_n.get(_k, 0) + 1
+                break
+    _how_run = ("点名" if items is not None
+                else "看片后" if os.environ.get("MS_HEAL_TICK") else "整队")
+    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_run}）："
+              f"{done}/{len(pend)} 个补上，约 {_spent:.0f} MB（{_how}）"
+              + (f"，路线 " + "、".join(f"{k} {v}" for k, v in _via_n.items())
+                 if _via_n else "")])
+    save_ms_state(heal_last={"ts": int(time.time()), "n": len(pend),
+                             "ok": done, "mb": round(_spent, 1), "how": _how_run,
+                             "via": _via_n, "meter": _how})
     _new = set_heal_pace(hit >= HEAL_429_STOP)
     _heal_summary(done, len(pend))
     _left2, _used2 = heal_budget()
@@ -10155,6 +10225,9 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
     done = hit = 0
     over = False
     spent_mb = 0.0            # 刹车那一刻量到的实际花销，只给下面那句提示用
+    # 这一轮的流水，轮末一次性落盘（见 heal_log）。屏上那几行是给【此刻坐在终端前】
+    # 的人看的，而自动那几轮没人看 —— 早上起来想知道"它是怎么补上的"，只能靠这个。
+    logs = []
     # 本轮每个条目的成败，轮末一次性落盘。只记【条目自己的】成败：
     # throttle 是上游在限流、skip 是本地没这个文件，都不是"这个条目探不出来"的证据，
     # 拿它们去累加失败次数会把好条目误判成放弃。
@@ -10184,6 +10257,15 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                 with lock:
                     n += 1
                     idx = n
+                    # 【走的哪条路从 note 里取】_heal_one 把它写进了附言
+                    # （「25 分钟（m3u8）」）。为它改返回值的形状不值得 —— 那个
+                    # 四元组在重试名单、并行回收好几处都按位置用着。
+                    _via = ("m3u8" if "（m3u8）" in (note or "")
+                            else "整文件" if "（整文件）" in (note or "") else "-")
+                    logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                                f"{pad(res, 8)}{pad(_via, 7)}{sec:>4.0f}s  "
+                                f"{(note or '').replace(chr(10), ' ')[:60]}  "
+                                f"{str(name)[:40]}")
                     # 【轮内刹车】每 HEAL_MB_CHECK_EVERY 个量一次。meter 读的是
                     # openlist 的收字节（退化时才是网卡），口径见 _heal_meter。
                     # 【mb_left 要跟 None 比，别写 `and mb_left`】额度正好剩 0
@@ -10253,6 +10335,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
             for f2 in futs:
                 f2.cancel()
     heal_fail_record(fails)
+    heal_log(logs)
     return done, hit, over
 
 
@@ -16482,10 +16565,22 @@ def do_healthcheck():
                 f"没人看片就不跑）")
         else:
             _hm = int((time.time() - _ht) / 60)
+            # 【小结里不带片名】这一屏是拿来截图发出去的（mask_host 那段刚栽过）。
+            # 片名只留在 0600 的流水里，用 media-stack heal-log 看。
+            _hl = ms_state().get("heal_last") or {}
+            _bits = ""
+            if isinstance(_hl, dict) and _hl.get("n"):
+                _via = _hl.get("via") or {}
+                _bits = (f"　{DIM}最近一轮（{_hl.get('how', '?')}）："
+                         f"{_hl.get('ok', 0)}/{_hl.get('n')} 个，"
+                         f"约 {_hl.get('mb', 0):.0f} MB"
+                         + ("，" + "、".join(f"{k} {v}" for k, v in _via.items())
+                            if _via else "") + f"{RST}")
             _hc("补时长（看片后）", "ok",
                 (f"{_hm} 分钟前跑过一轮" if _hm < 120
-                 else f"{_hm // 60} 小时前跑过一轮")
-                + f"{DIM}　（看过片才跑，所以久没跑 = 久没看片，不是故障）{RST}")
+                 else f"{_hm // 60} 小时前跑过一轮") + _bits
+                + f"{DIM}　（看过片才跑，所以久没跑 = 久没看片，不是故障）"
+                  f"　明细：media-stack heal-log{RST}")
     else:
         _hc("补时长（看片后）", "warn",
             "没装 —— 刚看完的那一集要等到下个整点才有进度条")
@@ -16824,6 +16919,28 @@ if __name__ == "__main__":
             # 被探两遍、流量翻倍。抢不到就让位，反正 10 分钟后还有一轮。
             if take_task_lock("heal"):
                 _timed("补时长heal", do_heal_tick)
+        elif arg == "heal-log":           # 翻补时长的流水账
+            require_root()                # 里面有片名，文件是 0600 的
+            _n = 40
+            if len(sys.argv) > 2 and sys.argv[2].isdigit():
+                _n = max(1, min(2000, int(sys.argv[2])))
+            _rows = heal_log_tail(_n)
+            if not _rows:
+                # 【读不到要照实说】"没记录"和"还没记过"是两回事
+                if os.path.exists(HEAL_LOG):
+                    info("流水是空的 —— 装上之后还没补过条目。")
+                else:
+                    info(f"还没有流水（{HEAL_LOG} 不存在）")
+                    print(f"  {DIM}补过一轮之后才会有。想现在就补一个："
+                          f"{BOLD}media-stack heal <片名>{RST}{DIM}。{RST}")
+            else:
+                print(f"\n  {BOLD}补时长流水{RST}  {DIM}最近 {len(_rows)} 行"
+                      f"（{HEAL_LOG}，只有 root 读得到）{RST}")
+                print(f"  {DIM}时间　　　　　　　　结局　　路线　　耗时　说明　　片名{RST}")
+                for _ln in _rows:
+                    print(f"  {_ln}")
+                print(f"  {DIM}路线：m3u8 = 只拉了一份几十 KB 的播放列表；"
+                      f"整文件 = 去拉了原片的文件头（几 MB）。{RST}")
         elif arg == "heal-reset":         # 清空「探不出来」的放弃名单，让它们重新排队
             require_root()
             _n = len(heal_fail_table())
