@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.131"
+SCRIPT_VERSION = "1.5.132"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1514,6 +1514,8 @@ case "${1:-info}" in
   restart [服务]  重启，省略服务名则全部重启
   strm            立刻跑一次 strm 生成并跟日志
   heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
+  heal <片名>     只补名字对得上的那几个(不走队列、不查放弃名单)
+                  没有时长 = Emby 存不住进度条，这条是"就让这一部先好"
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「6 链路体检」)
@@ -1649,7 +1651,10 @@ case "${1:-info}" in
     # 上一次栽在这儿的是 selfupdate，见上面那段注释。
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
-    exec python3 "$S" heal ;;
+    # 【参数要透传】`media-stack heal 仙逆` 只补那一部 —— 不透传的话壳会把片名
+    # 悄悄吃掉，变成整队跑，而那正是用户想避开的（流量）。
+    shift || true
+    exec python3 "$S" heal "$@" ;;
   check|doctor|healthcheck)
     # 【一路都在让人"跑 6 链路体检"，而命令行敲不到】Python 那边
     # `elif arg in ("check", "doctor", "healthcheck")` 早就有，壳里一直没有。
@@ -5624,8 +5629,14 @@ def migrate_strm_layout(d, key, wait=True):
     return n
 
 
-def do_heal():
-    """补时长：一轮一轮走，中间歇几分钟。
+def do_heal(q=None):
+    """补时长：一轮一轮走，中间歇几分钟。给了 q 就【只补名字对得上的那几个】。
+
+    【为什么要有"点名补一部"这条路】仓库主人：「就是点这个影片让他就有播放进度
+    记忆，现在不能让他整天的全量探测这样太耗流量了」。在这之前，想补某一部的人
+    只能敲 `media-stack heal`，而那会去跑整个队列 —— 两个要求（只补这一部、
+    别全量探）一个都满足不了。
+    点名这条路还【绕开放弃名单】：他指名要补，就是"现在再试一次"的意思。
 
     单独一个子命令而不是塞进 warm，是因为触发时机不同：warm 是每小时的例行，这个是
     【用户刚扫完盘】那一下 —— 那时候新条目最多、最需要赶紧补上。
@@ -5646,6 +5657,50 @@ def do_heal():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
     if not key:
+        return
+    if q:
+        # ---- 点名补这一部 ----
+        hit = find_strm_items(key, q)
+        if not hit:
+            _all = items_without_duration(key, scope="all")
+            warn(f"strm 媒体库里没有名字带「{q}」的条目。")
+            print(f"  {DIM}填的是 Emby 里显示的那个名字吗？集号也行，"
+                  f"比如「第159集」。{RST}")
+            if _all:
+                print(f"  {DIM}还没探到媒体信息的有 {len(_all)} 个，头几个叫："
+                      f"{'、'.join(str(x[2])[:18] for x in _all[:3])}{RST}")
+            return
+        if len(hit) > HEAL_BY_NAME_MAX:
+            warn(f"名字带「{q}」的有 {len(hit)} 个，太多了 —— 一次补这么多"
+                 f"跟全量探没区别。")
+            print(f"  {DIM}写具体一点（加集号），或者直接敲 media-stack heal "
+                  f"让它按队列慢慢补。{RST}")
+            print(f"  {DIM}前几个：{'、'.join(str(x[2])[:18] for x in hit[:5])}{RST}")
+            return
+        print()
+        info(f"点名补 {BOLD}{len(hit)}{RST} 个条目"
+             f"{DIM}（不走队列、不查放弃名单）{RST}")
+        for _u, _i, _n, _f in hit:
+            print(f"  {DIM}·{RST} {str(_n)[:40]}")
+        print(f"  {DIM}每个要从网盘拉一段文件头，几 MB 起步。{RST}")
+        heal_media_info(d, key, budget=HEAL_BUDGET * 3, items=hit)
+        # 【补完当场核对，别让人再去 Emby 里刷一遍】这一条的全部意义就是
+        # "我点名要的这个到底好了没有"，答不上来等于没做。
+        print()
+        _left = {str(x[1]) for x in items_without_duration(key, scope="all")}
+        _bad = [n for _u, i, n, _f in hit if str(i) in _left]
+        if not _bad:
+            ok("这几个的媒体信息都齐了 —— 回 Emby 里点开就有进度条了。")
+            print(f"  {DIM}补上之前已经丢掉的那些进度回不来，从这次起才记得住。{RST}")
+        else:
+            warn(f"还有 {len(_bad)} 个没补上："
+                 f"{'、'.join(str(x)[:18] for x in _bad[:5])}")
+            print(f"  {DIM}上面每个条目那一行写了是哪一档失败的。"
+                  f"「只探到时长」和「一还原就没了」是两回事：前者过一阵再试往往就成，"
+                  f"后者这套办法对它无效。{RST}")
+            print(f"  {DIM}整条链通不通用 {BOLD}bash cant-play.sh {q}{RST}"
+                  f"{DIM} 查；为什么没有进度条用 "
+                  f"{BOLD}sudo bash no-resume.sh {q}{RST}{DIM} 查。{RST}")
         return
     full = has_tty()
     if full:
@@ -7876,6 +7931,41 @@ def mediawarp_played_ids(minutes):
     return set(re.findall(r"/videos/(\d+)/", txt, re.I))
 
 
+def find_strm_items(key, q):
+    """在 strm 媒体库里按片名找条目 → [(uid, id, 名字, 是不是新片), ...]。
+
+    【和 items_without_duration 的筛法不一样，这是故意的】那边只给"没时长 + 你点开
+    过"的；这边是用户【点名】要补的，所以不看有没有时长、也不看点没点开过 ——
+    他说补这一部，就补这一部。
+    """
+    out = []
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return out
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return out
+    ql = str(q or "").lower()
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not is_strm_lib(lb):
+            continue
+        try:
+            d = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video"
+                      f"&Fields=Path,MediaSources,MediaStreams,DateCreated", key)
+        except Exception:
+            continue
+        for i in d.get("Items") or []:
+            if (ql in str(i.get("Name") or "").lower()
+                    or ql in str(i.get("Path") or "").lower()):
+                out.append((uid, i.get("Id"), i.get("Name") or "?",
+                            _is_fresh_item(i)))
+    return out
+
+
 def last_played_ts(key):
     """库里最近一次播放发生在什么时候（unix 秒）。【问不出来返回 None】。
 
@@ -9337,6 +9427,9 @@ HEAL_MB_EACH = 18
 # _heal_meter：pid 开轮时解析一次，之后纯文件读），比一次探测便宜好几个数量级。
 # 既然如此就没有理由攒着查 —— 每探完一个就结一次账。
 HEAL_MB_CHECK_EVERY = 1
+# 【点名补一部：一次最多几个】写"仙逆"能匹配一百多集，那跟全量探没区别，而这条路
+# 的全部卖点就是"只补这一部"。超了就让人写具体点，或者去走队列那条。
+HEAL_BY_NAME_MAX = 8
 HEAL_GIVEUP = 3          # 连续探失败几次就放弃
 HEAL_GIVEUP_DAYS = 30    # 第一次放弃后隔这么多天再给一次机会（万一网盘/格式那边修好了）
 # 【再试的间隔要越来越长，不能永远 30 天】固定 30 天的话，一个【永远探不出来】的库
@@ -9592,7 +9685,7 @@ def heal_fail_record(results):
             tab.pop(k, None)
     save_ms_state(heal_fail=tab)
 
-def heal_media_info(d, key, budget=None):
+def heal_media_info(d, key, budget=None, items=None):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
     Emby 拿不到时长时续播逻辑整个失效 —— 它按时长的百分比判断存不存续播点，分母为 0 就
@@ -9613,14 +9706,19 @@ def heal_media_info(d, key, budget=None):
     第 ④ 步不会把时长弄丢，靠的是一个实测过的行为：Emby 对【已经存在的条目】不会重新
     探测。媒体信息已经在它的数据库里，跟 strm 里写什么再无关系。
     """
-    allpend = items_without_duration(key)
+    # 【点名补这几个】items 给了就只探这几个：不走队列、不轮转、【不查放弃名单】。
+    # 用户指名要补的条目，意思就是"现在给我再试一次" —— 还去查放弃名单等于答非所问。
+    # 而"这一条被记进放弃名单了"恰恰是最常见的那种卡住：自动那条轮子从此绕着它走，
+    # 屏上一个字都不说，人只能一遍遍点播放然后纳闷。
+    allpend = list(items) if items is not None else items_without_duration(key)
     if not allpend:
         return
     _raw_pend = len(allpend)             # 真实待探数（含已放弃的），给每日增减用
     # 【放弃过的不再探】见 HEAL_GIVEUP 那段：探不出来的无限重试就是白烧流量。
     # 只在 heal 这里滤掉，体检那边照旧报真实待探数 —— 那是给人看的诊断，不该被藏起来。
     _tab, _now = heal_fail_table(), time.time()
-    _keep = [x for x in allpend if not heal_given_up(_tab, x[1], _now)]
+    _keep = ([x for x in allpend if not heal_given_up(_tab, x[1], _now)]
+             if items is None else list(allpend))
     if len(_keep) < len(allpend):
         # 【天数要按真实的退避算，别写死第一档】退避是翻倍的（30→60→120→240→360），
         # 写死 HEAL_GIVEUP_DAYS 的话，一个被放弃过四次的条目屏上说 30 天、实际 240 天
@@ -9651,35 +9749,40 @@ def heal_media_info(d, key, budget=None):
     # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
     # 条目怎么探都探不出来（网盘上是残缺文件、格式 Emby 不认），每轮都从头取
     # 的话它们会把名额永远占死，后面的条目一辈子轮不到。
-    cur = int(ms_state().get("heal_cursor") or 0)
-    # 【取多少要先夹到总数】不夹的话 (allpend+allpend) 在待探数少于 HEAL_LIMIT 时
-    # 会把同一批切出来两遍 —— 7 个待探切成 14 个，每个条目探两次、流量翻倍。
-    # 而这一步的全部意义就是省流量。
-    # 【配额是上一轮的遭遇定的】上一轮撞了限流，这一轮就自动砍半 —— 见 heal_pace。
-    # 不夹到总数的话 (allpend+allpend) 在待探数少于一批时会把同一批切两遍。
+    # 【_pace 要在分支外面取】下面收尾那段会拿它和这一轮的新配额比大小。定义在
+    # "整队跑"那一支里的话，点名那条路跑到收尾就是 UnboundLocalError ——
+    # 而那条路正是为"就让这一部先好"准备的，炸在最后一行等于白跑一趟。
     _pace = heal_pace()
-    take = min(max(HEAL_LIMIT, len(allpend) // 8), _pace, len(allpend))
-    # 【再按今天剩下的额度夹一刀】不夹的话最后一轮会一次性冲过头——
-    # 一批 300 个 × 约 7 MB = 2 GB，等于把上限当摆设。
-    _cap = max(1, int(_left / heal_mb_each()))
-    if _cap < take:
-        take = _cap
-    # 【新片插队，但只占一半名额】刚扫进来的条目在 Emby 里是 0B / 0bps，时长为 0，
-    # 于是进度条记不住 —— 而那正是用户此刻最想看的那一部。让它跟三个月前就在队里的
-    # 老片按同一个顺序排，是把优先级排反了。
-    # 【不能全给新的】一次扫进来几百个新片的话，老积压就永远轮不到 —— 而现在正积着
-    # 两千多个。一半一半：新片当轮就补上，老队也不饿死。
-    fresh = [x for x in allpend if len(x) > 3 and x[3]]
-    rest = [x for x in allpend if not (len(x) > 3 and x[3])]
-    head = fresh[:max(1, take // 2)] if fresh else []
-    need = take - len(head)
-    if rest and need > 0:
-        cur = cur % len(rest)
-        head += (rest + rest)[cur:cur + need]
-        save_ms_state(heal_cursor=(cur + need) % len(rest))
-    elif fresh:
-        head = fresh[:take]              # 全是新片，那就全探新片
-    pend = head
+    if items is not None:
+        # 点名的那几个全补，不切片不轮转 —— 一共就几个，切了反而要跑好几趟
+        pend = allpend
+    else:
+        cur = int(ms_state().get("heal_cursor") or 0)
+        # 【取多少要先夹到总数】不夹的话 (allpend+allpend) 在待探数少于 HEAL_LIMIT 时
+        # 会把同一批切出来两遍 —— 7 个待探切成 14 个，每个条目探两次、流量翻倍。
+        # 而这一步的全部意义就是省流量。
+        # 【配额是上一轮的遭遇定的】上一轮撞了限流，这一轮就自动砍半 —— 见 heal_pace。
+        take = min(max(HEAL_LIMIT, len(allpend) // 8), _pace, len(allpend))
+        # 【再按今天剩下的额度夹一刀】不夹的话最后一轮会一次性冲过头——
+        # 一批 300 个 × 约 7 MB = 2 GB，等于把上限当摆设。
+        _cap = max(1, int(_left / heal_mb_each()))
+        if _cap < take:
+            take = _cap
+        # 【新片插队，但只占一半名额】刚扫进来的条目在 Emby 里是 0B / 0bps，时长为 0，
+        # 于是进度条记不住 —— 而那正是用户此刻最想看的那一部。让它跟三个月前就在队里的
+        # 老片按同一个顺序排，是把优先级排反了。
+        # 【不能全给新的】一次扫进来几百个新片的话，老积压就永远轮不到。
+        fresh = [x for x in allpend if len(x) > 3 and x[3]]
+        rest = [x for x in allpend if not (len(x) > 3 and x[3])]
+        head = fresh[:max(1, take // 2)] if fresh else []
+        need = take - len(head)
+        if rest and need > 0:
+            cur = cur % len(rest)
+            head += (rest + rest)[cur:cur + need]
+            save_ms_state(heal_cursor=(cur + need) % len(rest))
+        elif fresh:
+            head = fresh[:take]              # 全是新片，那就全探新片
+        pend = head
     print()
     if len(allpend) > len(pend):
         info(f"给 {len(pend)} 个条目补媒体信息（时长、编码）"
@@ -16539,9 +16642,11 @@ if __name__ == "__main__":
             traffic_report(sys.argv[2] if len(sys.argv) > 2 else None)
         elif arg == "heal":               # 「4」扔后台的补时长；手动敲也走这条
             require_root()
+            # 【带片名就只补那一部】media-stack heal 仙逆 —— 见 do_heal 的说明
+            _q = sys.argv[2] if len(sys.argv) > 2 else None
             if take_task_lock("heal"):
                 # heal 自己拿网卡差实测过这一轮花了多少，比格子准 —— 带进备注里
-                _timed("补时长heal", do_heal,
+                _timed("补时长heal", lambda: do_heal(_q),
                        note=lambda: f"（自测 {(ms_state().get('heal_day') or {}).get('mb', 0):.0f} MB/天累计）")
             elif has_tty():
                 # 【抢不到锁要说话】原来是一声不吭直接退出 —— 用户敲完命令屏幕上
