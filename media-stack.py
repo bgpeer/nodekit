@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.130"
+SCRIPT_VERSION = "1.5.131"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3123,12 +3123,22 @@ def do_heal_tick():
                            "auth")
     if not key:
         return
+    # 【两个信号，任一说"有人点过播放"就跑】
+    #   · MediaWarp 日志里最近有没有播放请求 —— 最硬：那是请求本身，按下播放那一刻
+    #     就有，不依赖 Emby 里哪个字段什么时候更新
+    #   · Emby 的"最近一次播放"时间戳 —— 兜底：容器刚重启、日志被清空时还有它
+    # 【只有两边都明确说"没有"才跳过】任一边说"不知道"就照常跑。
+    # 多跑一轮不亏：队列空的时候 heal_media_info 自己就立刻返回了。
+    ids = mediawarp_played_ids(HEAL_TICK_MIN + 2)
     ts = last_played_ts(key)
+    water = float(ms_state().get("heal_tick_seen") or 0)
+    moved = ts is not None and ts > water
     if ts is not None:
-        water = float(ms_state().get("heal_tick_seen") or 0)
-        if ts <= water:
-            return                        # 上一轮之后没人看过片，什么都不做
         save_ms_state(heal_tick_seen=ts)
+    # 日志读不到时退回只看 Emby —— 不是无条件跑。否则问不到 docker 的机器会每轮
+    # 都去列一次全库，"闸在前面所以几乎没有代价"这个前提就整个作废了。
+    if ts is not None and not moved and not ids:
+        return                            # 两边都说这一轮没人点过播放
     # 【这一轮要有自己的预算】默认预算是 HEAL_BUDGET(600 秒)，而这条 cron 每
     # HEAL_TICK_MIN 分钟就触发一次、timeout 压在下一次触发之前 —— 用默认预算会被
     # 从中间砍掉，而砍掉的那一刻 strm 正可能停在【URL 形式】上（还原写在 finally
@@ -7840,6 +7850,30 @@ def _item_created_ts(i):
         return time.mktime(time.strptime(v, "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return 0
+
+
+def mediawarp_played_ids(minutes):
+    """最近这些分钟里，MediaWarp 上有播放请求的条目 id。【读不到返回 None】。
+
+    【这是"点开播放"最直接的证据】MediaWarp 是 Emby 的前置反代，每一次点播放都要
+    经它换直链 —— 日志里就带着条目 id。它是【请求本身】，按下播放那一刻就有，
+    不依赖 Emby 里哪个字段什么时候更新（UserData 的时间戳是开播时更新还是停止时
+    更新，各版本不一样，这边核对不了）。
+
+    【None 是"不知道"，不是"没人播过"】两种情况都会走到这里：这台机器上问不到
+    docker；以及容器刚重启过、日志本来就是空的。后一种今天刚在 cant-play.sh 的
+    (7) 那儿栽过一次 —— 把空日志当成"请求没发生"，接着让人去改客户端地址。
+    """
+    try:
+        p = subprocess.run(
+            ["docker", "logs", "--since", f"{int(minutes)}m", "mediawarp"],
+            capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    txt = (p.stdout or "") + (p.stderr or "")
+    if p.returncode != 0 and not txt:
+        return None
+    return set(re.findall(r"/videos/(\d+)/", txt, re.I))
 
 
 def last_played_ts(key):
