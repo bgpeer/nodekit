@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-07a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-20a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -45,6 +45,7 @@ TTL="$(sed -nE 's/^[[:space:]]*alist_api_ttl:[[:space:]]*"?([^"[:space:]#]+).*/\
 [ -n "$TTL" ] || TTL="一小会儿"
 
 export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N" MS_TTL="$TTL"
+export MS_DIR="$DIR"
 python3 - <<'PY'
 import json, os, re, subprocess, time, urllib.error, urllib.parse, urllib.request
 
@@ -54,6 +55,7 @@ OL   = "http://127.0.0.1:5244"
 KEY  = os.environ["MS_KEY"]
 OLPW = os.environ.get("MS_OLPW") or ""
 DATA_ROOT = os.environ["MS_DATA_ROOT"].rstrip("/")
+MS_DIR = (os.environ.get("MS_DIR") or "/opt/media-stack").rstrip("/")
 Q = os.environ["MS_Q"]
 TTL = os.environ.get("MS_TTL") or "一小会儿"
 G="\033[32m"; Y="\033[33m"; R="\033[31m"; D="\033[2m"; B="\033[1m"; C="\033[36m"; X="\033[0m"
@@ -491,6 +493,45 @@ else:
                 print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，本地那条 strm 会被清掉{X}")
         raise SystemExit
 
+def drive_setting(mount):
+    """这个盘在 OpenList 里设的：回源方式、画质。读不出来就返回空，绝不猜。
+
+    【为什么 ④ 非要知道这个】④ 已经认得出 MediaWarp 这一刻给的是整文件还是
+    HLS 分片流，可"给的是什么"只有和"设的是什么"摆在一起才有意义：
+    设成转码流却给了整文件，说明网盘那边对这个文件【没有转码版本】，回落成了
+    原画 —— 同一个盘里有转码版本的（多数剧集）和没有的（很多电影）走的是
+    两条不同的路，而这正是"剧集正常、电影有的能播有的不能"的形状。
+    """
+    db = os.path.join(MS_DIR, "openlist", "config", "data.db")
+    if not os.path.exists(db):
+        return "", ""
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = con.execute("select addition, web_proxy from x_storages "
+                          "where mount_path = ?", (mount,)).fetchone()
+        con.close()
+    except Exception:
+        return "", ""
+    if not row:
+        return "", ""
+    try:
+        add = json.loads(row[0] or "{}")
+    except Exception:
+        add = {}
+    proxy = "本机代理（字节过 VPS）" if str(row[1] or "").lower() in ("1", "true") \
+        else "302 直链（不过 VPS）"
+    # 转码流这件事在夸克叫 link_method=streaming，在 115 叫 use_transcoding_address
+    if (str(add.get("link_method") or "") == "streaming"
+            or str(add.get("use_transcoding_address") or "").lower() in ("true", "1")):
+        q = "转码流"
+    elif "link_method" in add or "use_transcoding_address" in add:
+        q = "原画直链"
+    else:
+        q = ""
+    return proxy, q
+
+
 # ================= ④ MediaWarp 换不换直链 =================
 print()
 print(f"  {B}④ MediaWarp 换不换直链（302）{X}")
@@ -526,6 +567,29 @@ if not loc:
 host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
 kind = "HLS 分片流" if ".m3u8" in loc.lower() else "整文件"
 print(f"  {G}✔ 302{X}  {D}{el:.1f} 秒{X}  →  {C}{host}{X}  {D}{kind}{X}")
+
+# 【设的是什么 vs 这一刻给的是什么】单看"给的是整文件"说明不了什么，跟盘的设置
+# 一对才有话讲。设成转码流却给了整文件 —— 那是网盘对这个文件没有转码版本、
+# 回落成了原画，而同一个盘里有转码版本的（多数剧集）走的是另一条路。
+# 【只摆事实】对不上时把两种可能都列出来，不替人挑一种。
+_mount = "/" + body.lstrip("/").split("/", 1)[0]
+_proxy, _qual = drive_setting(_mount)
+if _proxy:
+    print(f"  {D}这个盘（{_mount}）设的是　{C}{_proxy}"
+          + (f" · {_qual}" if _qual else "") + f"{X}")
+if _qual == "转码流" and kind == "整文件":
+    print(f"  {Y}⚠ 设的是转码流，这一刻给的却是整文件{X}")
+    print(f"  {D}两种可能，这个脚本分不出来，但都值得知道：{X}")
+    print(f"  {D}  · 网盘那边对【这个文件】没有转码版本，于是回落成原画 ——"
+          f"同一个盘里，有转码版本的（多数剧集）和没有的（很多电影）走的是"
+          f"两条路，这正是「剧集正常、电影有的能播有的不能」的形状；{X}")
+    print(f"  {D}  · 或者这个设置刚改过还没生效（已缓存的直链最多 {TTL} 后换过来，"
+          f"等不及就 docker restart mediawarp）。{X}")
+    print(f"  {D}要紧的是：走整文件这一路，下面 ⑥ 那一步（从文件中间要数据）"
+          f"就成了能不能播的关键；走分片流则完全不需要它。{X}")
+elif _qual == "原画直链" and kind == "HLS 分片流":
+    print(f"  {Y}⚠ 设的是原画直链，这一刻给的却是 HLS 分片流{X}"
+          f"  {D}设置多半刚改过还没铺开{X}")
 
 # 【302 成功 ≠ 播得了】302 到一个【只有容器里解析得了】的名字，对播放器就是死路：
 # 手机、电视报 "Name or service not known"，客户端上只有一句 load fail。
@@ -622,6 +686,38 @@ try:
                   f"{el2:.1f} 秒{X}")
             if good:
                 print(f"  {G}✔ 服务器认 Range{X}  {D}从哪儿要就从哪儿给{X}")
+                # 【这个数字本来被埋了】上一版把 el2 塞在 206 后面一个不起眼的
+                # 括号里，紧跟着就打绿勾 —— 而实测见过 64 KiB 要 91.5 秒（≈5.7
+                # kbps），同一分钟从【开头】拉却有 9.3 Mbps。这是整屏最响的一个数。
+                # "认不认 Range"和"这个位置给不给得动"是两件事，绿勾只回答了前一件。
+                _kb = n2 * 8 / el2 / 1e3 if el2 > 0 else 0
+                if el2 >= 5:
+                    print(f"  {R}✖ 可是这 {n2 // 1024} KiB 要了 {el2:.1f} 秒{X}"
+                          f"  {D}≈ {_kb:.1f} kbps{X}")
+                    if mbps:
+                        # 【对照才是证据】单独一个"91.5 秒"说明不了什么，
+                        # 跟同一分钟、同一条链的开头速度摆在一起才成立。
+                        print(f"  {D}同一条链、同一分钟，从【开头】拉是 "
+                              f"{mbps:.1f} Mbps —— 差了 {mbps * 1e3 / max(_kb, 0.01):.0f} 倍。"
+                              f"不是链坏了，是【挪到文件中间就几乎不动】。{X}")
+                    print(f"  {B}这一条就足以让它点开播不出来{X}"
+                          f"{D} —— mp4 的索引（moov）很多时候在文件【尾部】，"
+                          f"播放器开播、Emby 探编码，第一件事都是去读文件尾，"
+                          f"正好撞在这上面。① 那句「还没探到媒体流」和这一行"
+                          f"多半是同一件事。{X}")
+                    print(f"  {D}也解释了「早上还能播、下午就不行，别的片还可以」："
+                          f"直链有缓存期（这台机器 {TTL}），过期换一条新的，"
+                          f"落到哪个 CDN 节点由网盘那边定。文件没变、设置没变，"
+                          f"变的是这一刻给你的那条链 —— 是运气，不是配置。{X}")
+                    print(f"  {B}当场能试的{X}{D}：docker restart mediawarp 丢掉缓存的"
+                          f"直链，再点一次。换条链就能播 = 坐实了是这个。{X}")
+                    print(f"  {D}老碰上就换条路：这个盘改「转码流」（分片是一个个"
+                          f"独立的小文件，从头拉到尾，根本不用 seek 文件中段），"
+                          f"或者回源方式改「本机代理」（VPS 顺序拉一遍再喂给播放器，"
+                          f"代价是吃 VPS 带宽）。{X}")
+                elif el2 >= 1.5:
+                    print(f"  {Y}这 {n2 // 1024} KiB 要了 {el2:.1f} 秒{X}"
+                          f"  {D}≈ {_kb:.1f} kbps —— 偏慢，开播那几下会明显等一下{X}")
                 # 【能 seek ≠ 拖过去能看】上面只要了 64 KiB，那点数据任何服务器
                 # 都给得起。而"拖了之后卡住 / 跳回开头"是【供不上数据】：播放器
                 # seek 完要立刻填满缓冲，填不上就放弃重来。所以还得从同一个位置
