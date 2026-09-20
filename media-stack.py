@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.135"
+SCRIPT_VERSION = "1.5.136"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -14971,6 +14971,37 @@ def _is_internal_host(host):
             or _is_private_ip(bare))
 
 
+def mask_host(u):
+    """把地址里的域名打码：https://list.llj.xxx → https://list.<你的域名>。
+
+    【体检的输出是会被截图发出去的】这个文件里好几处注释都写着这句（
+    openlist_storages、tune_strm_libraries 都为它删过东西），可「换直链」和
+    「MediaWarp→OpenList」这两行偏偏把安装人的【真实域名】原样印了出来 ——
+    而仓库规矩第一条排在功能前面。实测就是这么撞上的：仓库主人把体检输出发过来
+    对问题，域名就跟着一起出去了。
+
+    子域标签（list / emby / home）是脚本自己定的常量，不是隐私，留着能看出是哪个
+    服务；后面那截才是。
+
+    【内网名和 IP 照原样留着】它们不是安装人信息，而且一打码就看不出"它落在内网"
+    这个关键结论 —— 那正是这两行要判的东西。
+    """
+    if not u:
+        return u
+    try:
+        sp = urllib.parse.urlsplit(u if "//" in u else "//" + u)
+        host = sp.hostname or ""
+        port = f":{sp.port}" if sp.port else ""
+    except ValueError:
+        return "<地址>"
+    if not host or _is_internal_host(host):
+        return u
+    scheme = f"{sp.scheme}://" if sp.scheme else ""
+    parts = host.split(".")
+    head = f"{parts[0]}." if len(parts) > 2 else ""
+    return f"{scheme}{head}<你的域名>{port}"
+
+
 def public_visitors(limit=20000):
     """从媒体服务自己那份 nginx 访问日志里，统计非内网来源的 IP。
 
@@ -15550,13 +15581,13 @@ def do_healthcheck():
                         urllib.parse.urlsplit(_mw_addr).netloc or _mw_addr):
                     _hc(label, "ok", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
                                      f"{DIM}（体检是从本机问的所以回本机地址；"
-                                     f"MediaWarp 走 {_mw_addr}，302 出去的是对外地址）{RST}")
+                                     f"MediaWarp 走 {mask_host(_mw_addr)}，302 出去的是对外地址）{RST}")
                 else:
                     _hc(label, "bad", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
                                       f"{RED}本机地址，外网放不了{RST}")
                     todo.append((
                         f"{mount} 是代理型存储（WebDAV、本地目录），OpenList 只能回自己的"
-                        f"地址；而 MediaWarp 现在用 {_mw_addr or '内网地址'} 去问它，"
+                        f"地址；而 MediaWarp 现在用 {mask_host(_mw_addr) or '内网地址'} 去问它，"
                         f"于是 302 出去的是容器内网名，手机电视解析不了",
                         "跑一次「7 更新」：它会把 MediaWarp 问 OpenList 的地址改成对外地址"
                         "（探不通会自动退回，不会把别的盘搞坏）"))
@@ -15608,12 +15639,12 @@ def do_healthcheck():
         pass                      # 没有代理型的盘，这一项与它无关，不占屏
     elif _mw_addr.rstrip("/") == _want_addr and _want_addr:
         _hc("MediaWarp→OpenList", "ok",
-            f"{_mw_addr}{DIM}（代理型的盘发得出对外地址）{RST}")
+            f"{mask_host(_mw_addr)}{DIM}（代理型的盘发得出对外地址）{RST}")
     else:
         _hc("MediaWarp→OpenList", "bad",
-            f"{_mw_addr or '?'}  {YELLOW}内网地址 —— "
+            f"{mask_host(_mw_addr) or '?'}  {YELLOW}内网地址 —— "
             f"{'、'.join(_proxy_drives[:2])} 这类盘的 302 播放器连不上{RST}")
-        todo.append((f"MediaWarp 用 {_mw_addr or '内网地址'} 去问 OpenList，"
+        todo.append((f"MediaWarp 用 {mask_host(_mw_addr) or '内网地址'} 去问 OpenList，"
                      f"而 {'、'.join(_proxy_drives[:2])} 是代理型存储（WebDAV 源、"
                      f"本地目录）—— 它们在网盘侧没有 CDN 直链，OpenList 只能回自己的"
                      f"地址，而那个地址是按请求里的 Host 拼的，于是 302 出去的是容器"
