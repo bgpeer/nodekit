@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.128"
+SCRIPT_VERSION = "1.5.129"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10404,8 +10404,13 @@ def do_strm(only=None):
     # 里，那条每小时都跑，不管这批 strm 是谁生成的。）
     # wait=False：下面紧跟着就是全库扫描，等的是同一件事，白等一次 15 分钟
     migrate_strm_layout(d, key, wait=False)
+    # 【收尾之后再数一次】这份才是最终的：AutoFilm 生成、压原盘、清失效、挪布局
+    # 全都做完了。半程那行「本地 strm：2725 → 2759」数的是 AutoFilm 刚扫完那一刻，
+    # 而清失效在它之后才跑 —— 拿那个数报净变化会对不上。
+    # 【放在 if key 外面】没有 Emby API Key 的机器同样要看到这一行，它甚至更需要：
+    # 那种机器得自己去 Emby 后台点扫描，不知道新增了多少就无从判断扫完对不对。
+    snap1 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, only)}
     if key:
-        snap1 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, only)}
         diff = ([(p, "Created") for p in sorted(snap1 - snap0) if p]
                 + [(p, "Deleted") for p in sorted(snap0 - snap1) if p])
         # 变动少就只报这几条（几秒）。多了、没变动、或者这条路没走通，都退回全库扫描 ——
@@ -10462,6 +10467,28 @@ def do_strm(only=None):
           f"不限制能刮哪国的片子，随时能在 Emby 里改。{RST}")
     print(f"  {DIM}·{RST} 片子文件名要像 {BOLD}流浪地球 (2019).mkv{RST}"
           f"{DIM} —— 带发布组标记的（[BT]xxx.1080p.WEB-DL-YYY）Emby 解析不出片名{RST}")
+
+    # 【这一趟的结论放在最后】半程那行「本地 strm：2725 → 2759」打完之后还有清失效、
+    # 通知 Emby、建库、一整屏建库说明，等跑完早滚上去了 —— 人翻回去找不到，等于没有。
+    # 用的是 snap0 / snap1：开工前和全部收尾之后的两份清单，减出来才是真的净变化。
+    print()
+    _add, _del = len(snap1 - snap0), len(snap0 - snap1)
+    _scope = f"{DIM}（只算 {only} 这个盘）{RST}" if only else ""
+    if _add or _del:
+        _bits = ([f"{BOLD}新增 {_add} 个{RST}"] if _add else []) + \
+                ([f"{BOLD}清掉 {_del} 个{RST}"] if _del else [])
+        ok(f"这一轮：{'、'.join(_bits)}{DIM}，本地现在一共 {len(snap1)} 个{RST}"
+           + _scope)
+        # 【别让人把"个"当成"部"】剧集是一集一个文件，一部 20 集的剧就是 20 个。
+        # 不说清的话，"新增 34 个"会被当成"新增了 34 部片子"。
+        print(f"  {DIM}数的是 strm 文件 —— 剧集是一集一个，不是一部一个。{RST}")
+        if _del:
+            print(f"  {DIM}清掉的是网盘里已经删了或改过名的那些。留着的话 Emby 里"
+                  f"会是同一部片两个条目，其中一个点不开。{RST}")
+    else:
+        # 【"没有变化"也要说】他这次就是 0，而屏上什么都不打，反而让人以为哪里没跑到。
+        ok(f"这一轮没有新增，也没有清掉{DIM} —— 本地还是 {len(snap1)} 个 strm，"
+           f"网盘那边没有新片、也没有删掉的{RST}" + _scope)
 
 
 def write_secret(path, key, value):
