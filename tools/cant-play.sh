@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-20a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-20b"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -47,7 +47,7 @@ TTL="$(sed -nE 's/^[[:space:]]*alist_api_ttl:[[:space:]]*"?([^"[:space:]#]+).*/\
 export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N" MS_TTL="$TTL"
 export MS_DIR="$DIR"
 python3 - <<'PY'
-import json, os, re, subprocess, time, urllib.error, urllib.parse, urllib.request
+import datetime, json, os, re, subprocess, time, urllib.error, urllib.parse, urllib.request
 
 EMBY = "http://127.0.0.1:8096"
 MW   = "http://127.0.0.1:9000"
@@ -595,8 +595,13 @@ elif _qual == "原画直链" and kind == "HLS 分片流":
 # 手机、电视报 "Name or service not known"，客户端上只有一句 load fail。
 # 而这一整条链每一步都是"成功"的 —— 这就是它极难自己看出来的原因。
 bare = host.split(":")[0]
-if (bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
-        or bare.startswith(("127.", "172.1", "172.2", "172.3", "10.", "192.168."))):
+# 【这条链到底过不过 VPS】⑤⑥ 慢下来的时候，这两种盘要给的是完全相反的解释，
+# 而判据就在这一行。上一版 ⑤ 不看这个，一慢就无条件念"代理型存储的视频全程经过
+# 你的 VPS"，还叫人"把大码率的片子放夸克" —— 而屏上三行之前 ③ 刚印过这条直链
+# 指的就是夸克的 CDN。判据现成在手里，只是没拿来用。
+via_vps = (bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
+           or bare.startswith(("127.", "172.1", "172.2", "172.3", "10.", "192.168.")))
+if via_vps:
     print()
     print(f"  {R}✖ 302 指向的是内网地址，播放器根本连不上{X}  {D}{host}{X}")
     print(f"  {D}这是代理型存储（WebDAV 源、本地目录）特有的：它们在网盘侧没有 CDN"
@@ -649,11 +654,22 @@ try:
     else:
         print(f"  {R}✖ 不够：这部片要 {need:.1f} Mbps，实测只有 {mbps:.1f}{X}")
         print(f"  {D}能开播，但会边放边等 —— 拖进度条之后尤其明显。{X}")
-        print(f"  {D}代理型存储（WebDAV 源）的视频【全程经过你的 VPS】，"
-              f"所以这里量到的就是 VPS 到上游那台服务器的速度，"
-              f"换播放器、改 Emby 设置都改不了它。{X}")
-        print(f"  {D}要么把大码率的片子放夸克/阿里（那些是 302 直连网盘 CDN，"
-              f"不吃 VPS 带宽），要么接受这个源只适合放码率低的片子。{X}")
+        # 【这两种盘慢的原因完全不同，说错了会让人去改一套本来没病的配置】
+        if via_vps:
+            print(f"  {D}代理型存储（WebDAV 源）的视频【全程经过你的 VPS】，"
+                  f"所以这里量到的就是 VPS 到上游那台服务器的速度，"
+                  f"换播放器、改 Emby 设置都改不了它。{X}")
+            print(f"  {D}要么把大码率的片子放夸克/阿里（那些是 302 直连网盘 CDN，"
+                  f"不吃 VPS 带宽），要么接受这个源只适合放码率低的片子。{X}")
+        else:
+            print(f"  {D}这条是 302 直连网盘 CDN（{host}），字节【不过你的 VPS】——"
+                  f"这里量到的是这台机器到网盘 CDN 的速度。VPS 的带宽、Emby 的设置"
+                  f"都碰不到它。{X}")
+            print(f"  {D}网盘 CDN 的直链是一条一条发的，每条落到哪个节点由网盘那边定，"
+                  f"快慢可以差很多倍。也就是说这个数字【是这一条链此刻的样子】，"
+                  f"不是这个盘的水平。{X}")
+            print(f"  {B}换条链再量一次{X}{D}：docker restart mediawarp 丢掉缓存的直链，"
+                  f"再跑一遍这个脚本。两次数字差很多 = 就是在碰运气，不是配置问题。{X}")
 
     # ---------- ⑥ 拖进度条（从文件中间要一段）----------
     # 【这一步和上面那步不是一回事】上面拉的是【开头】，服务器就算完全不认 Range、
@@ -748,6 +764,29 @@ try:
                         print(f"  {D}这正是「一拖就卡住 / 跳回从头播」的原因："
                               f"播放器 seek 完要立刻填满缓冲，填不上就放弃重来。"
                               f"服务器是认 Range 的（上面刚验过），纯粹是慢。{X}")
+                    # 【⑤ 和 ⑥ 差得离谱的时候，别让人自己猜信哪个】
+                    # 实测同一部片两次跑出来是反的：一次开头 9.32 Mbps、中段 0.2；
+                    # 另一次开头 0.21 Mbps、中段 7.1。相隔几秒，差几十倍。
+                    # 不是哪一次测错了 ——【这条链的速度本身在剧烈波动】。
+                    # 而这正是"同一部片早上能播下午不能、别的片还可以"的机理：
+                    # 能不能播，看你点播放那一刻它正好在哪个状态。
+                    if mbps and m3 and max(mbps, m3) >= min(mbps, m3) * 3:
+                        print()
+                        print(f"  {Y}⚠ 这两个数字对不上：⑤ 从开头拉是 {mbps:.2f} Mbps，"
+                              f"这里持续拉是 {m3:.1f} Mbps{X}"
+                              f"  {D}差 {max(mbps, m3) / max(min(mbps, m3), 0.01):.0f} 倍{X}")
+                        print(f"  {D}两次测量只隔了几秒，所以不是哪一次测错了 ——"
+                              f"【这条链的速度本身在剧烈波动】。{X}")
+                        print(f"  {B}这就是「同一部片早上能播、下午播不了，别的片还可以」{X}"
+                              f"{D}：能不能播，看你点播放那一刻它正好在哪个状态。"
+                              f"文件、设置都没变，变的是运气。{X}")
+                        if not via_vps:
+                            print(f"  {D}这个盘是 302 直连网盘 CDN，这条链由网盘那边发，"
+                                  f"这台机器上没有哪个设置管得着它的快慢。"
+                                  f"能做的只有换一条（docker restart mediawarp），"
+                                  f"或者让字节改走本机代理 —— VPS 顺序拉一遍再喂给"
+                                  f"播放器，能抹掉一部分抖动，但上游这一刻就是慢的话，"
+                                  f"谁也救不了。{X}")
                 except Exception as e3:
                     print(f"  {Y}持续拉的时候断了：{safe(e3)}{X}")
                     print(f"  {D}拖过去之后连不稳 —— 表现就是一拖就卡。{X}")
@@ -817,6 +856,36 @@ except urllib.error.HTTPError as e:
               f"（4 挂载路径 → 选那个盘 → 2 直链方式）。{X}")
 except Exception as e:
     print(f"  {R}✖ 拉不动：{safe(e)}{X}")
+def mw_uptime():
+    """MediaWarp 容器跑了多少秒。读不到返回 None —— 【读不到就是不知道，不是 0】。
+
+    【(7) 非问这一句不可】容器一重启，日志就从头开始，重启【之前】的播放记录全都
+    不在了。上一版把"日志里没有"当成"请求没发生"，接着让人去改客户端的服务器地址
+    —— 而实测正是在 docker restart mediawarp 三分钟后跑的，片子那会儿已经能播了。
+    把"不知道"当成"知道"，还给出了能把好配置改坏的建议。
+    """
+    try:
+        p = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.StartedAt}}", "mediawarp"],
+            capture_output=True, text=True, timeout=20)
+        t = (p.stdout or "").strip()
+    except Exception:
+        return None
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", t)
+    if not m:
+        return None
+    try:
+        started = datetime.datetime.strptime(
+            m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
+
+
+# 日志里找不到记录时，多久算"刚重启过、这一段说明不了任何事"
+MW_FRESH = 900
+
+
 # ================= (7) 真实播放那一刻发生了什么 =================
 # 【前面六段测的都是脚本自己造的请求】它们全通，只证明"这条路走得通"，不证明
 # "Emby 客户端走的是这条路"。而最常见的那个死因恰恰不在这六段里：Emby 判定客户端
@@ -843,11 +912,28 @@ else:
     OKC = ("200", "204", "206", "302", "304")
     TRANS = re.compile(r"master\.m3u8|main\.m3u8|hls", re.I)
     if not rows:
-        print(f"  {Y}日志里没有这个条目的任何播放请求{X}")
-        print(f"  {D}也就是说：你点播放的时候，请求【根本没到 MediaWarp】。{X}")
-        print(f"  {D}最常见的原因是客户端连的不是 MediaWarp —— 直连 Emby 的 8096 "
-              f"会绕过 302 拦截。客户端里填的服务器地址应该是 https://emby.<你的域名>。{X}")
-        print(f"  {D}（也可能只是你还没点过播放。点一次再跑这个脚本。）{X}")
+        _up = mw_uptime()
+        if _up is not None and _up < MW_FRESH:
+            # 【刚重启过 = 这一段什么都证明不了】而不是"请求没到"。
+            # 这一屏上面几步刚教人敲 docker restart mediawarp 去换直链，
+            # 于是这一段几乎必然撞上自己造出来的空日志。
+            print(f"  {Y}日志里没有这个条目的播放请求 —— 但 MediaWarp 是 "
+                  f"{_up / 60:.0f} 分钟前才重启的{X}")
+            print(f"  {D}容器一重启，日志就从头开始：重启【之前】的播放记录全都不在了。"
+                  f"所以这一段现在什么都证明不了 ——【不是】「请求没到 MediaWarp」。{X}")
+            print(f"  {D}（上面几步刚建议过 docker restart mediawarp 去换直链，"
+                  f"那之后跑到这儿必定是这个样子。）{X}")
+            print(f"  {B}要看这一段{X}{D}：现在去点一次播放，再跑一遍这个脚本。{X}")
+        else:
+            print(f"  {Y}日志里没有这个条目的任何播放请求{X}")
+            print(f"  {D}也就是说：你点播放的时候，请求【根本没到 MediaWarp】。{X}")
+            print(f"  {D}最常见的原因是客户端连的不是 MediaWarp —— 直连 Emby 的 8096 "
+                  f"会绕过 302 拦截。客户端里填的服务器地址应该是 https://emby.<你的域名>。{X}")
+            print(f"  {D}（也可能只是你还没点过播放。点一次再跑这个脚本。）{X}")
+            if _up is None:
+                # 【读不到就说读不到】别让人以为上面那个结论是核对过容器状态的
+                print(f"  {D}（问不到 MediaWarp 容器的启动时间，所以没法排除"
+                      f"「刚重启过、日志被清空」这一种。）{X}")
     else:
         print(f"  {D}最近 {min(len(rows), 6)} 条（时间 | 状态 | 走哪条路）：{X}")
         for ts, code, path, tail in rows[-6:]:
