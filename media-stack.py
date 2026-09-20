@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.134"
+SCRIPT_VERSION = "1.5.135"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9610,27 +9610,51 @@ def _host_rx_bytes():
         return None
     return tot
 
-def _heal_meter():
-    """返回 (读数函数, 口径名)：读数函数给出「到此刻为止拉了多少字节」。
+# 补时长的字节可能落在这两个容器里的任何一个，见 _heal_meter
+HEAL_METER_CONTAINERS = ("openlist", "emby")
 
-       优先用 openlist 容器自己的收字节。heal 的开销实质就是 openlist 替 ffprobe
-       去网盘拉文件头，这个口径最贴近真相。
+
+def _heal_meter():
+    """返回 (读数函数, 口径名)：读数函数给出「到此刻为止这几个容器一共收了多少字节」。
+
+       【openlist 和 emby 两个都要数】heal 的开销以前全落在 openlist 身上 —— 它替
+       ffprobe 去网盘拉文件头。自从补时长会先试转码流的 m3u8，ffprobe 拿到的是网盘
+       CDN 的地址，【字节直接进 emby 容器】，openlist 一个字节都不过。只数 openlist
+       的话，屏上报"这轮花了 0 MB"，而每日上限也就永远填不满 —— 那道刹车等于没有。
+
+       实测就是这么撞上的：同一条路连探三集，两次报「约 0 MB」。
+       0 是"量不到"，不是"没花" —— 这个坑这仓库踩过太多次了。
 
        【为什么不直接用物理网卡】网卡是全机的，会把【同一时段你在用代理】的流量也
        算进来。以前只在轮末结账，算多了顶多是账面虚高；现在要拿它当【刹车】，算多了
        就是你一看片 heal 就被判定超额、当场停工，积压永远补不完。
 
-       pid 在开轮时解析一次，之后每次只读一个 /proc 文件，几乎不花时间。
-       解析不到（没装 docker、容器没起）就退回网卡 —— 有个粗的刹车也好过没有。"""
-    try:
-        pid = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", "openlist"],
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+       pid 在开轮时解析一次，之后每次只读几个 /proc 文件，几乎不花时间。
+       一个都解析不到（没装 docker、容器没起）才退回网卡 —— 有个粗的刹车也好过没有。
+       中途某个容器重启会让它的计数归零，那时 _rx1 < _rx0，调用方自己会退回估算。"""
+    paths, names = [], []
+    for c in HEAL_METER_CONTAINERS:
+        try:
+            pid = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", c],
+                                 capture_output=True, text=True,
+                                 timeout=10).stdout.strip()
+        except Exception:
+            continue
         if pid and pid != "0":
-            path = f"/proc/{pid}/net/dev"
-            if _netdev_first(path):
-                return (lambda: (_netdev_first(path) or [None])[0]), "openlist"
-    except Exception:
-        pass
+            p = f"/proc/{pid}/net/dev"
+            if _netdev_first(p):
+                paths.append(p)
+                names.append(c)
+    if paths:
+        def _sum(_ps=tuple(paths)):
+            tot = 0
+            for p in _ps:
+                v = (_netdev_first(p) or [None])[0]
+                if v is None:
+                    return None      # 【读不到就说读不到】别把缺的那份当成 0
+                tot += v
+            return tot
+        return _sum, "+".join(names)
     return _host_rx_bytes, "网卡"
 
 def heal_mb_each():
@@ -10017,7 +10041,9 @@ def _heal_one(d, key, _it, base, token):
     # 【退回那一档必须留着】不是每个盘、每个文件都有转码版本（夸克对很多电影就
     # 没有，会回落成原画）；m3u8 那条探不出来时照旧走原来的路，行为不退步。
     _routes = []
-    _m3u8 = hls_probe_url(iid, key)
+    # 【留个开关是为了能做对照】m3u8 到底省不省流量，只有同一批条目两条路各跑一遍
+    # 才说得清。没有开关就没法把新路关掉，也就永远只能拿"感觉"下结论。
+    _m3u8 = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
     if _m3u8:
         _routes.append(("m3u8", _m3u8))
     _routes.append(("整文件", url))
