@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.129"
+SCRIPT_VERSION = "1.5.130"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1677,6 +1677,7 @@ SYNC_CRON      = "/etc/cron.d/media-stack-sync"
 WARM_CRON      = "/etc/cron.d/media-stack-warm"
 SELFUP_CRON    = "/etc/cron.d/media-stack-selfupdate"
 TRAFFIC_CRON   = "/etc/cron.d/media-stack-traffic"
+HEAL_CRON      = "/etc/cron.d/media-stack-heal"
 
 # ---- 全天流量账本 ----
 # 为什么非得常驻记账：临时采样（traffic-where.sh 第①栏）只能看见【运行那一刻】在跑的
@@ -1750,6 +1751,13 @@ KEEPALIVE_MIN  = 60
 #   timeout    卡死的那个自己会被杀掉。只有 flock 的话，第一个吊死之后锁永远不放，
 #              从"叠罗汉"换成"全停摆"，一样糟
 HEAL_BG_BUDGET_T = 1800 + 600   # do_heal 的预算 + 余量，见 CRON_TIMEOUT["heal"]
+# 【刚被点开过 = 这一条马上就要用到进度条】而补时长挂在每小时那条 cron 上，
+# 于是刚看完的一集最多要等一小时才补上 —— 这一小时里每看一集都在丢进度。
+# 所以另起一条轻量轮：每这么多分钟看一眼"有没有人看过片"，有才跑一轮 heal。
+# 闸在前面，没人看片时的代价就是一个小查询（见 do_heal_tick）。
+# 【定义在这儿而不是跟别的 HEAL_* 放一起】下面那张 CRON_TIMEOUT 在 import 时就求值，
+# 而别的 HEAL_* 在文件更下方 —— 放错地方就是 import 直接 NameError。
+HEAL_TICK_MIN  = 10
 CRON_LOCK_DIR  = "/run/lock"
 # 超时都压在【下一次触发之前】：宁可这轮少做点，也不能和下一轮撞上。
 # 三条任务本身都是幂等 + 带预算的，砍掉的部分下一轮会接着做。
@@ -1760,6 +1768,9 @@ CRON_TIMEOUT   = {
     # 后台补时长。比自己的预算多留一截 —— timeout 是防吊死的最后一道，
     # 不该在任务正常收尾之前把它砍了
     "heal":      HEAL_BG_BUDGET_T,
+    # 轻量轮：没人看片时就是一个小查询，有人看片时跑一轮 heal（HEAL_BUDGET 管住）。
+    # 压在下一次触发之前 —— 宁可这轮少做点，也不能和下一轮叠起来。
+    "heal-tick": HEAL_TICK_MIN * 60 - 60,
     "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
     "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
     # 只读 /proc + 每个容器两条 docker 命令，几十毫秒的事；给 60 秒够宽了
@@ -2588,6 +2599,31 @@ def do_precache():
     reload_storages(d, mounts)
 
 
+def install_heal_cron(install_dir):
+    """装「有人看过片就补时长」的轻量轮。见 do_heal_tick。
+
+    和预热那条分开，因为要的节奏完全不同：预热是每小时一次的锦上添花，这条是
+    "刚看完的那一集别等一小时"。合在一起就得把整条每小时的活也跑六遍。
+    """
+    try:
+        txt = (f"# media-stack 每 {HEAL_TICK_MIN} 分钟看一眼：有人看过片就补一轮\n"
+               f"# 条目的媒体信息（时长/音视频轨）。没有时长 = Emby 存不住续播点，\n"
+               f"# 一停止播放直接判「已看完」。挂在每小时那条上的话，刚看完的一集\n"
+               f"# 最多要等一小时才有进度条。\n"
+               f"# 没人看片时这一轮就是一个小查询，看到水位没动就立刻退出。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"*/{HEAL_TICK_MIN} * * * * root {cron_cmd('heal-tick')} "
+               ">/dev/null 2>&1\n")
+        with open(HEAL_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(HEAL_CRON, 0o644)
+        return True
+    except OSError as e:
+        warn(f"装补时长定时任务失败（不影响使用）：{e}")
+        return False
+
+
 def install_warm_cron(install_dir):
     """装定时预热。
 
@@ -3064,6 +3100,44 @@ def do_warm():
             json.dump({"ts": int(time.time())}, f)
     except OSError:
         pass
+
+
+def do_heal_tick():
+    """每 HEAL_TICK_MIN 分钟一次：有人看过片才补一轮时长。安静跑。
+
+    【为什么要这一条】补时长本来挂在每小时那条上，于是刚看完的一集最多要等一小时
+    才有进度条 —— 而这一小时里每看一集都在丢进度。"刚被点开过"恰恰是"这一条马上
+    就要用到进度条"最强的信号，最不该等。
+
+    【闸在前面，所以平时几乎没有代价】先问一句"最近一次播放是什么时候"（一个条目
+    的小查询），不比上次记下的水位新就立刻返回。真正贵的那一步（列全库、拉文件头）
+    只在有人看过片之后才发生。
+
+    【问不出来要照常跑】见 last_played_ts：把查询失败当成"没人播过"就是让补时长
+    静默停摆。宁可多跑一轮 —— 队列空的时候 heal_media_info 自己就立刻返回了。
+    """
+    d = ms_install_dir()
+    if not is_installed(d):
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
+                           "auth")
+    if not key:
+        return
+    ts = last_played_ts(key)
+    if ts is not None:
+        water = float(ms_state().get("heal_tick_seen") or 0)
+        if ts <= water:
+            return                        # 上一轮之后没人看过片，什么都不做
+        save_ms_state(heal_tick_seen=ts)
+    # 【这一轮要有自己的预算】默认预算是 HEAL_BUDGET(600 秒)，而这条 cron 每
+    # HEAL_TICK_MIN 分钟就触发一次、timeout 压在下一次触发之前 —— 用默认预算会被
+    # 从中间砍掉，而砍掉的那一刻 strm 正可能停在【URL 形式】上（还原写在 finally
+    # 里，SIGTERM 不走 finally）。留在磁盘上的 URL 形式 strm 会让 MediaWarp 认不出，
+    # 表现是"挂载能播、Emby 一直转圈"。所以这一轮只领半程的预算，跑不完的下一轮接着。
+    heal_media_info(d, key, budget=max(60, HEAL_TICK_MIN * 60 // 2))
+    # 【跑完留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"——
+    # 这台机器上已经栽过一次：三条任务全被锁死，而体检那行一直是绿的。
+    save_ms_state(heal_tick=int(time.time()))
 
 
 def follow_new_storages(d):
@@ -6687,6 +6761,7 @@ def do_update(from_menu=False):
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
+    install_heal_cron(d)      # 「有人看过片就补时长」的轻量轮，见 do_heal_tick
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
@@ -6800,7 +6875,8 @@ def do_uninstall():
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
-              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, TRAFFIC_CRON):
+              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, TRAFFIC_CRON,
+              HEAL_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -7035,6 +7111,7 @@ DOMAIN={cfg['domain']}
     install_keepalive(cfg["install_dir"])
     install_sync_cron(cfg["install_dir"])
     install_warm_cron(cfg["install_dir"])
+    install_heal_cron(cfg["install_dir"])
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
@@ -7763,6 +7840,43 @@ def _item_created_ts(i):
         return time.mktime(time.strptime(v, "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return 0
+
+
+def last_played_ts(key):
+    """库里最近一次播放发生在什么时候（unix 秒）。【问不出来返回 None】。
+
+    【None 是"不知道"，不是"没人播过"】调用方必须按"照常跑一轮"处理。把查询失败
+    当成"没人播过"就等于让补时长静默停摆 —— 这一轮反复在修的正是这种"把不知道
+    当成没有"。
+
+    只取一个条目：按播放时间倒序拿第一条，问的是 Emby 自己的库，一个字节都不出境。
+    """
+    try:
+        users = _emby("/Users", key) or []
+    except Exception:
+        return None
+    best, asked = 0.0, False
+    for u in users:
+        uid = (u or {}).get("Id") or ""
+        if not uid:
+            continue
+        try:
+            d = _emby(f"/Users/{uid}/Items?Recursive=true&Limit=1"
+                      f"&SortBy=DatePlayed&SortOrder=Descending&Filters=IsPlayed"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=UserData", key)
+        except Exception:
+            continue                      # 这个号问不到，换下一个
+        asked = True
+        for i in (d.get("Items") or []):
+            v = str(((i.get("UserData") or {}).get("LastPlayedDate")) or "")[:19]
+            if not v:
+                continue
+            try:
+                best = max(best, time.mktime(time.strptime(v, "%Y-%m-%dT%H:%M:%S")))
+            except ValueError:
+                continue
+    # 【一个号都没问成 = 不知道】；问成了但一条都没有 = 真的没人播过（0）
+    return best if asked else None
 
 
 def items_without_duration(key, scope=None):
@@ -16057,6 +16171,28 @@ def do_healthcheck():
         todo.append(("流量账本定时任务没装，事后查不了「谁在什么时刻吃了流量」",
                      "跑一次「7 更新」会自动补上"))
 
+    # 【装了但从没跑成 和 刚装上 长得一样，但都不能打绿勾】这台机器上栽过一次：
+    # 三条任务全被锁死，而体检那几行一直绿着。
+    if os.path.exists(HEAL_CRON):
+        _ht = int(ms_state().get("heal_tick") or 0)
+        if not _ht:
+            _hc("补时长（看片后）", "skip",
+                f"已装，还没跑过（每 {HEAL_TICK_MIN} 分钟看一眼，"
+                f"没人看片就不跑）")
+        else:
+            _hm = int((time.time() - _ht) / 60)
+            _hc("补时长（看片后）", "ok",
+                (f"{_hm} 分钟前跑过一轮" if _hm < 120
+                 else f"{_hm // 60} 小时前跑过一轮")
+                + f"{DIM}　（看过片才跑，所以久没跑 = 久没看片，不是故障）{RST}")
+    else:
+        _hc("补时长（看片后）", "warn",
+            "没装 —— 刚看完的那一集要等到下个整点才有进度条")
+        todo.append((
+            "「看过片就补时长」那条定时任务没装 —— 补时长只剩每小时那一轮，"
+            "刚看完的一集最多要等一小时才有进度条，这一小时里每看一集都在丢进度",
+            "跑一次「7 更新」会自动补上"))
+
     if os.path.exists(WARM_CRON):
         wm = warm_state(d)
         if not wm:
@@ -16379,6 +16515,12 @@ if __name__ == "__main__":
                 warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
                 print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
                       f"把那一轮停掉。{RST}")
+        elif arg == "heal-tick":          # cron 每 10 分钟调的：有人看过片才补一轮
+            require_root()
+            # 【和 heal 共用一把锁】两边干的是同一件事，叠起来就是同一批条目
+            # 被探两遍、流量翻倍。抢不到就让位，反正 10 分钟后还有一轮。
+            if take_task_lock("heal"):
+                _timed("补时长heal", do_heal_tick)
         elif arg == "heal-reset":         # 清空「探不出来」的放弃名单，让它们重新排队
             require_root()
             _n = len(heal_fail_table())
