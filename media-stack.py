@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.137"
+SCRIPT_VERSION = "1.5.139"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1516,6 +1516,8 @@ case "${1:-info}" in
   heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
   heal <片名>     只补名字对得上的那几个(不走队列、不查放弃名单)
                   没有时长 = Emby 存不住进度条，这条是"就让这一部先好"
+  heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
+                  想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
@@ -1662,6 +1664,12 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     exec python3 "$S" check ;;
+  heal-tick)
+    # 【这一档本来只给 cron】但"要验证自动那条路，就得能手动触发自动那条路"——
+    # heal <片名> 走的是【点名】那条，证明不了"点播放→自动补"这条链。
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" heal-tick ;;
   heal-log)
     # 【流水里有片名，所以要 root】Python 那边也再拦一道
     S=/etc/bgpeer/media-stack.py
@@ -1769,7 +1777,17 @@ HEAL_BG_BUDGET_T = 1800 + 600   # do_heal 的预算 + 余量，见 CRON_TIMEOUT[
 # 闸在前面，没人看片时的代价就是一个小查询（见 do_heal_tick）。
 # 【定义在这儿而不是跟别的 HEAL_* 放一起】下面那张 CRON_TIMEOUT 在 import 时就求值，
 # 而别的 HEAL_* 在文件更下方 —— 放错地方就是 import 直接 NameError。
-HEAL_TICK_MIN  = 10
+HEAL_TICK_MIN  = 1
+# 【一轮能干多久，跟"多久看一眼"是两件事】以前把 timeout 压在下一次触发之前，
+# 那是靠"间隔 > 一轮的活"成立的；间隔压到 1 分钟之后这个前提没了 —— 一个条目光探测
+# 就要 20 秒左右，硬压就会把正常的一轮从中间砍掉，而砍掉的那一刻 strm 可能正停在
+# 【URL 形式】上（还原写在 finally 里，SIGTERM 不走 finally）。
+# 叠加已经由 take_task_lock("heal") 挡住了：上一轮还在跑，这一轮直接让位。
+# 所以 timeout 只剩"防吊死"这一个用途，给足即可。
+HEAL_TICK_BUDGET = 150
+# 【整队那条仍按老节奏】看一眼从 10 分钟压到 1 分钟，压的是"刚点开的那一部"那条路；
+# 列全库、按游标轮转的那条没必要跟着快十倍 —— 那条本来就是补积压的。
+HEAL_QUEUE_MIN = 10
 CRON_LOCK_DIR  = "/run/lock"
 # 超时都压在【下一次触发之前】：宁可这轮少做点，也不能和下一轮撞上。
 # 三条任务本身都是幂等 + 带预算的，砍掉的部分下一轮会接着做。
@@ -1780,9 +1798,10 @@ CRON_TIMEOUT   = {
     # 后台补时长。比自己的预算多留一截 —— timeout 是防吊死的最后一道，
     # 不该在任务正常收尾之前把它砍了
     "heal":      HEAL_BG_BUDGET_T,
-    # 轻量轮：没人看片时就是一个小查询，有人看片时跑一轮 heal（HEAL_BUDGET 管住）。
-    # 压在下一次触发之前 —— 宁可这轮少做点，也不能和下一轮叠起来。
-    "heal-tick": HEAL_TICK_MIN * 60 - 60,
+    # 轻量轮：没人看片时几乎零开销，有人看片时跑一轮 heal（HEAL_TICK_BUDGET 管住）。
+    # 【不压在下一次触发之前】间隔只有 1 分钟，而一个条目探测就要 20 秒 —— 压了就是
+    # 把正常的一轮砍断。叠加由 take_task_lock 挡，这里只防吊死，给足余量。
+    "heal-tick": HEAL_TICK_BUDGET + 90,
     "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
     "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
     # 只读 /proc + 每个容器两条 docker 命令，几十毫秒的事；给 60 秒够宽了
@@ -2622,7 +2641,7 @@ def install_heal_cron(install_dir):
                f"# 条目的媒体信息（时长/音视频轨）。没有时长 = Emby 存不住续播点，\n"
                f"# 一停止播放直接判「已看完」。挂在每小时那条上的话，刚看完的一集\n"
                f"# 最多要等一小时才有进度条。\n"
-               f"# 没人看片时这一轮就是一个小查询，看到水位没动就立刻退出。\n"
+               f"# 没人看片时这一轮几乎没开销（看一眼日志有没有长），立刻退出。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
                f"*/{HEAL_TICK_MIN} * * * * root {cron_cmd('heal-tick')} "
@@ -3121,19 +3140,25 @@ def do_heal_tick():
     才有进度条 —— 而这一小时里每看一集都在丢进度。"刚被点开过"恰恰是"这一条马上
     就要用到进度条"最强的信号，最不该等。
 
-    【闸在前面，所以平时几乎没有代价】先问一句"最近一次播放是什么时候"（一个条目
-    的小查询），不比上次记下的水位新就立刻返回。真正贵的那一步（列全库、拉文件头）
-    只在有人看过片之后才发生。
+    【闸在前面，所以平时几乎没有代价】先看一眼 nginx 那份访问日志有没有长
+    （一次 stat + 只读新增的那几行），再问一句"最近一次播放是什么时候"。两边都说
+    没有就立刻返回。真正贵的那一步（列全库、拉文件头）只在有人看过片之后才发生。
 
     【问不出来要照常跑】见 last_played_ts：把查询失败当成"没人播过"就是让补时长
     静默停摆。宁可多跑一轮 —— 队列空的时候 heal_media_info 自己就立刻返回了。
     """
+    # 【手动敲的时候必须说话】这条路平时是 cron 调的，静默是对的；可人手动敲它
+    # （想立刻验一次"点播放→自动补"那条链）时，静默返回就是"敲了没反应"——
+    # 分不出"跳过了"还是"跑了但没东西补"。这一轮反复在修的就是这种沉默。
+    _say = info if has_tty() else (lambda *_a, **_k: None)
     d = ms_install_dir()
     if not is_installed(d):
+        _say("还没安装。")
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
     if not key:
+        _say("没有 Emby API Key（「3 后补参数」里填）。")
         return
     # 【两个信号，任一说"有人点过播放"就跑】
     #   · MediaWarp 日志里最近有没有播放请求 —— 最硬：那是请求本身，按下播放那一刻
@@ -3141,7 +3166,12 @@ def do_heal_tick():
     #   · Emby 的"最近一次播放"时间戳 —— 兜底：容器刚重启、日志被清空时还有它
     # 【只有两边都明确说"没有"才跳过】任一边说"不知道"就照常跑。
     # 多跑一轮不亏：队列空的时候 heal_media_info 自己就立刻返回了。
-    ids = mediawarp_played_ids(HEAL_TICK_MIN + 2)
+    # 【先用便宜的那个】nginx 那份日志按字节偏移读，没人看片时就是一次 stat；
+    # 读不到（没域名、没 nginx）才退回 docker logs —— 后者每次都要从头扫一遍，
+    # 每分钟一次就不便宜了。
+    ids = nginx_played_ids()
+    if ids is None:
+        ids = mediawarp_played_ids(HEAL_TICK_MIN + 2)
     ts = last_played_ts(key)
     water = float(ms_state().get("heal_tick_seen") or 0)
     moved = ts is not None and ts > water
@@ -3161,21 +3191,39 @@ def do_heal_tick():
     os.environ["MS_HEAL_TICK"] = "1"
     hot = strm_items_need_heal(key, ids or [])
     if hot:
-        heal_media_info(d, key, budget=max(60, HEAL_TICK_MIN * 60 // 2), items=hot)
+        _say(f"刚点开过、而且还缺媒体信息的有 {len(hot)} 个，先补这几个。")
+        heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
         save_ms_state(heal_tick=int(time.time()))
         return                            # 这一轮就干这个 —— 队列交给下一轮
     # 【刚点开的那几条都齐了，而 Emby 那边也没有新的播放完成 → 没有理由列全库】
     # 这一条是"平时几乎没有代价"的全部依据：连着看片的时候日志里一直有 id，
-    # 要是不看"它们缺不缺"就照跑，等于每 10 分钟列一次全库 —— 而那正是这条轮子
+    # 要是不看"它们缺不缺"就照跑，等于每分钟列一次全库 —— 而那正是这条轮子
     # 想省掉的开销。任一边说"不知道"时照旧往下跑（ts 为 None 就走不到这儿）。
     if ts is not None and not moved:
+        # 【说清是哪一种"没事做"】刚点开的那几条都齐了，Emby 那边也没有新的播放
+        _say("这一轮没事做：最近点开过的条目媒体信息都是齐的，"
+             "Emby 那边也没有新的播放完成。")
+        if has_tty():
+            print(f"  {DIM}想验「点播放 → 自动补」那条链：在 Emby 里点开一个 "
+                  f"0B / 0bps 的条目播几秒，再敲一次这个命令。{RST}")
+            print(f"  {DIM}想补某一部（不管点没点开过）：media-stack heal <片名>{RST}")
         return
+    # 【"不知道"要照常跑，但别每分钟跑一次整队】走到这儿只剩两种：Emby 那边有新的
+    # 播放完成（moved），或者压根问不到（ts 为 None）。后者是"不知道"—— 照跑是对的
+    # （把问不到当成没人播过就是让补时长静默停摆），可 Emby 要是坏上一整天，
+    # 每分钟列一次全库就等于把这条轮子省下来的开销全吐回去。整队那条仍按老节奏。
+    if ts is None:
+        _idle = time.time() - float(ms_state().get("heal_tick") or 0)
+        if _idle < HEAL_QUEUE_MIN * 60:
+            _say(f"问不到 Emby 的「最近一次播放」，整队那条按老节奏来 —— "
+                 f"离上一轮还不到 {HEAL_QUEUE_MIN} 分钟，这轮先不列全库。")
+            return
     # 【这一轮要有自己的预算】默认预算是 HEAL_BUDGET(600 秒)，而这条 cron 每
-    # HEAL_TICK_MIN 分钟就触发一次、timeout 压在下一次触发之前 —— 用默认预算会被
-    # 从中间砍掉，而砍掉的那一刻 strm 正可能停在【URL 形式】上（还原写在 finally
-    # 里，SIGTERM 不走 finally）。留在磁盘上的 URL 形式 strm 会让 MediaWarp 认不出，
-    # 表现是"挂载能播、Emby 一直转圈"。所以这一轮只领半程的预算，跑不完的下一轮接着。
-    heal_media_info(d, key, budget=max(60, HEAL_TICK_MIN * 60 // 2))
+    # HEAL_TICK_MIN 分钟就触发一次 —— 用默认预算会顶到 timeout 被从中间砍掉，
+    # 而砍掉的那一刻 strm 正可能停在【URL 形式】上（还原写在 finally 里，
+    # SIGTERM 不走 finally）。留在磁盘上的 URL 形式 strm 会让 MediaWarp 认不出，
+    # 表现是"挂载能播、Emby 一直转圈"。所以这一轮只领一小段预算，跑不完的下一轮接着。
+    heal_media_info(d, key, budget=HEAL_TICK_BUDGET)
     # 【跑完留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"——
     # 这台机器上已经栽过一次：三条任务全被锁死，而体检那行一直是绿的。
     save_ms_state(heal_tick=int(time.time()))
@@ -7933,6 +7981,65 @@ def _item_created_ts(i):
         return 0
 
 
+def nginx_played_ids():
+    """从媒体服务那份 nginx 访问日志里，读【上次读完之后新增的那一段】，找出这段
+    时间里有播放请求的条目 id。【读不到返回 None】。
+
+    【为什么不能只靠 docker logs】docker logs --since 每次都要把容器日志从头扫一遍。
+    每 5 分钟一次还算便宜，压到【每分钟】一次就不是了。而 nginx 这份日志在磁盘上，
+    记住上次读到第几个字节、下次 seek 过去只读新增的那几行 —— 开销跟"这一分钟有没有
+    人看片"成正比，没人看就只是一次 stat。这是把等待从 5 分钟压到 1 分钟的前提。
+
+    【None 是"不知道"，不是"没人播过"】没有域名的机器压根没有这份日志（客户端直连
+    Emby 的 8096），那种情况必须退回 docker logs 那条路。这一轮反复在修的就是把
+    "不知道"当成"没有"。
+
+    【轮转要认出来】logrotate 一转，inode 变了、或者新文件比旧偏移还短。那时从头读
+    这一份新的 —— 中间可能漏掉几行，但 Emby 那个水位是兜底的，而把偏移死死卡在
+    一个不存在的位置才是真的从此再也读不到。
+
+    【第一眼只看末尾那一小截】没有记号的时候（刚升级、刚轮转）从 0 读，就是把好几天
+    前的播放当成"刚点开"。那些片早就补过了，白白占掉这一轮的名额。所以第一眼只回看
+    NGX_FIRST_TAIL 这么点，之后才是严格的增量。
+    """
+    try:
+        st = os.stat(NGX_ACCESS_LOG)
+    except OSError:
+        return None
+    mark = ms_state().get("heal_ngx") or {}
+    fresh = mark.get("ino") != st.st_ino
+    off = 0 if fresh else int(mark.get("off") or 0)
+    if off > st.st_size:
+        off, fresh = 0, True          # 轮转过了（或者被 copytruncate 清空）
+    if fresh:
+        off = max(0, st.st_size - NGX_FIRST_TAIL)
+    if off >= st.st_size:             # 一个新字节都没有 = 这一分钟没人敲过
+        if fresh or mark.get("off") != off:
+            save_ms_state(heal_ngx={"ino": st.st_ino, "off": off})
+        return set()
+    # 【落后太多就跳到末尾那一截】要的是"刚点开的是哪几个"，不是把积压的旧日志
+    # 一分钟一截地补完 —— 那样越落后越读不到新的。
+    if st.st_size - off > NGX_TAIL_MAX:
+        off = st.st_size - NGX_TAIL_MAX
+    try:
+        with open(NGX_ACCESS_LOG, "rb") as f:
+            f.seek(off)
+            buf = f.read(NGX_TAIL_MAX)
+    except OSError:
+        return None
+    # 【最后一行可能只写了一半】nginx 还在往里写。把尾巴上那半行留给下一轮，
+    # 偏移就停在最后一个换行之后 —— 不然这条请求会被从中间劈开，两边都不匹配。
+    cut = buf.rfind(b"\n") + 1
+    if cut or len(buf) >= NGX_TAIL_MAX:
+        # （整整一块都没有换行 —— 不像日志了。那就照读，免得偏移从此卡在这儿）
+        buf = buf[:cut] if cut else buf
+    else:
+        buf = b""                     # 这一段全是半行，整个留给下一轮
+    save_ms_state(heal_ngx={"ino": st.st_ino, "off": off + len(buf)})
+    return set(re.findall(r"/videos/(\d+)/",
+                          buf.decode("utf-8", "replace"), re.I))
+
+
 def mediawarp_played_ids(minutes):
     """最近这些分钟里，MediaWarp 上有播放请求的条目 id。【读不到返回 None】。
 
@@ -9625,6 +9732,12 @@ def _host_rx_bytes():
 HEAL_METER_CONTAINERS = ("openlist", "emby")
 
 
+# 一次最多从 nginx 日志里读多少新增字节。看片高峰期一分钟也就几十 KB；封顶是防
+# 「这一分钟日志暴涨」把内存吃掉 —— 读不完的下一分钟接着读（偏移是往前走的）。
+NGX_TAIL_MAX = 2 << 20
+# 第一次看这份日志（刚升级 / 刚轮转）时往回看多少字节。只够装最近几分钟的请求 ——
+# 再多就是把几天前看过的片当成"刚点开"，白占这一轮的名额。
+NGX_FIRST_TAIL = 64 << 10
 HEAL_LOG = TRAFFIC_DIR + "/heal.log"     # 补时长的流水账，root-only
 HEAL_LOG_KEEP = 2000                     # 保留多少行（约几十天），超了丢最老的
 
