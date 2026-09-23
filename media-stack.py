@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.144"
+SCRIPT_VERSION = "1.5.145"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3723,7 +3723,18 @@ def _watch_snapshot(key, uid, iid, host):
     except Exception:
         return None
     srcs = it.get("MediaSources") or []
+    # 【同一个条目再从列表查询看一眼】补时长选人、核对都用的是列表查询。两个视图
+    # 要是一个 3 条一个 0 条，就知道哪一个读的是临时的那份
+    try:
+        _l = (_emby(f"/Users/{uid}/Items?Ids={iid}&Fields=MediaSources,MediaStreams",
+                    key, timeout=30).get("Items") or [{}])[0]
+        _ls = _l.get("MediaSources") or []
+        lst = (len(_l.get("MediaStreams") or [])
+               or sum(len(x.get("MediaStreams") or []) for x in _ls))
+    except Exception:
+        lst = None
     snap = {
+        "list_streams": lst,
         "streams": (len(it.get("MediaStreams") or [])
                     or sum(len(x.get("MediaStreams") or []) for x in srcs)),
         "ticks": (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
@@ -3800,9 +3811,19 @@ def do_heal_watch(q):
     hr()
     print(f"  {BOLD}二、盯着它{RST}  {DIM}每 {HEAL_WATCH_POLL} 秒看一眼，最多 "
           f"{HEAL_WATCH_MIN} 分钟；Ctrl-C 随时停。别的照常用，播放也没关系。{RST}")
-    print(f"  {DIM}起点：音视频轨 {s0['streams']} 条、时长 {s0['ticks'] / 6e8:.0f} 分钟、"
+    print(f"  {DIM}起点：音视频轨 {s0['streams']} 条（列表查询看是 "
+          f"{'?' if s0['list_streams'] is None else s0['list_streams']} 条）、"
+          f"时长 {s0['ticks'] / 6e8:.0f} 分钟、"
           f"{s0['sources']} 个版本、strm 是{s0['strm']}"
           f"{'、条目已锁定' if s0['locked'] else ''}{RST}")
+    # 【探测那一刻 Emby 回了什么】见 _PROBE_LAST
+    _pl = _PROBE_LAST.get(iid)
+    if _pl:
+        print(f"  {DIM}探测那一刻 Emby 回的：走 {_pl['route']}、协议 {_pl['protocol']}、"
+              f"{'开了直播流' if _pl['live'] else '没开直播流'}、"
+              f"要打开 {_pl['opening']}、要关闭 {_pl['closing']}、远程 {_pl['remote']}、"
+              f"可探测 {_pl['probing']}、无限流 {_pl['infinite']}、"
+              f"回包里轨道 {_pl['streams']} 条、容器 {_pl['container']}{RST}")
     t0, prev = time.monotonic(), s0
     try:
         while time.monotonic() - t0 < HEAL_WATCH_MIN * 60:
@@ -3814,7 +3835,8 @@ def do_heal_watch(q):
             # 【什么变了都报】轨道之外，条目被改写（Etag）、strm 被动过、版本数变了，
             # 都是"谁碰过它"的指纹 —— 哪怕那一刻轨道还在
             diff = []
-            for k, label in (("streams", "音视频轨"), ("ticks", "时长"),
+            for k, label in (("streams", "音视频轨"), ("list_streams", "列表查询的轨道"),
+                             ("ticks", "时长"),
                              ("sources", "版本数"), ("etag", "条目内容（Etag）"),
                              ("strm", "strm 形式"), ("strm_mtime", "strm 修改时间"),
                              ("locked", "锁定")):
@@ -3824,14 +3846,21 @@ def do_heal_watch(q):
                 _mark = "✖" if not cur["streams"] else "·"
                 print(f"  {RED if not cur['streams'] else DIM}{_mark}{RST} "
                       f"+{el // 60}分{el % 60:02d}秒  变了：{'、'.join(diff)}"
-                      f"  → 轨道 {cur['streams']} 条、时长 {cur['ticks'] / 6e8:.0f} 分钟、"
+                      f"  → 轨道 {cur['streams']} 条（列表 {cur['list_streams']}）、"
+                      f"时长 {cur['ticks'] / 6e8:.0f} 分钟、"
                       f"{cur['sources']} 个版本、strm {cur['strm']}")
                 for b in _watch_busy(key) or ["（这一刻脚本和 Emby 都没有在跑的任务）"]:
                     print(f"      {DIM}那一刻：{b}{RST}")
             if not cur["streams"]:
                 hr()
                 warn(f"补上后 {el // 60} 分 {el % 60} 秒，音视频轨没了。")
-                print(f"  {DIM}上面「那一刻」几行就是嫌疑人。把这一屏发给仓库主人。{RST}")
+                if "条目内容（Etag）" not in diff and "strm 修改时间" not in diff:
+                    # 【条目没被改写、strm 没被碰】那就不是谁把它抹掉了，是它从来没存进去：
+                    # 前面看到的那几条是 Emby 探完之后临时留着的，到点就放掉了
+                    print(f"  {DIM}条目没被改写（Etag 没变）、strm 也没被碰 —— 不像是被谁"
+                          f"抹掉的，更像是从来没存进去：之前看到的那几条是 Emby 探完之后"
+                          f"临时留着的一份，到点就放掉了。{RST}")
+                print(f"  {DIM}把这一屏发给仓库主人（尤其是「探测那一刻 Emby 回的」那一行）。{RST}")
                 return
             prev = cur
     except KeyboardInterrupt:
@@ -10927,6 +10956,34 @@ def hls_probe_url(iid, key):
     return loc if ".m3u8" in loc.split("?", 1)[0].lower() else ""
 
 
+# 【探测那一刻 Emby 回了什么】只留在本进程里，给 heal-watch 当场打出来。
+# 为什么要看：窃听风云2 补完 ✔ 3 条轨道，1 分 30 秒后变 0 条 —— 条目 Etag 没变、
+# 那一刻脚本和 Emby 都没在跑任务。不是谁把它抹掉了，是它【从来没存进去】：✔ 读到的
+# 是 Emby 探完之后临时留着的那一份，过一会儿就放掉了。那份临时的是怎么来的
+# （开了一个「直播流」？协议是什么？），就藏在 PlaybackInfo 的回包里。
+_PROBE_LAST = {}
+
+
+def _probe_note(iid, kind, resp):
+    """记下 PlaybackInfo 回包里跟"存没存"有关的那几项。不记地址、不记 key。"""
+    try:
+        ms = ((resp or {}).get("MediaSources") or [{}])[0] or {}
+        _PROBE_LAST[str(iid)] = {
+            "route": kind,
+            "protocol": ms.get("Protocol"),
+            "live": bool(ms.get("LiveStreamId")),
+            "opening": ms.get("RequiresOpening"),
+            "closing": ms.get("RequiresClosing"),
+            "remote": ms.get("IsRemote"),
+            "probing": ms.get("SupportsProbing"),
+            "infinite": ms.get("IsInfiniteStream"),
+            "streams": len(ms.get("MediaStreams") or []),
+            "container": ms.get("Container"),
+        }
+    except Exception:
+        pass
+
+
 def _heal_one(d, key, _it, base, token):
     """探一个条目。返回 (结局, 名字, 秒数, 附言)。
 
@@ -11002,10 +11059,11 @@ def _heal_one(d, key, _it, base, token):
             with open(host, "w", encoding="utf-8") as f:
                 f.write(_u)
             try:
-                _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&IsPlayback=true"
-                      f"&AutoOpenLiveStream=true&MediaSourceId=mediasource_{iid}"
-                      f"&StartTimeTicks=0&MaxStreamingBitrate=200000000",
-                      key, method="POST", timeout=200)
+                _pi = _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&IsPlayback=true"
+                            f"&AutoOpenLiveStream=true&MediaSourceId=mediasource_{iid}"
+                            f"&StartTimeTicks=0&MaxStreamingBitrate=200000000",
+                            key, method="POST", timeout=200)
+                _probe_note(iid, _kind, _pi)
             except Exception:
                 probed = False    # 探测请求本身没跑成（超时/断开）——【不算这个条目的账】
                 pass          # 探测本身超时也要走到 finally 把文件还原
