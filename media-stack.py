@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.143"
+SCRIPT_VERSION = "1.5.144"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1521,6 +1521,7 @@ case "${1:-info}" in
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
+  heal-watch <片名> 点名补上，然后盯着：音视频轨什么时候、被谁弄掉的
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「6 链路体检」)
@@ -1672,6 +1673,12 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     exec python3 "$S" heal-tick ;;
+  heal-watch)
+    # 【参数要透传】同 heal-trace
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" heal-watch "$@" ;;
   heal-trace)
     # 【参数要透传】片名常常是好几个词（完美世界 287），吃掉一个就对不上
     S=/etc/bgpeer/media-stack.py
@@ -3695,6 +3702,146 @@ def do_heal_trace(q, play=True):
         print(f"  {DIM}探了，没探成：{RST}")
         print(f"  {probe_line}")
         print(f"  {DIM}结局那一栏是 retry 的，下一次点开会再试；dead 的是这套办法对它无效。{RST}")
+
+
+# ============================================================================ heal-watch
+# 【补上之后盯着它，看是什么时候、被谁弄掉的】
+# 实测撞上的：窃听风云2 点名补上（✔ 119 分钟，补完当场核对也是齐的），不到 3 分钟
+# 再看，音视频轨 0 条、时长还在。那几分钟里没人播它、每小时那轮也没到点。
+# 读代码猜不出是谁 —— 会写电影条目的地方有好几处。只能当场抓：补完之后每隔几秒
+# 看一眼，一变就把那一刻在跑的东西全记下来。
+HEAL_WATCH_MIN = 20
+HEAL_WATCH_POLL = 5
+
+
+def _watch_snapshot(key, uid, iid, host):
+    """这一刻条目和周围的样子 → dict；问不到 Emby 返回 None。"""
+    try:
+        it = _emby(f"/Users/{uid}/Items/{iid}"
+                   f"?Fields=Path,MediaSources,MediaStreams,Etag,DateModified,ProviderIds",
+                   key, timeout=30)
+    except Exception:
+        return None
+    srcs = it.get("MediaSources") or []
+    snap = {
+        "streams": (len(it.get("MediaStreams") or [])
+                    or sum(len(x.get("MediaStreams") or []) for x in srcs)),
+        "ticks": (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+                  else (it.get("RunTimeTicks") or 0)),
+        "sources": len(srcs),
+        "etag": str(it.get("Etag") or ""),
+        "modified": str(it.get("DateModified") or "")[:19],
+        "locked": bool(it.get("LockData")),
+    }
+    try:
+        st = os.stat(host)
+        with open(host, encoding="utf-8") as f:
+            body = f.read().strip()
+        snap["strm"] = ("URL 形式" if body.startswith("http") else "路径形式")
+        snap["strm_mtime"] = int(st.st_mtime)
+    except OSError:
+        snap["strm"], snap["strm_mtime"] = "读不到", 0
+    return snap
+
+
+def _watch_busy(key):
+    """这一刻谁在跑：本脚本的后台任务 + Emby 的计划任务。"""
+    out = [f"脚本在跑 {sub}（{secs}s）" for _p, sub, secs in running_tasks()]
+    try:
+        for t in _emby("/ScheduledTasks", key, timeout=15) or []:
+            if t.get("State") == "Running":
+                out.append(f"Emby 在跑「{t.get('Name') or '?'}」")
+    except Exception:
+        out.append("问不到 Emby 的计划任务")
+    return out
+
+
+def do_heal_watch(q):
+    """media-stack heal-watch <片名>：点名补上，然后盯着，看音视频轨什么时候、被谁弄掉。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key（「3 后补参数」里填）。")
+        return
+    if not (q or "").strip():
+        warn("要告诉我是哪一部，比如：media-stack heal-watch 窃听风云2")
+        return
+    hits = find_strm_items(key, q)
+    if len(hits) != 1:
+        warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只盯一部。"
+             + ("" if hits else "换个写法试试。"))
+        for h in hits[:10]:
+            print(f"    {DIM}·{RST} {h[2]}")
+        return
+    uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
+    try:
+        _p = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30).get("Path") or ""
+    except Exception:
+        warn("问不到 Emby。")
+        return
+    host = _strm_host_path(d, _p)
+
+    print(f"\n  {BOLD}补上之后盯着它：{name}{RST}  {DIM}v{SCRIPT_VERSION}{RST}")
+    hr()
+    print(f"  {BOLD}一、先补上{RST}  {DIM}（点名补，不受额度限制）{RST}")
+    heal_media_info(d, key, budget=HEAL_BUDGET, items=hits[:1])
+    s0 = _watch_snapshot(key, uid, iid, host)
+    if s0 is None:
+        warn("补完问不到 Emby，没法盯。")
+        return
+    if not s0["streams"]:
+        warn("补完当场看，音视频轨就是 0 条 —— 没补上，没什么可盯的。"
+             "media-stack heal-log 看这一次的结果。")
+        return
+
+    hr()
+    print(f"  {BOLD}二、盯着它{RST}  {DIM}每 {HEAL_WATCH_POLL} 秒看一眼，最多 "
+          f"{HEAL_WATCH_MIN} 分钟；Ctrl-C 随时停。别的照常用，播放也没关系。{RST}")
+    print(f"  {DIM}起点：音视频轨 {s0['streams']} 条、时长 {s0['ticks'] / 6e8:.0f} 分钟、"
+          f"{s0['sources']} 个版本、strm 是{s0['strm']}"
+          f"{'、条目已锁定' if s0['locked'] else ''}{RST}")
+    t0, prev = time.monotonic(), s0
+    try:
+        while time.monotonic() - t0 < HEAL_WATCH_MIN * 60:
+            time.sleep(HEAL_WATCH_POLL)
+            cur = _watch_snapshot(key, uid, iid, host)
+            if cur is None:
+                continue
+            el = int(time.monotonic() - t0)
+            # 【什么变了都报】轨道之外，条目被改写（Etag）、strm 被动过、版本数变了，
+            # 都是"谁碰过它"的指纹 —— 哪怕那一刻轨道还在
+            diff = []
+            for k, label in (("streams", "音视频轨"), ("ticks", "时长"),
+                             ("sources", "版本数"), ("etag", "条目内容（Etag）"),
+                             ("strm", "strm 形式"), ("strm_mtime", "strm 修改时间"),
+                             ("locked", "锁定")):
+                if cur.get(k) != prev.get(k):
+                    diff.append(label)
+            if diff:
+                _mark = "✖" if not cur["streams"] else "·"
+                print(f"  {RED if not cur['streams'] else DIM}{_mark}{RST} "
+                      f"+{el // 60}分{el % 60:02d}秒  变了：{'、'.join(diff)}"
+                      f"  → 轨道 {cur['streams']} 条、时长 {cur['ticks'] / 6e8:.0f} 分钟、"
+                      f"{cur['sources']} 个版本、strm {cur['strm']}")
+                for b in _watch_busy(key) or ["（这一刻脚本和 Emby 都没有在跑的任务）"]:
+                    print(f"      {DIM}那一刻：{b}{RST}")
+            if not cur["streams"]:
+                hr()
+                warn(f"补上后 {el // 60} 分 {el % 60} 秒，音视频轨没了。")
+                print(f"  {DIM}上面「那一刻」几行就是嫌疑人。把这一屏发给仓库主人。{RST}")
+                return
+            prev = cur
+    except KeyboardInterrupt:
+        print()
+        info("停了。")
+        return
+    hr()
+    ok(f"盯了 {HEAL_WATCH_MIN} 分钟，音视频轨一直在。")
+    print(f"  {DIM}没在这段时间里掉。过几个小时再 media-stack heal-trace {q} --no-play "
+          f"看一眼：还在就是真好了；没了就是更晚的某个定时任务弄掉的。{RST}")
 
 
 def follow_new_storages(d):
@@ -10889,8 +11036,10 @@ def _heal_one(d, key, _it, base, token):
                 # 0 条轨道（时长还在），而 nginx 日志里一次播放都没有 —— 不是谁点了它。
                 # 最可能的解释：Emby 下一次扫库看见这个 strm "改过"，重读一遍，而此刻
                 # 它是路径形式、探不到（No such file），于是清掉轨道、留下时长。
-                # 这一点还没在真机上证实；但把修改时间放回原样本身没有代价 —— 内容
-                # 本来就没变，Emby 本来就不该当它改过。
+                # 【真机上否掉了】加上这一步之后再点名补，✔ 之后不到 3 分钟轨道就没了，
+                # 中间没有扫库 —— 掉轨道的不是这个（至少不止这个），真凶用 heal-watch 抓。
+                # 这一步留着：把修改时间放回原样本身没有代价 —— 内容本来就没变，
+                # Emby 本来就不该当它改过。
                 # 只在内容原样写回时还原：内容真变了（老版本留下的 URL 形式改成路径），
                 # 那就该让 Emby 知道。
                 if _back == original:
@@ -17681,6 +17830,9 @@ if __name__ == "__main__":
             require_root()                # 要读 nginx 日志和流水，都是 root-only 的
             _a = [x for x in sys.argv[2:] if x != "--no-play"]
             do_heal_trace(" ".join(_a).strip(), play="--no-play" not in sys.argv[2:])
+        elif arg == "heal-watch":         # 点名补上，然后盯着看是什么时候、被谁弄掉的
+            require_root()
+            do_heal_watch(" ".join(sys.argv[2:]).strip())
         elif arg == "heal-log":           # 翻补时长的流水账
             require_root()                # 里面有片名，文件是 0600 的
             _n = 40
