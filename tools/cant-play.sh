@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-20b"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-24a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -683,161 +683,169 @@ try:
     # 【必须先歇一下】⑤ 刚拉完 1 MiB，紧接着再发一个请求，撞上源的频率限制就是
     # 429 —— 而那是【脚本自己造出来的】。实测栽过一次：同一个文件，单独测时 ⑥ 报
     # "进度条能拖"，跟在 ⑤ 后面测就报 429，两次结论相反。歇三秒，测的才是它本来的样子。
-    print(f"  {D}先歇 3 秒再要 —— 紧跟着上一步发请求会撞上源的频率限制，"
-          f"那个 429 是脚本自己造的{X}")
-    time.sleep(3)
-    mid = max(1 << 20, (ol_size or size or (1 << 30)) // 2)
-    req2 = urllib.request.Request(loc, headers={
-        "Range": f"bytes={mid}-{mid + 65535}", "User-Agent": UA})
-    try:
-        t0 = time.time()
-        with urllib.request.urlopen(req2, timeout=90) as r2:
-            st2, cr = r2.status, r2.headers.get("Content-Range", "")
-            n2 = len(r2.read(65536))
-        el2 = time.time() - t0
-        if st2 == 206 and cr:
-            start_at = cr.split()[-1].split("-")[0].split("/")[0]
-            good = start_at.isdigit() and int(start_at) == mid
-            print(f"  {G if good else Y}HTTP 206{X}  {D}{cr}　拿到 {n2} 字节，"
-                  f"{el2:.1f} 秒{X}")
-            if good:
-                print(f"  {G}✔ 服务器认 Range{X}  {D}从哪儿要就从哪儿给{X}")
-                # 【这个数字本来被埋了】上一版把 el2 塞在 206 后面一个不起眼的
-                # 括号里，紧跟着就打绿勾 —— 而实测见过 64 KiB 要 91.5 秒（≈5.7
-                # kbps），同一分钟从【开头】拉却有 9.3 Mbps。这是整屏最响的一个数。
-                # "认不认 Range"和"这个位置给不给得动"是两件事，绿勾只回答了前一件。
-                _kb = n2 * 8 / el2 / 1e3 if el2 > 0 else 0
-                if el2 >= 5:
-                    print(f"  {R}✖ 可是这 {n2 // 1024} KiB 要了 {el2:.1f} 秒{X}"
-                          f"  {D}≈ {_kb:.1f} kbps{X}")
-                    if mbps:
-                        # 【对照才是证据】单独一个"91.5 秒"说明不了什么，
-                        # 跟同一分钟、同一条链的开头速度摆在一起才成立。
-                        print(f"  {D}同一条链、同一分钟，从【开头】拉是 "
-                              f"{mbps:.1f} Mbps —— 差了 {mbps * 1e3 / max(_kb, 0.01):.0f} 倍。"
-                              f"不是链坏了，是【挪到文件中间就几乎不动】。{X}")
-                    print(f"  {B}这一条就足以让它点开播不出来{X}"
-                          f"{D} —— mp4 的索引（moov）很多时候在文件【尾部】，"
-                          f"播放器开播、Emby 探编码，第一件事都是去读文件尾，"
-                          f"正好撞在这上面。① 那句「还没探到媒体流」和这一行"
-                          f"多半是同一件事。{X}")
-                    print(f"  {D}也解释了「早上还能播、下午就不行，别的片还可以」："
-                          f"直链有缓存期（这台机器 {TTL}），过期换一条新的，"
-                          f"落到哪个 CDN 节点由网盘那边定。文件没变、设置没变，"
-                          f"变的是这一刻给你的那条链 —— 是运气，不是配置。{X}")
-                    print(f"  {B}当场能试的{X}{D}：docker restart mediawarp 丢掉缓存的"
-                          f"直链，再点一次。换条链就能播 = 坐实了是这个。{X}")
-                    print(f"  {D}老碰上就换条路：这个盘改「转码流」（分片是一个个"
-                          f"独立的小文件，从头拉到尾，根本不用 seek 文件中段），"
-                          f"或者回源方式改「本机代理」（VPS 顺序拉一遍再喂给播放器，"
-                          f"代价是吃 VPS 带宽）。{X}")
-                elif el2 >= 1.5:
-                    print(f"  {Y}这 {n2 // 1024} KiB 要了 {el2:.1f} 秒{X}"
-                          f"  {D}≈ {_kb:.1f} kbps —— 偏慢，开播那几下会明显等一下{X}")
-                # 【能 seek ≠ 拖过去能看】上面只要了 64 KiB，那点数据任何服务器
-                # 都给得起。而"拖了之后卡住 / 跳回开头"是【供不上数据】：播放器
-                # seek 完要立刻填满缓冲，填不上就放弃重来。所以还得从同一个位置
-                # 持续拉几秒，量真实吞吐 —— 这跟 ⑤ 从头拉不是一回事，
-                # 很多源是开头快、拖到中间就慢下来。
-                print(f"  {D}再从同一个位置连着拉 4 秒，量拖过去之后供不供得上...{X}")
-                req3 = urllib.request.Request(loc, headers={
-                    "Range": f"bytes={mid}-{mid + (24 << 20)}", "User-Agent": UA})
-                try:
-                    got3, t3 = 0, time.time()
-                    with urllib.request.urlopen(req3, timeout=60) as r3:
-                        while time.time() - t3 < 4:
-                            chunk = r3.read(1 << 16)
-                            if not chunk:
-                                break
-                            got3 += len(chunk)
-                    el3 = max(0.1, time.time() - t3)
-                    m3 = got3 * 8 / el3 / 1e6
-                    if not need:
-                        print(f"  {D}拖过去之后 {m3:.1f} Mbps"
-                              f"（读不到码率，比不了）{X}")
-                    elif m3 >= need:
-                        print(f"  {G}✔ 拖过去也供得上{X}  {D}{m3:.1f} Mbps ≥ "
-                              f"这部片要的 {need:.1f} Mbps{X}")
-                    else:
-                        print(f"  {R}✖ 拖过去就供不上了{X}  {D}只有 {m3:.1f} Mbps，"
-                              f"这部片要 {need:.1f} Mbps{X}")
-                        print(f"  {D}这正是「一拖就卡住 / 跳回从头播」的原因："
-                              f"播放器 seek 完要立刻填满缓冲，填不上就放弃重来。"
-                              f"服务器是认 Range 的（上面刚验过），纯粹是慢。{X}")
-                    # 【⑤ 和 ⑥ 差得离谱的时候，别让人自己猜信哪个】
-                    # 实测同一部片两次跑出来是反的：一次开头 9.32 Mbps、中段 0.2；
-                    # 另一次开头 0.21 Mbps、中段 7.1。相隔几秒，差几十倍。
-                    # 不是哪一次测错了 ——【这条链的速度本身在剧烈波动】。
-                    # 而这正是"同一部片早上能播下午不能、别的片还可以"的机理：
-                    # 能不能播，看你点播放那一刻它正好在哪个状态。
-                    if mbps and m3 and max(mbps, m3) >= min(mbps, m3) * 3:
-                        print()
-                        print(f"  {Y}⚠ 这两个数字对不上：⑤ 从开头拉是 {mbps:.2f} Mbps，"
-                              f"这里持续拉是 {m3:.1f} Mbps{X}"
-                              f"  {D}差 {max(mbps, m3) / max(min(mbps, m3), 0.01):.0f} 倍{X}")
-                        print(f"  {D}两次测量只隔了几秒，所以不是哪一次测错了 ——"
-                              f"【这条链的速度本身在剧烈波动】。{X}")
-                        print(f"  {B}这就是「同一部片早上能播、下午播不了，别的片还可以」{X}"
-                              f"{D}：能不能播，看你点播放那一刻它正好在哪个状态。"
-                              f"文件、设置都没变，变的是运气。{X}")
-                        if not via_vps:
-                            print(f"  {D}这个盘是 302 直连网盘 CDN，这条链由网盘那边发，"
-                                  f"这台机器上没有哪个设置管得着它的快慢。"
-                                  f"能做的只有换一条（docker restart mediawarp），"
-                                  f"或者让字节改走本机代理 —— VPS 顺序拉一遍再喂给"
-                                  f"播放器，能抹掉一部分抖动，但上游这一刻就是慢的话，"
-                                  f"谁也救不了。{X}")
-                except Exception as e3:
-                    print(f"  {Y}持续拉的时候断了：{safe(e3)}{X}")
-                    print(f"  {D}拖过去之后连不稳 —— 表现就是一拖就卡。{X}")
+    # 【HLS 分片流不用测这一步】地址指向的是一份几 KB 的播放列表（m3u8），拖进度条是
+    # 换一个分片去要，不是从同一个文件中间要一段 —— 认不认 Range 跟它没关系。
+    # 以前照测不误，回 200 就报「服务器不认 Range…只能换个盘放」：对夸克的转码流
+    # 这是一句错话，而且错得很贵（叫人把好好的盘换掉）。
+    if kind == "HLS 分片流":
+        print(f"  {G}✔ 不用测{X}  {D}这一刻给的是 HLS 分片流：拖进度条是换一个分片去要，"
+              f"不是从同一个文件中间要一段，认不认 Range 跟它没关系。{X}")
+    else:
+        print(f"  {D}先歇 3 秒再要 —— 紧跟着上一步发请求会撞上源的频率限制，"
+              f"那个 429 是脚本自己造的{X}")
+        time.sleep(3)
+        mid = max(1 << 20, (ol_size or size or (1 << 30)) // 2)
+        req2 = urllib.request.Request(loc, headers={
+            "Range": f"bytes={mid}-{mid + 65535}", "User-Agent": UA})
+        try:
+            t0 = time.time()
+            with urllib.request.urlopen(req2, timeout=90) as r2:
+                st2, cr = r2.status, r2.headers.get("Content-Range", "")
+                n2 = len(r2.read(65536))
+            el2 = time.time() - t0
+            if st2 == 206 and cr:
+                start_at = cr.split()[-1].split("-")[0].split("/")[0]
+                good = start_at.isdigit() and int(start_at) == mid
+                print(f"  {G if good else Y}HTTP 206{X}  {D}{cr}　拿到 {n2} 字节，"
+                      f"{el2:.1f} 秒{X}")
+                if good:
+                    print(f"  {G}✔ 服务器认 Range{X}  {D}从哪儿要就从哪儿给{X}")
+                    # 【这个数字本来被埋了】上一版把 el2 塞在 206 后面一个不起眼的
+                    # 括号里，紧跟着就打绿勾 —— 而实测见过 64 KiB 要 91.5 秒（≈5.7
+                    # kbps），同一分钟从【开头】拉却有 9.3 Mbps。这是整屏最响的一个数。
+                    # "认不认 Range"和"这个位置给不给得动"是两件事，绿勾只回答了前一件。
+                    _kb = n2 * 8 / el2 / 1e3 if el2 > 0 else 0
+                    if el2 >= 5:
+                        print(f"  {R}✖ 可是这 {n2 // 1024} KiB 要了 {el2:.1f} 秒{X}"
+                              f"  {D}≈ {_kb:.1f} kbps{X}")
+                        if mbps:
+                            # 【对照才是证据】单独一个"91.5 秒"说明不了什么，
+                            # 跟同一分钟、同一条链的开头速度摆在一起才成立。
+                            print(f"  {D}同一条链、同一分钟，从【开头】拉是 "
+                                  f"{mbps:.1f} Mbps —— 差了 {mbps * 1e3 / max(_kb, 0.01):.0f} 倍。"
+                                  f"不是链坏了，是【挪到文件中间就几乎不动】。{X}")
+                        print(f"  {B}这一条就足以让它点开播不出来{X}"
+                              f"{D} —— mp4 的索引（moov）很多时候在文件【尾部】，"
+                              f"播放器开播、Emby 探编码，第一件事都是去读文件尾，"
+                              f"正好撞在这上面。① 那句「还没探到媒体流」和这一行"
+                              f"多半是同一件事。{X}")
+                        print(f"  {D}也解释了「早上还能播、下午就不行，别的片还可以」："
+                              f"直链有缓存期（这台机器 {TTL}），过期换一条新的，"
+                              f"落到哪个 CDN 节点由网盘那边定。文件没变、设置没变，"
+                              f"变的是这一刻给你的那条链 —— 是运气，不是配置。{X}")
+                        print(f"  {B}当场能试的{X}{D}：docker restart mediawarp 丢掉缓存的"
+                              f"直链，再点一次。换条链就能播 = 坐实了是这个。{X}")
+                        print(f"  {D}老碰上就换条路：这个盘改「转码流」（分片是一个个"
+                              f"独立的小文件，从头拉到尾，根本不用 seek 文件中段），"
+                              f"或者回源方式改「本机代理」（VPS 顺序拉一遍再喂给播放器，"
+                              f"代价是吃 VPS 带宽）。{X}")
+                    elif el2 >= 1.5:
+                        print(f"  {Y}这 {n2 // 1024} KiB 要了 {el2:.1f} 秒{X}"
+                              f"  {D}≈ {_kb:.1f} kbps —— 偏慢，开播那几下会明显等一下{X}")
+                    # 【能 seek ≠ 拖过去能看】上面只要了 64 KiB，那点数据任何服务器
+                    # 都给得起。而"拖了之后卡住 / 跳回开头"是【供不上数据】：播放器
+                    # seek 完要立刻填满缓冲，填不上就放弃重来。所以还得从同一个位置
+                    # 持续拉几秒，量真实吞吐 —— 这跟 ⑤ 从头拉不是一回事，
+                    # 很多源是开头快、拖到中间就慢下来。
+                    print(f"  {D}再从同一个位置连着拉 4 秒，量拖过去之后供不供得上...{X}")
+                    req3 = urllib.request.Request(loc, headers={
+                        "Range": f"bytes={mid}-{mid + (24 << 20)}", "User-Agent": UA})
+                    try:
+                        got3, t3 = 0, time.time()
+                        with urllib.request.urlopen(req3, timeout=60) as r3:
+                            while time.time() - t3 < 4:
+                                chunk = r3.read(1 << 16)
+                                if not chunk:
+                                    break
+                                got3 += len(chunk)
+                        el3 = max(0.1, time.time() - t3)
+                        m3 = got3 * 8 / el3 / 1e6
+                        if not need:
+                            print(f"  {D}拖过去之后 {m3:.1f} Mbps"
+                                  f"（读不到码率，比不了）{X}")
+                        elif m3 >= need:
+                            print(f"  {G}✔ 拖过去也供得上{X}  {D}{m3:.1f} Mbps ≥ "
+                                  f"这部片要的 {need:.1f} Mbps{X}")
+                        else:
+                            print(f"  {R}✖ 拖过去就供不上了{X}  {D}只有 {m3:.1f} Mbps，"
+                                  f"这部片要 {need:.1f} Mbps{X}")
+                            print(f"  {D}这正是「一拖就卡住 / 跳回从头播」的原因："
+                                  f"播放器 seek 完要立刻填满缓冲，填不上就放弃重来。"
+                                  f"服务器是认 Range 的（上面刚验过），纯粹是慢。{X}")
+                        # 【⑤ 和 ⑥ 差得离谱的时候，别让人自己猜信哪个】
+                        # 实测同一部片两次跑出来是反的：一次开头 9.32 Mbps、中段 0.2；
+                        # 另一次开头 0.21 Mbps、中段 7.1。相隔几秒，差几十倍。
+                        # 不是哪一次测错了 ——【这条链的速度本身在剧烈波动】。
+                        # 而这正是"同一部片早上能播下午不能、别的片还可以"的机理：
+                        # 能不能播，看你点播放那一刻它正好在哪个状态。
+                        if mbps and m3 and max(mbps, m3) >= min(mbps, m3) * 3:
+                            print()
+                            print(f"  {Y}⚠ 这两个数字对不上：⑤ 从开头拉是 {mbps:.2f} Mbps，"
+                                  f"这里持续拉是 {m3:.1f} Mbps{X}"
+                                  f"  {D}差 {max(mbps, m3) / max(min(mbps, m3), 0.01):.0f} 倍{X}")
+                            print(f"  {D}两次测量只隔了几秒，所以不是哪一次测错了 ——"
+                                  f"【这条链的速度本身在剧烈波动】。{X}")
+                            print(f"  {B}这就是「同一部片早上能播、下午播不了，别的片还可以」{X}"
+                                  f"{D}：能不能播，看你点播放那一刻它正好在哪个状态。"
+                                  f"文件、设置都没变，变的是运气。{X}")
+                            if not via_vps:
+                                print(f"  {D}这个盘是 302 直连网盘 CDN，这条链由网盘那边发，"
+                                      f"这台机器上没有哪个设置管得着它的快慢。"
+                                      f"能做的只有换一条（docker restart mediawarp），"
+                                      f"或者让字节改走本机代理 —— VPS 顺序拉一遍再喂给"
+                                      f"播放器，能抹掉一部分抖动，但上游这一刻就是慢的话，"
+                                      f"谁也救不了。{X}")
+                    except Exception as e3:
+                        print(f"  {Y}持续拉的时候断了：{safe(e3)}{X}")
+                        print(f"  {D}拖过去之后连不稳 —— 表现就是一拖就卡。{X}")
+                else:
+                    print(f"  {Y}回的 206 起点和要的对不上{X}  "
+                          f"{D}要 {mid}，给的是 {start_at}{X}")
+            elif st2 == 200:
+                print(f"  {R}✖ 回的是 200，不是 206 —— 服务器不认 Range{X}")
+                print(f"  {D}它把整个文件从头发过来了。表现就是：网页里从头播能播，"
+                      f"一拖进度条就卡死；而 Emby / 外部播放器开播时就要 seek，"
+                      f"于是直接播不出来。{X}")
+                print(f"  {D}这是代理型存储（WebDAV 源）最常见的死因 —— 上游那台 WebDAV "
+                      f"服务器不支持断点续传，OpenList 只是照转，改哪个配置都没用。{X}")
+                print(f"  {B}只能换个盘放{X}{D}：夸克 / 阿里 / 115 是 302 到网盘 CDN，"
+                      f"那些都认 Range。{X}")
             else:
-                print(f"  {Y}回的 206 起点和要的对不上{X}  "
-                      f"{D}要 {mid}，给的是 {start_at}{X}")
-        elif st2 == 200:
-            print(f"  {R}✖ 回的是 200，不是 206 —— 服务器不认 Range{X}")
-            print(f"  {D}它把整个文件从头发过来了。表现就是：网页里从头播能播，"
-                  f"一拖进度条就卡死；而 Emby / 外部播放器开播时就要 seek，"
-                  f"于是直接播不出来。{X}")
-            print(f"  {D}这是代理型存储（WebDAV 源）最常见的死因 —— 上游那台 WebDAV "
-                  f"服务器不支持断点续传，OpenList 只是照转，改哪个配置都没用。{X}")
-            print(f"  {B}只能换个盘放{X}{D}：夸克 / 阿里 / 115 是 302 到网盘 CDN，"
-                  f"那些都认 Range。{X}")
-        else:
-            print(f"  {R}✖ HTTP {st2}{X}  {D}要中间那一段被拒了{X}")
-    except urllib.error.HTTPError as e2:
-        if e2.code == 429:
-            # 【429 不是"不支持 seek"，是"你请求太频繁"】处置完全不同，说错方向
-            # 会让人去折腾 Range、折腾播放器，而真正的限制在源那边。
-            ra = e2.headers.get("Retry-After", "")
-            print(f"  {R}✖ HTTP 429 —— 源在限流{X}"
-                  + (f"  {D}它要求等 {ra} 秒{X}" if ra else ""))
-            print(f"  {D}歇 8 秒再要一次，看是一直被限还是刚才那下太密...{X}")
-            time.sleep(8)
-            try:
-                with urllib.request.urlopen(req2, timeout=90) as r4:
-                    print(f"  {Y}第二次成功了（HTTP {r4.status}）{X}")
-                    print(f"  {D}说明这个源【限的是频率，不是能力】：隔开就给，"
-                          f"连着要就拒。{X}")
-            except urllib.error.HTTPError as e4:
-                print(f"  {R}第二次还是 HTTP {e4.code}{X}")
-            except Exception as e4:
-                print(f"  {R}第二次也没成：{safe(e4)}{X}")
-            print()
-            print(f"  {B}这就是「拖进度条跳回开头 / Emby 直接 load fail」的原因{X}")
-            print(f"  {D}播放器一 seek 就是一个新请求；开播时更要连发好几个"
-                  f"（探测编码、要首帧、再要播放位置）。撞上限流被拒，播放器"
-                  f"只好放弃、从头再来 —— 你看到的就是「跳回开头」和「load fail」。{X}")
-            print(f"  {D}而挂载网页从头播没事，是因为那是【一个】连续的请求，"
-                  f"中途不再要新的。{X}")
-            print(f"  {D}限的是源那边，OpenList 只是照转 —— 改直链方式、换播放器、"
-                  f"调 Emby 设置都碰不到它。{X}")
-            print(f"  {B}这个源不适合放要拖进度条的片子{X}"
-                  f"{D}；大码率的放夸克/阿里（302 直连网盘 CDN，不吃这个限制）。{X}")
-        else:
-            print(f"  {R}✖ HTTP {e2.code}{X}  {D}要中间那一段被拒了 —— 进度条拖不动，"
-                  f"播放器多半直接播不出来{X}")
-    except Exception as e2:
-        print(f"  {R}✖ 要不到中间那一段：{safe(e2)}{X}")
+                print(f"  {R}✖ HTTP {st2}{X}  {D}要中间那一段被拒了{X}")
+        except urllib.error.HTTPError as e2:
+            if e2.code == 429:
+                # 【429 不是"不支持 seek"，是"你请求太频繁"】处置完全不同，说错方向
+                # 会让人去折腾 Range、折腾播放器，而真正的限制在源那边。
+                ra = e2.headers.get("Retry-After", "")
+                print(f"  {R}✖ HTTP 429 —— 源在限流{X}"
+                      + (f"  {D}它要求等 {ra} 秒{X}" if ra else ""))
+                print(f"  {D}歇 8 秒再要一次，看是一直被限还是刚才那下太密...{X}")
+                time.sleep(8)
+                try:
+                    with urllib.request.urlopen(req2, timeout=90) as r4:
+                        print(f"  {Y}第二次成功了（HTTP {r4.status}）{X}")
+                        print(f"  {D}说明这个源【限的是频率，不是能力】：隔开就给，"
+                              f"连着要就拒。{X}")
+                except urllib.error.HTTPError as e4:
+                    print(f"  {R}第二次还是 HTTP {e4.code}{X}")
+                except Exception as e4:
+                    print(f"  {R}第二次也没成：{safe(e4)}{X}")
+                print()
+                print(f"  {B}这就是「拖进度条跳回开头 / Emby 直接 load fail」的原因{X}")
+                print(f"  {D}播放器一 seek 就是一个新请求；开播时更要连发好几个"
+                      f"（探测编码、要首帧、再要播放位置）。撞上限流被拒，播放器"
+                      f"只好放弃、从头再来 —— 你看到的就是「跳回开头」和「load fail」。{X}")
+                print(f"  {D}而挂载网页从头播没事，是因为那是【一个】连续的请求，"
+                      f"中途不再要新的。{X}")
+                print(f"  {D}限的是源那边，OpenList 只是照转 —— 改直链方式、换播放器、"
+                      f"调 Emby 设置都碰不到它。{X}")
+                print(f"  {B}这个源不适合放要拖进度条的片子{X}"
+                      f"{D}；大码率的放夸克/阿里（302 直连网盘 CDN，不吃这个限制）。{X}")
+            else:
+                print(f"  {R}✖ HTTP {e2.code}{X}  {D}要中间那一段被拒了 —— 进度条拖不动，"
+                      f"播放器多半直接播不出来{X}")
+        except Exception as e2:
+            print(f"  {R}✖ 要不到中间那一段：{safe(e2)}{X}")
 except urllib.error.HTTPError as e:
     print(f"  {R}✖ HTTP {e.code}{X}  {D}直链拿到了，但拉不动{X}")
     if e.code == 429:
@@ -856,6 +864,20 @@ except urllib.error.HTTPError as e:
               f"（4 挂载路径 → 选那个盘 → 2 直链方式）。{X}")
 except Exception as e:
     print(f"  {R}✖ 拉不动：{safe(e)}{X}")
+    _es = safe(e)
+    if any(w in _es for w in ("timed out", "No route", "Connection reset", "refused")):
+        # 【超时 / 连不上 ≠ 这个盘坏了】302 已经给出来了（④ 是绿的），是【这台 VPS】
+        # 此刻连不上直链落到的那个 CDN 节点。手机是直连 CDN 的，可能连得上也可能一样
+        # 连不上；而 MediaWarp 会把这条直链缓存一阵 —— 撞上坏节点，这段时间里每次点开
+        # 拿到的都是同一条，表现就是「这一集怎么点都播不了，旁边那集好好的」。
+        print(f"  {D}④ 是绿的：直链换出来了，是这台机器此刻连不上它落到的那个网盘 CDN 节点。"
+              f"网盘 CDN 的节点是一条链一个，撞上坏的就是这样。{X}")
+        print(f"  {D}MediaWarp 会把这条直链缓存 {TTL} —— 这段时间里点这一集拿到的都是它。"
+              f"手机上也播不了的话：{X}")
+        print(f"    {B}docker restart mediawarp{X}  {D}丢掉缓存的直链，再点一次（会换一条新的）；"
+              f"或者等 {TTL} 自己过期。{X}")
+        print(f"  {D}隔一会儿再跑一次这个脚本：好了 = 就是那一条链的运气；一直超时 = 这台机器到"
+              f"网盘 CDN 的线路有问题，跑「6 链路体检」看看。{X}")
 def mw_uptime():
     """MediaWarp 容器跑了多少秒。读不到返回 None —— 【读不到就是不知道，不是 0】。
 
