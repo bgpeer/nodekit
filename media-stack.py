@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.145"
+SCRIPT_VERSION = "1.5.146"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3571,6 +3571,16 @@ def do_heal_trace(q, play=True):
         if _k:
             _trace_row("⚠" if _k >= HEAL_HOT_DAY_TRIES else "·", "今天因点开探过",
                        f"{_k} 次（一天最多 {HEAL_HOT_DAY_TRIES} 次）")
+    try:
+        _ip = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30).get("Path") or ""
+    except Exception:
+        _ip = ""
+    _mon = item_lib_monitor(key, _ip) if _ip else None
+    if _mon:
+        _trace_row("✖", "所在库实时监控", "开着 —— 补上的轨道 1 分多钟后会被它清掉，"
+                   "补一次掉一次。跑一次「7 更新」会关掉")
+    elif _mon is False:
+        _trace_row("✔", "所在库实时监控", "关着")
     _gv = heal_fail_table().get(iid)
     if _gv:
         _trace_row("·", "放弃名单", "在上面 —— 点开播放那条路不看这份名单，不影响")
@@ -3714,6 +3724,23 @@ HEAL_WATCH_MIN = 20
 HEAL_WATCH_POLL = 5
 
 
+def item_lib_monitor(key, item_path):
+    """这个条目所在的媒体库开没开实时监控 → True / False；认不出是哪个库 → None。"""
+    try:
+        libs = _emby("/Library/VirtualFolders", key) or []
+    except Exception:
+        return None
+    best, val = -1, None
+    for lb in libs:
+        for loc in lb.get("Locations") or []:
+            loc = str(loc).rstrip("/")
+            if loc and (item_path == loc or item_path.startswith(loc + "/")) \
+                    and len(loc) > best:
+                best = len(loc)
+                val = (lb.get("LibraryOptions") or {}).get("EnableRealtimeMonitor")
+    return None if best < 0 else bool(val)
+
+
 def _watch_snapshot(key, uid, iid, host):
     """这一刻条目和周围的样子 → dict；问不到 Emby 返回 None。"""
     try:
@@ -3796,6 +3823,10 @@ def do_heal_watch(q):
     host = _strm_host_path(d, _p)
 
     print(f"\n  {BOLD}补上之后盯着它：{name}{RST}  {DIM}v{SCRIPT_VERSION}{RST}")
+    _mon = item_lib_monitor(key, _p)
+    if _mon:
+        warn("它所在的媒体库开着实时监控 —— 补上的轨道 1 分多钟后多半会被它清掉。"
+             "跑一次「7 更新」会关掉（关掉不影响新片进库）。")
     hr()
     print(f"  {BOLD}一、先补上{RST}  {DIM}（点名补，不受额度限制）{RST}")
     heal_media_info(d, key, budget=HEAL_BUDGET, items=hits[:1])
@@ -3854,12 +3885,12 @@ def do_heal_watch(q):
             if not cur["streams"]:
                 hr()
                 warn(f"补上后 {el // 60} 分 {el % 60} 秒，音视频轨没了。")
-                if "条目内容（Etag）" not in diff and "strm 修改时间" not in diff:
-                    # 【条目没被改写、strm 没被碰】那就不是谁把它抹掉了，是它从来没存进去：
-                    # 前面看到的那几条是 Emby 探完之后临时留着的，到点就放掉了
-                    print(f"  {DIM}条目没被改写（Etag 没变）、strm 也没被碰 —— 不像是被谁"
-                          f"抹掉的，更像是从来没存进去：之前看到的那几条是 Emby 探完之后"
-                          f"临时留着的一份，到点就放掉了。{RST}")
+                if _mon:
+                    # 【真机抓到的就是这一种】补完 1 分 30 秒、没有任何计划任务在跑，
+                    # 轨道被清 —— 实时监控看见 strm 被写过，自己刷新了一遍
+                    print(f"  {DIM}它所在的库开着实时监控：补时长写回 strm 之后，监控"
+                          f"隔一会儿自己刷新这个条目，那一刻 Emby 探不到，就把轨道清了。"
+                          f"跑一次「7 更新」关掉它，再盯一次。{RST}")
                 print(f"  {DIM}把这一屏发给仓库主人（尤其是「探测那一刻 Emby 回的」那一行）。{RST}")
                 return
             prev = cur
@@ -8975,6 +9006,17 @@ STRM_LIB_OPTIONS = {
     # 下一次扫描读 .nfo 又灌回去。何况 strm 目录本来就是脚本生成、脚本清理的镜像目录 ——
     # 网盘里自带、由 AutoFilm 下载过来的那份才是用户的东西，不受这个影响。
     "SaveLocalMetadata": False,
+    # 【实时监控：补时长补上的轨道，90 秒后就是被它清掉的】
+    # 补时长探一个条目，要把 strm 临时写成 URL、探完写回路径形式。实时监控看见文件
+    # 变了，隔一小会儿（实测 1 分 30 秒）自己刷新这个条目 —— 而那一刻 strm 是路径
+    # 形式、Emby 探不到，于是把刚补上的音视频轨清空，时长留着。真机 heal-watch 抓到的
+    # 就是这个：3 条 → 0 条、条目 Etag 变了、那一刻没有任何计划任务在跑（实时监控的
+    # 刷新不算计划任务）。修改时间放回原样也拦不住：监控看的是"有人写过"，不是时间。
+    # 这就是"剧集补得住、电影补不住"：脚本自己建的库一直是关的（见 _emby_add_library），
+    # 在 Emby 网页里建的库是 Emby 默认的开。这里以前只在建库时关，没对已有的库对齐。
+    # 关掉不丢东西：strm 是脚本和 AutoFilm 批量生成的，数一变脚本自己会叫 Emby 扫
+    # （见 scan_if_grown，每小时一次，「5 生成媒体库」当场扫）。
+    "EnableRealtimeMonitor": False,
 }
 # 体检那边要单独引用，避免两处各写一份魔法数字
 RESUME_MIN_SECONDS = STRM_LIB_OPTIONS["MinResumeDurationSeconds"]
@@ -9087,6 +9129,14 @@ def tune_strm_libraries(key):
                   f"网盘库里那基本都是误判 —— 少一部片，而且进度条会坏。{RST}")
             print(f"  {DIM}关掉之后有几个文件就有几个条目。已经并在一起的，"
                   f"下一次扫描会拆开。{RST}")
+        if "EnableRealtimeMonitor" in diff:
+            ok(f"媒体库「{name}」关掉了实时监控")
+            print(f"  {DIM}补时长探完写回 strm，实时监控看见文件动过，1 分多钟后自己刷新"
+                  f"一遍，把刚补上的音视频轨清掉 —— 补一次掉一次。{RST}")
+            print(f"  {DIM}新文件照样进库：脚本发现 strm 数变了会叫 Emby 扫。{RST}")
+            # 【之前"补上又掉了"的那批立刻放回来】它们是被实时监控清掉的，不是补不住。
+            # 不清这张表的话，要白等 HEAL_STICK_H 小时才会再探。
+            save_ms_state(heal_ok={})
         _tog = [h for names, _v, h in STRM_LIB_TOGGLES
                 if _pick_opt_key(was, names) in diff]
         if _tog:
@@ -10957,10 +11007,10 @@ def hls_probe_url(iid, key):
 
 
 # 【探测那一刻 Emby 回了什么】只留在本进程里，给 heal-watch 当场打出来。
-# 为什么要看：窃听风云2 补完 ✔ 3 条轨道，1 分 30 秒后变 0 条 —— 条目 Etag 没变、
-# 那一刻脚本和 Emby 都没在跑任务。不是谁把它抹掉了，是它【从来没存进去】：✔ 读到的
-# 是 Emby 探完之后临时留着的那一份，过一会儿就放掉了。那份临时的是怎么来的
-# （开了一个「直播流」？协议是什么？），就藏在 PlaybackInfo 的回包里。
+# 当初加它，是怀疑补上的轨道"从来没存进去"、只是 Emby 临时留着的一份。真机回来的数：
+# 协议 Http、没开直播流、回包里 3 条轨道 —— 存进去了；1 分 30 秒后条目被改写（Etag
+# 变了）、轨道清空。真凶是媒体库的实时监控（见 STRM_LIB_OPTIONS）。留着它，下回再有
+# "补上又掉了"时一眼能看出 Emby 那一刻是怎么探的。
 _PROBE_LAST = {}
 
 
@@ -11095,7 +11145,8 @@ def _heal_one(d, key, _it, base, token):
                 # 最可能的解释：Emby 下一次扫库看见这个 strm "改过"，重读一遍，而此刻
                 # 它是路径形式、探不到（No such file），于是清掉轨道、留下时长。
                 # 【真机上否掉了】加上这一步之后再点名补，✔ 之后不到 3 分钟轨道就没了，
-                # 中间没有扫库 —— 掉轨道的不是这个（至少不止这个），真凶用 heal-watch 抓。
+                # 中间没有扫库。heal-watch 抓到的真凶是媒体库的实时监控：它看的是"有人
+                # 写过这个文件"，不看修改时间（见 STRM_LIB_OPTIONS 里 EnableRealtimeMonitor）。
                 # 这一步留着：把修改时间放回原样本身没有代价 —— 内容本来就没变，
                 # Emby 本来就不该当它改过。
                 # 只在内容原样写回时还原：内容真变了（老版本留下的 URL 形式改成路径），
@@ -17103,6 +17154,8 @@ def do_healthcheck():
                     what.append("续播门槛还是默认值（短片子不会有记忆）")
                 if allk & {"EnableMultiVersionByFiles", "EnableMultiVersionByMetadata"}:
                     what.append("多版本合并没关（名字相近的片子会被并成一部，进度条也会坏）")
+                if "EnableRealtimeMonitor" in allk:
+                    what.append("实时监控没关（补上的时长/轨道 1 分多钟后就被它清掉）")
                 _hc("媒体库选项", "bad", f"{names}  {YELLOW}{'；'.join(what)}{RST}")
                 todo.append((f"媒体库「{names.split('、')[0]}」的选项还是 Emby 默认值，"
                              f"对网盘库不合适",
@@ -17118,7 +17171,7 @@ def do_healthcheck():
                          if _miss else "")
                 _hc("媒体库选项", "ok",
                     f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、"
-                    f"多版本合并已关{_tail}")
+                    f"多版本合并已关、实时监控已关{_tail}")
 
             # 【私密库要能一眼验证】"以为遮住了、其实没遮"是这个功能唯一会真出事
             # 的失败方式，而它不会自己冒出来 —— 用户得亲自拿另一个账号登一次才
