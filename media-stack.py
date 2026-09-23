@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.141"
+SCRIPT_VERSION = "1.5.142"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3209,6 +3209,9 @@ def do_heal_tick(hot_only=False):
     ids = nginx_played_ids()
     if ids is None:
         ids = mediawarp_played_ids(HEAL_TICK_MIN + 2)
+        # 【脚本自己的请求不算】见 _self_touched —— 不减掉就是自己追着自己的尾巴
+        if ids:
+            ids = ids - _self_touched(HEAL_TICK_MIN + 3)
     ts = last_played_ts(key)
     water = float(ms_state().get("heal_tick_seen") or 0)
     moved = ts is not None and ts > water
@@ -3232,19 +3235,35 @@ def do_heal_tick(hot_only=False):
     _now = int(time.time())
     _cool = {k: v for k, v in (ms_state().get("heal_hot") or {}).items()
              if isinstance(v, (int, float)) and _now - v < HEAL_HOT_COOLDOWN_MIN * 60}
+    # 【一天最多探几次】这条路不设字节闸（见 HEAL_DAY_MB 那段），按集管：
+    # 冷却管住"边播边每分钟探一次"，这一道管住"一整天反复点开同一集探不出来的"
+    _today = time.strftime("%Y-%m-%d")
+    _tries = ms_state().get("heal_hot_n") or {}
+    if _tries.get("date") != _today:
+        _tries = {"date": _today, "n": {}}
+    _cnt = _tries.get("n") or {}
     _waiting = [x for x in hot if str(x[1]) in _cool]
-    hot = [x for x in hot if str(x[1]) not in _cool]
+    _spent = [x for x in hot if str(x[1]) not in _cool
+              and int(_cnt.get(str(x[1])) or 0) >= HEAL_HOT_DAY_TRIES]
+    hot = [x for x in hot if str(x[1]) not in _cool
+           and int(_cnt.get(str(x[1])) or 0) < HEAL_HOT_DAY_TRIES]
     if hot:
         _say(f"刚点开过、而且还缺媒体信息的有 {len(hot)} 个，先补这几个。")
         # 【先记再探】探到一半被 timeout 砍掉也算探过 —— 不然下一分钟又从头来一遍
         _cool.update({str(x[1]): _now for x in hot})
-        save_ms_state(heal_hot=_cool)
+        for x in hot:
+            _cnt[str(x[1])] = int(_cnt.get(str(x[1])) or 0) + 1
+        save_ms_state(heal_hot=_cool, heal_hot_n={"date": _today, "n": _cnt})
         heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
         save_ms_state(heal_tick=int(time.time()))
         return                            # 这一轮就干这个 —— 队列交给下一轮
-    if _waiting:
-        _say(f"刚点开的 {len(_waiting)} 个 {HEAL_HOT_COOLDOWN_MIN} 分钟内已经探过、"
-             f"没探成 —— 冷却期内不重复探（media-stack heal-log 看上一次的结果）。")
+    if _waiting or _spent:
+        if _waiting:
+            _say(f"刚点开的 {len(_waiting)} 个 {HEAL_HOT_COOLDOWN_MIN} 分钟内已经探过、"
+                 f"没探成 —— 冷却期内不重复探（media-stack heal-log 看上一次的结果）。")
+        if _spent:
+            _say(f"刚点开的 {len(_spent)} 个今天已经因为点开探过 {HEAL_HOT_DAY_TRIES} 次、"
+                 f"都没成 —— 今天不再自动探。想再试：media-stack heal 片名 集数")
         return
     if hot_only:
         # 【整队那一轮正在后台跑】列全库、按游标轮转的活它在干，这里再干一遍就是
@@ -3477,17 +3496,10 @@ def do_heal_trace(q, play=True):
             _what = ("整队补时长（刚点开的那几条不受它影响）" if _sub == "heal"
                      else "heal-tick")
             _trace_row("·", "正在跑", f"{_what}，已经 {_s // 60} 分 {_s % 60} 秒")
-    # 【报的是"看片后"那一档的额度】这条链走的就是它；整队补积压的碰不到留出来的那截
-    _left, _used = heal_budget("看片后")
-    _bl, _ = heal_budget("整队")
-    if _left <= 0:
-        _trace_row("✖", "今天的额度", f"用完了（约 {_used:.0f}/{HEAL_DAY_MB} MB）—— "
-                   f"今天点开什么都不会自动探，明天零点清零。"
-                   f"等不及：media-stack heal {q}（点名的不受额度限制）")
-    else:
-        _trace_row("✔", "今天的额度", f"刚点开的那几集还能用约 {_left:.0f} MB"
-                   f"{DIM}（已用 {_used:.0f}；补积压的只能用到 "
-                   f"{HEAL_DAY_MB - HEAL_HOT_RESERVE_MB}，还剩 {_bl:.0f}）{RST}")
+    # 【点开的那一集不受额度管】只报一句，免得人以为这条链会被额度卡住
+    _bl, _used = heal_budget("整队")
+    _trace_row("✔", "今天的额度", f"点开的那一集不受限{DIM}（额度只管补积压："
+               f"已用 {_used:.0f}/{HEAL_DAY_MB} MB，还剩 {_bl:.0f}）{RST}")
     try:
         _st = os.stat(NGX_ACCESS_LOG)
     except OSError:
@@ -3541,6 +3553,17 @@ def do_heal_trace(q, play=True):
         _trace_row("⚠", "冷却中", f"{int((time.time() - _hot_at) // 60)} 分钟前刚因为点开"
                    f"探过它 —— 再过 {_cool_left // 60 + 1} 分钟才会再自动探"
                    f"（防止一集探不出来、边播边每分钟探一次）")
+    _ok_at = heal_unstuck(iid)
+    if _ok_at:
+        _trace_row("⚠", "补上又掉了", f"{int((time.time() - _ok_at) // 3600)} 小时前补上过，"
+                   f"现在又没了 —— {HEAL_STICK_H} 小时内不再自动探（再探也是补上再掉）。"
+                   f"这一种是 bug，把这一屏发给仓库主人")
+    _tn = ms_state().get("heal_hot_n") or {}
+    if _tn.get("date") == time.strftime("%Y-%m-%d"):
+        _k = int((_tn.get("n") or {}).get(iid) or 0)
+        if _k:
+            _trace_row("⚠" if _k >= HEAL_HOT_DAY_TRIES else "·", "今天因点开探过",
+                       f"{_k} 次（一天最多 {HEAL_HOT_DAY_TRIES} 次）")
     _gv = heal_fail_table().get(iid)
     if _gv:
         _trace_row("·", "放弃名单", "在上面 —— 点开播放那条路不看这份名单，不影响")
@@ -8485,6 +8508,48 @@ def nginx_played_ids():
                           buf.decode("utf-8", "replace"), re.I))
 
 
+# 脚本自己打给 MediaWarp 的请求（预热、补时长问 m3u8）记在这儿：一行一条 "秒 条目id"。
+# 追加写，几个进程同时写也不会串行（一行远小于 PIPE_BUF）。
+SELF_TOUCH_LOG = TRAFFIC_DIR + "/mw-self.log"
+
+
+def self_touch(iid):
+    """记一笔：脚本自己刚请求过 MediaWarp 的这个条目。写不上就算了，不许连累主流程。"""
+    try:
+        os.makedirs(TRAFFIC_DIR, exist_ok=True)
+        with open(SELF_TOUCH_LOG, "a", encoding="ascii") as f:
+            f.write(f"{int(time.time())} {iid}\n")
+        if os.path.getsize(SELF_TOUCH_LOG) > (1 << 20):
+            with open(SELF_TOUCH_LOG, encoding="ascii", errors="replace") as f:
+                keep = f.read().splitlines()[-2000:]
+            with open(SELF_TOUCH_LOG, "w", encoding="ascii") as f:
+                f.write("\n".join(keep) + "\n")
+    except OSError:
+        pass
+
+
+def _self_touched(minutes):
+    """最近这些分钟里脚本自己请求过的条目 id。
+
+    【为什么要有】MediaWarp 的容器日志里分不出谁在请求 —— 每小时的预热、补时长问
+    m3u8，打的都是 /Videos/<id>/stream，跟播放器一模一样。实测撞上的：半夜 00:20、
+    00:30……01:50，每 10 分钟同一批 8 部电影被当成"刚点开"又探一遍，而那个点根本
+    没人在看。补时长自己的请求又喂出下一轮的信号 —— 自己追着自己的尾巴。
+    nginx 那份日志没有这个问题（脚本的请求直连 127.0.0.1，不经过 nginx）。
+    """
+    cut = time.time() - minutes * 60
+    out = set()
+    try:
+        with open(SELF_TOUCH_LOG, encoding="ascii", errors="replace") as f:
+            for ln in f.read().splitlines()[-2000:]:
+                a = ln.split()
+                if len(a) == 2 and a[0].isdigit() and int(a[0]) >= cut:
+                    out.add(a[1])
+    except OSError:
+        pass
+    return out
+
+
 def mediawarp_played_ids(minutes):
     """最近这些分钟里，MediaWarp 上有播放请求的条目 id。【读不到返回 None】。
 
@@ -10036,14 +10101,22 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 留的保险（比如一口气看了一百部、或者哪天判据又出漏洞）。不做成可调的：多一个旋钮
 # 就多一份"设错了怎么办"。
 HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）。用满就停，明天接着
-# 【这 2048 里留一截给"你刚点开的那一集"，整队补积压的碰不到】
-# 实测撞上的：半夜整队补积压那几轮（00:00~02:10）探了 172 次、花掉 2365 MB，把
-# 当天额度用得一干二净。晚上点开两集新片，自动那条路读到了、挑出来了，然后
-# 「今天的额度用完了」—— 真正在等进度条的那一集，被一堆没人在等的积压挤掉了。
-# 两件事的轻重完全不同：积压晚一天补没人察觉；刚点开的那一集晚一天，这一天里
-# 每看一次都在丢进度。所以积压只许用到 HEAL_DAY_MB - 这一截。
-# 512 MB 够探几十集（m3u8 那条路一集几 MB 到几十 MB），一天看不了这么多新片。
-HEAL_HOT_RESERVE_MB = 512
+# 【这 2048 只管补积压；你点开的那一集不设额度闸】
+# 实测撞上的：半夜整队补积压那几轮探了 172 次、花掉 2365 MB，把当天额度用得一干
+# 二净。晚上点开两集新片，自动那条路读到了、挑出来了，然后「今天的额度用完了」。
+# 仓库主人：「点击播放这个探测应该不受限制，因为一天点不了多少」。
+# 对：刚点开的那一集晚一天补，这一天里每看一次都在丢进度；而一天点开的集数是有数的。
+# 这条路自己的刹车是下面三道 —— 按【集】管，不按字节管：
+#   · 信号只认真客户端的请求（脚本自己的预热 / 探测不算，见 _self_touched）
+#   · 同一集 HEAL_HOT_COOLDOWN_MIN 分钟内只探一次、一天最多 HEAL_HOT_DAY_TRIES 次
+#   · 补上又掉了的，HEAL_STICK_H 小时内不再探（见 heal_unstuck）
+# 花的照样记账，照样算进当天的总数 —— 只是不被它拦。
+HEAL_HOT_DAY_TRIES = 3
+# 【补上了又掉了的，这么多小时内不再探】流水里撞上的：鹿鼎记、功夫、大话西游这一批
+# 【每 10 分钟探一次、每次都 ✔】，一个晚上探了一百多次 —— 补上之后又被什么抹掉了。
+# 这种再探一百遍也是同一个结局：✔ 然后再掉。一次几 MB 到几十 MB，全是白买的。
+# 一天给一次机会：真是偶然抹掉的，第二天就补回来了；每次都掉的，一天只白花一次。
+HEAL_STICK_H = 24
 # 【同一集点开之后，这么久之内不再探第二次】一集播放中客户端会反复请求
 # /videos/<id>/（实测一集 79 次），每分钟的 tick 都会再读到它。探成功的下一轮
 # 就被筛掉了，可要是这一集【探不出来】，每分钟就会再探一次 —— 看一小时就是
@@ -10319,12 +10392,41 @@ def heal_how(items):
 def heal_budget(how=None):
     """今天 heal 还剩多少额度 → (剩余 MB, 已用 MB)。跨天自动清零。
 
-    how 是「整队」时要让出 HEAL_HOT_RESERVE_MB —— 那一截只给刚点开的那几集。
+    【只有整队受它管】看片后、点名都不设闸（见 HEAL_DAY_MB 那段），但花的照样记进
+    已用 —— 所以点开得多的那天，留给补积压的就少。这个顺序是对的。
+    how 留着是给调用方写清"问的是哪一档"，数是同一个。
     """
     st = ms_state().get("heal_day") or {}
     used = float(st.get("mb") or 0) if st.get("date") == time.strftime("%Y-%m-%d") else 0.0
-    cap = HEAL_DAY_MB - (HEAL_HOT_RESERVE_MB if how == "整队" else 0)
-    return max(0.0, cap - used), used
+    return max(0.0, HEAL_DAY_MB - used), used
+
+
+def heal_budget_applies(how):
+    """这一档受不受每日额度管。只有整队受。"""
+    return how == "整队"
+
+
+def heal_ok_mark(iids):
+    """记下这几个条目刚补上的时间 —— heal_unstuck 靠它认出"补上又掉了"。"""
+    if not iids:
+        return
+    now = int(time.time())
+    cur = {k: v for k, v in (ms_state().get("heal_ok") or {}).items()
+           if isinstance(v, (int, float)) and now - v < HEAL_STICK_H * 3600}
+    cur.update({str(i): now for i in iids})
+    save_ms_state(heal_ok=cur)
+
+
+def heal_unstuck(iid, now=None):
+    """这个条目 HEAL_STICK_H 小时内补上过（现在又缺了）→ 返回补上时的时间戳，否则 0。
+
+    调用方拿到的都是【现在还缺】的条目，所以"补上过"就等于"补上又掉了"。
+    """
+    now = now or time.time()
+    v = (ms_state().get("heal_ok") or {}).get(str(iid))
+    if isinstance(v, (int, float)) and now - v < HEAL_STICK_H * 3600:
+        return v
+    return 0
 
 def heal_budget_spend(mb, probes=0):
     """记一笔账。跨天先清零再记。"""
@@ -10467,21 +10569,33 @@ def heal_media_info(d, key, budget=None, items=None):
         return
     _how_try = heal_how(items)
     _left, _used = heal_budget(_how_try)
-    # 【点名的不设闸】那是你亲手敲的「就补这一部」，最多 HEAL_BY_NAME_MAX 个 ——
-    # 额度用完的那天，它是唯一能立刻补上一集的办法。花的照样记账。
-    _nolimit = _how_try == "点名"
+    # 【只有整队受额度管】点名是你亲手敲的「就补这一部」；看片后是你刚点开的那一集。
+    # 两条都按集管住了（最多 HEAL_BY_NAME_MAX 个、冷却、一天几次），不按字节拦。
+    # 花的照样记账。
+    _nolimit = not heal_budget_applies(_how_try)
+    # 【补上又掉了的不再白买】见 HEAL_STICK_H。点名的不拦 —— 你亲手敲的那一集，
+    # 就是想看看它这次还掉不掉。
+    if _how_try != "点名":
+        _now_s = time.time()
+        _loose = [x for x in allpend if heal_unstuck(x[1], _now_s)]
+        if _loose:
+            allpend = [x for x in allpend if not heal_unstuck(x[1], _now_s)]
+            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+                      f"跳过 {len(_loose)} 个补上又掉了的（{HEAL_STICK_H} 小时内不再探）："
+                      + "、".join(str(x[2])[:20] for x in _loose[:6])
+                      + ("…" if len(_loose) > 6 else "")])
+            if not allpend:
+                return
     # 【没探也要进流水】cron 那几轮的输出全进 /dev/null。只记"探了什么"不记"为什么
     # 没探"，翻流水的人看到的就是一片空白 —— 和"根本没触发"长得一模一样。
     if _left <= 0 and not _nolimit:
-        _cap_mb = HEAL_DAY_MB - (HEAL_HOT_RESERVE_MB if _how_try == "整队" else 0)
+        _cap_mb = HEAL_DAY_MB
         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
                   f"没探：今天的额度用完了（约 {_used:.0f}/{_cap_mb} MB），"
                   f"{len(allpend)} 个没轮上"])
         print()
-        info(f"今天补时长已经用掉约 {_used:.0f} MB（这一类的上限 {_cap_mb} MB），这轮不探了")
-        if _how_try == "整队":
-            print(f"  {DIM}剩下那 {HEAL_HOT_RESERVE_MB} MB 留给你刚点开的那几集，"
-                  f"补积压的碰不到。{RST}")
+        info(f"今天补时长已经用掉约 {_used:.0f} MB（上限 {_cap_mb} MB），补积压这轮不探了")
+        print(f"  {DIM}你点开的那一集不受这个限：点开播放，一分钟左右自动补上。{RST}")
         print(f"  {DIM}明天零点自动清零接着探。还有 {len(allpend)} 个排队。"
               f"想现在就补某一集：media-stack heal 片名 集数（点名的不受额度限制）{RST}")
         return
@@ -10650,6 +10764,7 @@ def hls_probe_url(iid, key):
     不是转码流、或者这个文件在网盘那边没有转码版本（夸克对很多电影就没有，会
     回落成原画），这里就返回 "" —— 调用方照旧走原来那条路，行为不退步。
     """
+    self_touch(iid)                   # 这是补时长自己的请求，别被当成有人点了播放
     try:
         op = urllib.request.build_opener(_NoRedirect)
         req = urllib.request.Request(
@@ -10889,6 +11004,8 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                 if res == "ok":
                     done += 1
                     fails.append((_it[1], True))
+                    # 【记下补上的时间】下次它又缺了，就知道是"补上又掉了"
+                    heal_ok_mark([_it[1]])
                     print(f"  {GREEN}\u2714{RST} {pad(str(idx) + '/' + str(total), 9)}"
                           f"{name[:26]}  {note}  {DIM}{sec:.0f}s{RST}")
                 elif res == "skip":
@@ -15375,6 +15492,7 @@ def warm_links(d, key, limit=None):
             print(f"\r  {DIM}·{RST} {pad(name[:24], 26)}"
                   f"{DIM}接线中… 最多 {WARM_STEP_T} 秒{RST}\033[K",
                   end="", flush=True)
+            self_touch(iid)           # 预热是脚本自己的请求，别被当成有人点了播放
             url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
                    f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
             loc, why = "", ""
@@ -15551,6 +15669,7 @@ def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
     probed_mount = rel.split("/")[0] if rel else ""
 
     iid = item.get("Id")
+    self_touch(iid)                   # 体检自己的请求，别被当成有人点了播放
     url = (f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
            f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}")
     opener = urllib.request.build_opener(_NoRedirect)
