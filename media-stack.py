@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.147"
+SCRIPT_VERSION = "1.5.148"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5392,9 +5392,43 @@ def fix_episode_titles(d, rules, key, skip=(), items=None):
     """
     if not key:
         return 0
+    if items is None:
+        items = _episode_items(key)
     got = untitled_episodes(d, rules, key, items)
     if not got:
         return 0
+    # 【号写错了的占位符，不能交回给刮削器】「179.第79集」这种：名字是刮削源给的，
+    # 而刮削源那条数据本身就错（实测 TMDb 给第 157 集的标题是「第57集」、给第 179 集
+    # 的是「第79集」）。重新识别只会再问一遍同一个源、拿回同一个错名字，然后记进
+    # ep_title_tried，从此再也不修 —— 这正是它一直挂着的原因。
+    # 这种由脚本自己写名字：在 strm 旁边写那份编号 nfo，季集号照 Emby 现在认的写
+    # （编号本来就是对的，错的只有名字），名字写「第179集」。
+    # 【规则文件里写了 episode_number: false 的库不写】那是"别在我的库里放 nfo"。
+    _by_id = {str(i.get("Id")): i for i in (items or [])}
+    _no_nfo = lib_strm_dirs(d, rules, [r["name"] for r in rules
+                                       if (r.get("type") or "movies") == "tvshows"
+                                       and (r.get("epnum") is False
+                                            or (r.get("epnum") is None
+                                                and ep_fix_setting() is False))])
+    fixed = []
+    for hp, iid in list(got.items()):
+        it = _by_id.get(str(iid)) or {}
+        if not _wrong_ep_placeholder(it.get("Name"), it.get("IndexNumber")):
+            continue
+        # 不管写没写成、库里让不让写，都别再交给刮削器 —— 再问一遍还是那个错名字
+        got.pop(hp, None)
+        if any(_under(hp, q) for q in _no_nfo):
+            continue
+        if write_episode_nfo(hp, int(it.get("ParentIndexNumber") or 1),
+                             int(it.get("IndexNumber"))):
+            fixed.append((hp, iid, it.get("Name"), it.get("IndexNumber")))
+    if fixed:
+        refresh_items(key, [iid for _hp, iid, _n, _i in fixed])
+        ok(f"{len(fixed)} 个剧集的名字是刮削源给错了号的（比如"
+           f"「{fixed[0][2]}」挂在第 {fixed[0][3]} 集上），改成按集号起名"
+           f"{DIM}（旁挂 .nfo，文件名和网盘都没动）{RST}")
+    if not got:
+        return len(fixed)
     tried = set(ms_state().get("ep_title_tried") or []) | set(skip)
     todo = [(hp, iid) for hp, iid in got.items() if hp not in tried]
     if not todo:
