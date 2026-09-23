@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.142"
+SCRIPT_VERSION = "1.5.143"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10806,6 +10806,7 @@ def _heal_one(d, key, _it, base, token):
         return "skip", name, el(), ""
     try:
         original = open(host, encoding="utf-8").read()
+        _st0 = os.stat(host)
     except OSError:
         return "skip", name, el(), ""
     p = strm_target_path(original)
@@ -10880,8 +10881,20 @@ def _heal_one(d, key, _it, base, token):
             # 还原必须发生：留在 URL 形式上的话，这个条目的播放就绕过了直链缓存，
             # 每次开播都要现换一次直链（实测 7.5~47 秒）
             try:
+                _back = original if original.strip().startswith("/") else p
                 with open(host, "w", encoding="utf-8") as f:
-                    f.write(original if original.strip().startswith("/") else p)
+                    f.write(_back)
+                # 【修改时间也要还原】内容一字不差地写回去了，可文件的修改时间变成了
+                # "刚刚"。实测撞上的：窃听风云2 一小时内三次 ✔ 119 分钟，三次都又变回
+                # 0 条轨道（时长还在），而 nginx 日志里一次播放都没有 —— 不是谁点了它。
+                # 最可能的解释：Emby 下一次扫库看见这个 strm "改过"，重读一遍，而此刻
+                # 它是路径形式、探不到（No such file），于是清掉轨道、留下时长。
+                # 这一点还没在真机上证实；但把修改时间放回原样本身没有代价 —— 内容
+                # 本来就没变，Emby 本来就不该当它改过。
+                # 只在内容原样写回时还原：内容真变了（老版本留下的 URL 形式改成路径），
+                # 那就该让 Emby 知道。
+                if _back == original:
+                    os.utime(host, ns=(_st0.st_atime_ns, _st0.st_mtime_ns))
             except OSError as e:
                 err(f"{name[:26]} 的 strm 没还原成路径形式：{e}")
         # 【核对必须在还原之后】上一版在还原【之前】读，于是判"成功"用的是一个紧接着
