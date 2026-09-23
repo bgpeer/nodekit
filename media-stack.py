@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.139"
+SCRIPT_VERSION = "1.5.140"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1519,6 +1519,8 @@ case "${1:-info}" in
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
+  heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
+                  (--no-play 只看不按)
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「6 链路体检」)
@@ -1670,6 +1672,12 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     exec python3 "$S" heal-tick ;;
+  heal-trace)
+    # 【参数要透传】片名常常是好几个词（完美世界 287），吃掉一个就对不上
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" heal-trace "$@" ;;
   heal-log)
     # 【流水里有片名，所以要 root】Python 那边也再拦一道
     S=/etc/bgpeer/media-stack.py
@@ -2363,7 +2371,10 @@ def cron_cmd(sub):
     return cmd
 
 
-_TASK_LOCK_FH = None          # 必须活到进程结束：句柄一关，锁就放了
+# 必须活到进程结束：句柄一关，锁就放了。
+# 【是一张表，不是一个句柄】heal-tick 要同时拿两把（自己那把 + 补时长那把）；
+# 存成单个全局变量的话，拿第二把时第一把的句柄被覆盖、被回收，锁就悄悄放了。
+_TASK_LOCK_FHS = {}
 
 
 def take_task_lock(sub):
@@ -2372,7 +2383,6 @@ def take_task_lock(sub):
     用 fcntl 而不是再 fork 一个 flock：锁跟着进程走，进程无论怎么死（被 timeout 杀、
     OOM、断电）内核都会自动放锁，不会留下一把没人认领的锁挡住后面所有轮。
     """
-    global _TASK_LOCK_FH
     d = CRON_LOCK_DIR
     try:
         os.makedirs(d, exist_ok=True)
@@ -2388,7 +2398,7 @@ def take_task_lock(sub):
     except OSError:
         fh.close()
         return False                    # 锁被占着 —— 上一轮还在跑，安静退出
-    _TASK_LOCK_FH = fh
+    _TASK_LOCK_FHS[sub] = fh
     return True
 
 
@@ -2538,6 +2548,13 @@ def do_selfupdate():
             # 所有定时任务一起废掉 —— 而且下一轮自动更新也跑不起来，救不回来。
             compile(body, me, "exec")
             m = re.search(r'SCRIPT_VERSION\s*=\s*"([^"]+)"', body)
+            # 【cur 必须在这儿读】这一行以前直接 f.write(cur)，而 cur 从没定义过 ——
+            # 于是【只要仓库里有新版】就 NameError，被下面的 except 吞成一条 error，
+            # 本机这份一个字节都没换。自动更新从那以后一次都没成过，修好的东西只有
+            # 手动「7 更新」才到得了机器上。已是最新的那条分支走不到这儿，所以平时
+            # 看起来一切正常。
+            with open(me, encoding="utf-8") as f:
+                cur = f.read()
             with open(me + ".prev", "w", encoding="utf-8") as f:
                 f.write(cur)                  # 留一份上一版，出事能手动换回去
             tmp = me + ".new"
@@ -2653,6 +2670,26 @@ def install_heal_cron(install_dir):
     except OSError as e:
         warn(f"装补时长定时任务失败（不影响使用）：{e}")
         return False
+
+
+def refresh_heal_cron():
+    """机器上那条 heal-tick cron 和这份脚本对不上（间隔 / timeout）→ 重写。返回重写没有。
+
+    【为什么要有】自动更新只换脚本、不重装 cron。间隔从 10 分钟改成 1 分钟之后，
+    机器上那条还是老的 */10 —— 脚本是新的，节奏还是旧的，这次改动等于没到。
+    cron 指向的就是这个文件，所以让 tick 每次自己看一眼：一个小文件的读，对不上才写。
+
+    【没装就别自己装回去】文件不在，可能是被卸载了 —— 那不是这里该拍板的事。
+    """
+    try:
+        with open(HEAL_CRON, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return False
+    if (re.search(rf"^\*/{HEAL_TICK_MIN} \* \* \* \* ", txt, re.M)
+            and cron_cmd("heal-tick") in txt):
+        return False
+    return install_heal_cron(ms_install_dir())
 
 
 def install_warm_cron(install_dir):
@@ -3133,7 +3170,7 @@ def do_warm():
         pass
 
 
-def do_heal_tick():
+def do_heal_tick(hot_only=False):
     """每 HEAL_TICK_MIN 分钟一次：有人看过片才补一轮时长。安静跑。
 
     【为什么要这一条】补时长本来挂在每小时那条上，于是刚看完的一集最多要等一小时
@@ -3195,6 +3232,11 @@ def do_heal_tick():
         heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
         save_ms_state(heal_tick=int(time.time()))
         return                            # 这一轮就干这个 —— 队列交给下一轮
+    if hot_only:
+        # 【整队那一轮正在后台跑】列全库、按游标轮转的活它在干，这里再干一遍就是
+        # 同一批条目探两遍。刚点开的那几条已经在上面处理过了。
+        _say("刚点开过的条目里没有缺媒体信息的；整队那一轮在后台跑着，这里不重复。")
+        return
     # 【刚点开的那几条都齐了，而 Emby 那边也没有新的播放完成 → 没有理由列全库】
     # 这一条是"平时几乎没有代价"的全部依据：连着看片的时候日志里一直有 id，
     # 要是不看"它们缺不缺"就照跑，等于每分钟列一次全库 —— 而那正是这条轮子
@@ -3227,6 +3269,381 @@ def do_heal_tick():
     # 【跑完留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"——
     # 这台机器上已经栽过一次：三条任务全被锁死，而体检那行一直是绿的。
     save_ms_state(heal_tick=int(time.time()))
+
+
+# ============================================================================ heal-trace
+# 【替你按一次播放，把"点开 → 有进度条"的每一步都掐上表】
+# 仓库主人：「刚刚播放了一会还是没补上，你要不要写个检测代码直接拉起播放然后到补上
+# 探测这一个过程全部给他算出来」。
+# 这条链有五节：请求进日志 → heal-tick 读走 → 探测 → 落进流水 → Emby 里有时长。
+# 只看结局（"还是 0B"）分不出断在哪一节，而每一节坏了的修法完全不同。
+HEAL_TRACE_POLL = 2
+# 最多盯多久：等下一次触发 + 一轮的预算 + 一点余量。再久就不是"慢"，是断了
+HEAL_TRACE_WAIT = HEAL_TICK_MIN * 60 + HEAL_TICK_BUDGET + 60
+
+
+def _emby_site_local():
+    """nginx 里 emby 那个站点 → (server_name, 端口)。没有返回 None。
+
+    【读的是 NGX_SITE 本身，不从 cfg 拼】要打的是【真在跑的那份配置】—— 拼出来的
+    和实际生效的对不上，正是这种工具该抓出来的东西，不该被它自己掩盖掉。
+    """
+    try:
+        with open(NGX_SITE, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return None
+    for blk in txt.split("server {")[1:]:
+        m = re.search(r"server_name\s+(emby\.[^\s;]+)\s*;", blk)
+        if not m:
+            continue
+        lp = re.search(r"listen\s+(?:127\.0\.0\.1:)?(\d+)\s+ssl", blk)
+        return m.group(1), (int(lp.group(1)) if lp else 443)
+    return None
+
+
+def _trace_play(iid, msid, key):
+    """替你按一次播放 → (走的哪条路, 状态码 或 错误说明, 秒数)。
+
+    发的是播放器按下播放时发的那一个请求：/videos/<id>/stream。MediaWarp 回 302
+    指向网盘直链，【这里不跟过去】—— 跟你在手机上点一下一样换一次直链，但一个
+    视频字节都不拉。
+
+    【走 nginx，而且连的是本机】有域名的机器，手机上的请求就是经 nginx 进来的，
+    heal-tick 读的也是 nginx 那份日志。直接打 MediaWarp 的话日志里不会有这一条，
+    测出来的就不是那条真实的链。连 127.0.0.1、SNI 填 emby 子域：不出这台机器，
+    也就不会经过 CDN / 节点的 SNI 分流。
+    """
+    import http.client
+    path = (f"/emby/videos/{iid}/stream?MediaSourceId={urllib.parse.quote(str(msid))}"
+            f"&Static=true&api_key={key}")
+    site = _emby_site_local()
+    via = "nginx" if site else "MediaWarp"
+    t0 = time.monotonic()
+    try:
+        if site:
+            import socket
+            import ssl
+            host, port = site
+            # 连的是 127.0.0.1，中间没有别人，证书校验防的那种人在这条路上不存在；
+            # 而证书快过期、刚换过这类情况不该让一个诊断工具跟着一起挂
+            ctx = ssl._create_unverified_context()
+
+            class _Local(http.client.HTTPSConnection):
+                def connect(self):
+                    raw = socket.create_connection(("127.0.0.1", port), self.timeout)
+                    self.sock = ctx.wrap_socket(raw, server_hostname=host)
+
+            c = _Local(host, port, timeout=60)
+        else:
+            c = http.client.HTTPConnection("127.0.0.1", MEDIAWARP_PORT, timeout=60)
+        c.request("GET", path, headers={"User-Agent": HTTP_UA, "Range": "bytes=0-0"})
+        r = c.getresponse()
+        code = r.status
+        r.close()
+        c.close()
+        return via, code, time.monotonic() - t0
+    except Exception as e:
+        return via, _short_err(e), time.monotonic() - t0
+
+
+def _ngx_hit_after(off, iid):
+    """从 off 往后找第一条请求了这个条目的日志 → 那一行【结束】处的偏移；没有 → None。
+
+    返回行尾而不是行首：heal-tick 的偏移走过行尾，才算把这一行读走了。
+    """
+    try:
+        with open(NGX_ACCESS_LOG, "rb") as f:
+            f.seek(off)
+            buf = f.read(NGX_TAIL_MAX)
+    except OSError:
+        return None
+    m = re.search(rb"/videos/" + re.escape(str(iid).encode()) + rb"/[^\n]*\n",
+                  buf, re.I)
+    return off + m.end() if m else None
+
+
+def _ngx_past_plays(iid):
+    """这个条目在 nginx 日志里被请求过几次、最近一次在什么时候 → (次数, 时间串)。
+    日志读不到 → None（= 不知道，不是"没请求过"）。
+
+    【只取时间，不取 IP、不取整行】这一屏是会被截图发出去的；整行里有客户端 IP，
+    还有带 api_key 的地址。
+    """
+    hits, last, got = 0, "", False
+    pat = rb"/videos/" + re.escape(str(iid).encode()) + rb"/"
+    for path in (NGX_ACCESS_LOG + ".1", NGX_ACCESS_LOG):   # 先旧后新，last 落在最新
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - (8 << 20)))
+                buf = f.read()
+        except OSError:
+            continue
+        got = True
+        for ln in buf.split(b"\n"):
+            if re.search(pat, ln, re.I):
+                hits += 1
+                m = re.search(rb"\[([^\]]+)\]", ln)
+                if m:
+                    last = m.group(1).decode("ascii", "replace")
+    return (hits, last) if got else None
+
+
+def _trace_item(key, uid, iid):
+    """条目此刻的样子 → {ticks, streams, msid}；问不到 → None。
+
+    【时长看 MediaSource 的，不看条目的】条目上那个可能是 TMDb 刮来的片长，
+    进度条认的是 MediaSource 那个 —— 和 items_without_duration 同一个判据。
+    """
+    try:
+        it = _emby(f"/Users/{uid}/Items/{iid}?Fields=Path,MediaSources,MediaStreams",
+                   key, timeout=30)
+    except Exception:
+        return None
+    srcs = it.get("MediaSources") or []
+    ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+             else (it.get("RunTimeTicks") or 0))
+    nstr = (len(it.get("MediaStreams") or [])
+            or sum(len(x.get("MediaStreams") or []) for x in srcs))
+    msid = (srcs[0].get("Id") if srcs else "") or f"mediasource_{iid}"
+    return {"ticks": ticks, "streams": nstr, "msid": msid}
+
+
+def _trace_row(mark, label, text):
+    col = {"✔": GREEN, "✖": RED, "⚠": YELLOW}.get(mark, DIM)
+    print(f"  {col}{mark}{RST} {pad(label, 18)}{text}", flush=True)
+
+
+def do_heal_trace(q, play=True):
+    """media-stack heal-trace <片名>：替你按一次播放，掐表看它多久补上、卡在哪一节。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        return
+    if not (q or "").strip():
+        warn("要告诉我是哪一集，比如：media-stack heal-trace 完美世界 287")
+        return
+    print(f"\n  {BOLD}点开 → 有进度条：一节一节掐表{RST}  {DIM}v{SCRIPT_VERSION}{RST}")
+
+    # ------------------------------------------------------------ 一、这条链上的闸
+    hr()
+    print(f"  {BOLD}一、这条链上的几道闸{RST}")
+    try:
+        with open(HEAL_CRON, encoding="utf-8") as f:
+            ctxt = f.read()
+    except OSError:
+        ctxt = None
+    if ctxt is None:
+        _trace_row("✖", "看片后补时长", "定时任务没装 —— 点开之后不会有任何东西来补。"
+                   "跑一次「7 更新」装上")
+    else:
+        m = re.search(r"^\*/(\d+) \* \* \* \* ", ctxt, re.M)
+        n = int(m.group(1)) if m else 0
+        if n == HEAL_TICK_MIN:
+            _trace_row("✔", "看片后补时长", f"每 {n} 分钟看一眼")
+        else:
+            # 【自动更新只换脚本、不重装 cron】refresh_heal_cron 会在下一次 tick 自己改
+            _trace_row("⚠", "看片后补时长",
+                       f"机器上的定时任务还是每 {n or '?'} 分钟 —— 这份脚本要的是每 "
+                       f"{HEAL_TICK_MIN} 分钟。下一次它自己跑的时候会改过来")
+    _ht = int(ms_state().get("heal_tick") or 0)
+    if _ht:
+        _trace_row("·", "上一次跑完", f"{int(time.time() - _ht)} 秒前")
+    else:
+        _trace_row("⚠", "上一次跑完", "一次都没跑完过（或者是升级前的版本，没记这个）")
+    for _p, _sub, _s in running_tasks():
+        if _sub in ("heal", "heal-tick"):
+            _what = ("整队补时长（刚点开的那几条不受它影响）" if _sub == "heal"
+                     else "heal-tick")
+            _trace_row("·", "正在跑", f"{_what}，已经 {_s // 60} 分 {_s % 60} 秒")
+    _left, _used = heal_budget()
+    if _left <= 0:
+        _trace_row("✖", "今天的额度", f"用完了（约 {_used:.0f}/{HEAL_DAY_MB} MB）—— "
+                   f"今天点开什么都不会探，明天零点清零")
+    else:
+        _trace_row("✔", "今天的额度", f"还剩约 {_left:.0f} MB（已用 {_used:.0f}）")
+    try:
+        _st = os.stat(NGX_ACCESS_LOG)
+    except OSError:
+        _st = None
+    _site = _emby_site_local()
+    if _st and _site:
+        _trace_row("✔", "点播放的信号", "从 nginx 访问日志读（按字节增量，便宜）")
+    else:
+        _trace_row("·", "点播放的信号", "没有 nginx 那份日志，从 MediaWarp 容器日志读")
+
+    # ------------------------------------------------------------ 二、这一集
+    hr()
+    print(f"  {BOLD}二、这一集现在是什么样{RST}")
+    hits = find_strm_items(key, q)
+    if not hits:
+        warn(f"strm 媒体库里没找到「{q}」。")
+        print(f"  {DIM}按词找，每个词都要对上（剧名、集名、文件名任一处）。"
+              f"少给几个词试试。{RST}")
+        return
+    if len(hits) > 1:
+        warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只掐一集，多给几个词：")
+        for h in hits[:10]:
+            print(f"    {DIM}·{RST} {h[2]}")
+        if len(hits) > 10:
+            print(f"    {DIM}……还有 {len(hits) - 10} 个{RST}")
+        print(f"  {DIM}比如：media-stack heal-trace 完美世界 287{RST}")
+        return
+    uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
+    st0 = _trace_item(key, uid, iid)
+    if st0 is None:
+        warn("问不到 Emby（容器没起来？），没法往下测。")
+        return
+    _dur = f"{st0['ticks'] / 6e8:.0f} 分钟" if st0["ticks"] else "0（没有）"
+    _trace_row("·", "条目", f"{name}")
+    _trace_row("✔" if st0["ticks"] else "✖", "时长（MediaSource）", _dur)
+    _trace_row("✔" if st0["streams"] else "✖", "音视频轨", f"{st0['streams']} 条")
+    if st0["ticks"] and st0["streams"]:
+        ok("这一集时长和音视频轨都齐了 —— 没有东西可补，也就测不了这条链。")
+        print(f"  {DIM}要测就换一集还是 0B / 0bps 的。进度条还是记不住的话，原因不在"
+              f"补时长这边（仓库 tools/no-resume.sh 逐项查）。{RST}")
+        return
+    if not strm_items_need_heal(key, [iid]):
+        # 【两边判据对不上】这里看见它缺，自动那条路却认为不缺 —— 那它永远不会被补
+        _trace_row("✖", "自动那条路认不认", "不认 —— 它的筛子认为这一集【不用补】，"
+                   "点多少次播放都不会补。这是 bug，把这一屏发给仓库主人")
+    else:
+        _trace_row("✔", "自动那条路认不认", "认：点开之后它会被挑出来补")
+    _gv = heal_fail_table().get(iid)
+    if _gv:
+        _trace_row("·", "放弃名单", "在上面 —— 点开播放那条路不看这份名单，不影响")
+    past = _ngx_past_plays(iid) if _st else None
+    if past is not None:
+        if past[0]:
+            _trace_row("·", "以前点开过", f"nginx 日志里被请求过 {past[0]} 次，"
+                       f"最近一次 {past[1]}")
+        else:
+            _trace_row("⚠", "以前点开过", "nginx 日志里一次都没有 —— 你在手机上点的那几次"
+                       "没经过这台机器的 nginx（客户端填的是 IP:端口？）")
+    _mine = [ln for ln in heal_log_tail(HEAL_LOG_KEEP) if str(name)[:40] in ln][-3:]
+    for ln in _mine:
+        _trace_row("·", "流水里的它", ln)
+    if not _mine:
+        _trace_row("·", "流水里的它", "一条都没有 —— 自动那条路还从没探过它")
+
+    if not play:
+        return
+
+    # ------------------------------------------------------------ 三、按一次播放
+    hr()
+    print(f"  {BOLD}三、替你按一次播放{RST}  {DIM}（和手机上点一下一样换一次直链，"
+          f"302 回来就停，不拉视频）{RST}")
+    off0 = _st.st_size if (_st and _site) else None
+    t_play = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 1))
+    via, code, secs = _trace_play(iid, st0["msid"], key)
+    if not isinstance(code, int):
+        _trace_row("✖", "请求", f"走 {via}，没发出去：{code}")
+        return
+    _good = code in (301, 302, 303, 307, 308)
+    _trace_row("✔" if _good else "⚠", "请求",
+               f"走 {via}，回 {code}，{secs:.1f} 秒"
+               + ("" if _good else " —— 正常是 302（MediaWarp 换好直链让播放器直连网盘）"))
+
+    # ------------------------------------------------------------ 四、盯着
+    hr()
+    print(f"  {BOLD}四、盯着它走完{RST}  {DIM}最多 {HEAL_TRACE_WAIT} 秒，Ctrl-C 随时停"
+          f"（停了不影响它补）{RST}")
+    t0 = time.monotonic()
+    ev = {}                               # 哪一节 → 按下播放后第几秒
+    line_end, seen, probe_line = None, set(), ""
+
+    def _mark(k, text):
+        ev[k] = time.monotonic() - t0
+        _trace_row("✔", f"+{ev[k]:.0f}s", text)
+
+    last_emby = 0.0
+    try:
+        while time.monotonic() - t0 < HEAL_TRACE_WAIT:
+            if "log" not in ev:
+                if off0 is not None:
+                    line_end = _ngx_hit_after(off0, iid)
+                    if line_end:
+                        _mark("log", "nginx 日志里有了这一条（点播放的信号）")
+                else:
+                    _ids = mediawarp_played_ids(2)
+                    if _ids and iid in _ids:
+                        _mark("log", "MediaWarp 日志里有了这一条（点播放的信号）")
+            if "log" in ev and "read" not in ev and line_end:
+                try:
+                    _ino = os.stat(NGX_ACCESS_LOG).st_ino
+                except OSError:
+                    _ino = None
+                mk = ms_state().get("heal_ngx") or {}
+                if mk.get("ino") == _ino and int(mk.get("off") or 0) >= line_end:
+                    _mark("read", "heal-tick 把这一条读走了")
+            if "log" in ev and "run" not in ev and any(
+                    s == "heal-tick" for _p, s, _x in running_tasks()):
+                _mark("run", "heal-tick 在跑")
+            for ln in heal_log_tail(20):
+                if ln[:19] >= t_play and ln not in seen:
+                    seen.add(ln)
+                    _trace_row("·", "流水", ln[21:] if len(ln) > 21 else ln)
+                    if str(name)[:40] in ln and "probe" not in ev:
+                        probe_line = ln
+                        _mark("probe", "探完了")
+            if time.monotonic() - last_emby >= 4:
+                last_emby = time.monotonic()
+                cur = _trace_item(key, uid, iid)
+                if cur and cur["ticks"] and cur["streams"]:
+                    _mark("done", f"Emby 里有时长了：{cur['ticks'] / 6e8:.0f} 分钟，"
+                          f"{cur['streams']} 条音视频轨")
+                    break
+            time.sleep(HEAL_TRACE_POLL)
+    except KeyboardInterrupt:
+        print()
+        info("停了。它该补还是会补，过一会儿再敲一次这个命令看结果。")
+        return
+
+    # ------------------------------------------------------------ 五、算账
+    hr()
+    print(f"  {BOLD}五、这一趟花在哪{RST}")
+    # 【报的是每一节自己花了多久】累计秒数上面已经打过；这里要回答的是"慢在哪"
+    steps = [("log", "进日志"),
+             ("read", "被 heal-tick 读走（等下一次触发）"),
+             ("probe", "探完（探测本身）"),
+             ("done", "Emby 里显示出来")]
+    prev = 0.0
+    for k, label in steps:
+        if k in ev:
+            print(f"  {pad(label, 34)}{ev[k] - prev:>5.0f} 秒")
+            prev = ev[k]
+    if "done" in ev:
+        ok(f"按下播放到有进度条，一共 {ev['done']:.0f} 秒。")
+        return
+
+    # 【没走完：说清断在哪一节、那一节该怎么查】只报"没补上"等于什么都没说
+    warn(f"盯了 {HEAL_TRACE_WAIT} 秒没走完。")
+    if "log" not in ev:
+        print(f"  {DIM}断在第一节：请求回了 {code}，日志里却没有这一条。"
+              f"nginx 的日志不是写在 {NGX_ACCESS_LOG}？{RST}")
+    elif off0 is not None and "read" not in ev:
+        _busy = [s for _p, s, _x in running_tasks() if s == "heal-tick"]
+        print(f"  {DIM}断在第二节：这 {HEAL_TRACE_WAIT} 秒里 heal-tick 一次都没来读日志。{RST}")
+        if _busy:
+            print(f"  {DIM}有一轮 heal-tick 一直在跑、没让出来 —— 下一轮排在它后面。{RST}")
+        else:
+            print(f"  {DIM}定时任务没在跑？看看 cron 服务：systemctl status cron{RST}")
+    elif "probe" not in ev:
+        if any(s == "heal-tick" for _p, s, _x in running_tasks()):
+            print(f"  {DIM}还在探，到点了还没探完 —— 过一会儿敲 "
+                  f"{BOLD}media-stack heal-log{RST}{DIM} 看结果。{RST}")
+        else:
+            print(f"  {DIM}读走了，但没有去探它。上面「流水」那几行里要是有"
+                  f"「没探：……」，那就是原因。{RST}")
+    else:
+        print(f"  {DIM}探了，没探成：{RST}")
+        print(f"  {probe_line}")
+        print(f"  {DIM}结局那一栏是 retry 的，下一次点开会再试；dead 的是这套办法对它无效。{RST}")
 
 
 def follow_new_storages(d):
@@ -8121,7 +8538,11 @@ def find_strm_items(key, q):
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
         return out
-    ql = str(q or "").lower()
+    # 【按词找，每个词都要对上】「完美世界 287」：片名是「第287集」、剧名在
+    # SeriesName 里、「287」在文件名里 —— 当成一整串去找，一个都对不上。
+    words = [w for w in str(q or "").lower().split() if w]
+    if not words:
+        return out
     for lb in libs:
         pid = lb.get("ItemId")
         if not pid or not is_strm_lib(lb):
@@ -8133,8 +8554,9 @@ def find_strm_items(key, q):
         except Exception:
             continue
         for i in d.get("Items") or []:
-            if (ql in str(i.get("Name") or "").lower()
-                    or ql in str(i.get("Path") or "").lower()):
+            hay = " ".join(str(i.get(k) or "") for k in
+                           ("SeriesName", "Name", "Path")).lower()
+            if all(w in hay for w in words):
                 out.append((uid, i.get("Id"), i.get("Name") or "?",
                             _is_fresh_item(i)))
     return out
@@ -9986,7 +10408,14 @@ def heal_media_info(d, key, budget=None, items=None):
     if not allpend:
         return
     _left, _used = heal_budget()
+    # 【没探也要进流水】cron 那几轮的输出全进 /dev/null。只记"探了什么"不记"为什么
+    # 没探"，翻流水的人看到的就是一片空白 —— 和"根本没触发"长得一模一样。
+    _how_try = ("点名" if items is not None
+                else "看片后" if os.environ.get("MS_HEAL_TICK") else "整队")
     if _left <= 0:
+        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+                  f"没探：今天的额度用完了（约 {_used:.0f}/{HEAL_DAY_MB} MB），"
+                  f"{len(allpend)} 个没轮上"])
         print()
         info(f"今天补时长已经用掉约 {_used:.0f} MB（上限 {HEAL_DAY_MB} MB），这轮不探了")
         print(f"  {DIM}明天零点自动清零接着探。还有 {len(allpend)} 个排队。"
@@ -10050,6 +10479,8 @@ def heal_media_info(d, key, budget=None, items=None):
     except Exception:
         pass
     if not token:
+        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+                  f"没探：OpenList 登不上，{len(pend)} 个没轮上"])
         warn("OpenList 登不上，没法生成带签名的地址，这一步跳过。")
         return
 
@@ -17015,7 +17446,9 @@ if __name__ == "__main__":
         elif arg == "heal":               # 「4」扔后台的补时长；手动敲也走这条
             require_root()
             # 【带片名就只补那一部】media-stack heal 仙逆 —— 见 do_heal 的说明
-            _q = sys.argv[2] if len(sys.argv) > 2 else None
+            # 【多个词要拼回去】壳把 "$@" 原样透传，「heal 完美世界 287」到这儿是两个
+            # 参数；只取第一个就成了"补完美世界"—— 一下子点名八集。
+            _q = " ".join(sys.argv[2:]).strip() or None
             if take_task_lock("heal"):
                 # heal 自己拿网卡差实测过这一轮花了多少，比格子准 —— 带进备注里
                 _timed("补时长heal", lambda: do_heal(_q),
@@ -17026,12 +17459,32 @@ if __name__ == "__main__":
                 warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
                 print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
                       f"把那一轮停掉。{RST}")
-        elif arg == "heal-tick":          # cron 每 10 分钟调的：有人看过片才补一轮
+        elif arg == "heal-tick":          # cron 每分钟调的：有人看过片才补一轮
             require_root()
-            # 【和 heal 共用一把锁】两边干的是同一件事，叠起来就是同一批条目
-            # 被探两遍、流量翻倍。抢不到就让位，反正 10 分钟后还有一轮。
-            if take_task_lock("heal"):
+            refresh_heal_cron()           # 自动更新只换脚本，cron 的节奏靠这一句跟上
+            # 【两把锁，分开管两件事】
+            #   · heal-tick 自己那把：同一时刻只许一个 tick —— 间隔 1 分钟而一轮能跑
+            #     两分多钟，不拦就会一轮叠一轮
+            #   · heal 那把（和整队补时长共用）：拿到了才跑整队那一截
+            # 【以前只有 heal 那一把，结果整队一跑，"刚点开就补"整个停摆】扫完媒体库
+            # 会扔一轮整队到后台，一跑就是半小时往上。这期间每分钟的 tick 都抢不到锁、
+            # 一声不吭地让位 —— 你刚点开的那一集就这么干等着。偏偏"刚加了新片"正是
+            # 最会去点开新片的时候。所以抢不到 heal 那把时，只跑"刚点开的那几条"那一截：
+            # 一共不超过 HEAL_BY_NAME_MAX 个，和整队撞上同一个条目的代价是多探一次，
+            # 而不让位的代价是这一整段时间里点开什么都不补。
+            if not take_task_lock("heal-tick"):
+                if has_tty():
+                    warn("已经有一轮 heal-tick 在跑了，等它跑完再敲。")
+            elif take_task_lock("heal"):
                 _timed("补时长heal", do_heal_tick)
+            else:
+                if has_tty():
+                    info("整队补时长正在后台跑 —— 这一轮只补你刚点开的那几条。")
+                _timed("补时长heal", lambda: do_heal_tick(hot_only=True))
+        elif arg == "heal-trace":         # 替你按一次播放，掐表看多久补上、卡在哪
+            require_root()                # 要读 nginx 日志和流水，都是 root-only 的
+            _a = [x for x in sys.argv[2:] if x != "--no-play"]
+            do_heal_trace(" ".join(_a).strip(), play="--no-play" not in sys.argv[2:])
         elif arg == "heal-log":           # 翻补时长的流水账
             require_root()                # 里面有片名，文件是 0600 的
             _n = 40
