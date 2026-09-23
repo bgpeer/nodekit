@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.146"
+SCRIPT_VERSION = "1.5.147"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1521,7 +1521,8 @@ case "${1:-info}" in
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
-  heal-watch <片名> 点名补上，然后盯着：音视频轨什么时候、被谁弄掉的
+  heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
+                  (默认盯 20 分钟；要跨过整点那一轮就写 90)
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「6 链路体检」)
@@ -2407,6 +2408,16 @@ def take_task_lock(sub):
         return False                    # 锁被占着 —— 上一轮还在跑，安静退出
     _TASK_LOCK_FHS[sub] = fh
     return True
+
+
+def release_task_lock(sub):
+    """放掉本进程拿着的这把锁（没拿着就什么都不做）。"""
+    fh = _TASK_LOCK_FHS.pop(sub, None)
+    if fh is not None:
+        try:
+            fh.close()                  # 关掉句柄，flock 就放了
+        except OSError:
+            pass
 
 
 def running_tasks():
@@ -3721,6 +3732,7 @@ def do_heal_trace(q, play=True):
 # 读代码猜不出是谁 —— 会写电影条目的地方有好几处。只能当场抓：补完之后每隔几秒
 # 看一眼，一变就把那一刻在跑的东西全记下来。
 HEAL_WATCH_MIN = 20
+HEAL_WATCH_MAX = 180     # 最多盯三小时：跨过两三个整点，够看每小时那轮会不会弄掉它
 HEAL_WATCH_POLL = 5
 
 
@@ -3807,6 +3819,15 @@ def do_heal_watch(q):
     if not (q or "").strip():
         warn("要告诉我是哪一部，比如：media-stack heal-watch 窃听风云2")
         return
+    # 【最后一个词是数字 = 盯多少分钟】20 分钟证明不了"每小时那轮不会弄掉它"——
+    # 实测撞上的：盯满 20 分钟一直在，半小时后每小时那轮又把它补了一遍（又掉了）。
+    # 要跨过整点，就得能盯得更久。片名本身带数字的（完美世界 287）要写成
+    # 「完美世界 287 90」—— 只有多于一个词时最后那个数字才当分钟。
+    words = q.split()
+    mins = HEAL_WATCH_MIN
+    if len(words) > 1 and words[-1].isdigit():
+        mins = max(1, min(HEAL_WATCH_MAX, int(words[-1])))
+        q = " ".join(words[:-1])
     hits = find_strm_items(key, q)
     if len(hits) != 1:
         warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只盯一部。"
@@ -3828,9 +3849,14 @@ def do_heal_watch(q):
         warn("它所在的媒体库开着实时监控 —— 补上的轨道 1 分多钟后多半会被它清掉。"
              "跑一次「7 更新」会关掉（关掉不影响新片进库）。")
     hr()
-    print(f"  {BOLD}一、先补上{RST}  {DIM}（点名补，不受额度限制）{RST}")
-    heal_media_info(d, key, budget=HEAL_BUDGET, items=hits[:1])
     s0 = _watch_snapshot(key, uid, iid, host)
+    if s0 and s0["streams"] and s0["ticks"]:
+        # 【已经齐了就别再探】要盯的是"它什么时候掉"，不必先花一次流量
+        print(f"  {BOLD}一、已经是齐的{RST}  {DIM}（不用再补，直接盯）{RST}")
+    else:
+        print(f"  {BOLD}一、先补上{RST}  {DIM}（点名补，不受额度限制）{RST}")
+        heal_media_info(d, key, budget=HEAL_BUDGET, items=hits[:1])
+        s0 = _watch_snapshot(key, uid, iid, host)
     if s0 is None:
         warn("补完问不到 Emby，没法盯。")
         return
@@ -3841,7 +3867,7 @@ def do_heal_watch(q):
 
     hr()
     print(f"  {BOLD}二、盯着它{RST}  {DIM}每 {HEAL_WATCH_POLL} 秒看一眼，最多 "
-          f"{HEAL_WATCH_MIN} 分钟；Ctrl-C 随时停。别的照常用，播放也没关系。{RST}")
+          f"{mins} 分钟；Ctrl-C 随时停。别的照常用，播放也没关系。{RST}")
     print(f"  {DIM}起点：音视频轨 {s0['streams']} 条（列表查询看是 "
           f"{'?' if s0['list_streams'] is None else s0['list_streams']} 条）、"
           f"时长 {s0['ticks'] / 6e8:.0f} 分钟、"
@@ -3857,7 +3883,7 @@ def do_heal_watch(q):
               f"回包里轨道 {_pl['streams']} 条、容器 {_pl['container']}{RST}")
     t0, prev = time.monotonic(), s0
     try:
-        while time.monotonic() - t0 < HEAL_WATCH_MIN * 60:
+        while time.monotonic() - t0 < mins * 60:
             time.sleep(HEAL_WATCH_POLL)
             cur = _watch_snapshot(key, uid, iid, host)
             if cur is None:
@@ -3899,7 +3925,7 @@ def do_heal_watch(q):
         info("停了。")
         return
     hr()
-    ok(f"盯了 {HEAL_WATCH_MIN} 分钟，音视频轨一直在。")
+    ok(f"盯了 {mins} 分钟，音视频轨一直在。")
     print(f"  {DIM}没在这段时间里掉。过几个小时再 media-stack heal-trace {q} --no-play "
           f"看一眼：还在就是真好了；没了就是更晚的某个定时任务弄掉的。{RST}")
 
@@ -6549,14 +6575,27 @@ def align_library(d, key, heal=True, migrate=True):
         # 被每小时的 do_warm 调用 —— 于是账本里它顶着"直链预热"的名字，看不出真身。
         # 现场数据：账本里一条 heal 都没有，而"直链预热"跑了 22 分、窗口 973 MB，
         # 一度让人以为预热本身在烧流量（README 里写的是 15 MB/天）。
-        _h_t0 = time.time()
-        try:
-            heal_media_info(d, key)   # 条目级：补时长
-        finally:
-            _h_st = ms_state().get("heal_day") or {}
-            traffic_mark("补时长heal", _h_t0,
-                         f"（当天自测累计 {float(_h_st.get('mb') or 0):.0f} MB / "
-                         f"上限 {HEAL_DAY_MB} MB，{int(_h_st.get('probes') or 0)} 次）")
+        # 【要和别的整队那几轮抢同一把锁】这一步嵌在每小时的 warm / 每日的 sync 里，
+        # 那两条拿的是自己的锁，不是 heal 那把 —— 于是扫完库扔到后台的那一轮整队还在
+        # 跑，这里又起一轮整队，两边挑中同一批条目。流水里撞上的：07:30:07、07:30:08
+        # 两轮整队同时开跑，第79集被两边一起探，一边 3 秒成了，另一边白等 320 秒、
+        # 多花 24 MB。抢不到就跳过这一步，整队本来就在别处跑着。
+        # （本进程已经握着这把锁的 —— 手动敲 heal 那条路 —— 照常往下走。）
+        _mine = "heal" not in _TASK_LOCK_FHS
+        if _mine and not take_task_lock("heal"):
+            if has_tty():
+                print(f"  {DIM}补时长：另一轮整队正在后台跑，这里不重复跑。{RST}")
+        else:
+            _h_t0 = time.time()
+            try:
+                heal_media_info(d, key)   # 条目级：补时长
+            finally:
+                if _mine:
+                    release_task_lock("heal")
+                _h_st = ms_state().get("heal_day") or {}
+                traffic_mark("补时长heal", _h_t0,
+                             f"（当天自测累计 {float(_h_st.get('mb') or 0):.0f} MB / "
+                             f"上限 {HEAL_DAY_MB} MB，{int(_h_st.get('probes') or 0)} 次）")
     normalize_strm_files(d)           # heal 中途被打断的兜底
     # 剧集 strm 改名成带季集编号的。【必须排在 scan_if_grown 之前】——
     # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
