@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.140"
+SCRIPT_VERSION = "1.5.141"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3227,11 +3227,25 @@ def do_heal_tick(hot_only=False):
     # "它是因为我点了播放才补的"还是"刚好轮到它"。
     os.environ["MS_HEAL_TICK"] = "1"
     hot = strm_items_need_heal(key, ids or [])
+    # 【同一集，冷却期内不探第二次】见 HEAL_HOT_COOLDOWN_MIN：播放中那一集每分钟都会
+    # 被重新读到，探不出来的话就是每分钟探一次。
+    _now = int(time.time())
+    _cool = {k: v for k, v in (ms_state().get("heal_hot") or {}).items()
+             if isinstance(v, (int, float)) and _now - v < HEAL_HOT_COOLDOWN_MIN * 60}
+    _waiting = [x for x in hot if str(x[1]) in _cool]
+    hot = [x for x in hot if str(x[1]) not in _cool]
     if hot:
         _say(f"刚点开过、而且还缺媒体信息的有 {len(hot)} 个，先补这几个。")
+        # 【先记再探】探到一半被 timeout 砍掉也算探过 —— 不然下一分钟又从头来一遍
+        _cool.update({str(x[1]): _now for x in hot})
+        save_ms_state(heal_hot=_cool)
         heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
         save_ms_state(heal_tick=int(time.time()))
         return                            # 这一轮就干这个 —— 队列交给下一轮
+    if _waiting:
+        _say(f"刚点开的 {len(_waiting)} 个 {HEAL_HOT_COOLDOWN_MIN} 分钟内已经探过、"
+             f"没探成 —— 冷却期内不重复探（media-stack heal-log 看上一次的结果）。")
+        return
     if hot_only:
         # 【整队那一轮正在后台跑】列全库、按游标轮转的活它在干，这里再干一遍就是
         # 同一批条目探两遍。刚点开的那几条已经在上面处理过了。
@@ -3453,20 +3467,27 @@ def do_heal_trace(q, play=True):
                        f"{HEAL_TICK_MIN} 分钟。下一次它自己跑的时候会改过来")
     _ht = int(ms_state().get("heal_tick") or 0)
     if _ht:
-        _trace_row("·", "上一次跑完", f"{int(time.time() - _ht)} 秒前")
+        # 【是"动手"不是"跑"】它每分钟都跑，没人点开就一眼看完退出、不留记号
+        _trace_row("·", "上一次动手", f"{int(time.time() - _ht)} 秒前"
+                   f"{DIM}（每分钟都在看；没人点开就不动手、不记这个）{RST}")
     else:
-        _trace_row("⚠", "上一次跑完", "一次都没跑完过（或者是升级前的版本，没记这个）")
+        _trace_row("⚠", "上一次动手", "一次都没动过手（或者是升级前的版本，没记这个）")
     for _p, _sub, _s in running_tasks():
         if _sub in ("heal", "heal-tick"):
             _what = ("整队补时长（刚点开的那几条不受它影响）" if _sub == "heal"
                      else "heal-tick")
             _trace_row("·", "正在跑", f"{_what}，已经 {_s // 60} 分 {_s % 60} 秒")
-    _left, _used = heal_budget()
+    # 【报的是"看片后"那一档的额度】这条链走的就是它；整队补积压的碰不到留出来的那截
+    _left, _used = heal_budget("看片后")
+    _bl, _ = heal_budget("整队")
     if _left <= 0:
         _trace_row("✖", "今天的额度", f"用完了（约 {_used:.0f}/{HEAL_DAY_MB} MB）—— "
-                   f"今天点开什么都不会探，明天零点清零")
+                   f"今天点开什么都不会自动探，明天零点清零。"
+                   f"等不及：media-stack heal {q}（点名的不受额度限制）")
     else:
-        _trace_row("✔", "今天的额度", f"还剩约 {_left:.0f} MB（已用 {_used:.0f}）")
+        _trace_row("✔", "今天的额度", f"刚点开的那几集还能用约 {_left:.0f} MB"
+                   f"{DIM}（已用 {_used:.0f}；补积压的只能用到 "
+                   f"{HEAL_DAY_MB - HEAL_HOT_RESERVE_MB}，还剩 {_bl:.0f}）{RST}")
     try:
         _st = os.stat(NGX_ACCESS_LOG)
     except OSError:
@@ -3514,6 +3535,12 @@ def do_heal_trace(q, play=True):
                    "点多少次播放都不会补。这是 bug，把这一屏发给仓库主人")
     else:
         _trace_row("✔", "自动那条路认不认", "认：点开之后它会被挑出来补")
+    _hot_at = (ms_state().get("heal_hot") or {}).get(iid)
+    if isinstance(_hot_at, (int, float)) and time.time() - _hot_at < HEAL_HOT_COOLDOWN_MIN * 60:
+        _cool_left = int(HEAL_HOT_COOLDOWN_MIN * 60 - (time.time() - _hot_at))
+        _trace_row("⚠", "冷却中", f"{int((time.time() - _hot_at) // 60)} 分钟前刚因为点开"
+                   f"探过它 —— 再过 {_cool_left // 60 + 1} 分钟才会再自动探"
+                   f"（防止一集探不出来、边播边每分钟探一次）")
     _gv = heal_fail_table().get(iid)
     if _gv:
         _trace_row("·", "放弃名单", "在上面 —— 点开播放那条路不看这份名单，不影响")
@@ -3639,7 +3666,8 @@ def do_heal_trace(q, play=True):
                   f"{BOLD}media-stack heal-log{RST}{DIM} 看结果。{RST}")
         else:
             print(f"  {DIM}读走了，但没有去探它。上面「流水」那几行里要是有"
-                  f"「没探：……」，那就是原因。{RST}")
+                  f"「没探：……」，那就是原因；上面要是有「冷却中」，就是在冷却。{RST}")
+            print(f"  {DIM}等不及就点名补：media-stack heal {q}（不受额度限制）{RST}")
     else:
         print(f"  {DIM}探了，没探成：{RST}")
         print(f"  {probe_line}")
@@ -10008,6 +10036,19 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 留的保险（比如一口气看了一百部、或者哪天判据又出漏洞）。不做成可调的：多一个旋钮
 # 就多一份"设错了怎么办"。
 HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）。用满就停，明天接着
+# 【这 2048 里留一截给"你刚点开的那一集"，整队补积压的碰不到】
+# 实测撞上的：半夜整队补积压那几轮（00:00~02:10）探了 172 次、花掉 2365 MB，把
+# 当天额度用得一干二净。晚上点开两集新片，自动那条路读到了、挑出来了，然后
+# 「今天的额度用完了」—— 真正在等进度条的那一集，被一堆没人在等的积压挤掉了。
+# 两件事的轻重完全不同：积压晚一天补没人察觉；刚点开的那一集晚一天，这一天里
+# 每看一次都在丢进度。所以积压只许用到 HEAL_DAY_MB - 这一截。
+# 512 MB 够探几十集（m3u8 那条路一集几 MB 到几十 MB），一天看不了这么多新片。
+HEAL_HOT_RESERVE_MB = 512
+# 【同一集点开之后，这么久之内不再探第二次】一集播放中客户端会反复请求
+# /videos/<id>/（实测一集 79 次），每分钟的 tick 都会再读到它。探成功的下一轮
+# 就被筛掉了，可要是这一集【探不出来】，每分钟就会再探一次 —— 看一小时就是
+# 六十次，一次几 MB 到几十 MB。放弃名单拦不住它：这条路本来就不看那份名单。
+HEAL_HOT_COOLDOWN_MIN = 30
 # 一个条目要拉多少 MB。【注意这是上游口径】——nginx 日志里看到的约 6.7 MB 是
 # 「交付给 ffprobe」的量，而 openlist 为了给出这 6.7 MB 要从网盘拉约 2.8 倍。
 # 预算 HEAL_DAY_MB 是拿物理网卡的接收差实测的，也是上游口径，两边必须对齐。
@@ -10262,11 +10303,28 @@ def heal_mb_each():
             return min(60.0, max(4.0, mb / probes))
     return float(HEAL_MB_EACH)
 
-def heal_budget():
-    """今天 heal 还剩多少额度 → (剩余 MB, 已用 MB)。跨天自动清零。"""
+def heal_how(items):
+    """这一轮是谁触发的：看片后 / 点名 / 整队。流水、额度、体检都按它分。
+
+    【看片后 ≠ heal-tick 跑的每一轮】tick 在没有刚点开的缺信息条目时，会往下跑整队
+    那一截。以前那一截也记成「看片后」，而刚点开的那几条反倒因为传了 items 记成了
+    「点名」—— 两个标签正好贴反。标签反了，额度就分不对：积压会吃掉留给你刚点开
+    那一集的那一截。
+    """
+    if items is None:
+        return "整队"
+    return "看片后" if os.environ.get("MS_HEAL_TICK") else "点名"
+
+
+def heal_budget(how=None):
+    """今天 heal 还剩多少额度 → (剩余 MB, 已用 MB)。跨天自动清零。
+
+    how 是「整队」时要让出 HEAL_HOT_RESERVE_MB —— 那一截只给刚点开的那几集。
+    """
     st = ms_state().get("heal_day") or {}
     used = float(st.get("mb") or 0) if st.get("date") == time.strftime("%Y-%m-%d") else 0.0
-    return max(0.0, HEAL_DAY_MB - used), used
+    cap = HEAL_DAY_MB - (HEAL_HOT_RESERVE_MB if how == "整队" else 0)
+    return max(0.0, cap - used), used
 
 def heal_budget_spend(mb, probes=0):
     """记一笔账。跨天先清零再记。"""
@@ -10407,19 +10465,25 @@ def heal_media_info(d, key, budget=None, items=None):
     allpend = _keep
     if not allpend:
         return
-    _left, _used = heal_budget()
+    _how_try = heal_how(items)
+    _left, _used = heal_budget(_how_try)
+    # 【点名的不设闸】那是你亲手敲的「就补这一部」，最多 HEAL_BY_NAME_MAX 个 ——
+    # 额度用完的那天，它是唯一能立刻补上一集的办法。花的照样记账。
+    _nolimit = _how_try == "点名"
     # 【没探也要进流水】cron 那几轮的输出全进 /dev/null。只记"探了什么"不记"为什么
     # 没探"，翻流水的人看到的就是一片空白 —— 和"根本没触发"长得一模一样。
-    _how_try = ("点名" if items is not None
-                else "看片后" if os.environ.get("MS_HEAL_TICK") else "整队")
-    if _left <= 0:
+    if _left <= 0 and not _nolimit:
+        _cap_mb = HEAL_DAY_MB - (HEAL_HOT_RESERVE_MB if _how_try == "整队" else 0)
         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
-                  f"没探：今天的额度用完了（约 {_used:.0f}/{HEAL_DAY_MB} MB），"
+                  f"没探：今天的额度用完了（约 {_used:.0f}/{_cap_mb} MB），"
                   f"{len(allpend)} 个没轮上"])
         print()
-        info(f"今天补时长已经用掉约 {_used:.0f} MB（上限 {HEAL_DAY_MB} MB），这轮不探了")
+        info(f"今天补时长已经用掉约 {_used:.0f} MB（这一类的上限 {_cap_mb} MB），这轮不探了")
+        if _how_try == "整队":
+            print(f"  {DIM}剩下那 {HEAL_HOT_RESERVE_MB} MB 留给你刚点开的那几集，"
+                  f"补积压的碰不到。{RST}")
         print(f"  {DIM}明天零点自动清零接着探。还有 {len(allpend)} 个排队。"
-              f"只补你点开过的，所以队列不会一直涨。{RST}")
+              f"想现在就补某一集：media-stack heal 片名 集数（点名的不受额度限制）{RST}")
         return
     # 【轮转取一批】。全量探的代价见 HEAL_LIMIT 那段注释。用游标是因为总有一批
     # 条目怎么探都探不出来（网盘上是残缺文件、格式 Emby 不认），每轮都从头取
@@ -10502,7 +10566,8 @@ def heal_media_info(d, key, budget=None, items=None):
             time.sleep(HEAL_GAP)
         again = []
         _d, _t, _over = _heal_round(d, key, todo_items, base, token, again,
-                                    t_all, budget, _meter, _rx0, _left)
+                                    t_all, budget, _meter, _rx0,
+                                    None if _nolimit else _left)
         done += _d
         hit += _t
         todo_items = again
@@ -10532,8 +10597,7 @@ def heal_media_info(d, key, budget=None, items=None):
             if f"  {_k} " in _ln or f"{_k}  " in _ln:
                 _via_n[_k] = _via_n.get(_k, 0) + 1
                 break
-    _how_run = ("点名" if items is not None
-                else "看片后" if os.environ.get("MS_HEAL_TICK") else "整队")
+    _how_run = _how_try
     heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_run}）："
               f"{done}/{len(pend)} 个补上，约 {_spent:.0f} MB（{_how}）"
               + (f"，路线 " + "、".join(f"{k} {v}" for k, v in _via_n.items())
@@ -10546,7 +10610,7 @@ def heal_media_info(d, key, budget=None, items=None):
     _left2, _used2 = heal_budget()
     print(f"  {DIM}这轮花了约 {_spent:.0f} MB（{_how}）；今天累计 {_used2:.0f} MB / "
           f"上限 {HEAL_DAY_MB} MB，还剩 {_left2:.0f} MB{RST}")
-    if _over or _left2 <= 0:
+    if _over or (_left2 <= 0 and not _nolimit):
         print(f"  {YELLOW}今天的额度用完了，后面几轮不再探，明天零点自动清零。{RST}")
         if _over:
             print(f"  {DIM}（这轮是【探到一半】被额度拉停的 —— 排队没轮到的一个都没发，"
