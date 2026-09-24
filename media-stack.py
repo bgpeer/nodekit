@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.149"
+SCRIPT_VERSION = "1.5.150"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3248,6 +3248,11 @@ def do_heal_tick(hot_only=False):
     # "它是因为我点了播放才补的"还是"刚好轮到它"。
     os.environ["MS_HEAL_TICK"] = "1"
     hot = strm_items_need_heal(key, ids or [])
+    # 【一次性：清掉旧口径记下的冤枉账】v1.5.149 之前，被「补上又掉了」拦下、根本没探的
+    # 那几次也照样记了冷却和次数 —— 仓库主人的遮天 181 就这样：一次都没探，却"冷却中、
+    # 今天已探 2 次"，点开还是不补。旧账里分不出哪些是真探过的，整张清掉。
+    if int(ms_state().get("heal_hot_v") or 0) < HEAL_HOT_V:
+        save_ms_state(heal_hot={}, heal_hot_n={}, heal_hot_v=HEAL_HOT_V)
     # 【同一集，冷却期内不探第二次】见 HEAL_HOT_COOLDOWN_MIN：播放中那一集每分钟都会
     # 被重新读到，探不出来的话就是每分钟探一次。
     _now = int(time.time())
@@ -10421,7 +10426,13 @@ HEAL_STICK_H = 24
 # /videos/<id>/（实测一集 79 次），每分钟的 tick 都会再读到它。探成功的下一轮
 # 就被筛掉了，可要是这一集【探不出来】，每分钟就会再探一次 —— 看一小时就是
 # 六十次，一次几 MB 到几十 MB。放弃名单拦不住它：这条路本来就不看那份名单。
-HEAL_HOT_COOLDOWN_MIN = 30
+# 【10 分钟，不是 30】防死循环的是冷却【加上】一天最多 HEAL_HOT_DAY_TRIES 次：
+# 一集一直探不出来，一天也最多白探这几次。冷却只管"别每分钟来一遍"，拉得太长就成了
+# 仓库主人说的那样：没补上的点了播放却不补。上一次失败多半是撞上坏节点这种一阵子的事，
+# 10 分钟后再点，换一条直链多半就成了。
+HEAL_HOT_COOLDOWN_MIN = 10
+# 冷却 / 次数那两张表的口径版本。见 do_heal_tick 里的一次性清理。
+HEAL_HOT_V = 2
 # 一个条目要拉多少 MB。【注意这是上游口径】——nginx 日志里看到的约 6.7 MB 是
 # 「交付给 ffprobe」的量，而 openlist 为了给出这 6.7 MB 要从网盘拉约 2.8 倍。
 # 预算 HEAL_DAY_MB 是拿物理网卡的接收差实测的，也是上游口径，两边必须对齐。
@@ -10706,6 +10717,21 @@ def heal_budget_applies(how):
     return how == "整队"
 
 
+def heal_hot_unmark(iids):
+    """退回"因为点开探过"的冷却和次数 —— 用在一个都没探成的时候。"""
+    ids = {str(i) for i in (iids or [])}
+    if not ids:
+        return
+    st = ms_state()
+    cool = {k: v for k, v in (st.get("heal_hot") or {}).items() if k not in ids}
+    tries = st.get("heal_hot_n") or {}
+    cnt = dict(tries.get("n") or {})
+    for i in ids:
+        if int(cnt.get(i) or 0) > 0:
+            cnt[i] = int(cnt[i]) - 1
+    save_ms_state(heal_hot=cool, heal_hot_n={"date": tries.get("date"), "n": cnt})
+
+
 def heal_ok_mark(iids):
     """记下这几个条目刚补上的时间 —— heal_unstuck 靠它认出"补上又掉了"。"""
     if not iids:
@@ -10965,6 +10991,11 @@ def heal_media_info(d, key, budget=None, items=None):
     if not token:
         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
                   f"没探：OpenList 登不上，{len(pend)} 个没轮上"])
+        # 【没探就不算探过】看片后那条在探之前先记了冷却和次数（防被 timeout 砍掉后
+        # 下一分钟从头再来）。这里一个都没探，把那两笔退回去 —— 不然下次点开会被
+        # 一次根本没发生的探测挡住。
+        if _how_try == "看片后":
+            heal_hot_unmark([x[1] for x in pend])
         warn("OpenList 登不上，没法生成带签名的地址，这一步跳过。")
         return
 
