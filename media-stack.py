@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.155"
+SCRIPT_VERSION = "1.5.156"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3206,7 +3206,13 @@ def do_warm():
 # 补救：点开时还没补上的那几集记下来，播着的时候每分钟看一眼放到哪儿了；停了之后，
 # 要是 Emby 把续播点清成了 0、而你其实没看到结尾，就把最后看到的位置写回去。
 HEAL_RESCUE_H = 6            # 记下之后多久不再管（点开了但一直没播的，别一直挂着）
-HEAL_RESCUE_MIN_S = 60       # 只播了不到这么多秒的不救 —— 那是点开看了一眼
+# 只播了不到这么多秒的不写位置。【以前是 60】完美世界 288 实测：点开播了很短一下就退，
+# Emby 按没时长判成「已看完」、打上勾 —— 这一集你其实一眼都没看，勾是错的。媒体库的
+# 续播门槛本来就是 2 秒（RESUME_MIN_SECONDS），这里没理由比它严那么多。
+HEAL_RESCUE_MIN_S = 10
+# 点开时还没时长、却一次都没赶上它在播（播得比 tick 的间隔还短）：过了这么久还没看到
+# 在播，就当这一场结束了，去看 Emby 有没有打上错的「已看完」
+HEAL_RESCUE_UNSEEN_S = 150
 HEAL_RESCUE_END_PCT = 0.9    # 放到这个比例之后停的，当它是真看完了（Emby 的默认也是 90%）
 
 
@@ -3222,6 +3228,20 @@ def rescue_arm(items):
         # 同一集再点开：名字、用户有更好的就补上（点开信号里只有 id）
         e["uid"] = e.get("uid") or x[0]
         e["name"] = e.get("name") or str(x[2])[:40]
+    save_ms_state(heal_rescue=st)
+
+
+def rescue_mark_nodur(items):
+    """这几集点开时【确实还没时长】—— 它们的「已看完」要是来得太快，就是误标的。"""
+    if not items:
+        return
+    st = dict(ms_state().get("heal_rescue") or {})
+    for x in items:
+        e = st.get(str(x[1]))
+        if e is not None:
+            e["nodur"] = True
+            e["uid"] = e.get("uid") or x[0]
+            e["name"] = e.get("name") or str(x[2])[:40]
     save_ms_state(heal_rescue=st)
 
 
@@ -3253,12 +3273,35 @@ def rescue_progress(key):
             e["seen"] = now
             continue
         if not e.get("seen"):
-            if now - int(e.get("t0") or now) > HEAL_RESCUE_H * 3600:
+            age = now - int(e.get("t0") or now)
+            # 【一次都没赶上它在播】播得比 tick 的间隔还短。位置不知道，写不回去；可要是
+            # 点开时确实没时长（nodur），Emby 那个「已看完」的勾就是误标的 —— 撤掉它。
+            if e.get("nodur") and e.get("uid") and age >= HEAL_RESCUE_UNSEEN_S:
+                st.pop(iid, None)
+                try:
+                    it = _emby(f"/Users/{e['uid']}/Items/{iid}?Fields=UserData",
+                               key, timeout=30)
+                    ud = it.get("UserData") or {}
+                    if ud.get("Played") and not int(ud.get("PlaybackPositionTicks") or 0):
+                        _emby(f"/Users/{e['uid']}/Items/{iid}/UserData", key,
+                              method="POST",
+                              body={"PlaybackPositionTicks": 0, "Played": False,
+                                    "PlayCount": int(ud.get("PlayCount") or 0),
+                                    "IsFavorite": bool(ud.get("IsFavorite"))}, timeout=30)
+                        fixed += 1
+                        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
+                                    f"只播了一小会儿，Emby 判成看完了（那时还没时长），"
+                                    f"已撤掉「已看完」  {e.get('name') or it.get('Name') or iid}")
+                except Exception:
+                    pass
+                continue
+            if age > HEAL_RESCUE_H * 3600:
                 st.pop(iid, None)     # 点开了却一直没看到在播，别一直挂着
             continue
         st.pop(iid, None)             # 播过、现在不在播了 → 这一场结束了，结一次账
         pos = int(e.get("pos") or 0)
-        if pos < HEAL_RESCUE_MIN_S * 10 ** 7:
+        # 点开时确实没时长的（nodur）不看这道门槛：哪怕只播了几秒，那个「已看完」也是误标的
+        if pos < HEAL_RESCUE_MIN_S * 10 ** 7 and not e.get("nodur"):
             continue
         try:
             it = _emby(f"/Users/{e.get('uid')}/Items/{iid}?Fields=UserData,MediaSources",
@@ -3392,6 +3435,7 @@ def do_heal_tick(hot_only=False):
         # 【点开时还没补上的，这一场播放要盯着】补上之后这一场的续播点多半还是会被
         # Emby 清掉（它是按开播那一刻的"没时长"开的场），见 rescue_progress
         rescue_arm(hot)
+        rescue_mark_nodur(hot)
         heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
         # 补完多半还在播 —— 当场记一次位置，别等下一分钟（下一分钟可能已经停了）
         rescue_progress(key)
