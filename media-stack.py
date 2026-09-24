@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.153"
+SCRIPT_VERSION = "1.5.154"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3217,8 +3217,11 @@ def rescue_arm(items):
     st = dict(ms_state().get("heal_rescue") or {})
     now = int(time.time())
     for x in items:
-        st.setdefault(str(x[1]), {"uid": x[0], "pos": 0, "seen": 0, "t0": now,
-                                  "name": str(x[2])[:40]})
+        e = st.setdefault(str(x[1]), {"uid": x[0], "pos": 0, "seen": 0, "t0": now,
+                                      "name": str(x[2])[:40]})
+        # 同一集再点开：名字、用户有更好的就补上（点开信号里只有 id）
+        e["uid"] = e.get("uid") or x[0]
+        e["name"] = e.get("name") or str(x[2])[:40]
     save_ms_state(heal_rescue=st)
 
 
@@ -3277,6 +3280,7 @@ def rescue_progress(key):
         except Exception:
             continue
         fixed += 1
+        e["name"] = e.get("name") or str(it.get("Name") or "")[:40]
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：第一场播放"
                     f"停在 {pos // 600000000} 分 {pos // 10 ** 7 % 60:02d} 秒，Emby 判成看完了"
                     f"（那时还没时长），已写回续播点  {e.get('name') or iid}")
@@ -3330,6 +3334,14 @@ def do_heal_tick(hot_only=False):
         # 【脚本自己的请求不算】见 _self_touched —— 不减掉就是自己追着自己的尾巴
         if ids:
             ids = ids - _self_touched(HEAL_TICK_MIN + 3)
+    # 【点开的每一集都盯，不只盯还缺时长的】实测撞上的：吞噬星空 242 第一次点开，
+    # 媒体信息是「1440p / 793.1 MB / 4.9 Mbps」—— 原片的数字，是 Emby 在点播放那一刻
+    # 自己探的（我们走 m3u8 补的是几十 KB 那种）。它抢在 tick 前面补上了，tick 一看
+    # "不缺"就没记下；可这一场是按没时长开的，停了照样被判「已看完」、续播点清零。
+    # 要不要写回，rescue_progress 自己有三道判据（条目有时长、续播点被清成 0、没到
+    # 90%），正常记住了进度的一个都不碰 —— 所以这里放宽到"点开过的都盯"没有风险。
+    if ids:
+        rescue_arm([("", i, "") for i in list(ids)[:HEAL_BY_NAME_MAX]])
     ts = last_played_ts(key)
     water = float(ms_state().get("heal_tick_seen") or 0)
     moved = ts is not None and ts > water
