@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.150"
+SCRIPT_VERSION = "1.5.151"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1817,7 +1817,13 @@ CRON_TIMEOUT   = {
     # 轻量轮：没人看片时几乎零开销，有人看片时跑一轮 heal（HEAL_TICK_BUDGET 管住）。
     # 【不压在下一次触发之前】间隔只有 1 分钟，而一个条目探测就要 20 秒 —— 压了就是
     # 把正常的一轮砍断。叠加由 take_task_lock 挡，这里只防吊死，给足余量。
-    "heal-tick": HEAL_TICK_BUDGET + 90,
+    # 【余量要按"一集最坏要多久"给，不是按预算】预算只在两集之间看，拦不住正在探的
+    # 那一集。一集的上限：问 Emby 30 + 换直链 120 + 预拉文件头 40（带重试）+ 问 m3u8 60
+    # + 探测 200×两条路 + 几次回读 ≈ 十来分钟。以前给的是 240 秒 —— 实测撞上的：
+    # 遮天 181 点开，挑中了、记了次数，然后一行流水都没有；那一轮是撞上网盘节点卡住，
+    # 探到一半被砍掉的（单集 320 秒的流水这台机器上有过）。被砍的那一刻流水还没写、
+    # 冷却却已经记下，于是下一次点开也不补 —— 看起来就是"点了不补"。
+    "heal-tick": 900,
     "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
     "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
     # 只读 /proc + 每个容器两条 docker 命令，几十毫秒的事；给 60 秒够宽了
@@ -10618,6 +10624,26 @@ def heal_log(lines):
         pass                          # 记不上账不该把补时长本身弄挂
 
 
+def heal_on_term(how):
+    """装一个 SIGTERM 处理：被 timeout 砍掉时，流水里留一行，然后正常退出。
+
+    【为什么要有】cron 那条前面挂着 timeout，砍的时候发的就是 SIGTERM。默认处理是
+    当场死掉：流水不写、正在探的那一集 strm 的还原（写在 finally 里）也不跑。
+    转成 SystemExit 之后：这一行先落下，主线程按正常退出走；探测是在线程池里跑的，
+    解释器退出前会等这些线程收尾，它们的 finally 照常把 strm 写回路径形式。
+    """
+    import signal as _sig
+
+    def _h(signum, frame):
+        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{how}）"
+                  f"被 timeout 砍掉了 —— 正在探的那一集没探完，下次点开会再探"])
+        raise SystemExit(143)
+    try:
+        _sig.signal(_sig.SIGTERM, _h)
+    except (ValueError, OSError):
+        pass                          # 不在主线程之类的，装不上就算了
+
+
 def heal_log_tail(n=40):
     """最近 n 行流水。读不到返回空表 —— 调用方要照实说"读不到"，不许当成"没记录"。"""
     try:
@@ -11371,6 +11397,9 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                                 f"{pad(res, 8)}{pad(_via, 7)}{sec:>4.0f}s  "
                                 f"{(note or '').replace(chr(10), ' ')[:60]}  "
                                 f"{str(name)[:40]}")
+                    # 【探完一集就落一行】以前攒到整轮结束才写 —— 一轮被 timeout 砍掉，
+                    # 前面探完的那几集也一个字都不剩，翻流水像"根本没跑过"。
+                    heal_log(logs[-1:])
                     # 【轮内刹车】每 HEAL_MB_CHECK_EVERY 个量一次。meter 读的是
                     # openlist 的收字节（退化时才是网卡），口径见 _heal_meter。
                     # 【mb_left 要跟 None 比，别写 `and mb_left`】额度正好剩 0
@@ -11442,7 +11471,6 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
             for f2 in futs:
                 f2.cancel()
     heal_fail_record(fails)
-    heal_log(logs)
     return done, hit, over
 
 
@@ -18039,6 +18067,7 @@ if __name__ == "__main__":
             # 最会去点开新片的时候。所以抢不到 heal 那把时，只跑"刚点开的那几条"那一截：
             # 一共不超过 HEAL_BY_NAME_MAX 个，和整队撞上同一个条目的代价是多探一次，
             # 而不让位的代价是这一整段时间里点开什么都不补。
+            heal_on_term("看片后")
             if not take_task_lock("heal-tick"):
                 if has_tty():
                     warn("已经有一轮 heal-tick 在跑了，等它跑完再敲。")
