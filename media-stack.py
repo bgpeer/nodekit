@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.157"
+SCRIPT_VERSION = "1.5.158"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3384,7 +3384,7 @@ def do_heal_tick(hot_only=False):
     # 要不要写回，rescue_progress 自己有三道判据（条目有时长、续播点被清成 0、没到
     # 90%），正常记住了进度的一个都不碰 —— 所以这里放宽到"点开过的都盯"没有风险。
     if ids:
-        rescue_arm([("", i, "") for i in list(ids)[:HEAL_BY_NAME_MAX]])
+        rescue_arm([("", i, "") for i in ids])
     ts = last_played_ts(key)
     water = float(ms_state().get("heal_tick_seen") or 0)
     moved = ts is not None and ts > water
@@ -3402,6 +3402,11 @@ def do_heal_tick(hot_only=False):
     # 前者是你刚点过播放，后者是例行补积压。混在一起的话，翻流水的人分不出
     # "它是因为我点了播放才补的"还是"刚好轮到它"。
     os.environ["MS_HEAL_TICK"] = "1"
+    # 【上一轮没轮上的，这一轮接着补】见下面 heal_hot_queue
+    _q = {k: v for k, v in (ms_state().get("heal_hot_queue") or {}).items()
+          if isinstance(v, (int, float)) and time.time() - v < HEAL_HOT_QUEUE_H * 3600}
+    if _q:
+        ids = set(ids or ()) | set(_q)
     hot = strm_items_need_heal(key, ids or [])
     # 【一次性：清掉旧口径记下的冤枉账】v1.5.149 之前，被「补上又掉了」拦下、根本没探的
     # 那几次也照样记了冷却和次数 —— 仓库主人的遮天 181 就这样：一次都没探，却"冷却中、
@@ -3425,6 +3430,14 @@ def do_heal_tick(hot_only=False):
               and int(_cnt.get(str(x[1])) or 0) >= HEAL_HOT_DAY_TRIES]
     hot = [x for x in hot if str(x[1]) not in _cool
            and int(_cnt.get(str(x[1])) or 0) < HEAL_HOT_DAY_TRIES]
+    # 【一轮最多补几个，剩下的排队】连着点开十来集时，这一轮补前 HEAL_BY_NAME_MAX 个，
+    # 其余的记进 heal_hot_queue，下一分钟接着来 —— 不丢。不在 hot 里的（补齐了、在冷却、
+    # 今天次数用完）从队列里拿掉。
+    _later = hot[HEAL_BY_NAME_MAX:]
+    hot = hot[:HEAL_BY_NAME_MAX]
+    _now_q = int(time.time())
+    save_ms_state(heal_hot_queue={str(x[1]): int(_q.get(str(x[1])) or _now_q)
+                                  for x in _later})
     if hot:
         _say(f"刚点开过、而且还缺媒体信息的有 {len(hot)} 个，先补这几个。")
         # 【先记再探】探到一半被 timeout 砍掉也算探过 —— 不然下一分钟又从头来一遍
@@ -3436,7 +3449,17 @@ def do_heal_tick(hot_only=False):
         # Emby 清掉（它是按开播那一刻的"没时长"开的场），见 rescue_progress
         rescue_arm(hot)
         rescue_mark_nodur(hot)
+        _PROBED.clear()
         heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
+        # 【没轮到探的，退回冷却和次数、排回队列】这一轮时间到了、或者撞上限流整轮
+        # 拉停了，排在后面的几集一个请求都没发出去 —— 却已经记了冷却和次数，下次点开
+        # 就会被一次根本没发生的探测挡住。
+        _miss = [x for x in hot if str(x[1]) not in _PROBED]
+        if _miss:
+            heal_hot_unmark([x[1] for x in _miss])
+            _qq = dict(ms_state().get("heal_hot_queue") or {})
+            _qq.update({str(x[1]): int(time.time()) for x in _miss})
+            save_ms_state(heal_hot_queue=_qq)
         # 补完多半还在播 —— 当场记一次位置，别等下一分钟（下一分钟可能已经停了）
         rescue_progress(key)
         save_ms_state(heal_tick=int(time.time()))
@@ -9044,10 +9067,17 @@ def strm_items_need_heal(key, ids):
     uid = (users[0] or {}).get("Id", "") if users else ""
     if not uid:
         return out
-    want = [str(i) for i in ids][:HEAL_BY_NAME_MAX]
+    # 【先筛、后截】以前在这儿就截成 HEAL_BY_NAME_MAX 个再去筛 —— 一分钟里连着点开了
+    # 十来集，已经补齐的也占名额，缺时长的反倒可能被挤掉；而挤掉的那几集，这一次点开
+    # 的信号就此作废。现在全都查（分批问，一批 50 个），要不要截、截下来的去哪，交给
+    # 调用方（do_heal_tick 一轮最多补 HEAL_BY_NAME_MAX 个，剩下的排队下一轮）。
+    want = [str(i) for i in ids]
+    d = {"Items": []}
     try:
-        d = _emby(f"/Users/{uid}/Items?Ids={','.join(want)}"
-                  f"&Fields=Path,MediaSources,MediaStreams,DateCreated", key)
+        for k in range(0, len(want), 50):
+            d["Items"] += (_emby(f"/Users/{uid}/Items?Ids={','.join(want[k:k + 50])}"
+                                 f"&Fields=Path,MediaSources,MediaStreams,DateCreated",
+                                 key).get("Items") or [])
     except Exception:
         return out
     for i in d.get("Items") or []:
@@ -10595,6 +10625,8 @@ HEAL_STICK_H = 24
 # 仓库主人说的那样：没补上的点了播放却不补。上一次失败多半是撞上坏节点这种一阵子的事，
 # 10 分钟后再点，换一条直链多半就成了。
 HEAL_HOT_COOLDOWN_MIN = 10
+# 点开了、这一轮没轮上的，排队多久之内还算数（小时）
+HEAL_HOT_QUEUE_H = 1
 # 冷却 / 次数那两张表的口径版本。见 do_heal_tick 里的一次性清理。
 HEAL_HOT_V = 2
 # 一个条目要拉多少 MB。【注意这是上游口径】——nginx 日志里看到的约 6.7 MB 是
@@ -11266,7 +11298,15 @@ def heal_media_info(d, key, budget=None, items=None):
 
 
 def heal_workers():
-    """这一轮同时探几个。上一轮撞过限流（配额已经砍到底）就退回单线程。"""
+    """这一轮同时探几个。上一轮撞过限流（配额已经砍到底）就退回单线程。
+
+    【点开那条路（heal-tick）一次只探一集】那时候你正在播、正在切换 —— 每点开一集，
+    播放器也在向网盘要直链。再叠上三路并发探测，最容易撞上网盘的频率限制（429），
+    撞上的不只是探测，还有你正在点的那一集。一集一集探，单点一集的等待不变；连着
+    点开十来集时后面的排队，下一分钟接着补。
+    """
+    if os.environ.get("MS_HEAL_TICK"):
+        return 1
     return 1 if heal_pace() <= HEAL_PACE_MIN else HEAL_WORKERS
 
 
@@ -11382,6 +11422,10 @@ def _clear_half_info(key, uid, iid):
     return True, False
 
 
+# 本进程里真正开探过的条目 id —— heal-tick 用它分出"没轮到探的"，退回冷却和次数
+_PROBED = set()
+
+
 def _heal_one(d, key, _it, base, token):
     """探一个条目。返回 (结局, 名字, 秒数, 附言)。
 
@@ -11395,6 +11439,7 @@ def _heal_one(d, key, _it, base, token):
     # "是不是新片"），而重试名单里塞回来的也是同一个元组 —— 解包会随元素
     # 个数变化而崩，下标不会。
     uid, iid, name = _it[0], _it[1], _it[2]
+    _PROBED.add(str(iid))
     _t1 = time.monotonic()
     el = lambda: time.monotonic() - _t1
     try:
