@@ -26,13 +26,6 @@ profile: {store-selected: true, store-fake-ip: true}
 ntp: {enable: true, server: time.apple.com, port: 123, interval: 30, dialer-proxy: "", write-to-system: false}
 experimental: {quic-go-disable-ecn: true}
 
-geodata-mode: false
-geo-auto-update: true
-geo-update-interval: 24
-geox-url:
-  mmdb: "https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb"
-  asn: "https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
-
 external-controller-cors:
   allow-origins: ["*"]
   allow-private-network: true
@@ -40,6 +33,13 @@ external-controller: 127.0.0.1:9092
 secret: "88888888"
 external-ui: './ui'
 external-ui-url: "https://gh-proxy.com/https://codeload.github.com/Zephyruso/zashboard/zip/refs/heads/gh-pages"
+
+geodata-mode: false
+geo-auto-update: true
+geo-update-interval: 24
+geox-url:
+  mmdb: "https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb"
+  asn: "https://gh-proxy.com/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-ASN.mmdb"
 
 tun:
   enable: true
