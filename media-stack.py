@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.148"
+SCRIPT_VERSION = "1.5.149"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3574,8 +3574,9 @@ def do_heal_trace(q, play=True):
     _ok_at = heal_unstuck(iid)
     if _ok_at:
         _trace_row("⚠", "补上又掉了", f"{int((time.time() - _ok_at) // 3600)} 小时前补上过，"
-                   f"现在又没了 —— {HEAL_STICK_H} 小时内不再自动探（再探也是补上再掉）。"
-                   f"这一种是 bug，把这一屏发给仓库主人")
+                   f"现在又没了 —— 后台补积压 {HEAL_STICK_H} 小时内不再碰它；"
+                   f"点开播放照常补。常见原因：某次播放失败（撞上连不上的 CDN 节点），"
+                   f"Emby 拿失败时读到的半截信息盖掉了补好的")
     _tn = ms_state().get("heal_hot_n") or {}
     if _tn.get("date") == time.strftime("%Y-%m-%d"):
         _k = int((_tn.get("n") or {}).get(iid) or 0)
@@ -10872,9 +10873,15 @@ def heal_media_info(d, key, budget=None, items=None):
     # 两条都按集管住了（最多 HEAL_BY_NAME_MAX 个、冷却、一天几次），不按字节拦。
     # 花的照样记账。
     _nolimit = not heal_budget_applies(_how_try)
-    # 【补上又掉了的不再白买】见 HEAL_STICK_H。点名的不拦 —— 你亲手敲的那一集，
-    # 就是想看看它这次还掉不掉。
-    if _how_try != "点名":
+    # 【补上又掉了的不再白买】见 HEAL_STICK_H。【只拦整队】：
+    #   · 点名的不拦 —— 你亲手敲的那一集，就是想看看它这次还掉不掉
+    #   · 看片后的也不拦 —— 实测撞上的：遮天 181 07:54 补上，4 分钟后你点它正撞上
+    #     一个连不上的 CDN 节点，播放失败，Emby 拿那次失败里读到的半截信息（有轨道、
+    #     没时长）把补好的盖掉了。你再点开，这条规则说"补上又掉了"不给探 —— 挡住的
+    #     恰恰是你正在看的那一集。这条路自己有冷却（HEAL_HOT_COOLDOWN_MIN）和一天
+    #     几次（HEAL_HOT_DAY_TRIES），按集管住了，用不着它
+    # 整队那边它照旧有用：一批条目每轮 ✔、每轮掉，就是每轮重买一遍。
+    if _how_try == "整队":
         _now_s = time.time()
         _loose = [x for x in allpend if heal_unstuck(x[1], _now_s)]
         if _loose:
