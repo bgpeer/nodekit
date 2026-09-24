@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.156"
+SCRIPT_VERSION = "1.5.157"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -7805,11 +7805,14 @@ def do_update(from_menu=False):
     # 机器上既没有那个 systemd 服务、nginx 里也没有那条 location。只挂在"切画质"
     # 那一下的话，早就把画质设成转码流的人【永远等不到它】—— 更新完看着版本号是
     # 新的，播放却还是照旧转圈，而且完全看不出差在哪。所以更新这条路上必须对一次。
+    # 【nginx 那条 location 不在这儿写】下面「按当前版本重新生成 nginx 站点配置」本来
+    # 就会连它一起写上。以前这里也调了一次 apply_nginx_site：更新一次，nginx 被写两遍、
+    # 重载两遍，屏上「nginx 配置已生效」连着出现两次（仓库主人：「nginx 更新是不是重复
+    # 了两次？」）。而且这一处不看 NGX_SITE 在不在 —— 装的时候选了"不让脚本配 nginx"
+    # 的机器，更新一次就被凭空写出一份站点配置来。
     try:
         if sync_hls_service(d):
             ok("转码流的分片重定向已就绪（Emby 里现在能播转码流）")
-        if cfg.get("has_domain") and os.path.exists(cfg.get("crt") or ""):
-            apply_nginx_site(cfg)
     except Exception as e:
         warn(f"分片重定向没对上（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
