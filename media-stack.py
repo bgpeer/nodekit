@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.154"
+SCRIPT_VERSION = "1.5.155"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -16365,7 +16365,7 @@ def _is_internal_host(host):
 
 
 def mask_host(u):
-    """把地址里的域名打码：https://list.llj.xxx → https://list.<你的域名>。
+    """把地址里的域名打码：https://list.jp.example.net → https://list.<你的域名>。
 
     【体检的输出是会被截图发出去的】这个文件里好几处注释都写着这句（
     openlist_storages、tune_strm_libraries 都为它删过东西），可「换直链」和
