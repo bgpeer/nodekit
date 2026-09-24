@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.151"
+SCRIPT_VERSION = "1.5.152"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11171,6 +11171,59 @@ def _probe_note(iid, kind, resp):
         pass
 
 
+# 等 Emby 把半截信息清掉，最多等多久（秒）。刷新是后台跑的，一般几秒就完。
+HEAL_CLEAR_WAIT = 45
+
+
+def _half_info(key, uid, iid):
+    """条目此刻是不是"有轨道、没时长"的半截样子 → (是不是, 轨道数)。问不到 → (False, 0)。"""
+    try:
+        got = _emby(f"/Users/{uid}/Items/{iid}?Fields=MediaSources,MediaStreams",
+                    key, timeout=30)
+    except Exception:
+        return False, 0
+    srcs = got.get("MediaSources") or []
+    ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+             else (got.get("RunTimeTicks") or 0))
+    n = (len(got.get("MediaStreams") or [])
+         or sum(len(x.get("MediaStreams") or []) for x in srcs))
+    return bool(n and not ticks), n
+
+
+def _clear_half_info(key, uid, iid):
+    """条目手里拿着"有轨道、没时长"的半截信息时，先让 Emby 把它清掉。
+
+    返回 (原来是不是半截, 清掉了没有)。
+
+    【为什么要清】实测撞上的：遮天 181 07:54 补上，4 分钟后一次播放撞上坏节点失败，
+    Emby 拿失败时读到的半截（2 条轨道、没时长、0B / 188 Kbps）盖掉了补好的。之后
+    怎么点开、怎么补都没用：Emby 看它已经有轨道了，探测请求直接拿这份旧的交差，
+    时长永远是 0。仓库主人：「他只补了一半是不是认为他已经补了就不补了」—— 就是这样，
+    只不过"认为补过了"的是 Emby，不是脚本。
+
+    【怎么清】让 Emby 刷新这个条目一次，趁 strm 还是路径形式 —— 它读不到那个路径，
+    就把轨道清空。这正是实时监控当初把补好的轨道清掉的那个机制（见 STRM_LIB_OPTIONS），
+    这里是故意用它。清空之后探测请求才会老老实实从头探。
+    只刷元数据、不碰图、ReplaceAllMetadata=false：名字、简介、编号一个字不动。
+    """
+    half, _n = _half_info(key, uid, iid)
+    if not half:
+        return False, False
+    try:
+        _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
+              f"&ImageRefreshMode=None&ReplaceAllMetadata=false&ReplaceAllImages=false",
+              key, method="POST", timeout=30)
+    except Exception:
+        return True, False
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < HEAL_CLEAR_WAIT:
+        time.sleep(3)
+        still, n = _half_info(key, uid, iid)
+        if not n:
+            return True, True         # 轨道清空了，可以从头探了
+    return True, False
+
+
 def _heal_one(d, key, _it, base, token):
     """探一个条目。返回 (结局, 名字, 秒数, 附言)。
 
@@ -11219,6 +11272,8 @@ def _heal_one(d, key, _it, base, token):
             return "throttle", name, el(), f"网盘没给出文件头（{why}）"
         return "retry", name, el(), f"网盘没给出文件头（{why}）"
     url = base + "/d" + urllib.parse.quote(p) + (f"?sign={sign}" if sign else "")
+    # 【手里有半截信息的，先清掉再探】见 _clear_half_info
+    _half, _cleared = _clear_half_info(key, uid, iid)
     # 【先试 m3u8，探不出来再退回整文件】转码流的盘，MediaWarp 会 302 到一份几 KB
     # 的播放列表，每个分片带 #EXTINF 秒数 —— ffprobe 读它就拿到时长，编码读一个
     # 分片就有。而 /d/ 那条要把原始文件的文件头拉下来，实测一个条目几 MB 起步。
@@ -11328,6 +11383,13 @@ def _heal_one(d, key, _it, base, token):
         # 内存不够都会这样）。它比"完全没探到"更骗人：条目上显示着片长，
         # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
         return "retry", name, el(), "只探到时长，没有音视频轨（这样点开会 load fail）"
+    if streams and not mins:
+        # 【有轨道、没时长：Emby 没重新探】手里那份半截信息它不肯丢，探测请求直接拿
+        # 旧的交差。以前落到下面那条「没有音视频轨」—— 明明有轨道，话是错的，还判了
+        # dead。这不是源的问题，是那半截没清掉，下次再试。
+        return ("retry", name, el(),
+                "只有轨道没有时长 —— Emby 拿着之前那份半截信息没重新探"
+                + ("（先清过一次，没清掉）" if _half and not _cleared else ""))
     if probed:
         # 【探测跑完了、Emby 什么都没找到 = 确定的答案，不是线路抖了一下】
         # 这种再探两次只是把同一个答案买三遍，而一遍的价钱是「全库 × 每个几 MB」。
