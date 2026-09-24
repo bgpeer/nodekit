@@ -6825,7 +6825,7 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard, node_dom=None):
        照着它校验会把唯一正确的那张新证书拦下来。所以那条路显式传新域名进来。"""
     G_OK, R, N = "\033[1;32m", "\033[1;31m", "\033[0m"
     # 最后一道闸：这张证书是全机共用的地基，节点正在用的域名【一定】要盖得住。
-    # 只校验「盖不盖得住你刚才输的域名」是不够的——输错一个字符（llj 打成 ly），
+    # 只校验「盖不盖得住你刚才输的域名」是不够的——输错一个字符（example 打成 exmaple），
     # 新证书对它自己完全合法，装上去却让所有吃证书的节点被客户端当场拒绝
     # （tls: bad certificate），而 reality 照常通，看起来就像「随机几个节点坏了」。
     nd = node_domain() if node_dom is None else node_dom
@@ -7595,7 +7595,7 @@ def cert_change_domain_apply(new, cf_token="", emby_new=""):
 
 def _emby_default_base(new):
     """Emby 对外是 <子域>.<域名>，而节点域名是一个完整主机名。节点换到 jp2.example.net
-       时 Emby 多半该跟到 example.net（跟现在 jp.example.net / example.net 的关系一样）。
+       时 Emby 多半该跟到 example.net（就像 jp.example.com 对应 example.com）。
        只是个默认值，问的时候可以改。"""
     parts = new.split(".")
     return ".".join(parts[1:]) if len(parts) >= 3 else new
