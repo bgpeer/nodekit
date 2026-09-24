@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.152"
+SCRIPT_VERSION = "1.5.153"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3194,6 +3194,97 @@ def do_warm():
         pass
 
 
+# ============================================================================ 进度抢救
+# 【第一次点开的那一次播放，进度也要留住】仓库主人：「我第一次点播放的时候他虽然补上了，
+# 第一次没有进度条记忆，估计到第二次点他才会有，就没有什么办法在边播的时候把这个探测
+# 补上然后插入进去吗」。
+#
+# 时序是这样的：点开的那一刻这一集还没有时长，Emby 就按"没有时长"开了这一场播放；
+# 二十来秒后时长补上了，可这一场早就开了 —— 停的时候 Emby 拿"分母是 0"那套逻辑一算，
+# 直接判「已看完」、把续播点清掉。时长只对【下一场】起作用。
+#
+# 补救：点开时还没补上的那几集记下来，播着的时候每分钟看一眼放到哪儿了；停了之后，
+# 要是 Emby 把续播点清成了 0、而你其实没看到结尾，就把最后看到的位置写回去。
+HEAL_RESCUE_H = 6            # 记下之后多久不再管（点开了但一直没播的，别一直挂着）
+HEAL_RESCUE_MIN_S = 60       # 只播了不到这么多秒的不救 —— 那是点开看了一眼
+HEAL_RESCUE_END_PCT = 0.9    # 放到这个比例之后停的，当它是真看完了（Emby 的默认也是 90%）
+
+
+def rescue_arm(items):
+    """把"点开时还没补上"的这几集记下来，之后的每一轮 tick 都会盯着它们。"""
+    if not items:
+        return
+    st = dict(ms_state().get("heal_rescue") or {})
+    now = int(time.time())
+    for x in items:
+        st.setdefault(str(x[1]), {"uid": x[0], "pos": 0, "seen": 0, "t0": now,
+                                  "name": str(x[2])[:40]})
+    save_ms_state(heal_rescue=st)
+
+
+def rescue_progress(key):
+    """盯着记下的那几集：在播就记位置；播完了、续播点被 Emby 清掉了就写回去。返回写回了几个。
+
+    【没东西要盯就一个请求都不发】平时这张表是空的，每分钟这一步的代价就是读一次状态文件。
+    【只在确凿时写】三条都满足才动：条目现在有时长了（没时长写了也白写）、Emby 那边
+    续播点是 0（它自己记住了就不碰）、最后看到的位置没到结尾（真看完了就不碰）。
+    """
+    st = dict(ms_state().get("heal_rescue") or {})
+    if not st:
+        return 0
+    try:
+        sessions = _emby("/Sessions", key, timeout=20) or []
+    except Exception:
+        return 0                      # 问不到就这轮不动，别把"不知道"当成"播完了"
+    now, fixed, logs = int(time.time()), 0, []
+    playing = {}
+    for se in sessions:
+        iid = str((se.get("NowPlayingItem") or {}).get("Id") or "")
+        if iid in st:
+            playing[iid] = (se.get("UserId") or st[iid].get("uid"),
+                            int((se.get("PlayState") or {}).get("PositionTicks") or 0))
+    for iid, e in list(st.items()):
+        if iid in playing:
+            # 【取最新的，不取最大的】人会往回拖；最后停在哪儿才是要续的地方
+            e["uid"], e["pos"] = playing[iid][0], max(0, playing[iid][1])
+            e["seen"] = now
+            continue
+        if not e.get("seen"):
+            if now - int(e.get("t0") or now) > HEAL_RESCUE_H * 3600:
+                st.pop(iid, None)     # 点开了却一直没看到在播，别一直挂着
+            continue
+        st.pop(iid, None)             # 播过、现在不在播了 → 这一场结束了，结一次账
+        pos = int(e.get("pos") or 0)
+        if pos < HEAL_RESCUE_MIN_S * 10 ** 7:
+            continue
+        try:
+            it = _emby(f"/Users/{e.get('uid')}/Items/{iid}?Fields=UserData,MediaSources",
+                       key, timeout=30)
+        except Exception:
+            continue
+        srcs = it.get("MediaSources") or []
+        ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+                 else (it.get("RunTimeTicks") or 0))
+        ud = it.get("UserData") or {}
+        if not ticks or int(ud.get("PlaybackPositionTicks") or 0) > 0 \
+                or pos >= ticks * HEAL_RESCUE_END_PCT:
+            continue
+        try:
+            _emby(f"/Users/{e.get('uid')}/Items/{iid}/UserData", key, method="POST",
+                  body={"PlaybackPositionTicks": pos, "Played": False,
+                        "PlayCount": int(ud.get("PlayCount") or 0),
+                        "IsFavorite": bool(ud.get("IsFavorite"))}, timeout=30)
+        except Exception:
+            continue
+        fixed += 1
+        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：第一场播放"
+                    f"停在 {pos // 600000000} 分 {pos // 10 ** 7 % 60:02d} 秒，Emby 判成看完了"
+                    f"（那时还没时长），已写回续播点  {e.get('name') or iid}")
+    save_ms_state(heal_rescue=st)
+    heal_log(logs)
+    return fixed
+
+
 def do_heal_tick(hot_only=False):
     """每 HEAL_TICK_MIN 分钟一次：有人看过片才补一轮时长。安静跑。
 
@@ -3221,6 +3312,9 @@ def do_heal_tick(hot_only=False):
     if not key:
         _say("没有 Emby API Key（「3 后补参数」里填）。")
         return
+    # 【先盯着第一次点开的那几场播放】见 rescue_progress。放在最前面：下面好几个分支
+    # 会提前返回，而这一步每一轮都得跑
+    rescue_progress(key)
     # 【两个信号，任一说"有人点过播放"就跑】
     #   · MediaWarp 日志里最近有没有播放请求 —— 最硬：那是请求本身，按下播放那一刻
     #     就有，不依赖 Emby 里哪个字段什么时候更新
@@ -3283,7 +3377,12 @@ def do_heal_tick(hot_only=False):
         for x in hot:
             _cnt[str(x[1])] = int(_cnt.get(str(x[1])) or 0) + 1
         save_ms_state(heal_hot=_cool, heal_hot_n={"date": _today, "n": _cnt})
+        # 【点开时还没补上的，这一场播放要盯着】补上之后这一场的续播点多半还是会被
+        # Emby 清掉（它是按开播那一刻的"没时长"开的场），见 rescue_progress
+        rescue_arm(hot)
         heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
+        # 补完多半还在播 —— 当场记一次位置，别等下一分钟（下一分钟可能已经停了）
+        rescue_progress(key)
         save_ms_state(heal_tick=int(time.time()))
         return                            # 这一轮就干这个 —— 队列交给下一轮
     if _waiting or _spent:
