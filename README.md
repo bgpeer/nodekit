@@ -560,13 +560,13 @@ reload nginx，所以合并后 Emby 自动跟着吃到新证书。原证书备�
 
 ```
   当前:      各用各的（两张证书、两条续期链）
-  节点这张:  llj.679588.xyz    还剩 89 天    /etc/ssl/sb/acme.crt
-  Emby 这张: *.llj.679588.xyz  还剩 89 天    /etc/nginx/certs/llj.679588.xyz.crt
+  节点这张:  jp.example.net    还剩 89 天    /etc/ssl/sb/acme.crt
+  Emby 这张: *.jp.example.net  还剩 89 天    /etc/nginx/certs/jp.example.net.crt
   ⚠ 两条续期链 = 把「证书过期全挂」的风险配了两份，而且 Emby 那条断了不会有人发现
 ------------------------------------------------------------
-  1 共用节点这张证书    ✗ 不行：节点这张盖不住 <子域>.llj.679588.xyz
+  1 共用节点这张证书    ✗ 不行：节点这张盖不住 <子域>.jp.example.net
                         Emby 对外是 emby./mw. 等好几个子域，要泛域名才顶得住；
-                        节点这张覆盖的是 llj.679588.xyz
+                        节点这张覆盖的是 jp.example.net
                         先去『1 安装证书』用 DNS-01 重签一张泛域名的，再回来合并
   2 各用各的            当前就是
   0 返回
