@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.184"
+SCRIPT_VERSION = "1.5.185"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1565,6 +1565,7 @@ case "${1:-info}" in
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
   covers --retry 截失败过的也重新试一遍
+  play-speed <片名> [--wait 秒]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
   heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
@@ -1732,6 +1733,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" heal-trace "$@" ;;
+  play-speed)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" play-speed "$@" ;;
   covers)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -3971,6 +3977,187 @@ def do_covers(retry=False):
     n = fill_covers(d, key, say=say)
     info(f"这一轮截成了 {n} 张。每张大约拉几 MB；平时每小时自动补一批，一天最多 "
          f"{COVER_DAY_MAX} 张。回 Emby 里下拉刷新就能看见。")
+
+
+# ============================================================================ 第一次播放测速
+# 仓库主人：「没播放过的都是第一次播放很卡第二次播放就很流畅，你要不要用检测代码试一下
+# 第一次播一会然后断开过几秒再播第二次」。
+PLAY_SPEED_S = 15             # 每一次拉多久（秒）
+PLAY_SPEED_MB = 30            # 每一次最多拉多少（MB）—— 两次合计封顶 60 MB
+
+
+def _local_emby_conn(timeout=60):
+    """连本机那个 emby 站点（经 nginx，和手机走同一道门）；没有 nginx 就直连 MediaWarp。"""
+    import http.client
+    site = _emby_site_local()
+    if site:
+        import socket
+        import ssl
+        host, port = site
+        ctx = ssl._create_unverified_context()     # 连的是 127.0.0.1，见 _trace_play
+
+        class _Local(http.client.HTTPSConnection):
+            def connect(self):
+                raw = socket.create_connection(("127.0.0.1", port), self.timeout)
+                self.sock = ctx.wrap_socket(raw, server_hostname=host)
+
+        return _Local(host, port, timeout=timeout)
+    return http.client.HTTPConnection("127.0.0.1", MEDIAWARP_PORT, timeout=timeout)
+
+
+def _play_start(iid, msid, key):
+    """像播放器一样按下播放：PlaybackInfo（经过「先补再播」），再要 /stream 的 302。
+    → {"pi": PlaybackInfo 秒数, "go": 拿到直链秒数, "loc": 直链, "err": 说明}"""
+    out = {"pi": 0.0, "go": 0.0, "loc": "", "err": ""}
+    try:
+        c = _local_emby_conn()
+        t0 = time.monotonic()
+        c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?api_key={key}", body=b"{}",
+                  headers={"User-Agent": HTTP_UA, "Content-Type": "application/json"})
+        c.getresponse().read()
+        out["pi"] = time.monotonic() - t0
+        t1 = time.monotonic()
+        c.request("GET", f"/emby/videos/{iid}/stream?MediaSourceId="
+                  f"{urllib.parse.quote(str(msid))}&Static=true&api_key={key}",
+                  headers={"User-Agent": HTTP_UA})
+        r = c.getresponse()
+        out["loc"] = r.getheader("Location") or ""
+        r.close()
+        c.close()
+        out["go"] = time.monotonic() - t1
+        if not out["loc"]:
+            out["err"] = f"没给 302（HTTP {r.status}）—— 这个盘走的是本机代理，不是直链"
+    except Exception as e:
+        out["err"] = _short_err(e)
+    return out
+
+
+def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB):
+    """照播放器的样子拉 url：普通文件从头连续读；m3u8 就一个分片一个分片地读。
+    → {"kind", "ttfb", "bytes", "t", "per_s": [每秒 KB], "err"}"""
+    res = {"kind": "文件", "ttfb": 0.0, "bytes": 0, "t": 0.0, "per_s": [], "err": ""}
+    cap = cap_mb << 20
+    t0 = time.monotonic()
+    marks = {}
+
+    def _feed(n):
+        res["bytes"] += n
+        sec = int(time.monotonic() - t0)
+        marks[sec] = marks.get(sec, 0) + n
+
+    def _read_all(resp):
+        first = True
+        while res["bytes"] < cap and time.monotonic() - t0 < secs:
+            b = resp.read(65536)
+            if not b:
+                break
+            if first and not res["ttfb"]:
+                res["ttfb"] = time.monotonic() - t0
+            first = False
+            _feed(len(b))
+
+    hdr = {"User-Agent": BROWSER_UA}
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=30)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        head = r.read(8)
+        if head.startswith(b"#EXTM3U") or "mpegurl" in ctype:
+            res["kind"] = "转码流（m3u8）"
+            body = (head + r.read(1 << 20)).decode("utf-8", "replace")
+            base = r.geturl()
+            r.close()
+            segs = [urllib.parse.urljoin(base, ln.strip()) for ln in body.splitlines()
+                    if ln.strip() and not ln.startswith("#")]
+            if segs and segs[0].split("?")[0].endswith(".m3u8"):     # 多码率的总表
+                r2 = urllib.request.urlopen(urllib.request.Request(segs[0], headers=hdr),
+                                            timeout=30)
+                sub = r2.read(1 << 20).decode("utf-8", "replace")
+                base = r2.geturl()
+                r2.close()
+                segs = [urllib.parse.urljoin(base, ln.strip()) for ln in sub.splitlines()
+                        if ln.strip() and not ln.startswith("#")]
+            for sg in segs:
+                if res["bytes"] >= cap or time.monotonic() - t0 >= secs:
+                    break
+                with urllib.request.urlopen(urllib.request.Request(sg, headers=hdr),
+                                            timeout=30) as rs:
+                    _read_all(rs)
+        else:
+            res["ttfb"] = time.monotonic() - t0
+            _feed(len(head))
+            _read_all(r)
+            r.close()
+    except Exception as e:
+        res["err"] = re.sub(r"https?://\S+", "<地址>", _short_err(e))
+    res["t"] = max(0.001, time.monotonic() - t0)
+    last = int(res["t"])
+    res["per_s"] = [marks.get(i, 0) // 1024 for i in range(0, last + 1)]
+    return res
+
+
+def do_play_speed(q, wait=5):
+    """media-stack play-speed <片名> [--wait 秒]：替你播两次，看第一次是不是比第二次慢。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        return
+    hits = find_strm_items(key, q)
+    if not hits:
+        warn(f"strm 媒体库里没找到「{q}」。")
+        return
+    if len(hits) > 1:
+        warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只测一部，多给几个词：")
+        _list_hits(key, hits)
+        return
+    uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
+    st0 = _trace_item(key, uid, iid) or {"ticks": 0, "msid": f"mediasource_{iid}"}
+    print(f"\n  {BOLD}第一次 / 第二次播放测速{RST}  {name}")
+    print(f"  {DIM}在这台服务器上替你按两次播放，每次拉 {PLAY_SPEED_S} 秒（最多 "
+          f"{PLAY_SPEED_MB} MB），中间断开 {wait} 秒。测的是【服务器到网盘】这一段，"
+          f"不是你手机到网盘那一段。{RST}")
+    if not st0.get("ticks"):
+        print(f"  {DIM}这一集现在还没时长：第一次会经过「先补再播」，补时长的等待也算在里面。{RST}")
+    rows = []
+    for n in (1, 2):
+        if n == 2:
+            print(f"  {DIM}…断开，等 {wait} 秒…{RST}", flush=True)
+            time.sleep(wait)
+        st = _play_start(iid, st0.get("msid") or f"mediasource_{iid}", key)
+        if st["err"]:
+            _trace_row("✖", f"第 {n} 次", st["err"])
+            return
+        sp = _pull_speed(st["loc"])
+        rows.append((st, sp))
+        avg = sp["bytes"] / sp["t"] / 1024
+        _trace_row("·", f"第 {n} 次", f"PlaybackInfo {st['pi']:.1f}s → 拿到直链 {st['go']:.1f}s → "
+                   f"首字节 {sp['ttfb']:.1f}s；{sp['kind']}，{sp['t']:.0f} 秒拉了 "
+                   f"{sp['bytes'] / 1048576:.1f} MB，平均 {avg:.0f} KB/s"
+                   + (f"；{sp['err']}" if sp["err"] else ""))
+        print(f"  {DIM}{'':20}每秒 KB：{' '.join(str(x) for x in sp['per_s'][:20])}{RST}")
+    (s1, p1), (s2, p2) = rows
+    same = s1["loc"].split("?")[0] == s2["loc"].split("?")[0]
+    _trace_row("·", "两次的直链", "同一条（MediaWarp 缓存的）" if same else "换了一条")
+    a1 = p1["bytes"] / p1["t"]
+    a2 = p2["bytes"] / p2["t"]
+    hr()
+    if s1["pi"] > s2["pi"] + 3:
+        print(f"  · 第一次开播前多等了 {s1['pi'] - s2['pi']:.0f} 秒：那是「先补再播」在补时长。")
+    if a1 < a2 * 0.5:
+        print(f"  {YELLOW}服务器这头也复现了：第一次 {a1 / 1024:.0f} KB/s，第二次 "
+              f"{a2 / 1024:.0f} KB/s。{RST}")
+        print(f"  {DIM}网盘那边第一次是冷的（原片要从源站取 / 转码版要现做），取过一次就热了。"
+              f"不是解码、也不是你的手机。{RST}")
+    elif a1 > 0 and a2 > 0 and abs(a1 - a2) < max(a1, a2) * 0.3:
+        print(f"  服务器这头两次差不多（{a1 / 1024:.0f} / {a2 / 1024:.0f} KB/s）。")
+        print(f"  {DIM}第一次卡多半卡在【你手机到网盘】那一段：离你近的那个网盘节点第一次也是冷的，"
+              f"或者那一刻手机的网慢。服务器替不了那一段。{RST}")
+    else:
+        print(f"  第一次 {a1 / 1024:.0f} KB/s，第二次 {a2 / 1024:.0f} KB/s。")
+    print(f"  {DIM}这一集现在已经播过两次了；想再亲手比一次，换一部没播过的。{RST}")
 
 
 # ============================================================================ 进度抢救
@@ -19788,6 +19975,18 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("sync"):
                 _timed("每日对齐", do_sync)
+        elif arg == "play-speed":         # 替你播两次，看第一次是不是比第二次慢
+            require_root()
+            # 【等几秒要写 --wait】片名本身常带数字（完美世界 28），不能拿最后一个数猜
+            _a, _w = list(sys.argv[2:]), 5
+            if "--wait" in _a:
+                _i = _a.index("--wait")
+                try:
+                    _w = max(0, min(600, int(_a[_i + 1])))
+                    del _a[_i:_i + 2]
+                except (IndexError, ValueError):
+                    del _a[_i:]
+            do_play_speed(" ".join(_a).strip(), wait=_w)
         elif arg == "covers":             # 没刮到封面的：截一帧当封面
             require_root()
             do_covers(retry="--retry" in sys.argv[2:])
