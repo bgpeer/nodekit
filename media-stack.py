@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.187"
+SCRIPT_VERSION = "1.5.188"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2384,8 +2384,12 @@ def do_heal_daemon():
 
 
 # ============================================================================ 先补再播
-# 开播前最多替它补多久（秒）。补一集实测 4~10 秒；等不到就放行，照老路播 + 事后抢救
-HEAL_GATE_WAIT_S = 15
+# 开播前最多替它补多久（秒）。补一集实测多半 4~10 秒；等不到就放行。
+# 【30，不是 15】真机 FC2-060525（play-watch 抓到的）：这一集补了 40 多秒，门等满 15 秒就
+# 放行了 —— 可补的时候 strm 临时是 URL 形式，MediaWarp 认不出、给不了 302，Emby 只好
+# 自己从网盘拉了再转给手机：开头 40 秒 53 MB 全经东京服务器转手，这就是「第一次卡」。
+# 等久一点，宁可开播前多转几秒圈，也别一开播就绕服务器。
+HEAL_GATE_WAIT_S = 30
 # 多久没人开播就退出（由 systemd 的 socket 再叫醒）
 HEAL_GATE_IDLE_S = 1800
 
@@ -2573,6 +2577,12 @@ def do_heal_gate():
                                     threading.Thread(target=_bg, args=(need[0], ev)).start()
                     if ev is not None:
                         ev.wait(HEAL_GATE_WAIT_S)
+                    else:
+                        # 【别人正在探这一集】看片后 / 整队那一轮正把它的 strm 切成 URL 在探 ——
+                        # 等它切回来再放行，不然开播就是经服务器转手（见 _probe_busy）
+                        t_w = time.monotonic()
+                        while _probe_busy_now(iid) and time.monotonic() - t_w < HEAL_GATE_WAIT_S:
+                            time.sleep(1)
             except Exception:
                 pass
             self.send_response(204)
@@ -13124,6 +13134,31 @@ def _clear_half_info(key, uid, iid):
 _PROBED = set()
 
 
+def _probe_busy(iid, on):
+    """记一笔：这一集的 strm 此刻被临时切成了 URL 形式（正在探）。
+
+    【门要看它】切成 URL 的那几秒到几十秒里，MediaWarp 认不出它、给不了 302，这时候
+    开播就是 Emby 自己从网盘拉了再转给手机 —— 全经服务器。门（do_heal_gate）看见这一集
+    正在被探（不管是谁在探：门自己、看片后、整队），就等它探完再放行。
+    """
+    try:
+        cur = {k: v for k, v in (ms_state().get("heal_probe_busy") or {}).items()
+               if isinstance(v, (int, float)) and time.time() - v < 600}
+        if on:
+            cur[str(iid)] = int(time.time())
+        else:
+            cur.pop(str(iid), None)
+        save_ms_state(heal_probe_busy=cur)
+    except Exception:
+        pass
+
+
+def _probe_busy_now(iid):
+    # 5 分钟封顶：探的那一轮要是中途炸了没来得及摘掉，别让门一直替它等
+    v = (ms_state().get("heal_probe_busy") or {}).get(str(iid))
+    return isinstance(v, (int, float)) and time.time() - v < 300
+
+
 def _heal_one(d, key, _it, base, token):
     """探一个条目。返回 (结局, 名字, 秒数, 附言)。
 
@@ -13210,6 +13245,7 @@ def _heal_one(d, key, _it, base, token):
     # 【每条路各自走完"写URL→探→还原→核对"一整趟】核对必须在还原之后（见下面那段
     # 注释），所以不能先把两条路都探完再核对 —— 那样又回到"拿还原前的状态下结论"
     # 那个老毛病上。代价是每条路多一次本机 Emby 读，不碰网盘。
+    _probe_busy(iid, True)
     for _kind, _u, _qs in _routes:     # 【边走边加】见下面「不开直播流」那一段
         _via = _kind
         _tried.append(_kind)
@@ -13301,6 +13337,7 @@ def _heal_one(d, key, _it, base, token):
                           + _probe_brief(iid) + _log_tag(iid)])
                 _routes.append(("不开直播流", url,
                                 "IsPlayback=false&AutoOpenLiveStream=false"))
+    _probe_busy(iid, False)
     if mins and streams:
         # 【把走的哪条路写在屏上】这是"省流量"这件事唯一看得见的证据；
         # 走 m3u8 还是整文件，代价差几十倍，而两种在别的输出里长得一模一样。
