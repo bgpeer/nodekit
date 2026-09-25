@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.186"
+SCRIPT_VERSION = "1.5.187"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1570,6 +1570,7 @@ case "${1:-info}" in
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
   covers --retry 截失败过的也重新试一遍
+  play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
@@ -1738,6 +1739,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" heal-trace "$@" ;;
+  play-watch)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" play-watch "$@" ;;
   play-speed)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -4173,6 +4179,156 @@ def do_play_speed(q, wait=5, ua="player"):
     else:
         print(f"  第一次 {a1 / 1024:.0f} KB/s，第二次 {a2 / 1024:.0f} KB/s。")
     print(f"  {DIM}这一集现在已经播过两次了；想再亲手比一次，换一部没播过的。{RST}")
+
+
+# ============================================================================ 手机播放盯梢
+# 仓库主人：「要不用这一个我直接在这上面播两次然后你再检测他们分别的网速还是什么原因」。
+# 手机直连网盘的那一段服务器看不见，但看得见两件能定案的事：
+#   · 视频字节有没有经过这台服务器（nginx 回的是 302 跳走，还是自己吐了几十 MB）
+#   · Emby 这一场是怎么播的（直接播 / 服务器转发 / 服务器转码，以及它说的原因）
+# 第一次 100~300 KB/s（像是经服务器转手）、第二次 2.5 MB/s（像是直连网盘）—— 这正是
+# 要验的。只报数和方式，不报 IP、不报设备名、不报直链。
+_NGX_LINE = re.compile(r'\[(?P<t>[^\]]+)\] "(?P<m>[A-Z]+) (?P<u>\S+)[^"]*" (?P<st>\d{3}) '
+                       r'(?P<b>\d+) "[^"]*" "(?P<ua>[^"]*)"')
+
+
+def _ngx_item_lines(buf, iid):
+    """nginx 日志那一段里跟这个条目有关的请求 → [(时刻, 方法, 路径, 状态, 字节, UA)]。
+    路径去掉查询串（里面有 api_key）；不取来源 IP。"""
+    out = []
+    for ln in buf.splitlines():
+        if f"/{iid}/" not in ln:
+            continue
+        mt = _NGX_LINE.search(ln)
+        if not mt:
+            continue
+        u = mt.group("u").split("?")[0]
+        if not re.search(rf"/(?:videos|items)/{iid}/", u, re.I):
+            continue
+        out.append((mt.group("t").split(" ")[0].split(":", 1)[-1], mt.group("m"), u,
+                    int(mt.group("st")), int(mt.group("b")), mt.group("ua")[:40]))
+    return out
+
+
+def _session_of(key, iid):
+    """Emby 此刻正在播这个条目的那一场 → {方式, 原因, 码率, 位置, 暂停}；没在播 → None。"""
+    try:
+        for se in _emby("/Sessions", key, timeout=15) or []:
+            if str((se.get("NowPlayingItem") or {}).get("Id") or "") != str(iid):
+                continue
+            ps = se.get("PlayState") or {}
+            ti = se.get("TranscodingInfo") or {}
+            return {"how": ps.get("PlayMethod") or "?",
+                    "why": ",".join(ti.get("TranscodeReasons") or []),
+                    "kbps": int((ti.get("Bitrate") or 0) / 1000),
+                    "pos": int(ps.get("PositionTicks") or 0) // 10 ** 7,
+                    "paused": bool(ps.get("IsPaused"))}
+    except Exception:
+        return None
+    return None
+
+
+_HOW_CN = {"DirectPlay": "直接播放（手机直连网盘）", "DirectStream": "服务器转发（不转码）",
+           "Transcode": "服务器转码"}
+
+
+def do_play_watch(q, minutes=15):
+    """media-stack play-watch <片名> [--min 分钟]：开着它，用手机播几次，一场一场记下来。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        return
+    hits = find_strm_items(key, q)
+    if not hits:
+        warn(f"strm 媒体库里没找到「{q}」。")
+        return
+    if len(hits) > 1:
+        warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只盯一部，多给几个词：")
+        _list_hits(key, hits)
+        return
+    uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
+    try:
+        off = os.stat(NGX_ACCESS_LOG).st_size
+    except OSError:
+        warn("没有 nginx 那份访问日志 —— 看不了字节走没走服务器（客户端是直连 IP:端口？）")
+        return
+    print(f"\n  {BOLD}手机播放盯梢{RST}  {name}")
+    print(f"  {DIM}现在去手机上播这一集：播一两分钟、退出，等几秒再播一次。每一场这里都会记下来。"
+          f"最多盯 {minutes} 分钟，Ctrl-C 随时结束。{RST}")
+    print(f"  {DIM}只看两件事：视频字节有没有经过这台服务器、Emby 这一场是怎么播的。"
+          f"不报 IP、不报设备名、不报直链。{RST}\n")
+    scenes, cur, t_end = [], None, time.monotonic() + minutes * 60
+    try:
+        while time.monotonic() < t_end:
+            time.sleep(2)
+            try:
+                with open(NGX_ACCESS_LOG, "rb") as f:
+                    f.seek(off)
+                    buf = f.read(NGX_TAIL_MAX)
+                cut = buf.rfind(b"\n") + 1
+                off += cut
+                rows = _ngx_item_lines(buf[:cut].decode("utf-8", "replace"), iid)
+            except OSError:
+                rows = []
+            for t, mth, u, st, b, ua in rows:
+                kind = ("按下播放" if u.lower().endswith("/playbackinfo") else
+                        "要视频" if "/videos/" in u.lower() else "其它")
+                # 【新的一场】上一场结束了；或者 Emby 那边一直没见到它在播（外部播放器有时
+                # 不报），那就按"隔了半分钟以上的又一次按下播放"算新的一场。同一场开播时
+                # 客户端常连问两三次 PlaybackInfo，不能每问一次就算一场
+                if kind == "按下播放" and (
+                        cur is None or cur.get("ended")
+                        or (not cur["how"] and time.monotonic() - cur["t0"] > 30)):
+                    cur = {"n": len(scenes) + 1, "t": t, "via_vps": 0, "r302": 0, "how": set(),
+                           "why": set(), "kbps": 0, "pos": 0, "t0": time.monotonic()}
+                    scenes.append(cur)
+                    print(f"  {BOLD}── 第 {cur['n']} 场（{t} 按下播放）{RST}")
+                if cur is not None and kind == "要视频":
+                    if st in (301, 302, 307):
+                        cur["r302"] += 1
+                    else:
+                        cur["via_vps"] += b
+                print(f"  {DIM}{t}  {kind:<4} {mth:<4} {st}  "
+                      f"{('跳走（302）' if st in (301, 302, 307) else f'{b / 1048576:.1f} MB 经服务器')}"
+                      f"  {u.split('/')[-1][:24]}  {ua}{RST}")
+            ss = _session_of(key, iid)
+            if cur is not None and ss:
+                cur["how"].add(ss["how"])
+                if ss["why"]:
+                    cur["why"].add(ss["why"])
+                cur["kbps"] = max(cur["kbps"], ss["kbps"])
+                cur["pos"] = ss["pos"]
+                cur.pop("ended", None)
+            elif cur is not None and not ss and cur.get("how") and not cur.get("ended"):
+                cur["ended"] = True
+                print(f"  {DIM}   这一场结束（播到 {cur['pos'] // 60} 分 {cur['pos'] % 60:02d} 秒）{RST}")
+    except KeyboardInterrupt:
+        pass
+    hr()
+    if not scenes:
+        info("这段时间里没看到这一集的「按下播放」。手机连的是不是这台机器的域名？")
+        return
+    for sc in scenes:
+        how = "、".join(_HOW_CN.get(h, h) for h in sorted(sc["how"])) or "没看到 Emby 的播放记录"
+        _trace_row("·", f"第 {sc['n']} 场", f"{how}；视频字节经服务器 {sc['via_vps'] / 1048576:.1f} MB，"
+                   f"跳走 {sc['r302']} 次"
+                   + (f"；转码原因 {'/'.join(sc['why'])}" if sc["why"] else "")
+                   + (f"；转码码率 {sc['kbps']} kbps" if sc["kbps"] else ""))
+    if len(scenes) >= 2:
+        a, b = scenes[0], scenes[1]
+        if a["via_vps"] > 5 * 1048576 and b["via_vps"] < 1048576:
+            print(f"  {YELLOW}第一场的视频是经这台服务器转手的，第二场是手机直连网盘 —— "
+                  f"第一次卡就卡在这儿（东京转到你手机只有几百 KB/s）。把这一屏发给仓库主人。{RST}")
+        elif a["how"] != b["how"]:
+            print(f"  {YELLOW}两场 Emby 的播放方式不一样 —— 把这一屏发给仓库主人。{RST}")
+        else:
+            print(f"  两场都是{'、'.join(_HOW_CN.get(h, h) for h in sorted(a['how'])) or '同一种方式'}，"
+                  f"视频字节都没怎么经过服务器。")
+            print(f"  {DIM}那第一次卡就只能在手机到网盘那一段：网盘离你近的那个节点第一次是冷的。{RST}")
 
 
 # ============================================================================ 进度抢救
@@ -19990,6 +20146,17 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("sync"):
                 _timed("每日对齐", do_sync)
+        elif arg == "play-watch":         # 你用手机播，它盯着：字节走没走服务器、Emby 怎么播的
+            require_root()
+            _a, _mn = list(sys.argv[2:]), 15
+            if "--min" in _a:
+                _i = _a.index("--min")
+                try:
+                    _mn = max(1, min(120, int(_a[_i + 1])))
+                    del _a[_i:_i + 2]
+                except (IndexError, ValueError):
+                    del _a[_i:]
+            do_play_watch(" ".join(_a).strip(), minutes=_mn)
         elif arg == "play-speed":         # 替你播两次，看第一次是不是比第二次慢
             require_root()
             # 【等几秒要写 --wait】片名本身常带数字（完美世界 28），不能拿最后一个数猜
