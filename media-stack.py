@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.162"
+SCRIPT_VERSION = "1.5.163"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3374,6 +3374,8 @@ def do_heal_tick(hot_only=False):
     # 读不到（没域名、没 nginx）才退回 docker logs —— 后者每次都要从头扫一遍，
     # 每分钟一次就不便宜了。
     ids = nginx_played_ids()
+    # 【按下播放 ≠ 正在播】None = 读不到 nginx 日志，分不出来
+    clicks = set(NGX_CLICKS) if ids is not None else None
     if ids is None:
         ids = mediawarp_played_ids(HEAL_TICK_MIN + 2)
         # 【脚本自己的请求不算】见 _self_touched —— 不减掉就是自己追着自己的尾巴
@@ -3415,23 +3417,30 @@ def do_heal_tick(hot_only=False):
     # 今天已探 2 次"，点开还是不补。旧账里分不出哪些是真探过的，整张清掉。
     if int(ms_state().get("heal_hot_v") or 0) < HEAL_HOT_V:
         save_ms_state(heal_hot={}, heal_hot_n={}, heal_hot_v=HEAL_HOT_V)
-    # 【同一集，冷却期内不探第二次】见 HEAL_HOT_COOLDOWN_MIN：播放中那一集每分钟都会
-    # 被重新读到，探不出来的话就是每分钟探一次。
+    # 【点一次播放，探一次；不设冷却、不设次数】仓库主人：「手动点播放的不要限制探测，
+    # 限制的是后台自己跑的那种 …… 你手动点探测几分钟没探到就停止了，下次点播放再探」。
+    # 一天手动点不了几回，每一回都是人在等着看 —— 拦下哪一回都是让他白点。
+    # 【怕的是边播边每分钟探一次】那是"正在播"，不是"按下播放"：播放中客户端一直在请求
+    # /videos/<id>/（实测一集 79 次），可 PlaybackInfo 只在按下播放那一刻问一次。
+    # 所以：
+    #   · 这一分钟里按过播放的（clicks）→ 探，不看冷却、不看次数
+    #   · 只是在播、没按过 → 这一场探过就不再探（HEAL_HOT_PLAYING_MIN 内探过的跳过）
+    #   · 读不到 nginx（分不出按没按）→ 老规矩，HEAL_HOT_COOLDOWN_MIN 分钟一次
     _now = int(time.time())
-    _cool = {k: v for k, v in (ms_state().get("heal_hot") or {}).items()
-             if isinstance(v, (int, float)) and _now - v < HEAL_HOT_COOLDOWN_MIN * 60}
-    # 【一天最多探几次】这条路不设字节闸（见 HEAL_DAY_MB 那段），按集管：
-    # 冷却管住"边播边每分钟探一次"，这一道管住"一整天反复点开同一集探不出来的"
+    _gap = (HEAL_HOT_PLAYING_MIN if clicks is not None else HEAL_HOT_COOLDOWN_MIN) * 60
+    _all_hot = {k: v for k, v in (ms_state().get("heal_hot") or {}).items()
+                if isinstance(v, (int, float)) and _now - v < HEAL_HOT_PLAYING_MIN * 60}
+    _cool = {k: v for k, v in _all_hot.items() if _now - v < _gap}
+    _fresh = set(clicks or ()) | set(_q)      # 按下播放的 + 上一轮排上队没轮到的
+    # 次数照记（heal-trace 报给人看），不拿来拦
     _today = time.strftime("%Y-%m-%d")
     _tries = ms_state().get("heal_hot_n") or {}
     if _tries.get("date") != _today:
         _tries = {"date": _today, "n": {}}
     _cnt = _tries.get("n") or {}
-    _waiting = [x for x in hot if str(x[1]) in _cool]
-    _spent = [x for x in hot if str(x[1]) not in _cool
-              and int(_cnt.get(str(x[1])) or 0) >= HEAL_HOT_DAY_TRIES]
-    hot = [x for x in hot if str(x[1]) not in _cool
-           and int(_cnt.get(str(x[1])) or 0) < HEAL_HOT_DAY_TRIES]
+    _waiting = [x for x in hot if str(x[1]) in _cool and str(x[1]) not in _fresh]
+    hot = [x for x in hot if str(x[1]) not in _cool or str(x[1]) in _fresh]
+    _cool = _all_hot
     # 【一轮最多补几个，剩下的排队】连着点开十来集时，这一轮补前 HEAL_BY_NAME_MAX 个，
     # 其余的记进 heal_hot_queue，下一分钟接着来 —— 不丢。不在 hot 里的（补齐了、在冷却、
     # 今天次数用完）从队列里拿掉。
@@ -3443,6 +3452,7 @@ def do_heal_tick(hot_only=False):
     if hot:
         _say(f"刚点开过、而且还缺媒体信息的有 {len(hot)} 个，先补这几个。")
         # 【先记再探】探到一半被 timeout 砍掉也算探过 —— 不然下一分钟又从头来一遍
+        # （只拦"正在播"的；重新按下播放照样马上再探）
         _cool.update({str(x[1]): _now for x in hot})
         for x in hot:
             _cnt[str(x[1])] = int(_cnt.get(str(x[1])) or 0) + 1
@@ -3466,13 +3476,9 @@ def do_heal_tick(hot_only=False):
         rescue_progress(key)
         save_ms_state(heal_tick=int(time.time()))
         return                            # 这一轮就干这个 —— 队列交给下一轮
-    if _waiting or _spent:
-        if _waiting:
-            _say(f"刚点开的 {len(_waiting)} 个 {HEAL_HOT_COOLDOWN_MIN} 分钟内已经探过、"
-                 f"没探成 —— 冷却期内不重复探（media-stack heal-log 看上一次的结果）。")
-        if _spent:
-            _say(f"刚点开的 {len(_spent)} 个今天已经因为点开探过 {HEAL_HOT_DAY_TRIES} 次、"
-                 f"都没成 —— 今天不再自动探。想再试：media-stack heal 片名 集数")
+    if _waiting:
+        _say(f"正在播的 {len(_waiting)} 个这一场已经探过、没探成 —— 边播不重复探；"
+             f"退出来重新点开播放会马上再探（media-stack heal-log 看上一次的结果）。")
         return
     if hot_only:
         # 【整队那一轮正在后台跑】列全库、按游标轮转的活它在干，这里再干一遍就是
@@ -3547,9 +3553,9 @@ def _emby_site_local():
 def _trace_play(iid, msid, key):
     """替你按一次播放 → (走的哪条路, 状态码 或 错误说明, 秒数)。
 
-    发的是播放器按下播放时发的那一个请求：/videos/<id>/stream。MediaWarp 回 302
-    指向网盘直链，【这里不跟过去】—— 跟你在手机上点一下一样换一次直链，但一个
-    视频字节都不拉。
+    发的是播放器按下播放时发的那两个请求：PlaybackInfo，然后 /videos/<id>/stream。
+    MediaWarp 回 302 指向网盘直链，【这里不跟过去】—— 跟你在手机上点一下一样换一次
+    直链，但一个视频字节都不拉。
 
     【走 nginx，而且连的是本机】有域名的机器，手机上的请求就是经 nginx 进来的，
     heal-tick 读的也是 nginx 那份日志。直接打 MediaWarp 的话日志里不会有这一条，
@@ -3579,6 +3585,11 @@ def _trace_play(iid, msid, key):
             c = _Local(host, port, timeout=60)
         else:
             c = http.client.HTTPConnection("127.0.0.1", MEDIAWARP_PORT, timeout=60)
+        # 【先问一次 PlaybackInfo】客户端按下播放先问它 —— heal-tick 认"按下播放"
+        # 认的就是这一条（见 NGX_CLICKS）。只发 /stream 的话，它会被当成"正在播"。
+        c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?api_key={key}", body=b"{}",
+                  headers={"User-Agent": HTTP_UA, "Content-Type": "application/json"})
+        c.getresponse().read()
         c.request("GET", path, headers={"User-Agent": HTTP_UA, "Range": "bytes=0-0"})
         r = c.getresponse()
         code = r.status
@@ -3778,11 +3789,9 @@ def do_heal_trace(q, play=True):
     else:
         _trace_row("✔", "自动那条路认不认", "认：点开之后它会被挑出来补")
     _hot_at = (ms_state().get("heal_hot") or {}).get(iid)
-    if isinstance(_hot_at, (int, float)) and time.time() - _hot_at < HEAL_HOT_COOLDOWN_MIN * 60:
-        _cool_left = int(HEAL_HOT_COOLDOWN_MIN * 60 - (time.time() - _hot_at))
-        _trace_row("⚠", "冷却中", f"{int((time.time() - _hot_at) // 60)} 分钟前刚因为点开"
-                   f"探过它 —— 再过 {_cool_left // 60 + 1} 分钟才会再自动探"
-                   f"（防止一集探不出来、边播边每分钟探一次）")
+    if isinstance(_hot_at, (int, float)) and time.time() - _hot_at < HEAL_HOT_PLAYING_MIN * 60:
+        _trace_row("·", "上次因点开探", f"{int((time.time() - _hot_at) // 60)} 分钟前 —— "
+                   f"这一场边播不再重复探；退出来重新点开播放会马上再探")
     _ok_at = heal_unstuck(iid)
     if _ok_at:
         _trace_row("⚠", "补上又掉了", f"{int((time.time() - _ok_at) // 3600)} 小时前补上过，"
@@ -3793,8 +3802,7 @@ def do_heal_trace(q, play=True):
     if _tn.get("date") == time.strftime("%Y-%m-%d"):
         _k = int((_tn.get("n") or {}).get(iid) or 0)
         if _k:
-            _trace_row("⚠" if _k >= HEAL_HOT_DAY_TRIES else "·", "今天因点开探过",
-                       f"{_k} 次（一天最多 {HEAL_HOT_DAY_TRIES} 次）")
+            _trace_row("·", "今天因点开探过", f"{_k} 次（点一次探一次，不设上限）")
     try:
         _ip = _emby(f"/Users/{uid}/Items/{iid}", key, timeout=30).get("Path") or ""
     except Exception:
@@ -8970,6 +8978,11 @@ def _item_created_ts(i):
         return 0
 
 
+# 上一次 nginx_played_ids 读到的那一段里【按下播放】的条目 id（问 PlaybackInfo 的）。
+# 客户端每按一次播放问一次；播放中那几十个 /videos/ 请求不算。见 do_heal_tick。
+NGX_CLICKS = set()
+
+
 def nginx_played_ids():
     """从媒体服务那份 nginx 访问日志里，读【上次读完之后新增的那一段】，找出这段
     时间里有播放请求的条目 id。【读不到返回 None】。
@@ -8991,6 +9004,7 @@ def nginx_played_ids():
     前的播放当成"刚点开"。那些片早就补过了，白白占掉这一轮的名额。所以第一眼只回看
     NGX_FIRST_TAIL 这么点，之后才是严格的增量。
     """
+    NGX_CLICKS.clear()                # 每一段各算各的：没读到新请求 = 这一分钟没人按
     try:
         st = os.stat(NGX_ACCESS_LOG)
     except OSError:
@@ -9025,8 +9039,9 @@ def nginx_played_ids():
     else:
         buf = b""                     # 这一段全是半行，整个留给下一轮
     save_ms_state(heal_ngx={"ino": st.st_ino, "off": off + len(buf)})
-    return set(re.findall(r"/videos/(\d+)/",
-                          buf.decode("utf-8", "replace"), re.I))
+    txt = buf.decode("utf-8", "replace")
+    NGX_CLICKS.update(re.findall(r"/items/(\d+)/playbackinfo", txt, re.I))
+    return set(re.findall(r"/videos/(\d+)/", txt, re.I))
 
 
 # 脚本自己打给 MediaWarp 的请求（预热、补时长问 m3u8）记在这儿：一行一条 "秒 条目id"。
@@ -10655,10 +10670,12 @@ HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）。用满就停，�
 # 对：刚点开的那一集晚一天补，这一天里每看一次都在丢进度；而一天点开的集数是有数的。
 # 这条路自己的刹车是下面三道 —— 按【集】管，不按字节管：
 #   · 信号只认真客户端的请求（脚本自己的预热 / 探测不算，见 _self_touched）
-#   · 同一集 HEAL_HOT_COOLDOWN_MIN 分钟内只探一次、一天最多 HEAL_HOT_DAY_TRIES 次
+#   · 按一次播放探一次；正在播的一场只探一次（见 do_heal_tick 里 clicks 那段）
 #   · 补上又掉了的，HEAL_STICK_H 小时内不再探（见 heal_unstuck）
 # 花的照样记账，照样算进当天的总数 —— 只是不被它拦。
-HEAL_HOT_DAY_TRIES = 3
+# 【正在播、没重新按播放的】这么久之内探过就不再探 —— 一场播放一次。
+# 180 分钟够一部长片；重新按下播放不受它管。
+HEAL_HOT_PLAYING_MIN = 180
 # 【补上了又掉了的，这么多小时内不再探】流水里撞上的：鹿鼎记、功夫、大话西游这一批
 # 【每 10 分钟探一次、每次都 ✔】，一个晚上探了一百多次 —— 补上之后又被什么抹掉了。
 # 这种再探一百遍也是同一个结局：✔ 然后再掉。一次几 MB 到几十 MB，全是白买的。
@@ -10668,8 +10685,8 @@ HEAL_STICK_H = 24
 # /videos/<id>/（实测一集 79 次），每分钟的 tick 都会再读到它。探成功的下一轮
 # 就被筛掉了，可要是这一集【探不出来】，每分钟就会再探一次 —— 看一小时就是
 # 六十次，一次几 MB 到几十 MB。放弃名单拦不住它：这条路本来就不看那份名单。
-# 【10 分钟，不是 30】防死循环的是冷却【加上】一天最多 HEAL_HOT_DAY_TRIES 次：
-# 一集一直探不出来，一天也最多白探这几次。冷却只管"别每分钟来一遍"，拉得太长就成了
+# 【现在只用在读不到 nginx 日志的机器上】有 nginx 的分得清"按下播放"和"正在播"，
+# 见 HEAL_HOT_PLAYING_MIN。冷却只管"别每分钟来一遍"，拉得太长就成了
 # 仓库主人说的那样：没补上的点了播放却不补。上一次失败多半是撞上坏节点这种一阵子的事，
 # 10 分钟后再点，换一条直链多半就成了。
 HEAL_HOT_COOLDOWN_MIN = 10
@@ -11200,8 +11217,7 @@ def heal_media_info(d, key, budget=None, items=None):
     #   · 看片后的也不拦 —— 实测撞上的：遮天 181 07:54 补上，4 分钟后你点它正撞上
     #     一个连不上的 CDN 节点，播放失败，Emby 拿那次失败里读到的半截信息（有轨道、
     #     没时长）把补好的盖掉了。你再点开，这条规则说"补上又掉了"不给探 —— 挡住的
-    #     恰恰是你正在看的那一集。这条路自己有冷却（HEAL_HOT_COOLDOWN_MIN）和一天
-    #     几次（HEAL_HOT_DAY_TRIES），按集管住了，用不着它
+    #     恰恰是你正在看的那一集。这条路自己按"一次按播放、一次探"管住了，用不着它
     # 整队那边它照旧有用：一批条目每轮 ✔、每轮掉，就是每轮重买一遍。
     if _how_try == "整队":
         _now_s = time.time()
