@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.188"
+SCRIPT_VERSION = "1.5.189"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2385,11 +2385,16 @@ def do_heal_daemon():
 
 # ============================================================================ 先补再播
 # 开播前最多替它补多久（秒）。补一集实测多半 4~10 秒；等不到就放行。
-# 【30，不是 15】真机 FC2-060525（play-watch 抓到的）：这一集补了 40 多秒，门等满 15 秒就
-# 放行了 —— 可补的时候 strm 临时是 URL 形式，MediaWarp 认不出、给不了 302，Emby 只好
-# 自己从网盘拉了再转给手机：开头 40 秒 53 MB 全经东京服务器转手，这就是「第一次卡」。
-# 等久一点，宁可开播前多转几秒圈，也别一开播就绕服务器。
-HEAL_GATE_WAIT_S = 30
+# 【15，试过 30 不行】1.5.188 改成 30：新片 IDG5591 点播放直接「Connection reset」——
+# 客户端（Hills）或者前面那层 SNI 分流等不了那么久，连 PlaybackInfo 都没走完就断了。
+# 15 秒真机上是过得去的（FC2-060525 那一场）。
+HEAL_GATE_WAIT_S = 15
+# 【门那一路：strm 只切成 URL 这么几秒】Emby 一收到探测请求就把 strm 读走、拿着那个 URL
+# 去探；读走之后 strm 是什么样已经不影响这一趟探测。所以门那一路在切过去这么多秒后就
+# 先切回路径形式，不等探测跑完 —— 门等满 15 秒放行开播时，MediaWarp 看到的已经是路径
+# 形式，给得出 302。真机 FC2-060525：一场补了 40 多秒，strm 一直是 URL，开头 40 秒
+# 53 MB 全经东京服务器转手（play-watch 抓到的），这就是「第一次播放卡」
+HEAL_GATE_RESTORE_S = 8
 # 多久没人开播就退出（由 systemd 的 socket 再叫醒）
 HEAL_GATE_IDLE_S = 1800
 
@@ -13256,6 +13261,22 @@ def _heal_one(d, key, _it, base, token):
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
             with open(host, "w", encoding="utf-8") as f:
                 f.write(_u)
+            _early = None
+            if os.environ.get("MS_HEAL_GATE"):
+                # 【门那一路：几秒后先切回去】见 HEAL_GATE_RESTORE_S
+                def _early_back(_want=_u):
+                    try:
+                        with open(host, encoding="utf-8") as f:
+                            if f.read() != _want:
+                                return            # 已经被别的地方还原过了
+                        with open(host, "w", encoding="utf-8") as f:
+                            f.write(original if original.strip().startswith("/") else p)
+                        os.utime(host, ns=(_st0.st_atime_ns, _st0.st_mtime_ns))
+                    except OSError:
+                        pass
+                _early = threading.Timer(HEAL_GATE_RESTORE_S, _early_back)
+                _early.daemon = True
+                _early.start()
             try:
                 _pi = _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&{_qs}"
                             f"&MediaSourceId=mediasource_{iid}"
@@ -13265,6 +13286,8 @@ def _heal_one(d, key, _it, base, token):
             except Exception:
                 probed = False    # 探测请求本身没跑成（超时/断开）——【不算这个条目的账】
                 pass          # 探测本身超时也要走到 finally 把文件还原
+            if _early is not None:
+                _early.cancel()   # 探完了还没到点：交给下面 finally 照常还原
             # 【核对源的时长，不是条目的】条目的 RunTimeTicks 可能是刮削回填的
             # （TMDb 给的片长）。拿它当探测结果的话，探测明明失败了也会报"✔ 18 分钟"
             # —— 谎报成功比报失败坏得多：这个条目从此被当成已修好，再也不会重试，
