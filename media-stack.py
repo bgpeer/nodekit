@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.173"
+SCRIPT_VERSION = "1.5.174"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3555,6 +3555,20 @@ def rescue_progress(key):
         if not played and not settled:
             continue                  # 还没打勾：多半是 Emby 还没把这一场记完，下一轮再看
         if not ticks and not settled:
+            # 【播着播着时长又没了 → 这一场一停就再补一次】实测 FC2-4932682：点开 8 秒
+            # 补上 64 分钟，边播边拖进度条，停了之后时长又没了（只剩轨道、0B）。Emby
+            # 拖动时自己又探了一次，那个盘挡它的 UA（Lavf 读出 I/O error），读回来的
+            # 半截把补好的盖掉了。不补回来，这一场的进度就写不回去。排进"刚点开"那个
+            # 队 —— 同一轮 heal-tick 接着就补，补完当场再结一次账（见 do_heal_tick）。
+            # 一场只补一次：补不上就照旧等满了留一句，不在这儿打转。
+            if not e.get("reheal"):
+                e["reheal"] = True
+                _q = dict(ms_state().get("heal_hot_queue") or {})
+                _q[str(iid)] = now
+                save_ms_state(heal_hot_queue=_q)
+                logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
+                            f"这一场停了，时长却又没了（补上之后被盖掉）—— 马上再补一次"
+                            f"  {e.get('name') or iid}{_log_tag(iid)}")
             continue                  # 还没补上时长：写了也白写，等一等
         st.pop(iid, None)
         if ticks and pos and pos >= ticks * HEAL_RESCUE_END_PCT:
