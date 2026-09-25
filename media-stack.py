@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.189"
+SCRIPT_VERSION = "1.5.190"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4329,15 +4329,25 @@ def do_play_watch(q, minutes=15):
         return
     for sc in scenes:
         how = "、".join(_HOW_CN.get(h, h) for h in sorted(sc["how"])) or "没看到 Emby 的播放记录"
+        if not (sc["via_vps"] or sc["r302"]):
+            how = "没播起来（按了播放、一个视频请求都没有）"
         _trace_row("·", f"第 {sc['n']} 场", f"{how}；视频字节经服务器 {sc['via_vps'] / 1048576:.1f} MB，"
                    f"跳走 {sc['r302']} 次"
                    + (f"；转码原因 {'/'.join(sc['why'])}" if sc["why"] else "")
                    + (f"；转码码率 {sc['kbps']} kbps" if sc["kbps"] else ""))
-    if len(scenes) >= 2:
-        a, b = scenes[0], scenes[1]
+    # 【没播起来的那几场不拿来比】按了播放、一个视频请求都没有（连接断了 / 退出了），
+    # 没东西可比。真机 IDG5591：第 1、3 场就是这样，结论却说「两场方式不一样」
+    real = [sc for sc in scenes if sc["via_vps"] or sc["r302"]]
+    if len(real) >= 2:
+        a, b = real[0], real[1]
         if a["via_vps"] > 5 * 1048576 and b["via_vps"] < 1048576:
             print(f"  {YELLOW}第一场的视频是经这台服务器转手的，第二场是手机直连网盘 —— "
                   f"第一次卡就卡在这儿（东京转到你手机只有几百 KB/s）。把这一屏发给仓库主人。{RST}")
+        elif a["via_vps"] < 1048576 and b["via_vps"] < 1048576:
+            # 【Emby 标的方式别当真】strm 的条目它常标「服务器转发」，可 nginx 那边全是 302 ——
+            # 字节没经过服务器才是要看的
+            print(f"  两场视频字节都没经过服务器（都是 302 直连网盘）。")
+            print(f"  {DIM}那第一次卡就只能在手机到网盘那一段：网盘离你近的那个节点第一次是冷的。{RST}")
         elif a["how"] != b["how"]:
             print(f"  {YELLOW}两场 Emby 的播放方式不一样 —— 把这一屏发给仓库主人。{RST}")
         else:
@@ -12123,8 +12133,22 @@ def _netdisk_head_ok(raw_url, timeout=HEAL_PRE_T):
     """
     if not raw_url:
         return False, "没拿到直链"
+    # 【先播放器那张脸，不成再浏览器那张】见 PLAYER_UA。真机 IDG5591 / FC2-4850620：
+    # 这一步用浏览器脸，夸克限到几十 KB/s，64 KB 都拉不完 —— 「网盘没给出文件头
+    # （timed out）」321 秒，连 Emby 那一步都没走到就放弃了。
+    # 【门那一路等不起】开播前总共只等 HEAL_GATE_WAIT_S，这一步每张脸最多 10 秒
+    if os.environ.get("MS_HEAL_GATE"):
+        timeout = min(timeout, 10)
+    ok_, why = _netdisk_head_try(raw_url, timeout, PLAYER_UA)
+    if ok_:
+        return ok_, why
+    return _netdisk_head_try(raw_url, timeout, BROWSER_UA)
+
+
+def _netdisk_head_try(raw_url, timeout, ua):
+    """_netdisk_head_ok 用一张脸试一遍（429 / 5xx 退避重试）→ (能不能, 说明)。"""
     req = urllib.request.Request(
-        raw_url, headers={"User-Agent": BROWSER_UA,
+        raw_url, headers={"User-Agent": ua,
                           "Range": f"bytes=0-{WARM_BYTES - 1}"})
     # 【429 要退避重试，不能一次失败就判死】上游即便认了 UA 也还按频率限：实测同一个
     # 文件用浏览器 UA 连吃三个 429，隔了半分钟才拿到 206。一次就判"这条线不通"的话，
