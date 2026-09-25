@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.166"
+SCRIPT_VERSION = "1.5.167"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11703,9 +11703,22 @@ def _probe_note(iid, kind, resp):
             "infinite": ms.get("IsInfiniteStream"),
             "streams": len(ms.get("MediaStreams") or []),
             "container": ms.get("Container"),
+            "ticks": ms.get("RunTimeTicks") or 0,
+            "size": ms.get("Size") or 0,
         }
     except Exception:
         pass
+
+
+def _probe_brief(iid):
+    """_probe_note 记下的那一趟回包，压成一句（进流水）。不含地址。"""
+    e = _PROBE_LAST.get(str(iid)) or {}
+    if not e:
+        return "没有回包（请求没跑成）"
+    yn = lambda v: "是" if v else "否"
+    return (f"直播流 {yn(e.get('live'))}、无限流 {yn(e.get('infinite'))}、"
+            f"回包时长 {(e.get('ticks') or 0) / 6e8:.0f} 分、大小 {(e.get('size') or 0) >> 20} MB、"
+            f"轨道 {e.get('streams')}、容器 {e.get('container') or '-'}、协议 {e.get('protocol') or '-'}")
 
 
 # 等 Emby 把半截信息清掉，最多等多久（秒）。刷新是后台跑的，一般几秒就完。
@@ -11868,10 +11881,13 @@ def _heal_one(d, key, _it, base, token):
     # 才说得清。没有开关就没法把新路关掉，也就永远只能拿"感觉"下结论。
     if _m3u8 is None:
         _m3u8 = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
+    _qs_live = "IsPlayback=true&AutoOpenLiveStream=true"
     if _m3u8:
-        _routes.append(("m3u8", _m3u8))
+        _routes.append(("m3u8", _m3u8, _qs_live))
     if not _nohead:
-        _routes.append(("整文件", url))
+        _routes.append(("整文件", url, _qs_live))
+    _lay = None                       # file_layout 的结果，看过一次就留着
+    _alt = False                      # 「不开直播流」那一趟加过没有
     _tried = []                       # 这一次真的走过哪几条路 —— 写进结局，别只剩一个「-」
     mins, streams, probed = 0, False, True
     streams_hot = False               # 还原【之前】有没有轨道，见下面那一档
@@ -11879,17 +11895,19 @@ def _heal_one(d, key, _it, base, token):
     # 【每条路各自走完"写URL→探→还原→核对"一整趟】核对必须在还原之后（见下面那段
     # 注释），所以不能先把两条路都探完再核对 —— 那样又回到"拿还原前的状态下结论"
     # 那个老毛病上。代价是每条路多一次本机 Emby 读，不碰网盘。
-    for _kind, _u in _routes:
+    for _kind, _u, _qs in _routes:     # 【边走边加】见下面「不开直播流」那一段
         _via = _kind
         _tried.append(_kind)
         probed = True
+        if _qs != _qs_live:
+            _clear_half_info(key, uid, iid)   # 上一趟留下的半截先清掉，不然 Emby 拿它交差
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
             with open(host, "w", encoding="utf-8") as f:
                 f.write(_u)
             try:
-                _pi = _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&IsPlayback=true"
-                            f"&AutoOpenLiveStream=true&MediaSourceId=mediasource_{iid}"
+                _pi = _emby(f"/Items/{iid}/PlaybackInfo?UserId={uid}&{_qs}"
+                            f"&MediaSourceId=mediasource_{iid}"
                             f"&StartTimeTicks=0&MaxStreamingBitrate=200000000",
                             key, method="POST", timeout=200)
                 _probe_note(iid, _kind, _pi)
@@ -11954,6 +11972,20 @@ def _heal_one(d, key, _it, base, token):
             mins, streams = 0, False
         if mins and streams:
             break                     # 这条路成了，别再走下一条（省的就是这一趟）
+        # 【整文件探出"有轨道没时长"、而文件里明明写着 → 换「不开直播流」再探一趟】
+        # 实测 FC2-4954902：普通 mp4、时长索引（moov）在文件末尾；Emby 容器里的 ffprobe
+        # 直接读同一个地址，两张脸都读得出 29 分钟。可经 PlaybackInfo（开直播流）探，
+        # 清掉重探过也还是只有轨道 —— 条目上 0B，Emby 那一趟多半是把它当成不能跳的
+        # 流在读，读不到末尾的索引。时长索引在开头的文件（绝大多数）不受影响，所以
+        # 以前没撞上。不开直播流时 Emby 走的是另一条探测路，这一趟多花一次文件头。
+        if streams and not mins and _kind == "整文件" and not _alt:
+            _lay = file_layout(raw)
+            if file_layout_says(_lay)[0]:
+                _alt = True
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 探测回包（{_kind}）："
+                          + _probe_brief(iid) + _log_tag(iid)])
+                _routes.append(("不开直播流", url,
+                                "IsPlayback=false&AutoOpenLiveStream=false"))
     if mins and streams:
         # 【把走的哪条路写在屏上】这是"省流量"这件事唯一看得见的证据；
         # 走 m3u8 还是整文件，代价差几十倍，而两种在别的输出里长得一模一样。
@@ -11975,7 +12007,11 @@ def _heal_one(d, key, _it, base, token):
         # 【先看文件本身】"有轨道没时长"有两种，长得一模一样：文件里写着时长、Emby
         # 没读到；文件头里本来就没写。不看文件就只能猜（FC2-4954902 猜错过两次）。
         # 只在这一种结局才看，几十 KB。
-        _has, _say_f = file_layout_says(file_layout(raw)) if "整文件" in _tried else (None, "")
+        if _alt:
+            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 探测回包（不开直播流）："
+                      + _probe_brief(iid) + _log_tag(iid)])
+        _has, _say_f = (file_layout_says(_lay if _lay is not None else file_layout(raw))
+                        if "整文件" in _tried else (None, ""))
         if _has is False:
             heal_nohead_mark(iid)     # 下次点开不再白拉整文件，只等 m3u8
             return ("retry", name, el(),
@@ -12001,10 +12037,16 @@ def _heal_one(d, key, _it, base, token):
             heal_nohead_mark(iid)     # 下次点开就不再白拉整文件了，只等 m3u8
         if _has:
             return ("retry", name, el(),
-                    f"文件里写着时长，Emby 却没读到（探之前是干净的）；试了 {_rt}")
+                    f"文件里写着时长，Emby 却没读到（"
+                    f"{'清掉重探过' if _cleared or _alt else '探之前是干净的'}）；试了 {_rt}")
         return ("retry", name, el(),
                 f"探到轨道但文件头里没时长（分段 mp4/ts 常见）；试了 {_rt}"
                 + ("；没转码版，转好码后走 m3u8 就有" if "m3u8" not in _tried else ""))
+    if _alt:
+        # 【「不开直播流」那一趟清掉了半截、又什么都没探到】不是"这个源没有音视频轨"
+        # —— 前一趟明明探到过。别判 dead，下次点开再来
+        return ("retry", name, el(),
+                f"文件里写着时长，两种探法 Emby 都没读到；试了 {'、'.join(_tried)}")
     if probed:
         # 【探测跑完了、Emby 什么都没找到 = 确定的答案，不是线路抖了一下】
         # 这种再探两次只是把同一个答案买三遍，而一遍的价钱是「全库 × 每个几 MB」。
