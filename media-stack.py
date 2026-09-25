@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.194"
+SCRIPT_VERSION = "1.5.195"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -74,10 +74,10 @@ CLI_PATH      = "/usr/local/bin/media-stack"
 CLI_ALIAS     = "/usr/local/bin/emby"
 SNI_HTTPS_PORT_FALLBACK = 8443              # 和 xy-installer.py 的常量一致
 
-# AutoFilm 调度器的时区，以及默认的 strm 生成时刻（该时区下的 05:15）。
+# AutoFilm 调度器的时区，以及默认的 strm 生成时刻（该时区下的 04:20）。
 # 钉在北京时间：网盘在国内，「凌晨闲时」是按北京时间定义的，跟 VPS 摆在哪无关。
 AUTOFILM_TZ       = "Asia/Shanghai"
-DEFAULT_STRM_CRON = "0 15 5 * * *"          # 秒 分 时 日 月 周 —— 北京时间 05:15
+DEFAULT_STRM_CRON = "0 20 4 * * *"          # 秒 分 时 日 月 周 —— 北京时间 04:20
 OLD_STRM_CRON     = "0 0 5 * * *"           # 旧默认值，更新时静默迁移到上面那个
 
 OPENLIST_PORT  = 5244
@@ -837,13 +837,13 @@ def strm_cron_of(path, fallback=None):
 def trusted_disk_cron(v):
     """配置文件里读到的 cron，能不能当成"用户的设置"带进新配置。
 
-    【真机】三个盘全是 "0 57 19 * * *"，早上 05:15 一个都不跑，昨晚加的片子今天没进库。
+    【真机】三个盘全是 "0 57 19 * * *"，凌晨一个都不跑，昨晚加的片子今天没进库。
     这个 19:57 是早年手动扫描写进去的【一次性临时值】（那时"两分钟后触发一次"的时刻算错了
     时区，没还原回去）。而状态文件里没有全局定时时，每次更新都从配置里读第一个 cron 当全局
     —— 临时值就这样被当成用户设置，一代一代带了下去。
 
     用户自己设的定时只走菜单，菜单一律写进状态文件（strm_cron_global / 按盘）。所以配置里
-    的"每天某时"没有状态文件背书的，就不认，回到默认的 05:15。"关"和"每 N 小时"这两种
+    的"每天某时"没有状态文件背书的，就不认，回到默认时刻（DEFAULT_STRM_CRON）。"关"和"每 N 小时"这两种
     不可能是手动扫描留下的，照旧认。
     """
     v = str(v or "").strip()
@@ -1845,15 +1845,22 @@ WARM_ROTATE_MAX = WARM_REST * (LINK_TTL_H // WARM_EVERY_H)
 # 连着打十几个换直链请求容易被风控盯上，那会连累列目录、播放一起超时。
 WARM_GAP       = 2
 WARM_BYTES     = 65536  # 每部拉多少字节 —— 够让网盘把那一段准备好，又不占带宽
+# 【凌晨这一串的时间表（北京时间）】仓库主人：「扫太晚了，人都起来了片还没刷新」，
+# 要 4 点多就扫完。顺序不能乱，也要躲开同一台机器上别的仓库的定时任务：
+#   03:00 每天   cn-block / whitelist-inject 刷新规则并重启各自的 sing-box
+#   03:10 每月1号 net-optimize 升级 nginx（会重启 nginx，Emby 那几秒进不去）
+#   04:00 每月2号 xy-installer 更新内核
+#   04:10 自动更新脚本 → 04:15 刷目录缓存 → 04:20 AutoFilm 生成 strm → 04:50 对齐
+#   每小时 :00 预热，:30 保活（错开，别在同一分钟一起打网盘）
 # 每天对齐一次的时刻（北京时间），钉在 AutoFilm 生成 strm 之后半小时 —— 先有
 # 文件，再去清失效、补时长。和 DEFAULT_STRM_CRON 一起改
-SYNC_HOUR_CST  = "05:45"
-# 刷目录缓存的时刻。必须【早于】AutoFilm 生成 strm 的 05:15（见 DEFAULT_STRM_CRON），
+SYNC_HOUR_CST  = "04:50"
+# 刷目录缓存的时刻。必须【早于】AutoFilm 生成 strm 的 04:20（见 DEFAULT_STRM_CRON），
 # 又不必太早 —— 刷完到开扫之间隔得越久，这中间新加的片子越可能又赶不上。5 分钟够。
-PRECACHE_HOUR_CST = "05:10"
+PRECACHE_HOUR_CST = "04:15"
 # 自动更新【只换脚本，不动容器、不重生成配置】。放在每日对齐之前一点，
 # 换完那一轮对齐就是新版脚本在跑。见 do_selfupdate 里为什么只换脚本。
-SELFUP_HOUR_CST = "05:15"
+SELFUP_HOUR_CST = "04:10"
 # 每 20 分钟一次 ≈ 72 次/天。别为了"让链路更热"去调小它 —— 实测耗时和空闲时间
 # 不相关，理由见 do_keepalive() 的文档字符串。
 # 【一小时一次就够，而且要轮流打】这个探测是【真实】列目录（带 refresh），
@@ -3057,7 +3064,8 @@ def _ka_cron():
     if KEEPALIVE_MIN < 60:
         return f"*/{KEEPALIVE_MIN} * * * *"
     h = max(1, KEEPALIVE_MIN // 60)
-    return "0 * * * *" if h == 1 else f"0 */{h} * * *"
+    # 放在 30 分：整点是预热（warm）的，两个一起打网盘只会互相拖慢
+    return "30 * * * *" if h == 1 else f"30 */{h} * * *"
 
 
 def install_keepalive(install_dir):
@@ -3276,7 +3284,7 @@ def refresh_heal_cron():
 def install_warm_cron(install_dir):
     """装定时预热。
 
-    不能挂在每日对齐（05:45）里：MediaWarp 的直链缓存只有 2 小时，05:45 热完 07:45
+    不能挂在每日对齐（04:50）里：MediaWarp 的直链缓存只有 2 小时，04:50 热完 06:50
     就过期了，而用户起床看片多半在那之后 —— 热在错的时间等于没热。所以单独一条、
     每小时一次，封顶 10 部（「继续观看」+ 最近新加），那正是最可能被点开的。
 
@@ -8267,7 +8275,7 @@ def do_heal(q=None):
 def align_library(d, key, heal=True, migrate=True):
     """把【所有】指向 strm 的媒体库和它们里面的条目，拉到脚本认定的状态。
 
-    这一坨原本散在 do_strm / do_sync 里各抄一遍，而 do_sync 一天只跑一次(05:45)，后果就是
+    这一坨原本散在 do_strm / do_sync 里各抄一遍，而 do_sync 一天只跑一次(04:50)，后果就是
     "新加进来的片全都没有进度条记忆"。这些从来就不该是某几部片子享有的待遇。收成一个
     函数、按小时跑，新内容不管从哪儿冒出来（手动点、凌晨 AutoFilm、用户自己新建一个库）
     最多一小时就跟上。
@@ -9365,6 +9373,12 @@ def do_update(from_menu=False):
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
     install_selfupdate_cron(d)
+    # 配置刚按新版重写过（定时可能变了），AutoFilm 内存里还是旧的 —— 对不上就当场重启，
+    # 别等每小时那轮
+    try:
+        autofilm_schedule_fix(d, fresh=True)
+    except Exception:
+        pass
 
     if cfg["homepage"]:
         info("刷新 Homepage 导航配置...")
@@ -13928,21 +13942,22 @@ def _af_mem(log):
     return mem, running
 
 
-def autofilm_schedule_fix(d=None):
+def autofilm_schedule_fix(d=None, fresh=False):
     """AutoFilm 的定时和【该有的】对不上就改回来。返回做了什么（"" = 没动）。
 
-    两种对不上，都会让"每天 05:15 自动扫"悄悄不跑：
+    两种对不上，都会让"每天凌晨自动扫"悄悄不跑：
       · 磁盘上的配置被临时值占着（见 trusted_disk_cron）
       · 磁盘是对的，【内存】里还是手动扫描那一刻的临时定时 —— AutoFilm 只在启动时读
         cron，手动扫描还原的是磁盘，内存里那条要等下一次重启才换回来。手动扫一次之后
-        那个盘就从"每天 05:15"变成了"每天手动扫描的那个时刻"。
+        那个盘就从"每天凌晨"变成了"每天手动扫描的那个时刻"。
     挂在每小时的保活上，最多错一小时。正在扫的不打断：有任务开始了还没完成，就等下一轮。
     """
     d = d or ms_install_dir()
     cfg_path = os.path.join(d, "autofilm", "config", "config.yaml")
     try:
         disk_txt = open(cfg_path, encoding="utf-8").read()
-        if time.time() - os.path.getmtime(cfg_path) < AF_CFG_QUIET_S:
+        # fresh：「7 更新」刚自己重写过配置，那个"刚动过"就是它自己，不是有人在手动扫
+        if not fresh and time.time() - os.path.getmtime(cfg_path) < AF_CFG_QUIET_S:
             return ""
         want_txt = gen_autofilm_conf(rebuild_cfg_from_disk(d))
     except Exception:
@@ -14094,7 +14109,7 @@ def do_strm(only=None):
     【为什么还原不等到最后】AutoFilm 是启动时把 config.yaml 读进内存注册 cron 的，之后再改
     磁盘上那份不影响已经排好的这一轮。所以容器一起来就立刻还原 —— 用户可以随时 Ctrl-C
     走人，不会留下临时定时值。代价是那条临时 cron 以每天一次的形式留在内存里直到下次重启
-    —— 【这不是无害的】它顶掉的是这个盘原来的 05:15，手动扫一次之后凌晨就不扫了。
+    —— 【这不是无害的】它顶掉的是这个盘原来的凌晨定时，手动扫一次之后凌晨就不扫了。
     扫完之后由每小时那轮 autofilm_schedule_fix 发现、重启换回来。
     """
     d = ms_install_dir()
@@ -14122,7 +14137,7 @@ def do_strm(only=None):
     # 实测撞过：AutoFilm 在扫的那两分钟里，同一条路径列目录要 20.5 秒，
     # 扫描过去之后立刻再打是 0.4 秒 —— 快 50 倍。对正在看片的人来说，
     # 这就是"好好看着突然卡住转圈"，而且他完全不知道是有人点了「4」。
-    # 定时那轮排在凌晨 05:15 正是为了避开，手动点这一下绕过了那个安排。
+    # 定时那轮排在凌晨 04:20 正是为了避开，手动点这一下绕过了那个安排。
     _k0 = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
     if _k0:
@@ -17545,7 +17560,7 @@ def _scan_menu(d, mount=None, label=""):
     while True:
         cur = (strm_cron_desc(only_mounts(mount)[0]) if mount
                else (cron_desc(strm_cron_global(), autofilm_tz_shift())
-                     or f"每天 {cron_to_bj(DEFAULT_STRM_CRON, autofilm_tz_shift()) or '05:15'}"))
+                     or f"每天 {cron_to_bj(DEFAULT_STRM_CRON, autofilm_tz_shift()) or '04:20'}"))
         print("\n" + "-" * 60)
         print(f"  {BOLD}生成媒体库{RST}   "
               f"{CYAN}{label or '、'.join(only_mounts(mount)) or '所有网盘'}{RST}")
