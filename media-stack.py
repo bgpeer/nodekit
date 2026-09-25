@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.176"
+SCRIPT_VERSION = "1.5.177"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2216,7 +2216,7 @@ WantedBy=multi-user.target
 # heal-tick 读完 nginx 那一段就删掉它；rescue_linger 看见它就收手，把锁让出来。
 HEAL_KICK = TRAFFIC_DIR + "/heal-kick"
 HEAL_DAEMON_POLL = 1.0        # 多久看一眼 nginx 日志（秒）
-HEAL_DAEMON_RESPAWN = 3.0     # 按下播放还没被读走时，多久再扣一次扳机（秒）
+HEAL_DAEMON_RESPAWN = 2.0     # 按下播放 / 停止播放还没被读走时，多久再扣一次扳机（秒）
 # 【自己睡觉】多久没见到有人按下播放就退出（仓库主人要的半小时）。退出后由闹钟叫醒
 HEAL_DAEMON_IDLE_S = 1800
 # 被叫醒了、却一次按下播放都没见到（只是有人开着 Emby 翻目录）：这么久就回去睡。
@@ -3622,7 +3622,14 @@ def rescue_linger(key=None):
                                                 "config.yaml"), "auth")
             if not key:
                 return
-        time.sleep(HEAL_RESCUE_POLL_S)
+        # 【一秒一秒地睡】真机 FC2-4850620：大约 16:28:20 退出，16:28:32 才写回 67:21 ——
+        # 这 10 秒整个睡过去，常驻服务看见"停止播放"放下的 kick 也要等睡醒才看得见，
+        # 那一轮 heal-tick 就一直抢不到锁。人一退出就回详情页，晚十来秒就是看见
+        # 「已看完」、要退出去再点进来才有续播点。
+        for _ in range(int(HEAL_RESCUE_POLL_S)):
+            time.sleep(1)
+            if os.path.exists(HEAL_KICK):
+                return                # 停了（或者有人按了播放）—— 把锁让出来
         try:
             sessions = _emby("/Sessions", key, timeout=20) or []
         except Exception:
