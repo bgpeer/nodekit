@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.182"
+SCRIPT_VERSION = "1.5.183"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -14591,6 +14591,14 @@ def mount_of_path(d, path):
     return best or ("", None)
 
 
+def order_mounts(mps):
+    """按用户在「挂载路径 → 调整顺序」里排的先后，把挂载点排一下。没排过的排在后面，
+    彼此之间保持原来的顺序（原来是按挂载点的名字排）。"""
+    want = [str(x) for x in (ms_state().get("mount_order") or [])]
+    pos = {mp: i for i, mp in enumerate(want)}
+    return sorted(mps, key=lambda mp: pos.get(str(mp), len(want)))
+
+
 def mount_rank(d):
     """→ 一个函数：Emby 条目路径（.strm）→ 它那个盘在「挂载路径」菜单里排第几（从 0 起）。
 
@@ -14598,7 +14606,7 @@ def mount_rank(d):
     先刮他的呢，还有探测也是的」。菜单的顺序就是 _storage_rows 的顺序（按挂载点排）。
     认不出是哪个盘的排最后。只读本机的 strm 文件，不碰网盘。
     """
-    mps = [str(r[1] or "") for r in _storage_rows(d)]
+    mps = order_mounts([str(r[1] or "") for r in _storage_rows(d)])
     last = len(mps)
 
     def rank(emby_path):
@@ -16834,6 +16842,36 @@ def _rest_menu(d):
         _apply_scan_paths(d, "自动" + ("打开" if not on else "关掉") + "，")
 
 
+def _mount_order_menu(stores):
+    """挂载路径 → 调整顺序：输入新的先后（上面那一屏的编号），存进状态文件。
+
+    【为什么要有】仓库主人：「把夸克放在第一位 …… 115 放在第三位」。补积压、截封面都按
+    盘的先后来（见 mount_rank），而原来的先后只是挂载点名字的字母序。
+    只写了几个的，写了的排前面，没写的按现在的先后跟在后面。
+    """
+    print()
+    for i, (mp, drv, _st) in enumerate(stores, 1):
+        print(f"  {i:>2}. {driver_cn(drv)} {mp}")
+    print(f"  {DIM}按新的先后输入上面的编号，空格隔开（比如 3 2 1 4）；"
+          f"只写几个也行，没写的按现在的先后跟在后面。直接回车 = 不改{RST}")
+    raw = ask("新的顺序").replace(",", " ").replace("，", " ").split()
+    if not raw:
+        print("没有改动。")
+        return
+    try:
+        idx = [int(x) for x in raw]
+    except ValueError:
+        warn("只能填编号。没有改动。")
+        return
+    if any(not 1 <= i <= len(stores) for i in idx) or len(set(idx)) != len(idx):
+        warn(f"编号要在 1~{len(stores)} 之间、不能重复。没有改动。")
+        return
+    first = [stores[i - 1][0] for i in idx]
+    new = first + [mp for mp, _d, _s in stores if mp not in first]
+    save_ms_state(mount_order=new)
+    ok("新的顺序：" + " → ".join(new))
+
+
 def mount_paths_menu():
     """挂载路径：一个盘一屏，各管各的。
 
@@ -16850,6 +16888,9 @@ def mount_paths_menu():
     while True:
         stores = [(mp, drv, st) for mp, drv, st, _r, _m in openlist_storages(d)
                   if mp and mp != "/"]
+        # 【按用户排的先后显示】补时长、截封面也按这个先后（见 mount_rank）
+        _pos = {mp: i for i, mp in enumerate(order_mounts([x[0] for x in stores]))}
+        stores.sort(key=lambda x: _pos.get(x[0], 0))
         print("\n" + "=" * 60)
         print(f"  {BOLD}挂载路径{RST}{DIM}（哪些网盘要进 Emby，各自扫哪些目录）{RST}")
         print("=" * 60)
@@ -16875,6 +16916,8 @@ def mount_paths_menu():
                   + opt_tag("__source__", "proxy" if _vps.get(mp) else "direct"))
         print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
+        print(f"  {len(stores) + 2:>2}. 调整顺序            "
+              f"{DIM}补时长、截封面按上面的先后来{RST}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
         # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
         # 装完那一刻网盘还没挂，没有它就是死局（见 do_strm 的说明）。
@@ -16890,10 +16933,12 @@ def mount_paths_menu():
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 1:
+        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 2:
             print("无效选择。")
             continue
-        if int(c) == len(stores) + 1:
+        if int(c) == len(stores) + 2:
+            _mount_order_menu(stores)
+        elif int(c) == len(stores) + 1:
             _rest_menu(d)
         else:
             mp, drv, _st = stores[int(c) - 1]
