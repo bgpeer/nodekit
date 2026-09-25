@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.195"
+SCRIPT_VERSION = "1.5.196"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3786,6 +3786,12 @@ COVER_RECHECK_H = 24          # 截帧的那些，多久问一次刮削器找没
 # 再试；一共 COVER_MAX_TRIES 次都不成就不再碰（media-stack covers --retry 清掉重来）
 COVER_RETRY_H = 24
 COVER_MAX_TRIES = 3
+# 【流量闸】真机一夜 15 GB 之后加的。正常一张封面几 MB（m3u8 一个分片，或原片跳到三分之一
+# 读一小段）。一张超过 COVER_ONE_MB = 这个源跳不过去，只能从头顺着读 → 不再试这一部；
+# 一天合计到 COVER_DAY_MB 就停。
+COVER_FRAME_T = 60            # 截一帧最多等几秒（到点连容器里的 ffmpeg 一起杀，见 emby_exec）
+COVER_ONE_MB = 40
+COVER_DAY_MB = 500
 EMBY_FFMPEG_PATHS = ("/bin/ffmpeg", "/opt/emby-server/bin/ffmpeg", "/app/emby/bin/ffmpeg")
 
 
@@ -3838,7 +3844,7 @@ def cover_candidates(key, d=None):
     return [x[:5] for x in out]
 
 
-def cover_frame(url, sec, timeout=120, ua=None):
+def cover_frame(url, sec, timeout=COVER_FRAME_T, ua=None):
     """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → (JPEG 字节, 截不到的原因)。
 
     -ss 放在 -i 前面：先按索引跳过去再读，只拉那一小段。UA 用浏览器那张脸 ——
@@ -3846,13 +3852,14 @@ def cover_frame(url, sec, timeout=120, ua=None):
     【原因要带出来】只写"截不到画面"的话，是被拦了、超时了、还是解不出来，一概分不清
     （仓库主人问「不会是帧率大了吧」—— 没有报错就只能猜）。报错里的地址抹掉。
     """
+    # -rw_timeout：连接卡住 15 秒没数据就放弃，别挂着
     args = ["-hide_banner", "-loglevel", "error", "-user_agent", ua or PLAYER_UA,
+            "-rw_timeout", "15000000",
             "-ss", f"{max(0.0, sec):.1f}", "-i", url, "-frames:v", "1",
             "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", "-f", "mjpeg", "pipe:1"]
     for fp in EMBY_FFMPEG_PATHS:
         try:
-            r = subprocess.run(["docker", "exec", "emby", fp] + args,
-                               capture_output=True, timeout=timeout)
+            r = emby_exec([fp] + args, timeout)
         except subprocess.TimeoutExpired:
             return b"", f"{timeout} 秒没截完"
         except OSError:
@@ -3882,6 +3889,12 @@ def emby_set_image(key, iid, jpg, typ="Primary"):
             return 200 <= r.status < 300
     except Exception:
         return False
+
+
+def _cover_meter_mb(rx0):
+    """从 rx0 到现在物理网卡收了多少 MB（读不到返回 0）。"""
+    rx1 = _host_rx_bytes()
+    return max(0.0, (rx1 - rx0) / 1048576) if (rx0 is not None and rx1 is not None) else 0.0
 
 
 def _cover_day():
@@ -3917,6 +3930,13 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             say("有人在看片 —— 截封面先让路，等没人看了再截（每小时那一轮会接着来）。")
         return 0
     day = _cover_day()
+    # 【流量闸】一张正常的封面是几 MB。一天用掉 COVER_DAY_MB 就停 —— 张数封顶管不住
+    # "一张拉了一个 GB"那种
+    if float(day.get("mb") or 0) >= COVER_DAY_MB:
+        if say:
+            say(f"今天截封面已经用了 {float(day.get('mb') or 0):.0f} MB"
+                f"（一天最多 {COVER_DAY_MB} MB），明天接着来。")
+        return 0
     room = min(limit, COVER_DAY_MAX - int(day.get("n") or 0))
     if room <= 0:
         if say:
@@ -3975,6 +3995,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
                 pass
         url = routes[0] if routes else ""
         why, jpg, at = "", b"", 0.0
+        _rx0 = _host_rx_bytes()
         for url in routes:
             if not secs:
                 # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
@@ -3989,28 +4010,40 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             # 截一帧要跳到中间读几 MB，用浏览器脸多半超时 —— 前几轮「截不到画面」里就有这种
             for _ua in (PLAYER_UA, BROWSER_UA):
                 jpg, why = cover_frame(url, at, ua=_ua)
-                if jpg:
+                if jpg or _cover_meter_mb(_rx0) > COVER_ONE_MB:
                     break
-            if jpg:
+            if jpg or _cover_meter_mb(_rx0) > COVER_ONE_MB:
                 break
         ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
         day["n"] = int(day.get("n") or 0) + 1
+        _mb = _cover_meter_mb(_rx0)
+        day["mb"] = round(float(day.get("mb") or 0) + _mb, 1)
+        # 【一张就吃掉几十 MB = 这个源跳不过去】多半是不认 Range、只能从头顺着读。
+        # 再试也一样贵，直接判"不再试"
+        _heavy = _mb > COVER_ONE_MB
         if ok_:
             done += 1
             made[iid] = int(time.time())
             fails.pop(iid, None)
         else:
             _f = fails.get(iid) or {}
-            fails[iid] = {"n": int(_f.get("n") or 0) + 1, "t": int(time.time())}
+            fails[iid] = {"n": COVER_MAX_TRIES if _heavy else int(_f.get("n") or 0) + 1,
+                          "t": int(time.time())}
+            if _heavy:
+                why = f"拉了 {_mb:.0f} MB 还没截到，这个源跳不到中间"
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
                     + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
                        if ok_ else "没截成（" + ("拿不到地址" if not url else
                                                  "Emby 没收下" if jpg else why or "截不到画面")
                        + (f"），{COVER_RETRY_H} 小时后再试" if fails[iid]["n"] < COVER_MAX_TRIES
                           else f"），{COVER_MAX_TRIES} 次都没成，不再试"))
-                    + f"  {str(name)[:40]}{_log_tag(iid)}")
+                    + f"  {_mb:.0f}MB  {str(name)[:40]}{_log_tag(iid)}")
         if say:
             say(("✔ " if ok_ else "✖ ") + logs[-1].split("---- 封面：", 1)[1])
+        if float(day["mb"]) >= COVER_DAY_MB:
+            if say:
+                say(f"今天截封面的流量到 {COVER_DAY_MB} MB 了，剩下的明天再截。")
+            break
     save_ms_state(cover_made=made, cover_day=day, cover_fail=fails)
     heal_log(logs)
     return done
@@ -12415,6 +12448,42 @@ def file_layout(raw_url, max_req=10):
 EMBY_FFPROBE_PATHS = ("/bin/ffprobe", "/opt/emby-server/bin/ffprobe", "/app/emby/bin/ffprobe")
 
 
+def _kill_tagged(tag):
+    """把环境变量里带着这个记号的进程全部杀掉（容器里的进程在宿主机上看得见）。"""
+    want = f"MS_EXEC_TAG={tag}".encode()
+    n = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                if want not in f.read().split(b"\0"):
+                    continue
+            os.kill(int(pid), signal.SIGKILL)
+            n += 1
+        except (OSError, ProcessLookupError):
+            pass
+    return n
+
+
+def emby_exec(argv, timeout, text=False):
+    """在 Emby 容器里跑一条命令，【超时就连容器里那个进程一起杀掉】。
+
+    【真机】一夜 15 GB：截封面的 ffmpeg 在 Emby 容器里跑，subprocess 的 timeout 只杀得掉
+    宿主机这边的 docker exec 客户端，容器里的 ffmpeg 照跑 —— 碰上不认 Range 的源，它就
+    从头顺着拉整部片子，拉完才停。每小时那轮截 20 张，每轮多出几个 GB（openlist 一夜
+    转手 12 GB，emby 收了 10 GB）。
+    所以给进程打个记号（环境变量），超时之后按记号去 /proc 里找出来杀掉。
+    """
+    tag = secrets.token_hex(8)
+    try:
+        return subprocess.run(["docker", "exec", "-e", f"MS_EXEC_TAG={tag}", "emby"] + argv,
+                              capture_output=True, text=text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tagged(tag)
+        raise
+
+
 def emby_ffprobe(url, ua=None, timeout=150):
     """用 Emby 容器里【它自己那个】ffprobe 读 url → (时长秒 或 None, 轨道数, 报错那一行)。
 
@@ -12430,8 +12499,7 @@ def emby_ffprobe(url, ua=None, timeout=150):
         args += ["-user_agent", ua]
     for fp in EMBY_FFPROBE_PATHS:
         try:
-            r = subprocess.run(["docker", "exec", "emby", fp] + args + ["-i", url],
-                               capture_output=True, text=True, timeout=timeout)
+            r = emby_exec([fp] + args + ["-i", url], timeout, text=True)
         except subprocess.TimeoutExpired:
             return None, 0, f"等了 {timeout} 秒没读完"
         except OSError:
