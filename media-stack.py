@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.167"
+SCRIPT_VERSION = "1.5.168"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3271,6 +3271,7 @@ def rescue_progress(key):
             # 【取最新的，不取最大的】人会往回拖；最后停在哪儿才是要续的地方
             e["uid"], e["pos"] = playing[iid][0], max(0, playing[iid][1])
             e["seen"] = now
+            e.pop("end", None)        # 又开播了：上一场的"停了"不算数
             continue
         if not e.get("seen"):
             age = now - int(e.get("t0") or now)
@@ -3299,22 +3300,55 @@ def rescue_progress(key):
             if age > HEAL_RESCUE_H * 3600:
                 st.pop(iid, None)     # 点开了却一直没看到在播，别一直挂着
             continue
-        st.pop(iid, None)             # 播过、现在不在播了 → 这一场结束了，结一次账
+        # 【播完了 → 结账；可别只看一眼就走】实测 FC2-4954902：点开时没时长，播着播着
+        # 补上了 29 分钟，停了之后条目上还是「已看完」、没有续播点，流水里一个字都没有。
+        # 以前这里一看见"不在播了"就把它从表里拿掉、只读一次 UserData：Emby 处理
+        # "停止播放"（打「已看完」那个勾）要是比这一眼晚几秒，读到的还是没打勾的样子，
+        # 于是什么都不做、也不留话。现在：停了之后 HEAL_RESCUE_SETTLE_S 秒内每一轮都
+        # 再看一次，等到 Emby 把账记完再动手；每一场都在流水里留一句看到了什么、做了什么。
+        e.setdefault("end", now)
         pos = int(e.get("pos") or 0)
         # 点开时确实没时长的（nodur）不看这道门槛：哪怕只播了几秒，那个「已看完」也是误标的
         if pos < HEAL_RESCUE_MIN_S * 10 ** 7 and not e.get("nodur"):
+            st.pop(iid, None)
             continue
         try:
             it = _emby(f"/Users/{e.get('uid')}/Items/{iid}?Fields=UserData,MediaSources",
                        key, timeout=30)
         except Exception:
-            continue
+            continue                  # 问不到，下一轮再看
         srcs = it.get("MediaSources") or []
         ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
                  else (it.get("RunTimeTicks") or 0))
         ud = it.get("UserData") or {}
-        if not ticks or int(ud.get("PlaybackPositionTicks") or 0) > 0 \
-                or pos >= ticks * HEAL_RESCUE_END_PCT:
+        upos = int(ud.get("PlaybackPositionTicks") or 0)
+        played = bool(ud.get("Played"))
+        settled = now - int(e["end"]) >= HEAL_RESCUE_SETTLE_S
+        e["name"] = e.get("name") or str(it.get("Name") or "")[:40]
+        _mmss = lambda t: f"{t // 600000000} 分 {t // 10 ** 7 % 60:02d} 秒"
+        _saw = (f"看到停在 {_mmss(pos)}" if pos else "播放器没报位置")
+        _emb = (f"Emby：已看完 {'是' if played else '否'}、续播点 "
+                f"{_mmss(upos) if upos else '0'}、时长 {ticks / 6e8:.0f} 分")
+        _tail = f"  {e.get('name') or iid}{_log_tag(iid)}"
+        _ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        if upos > 0:
+            st.pop(iid, None)         # Emby 自己记住了，不碰
+            if e.get("nodur"):
+                logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 它自己记住了，不用动{_tail}")
+            continue
+        if not played and not settled:
+            continue                  # 还没打勾：多半是 Emby 还没把这一场记完，下一轮再看
+        if not ticks and not settled:
+            continue                  # 还没补上时长：写了也白写，等一等
+        st.pop(iid, None)
+        if ticks and pos and pos >= ticks * HEAL_RESCUE_END_PCT:
+            logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 真看到结尾了，不动{_tail}")
+            continue
+        if not ticks:
+            logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 一直没补上时长，写不回去{_tail}")
+            continue
+        if not played and not pos:
+            logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 没打勾、也没位置可写{_tail}")
             continue
         try:
             _emby(f"/Users/{e.get('uid')}/Items/{iid}/UserData", key, method="POST",
@@ -3322,13 +3356,12 @@ def rescue_progress(key):
                         "PlayCount": int(ud.get("PlayCount") or 0),
                         "IsFavorite": bool(ud.get("IsFavorite"))}, timeout=30)
         except Exception:
+            st[iid] = e               # 没写成，下一轮再来
             continue
         fixed += 1
-        e["name"] = e.get("name") or str(it.get("Name") or "")[:40]
-        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：第一场播放"
-                    f"停在 {pos // 600000000} 分 {pos // 10 ** 7 % 60:02d} 秒，Emby 判成看完了"
-                    f"（那时还没时长），已写回续播点  {e.get('name') or iid}"
-                    f"{_log_tag(iid)}")
+        logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— "
+                    + (f"已写回续播点 {_mmss(pos)}" if pos
+                       else "位置拿不到，已撤掉「已看完」") + _tail)
     save_ms_state(heal_rescue=st)
     heal_log(logs)
     return fixed
@@ -11719,6 +11752,10 @@ def _probe_brief(iid):
     return (f"直播流 {yn(e.get('live'))}、无限流 {yn(e.get('infinite'))}、"
             f"回包时长 {(e.get('ticks') or 0) / 6e8:.0f} 分、大小 {(e.get('size') or 0) >> 20} MB、"
             f"轨道 {e.get('streams')}、容器 {e.get('container') or '-'}、协议 {e.get('protocol') or '-'}")
+
+
+# 【进度抢救】播放停了之后，最多等 Emby 这么久把这一场记完（打勾 / 记续播点）再结账
+HEAL_RESCUE_SETTLE_S = 180
 
 
 # 等 Emby 把半截信息清掉，最多等多久（秒）。刷新是后台跑的，一般几秒就完。
