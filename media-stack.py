@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.183"
+SCRIPT_VERSION = "1.5.184"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3749,8 +3749,12 @@ def cover_candidates(key, d=None):
         except Exception:
             continue
         for it in got:
-            if (it.get("ImageTags") or {}).get("Primary"):
-                continue                  # 有封面了（刮到的、或者之前截过的）
+            _tags = it.get("ImageTags") or {}
+            if _tags.get("Primary") or _tags.get("Thumb") or it.get("BackdropImageTags"):
+                # 有封面了（刮到的、或者之前截过的）。【横图、背景图也算】客户端没有竖版
+                # 封面时拿它们顶上，人看到的就是有图 —— 仓库主人：「兄弟和老婆明明截到
+                # 图片了，他还说没截到」，它有刮到的背景图、只是没有竖版封面
+                continue
             path = str(it.get("Path") or "")
             if not path.startswith(STRM_PATH):
                 continue
@@ -3763,11 +3767,13 @@ def cover_candidates(key, d=None):
     return sorted(out, key=lambda x: (rank(x[3]), x[4] is None))
 
 
-def cover_frame(url, sec, timeout=120):
-    """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → JPEG 字节，截不到返回 b""。
+def cover_frame(url, sec, timeout=180):
+    """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → (JPEG 字节, 截不到的原因)。
 
     -ss 放在 -i 前面：先按索引跳过去再读，只拉那一小段。UA 用浏览器那张脸 ——
     实测 FC2-4932682 那个盘，ffmpeg 自己的 UA（Lavf）读出 I/O error，浏览器 UA 读得出。
+    【原因要带出来】只写"截不到画面"的话，是被拦了、超时了、还是解不出来，一概分不清
+    （仓库主人问「不会是帧率大了吧」—— 没有报错就只能猜）。报错里的地址抹掉。
     """
     args = ["-hide_banner", "-loglevel", "error", "-user_agent", BROWSER_UA,
             "-ss", f"{max(0.0, sec):.1f}", "-i", url, "-frames:v", "1",
@@ -3776,13 +3782,21 @@ def cover_frame(url, sec, timeout=120):
         try:
             r = subprocess.run(["docker", "exec", "emby", fp] + args,
                                capture_output=True, timeout=timeout)
-        except (subprocess.TimeoutExpired, OSError):
-            return b""
+        except subprocess.TimeoutExpired:
+            return b"", f"{timeout} 秒没截完"
+        except OSError:
+            return b"", "跑不了 docker"
         if r.returncode in (126, 127):
             continue
         out = r.stdout or b""
-        return out if out[:2] == b"\xff\xd8" and len(out) > 2000 else b""
-    return b""
+        if out[:2] == b"\xff\xd8" and len(out) > 2000:
+            return out, ""
+        errs = [ln.strip() for ln in (r.stderr or b"").decode("utf-8", "replace").splitlines()
+                if ln.strip()]
+        e = re.sub(r"https?://\S+", "<地址>", errs[-1]) if errs else "没出画面"
+        e = re.sub(r"^\[[^\]]*\]\s*", "", e)          # 去掉 [mov,mp4 @ 0x…] 这种前缀
+        return b"", e[:40]
+    return b"", "容器里找不到 ffmpeg"
 
 
 def emby_set_image(key, iid, jpg, typ="Primary"):
@@ -3839,29 +3853,40 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
     made = dict(ms_state().get("cover_made") or {})
     done, logs = 0, []
     for uid, iid, name, path, secs in todo:
-        url = ""
+        # 【两条路，前一条截不到就换后一条】转码流的 m3u8 最省（一个分片），可截帧要把
+        # 那个分片真拉下来，有的盘这一步拦；那就退回原片的 /d/。
+        routes = []
         try:
-            url = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
+            if not os.environ.get("MS_HEAL_NO_M3U8"):
+                _m = hls_probe_url(iid, key)
+                if _m:
+                    routes.append(_m)
         except Exception:
-            url = ""
-        if not url and token and base:
+            pass
+        if token and base:
             try:
                 with open(_strm_host_path(d, path), encoding="utf-8") as f:
                     tp = strm_target_path(f.read())
                 sign = ((_ol_api("/api/fs/get", {"path": tp, "password": ""}, token,
                                  timeout=60).get("data") or {}).get("sign", "")) if tp else ""
-                url = (base + "/d" + urllib.parse.quote(tp) + (f"?sign={sign}" if sign else "")
-                       if tp else "")
+                if tp:
+                    routes.append(base + "/d" + urllib.parse.quote(tp)
+                                  + (f"?sign={sign}" if sign else ""))
             except Exception:
-                url = ""
-        why = ""
-        if url and not secs:
-            # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
-            secs, _n, _e = emby_ffprobe(url, BROWSER_UA)
+                pass
+        url = routes[0] if routes else ""
+        why, jpg, at = "", b"", 0.0
+        for url in routes:
             if not secs:
-                why = "读不出时长"
-        at = (secs or 0) * COVER_AT
-        jpg = cover_frame(url, at) if url and secs else b""
+                # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
+                secs, _n, _e = emby_ffprobe(url, BROWSER_UA)
+                if not secs:
+                    why = "读不出时长"
+                    continue
+            at = secs * COVER_AT
+            jpg, why = cover_frame(url, at)
+            if jpg:
+                break
         ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
         day["n"] = int(day.get("n") or 0) + 1
         if ok_:
@@ -3873,8 +3898,8 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             fails[iid] = {"n": int(_f.get("n") or 0) + 1, "t": int(time.time())}
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
                     + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
-                       if ok_ else "没截成（" + ("拿不到地址" if not url else why if why else
-                                                 "截不到画面" if not jpg else "Emby 没收下")
+                       if ok_ else "没截成（" + ("拿不到地址" if not url else
+                                                 "Emby 没收下" if jpg else why or "截不到画面")
                        + (f"），{COVER_RETRY_H} 小时后再试" if fails[iid]["n"] < COVER_MAX_TRIES
                           else f"），{COVER_MAX_TRIES} 次都没成，不再试"))
                     + f"  {str(name)[:40]}{_log_tag(iid)}")
