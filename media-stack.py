@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.160"
+SCRIPT_VERSION = "1.5.161"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3805,6 +3805,17 @@ def do_heal_trace(q, play=True):
                    "补一次掉一次。跑一次「7 更新」会关掉")
     elif _mon is False:
         _trace_row("✔", "所在库实时监控", "关着")
+    _nh = heal_nohead_at(iid)
+    if _nh:
+        try:
+            with open(_strm_host_path(d, _ip), encoding="utf-8") as f:
+                _ext = os.path.splitext(strm_target_path(f.read()) or "")[1]
+        except (OSError, TypeError):
+            _ext = ""
+        _trace_row("⚠", "文件头里没时长", f"{int((time.time() - _nh) // 3600)} 小时前探明"
+                   + (f"（文件是 {_ext}）" if _ext else "")
+                   + " —— 整文件那条路探不出时长，不再拉它；只剩 m3u8：网盘转好码之后"
+                   f"点开就走它。{HEAL_NOHEAD_H} 小时后会再拉一次整文件确认")
     _gv = heal_fail_table().get(iid)
     if _gv:
         _trace_row("·", "放弃名单", "在上面 —— 点开播放那条路不看这份名单，不影响")
@@ -11431,6 +11442,25 @@ def _probe_note(iid, kind, resp):
 
 # 等 Emby 把半截信息清掉，最多等多久（秒）。刷新是后台跑的，一般几秒就完。
 HEAL_CLEAR_WAIT = 45
+# 探明「文件头里没时长」之后，多久内不再拉整文件去探它（只等 m3u8）
+HEAL_NOHEAD_H = 24
+_CLEAR_WHY = {}                       # 清半截没清掉的原因，按条目 id；只给流水那句话用
+
+
+def heal_nohead_mark(iid):
+    """记下：这个条目从干净状态探过，整文件那条路只探得出轨道、探不出时长。"""
+    now = int(time.time())
+    cur = {k: v for k, v in (ms_state().get("heal_nohead") or {}).items()
+           if isinstance(v, (int, float)) and now - v < HEAL_NOHEAD_H * 3600}
+    cur[str(iid)] = now
+    save_ms_state(heal_nohead=cur)
+
+
+def heal_nohead_at(iid, now=None):
+    """HEAL_NOHEAD_H 小时内探明过「文件头里没时长」→ 那一刻的时间戳，否则 0。"""
+    now = now or time.time()
+    v = (ms_state().get("heal_nohead") or {}).get(str(iid))
+    return v if isinstance(v, (int, float)) and now - v < HEAL_NOHEAD_H * 3600 else 0
 
 
 def _half_info(key, uid, iid):
@@ -11467,18 +11497,25 @@ def _clear_half_info(key, uid, iid):
     half, _n = _half_info(key, uid, iid)
     if not half:
         return False, False
+    _CLEAR_WHY.pop(str(iid), None)
     try:
         _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
               f"&ImageRefreshMode=None&ReplaceAllMetadata=false&ReplaceAllImages=false",
               key, method="POST", timeout=30)
-    except Exception:
+    except urllib.error.HTTPError as e:
+        _CLEAR_WHY[str(iid)] = f"刷新被拒 HTTP {e.code}"
         return True, False
+    except Exception:
+        # 【超时不等于没刷】实测 FC2-4954902 两次都"没清掉"，耗时正好卡在这个
+        # 请求的超时上：Emby 收下了、只是回得慢。以前这里直接放弃，等都不等。
+        pass
     t0 = time.monotonic()
     while time.monotonic() - t0 < HEAL_CLEAR_WAIT:
         time.sleep(3)
         still, n = _half_info(key, uid, iid)
         if not n:
             return True, True         # 轨道清空了，可以从头探了
+    _CLEAR_WHY[str(iid)] = f"等了 {HEAL_CLEAR_WAIT}s 轨道还在"
     return True, False
 
 
@@ -11519,6 +11556,16 @@ def _heal_one(d, key, _it, base, token):
     p = strm_target_path(original)
     if not p:
         return "skip", name, el(), ""
+    # 【已经探明文件头里没时长的，别再拉整文件】再拉一百遍还是同一个答案，还白白
+    # 先清一遍半截信息、换一次直链。只剩 m3u8 那条路救得了：网盘转好码了就走它，
+    # 没转好就直接说，不碰 Emby。HEAL_NOHEAD_H 小时后记号过期，会再拉一次整文件确认。
+    _nohead = heal_nohead_at(iid)
+    _m3u8 = ("" if os.environ.get("MS_HEAL_NO_M3U8")
+             else hls_probe_url(iid, key)) if _nohead else None
+    if _nohead and not _m3u8:
+        return ("retry", name, el(),
+                f"文件头里没时长（{int((time.time() - _nohead) // 3600)} 小时前探明）；"
+                f"网盘还没转码版，没 m3u8 可走")
     try:
         got0 = (_ol_api("/api/fs/get", {"path": p, "password": ""},
                         token, timeout=120).get("data") or {})
@@ -11546,10 +11593,12 @@ def _heal_one(d, key, _it, base, token):
     _routes = []
     # 【留个开关是为了能做对照】m3u8 到底省不省流量，只有同一批条目两条路各跑一遍
     # 才说得清。没有开关就没法把新路关掉，也就永远只能拿"感觉"下结论。
-    _m3u8 = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
+    if _m3u8 is None:
+        _m3u8 = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
     if _m3u8:
         _routes.append(("m3u8", _m3u8))
-    _routes.append(("整文件", url))
+    if not _nohead:
+        _routes.append(("整文件", url))
     _tried = []                       # 这一次真的走过哪几条路 —— 写进结局，别只剩一个「-」
     mins, streams, probed = 0, False, True
     streams_hot = False               # 还原【之前】有没有轨道，见下面那一档
@@ -11654,8 +11703,8 @@ def _heal_one(d, key, _it, base, token):
             # 【有轨道、没时长，而且探之前就是这个样子、没清掉】Emby 手里那份半截
             # 信息它不肯丢，探测请求直接拿旧的交差。
             return ("retry", name, el(),
-                    f"只有轨道没有时长 —— Emby 拿着之前那份半截信息没重新探"
-                    f"（先清过一次，没清掉；试了 {_rt}）")
+                    f"有轨道没时长，半截信息没清掉"
+                    f"（{_CLEAR_WHY.get(str(iid)) or '原因不明'}）；试了 {_rt}")
         # 【探之前是干净的，探完才有轨道没时长】那就不是 Emby 偷懒，是【这个文件的
         # 文件头里就没有时长】。实测撞上的：FC2-4954902，探之前 0B / 0bps，探完有轨道、
         # 时长 0。分段式 mp4、ts 这类要把整个文件读完才知道多长，Emby 只读文件头。
@@ -11664,6 +11713,8 @@ def _heal_one(d, key, _it, base, token):
         # 再点开，或者整队那一轮轮到它，就会走 m3u8。
         # 【说明压在 60 字以内】流水一行只留说明的前 60 个字，关键的"试了哪条路"
         # 放后面会被截掉
+        if "整文件" in _tried:
+            heal_nohead_mark(iid)     # 下次点开就不再白拉整文件了，只等 m3u8
         return ("retry", name, el(),
                 f"探到轨道但文件头里没时长（分段 mp4/ts 常见）；试了 {_rt}"
                 + ("；没转码版，转好码后走 m3u8 就有" if "m3u8" not in _tried else ""))
