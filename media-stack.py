@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.164"
+SCRIPT_VERSION = "1.5.165"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3830,7 +3830,29 @@ def do_heal_trace(q, play=True):
                   f"（走 m3u8），要么转封装成普通 mp4 再传：ffmpeg -i 原文件 -c copy "
                   f"-movflags +faststart 新.mp4{RST}")
         elif _has:
-            print(f"  {DIM}  → 文件里写着时长，Emby 没读到 —— 这是要查的，把这一屏发给仓库主人{RST}")
+            # 【文件里写着、Emby 没读到 → 当场让 Emby 自己的 ffprobe 读同一个地址】
+            # 两张脸各读一次：它自己的（Lavf）和浏览器的。差在哪张脸上，就是哪儿的毛病。
+            print(f"  {DIM}  → 文件里写着时长，Emby 没读到。用 Emby 自己的 ffprobe 读一遍"
+                  f"补时长用的那个地址（各读一次文件头和尾巴，几 MB）…{RST}")
+            try:
+                _sign = ((_ol_api("/api/fs/get", {"path": _tp, "password": ""},
+                                  _ol_token(d), timeout=60).get("data") or {})
+                         .get("sign", ""))
+                _pu = (openlist_public_url(rebuild_cfg_from_disk(d)) + "/d"
+                       + urllib.parse.quote(_tp) + (f"?sign={_sign}" if _sign else ""))
+            except Exception:
+                _pu = ""
+            if not _pu:
+                _trace_row("·", "Emby 的 ffprobe", "拿不到地址，读不了")
+            else:
+                for _lab, _ua in (("它自己的 UA", None), ("换成浏览器 UA", BROWSER_UA)):
+                    _du, _n, _e = emby_ffprobe(_pu, _ua)
+                    _trace_row("✔" if _du else "✖", f"ffprobe（{_lab}）",
+                               (f"时长 {_du / 60:.0f} 分钟、{_n} 条轨道" if _du
+                                else f"没时长、{_n} 条轨道")
+                               + (f"；报错：{_e}" if _e else ""))
+                print(f"  {DIM}  → 把这几行发给仓库主人。时长索引在文件末尾（moov 在 mdat 后面）"
+                      f"的 mp4，ffprobe 要多跳一次去读尾巴，这一跳最容易被上游拦。{RST}")
     _nh = heal_nohead_at(iid)
     if _nh:
         try:
@@ -10932,6 +10954,48 @@ def file_layout(raw_url, max_req=10):
                                       else struct.unpack(">I", m[12:16])[0])
                         info["mehd_s"] = du / ts if ts else None
     return info
+
+
+EMBY_FFPROBE_PATHS = ("/bin/ffprobe", "/opt/emby-server/bin/ffprobe", "/app/emby/bin/ffprobe")
+
+
+def emby_ffprobe(url, ua=None, timeout=150):
+    """用 Emby 容器里【它自己那个】ffprobe 读 url → (时长秒 或 None, 轨道数, 报错那一行)。
+
+    【为什么要有】file_layout 说"文件里写着 29 分钟"，Emby 却只拿到轨道 —— 那就得看
+    Emby 自己的 ffprobe 读这个地址时到底卡在哪。时长索引（moov）在文件【末尾】的 mp4，
+    ffprobe 读完开头还得再发一个请求跳到末尾；这一跳被上游限流（429）或者不给跳，
+    就读不全。
+    【报错里的地址要抹掉】里面有签名和域名，这一屏是要截图发出去的。
+    """
+    args = ["-v", "warning", "-show_entries",
+            "format=duration:stream=codec_type", "-of", "json"]
+    if ua:
+        args += ["-user_agent", ua]
+    for fp in EMBY_FFPROBE_PATHS:
+        try:
+            r = subprocess.run(["docker", "exec", "emby", fp] + args + ["-i", url],
+                               capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, 0, f"等了 {timeout} 秒没读完"
+        except OSError:
+            return None, 0, "跑不了 docker"
+        if r.returncode in (126, 127):
+            continue                  # 这个路径上没有（docker exec 找不到程序），换下一个
+        try:
+            j = json.loads(r.stdout or "{}")
+        except ValueError:
+            j = {}
+        dur = (j.get("format") or {}).get("duration")
+        try:
+            dur = float(dur) if dur not in (None, "N/A") else None
+        except ValueError:
+            dur = None
+        n = len(j.get("streams") or [])
+        errs = [ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()]
+        e = re.sub(r"https?://\S+", "<地址>", errs[-1])[:100] if errs else ""
+        return dur, n, e
+    return None, 0, "容器里找不到 ffprobe"
 
 
 def file_layout_says(info):
