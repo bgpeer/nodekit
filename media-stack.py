@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.185"
+SCRIPT_VERSION = "1.5.186"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -140,6 +140,11 @@ SUBDOMAINS = [
 # 【别再写 "Mozilla/5.0" 这种半截的】六个字符，任何一个像样的防盗链都认得出不是浏览器。
 BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+# 【播放器那张脸】和 BROWSER_UA 一样是【故意】伪装的，不是自报家门：拉视频字节的时候
+# 网盘按 UA 限速，浏览器那张脸反而最慢 —— 实测夸克：浏览器 ~0 / VLC 16 Mbps（见
+# tools/why-stall.sh 的 ④b）；play-speed 用浏览器脸拉 FC2-120222 只有 29 KB/s。
+# 所以要真拉一段视频的地方（测速、截封面）先用这张脸，不成再退回浏览器那张。
+PLAYER_UA = "VLC/3.0.18 LibVLC/3.0.18"
 
 RST = "\033[0m"; BOLD = "\033[1m"; DIM = "\033[2m"
 RED = "\033[31m"; GREEN = "\033[32m"; YELLOW = "\033[33m"
@@ -1565,7 +1570,7 @@ case "${1:-info}" in
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
   covers --retry 截失败过的也重新试一遍
-  play-speed <片名> [--wait 秒]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
+  play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
   heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
@@ -3773,7 +3778,7 @@ def cover_candidates(key, d=None):
     return sorted(out, key=lambda x: (rank(x[3]), x[4] is None))
 
 
-def cover_frame(url, sec, timeout=180):
+def cover_frame(url, sec, timeout=120, ua=None):
     """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → (JPEG 字节, 截不到的原因)。
 
     -ss 放在 -i 前面：先按索引跳过去再读，只拉那一小段。UA 用浏览器那张脸 ——
@@ -3781,7 +3786,7 @@ def cover_frame(url, sec, timeout=180):
     【原因要带出来】只写"截不到画面"的话，是被拦了、超时了、还是解不出来，一概分不清
     （仓库主人问「不会是帧率大了吧」—— 没有报错就只能猜）。报错里的地址抹掉。
     """
-    args = ["-hide_banner", "-loglevel", "error", "-user_agent", BROWSER_UA,
+    args = ["-hide_banner", "-loglevel", "error", "-user_agent", ua or PLAYER_UA,
             "-ss", f"{max(0.0, sec):.1f}", "-i", url, "-frames:v", "1",
             "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", "-f", "mjpeg", "pipe:1"]
     for fp in EMBY_FFMPEG_PATHS:
@@ -3885,12 +3890,19 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         for url in routes:
             if not secs:
                 # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
-                secs, _n, _e = emby_ffprobe(url, BROWSER_UA)
+                secs, _n, _e = emby_ffprobe(url, PLAYER_UA)
+                if not secs:
+                    secs, _n, _e = emby_ffprobe(url, BROWSER_UA)
                 if not secs:
                     why = "读不出时长"
                     continue
             at = secs * COVER_AT
-            jpg, why = cover_frame(url, at)
+            # 【先播放器那张脸，不成换浏览器那张】见 PLAYER_UA：夸克对浏览器脸限速到几十 KB/s，
+            # 截一帧要跳到中间读几 MB，用浏览器脸多半超时 —— 前几轮「截不到画面」里就有这种
+            for _ua in (PLAYER_UA, BROWSER_UA):
+                jpg, why = cover_frame(url, at, ua=_ua)
+                if jpg:
+                    break
             if jpg:
                 break
         ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
@@ -4032,7 +4044,7 @@ def _play_start(iid, msid, key):
     return out
 
 
-def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB):
+def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None):
     """照播放器的样子拉 url：普通文件从头连续读；m3u8 就一个分片一个分片地读。
     → {"kind", "ttfb", "bytes", "t", "per_s": [每秒 KB], "err"}"""
     res = {"kind": "文件", "ttfb": 0.0, "bytes": 0, "t": 0.0, "per_s": [], "err": ""}
@@ -4056,7 +4068,7 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB):
             first = False
             _feed(len(b))
 
-    hdr = {"User-Agent": BROWSER_UA}
+    hdr = {"User-Agent": ua or PLAYER_UA}
     try:
         r = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=30)
         ctype = (r.headers.get("Content-Type") or "").lower()
@@ -4095,7 +4107,7 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB):
     return res
 
 
-def do_play_speed(q, wait=5):
+def do_play_speed(q, wait=5, ua="player"):
     """media-stack play-speed <片名> [--wait 秒]：替你播两次，看第一次是不是比第二次慢。"""
     d = ms_install_dir()
     if not is_installed(d):
@@ -4119,6 +4131,9 @@ def do_play_speed(q, wait=5):
     print(f"  {DIM}在这台服务器上替你按两次播放，每次拉 {PLAY_SPEED_S} 秒（最多 "
           f"{PLAY_SPEED_MB} MB），中间断开 {wait} 秒。测的是【服务器到网盘】这一段，"
           f"不是你手机到网盘那一段。{RST}")
+    _ua = BROWSER_UA if ua == "browser" else PLAYER_UA
+    print(f"  {DIM}用的是{'浏览器' if ua == 'browser' else '播放器（VLC）'}那张脸拉"
+          f"（网盘按脸限速；--ua browser 换浏览器那张比一比）。{RST}")
     if not st0.get("ticks"):
         print(f"  {DIM}这一集现在还没时长：第一次会经过「先补再播」，补时长的等待也算在里面。{RST}")
     rows = []
@@ -4130,7 +4145,7 @@ def do_play_speed(q, wait=5):
         if st["err"]:
             _trace_row("✖", f"第 {n} 次", st["err"])
             return
-        sp = _pull_speed(st["loc"])
+        sp = _pull_speed(st["loc"], ua=_ua)
         rows.append((st, sp))
         avg = sp["bytes"] / sp["t"] / 1024
         _trace_row("·", f"第 {n} 次", f"PlaybackInfo {st['pi']:.1f}s → 拿到直链 {st['go']:.1f}s → "
@@ -19986,7 +20001,12 @@ if __name__ == "__main__":
                     del _a[_i:_i + 2]
                 except (IndexError, ValueError):
                     del _a[_i:]
-            do_play_speed(" ".join(_a).strip(), wait=_w)
+            _u = "player"
+            if "--ua" in _a:
+                _i = _a.index("--ua")
+                _u = (_a[_i + 1] if _i + 1 < len(_a) else "player")
+                del _a[_i:_i + 2]
+            do_play_speed(" ".join(_a).strip(), wait=_w, ua=_u)
         elif arg == "covers":             # 没刮到封面的：截一帧当封面
             require_root()
             do_covers(retry="--retry" in sys.argv[2:])
