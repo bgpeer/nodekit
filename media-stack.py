@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.190"
+SCRIPT_VERSION = "1.5.191"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3776,7 +3776,7 @@ def cover_candidates(key, d=None):
         try:
             got = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
                         f"&IncludeItemTypes=Movie,Episode,Video"
-                        f"&Fields=Path,MediaSources&SortBy=DateCreated&SortOrder=Descending",
+                        f"&Fields=Path,MediaSources,DateCreated&SortBy=DateCreated&SortOrder=Descending",
                         key).get("Items") or []
         except Exception:
             continue
@@ -3794,9 +3794,14 @@ def cover_candidates(key, d=None):
             ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
                      else (it.get("RunTimeTicks") or 0))
             out.append((uid, str(it.get("Id")), it.get("Name") or "?", path,
-                        ticks / 1e7 if ticks else None))
+                        ticks / 1e7 if ticks else None, str(it.get("DateCreated") or "")))
+    # 【同一个盘里新进来的先截】仓库主人：「新加进来的影片他没有刮削应该就让他先补上
+    # 图片的」—— 一天就 COVER_DAY_MAX 张，不能让老片先占掉。刚进来的多半还没时长，
+    # 截的时候现读（见 fill_covers），所以不再"有时长的排前面"
     rank = mount_rank(d) if d else (lambda _p: 0)
-    return sorted(out, key=lambda x: (rank(x[3]), x[4] is None))
+    out.sort(key=lambda x: x[5], reverse=True)       # 新的在前（ISO 时间，字符串比就行）
+    out.sort(key=lambda x: rank(x[3]))               # 再按盘排（稳定排序，盘内保持新的在前）
+    return [x[:5] for x in out]
 
 
 def cover_frame(url, sec, timeout=120, ua=None):
@@ -4673,6 +4678,9 @@ def do_heal_tick(hot_only=False):
     # 【上一轮没轮上的，这一轮接着补】见下面 heal_hot_queue
     _q = {k: v for k, v in (ms_state().get("heal_hot_queue") or {}).items()
           if isinstance(v, (int, float)) and time.time() - v < HEAL_HOT_QUEUE_H * 3600}
+    # 【脚本自己刷新过、到点了的】当"刚点开的"补，见 heal_later_add
+    for _i in heal_later_due():
+        _q.setdefault(_i, int(time.time()))
     if _q:
         ids = set(ids or ()) | set(_q)
     hot = strm_items_need_heal(key, ids or [])
@@ -6882,14 +6890,53 @@ def refresh_items(key, ids):
         if not iid:
             continue
         try:
-            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
+            # 【Default，不是 FullRefresh】FullRefresh 连视频文件也重读一遍 —— strm 此刻是
+            # 路径形式，Emby 读不到，于是清掉音视频轨、留下时长。真机：第181集、第182集、
+            # 第242集、第287集这批改过片名的剧集，补上几小时后轨道又没了，「补上又掉了」
+            # 一晚上从 19 涨到 31。Default 只读改过的东西（新写的 nfo），不重读视频
+            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=Default"
                   f"&ImageRefreshMode=Default"
                   f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
                   key, method="POST", timeout=30)
             n += 1
         except Exception:
             continue
+    heal_later_add(ids)               # 万一还是清掉了，过几分钟补回来
     return n
+
+
+# 【脚本自己叫 Emby 刷新过的条目，过几分钟再补一次】刷新（尤其是重新识别，那个只能用
+# FullRefresh）会清掉音视频轨；而「补上又掉了」那条规则会让补积压 24 小时不碰它们 ——
+# 于是一直是坏的。排进这个队，heal-tick 到点就补（不看那条规则）。
+HEAL_LATER_DELAY_S = 180
+
+
+def heal_later_add(ids, delay=HEAL_LATER_DELAY_S):
+    ids = [str(i) for i in ids or () if i]
+    if not ids:
+        return
+    try:
+        cur = dict(ms_state().get("heal_later") or {})
+        due = int(time.time()) + delay
+        for i in ids:
+            cur[i] = due
+        save_ms_state(heal_later=cur)
+    except Exception:
+        pass
+
+
+def heal_later_due():
+    """到点了的 → [id]，并从队里拿掉。"""
+    cur = dict(ms_state().get("heal_later") or {})
+    if not cur:
+        return []
+    now = time.time()
+    due = [k for k, v in cur.items() if isinstance(v, (int, float)) and v <= now]
+    if due:
+        for k in due:
+            cur.pop(k, None)
+        save_ms_state(heal_later=cur)
+    return due
 
 
 def reidentify_items(key, ids):
@@ -6916,6 +6963,8 @@ def reidentify_items(key, ids):
             n += 1
         except Exception:
             continue
+    # 【重新识别只能用 FullRefresh，会清掉音视频轨】过几分钟补回来，见 heal_later_add
+    heal_later_add(ids)
     return n
 
 
@@ -12636,13 +12685,22 @@ def heal_ok_mark(iids):
     save_ms_state(heal_ok=cur)
 
 
+# 「补上又掉了」那张表的口径版本。v2：1.5.191 之前改片名那一刷用 FullRefresh，把补好的
+# 轨道清掉了 —— 那一批不是"怎么补都会掉"，是脚本自己弄掉的。清掉旧账，让它们重新补。
+HEAL_OK_V = 2
+
+
 def heal_unstuck(iid, now=None):
     """这个条目 HEAL_STICK_H 小时内补上过（现在又缺了）→ 返回补上时的时间戳，否则 0。
 
     调用方拿到的都是【现在还缺】的条目，所以"补上过"就等于"补上又掉了"。
     """
     now = now or time.time()
-    v = (ms_state().get("heal_ok") or {}).get(str(iid))
+    st = ms_state()
+    if int(st.get("heal_ok_v") or 0) < HEAL_OK_V:
+        save_ms_state(heal_ok={}, heal_ok_v=HEAL_OK_V)
+        return 0
+    v = (st.get("heal_ok") or {}).get(str(iid))
     if isinstance(v, (int, float)) and now - v < HEAL_STICK_H * 3600:
         return v
     return 0
