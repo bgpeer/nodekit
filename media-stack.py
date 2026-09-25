@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.193"
+SCRIPT_VERSION = "1.5.194"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -832,6 +832,24 @@ def strm_cron_of(path, fallback=None):
     m = "/" + strm_mount_dir(path)
     v = (ms_state().get("strm_cron_by_mount") or {}).get(m)
     return v or strm_cron_global() or fallback or DEFAULT_STRM_CRON
+
+
+def trusted_disk_cron(v):
+    """配置文件里读到的 cron，能不能当成"用户的设置"带进新配置。
+
+    【真机】三个盘全是 "0 57 19 * * *"，早上 05:15 一个都不跑，昨晚加的片子今天没进库。
+    这个 19:57 是早年手动扫描写进去的【一次性临时值】（那时"两分钟后触发一次"的时刻算错了
+    时区，没还原回去）。而状态文件里没有全局定时时，每次更新都从配置里读第一个 cron 当全局
+    —— 临时值就这样被当成用户设置，一代一代带了下去。
+
+    用户自己设的定时只走菜单，菜单一律写进状态文件（strm_cron_global / 按盘）。所以配置里
+    的"每天某时"没有状态文件背书的，就不认，回到默认的 05:15。"关"和"每 N 小时"这两种
+    不可能是手动扫描留下的，照旧认。
+    """
+    v = str(v or "").strip()
+    if v == NEVER_CRON or re.search(r"\*/\d+", v):
+        return v
+    return DEFAULT_STRM_CRON
 
 
 def set_strm_cron(mount, hours):
@@ -1651,7 +1669,7 @@ case "${1:-info}" in
     # INT/TERM 只负责退出:bash 跑完信号处理函数后默认【继续往下执行】,
     # 直接把 restore 挂在 INT 上的话,Ctrl-C 会还原配置然后接着轮询六分钟。
     # 还原统一交给 EXIT,正常结束和被中断走同一条路。
-    trap 'exit 130' INT TERM
+    trap 'exit 130' INT TERM HUP
     trap restore EXIT
 
     # 定成"每分钟"是错的:一轮跑不完下一轮就压上来,几轮任务并发扫同一个目录、
@@ -8931,7 +8949,7 @@ def rebuild_cfg_from_disk(d):
     # 【先读状态文件】有了按盘定时之后，配置里第一个 cron 可能是某个盘自己的值，
     # 拿它当全局会把别的盘一起带偏
     cfg["strm_cron"]    = (strm_cron_global()
-                           or read_yaml_scalar(af, "cron", DEFAULT_STRM_CRON))
+                           or trusted_disk_cron(read_yaml_scalar(af, "cron", "")))
     # 只迁移「没被动过的旧默认值」：以前默认 0 0 5 * * *，而 AutoFilm 当时按 UTC 解释，
     # 对国内用户等于下午一点多在跑。现在调度器钉在北京时间、默认值改成 05:15，
     # 老机器更新时顺手带过去。用户自己改过 cron 的一律保持原样，不越俎代庖。
@@ -13872,6 +13890,91 @@ def autofilm_clock():
     return t.tm_hour, t.tm_min
 
 
+AF_TASK_RE = re.compile(r"添加 Alist2Strm 定时任务 task_id=(\S+) cron=(.+?)\s*$")
+AF_START_RE = re.compile(r"开始执行 Alist2Strm 任务 task_id=(\S+)")
+AF_DONE_RE = re.compile(r"Alist2Strm 任务(?:完成|失败)\S* task_id=(\S+)")
+AF_CFG_QUIET_S = 600        # 配置文件这么久内被动过 → 可能正有人在手动扫描，不插手
+
+
+def _af_crons(text):
+    """配置文本里 {task_id: cron}。"""
+    out, cur = {}, None
+    for ln in text.splitlines():
+        m = re.match(r'\s*-\s*id:\s*"?([^"]+?)"?\s*$', ln)
+        if m:
+            cur = m.group(1)
+            continue
+        m = re.match(r'\s*cron:\s*"?([^"#]+?)"?\s*(?:#.*)?$', ln)
+        if m and cur:
+            out[cur] = m.group(1).strip()
+    return out
+
+
+def _af_mem(log):
+    """AutoFilm 这次启动时注册进内存的 {task_id: cron}，以及现在还没跑完的任务。"""
+    mem, running = {}, set()
+    for ln in ANSI_RE.sub("", log).splitlines():
+        m = AF_TASK_RE.search(ln)
+        if m:
+            mem[m.group(1)] = m.group(2).strip()
+            continue
+        m = AF_START_RE.search(ln)
+        if m:
+            running.add(m.group(1))
+            continue
+        m = AF_DONE_RE.search(ln)
+        if m:
+            running.discard(m.group(1))
+    return mem, running
+
+
+def autofilm_schedule_fix(d=None):
+    """AutoFilm 的定时和【该有的】对不上就改回来。返回做了什么（"" = 没动）。
+
+    两种对不上，都会让"每天 05:15 自动扫"悄悄不跑：
+      · 磁盘上的配置被临时值占着（见 trusted_disk_cron）
+      · 磁盘是对的，【内存】里还是手动扫描那一刻的临时定时 —— AutoFilm 只在启动时读
+        cron，手动扫描还原的是磁盘，内存里那条要等下一次重启才换回来。手动扫一次之后
+        那个盘就从"每天 05:15"变成了"每天手动扫描的那个时刻"。
+    挂在每小时的保活上，最多错一小时。正在扫的不打断：有任务开始了还没完成，就等下一轮。
+    """
+    d = d or ms_install_dir()
+    cfg_path = os.path.join(d, "autofilm", "config", "config.yaml")
+    try:
+        disk_txt = open(cfg_path, encoding="utf-8").read()
+        if time.time() - os.path.getmtime(cfg_path) < AF_CFG_QUIET_S:
+            return ""
+        want_txt = gen_autofilm_conf(rebuild_cfg_from_disk(d))
+    except Exception:
+        return ""
+    want, disk = _af_crons(want_txt), _af_crons(disk_txt)
+    if not want:
+        return ""
+    r = sh("docker inspect -f '{{.State.StartedAt}}' autofilm", timeout=30)
+    started = (r.stdout or "").strip()
+    if r.returncode != 0 or not started:
+        return ""
+    lg = sh(f"docker logs --since {started} autofilm", timeout=60)
+    mem, running = _af_mem((lg.stdout or "") + (lg.stderr or ""))
+    if running:
+        return ""
+    disk_bad = disk != want
+    mem_bad = bool(mem) and mem != want
+    if not disk_bad and not mem_bad:
+        return ""
+    try:
+        if disk_bad:
+            write_atomic(cfg_path, want_txt, 0o600)
+        subprocess.run(["docker", "restart", "autofilm"], capture_output=True, timeout=120)
+    except Exception:
+        return ""
+    try:
+        save_ms_state(autofilm_cron_fixed=int(time.time()))
+    except Exception:
+        pass
+    return "disk" if disk_bad else "mem"
+
+
 def _patch_cron(text, fire, ids=None):
     """把配置里的 cron 改成 fire。ids 给定时【只改这几个任务】。返回 (新文本, 改了几个)。
 
@@ -13990,8 +14093,9 @@ def do_strm(only=None):
 
     【为什么还原不等到最后】AutoFilm 是启动时把 config.yaml 读进内存注册 cron 的，之后再改
     磁盘上那份不影响已经排好的这一轮。所以容器一起来就立刻还原 —— 用户可以随时 Ctrl-C
-    走人，不会留下临时定时值。代价是那条临时 cron 以每天一次的形式留在内存里直到下次重启，
-    无害：overwrite 是 false、同步删除是关的，重复跑一轮只是白扫一遍。
+    走人，不会留下临时定时值。代价是那条临时 cron 以每天一次的形式留在内存里直到下次重启
+    —— 【这不是无害的】它顶掉的是这个盘原来的 05:15，手动扫一次之后凌晨就不扫了。
+    扫完之后由每小时那轮 autofilm_schedule_fix 发现、重启换回来。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -20462,6 +20566,10 @@ if __name__ == "__main__":
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
                 _timed("链路保活", do_keepalive)
+                try:
+                    autofilm_schedule_fix()     # 定时被临时值占着就改回来，见它的说明
+                except Exception:
+                    pass
         elif arg == "precache":           # cron 调的：开扫前刷一次目录缓存
             require_root()
             if take_task_lock("precache"):
