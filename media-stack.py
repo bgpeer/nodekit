@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.172"
+SCRIPT_VERSION = "1.5.173"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2258,7 +2258,11 @@ def do_heal_daemon():
     kids = []
     t_wake = time.monotonic()
     t_play = None                     # 最近一次见到按下播放（这一觉醒来之后）
-    click = re.compile(rb"/items/\d+/playbackinfo", re.I)
+    # 【两种扳机】按下播放（PlaybackInfo）→ 马上补时长；停止播放（Sessions/Playing/
+    # Stopped）→ 马上给进度抢救结账。仓库主人：「退出播放后他是过几秒补上的进度，
+    # 不可以立即补上吗？」—— 以前要等下一分钟那一轮才发现"这一场停了"。nginx 记下
+    # Stopped 这一行时 Emby 已经处理完这一场（打勾 / 清续播点），这时候去写正好。
+    click = re.compile(rb"/items/\d+/playbackinfo|/sessions/playing/stopped", re.I)
     while True:
         time.sleep(HEAL_DAEMON_POLL)
         kids = [k for k in kids if k.poll() is None]
