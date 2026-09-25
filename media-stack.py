@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.191"
+SCRIPT_VERSION = "1.5.192"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3856,8 +3856,32 @@ def _cover_day():
     return st if st.get("date") == today else {"date": today, "n": 0}
 
 
+_HEAL_YIELD = False
+_PLAYING_AT = [0.0, False]
+
+
+def someone_playing(key, cache_s=0):
+    """此刻有没有人在 Emby 里播东西（不管哪一部）。问不到当没有 —— 别因为"不知道"
+    就把后台活全停了。cache_s>0 时这么多秒内复用上一次的答案（轮内每个条目都要问）。"""
+    if cache_s and time.monotonic() - _PLAYING_AT[0] < cache_s:
+        return _PLAYING_AT[1]
+    try:
+        on = any((se.get("NowPlayingItem") or {}).get("Id")
+                 for se in (_emby("/Sessions", key, timeout=15) or []))
+    except Exception:
+        on = False
+    _PLAYING_AT[0], _PLAYING_AT[1] = time.monotonic(), on
+    return on
+
+
 def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
-    """给没封面的截一帧。返回截成了几张。say 给了就把每一张的结果打出来（手动跑时）。"""
+    """给没封面的截一帧。返回截成了几张。say 给了就把每一张的结果打出来（手动跑时）。
+
+    【有人在看片就不截】截一张要去网盘拉几 MB，跟看片的人抢同一个账号的速度。"""
+    if someone_playing(key):
+        if say:
+            say("有人在看片 —— 截封面先让路，等没人看了再截（每小时那一轮会接着来）。")
+        return 0
     day = _cover_day()
     room = min(limit, COVER_DAY_MAX - int(day.get("n") or 0))
     if room <= 0:
@@ -3890,6 +3914,10 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
     made = dict(ms_state().get("cover_made") or {})
     done, logs = 0, []
     for uid, iid, name, path, secs in todo:
+        if someone_playing(key, cache_s=30):
+            if say:
+                say("有人开始看片了 —— 剩下的先不截，让路。")
+            break
         # 【两条路，前一条截不到就换后一条】转码流的 m3u8 最省（一个分片），可截帧要把
         # 那个分片真拉下来，有的盘这一步拦；那就退回原片的 /d/。
         routes = []
@@ -12870,6 +12898,16 @@ def heal_media_info(d, key, budget=None, items=None):
     #     没时长）把补好的盖掉了。你再点开，这条规则说"补上又掉了"不给探 —— 挡住的
     #     恰恰是你正在看的那一集。这条路自己按"一次按播放、一次探"管住了，用不着它
     # 整队那边它照旧有用：一批条目每轮 ✔、每轮掉，就是每轮重买一遍。
+    # 【有人在看片，补积压让路】仓库主人：遮天 181 刚开播只有 99 KB/s，过一会就好了 ——
+    # 那一分钟后台正在同时补龙虎门、变形金刚、大话西游……好几路一起去网盘拉原片开头。
+    # 同一个网盘账号，服务器这边拉得越凶，手机那一路越慢。补积压不急，等没人看了再补；
+    # 刚点开的那一集（开播前 / 看片后）照补不误 —— 那是人在等的
+    global _HEAL_YIELD
+    _HEAL_YIELD = (_how_try == "整队")
+    if _how_try == "整队" and someone_playing(key):
+        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（整队）让路："
+                  f"有人在看片，等没人看了再补"])
+        return
     if _how_try == "整队":
         _now_s = time.time()
         _loose = [x for x in allpend if heal_unstuck(x[1], _now_s)]
@@ -13547,6 +13585,9 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
     def run(_it):
         if stop.is_set():
             return None               # 已经拉停了，排队没轮到的直接作废
+        if _HEAL_YIELD and someone_playing(key, cache_s=30):
+            stop.set()                # 补到一半有人开播了：剩下的这一轮不补了，让路
+            return None
         return (_it,) + _heal_one(d, key, _it, base, token)
 
     nw = heal_workers()
