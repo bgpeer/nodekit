@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.177"
+SCRIPT_VERSION = "1.5.178"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -104,6 +104,10 @@ HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
 HEAL_DAEMON_UNIT = "/etc/systemd/system/media-stack-heald.service"
 # 它的闹钟：nginx 日志一被写就把上面那个服务叫起来（它睡着的时候机器上没有这个进程）
 HEAL_DAEMON_PATH = "/etc/systemd/system/media-stack-heald.path"
+# 「先补时长再开播」：nginx 在放行 PlaybackInfo 之前先问它一声（见 do_heal_gate）
+HEAL_GATE_SOCK = "/run/media-stack-healgate.sock"
+HEAL_GATE_SOCKET_UNIT = "/etc/systemd/system/media-stack-healgate.socket"
+HEAL_GATE_UNIT = "/etc/systemd/system/media-stack-healgate.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
 # 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
 HLS_BASE_TTL = 300
@@ -1297,6 +1301,10 @@ def gen_nginx_site(cfg):
         hls_on = (hls_ready() if _w is None else bool(_w)) and hls_port() > 0
     except Exception:
         hls_on = False
+    try:
+        gate_on = heal_gate_ready()
+    except Exception:
+        gate_on = False
     spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
     if spoof:
         # 两级判断，两个都成立才换：
@@ -1363,6 +1371,38 @@ def gen_nginx_site(cfg):
         proxy_redirect off;
     }}
 """ if sub == "emby" and hls_on else "")
+        # 【先补时长再开播】按下播放的第一个请求（PlaybackInfo）先问一声 do_heal_gate：
+        # 这一集缺时长就当场补好再放行，Emby 从这一场一开始就有时长、自己记得住进度。
+        # 问不到 / 超时（5xx）→ error_page 原样放行：这一段只会让开播晚几秒，绝不挡播放。
+        # auth_request 先于读请求体，所以放行时 POST 的 body 原封不动交给后面。
+        _px = f"""        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect  off;
+        proxy_buffering off;"""
+        gate = (f"""
+    # 先补时长再开播（见 media-stack.py 的 do_heal_gate）
+    location ~* ^/(?:emby/)?items/[0-9]+/playbackinfo$ {{
+        auth_request /__ms_heal_gate;
+        error_page 500 502 503 504 = @ms_pbi;
+{_px}
+    }}
+    location @ms_pbi {{
+{_px}
+    }}
+    location = /__ms_heal_gate {{
+        internal;
+        proxy_pass http://unix:{HEAL_GATE_SOCK}:/gate;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout {HEAL_GATE_WAIT_S + 10}s;
+    }}
+""" if sub == "emby" and gate_on else "")
         out.append(f"""
 server {{
 {listen_line}
@@ -1378,7 +1418,7 @@ server {{
     access_log {NGX_ACCESS_LOG};
 
     client_max_body_size 0;
-{a}{hls}
+{a}{hls}{gate}
     location / {{
         proxy_pass http://127.0.0.1:{port};
         proxy_http_version 1.1;
@@ -2317,6 +2357,242 @@ def do_heal_daemon():
                                              stderr=subprocess.DEVNULL))
             except OSError:
                 pass
+
+
+# ============================================================================ 先补再播
+# 开播前最多替它补多久（秒）。补一集实测 4~10 秒；等不到就放行，照老路播 + 事后抢救
+HEAL_GATE_WAIT_S = 15
+# 多久没人开播就退出（由 systemd 的 socket 再叫醒）
+HEAL_GATE_IDLE_S = 1800
+
+
+def heal_gate_nginx_ok():
+    """这台机器的 nginx 带不带 auth_request 模块。不带就不生成那段 —— 否则 nginx -t
+    不过，整份站点配置都会被回滚。"""
+    try:
+        r = subprocess.run(["nginx", "-V"], capture_output=True, text=True, timeout=10)
+        return "http_auth_request_module" in (r.stdout + r.stderr)
+    except Exception:
+        return False
+
+
+def heal_gate_ready():
+    """nginx 那段该不该生成：socket 装上了、nginx 也认 auth_request。"""
+    return os.path.exists(HEAL_GATE_SOCKET_UNIT) and heal_gate_nginx_ok()
+
+
+def heal_gate_active():
+    """「先补再播」的 socket 在不在 → True / False；没有 systemctl → None。"""
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        r = subprocess.run(["systemctl", "is-active", os.path.basename(HEAL_GATE_SOCKET_UNIT)],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return None
+
+
+def remove_heal_gate():
+    """停掉并删掉「先补再播」（socket 和服务）。卸载时走这里。"""
+    for u in (HEAL_GATE_SOCKET_UNIT, HEAL_GATE_UNIT):
+        if not os.path.exists(u):
+            continue
+        try:
+            sh(f"systemctl disable --now {os.path.basename(u)}", timeout=60)
+            os.remove(u)
+        except Exception:
+            pass
+    try:
+        sh("systemctl daemon-reload", timeout=60)
+    except Exception:
+        pass
+
+
+def sync_heal_gate(apply_site=False, quiet=True):
+    """装上「先补再播」：一个 systemd socket（nginx 连它）+ 按需拉起的服务。
+
+    【为什么要有】仓库主人：「改成先补时长再开播」。以前是点开之后才补：Emby 按
+    "这一集没有时长"开了这一场，停的时候就判成看完、清掉续播点，脚本只能事后改回来 ——
+    可客户端一退出就刷新详情页，永远比事后改回来快一步，于是看见「已看完」、旧页面上
+    点播放还播不起来。现在客户端问 PlaybackInfo（按下播放的第一个请求）时，nginx 先
+    问这个服务一声：这一集缺时长就当场补（最多等 HEAL_GATE_WAIT_S 秒），补好了才放行。
+    Emby 从这一场一开始就有时长，进度它自己就记得住。
+    【用 socket 而不是常驻端口】systemd 替它守着那个 unix socket：服务没起来、挂了、
+    睡着了，连接都不会被拒 —— systemd 收下连接、把服务拉起来再交给它。不占端口。
+    【坏了也不挡播放】nginx 那边问不到 / 超时（5xx）就原样放行（error_page 那一段）。
+
+    apply_site=True：装上之后顺手重新生成 nginx 站点（安装那条路 nginx 早就写好了）。
+    更新那条路后面本来就会重新生成，传 False，免得 nginx 被写两遍。
+    """
+    if not shutil.which("systemctl"):
+        return False
+    grp = nginx_worker_user() or "www-data"
+    sock_unit = f"""[Unit]
+Description=media-stack heal-before-play gate (socket)
+
+[Socket]
+ListenStream={HEAL_GATE_SOCK}
+SocketUser=root
+SocketGroup={grp}
+SocketMode=0660
+Accept=no
+
+[Install]
+WantedBy=sockets.target
+"""
+    svc_unit = f"""[Unit]
+Description=media-stack heal-before-play gate
+Requires={os.path.basename(HEAL_GATE_SOCKET_UNIT)}
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {os.path.realpath(__file__)} heal-gate
+Restart=on-failure
+RestartSec=3
+KillMode=process
+"""
+    try:
+        changed = False
+        for u, want in ((HEAL_GATE_SOCKET_UNIT, sock_unit), (HEAL_GATE_UNIT, svc_unit)):
+            try:
+                with open(u, encoding="utf-8") as f:
+                    cur = f.read()
+            except OSError:
+                cur = ""
+            if cur != want:
+                with open(u, "w", encoding="utf-8") as f:
+                    f.write(want)
+                changed = True
+        if changed:
+            sh("systemctl daemon-reload", timeout=60)
+        sh(f"systemctl enable --now {os.path.basename(HEAL_GATE_SOCKET_UNIT)}", timeout=60)
+        # 醒着的那个换成新代码：停掉就行，下一次开播 socket 用新代码把它叫起来
+        sh(f"systemctl stop {os.path.basename(HEAL_GATE_UNIT)}", timeout=60)
+        if apply_site and changed and os.path.exists(NGX_SITE):
+            cfg2 = rebuild_cfg_from_disk(ms_install_dir())
+            if cfg2.get("has_domain") and os.path.exists(cfg2.get("crt") or ""):
+                apply_nginx_site(cfg2)
+        if not quiet:
+            info("已装「先补再播」（新片第一次点开先补好时长再开播）")
+        return True
+    except Exception as e:
+        warn(f"「先补再播」没装上（照旧点开之后再补）：{_short_err(e)}")
+        return False
+
+
+def do_heal_gate():
+    """systemd socket 拉起来的：nginx 放行 PlaybackInfo 之前来问一声。
+
+    问的是【这一集还缺不缺时长】：不缺 → 马上回 204 放行（一次本机 Emby 查询）；
+    缺 → 当场补，最多等 HEAL_GATE_WAIT_S 秒，然后不管补没补上都回 204 放行 ——
+    这个服务【只会让开播晚几秒，绝不会挡住开播】。
+    同一集同时来好几个 PlaybackInfo（有的客户端一开播问两三次）：只补一次，都等这一次。
+    HEAL_GATE_IDLE_S 没人开播就退出，socket 还在 systemd 手里，下一次开播再被叫起来。
+    """
+    import http.server
+    import socket
+    import socketserver
+    import threading
+    sys.stdout = open(os.devnull, "w")        # 补时长那一路会往屏上打字，这里没人看
+    os.environ["MS_HEAL_GATE"] = "1"
+    d = ms_install_dir()
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    busy, lock = {}, threading.Lock()
+    last = [time.monotonic()]
+
+    def _mark(iid, on):
+        # 【告诉 heal-tick：这一集门这边在补】门等满 15 秒放行之后，这一集的 PlaybackInfo
+        # 才进 nginx 日志，常驻服务马上扣 heal-tick 的扳机 —— 不说一声，两边会同时补同一集
+        try:
+            with lock:
+                cur = {k: v for k, v in (ms_state().get("heal_gate_busy") or {}).items()
+                       if isinstance(v, (int, float)) and time.time() - v < 600}
+                if on:
+                    cur[str(iid)] = int(time.time())
+                else:
+                    cur.pop(str(iid), None)
+                save_ms_state(heal_gate_busy=cur)
+        except Exception:
+            pass
+
+    def _bg(item, ev):
+        _mark(item[1], True)
+        try:
+            heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=[item])
+        except Exception:
+            pass
+        finally:
+            _mark(item[1], False)
+            ev.set()
+            with lock:
+                busy.pop(str(item[1]), None)
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def _go(self):
+            last[0] = time.monotonic()
+            try:
+                m = re.search(r"/items/(\d+)/playbackinfo",
+                              self.headers.get("X-Original-URI") or "", re.I)
+                if m and key:
+                    iid = m.group(1)
+                    with lock:
+                        ev = busy.get(iid)
+                    if ev is None:
+                        need = strm_items_need_heal(key, [iid])
+                        if need:
+                            with lock:
+                                ev = busy.get(iid)
+                                if ev is None:
+                                    ev = threading.Event()
+                                    busy[iid] = ev
+                                    threading.Thread(target=_bg, args=(need[0], ev)).start()
+                    if ev is not None:
+                        ev.wait(HEAL_GATE_WAIT_S)
+            except Exception:
+                pass
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            last[0] = time.monotonic()
+
+        do_GET = do_POST = do_HEAD = _go
+
+        def log_message(self, *a):
+            pass
+
+        def address_string(self):
+            return "-"
+
+    class S(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = False
+
+    if os.environ.get("LISTEN_FDS") == "1":
+        srv = S(HEAL_GATE_SOCK, H, bind_and_activate=False)
+        srv.socket = socket.socket(fileno=3)
+    else:                                  # 手动起（调试）：自己建 socket
+        try:
+            os.remove(HEAL_GATE_SOCK)
+        except OSError:
+            pass
+        srv = S(HEAL_GATE_SOCK, H)
+    srv.timeout = 30
+    me = os.path.realpath(__file__)
+    try:
+        m0 = os.stat(me).st_mtime
+    except OSError:
+        m0 = 0
+    while True:
+        srv.handle_request()
+        idle = time.monotonic() - last[0] > HEAL_GATE_IDLE_S
+        try:
+            moved = os.stat(me).st_mtime != m0
+        except OSError:
+            moved = False
+        with lock:
+            quiet = not busy
+        if (idle or moved) and quiet:
+            return                         # 在补的等补完（非守护线程，退出前会等）
 
 
 def keepalive_state(d):
@@ -3756,6 +4032,11 @@ def do_heal_tick(hot_only=False):
     if _tries.get("date") != _today:
         _tries = {"date": _today, "n": {}}
     _cnt = _tries.get("n") or {}
+    # 【门那边正在补的不碰】见 do_heal_gate 的 _mark：等满放行之后它还在补，同时再补一遍
+    # 就是两边一起改同一个 strm
+    _gb = {k for k, v in (ms_state().get("heal_gate_busy") or {}).items()
+           if isinstance(v, (int, float)) and time.time() - v < 600}
+    hot = [x for x in hot if str(x[1]) not in _gb]
     _waiting = [x for x in hot if str(x[1]) in _cool and str(x[1]) not in _fresh]
     hot = [x for x in hot if str(x[1]) not in _cool or str(x[1]) in _fresh]
     _cool = _all_hot
@@ -4078,6 +4359,20 @@ def do_heal_trace(q, play=True):
         elif _on is False:
             _trace_row("⚠", "点了立刻补", "没装上 / 闹钟没开 —— 退回每分钟看一次。"
                        "跑一次「7 更新」会装上")
+        _g = heal_gate_active()
+        _gn = False
+        try:
+            with open(NGX_SITE, encoding="utf-8") as f:
+                _gn = "__ms_heal_gate" in f.read()
+        except OSError:
+            pass
+        if _g and _gn:
+            _trace_row("✔", "先补再播", f"开着：新片第一次点开先补好时长再开播"
+                       f"（最多多等 {HEAL_GATE_WAIT_S} 秒）")
+        elif _g is not None:
+            _trace_row("⚠", "先补再播", ("nginx 不带 auth_request 模块，用不了 —— "
+                       "照旧点开之后再补" if _g and not heal_gate_nginx_ok()
+                       else "没装上 —— 照旧点开之后再补。跑一次「7 更新」会装上"))
     else:
         _trace_row("·", "点播放的信号", "没有 nginx 那份日志，从 MediaWarp 容器日志读")
 
@@ -8292,6 +8587,7 @@ def do_update(from_menu=False):
     install_warm_cron(d)      # 定时预热同上
     install_heal_cron(d)      # 「有人看过片就补时长」的轻量轮，见 do_heal_tick
     sync_heal_daemon()        # 按下播放几秒内就补，见 do_heal_daemon
+    sync_heal_gate()          # 先补时长再开播；nginx 那一段由下面重新生成站点时写上
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
@@ -8393,6 +8689,7 @@ def do_uninstall():
             sh(f"docker rm -f {c}")
     ok("容器已删除")
     remove_heal_daemon()      # 常驻进程：卸完不该还有一个 media-stack 的进程在跑
+    remove_heal_gate()
 
     if os.path.exists(NGX_SITE):
         os.remove(NGX_SITE)
@@ -8644,6 +8941,7 @@ DOMAIN={cfg['domain']}
     install_warm_cron(cfg["install_dir"])
     install_heal_cron(cfg["install_dir"])
     sync_heal_daemon()
+    sync_heal_gate(apply_site=True)   # nginx 上面已经写过了，装上之后补上那一段
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
@@ -11605,6 +11903,8 @@ def heal_how(items):
     """
     if items is None:
         return "整队"
+    if os.environ.get("MS_HEAL_GATE"):
+        return "开播前"
     return "看片后" if os.environ.get("MS_HEAL_TICK") else "点名"
 
 
@@ -19146,6 +19446,9 @@ if __name__ == "__main__":
                 warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
                 print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
                       f"把那一轮停掉。{RST}")
+        elif arg == "heal-gate":          # systemd socket 拉起的：开播前先补时长
+            require_root()
+            do_heal_gate()
         elif arg == "heal-daemon":        # systemd 起的常驻：按下播放就扣 heal-tick 的扳机
             require_root()
             do_heal_daemon()
