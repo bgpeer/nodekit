@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.159"
+SCRIPT_VERSION = "1.5.160"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3291,7 +3291,8 @@ def rescue_progress(key):
                         fixed += 1
                         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
                                     f"只播了一小会儿，Emby 判成看完了（那时还没时长），"
-                                    f"已撤掉「已看完」  {e.get('name') or it.get('Name') or iid}")
+                                    f"已撤掉「已看完」  {e.get('name') or it.get('Name') or iid}"
+                                    f"{_log_tag(iid)}")
                 except Exception:
                     pass
                 continue
@@ -3326,7 +3327,8 @@ def rescue_progress(key):
         e["name"] = e.get("name") or str(it.get("Name") or "")[:40]
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：第一场播放"
                     f"停在 {pos // 600000000} 分 {pos // 10 ** 7 % 60:02d} 秒，Emby 判成看完了"
-                    f"（那时还没时长），已写回续播点  {e.get('name') or iid}")
+                    f"（那时还没时长），已写回续播点  {e.get('name') or iid}"
+                    f"{_log_tag(iid)}")
     save_ms_state(heal_rescue=st)
     heal_log(logs)
     return fixed
@@ -3812,11 +3814,20 @@ def do_heal_trace(q, play=True):
             _trace_row("·", "以前点开过", f"nginx 日志里被请求过 {past[0]} 次，"
                        f"最近一次 {past[1]}")
         else:
-            _trace_row("⚠", "以前点开过", "nginx 日志里一次都没有 —— 你在手机上点的那几次"
-                       "没经过这台机器的 nginx（客户端填的是 IP:端口？）")
-    _mine = [ln for ln in heal_log_tail(HEAL_LOG_KEEP) if str(name)[:40] in ln][-3:]
+            _trace_row("⚠", "以前点开过", "nginx 日志里一次都没有 —— 要么还没点开过这一部，"
+                       "要么点的那几次没经过这台机器的 nginx（客户端填的是 IP:端口？）")
+    _mine, _by_name = heal_log_mine(iid, name, heal_log_tail(HEAL_LOG_KEEP))
+    _mine = _mine[-3:]
     for ln in _mine:
         _trace_row("·", "流水里的它", ln)
+    if _mine and _by_name:
+        try:
+            _same = len(find_strm_items(key, str(name))) > 1
+        except Exception:
+            _same = False
+        if _same:
+            _trace_row("⚠", "同名的分不开", "上面几行有 1.5.160 以前记的，那时只按片名记 ——"
+                       "同名的几部混在一起，不一定是这一部的")
     if not _mine:
         _trace_row("·", "流水里的它", "一条都没有 —— 自动那条路还从没探过它")
 
@@ -3876,8 +3887,8 @@ def do_heal_trace(q, play=True):
             for ln in heal_log_tail(20):
                 if ln[:19] >= t_play and ln not in seen:
                     seen.add(ln)
-                    _trace_row("·", "流水", ln[21:] if len(ln) > 21 else ln)
-                    if str(name)[:40] in ln and "probe" not in ev:
+                    _trace_row("·", "流水", re.sub(r"  #\d+$", "", ln[21:] if len(ln) > 21 else ln))
+                    if heal_log_mine(iid, name, [ln])[0] and "probe" not in ev:
                         probe_line = ln
                         _mark("probe", "探完了")
             if time.monotonic() - last_emby >= 4:
@@ -10857,6 +10868,32 @@ def heal_on_term(how):
         pass                          # 不在主线程之类的，装不上就算了
 
 
+def _log_tag(iid):
+    """流水里每个条目那行末尾的 id 记号。
+
+    【为什么要有】heal-trace 以前按片名去对流水 —— 两部同名的（FC2-xxxx_1 / _2）
+    互相把对方的记录当成自己的：没点过、没探过的那部，也显示"探过两次、清过一次"。
+    id 是 Emby 自己的条目编号，只在这台机器上有意义，不是安装人的信息。
+    """
+    return f"  #{iid}" if iid else ""
+
+
+def heal_log_mine(iid, name, lines):
+    """从流水里挑出这一个条目的行：带 id 记号的按 id 对；老版本留下的不带记号，
+    只能按片名对（返回的第二项告诉调用方用上了片名对，同名的会混在一起）。"""
+    tag = re.compile(r"  #(\d+)$")
+    mine, by_name = [], False
+    for ln in lines:
+        mt = tag.search(ln)
+        if mt:
+            if mt.group(1) == str(iid):
+                mine.append(ln[:mt.start()])
+        elif str(name)[:40] in ln:
+            mine.append(ln)
+            by_name = True
+    return mine, by_name
+
+
 def heal_log_tail(n=40):
     """最近 n 行流水。读不到返回空表 —— 调用方要照实说"读不到"，不许当成"没记录"。"""
     try:
@@ -11698,7 +11735,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                     logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
                                 f"{pad(res, 8)}{pad(_via, 7)}{sec:>4.0f}s  "
                                 f"{(note or '').replace(chr(10), ' ')[:60]}  "
-                                f"{str(name)[:40]}")
+                                f"{str(name)[:40]}{_log_tag(_it[1])}")
                     # 【探完一集就落一行】以前攒到整轮结束才写 —— 一轮被 timeout 砍掉，
                     # 前面探完的那几集也一个字都不剩，翻流水像"根本没跑过"。
                     heal_log(logs[-1:])
@@ -18405,7 +18442,7 @@ if __name__ == "__main__":
                       f"（{HEAL_LOG}，只有 root 读得到）{RST}")
                 print(f"  {DIM}时间　　　　　　　　结局　　路线　　耗时　说明　　片名{RST}")
                 for _ln in _rows:
-                    print(f"  {_ln}")
+                    print(f"  {re.sub(r'  #[0-9]+$', '', _ln)}")   # id 记号是给 heal-trace 对的
                 print(f"  {DIM}路线：m3u8 = 只拉了一份几十 KB 的播放列表；"
                       f"整文件 = 去拉了原片的文件头（几 MB）。{RST}")
         elif arg == "heal-reset":         # 清空「探不出来」的放弃名单，让它们重新排队
