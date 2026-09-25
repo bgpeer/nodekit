@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.180"
+SCRIPT_VERSION = "1.5.181"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1564,6 +1564,7 @@ case "${1:-info}" in
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
+  covers --retry 截失败过的也重新试一遍
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
   heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
@@ -1734,7 +1735,8 @@ case "${1:-info}" in
   covers)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
-    exec python3 "$S" covers ;;
+    shift || true
+    exec python3 "$S" covers "$@" ;;
   heal-log)
     # 【流水里有片名，所以要 root】Python 那边也再拦一道
     S=/etc/bgpeer/media-stack.py
@@ -3712,6 +3714,12 @@ COVER_AT = 1 / 3
 COVER_PER_RUN = 20            # 每小时那一轮最多截几张
 COVER_DAY_MAX = 100           # 一天最多截几张（每张几 MB，别一口气把整库拉一遍）
 COVER_RECHECK_H = 24          # 截帧的那些，多久问一次刮削器找没找到正式封面
+# 【截不成的不许每小时都来一遍】仓库主人：「如果一直没截成会不会造成死循环」。
+# 有每天 COVER_DAY_MAX 那道闸，不会无限转；可一张截不成的片每小时都被重新挑出来，
+# 一天白试 24 次，截不成的多了还会一直占着前面的名额。所以：失败了隔 COVER_RETRY_H
+# 再试；一共 COVER_MAX_TRIES 次都不成就不再碰（media-stack covers --retry 清掉重来）
+COVER_RETRY_H = 24
+COVER_MAX_TRIES = 3
 EMBY_FFMPEG_PATHS = ("/bin/ffmpeg", "/opt/emby-server/bin/ffmpeg", "/app/emby/bin/ffmpeg")
 
 
@@ -3803,7 +3811,20 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         if say:
             say(f"今天已经截了 {day.get('n')} 张（一天最多 {COVER_DAY_MAX}），明天接着来。")
         return 0
-    todo = cover_candidates(key)[:room]
+    fails = dict(ms_state().get("cover_fail") or {})
+    _now = time.time()
+
+    def _skip(iid):
+        f = fails.get(iid) or {}
+        return (int(f.get("n") or 0) >= COVER_MAX_TRIES
+                or _now - float(f.get("t") or 0) < COVER_RETRY_H * 3600)
+
+    allc = cover_candidates(key)
+    todo = [x for x in allc if not _skip(x[1])][:room]
+    _gave = sum(1 for x in allc if int((fails.get(x[1]) or {}).get("n") or 0) >= COVER_MAX_TRIES)
+    if say and _gave:
+        say(f"· {_gave} 部截了 {COVER_MAX_TRIES} 次都没成，不再试"
+            f"（想重来：media-stack covers --retry）")
     if not todo:
         if say:
             say("没有要补的：strm 库里的片都有封面了。")
@@ -3844,15 +3865,20 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         if ok_:
             done += 1
             made[iid] = int(time.time())
+            fails.pop(iid, None)
+        else:
+            _f = fails.get(iid) or {}
+            fails[iid] = {"n": int(_f.get("n") or 0) + 1, "t": int(time.time())}
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
                     + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
                        if ok_ else "没截成（" + ("拿不到地址" if not url else why if why else
                                                  "截不到画面" if not jpg else "Emby 没收下")
-                       + "），下一轮再试")
+                       + (f"），{COVER_RETRY_H} 小时后再试" if fails[iid]["n"] < COVER_MAX_TRIES
+                          else f"），{COVER_MAX_TRIES} 次都没成，不再试"))
                     + f"  {str(name)[:40]}{_log_tag(iid)}")
         if say:
             say(("✔ " if ok_ else "✖ ") + logs[-1].split("---- 封面：", 1)[1])
-    save_ms_state(cover_made=made, cover_day=day)
+    save_ms_state(cover_made=made, cover_day=day, cover_fail=fails)
     heal_log(logs)
     return done
 
@@ -3897,8 +3923,9 @@ def cover_prefer_scrape(key, limit=COVER_PER_RUN):
     return n
 
 
-def do_covers():
-    """media-stack covers：现在就给没封面的截一帧（平时每小时那一轮自动补一批）。"""
+def do_covers(retry=False):
+    """media-stack covers [--retry]：现在就给没封面的截一帧（平时每小时那一轮自动补一批）。
+    --retry：把截失败的记录清掉，全部重新给一次机会。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn("还没安装。")
@@ -3907,6 +3934,9 @@ def do_covers():
     if not key:
         warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
         return
+    if retry:
+        save_ms_state(cover_fail={})
+        info("截失败的记录清掉了，这一轮全部重新给一次机会。")
     n0 = cover_prefer_scrape(key)
     if n0:
         ok(f"{n0} 张截帧封面换成了刮削找到的正式封面。")
@@ -19650,7 +19680,7 @@ if __name__ == "__main__":
                 _timed("每日对齐", do_sync)
         elif arg == "covers":             # 没刮到封面的：截一帧当封面
             require_root()
-            do_covers()
+            do_covers(retry="--retry" in sys.argv[2:])
         elif arg == "warm":               # cron 调的直链预热
             require_root()
             if take_task_lock("warm"):
