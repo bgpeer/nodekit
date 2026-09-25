@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.161"
+SCRIPT_VERSION = "1.5.162"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3827,8 +3827,11 @@ def do_heal_trace(q, play=True):
         else:
             _trace_row("⚠", "以前点开过", "nginx 日志里一次都没有 —— 要么还没点开过这一部，"
                        "要么点的那几次没经过这台机器的 nginx（客户端填的是 IP:端口？）")
-    _mine, _by_name = heal_log_mine(iid, name, heal_log_tail(HEAL_LOG_KEEP))
+    _mine, _ = heal_log_mine(iid, name, heal_log_tail(HEAL_LOG_KEEP))
     _mine = _mine[-3:]
+    # 【只看显示出来的那几行】整份流水里有老行不算数 —— 显示的三行都带 id 记号的话，
+    # 它们就一定是这一部的
+    _by_name = bool(_mine) and heal_log_mine(iid, name, _mine_raw(iid, name))[1]
     for ln in _mine:
         _trace_row("·", "流水里的它", ln)
     if _mine and _by_name:
@@ -3838,7 +3841,7 @@ def do_heal_trace(q, play=True):
             _same = False
         if _same:
             _trace_row("⚠", "同名的分不开", "上面几行有 1.5.160 以前记的，那时只按片名记 ——"
-                       "同名的几部混在一起，不一定是这一部的")
+                       " 同名的几部混在一起，不一定是这一部的")
     if not _mine:
         _trace_row("·", "流水里的它", "一条都没有 —— 自动那条路还从没探过它")
 
@@ -10905,6 +10908,12 @@ def heal_log_mine(iid, name, lines):
     return mine, by_name
 
 
+def _mine_raw(iid, name, keep=3):
+    """heal_log_mine 挑中的最后 keep 行，原样（带记号）返回 —— 用来判断它们是不是老行。"""
+    rows = [ln for ln in heal_log_tail(HEAL_LOG_KEEP) if heal_log_mine(iid, name, [ln])[0]]
+    return rows[-keep:]
+
+
 def heal_log_tail(n=40):
     """最近 n 行流水。读不到返回空表 —— 调用方要照实说"读不到"，不许当成"没记录"。"""
     try:
@@ -11499,8 +11508,13 @@ def _clear_half_info(key, uid, iid):
         return False, False
     _CLEAR_WHY.pop(str(iid), None)
     try:
+        # 【图那一项写 ValidationOnly，不能写 None】Emby 的 ImageRefreshMode 只有
+        # Default / ValidationOnly / FullRefresh 三个值，写 None 直接回 400 —— 真机上
+        # FC2-4954902 连着几次「没清掉」就是这个：请求一次都没被收下。
+        # ValidationOnly 只核对已有的图还在不在，不去下新图。
         _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
-              f"&ImageRefreshMode=None&ReplaceAllMetadata=false&ReplaceAllImages=false",
+              f"&ImageRefreshMode=ValidationOnly"
+              f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
               key, method="POST", timeout=30)
     except urllib.error.HTTPError as e:
         _CLEAR_WHY[str(iid)] = f"刷新被拒 HTTP {e.code}"
@@ -11706,8 +11720,9 @@ def _heal_one(d, key, _it, base, token):
                     f"有轨道没时长，半截信息没清掉"
                     f"（{_CLEAR_WHY.get(str(iid)) or '原因不明'}）；试了 {_rt}")
         # 【探之前是干净的，探完才有轨道没时长】那就不是 Emby 偷懒，是【这个文件的
-        # 文件头里就没有时长】。实测撞上的：FC2-4954902，探之前 0B / 0bps，探完有轨道、
-        # 时长 0。分段式 mp4、ts 这类要把整个文件读完才知道多长，Emby 只读文件头。
+        # 文件头里就没有时长】。分段式 mp4、ts 这类要把整个文件读完才知道多长，
+        # Emby 只读文件头。（FC2-4954902 起初被当成这一种，后来查明不是：播放器读得出
+        # 29:04，是清半截那一刷一直被 Emby 400 拒掉 —— 见 _clear_half_info。）
         # 以前这一种也说成"Emby 拿着半截信息没重新探"—— 叫人往错的方向查。
         # 这种只有 m3u8 那条路救得了（播放列表里每一段都带秒数）：网盘转好码之后
         # 再点开，或者整队那一轮轮到它，就会走 m3u8。
