@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.171"
+SCRIPT_VERSION = "1.5.172"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2219,8 +2219,11 @@ HEAL_DAEMON_POLL = 1.0        # 多久看一眼 nginx 日志（秒）
 HEAL_DAEMON_RESPAWN = 3.0     # 按下播放还没被读走时，多久再扣一次扳机（秒）
 # 【自己睡觉】多久没见到有人按下播放就退出（仓库主人要的半小时）。退出后由闹钟叫醒
 HEAL_DAEMON_IDLE_S = 1800
-# 被叫醒了、却一次按下播放都没见到（只是有人开着 Emby 翻目录）：这么久就回去睡
-HEAL_DAEMON_WAKE_S = 120
+# 被叫醒了、却一次按下播放都没见到（只是有人开着 Emby 翻目录）：这么久就回去睡。
+# 【10 分钟，不是 2 分钟】仓库主人：「找片都不止 2 分钟」。睡着了其实也不会漏 ——
+# 按下播放那一下会写日志、闹钟当场把它叫醒 —— 可翻目录时一会儿睡一会儿醒，
+# 每醒一次都要重新起一个进程，不如让它多醒一会儿。
+HEAL_DAEMON_WAKE_S = 600
 
 
 def do_heal_daemon():
