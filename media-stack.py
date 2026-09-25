@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.179"
+SCRIPT_VERSION = "1.5.180"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3703,7 +3703,11 @@ def do_warm():
 # · 刮削后来找到了 → 换成刮削的（cover_prefer_scrape）：截帧只是占位
 # · 用 Emby 容器里它自己的 ffmpeg，-ss 先跳到三分之一再读 —— 只拉那一小段，几 MB；
 #   转码流的盘有 m3u8 就走 m3u8（一个分片，更省）
-# · 要时长才知道三分之一在哪：还没补上时长的先跳过，补上了下一轮再来
+# · 要时长才知道三分之一在哪。Emby 里已经有时长的直接用；还没有的（没点开过的新片
+#   多半这样 —— 仓库主人：「刚开始都没有时长那让服务器怎么知道这个视频的时长」），
+#   截之前先用 Emby 容器里的 ffprobe 读一下文件头的索引拿到总长（m3u8 读播放列表，
+#   几十 KB；原片读开头几 MB），再去三分之一处截。只拿来算截图位置，不写进 Emby
+#   的媒体信息 —— 那是补时长那条路的事
 COVER_AT = 1 / 3
 COVER_PER_RUN = 20            # 每小时那一轮最多截几张
 COVER_DAY_MAX = 100           # 一天最多截几张（每张几 MB，别一口气把整库拉一遍）
@@ -3712,7 +3716,9 @@ EMBY_FFMPEG_PATHS = ("/bin/ffmpeg", "/opt/emby-server/bin/ffmpeg", "/app/emby/bi
 
 
 def cover_candidates(key):
-    """strm 库里【没有封面、但已经有时长】的条目 → [(uid, id, 名字, 路径, 秒数)]。"""
+    """strm 库里【没有封面】的条目 → [(uid, id, 名字, 路径, 秒数或 None)]。
+
+    有时长的排前面（截一次就成，便宜）；没时长的排后面，截之前要先读一下时长。"""
     out = []
     try:
         libs = _emby("/Library/VirtualFolders", key)
@@ -3742,9 +3748,9 @@ def cover_candidates(key):
             srcs = it.get("MediaSources") or []
             ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
                      else (it.get("RunTimeTicks") or 0))
-            if ticks:
-                out.append((uid, str(it.get("Id")), it.get("Name") or "?", path, ticks / 1e7))
-    return out
+            out.append((uid, str(it.get("Id")), it.get("Name") or "?", path,
+                        ticks / 1e7 if ticks else None))
+    return sorted(out, key=lambda x: x[4] is None)
 
 
 def cover_frame(url, sec, timeout=120):
@@ -3800,7 +3806,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
     todo = cover_candidates(key)[:room]
     if not todo:
         if say:
-            say("没有要补的：有时长的片都有封面了（还没补上时长的，补上之后再截）。")
+            say("没有要补的：strm 库里的片都有封面了。")
         return 0
     token = _ol_token(d)
     try:
@@ -3810,7 +3816,6 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
     made = dict(ms_state().get("cover_made") or {})
     done, logs = 0, []
     for uid, iid, name, path, secs in todo:
-        at = secs * COVER_AT
         url = ""
         try:
             url = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
@@ -3826,7 +3831,14 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
                        if tp else "")
             except Exception:
                 url = ""
-        jpg = cover_frame(url, at) if url else b""
+        why = ""
+        if url and not secs:
+            # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
+            secs, _n, _e = emby_ffprobe(url, BROWSER_UA)
+            if not secs:
+                why = "读不出时长"
+        at = (secs or 0) * COVER_AT
+        jpg = cover_frame(url, at) if url and secs else b""
         ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
         day["n"] = int(day.get("n") or 0) + 1
         if ok_:
@@ -3834,7 +3846,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             made[iid] = int(time.time())
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
                     + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
-                       if ok_ else "没截成（" + ("拿不到地址" if not url else
+                       if ok_ else "没截成（" + ("拿不到地址" if not url else why if why else
                                                  "截不到画面" if not jpg else "Emby 没收下")
                        + "），下一轮再试")
                     + f"  {str(name)[:40]}{_log_tag(iid)}")
