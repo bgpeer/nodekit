@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.178"
+SCRIPT_VERSION = "1.5.179"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1563,6 +1563,7 @@ case "${1:-info}" in
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
+  covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
   heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
@@ -1730,6 +1731,10 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" heal-trace "$@" ;;
+  covers)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" covers ;;
   heal-log)
     # 【流水里有片名，所以要 root】Python 那边也再拦一道
     S=/etc/bgpeer/media-stack.py
@@ -3677,6 +3682,11 @@ def do_warm():
         return
     align_library(d, key)
     warm_links(d, key)
+    try:
+        cover_prefer_scrape(key)      # 先让刮削的顶掉截帧的
+        fill_covers(d, key)           # 再给还没封面的截一帧
+    except Exception:
+        pass                          # 封面是锦上添花，别连累预热那一行的时间戳
     # 【跑完必须留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"。
     # 写在最后：中途炸了就不该留下"跑过了"的痕迹。
     try:
@@ -3684,6 +3694,214 @@ def do_warm():
             json.dump({"ts": int(time.time())}, f)
     except OSError:
         pass
+
+
+# ============================================================================ 截帧封面
+# 【没刮到封面的，截一帧当封面】仓库主人：「这些没有刮削出来的可不可以让服务器到视频
+# 总时长里面三分之一的位置取一帧图片，自动补上封面，如果刮削出来了刮削优先占有第一位」。
+# · 只给【没有封面】的补：刮到了的一张都不碰
+# · 刮削后来找到了 → 换成刮削的（cover_prefer_scrape）：截帧只是占位
+# · 用 Emby 容器里它自己的 ffmpeg，-ss 先跳到三分之一再读 —— 只拉那一小段，几 MB；
+#   转码流的盘有 m3u8 就走 m3u8（一个分片，更省）
+# · 要时长才知道三分之一在哪：还没补上时长的先跳过，补上了下一轮再来
+COVER_AT = 1 / 3
+COVER_PER_RUN = 20            # 每小时那一轮最多截几张
+COVER_DAY_MAX = 100           # 一天最多截几张（每张几 MB，别一口气把整库拉一遍）
+COVER_RECHECK_H = 24          # 截帧的那些，多久问一次刮削器找没找到正式封面
+EMBY_FFMPEG_PATHS = ("/bin/ffmpeg", "/opt/emby-server/bin/ffmpeg", "/app/emby/bin/ffmpeg")
+
+
+def cover_candidates(key):
+    """strm 库里【没有封面、但已经有时长】的条目 → [(uid, id, 名字, 路径, 秒数)]。"""
+    out = []
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return out
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return out
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not is_strm_lib(lb):
+            continue
+        try:
+            got = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                        f"&IncludeItemTypes=Movie,Episode,Video"
+                        f"&Fields=Path,MediaSources&SortBy=DateCreated&SortOrder=Descending",
+                        key).get("Items") or []
+        except Exception:
+            continue
+        for it in got:
+            if (it.get("ImageTags") or {}).get("Primary"):
+                continue                  # 有封面了（刮到的、或者之前截过的）
+            path = str(it.get("Path") or "")
+            if not path.startswith(STRM_PATH):
+                continue
+            srcs = it.get("MediaSources") or []
+            ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+                     else (it.get("RunTimeTicks") or 0))
+            if ticks:
+                out.append((uid, str(it.get("Id")), it.get("Name") or "?", path, ticks / 1e7))
+    return out
+
+
+def cover_frame(url, sec, timeout=120):
+    """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → JPEG 字节，截不到返回 b""。
+
+    -ss 放在 -i 前面：先按索引跳过去再读，只拉那一小段。UA 用浏览器那张脸 ——
+    实测 FC2-4932682 那个盘，ffmpeg 自己的 UA（Lavf）读出 I/O error，浏览器 UA 读得出。
+    """
+    args = ["-hide_banner", "-loglevel", "error", "-user_agent", BROWSER_UA,
+            "-ss", f"{max(0.0, sec):.1f}", "-i", url, "-frames:v", "1",
+            "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", "-f", "mjpeg", "pipe:1"]
+    for fp in EMBY_FFMPEG_PATHS:
+        try:
+            r = subprocess.run(["docker", "exec", "emby", fp] + args,
+                               capture_output=True, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            return b""
+        if r.returncode in (126, 127):
+            continue
+        out = r.stdout or b""
+        return out if out[:2] == b"\xff\xd8" and len(out) > 2000 else b""
+    return b""
+
+
+def emby_set_image(key, iid, jpg, typ="Primary"):
+    """把一张 JPEG 设成条目的图（Emby 要的是 base64 的请求体）。成功返回 True。"""
+    import base64 as _b64
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:8096/Items/{iid}/Images/{typ}?api_key={key}",
+            data=_b64.b64encode(jpg), method="POST",
+            headers={"Content-Type": "image/jpeg"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return 200 <= r.status < 300
+    except Exception:
+        return False
+
+
+def _cover_day():
+    today = time.strftime("%Y-%m-%d")
+    st = ms_state().get("cover_day") or {}
+    return st if st.get("date") == today else {"date": today, "n": 0}
+
+
+def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
+    """给没封面的截一帧。返回截成了几张。say 给了就把每一张的结果打出来（手动跑时）。"""
+    day = _cover_day()
+    room = min(limit, COVER_DAY_MAX - int(day.get("n") or 0))
+    if room <= 0:
+        if say:
+            say(f"今天已经截了 {day.get('n')} 张（一天最多 {COVER_DAY_MAX}），明天接着来。")
+        return 0
+    todo = cover_candidates(key)[:room]
+    if not todo:
+        if say:
+            say("没有要补的：有时长的片都有封面了（还没补上时长的，补上之后再截）。")
+        return 0
+    token = _ol_token(d)
+    try:
+        base = openlist_public_url(rebuild_cfg_from_disk(d))
+    except Exception:
+        base = ""
+    made = dict(ms_state().get("cover_made") or {})
+    done, logs = 0, []
+    for uid, iid, name, path, secs in todo:
+        at = secs * COVER_AT
+        url = ""
+        try:
+            url = "" if os.environ.get("MS_HEAL_NO_M3U8") else hls_probe_url(iid, key)
+        except Exception:
+            url = ""
+        if not url and token and base:
+            try:
+                with open(_strm_host_path(d, path), encoding="utf-8") as f:
+                    tp = strm_target_path(f.read())
+                sign = ((_ol_api("/api/fs/get", {"path": tp, "password": ""}, token,
+                                 timeout=60).get("data") or {}).get("sign", "")) if tp else ""
+                url = (base + "/d" + urllib.parse.quote(tp) + (f"?sign={sign}" if sign else "")
+                       if tp else "")
+            except Exception:
+                url = ""
+        jpg = cover_frame(url, at) if url else b""
+        ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
+        day["n"] = int(day.get("n") or 0) + 1
+        if ok_:
+            done += 1
+            made[iid] = int(time.time())
+        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
+                    + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
+                       if ok_ else "没截成（" + ("拿不到地址" if not url else
+                                                 "截不到画面" if not jpg else "Emby 没收下")
+                       + "），下一轮再试")
+                    + f"  {str(name)[:40]}{_log_tag(iid)}")
+        if say:
+            say(("✔ " if ok_ else "✖ ") + logs[-1].split("---- 封面：", 1)[1])
+    save_ms_state(cover_made=made, cover_day=day)
+    heal_log(logs)
+    return done
+
+
+def cover_prefer_scrape(key, limit=COVER_PER_RUN):
+    """截帧当的封面只是占位：刮削器后来找到正式封面了，就换成刮削的。返回换了几张。"""
+    made = dict(ms_state().get("cover_made") or {})
+    if not made:
+        return 0
+    seen = dict(ms_state().get("cover_checked") or {})
+    now, n, logs = int(time.time()), 0, []
+    for iid in list(made)[:200]:
+        if n >= limit:
+            break
+        if now - int(seen.get(iid) or 0) < COVER_RECHECK_H * 3600:
+            continue
+        seen[iid] = now
+        try:
+            imgs = (_emby(f"/Items/{iid}/RemoteImages?Type=Primary&Limit=1", key,
+                          timeout=60).get("Images") or [])
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                made.pop(iid, None)       # 条目没了
+            continue
+        except Exception:
+            continue
+        u = (imgs[0] or {}).get("Url") if imgs else ""
+        if not u:
+            continue
+        try:
+            _emby(f"/Items/{iid}/RemoteImages/Download?Type=Primary"
+                  f"&ImageUrl={urllib.parse.quote(u, safe='')}", key, method="POST", timeout=120)
+        except Exception:
+            continue
+        made.pop(iid, None)
+        seen.pop(iid, None)
+        n += 1
+        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面：刮削找到了正式封面，"
+                    f"换掉了截帧的那张{_log_tag(iid)}")
+    save_ms_state(cover_made=made, cover_checked=seen)
+    heal_log(logs)
+    return n
+
+
+def do_covers():
+    """media-stack covers：现在就给没封面的截一帧（平时每小时那一轮自动补一批）。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        return
+    n0 = cover_prefer_scrape(key)
+    if n0:
+        ok(f"{n0} 张截帧封面换成了刮削找到的正式封面。")
+    say = lambda t: print(f"  {t}")
+    n = fill_covers(d, key, say=say)
+    info(f"这一轮截成了 {n} 张。每张大约拉几 MB；平时每小时自动补一批，一天最多 "
+         f"{COVER_DAY_MAX} 张。回 Emby 里下拉刷新就能看见。")
 
 
 # ============================================================================ 进度抢救
@@ -19418,6 +19636,9 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("sync"):
                 _timed("每日对齐", do_sync)
+        elif arg == "covers":             # 没刮到封面的：截一帧当封面
+            require_root()
+            do_covers()
         elif arg == "warm":               # cron 调的直链预热
             require_root()
             if take_task_lock("warm"):
