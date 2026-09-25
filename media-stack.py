@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.170"
+SCRIPT_VERSION = "1.5.171"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -102,6 +102,8 @@ HLS_LOC_MARK = "(?:emby/)?videos/"
 HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
 # 常驻盯着 nginx 日志：一有人按下播放，立刻跑一轮 heal-tick（见 do_heal_daemon）
 HEAL_DAEMON_UNIT = "/etc/systemd/system/media-stack-heald.service"
+# 它的闹钟：nginx 日志一被写就把上面那个服务叫起来（它睡着的时候机器上没有这个进程）
+HEAL_DAEMON_PATH = "/etc/systemd/system/media-stack-heald.path"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
 # 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
 HLS_BASE_TTL = 300
@@ -2106,73 +2108,104 @@ WantedBy=multi-user.target
 
 
 def heal_daemon_active():
-    """「点了立刻补」的常驻服务在不在跑 → True / False；没有 systemctl → None。"""
+    """「点了立刻补」现在什么状态 → "awake"（醒着）/ "standby"（睡着、等人按播放）/
+    False（没装或坏了）/ None（没有 systemctl）。"""
     if not shutil.which("systemctl"):
         return None
     try:
-        r = subprocess.run(["systemctl", "is-active", os.path.basename(HEAL_DAEMON_UNIT)],
-                           capture_output=True, text=True, timeout=10)
-        return r.stdout.strip() == "active"
+        def _on(u):
+            r = subprocess.run(["systemctl", "is-active", os.path.basename(u)],
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() == "active"
+        if _on(HEAL_DAEMON_UNIT):
+            return "awake"
+        return "standby" if _on(HEAL_DAEMON_PATH) else False
     except Exception:
         return None
 
 
 def remove_heal_daemon():
-    """停掉并删掉「点了立刻补」的常驻服务。卸载时走这里。"""
-    if not os.path.exists(HEAL_DAEMON_UNIT):
-        return
-    unit = os.path.basename(HEAL_DAEMON_UNIT)
+    """停掉并删掉「点了立刻补」（闹钟和服务两个都删）。卸载时走这里。"""
+    for u in (HEAL_DAEMON_PATH, HEAL_DAEMON_UNIT):
+        if not os.path.exists(u):
+            continue
+        try:
+            sh(f"systemctl disable --now {os.path.basename(u)}", timeout=60)
+            os.remove(u)
+        except Exception:
+            pass
     try:
-        sh(f"systemctl disable --now {unit}", timeout=60)
-        os.remove(HEAL_DAEMON_UNIT)
         sh("systemctl daemon-reload", timeout=60)
     except Exception:
         pass
 
 
 def sync_heal_daemon(quiet=True):
-    """装上（或重启）「点了立刻补」的常驻服务。返回它现在开着没有。
+    """装上「点了立刻补」：一个闹钟（.path）+ 一个按需起的服务。返回装上没有。
 
     【为什么要有】仓库主人：「时长补慢了一点点」。点下播放之后，每分钟那一轮 cron
-    要等 0~60 秒才轮到，探本身只要 10 秒上下 —— 慢的是等。常驻进程一秒看一眼 nginx
+    要等 0~60 秒才轮到，探本身只要 10 秒上下 —— 慢的是等。服务一秒看一眼 nginx
     日志，看见按下播放就马上跑一轮 heal-tick。
+    【没人看片就不占进程】仓库主人：「半个小时没有人播放视频他将自动关掉，当你再次
+    点开播放的时候他又自动唤醒」。闹钟是 systemd 的 .path：内核盯着 nginx 那份日志
+    （inotify，不是轮询），日志一被写就把服务拉起来；服务 HEAL_DAEMON_IDLE_S 没见到
+    按下播放就自己退出。退出之后机器上【没有这个进程】，只剩内核里一个文件监视。
     【它只是个扳机】探什么、探几次、防死循环，全是 heal-tick 自己那一套 —— 这里不另起
-    一套规矩。每分钟的 cron 照旧留着兜底：常驻进程挂了，退回原来的一分钟。
+    一套规矩。每分钟的 cron 照旧留着兜底：闹钟或服务坏了，退回原来的一分钟。
     """
     if not shutil.which("systemctl"):
         if not quiet:
             warn("这台机器没有 systemctl，「点了立刻补」装不了 —— 照旧每分钟看一次。")
         return False
-    unit = os.path.basename(HEAL_DAEMON_UNIT)
-    want = f"""[Unit]
+    svc, pth = os.path.basename(HEAL_DAEMON_UNIT), os.path.basename(HEAL_DAEMON_PATH)
+    # 【KillMode=process】停它（更新时）只停它自己：它扣扳机拉起来的那一轮 heal-tick
+    # 正在探的话接着探完，别被连带砍掉。
+    # 【Restart=on-failure，不是 always】没人看片时它是【正常退出】（退出码 0）去睡觉的，
+    # always 会被 systemd 立刻拉回来 —— 那就又成了一直开着。没有 [Install]：它不开机自启，
+    # 只由闹钟叫醒。
+    want_svc = f"""[Unit]
 Description=media-stack play-start watcher
 After=network.target
 
 [Service]
 Type=simple
 ExecStart={sys.executable} {os.path.realpath(__file__)} heal-daemon
-Restart=always
+Restart=on-failure
 RestartSec=5
 Nice=10
+KillMode=process
+"""
+    want_pth = f"""[Unit]
+Description=media-stack play-start watcher (wakes on media site traffic)
+
+[Path]
+PathModified={NGX_ACCESS_LOG}
+Unit={svc}
 
 [Install]
 WantedBy=multi-user.target
 """
     try:
-        try:
-            with open(HEAL_DAEMON_UNIT, encoding="utf-8") as f:
-                cur = f.read()
-        except OSError:
-            cur = ""
-        if cur != want:
-            with open(HEAL_DAEMON_UNIT, "w", encoding="utf-8") as f:
-                f.write(want)
+        changed = False
+        for u, want in ((HEAL_DAEMON_UNIT, want_svc), (HEAL_DAEMON_PATH, want_pth)):
+            try:
+                with open(u, encoding="utf-8") as f:
+                    cur = f.read()
+            except OSError:
+                cur = ""
+            if cur != want:
+                with open(u, "w", encoding="utf-8") as f:
+                    f.write(want)
+                changed = True
+        if changed:
             sh("systemctl daemon-reload", timeout=60)
-            sh(f"systemctl enable {unit}", timeout=60)
-        # 【每次都重启】脚本刚换过的话，跑着的还是旧代码
-        sh(f"systemctl restart {unit}", timeout=60)
+            # 1.5.170 装的是"开机自启、一直开着"的那种 —— 把那个自启撤掉
+            sh(f"systemctl disable {svc}", timeout=60)
+        sh(f"systemctl enable --now {pth}", timeout=60)
+        # 【醒着的那个换成新代码】停掉就行：下一次有人访问，闹钟用新代码把它叫起来
+        sh(f"systemctl stop {svc}", timeout=60)
         if not quiet:
-            info("已起「点了立刻补」常驻服务（按下播放几秒内就开始补时长）")
+            info("已装「点了立刻补」（按下播放几秒内就补；半小时没人看片自己睡，不占进程）")
         return True
     except Exception as e:
         warn(f"「点了立刻补」没装上（照旧每分钟看一次）：{_short_err(e)}")
@@ -2184,6 +2217,10 @@ WantedBy=multi-user.target
 HEAL_KICK = TRAFFIC_DIR + "/heal-kick"
 HEAL_DAEMON_POLL = 1.0        # 多久看一眼 nginx 日志（秒）
 HEAL_DAEMON_RESPAWN = 3.0     # 按下播放还没被读走时，多久再扣一次扳机（秒）
+# 【自己睡觉】多久没见到有人按下播放就退出（仓库主人要的半小时）。退出后由闹钟叫醒
+HEAL_DAEMON_IDLE_S = 1800
+# 被叫醒了、却一次按下播放都没见到（只是有人开着 Emby 翻目录）：这么久就回去睡
+HEAL_DAEMON_WAKE_S = 120
 
 
 def do_heal_daemon():
@@ -2203,13 +2240,30 @@ def do_heal_daemon():
     except OSError:
         m0 = 0
     off = ino = None
+    # 【从 heal-tick 读到的地方接着看】它被叫醒，正是因为有人刚访问 —— 很可能就是那一下
+    # "按下播放"。从日志末尾开始看就把叫醒它的那一条漏了。heal-tick 还没读走的那一段
+    # 就是"还没处理的"，从那儿看起；对不上（轮转了 / 没记号）才从末尾开始。
+    try:
+        _st0 = os.stat(NGX_ACCESS_LOG)
+        _mk = ms_state().get("heal_ngx") or {}
+        if _mk.get("ino") == _st0.st_ino and 0 <= int(_mk.get("off") or 0) <= _st0.st_size:
+            off, ino = int(_mk["off"]), _st0.st_ino
+    except (OSError, ValueError):
+        pass
     pend, pend_ino = 0, None
     last = 0.0
     kids = []
+    t_wake = time.monotonic()
+    t_play = None                     # 最近一次见到按下播放（这一觉醒来之后）
     click = re.compile(rb"/items/\d+/playbackinfo", re.I)
     while True:
         time.sleep(HEAL_DAEMON_POLL)
         kids = [k for k in kids if k.poll() is None]
+        # 【该睡了】半小时没人按播放（醒来一次都没按过的，2 分钟）；手上的活要先干完
+        _idle = (time.monotonic() - t_play > HEAL_DAEMON_IDLE_S if t_play is not None
+                 else time.monotonic() - t_wake > HEAL_DAEMON_WAKE_S)
+        if _idle and not pend and not kids:
+            return
         try:
             if os.stat(me).st_mtime != m0:
                 return
@@ -2234,6 +2288,7 @@ def do_heal_daemon():
                 continue                          # 半行，下一秒再读
             if click.search(buf[:cut]):
                 pend, pend_ino = off + cut, ino
+                t_play = time.monotonic()
             off += cut
         if not pend:
             continue
@@ -3986,11 +4041,15 @@ def do_heal_trace(q, play=True):
     if _st and _site:
         _trace_row("✔", "点播放的信号", "从 nginx 访问日志读（按字节增量，便宜）")
         _on = heal_daemon_active()
-        if _on:
-            _trace_row("✔", "点了立刻补", "常驻服务开着：按下播放几秒内就开始补")
+        if _on == "awake":
+            _trace_row("✔", "点了立刻补", "醒着：按下播放几秒内就开始补"
+                       f"（{HEAL_DAEMON_IDLE_S // 60} 分钟没人按播放就自己睡）")
+        elif _on == "standby":
+            _trace_row("✔", "点了立刻补", "睡着（不占进程）：有人一访问就被叫醒，"
+                       "按下播放几秒内就开始补")
         elif _on is False:
-            _trace_row("⚠", "点了立刻补", "常驻服务没在跑 —— 退回每分钟看一次。"
-                       "跑一次「7 更新」会装上 / 拉起来")
+            _trace_row("⚠", "点了立刻补", "没装上 / 闹钟没开 —— 退回每分钟看一次。"
+                       "跑一次「7 更新」会装上")
     else:
         _trace_row("·", "点播放的信号", "没有 nginx 那份日志，从 MediaWarp 容器日志读")
 
