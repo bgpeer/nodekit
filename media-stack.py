@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.192"
+SCRIPT_VERSION = "1.5.193"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2569,8 +2569,16 @@ def do_heal_gate():
                               self.headers.get("X-Original-URI") or "", re.I)
                 if m and key:
                     iid = m.group(1)
+                    t_in = time.monotonic()
                     with lock:
                         ev = busy.get(iid)
+                    if ev is None and not _probe_busy_now(iid):
+                        # 【先验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
+                        # 之后一帧不出（遮天 181）。命中缓存又活着的，多花不到两秒
+                        try:
+                            link_stale_fix(iid, key)
+                        except Exception:
+                            pass
                     if ev is None:
                         need = strm_items_need_heal(key, [iid])
                         if need:
@@ -2581,7 +2589,7 @@ def do_heal_gate():
                                     busy[iid] = ev
                                     threading.Thread(target=_bg, args=(need[0], ev)).start()
                     if ev is not None:
-                        ev.wait(HEAL_GATE_WAIT_S)
+                        ev.wait(max(3, HEAL_GATE_WAIT_S - (time.monotonic() - t_in)))
                     else:
                         # 【别人正在探这一集】看片后 / 整队那一轮正把它的 strm 切成 URL 在探 ——
                         # 等它切回来再放行，不然开播就是经服务器转手（见 _probe_busy）
@@ -13124,6 +13132,139 @@ def hls_probe_url(iid, key):
     except Exception:
         return ""
     return loc if ".m3u8" in loc.split("?", 1)[0].lower() else ""
+
+
+# ── 缓存里的直链死了没有（见 link_stale_fix）──────────────────────────────
+# 【真机】遮天 第181集：点开只有一个 302，之后什么都没有 —— MediaWarp 把缓存里
+# 【已经过期】的那条地址 302 给了播放器。docker restart mediawarp 清掉缓存当场就好。
+# 转码流的 m3u8 比原画直链短命，按驱动去猜寿命猜不准，所以改成开播那一刻直接验。
+LINK_CHECK_T      = 4        # 验一次最多等几秒（问 MediaWarp 一次、摸网盘一次）
+LINK_FIX_GAP_S    = 900      # 两次"清缓存换新"至少隔多久 —— 重启清的是所有人的缓存
+LINK_CHECK_SKIP_D = 7        # 换了新的照样验不过 → 这家的验法不可信，这么多天不再验
+LINK_DEAD_CODES   = (401, 403, 404, 410)   # 只认这几个"明确拒了"；超时 / 5xx 不算
+
+
+def stream_location(iid, key, timeout=LINK_CHECK_T):
+    """MediaWarp 这一刻会把这一集 302 到哪儿 → (地址, 花了几秒)。没给 302 / 超时回 ""。
+
+    缓存命中是几毫秒；没命中它要现去网盘换，那就一定是新的 —— 等不及就算了。"""
+    self_touch(iid)
+    t0 = time.monotonic()
+    try:
+        op = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{iid}/stream"
+            f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}",
+            headers={"User-Agent": HTTP_UA})
+        op.open(req, timeout=timeout).close()
+        return "", time.monotonic() - t0
+    except urllib.error.HTTPError as e:
+        return (e.headers.get("Location") or ""), time.monotonic() - t0
+    except Exception:
+        return "", time.monotonic() - t0
+
+
+def _link_code(url, timeout):
+    """摸一下这个地址：两张脸都试（夸克按脸限速，115 认脸）。→ 活着 0 / 明确拒了的码 / 说不准 None。"""
+    last = None
+    for ua in (PLAYER_UA, BROWSER_UA):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua, "Range": "bytes=0-0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                r.read(1)
+            return 0
+        except urllib.error.HTTPError as e:
+            last = e.code if e.code in LINK_DEAD_CODES else None
+            if last is None:
+                return None           # 429 / 5xx：上游在抖，不是死地址
+        except Exception:
+            return None               # 超时：说不准，不下结论
+    return last
+
+
+def link_dead(loc, timeout=LINK_CHECK_T):
+    """这条 302 地址死了没有 → 明确被拒的 HTTP 码，活着 / 说不准都回 0。
+
+    转码流要多看一层：m3u8 本身还在、里面的分片已经过期，播放器照样一帧不出。"""
+    if not loc.startswith(("http://", "https://")):
+        return 0
+    if ".m3u8" not in loc.split("?", 1)[0].lower():
+        return _link_code(loc, timeout) or 0
+    try:
+        req = urllib.request.Request(loc, headers={"User-Agent": PLAYER_UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read(1 << 18).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code if e.code in LINK_DEAD_CODES else 0
+    except Exception:
+        return 0
+    seg = next((ln.strip() for ln in body.splitlines()
+                if ln.strip() and not ln.startswith("#")), "")
+    if not seg:
+        return 0
+    return _link_code(urllib.parse.urljoin(loc, seg), timeout) or 0
+
+
+def _mediawarp_up(wait):
+    """重启之后等 MediaWarp 的端口能接话。"""
+    import socket as _s
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        try:
+            _s.create_connection(("127.0.0.1", MEDIAWARP_PORT), timeout=1).close()
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def link_stale_fix(iid, key, budget=HEAL_GATE_WAIT_S):
+    """开播前验这一集缓存里的直链；死了就清缓存换新。返回做了什么（"" = 没动）。
+
+    【为什么只能整个重启】MediaWarp 没有删单条缓存的口子。代价是别人缓存的直链一起
+    没了 —— 所以两次之间至少隔 LINK_FIX_GAP_S，而且只认网盘【明确拒了】的回答。
+    【换完再验一次】新换的照样被拒，说明是这家网盘不吃我们这种摸法（比如认脸认 IP），
+    不是缓存的错：记下这个域名，LINK_CHECK_SKIP_D 天里不再为它重启。
+    域名只进 root-only 的状态文件，不上屏、不进流水。
+    """
+    t0 = time.monotonic()
+    loc, took = stream_location(iid, key)
+    if not loc or took > 1.5:        # 没命中缓存 = 刚换的新地址，不用验
+        return ""
+    host = urllib.parse.urlsplit(loc).hostname or ""
+    now = time.time()
+    st = ms_state()
+    skip = {h: t for h, t in (st.get("link_check_skip") or {}).items()
+            if isinstance(t, (int, float)) and now - t < LINK_CHECK_SKIP_D * 86400}
+    if host in skip:
+        return ""
+    code = link_dead(loc)
+    if not code:
+        return ""
+    stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    if now - float(st.get("link_fix_at") or 0) < LINK_FIX_GAP_S:
+        heal_log([f"{stamp}  缓存里的直链已失效（HTTP {code}），刚清过一次，这回不重启"
+                  + _log_tag(iid)])
+        return "gap"
+    save_ms_state(link_fix_at=int(now))
+    try:
+        subprocess.run(["docker", "restart", "mediawarp"], capture_output=True, timeout=60)
+    except Exception:
+        return ""
+    _mediawarp_up(max(3, budget - (time.monotonic() - t0)))
+    left = budget - (time.monotonic() - t0)
+    loc2 = ""
+    if left > 2:                      # 顺手把新地址换好，播放器那一下直接命中缓存
+        loc2, _ = stream_location(iid, key, timeout=left)
+    if loc2 and link_dead(loc2):
+        skip[host] = int(now)
+        save_ms_state(link_check_skip=skip)
+        heal_log([f"{stamp}  直链验不过（HTTP {code}），换新的也一样 —— 这家不能这么验，"
+                  f"{LINK_CHECK_SKIP_D} 天内不再为它清缓存" + _log_tag(iid)])
+        return "unreliable"
+    heal_log([f"{stamp}  缓存里的直链已失效（HTTP {code}），已清缓存换新"
+              f"（{time.monotonic() - t0:.0f}秒）" + _log_tag(iid)])
+    return "fixed"
 
 
 # 【探测那一刻 Emby 回了什么】只留在本进程里，给 heal-watch 当场打出来。
