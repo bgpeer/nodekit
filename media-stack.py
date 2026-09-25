@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.196"
+SCRIPT_VERSION = "1.5.197"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1821,6 +1821,12 @@ WARM_EVERY_H   = 1
 WARM_STEP_T    = 45     # 后台跑，等久点没关系 —— 热不成才是白跑
 WARM_BUDGET    = 600    # 整轮封顶（秒）。用满就收工，剩下的交给一小时后那轮
 WARM_RETRY     = 2      # 每部最多试几次。跨境超时多是偶发，隔一轮再试往往就成了
+# 【预热关了】仓库主人：「前 10 预热那个好像也没什么用，一般播放过的人家不会再回去看，
+# 感觉还是取消吧」。确实：「继续观看」里是看了一半的，而看过的片基本不会再点；新片是
+# 点开前那道门（heal-gate）现场换直链，预热那一下并不省。每小时几十次换直链却是实打实地
+# 敲网盘接口（夸克风控严）。所以只留每小时的对齐 / 补时长 / 截封面，不再换直链。
+# 想恢复改成 True 就行，其余逻辑原样留着。
+WARM_ON        = False
 WARM_LIMIT     = 10     # 优先批热几部。「继续观看」里靠前的那几部才是真会被点开的
 # 【优先批之外还要轮全库】「继续观看」+ 最近新加盖不到【看完过的老片】：有播放记录
 # 所以不在「继续观看」，不是新加的所以不在 Latest 里，于是永远是冷的。
@@ -9481,8 +9487,8 @@ def do_update(from_menu=False):
                 [sys.executable, os.path.realpath(__file__), "warm"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
-            print(f"  {DIM}已在后台给「继续观看」+ 最近新加的片子预热线路"
-                  f"（换直链，最多几分钟）—— 不用等它，直接回车就行。{RST}")
+            print(f"  {DIM}已在后台对齐媒体库（续播门槛、补时长、封面）"
+                  f"—— 不用等它，直接回车就行。{RST}")
         except Exception as e:
             warn(f"后台预热没起来（不影响更新）：{_short_err(e)}")
 
@@ -14585,7 +14591,7 @@ def do_strm(only=None):
                     [sys.executable, os.path.realpath(__file__), _sub],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
-            print(f"  {DIM}已在后台预热线路{RST}"
+            print(f"  {DIM}已在后台对齐媒体库{RST}"
                   + (f"{DIM}，并给 {RST}{BOLD}{_nodur}{RST}{DIM} 个条目补时长"
                      f"（每 {HEAL_RETRY_MIN} 分钟一轮，没探到的会自动再试）{RST}"
                      if _nodur else f"{DIM}（时长都齐了）{RST}"))
@@ -16561,9 +16567,7 @@ def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
         # 【MediaWarp 没重启成就别热】它手里是废令牌，这十几部一定【全部】404 ——
         # 白等十分钟、白打一轮网盘接口，末尾还会打出"网盘接口多半在抖"，
         # 把人往完全错的方向带。实测就是这么发生的。
-        print(f"  {DIM}这次不预热了：MediaWarp 还握着旧令牌，现在热必定一部都热不上。{RST}")
-        print(f"  {DIM}按上面那条命令重启完，下一轮（{WARM_EVERY_H} 小时内）会自动补热；"
-              f"想马上热就再进一次这个菜单。{RST}")
+        print(f"  {DIM}MediaWarp 还握着旧令牌，按上面那条命令重启完才能播。{RST}")
     elif key:
         # 【放后台】预热要一部一部跨境换直链，慢的时候整轮要几分钟。通道已经切完、
         # 配置已经落盘，热不热跟这次切换成没成功毫无关系 —— 没道理让人对着它干等。
@@ -16573,8 +16577,8 @@ def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
                 [sys.executable, os.path.realpath(__file__), "warm"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
-            print(f"  {DIM}已在后台给「继续观看」+ 最近新加的片子预热线路"
-                  f"（换直链，最多几分钟）—— 不用等它，直接回车就行。{RST}")
+            print(f"  {DIM}已在后台对齐媒体库（续播门槛、补时长、封面）"
+                  f"—— 不用等它，直接回车就行。{RST}")
         except Exception as e:
             warn(f"后台预热没起来（不影响切换）：{_short_err(e)}")
     else:
@@ -18369,6 +18373,8 @@ def warm_links(d, key, limit=None):
     热的做法和真实播放【完全一样】：走 MediaWarp 的 /Videos/{id}/stream 拿 302，再从【续播点
     那个位置】拉一小段字节 —— 位置对得上才有意义，从头拉反而热错了地方。
     """
+    if not WARM_ON:
+        return 0, 0                   # 预热关了，见 WARM_ON
     try:
         users = _emby("/Users", key)
     except Exception:
@@ -20364,26 +20370,25 @@ def do_healthcheck():
         if not wm:
             # 【装了但从没跑成】和"刚装上还没到点"长得一样，只能说"还没跑过"，
             # 但至少不能再打绿勾 —— 那次三条任务全被锁死时，就是这一行一直绿着
-            _hc("直链预热", "skip",
+            _hc("每小时对齐", "skip",
                 f"已装，还没跑过（每 {WARM_EVERY_H} 小时一次）")
         else:
             wmin = int((time.time() - wm.get("ts", 0)) / 60)
             st3, note3 = _stale_note(wmin, WARM_EVERY_H * 60,
                                      f"{WARM_EVERY_H} 小时")
             when3 = f"{wmin // 60} 小时前" if wmin >= 60 else f"{wmin} 分钟前"
-            _hc("直链预热", st3,
-                f"{when3}热过「继续观看」和新加的片子"
-                f"{DIM}（省掉点播放时的换直链等待）{RST}{note3}")
+            _hc("每小时对齐", st3,
+                f"{when3}跑过"
+                f"{DIM}（新片的续播门槛、补时长、封面）{RST}{note3}")
             if st3 == "bad":
                 todo.append((
-                    f"直链预热该每 {WARM_EVERY_H} 小时跑一次，实际已经 "
-                    f"{wmin // 60} 小时没跑了 —— 新加的片子第一次点开要等换直链，"
-                    f"新建的库也不会自动补时长和续播门槛",
+                    f"每小时对齐该每 {WARM_EVERY_H} 小时跑一次，实际已经 "
+                    f"{wmin // 60} 小时没跑了 —— 新加的片子和新建的库不会自动补时长和续播门槛",
                     "和「链路保活」多半是同一个原因（cron 没在工作）。"
                     "跑一次「7 更新」会重装这三条 cron"))
     else:
-        _hc("直链预热", "warn", "没装 —— 隔一阵没看，第一次点播放要等换直链")
-        todo.append(("直链预热没装，冷启动时第一次播放要等几秒到几十秒",
+        _hc("每小时对齐", "warn", "没装 —— 新片要等每天凌晨那一轮才补时长和续播门槛")
+        todo.append(("每小时对齐没装，新片要等到第二天凌晨才有进度条记忆",
                      "跑一次「7 更新」会自动补上"))
 
     if os.path.exists(SYNC_CRON):
