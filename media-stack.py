@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.165"
+SCRIPT_VERSION = "1.5.166"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3845,14 +3845,29 @@ def do_heal_trace(q, play=True):
             if not _pu:
                 _trace_row("·", "Emby 的 ffprobe", "拿不到地址，读不了")
             else:
+                _got = []
                 for _lab, _ua in (("它自己的 UA", None), ("换成浏览器 UA", BROWSER_UA)):
                     _du, _n, _e = emby_ffprobe(_pu, _ua)
+                    _got.append(bool(_du))
+                    # 【只报真报错】"Unknown cover type" 这类是 ffprobe 的闲话，读得出
+                    # 时长的时候不值得占一行、更不该让人以为出了错
                     _trace_row("✔" if _du else "✖", f"ffprobe（{_lab}）",
                                (f"时长 {_du / 60:.0f} 分钟、{_n} 条轨道" if _du
                                 else f"没时长、{_n} 条轨道")
-                               + (f"；报错：{_e}" if _e else ""))
-                print(f"  {DIM}  → 把这几行发给仓库主人。时长索引在文件末尾（moov 在 mdat 后面）"
-                      f"的 mp4，ffprobe 要多跳一次去读尾巴，这一跳最容易被上游拦。{RST}")
+                               + (f"；报错：{_e}" if _e and not _du else ""))
+                # 【按结果说，不是一句话说到底】真机上 FC2-4954902 两张脸都读得出
+                # 29 分钟 —— 那就不是上游拦，是 Emby 手里那份旧的半截一直没换掉
+                # （1.5.162 之前清半截那一刷全被 400 拒了）。
+                if all(_got):
+                    print(f"  {DIM}  → ffprobe 读得出来，网盘没拦、文件也没毛病：是 Emby 手里"
+                          f"那份旧的半截信息一直没换掉。点名补一次（先清掉再探）："
+                          f"media-stack heal {_hit_stem(key, (uid, iid)) or name}{RST}")
+                elif _got[1] and not _got[0]:
+                    print(f"  {DIM}  → 只有浏览器那张脸读得出：这个盘按 UA 挡人。「4 挂载路径 →"
+                          f" 选盘 → 直链方式」里给它开「伪装成浏览器」{RST}")
+                else:
+                    print(f"  {DIM}  → ffprobe 自己也读不全。时长索引在文件末尾的 mp4 要多跳"
+                          f"一次去读尾巴，这一跳被拦了。把这几行发给仓库主人{RST}")
     _nh = heal_nohead_at(iid)
     if _nh:
         try:
