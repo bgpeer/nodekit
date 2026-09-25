@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.181"
+SCRIPT_VERSION = "1.5.182"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3723,10 +3723,11 @@ COVER_MAX_TRIES = 3
 EMBY_FFMPEG_PATHS = ("/bin/ffmpeg", "/opt/emby-server/bin/ffmpeg", "/app/emby/bin/ffmpeg")
 
 
-def cover_candidates(key):
+def cover_candidates(key, d=None):
     """strm 库里【没有封面】的条目 → [(uid, id, 名字, 路径, 秒数或 None)]。
 
-    有时长的排前面（截一次就成，便宜）；没时长的排后面，截之前要先读一下时长。"""
+    先按网盘在「挂载路径」里的顺序（见 mount_rank）；同一个盘里有时长的排前面（截一次
+    就成，便宜），没时长的排后面（截之前要先读一下时长）；再往下按加入日期新的在前。"""
     out = []
     try:
         libs = _emby("/Library/VirtualFolders", key)
@@ -3758,7 +3759,8 @@ def cover_candidates(key):
                      else (it.get("RunTimeTicks") or 0))
             out.append((uid, str(it.get("Id")), it.get("Name") or "?", path,
                         ticks / 1e7 if ticks else None))
-    return sorted(out, key=lambda x: x[4] is None)
+    rank = mount_rank(d) if d else (lambda _p: 0)
+    return sorted(out, key=lambda x: (rank(x[3]), x[4] is None))
 
 
 def cover_frame(url, sec, timeout=120):
@@ -3819,7 +3821,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         return (int(f.get("n") or 0) >= COVER_MAX_TRIES
                 or _now - float(f.get("t") or 0) < COVER_RETRY_H * 3600)
 
-    allc = cover_candidates(key)
+    allc = cover_candidates(key, d)
     todo = [x for x in allc if not _skip(x[1])][:room]
     _gave = sum(1 for x in allc if int((fails.get(x[1]) or {}).get("n") or 0) >= COVER_MAX_TRIES)
     if say and _gave:
@@ -10268,8 +10270,9 @@ def items_without_duration(key, scope=None):
             # 第四位 =【是不是刚进库的】。补探测靠它让新片插队 ——
             # 刚加进来的片子正是此刻最想看的那一部，不该跟三个月前就在
             # 队里的老片按同一个顺序排。见 heal_media_info。
+            # 第五位 = Emby 里的路径：补积压按网盘顺序排要用（见 heal_media_info）
             out.append((uid, i.get("Id"), i.get("Name") or "?",
-                        _is_fresh_item(i)))
+                        _is_fresh_item(i), str(i.get("Path") or "")))
     return out
 
 
@@ -12307,6 +12310,16 @@ def heal_fail_record(results):
             tab.pop(k, None)
     save_ms_state(heal_fail=tab)
 
+def heal_order(d, pend):
+    """补积压的顺序：「挂载路径」里排前面的盘先补（见 mount_rank）；同一个盘里保持原来的
+    顺序（sort 是稳定的）。排不了（读不到存储表之类）就原样返回。"""
+    try:
+        rk = mount_rank(d)
+        return sorted(pend, key=lambda x: rk(x[4]) if len(x) > 4 else 1 << 20)
+    except Exception:
+        return list(pend)
+
+
 def heal_media_info(d, key, budget=None, items=None):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
@@ -12335,6 +12348,9 @@ def heal_media_info(d, key, budget=None, items=None):
     allpend = list(items) if items is not None else items_without_duration(key)
     if not allpend:
         return
+    if items is None:
+        # 【按网盘顺序补】见 heal_order。点名 / 看片后那几条是人刚点的，不排
+        allpend = heal_order(d, allpend)
     _raw_pend = len(allpend)             # 真实待探数（含已放弃的），给每日增减用
     # 【放弃过的不再探】见 HEAL_GIVEUP 那段：探不出来的无限重试就是白烧流量。
     # 只在 heal 这里滤掉，体检那边照旧报真实待探数 —— 那是给人看的诊断，不该被藏起来。
@@ -14573,6 +14589,30 @@ def mount_of_path(d, path):
                 best = (mp, _truthy(cols.get("web_proxy"))
                         or str(drv or "").lower() in PROXY_ONLY_DRIVERS)
     return best or ("", None)
+
+
+def mount_rank(d):
+    """→ 一个函数：Emby 条目路径（.strm）→ 它那个盘在「挂载路径」菜单里排第几（从 0 起）。
+
+    【按网盘顺序来】仓库主人：「你要按这个网盘顺序刮啊，WebDAV 他也才是排在第四位怎么
+    先刮他的呢，还有探测也是的」。菜单的顺序就是 _storage_rows 的顺序（按挂载点排）。
+    认不出是哪个盘的排最后。只读本机的 strm 文件，不碰网盘。
+    """
+    mps = [str(r[1] or "") for r in _storage_rows(d)]
+    last = len(mps)
+
+    def rank(emby_path):
+        try:
+            with open(_strm_host_path(d, emby_path), encoding="utf-8") as f:
+                tp = strm_target_path(f.read()) or ""
+        except (OSError, TypeError):
+            return last
+        best, at = -1, last
+        for i, mp in enumerate(mps):
+            if mp and (tp == mp or tp.startswith(mp.rstrip("/") + "/")) and len(mp) > best:
+                best, at = len(mp), i
+        return at
+    return rank
 
 
 def _storage_rows(d, strict=False):
