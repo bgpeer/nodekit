@@ -2349,10 +2349,47 @@ def detect_countries(names):
     return out
 
 def other_members(names, present):
-    """不属于任何已建国家组的漏网节点名（present 为 detect_countries 的返回）。"""
+    """不属于任何已建国家组、也不是中国节点的漏网节点名（present 为 detect_countries 的返回）。"""
     norm = [_norm_us_flag(n) for n in names]
     rxs = [re.compile(p) for _, p, _ in present]
-    return [n for n in norm if not any(rx.search(n) for rx in rxs)]
+    return [n for n in norm if not any(rx.search(n) for rx in rxs) and not is_cn_node(n)]
+
+# ---------------------------------------------------------------------------- 中国节点
+# 中国节点（回国 / 国内 BGP / 装在国内机上的节点，或模板里手写的）不该混进出国用的组：
+# 被手选或被 url-test 挑中，国外流量就绕到国内机上了。与 Mihomo-fx 复写脚本同一套做法：
+#   · 收进 🎯直连（可手选单节点）+ 隐藏的 🇨🇳中国随机（国内地址测速，只挂在 🎯直连 下）；
+#   · 从其它出国用途的组（🌍全球加速 / ♻️全部随机 / 🎲其他随机 / 服务组）剔除；
+#   · 不受 COUNTRY_THRESHOLD 约束，有 1 个就生效。
+# 只认 🇨🇳 国旗、独立单词 CN/cn、"中国大陆"。故意【不】走 _cc 放宽——放宽后 CN2/CNIX
+# 这类线路标记会被误收。同时命中其它国家的（🇨🇳台湾、深港中转、CN→JP 中转）不算大陆，
+# 仍归原国家组。
+# 全是中国节点时不剔除：剔完出国组就空了（sing-box 空组直接 FATAL），保持原样。
+CN_GROUP = "🇨🇳中国随机"
+CN_PAT = r"🇨🇳|\bCN\b|\bcn\b|中国大陆"
+CN_TEST_URL = "http://connect.rom.miui.com/generate_204"   # 国内机连不上 gstatic，不能拿它测
+DIRECT_GROUP = "🎯直连"
+OTHER_CC_PAT = "|".join(p for _, p in COUNTRY_GROUPS)
+# 这些组保留中国节点：直连两件套、国家组（自带精确 filter）、其他随机（自己排过）、
+# 链式中转（国内 BGP 机做前置跳板是正经用法）、GLOBAL（全局模式什么都能选）
+CN_KEEP = {DIRECT_GROUP, CN_GROUP, OTHER_GROUP, "GLOBAL", "🔗链式中转"} | {g for g, _ in COUNTRY_GROUPS}
+_CN_RX, _OTHER_CC_RX = re.compile(CN_PAT), re.compile(OTHER_CC_PAT)
+
+def is_cn_node(name):
+    n = _norm_us_flag(name)
+    return bool(_CN_RX.search(n)) and not _OTHER_CC_RX.search(n)
+
+def cn_exact_re(names):
+    """把一批节点名拼成精确匹配的正则 ^(?:a|b)$，给 mihomo 的 exclude-filter 用。
+       为什么不直接用 CN_PAT：Go 正则没有环视，写不出「是 CN 但不带其它国家标记」，
+       直接排 CN_PAT 会把「🇨🇳台湾」这类其实不是大陆的节点也踢出去。服务器知道哪些是
+       中国节点，列名字最准。只转义正则元字符——Go 不认 `\ ` 这类对非标点的转义。"""
+    esc = lambda n: re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", n)
+    return "^(?:" + "|".join(esc(n) for n in names) + ")$"
+
+def cn_split(names):
+    """返回 (中国节点名列表, 要不要从出国组里剔除)。全是中国节点时不剔除（见上）。"""
+    cn = [n for n in names if is_cn_node(n)]
+    return cn, bool(cn) and len(cn) < len([n for n in names if n])
 
 def _sb_country_groups(tags, existing=()):
     """sing-box 国家随机组：无 filter，按正则算好每国成员显式列入 urltest。
@@ -2362,13 +2399,16 @@ def _sb_country_groups(tags, existing=()):
        sing-box 遇到重复 tag 是硬失败(FATAL: duplicate outbound/endpoint tag)，整份配置
        解析不了。与 mihomo 侧同一套取舍：同名接管、不同名并存。"""
     present = detect_countries(tags)
-    if not present:                                      # 没有任何国家 → 不建组（含"其他随机"），与 mihomo 一致
-        return [], []
+    cn, _ = cn_split(tags)
     existing = set(existing)
     objs, names = [], []
-    mk = lambda tag, members: {"tag": tag, "type": "urltest", "outbounds": members,
-                               "url": "https://www.gstatic.com/generate_204",
-                               "interval": "120s", "tolerance": 30}
+    mk = lambda tag, members, url="https://www.gstatic.com/generate_204": {
+        "tag": tag, "type": "urltest", "outbounds": members, "url": url,
+        "interval": "120s", "tolerance": 30}
+    if cn and CN_GROUP not in existing:                  # 🇨🇳中国随机：只挂在 🎯直连 下，不进 names
+        objs.append(mk(CN_GROUP, cn, CN_TEST_URL))
+    if not present:                                      # 没有任何国家 → 不建国家组（含"其他随机"），与 mihomo 一致
+        return objs, []
     for gname, pat, _ in present:
         rx = re.compile(pat)
         members = [t for t in tags if rx.search(_norm_us_flag(t))]
@@ -2377,12 +2417,23 @@ def _sb_country_groups(tags, existing=()):
         names.append(gname)                              # 名字照样展开（指向模板里的同名出站）
     if OTHER_GROUP:
         rxs = [re.compile(p) for _, p, _ in present]
-        omembers = [t for t in tags if not any(r.search(_norm_us_flag(t)) for r in rxs)]
+        omembers = [t for t in tags if not any(r.search(_norm_us_flag(t)) for r in rxs)
+                    and not is_cn_node(t)]
         if omembers:
             if OTHER_GROUP not in existing:
                 objs.append(mk(OTHER_GROUP, omembers))
             names.append(OTHER_GROUP)
     return objs, names
+
+def _cn_into_direct(members, cn):
+    """🎯直连 的成员里挂上中国节点：DIRECT 后面插 🇨🇳中国随机，单节点追加在末尾
+       （与 mihomo 侧 include-all 的效果同序：DIRECT / 🇨🇳中国随机 / 🌍… / 各中国单节点）。
+       已经在里面的不重复加。"""
+    out = list(members)
+    if CN_GROUP not in out:
+        i = out.index("DIRECT") + 1 if "DIRECT" in out else 0
+        out.insert(i, CN_GROUP)
+    return out + [n for n in cn if n not in out]
 
 def build_singbox_sub(nodes, tpl_url):
     """对象级替换锚点：_NOD_ 换节点对象、_GRP_ 换国家组、
@@ -2408,9 +2459,11 @@ def build_singbox_sub(nodes, tpl_url):
     # 已知 tag 全集：模板自己定义的（含 DIRECT、策略组、静态节点）+ 注入的节点 + 自动建的国家组。
     # 用来分辨「字面 tag 名」和「裸正则」——两者都是普通字符串，没有语法上的区别，
     # 只能靠"是不是已经存在这么一个出站"来判。
-    known_tags = set(existing_tags) | set(tags) | set(country_names)
+    known_tags = set(existing_tags) | set(tags) | set(country_names) | {CN_GROUP}
+    cn_tags, cn_drop = cn_split(tags)
+    cn_set = set(cn_tags)
 
-    def expand_list(lst):
+    def expand_list(lst, owner=""):
         """展开策略组成员。三种写法可拆解组合（前缀管建不建国家组，冒号后的正则管带不带节点）：
 
              _NAM_        只列国家组名，不带节点
@@ -2422,20 +2475,28 @@ def build_singbox_sub(nodes, tpl_url):
            而 ".*" 这种不存在的 tag 才会被当成正则。
 
            正则一条都没匹配上时【保留字面量】而不是丢掉：这样模板里把 tag 名写错一个字，
-           sing-box 会照常报 "outbound not found"，一眼能看出问题；静默丢掉反而查不出来。"""
+           sing-box 会照常报 "outbound not found"，一眼能看出问题；静默丢掉反而查不出来。
+
+           owner 是这个组自己的 tag：出国用途的组（不在 CN_KEEP 里）正则展开时剔除中国节点。
+           正则本来命中了、只是全被剔掉的，算"命中了零个"，不当字面量保留。"""
+        drop = cn_set if (cn_drop and owner not in CN_KEEP) else set()
+        pick = lambda rx: [t for t in tags if re.search(rx, t) and t not in drop]
         out = []
         for x in lst:
             if x == A_NAMES:
                 out += country_names                                 # 只国家组名
             elif isinstance(x, str) and x.startswith(A_NAMES + ":"):
                 out += country_names                                 # 国家组名 + 命中节点名
-                out += [t for t in tags if re.search(x[len(A_NAMES) + 1:], t)]
+                out += pick(x[len(A_NAMES) + 1:])
             elif isinstance(x, str) and x not in known_tags:
                 try:
-                    hit = [t for t in tags if re.search(x, t)]       # 裸正则 → 只匹配节点名
+                    raw = [t for t in tags if re.search(x, t)]       # 裸正则 → 只匹配节点名
+                    hit = pick(x)
                 except re.error:
-                    hit = []                                         # 不是合法正则 → 当字面量
-                if hit:
+                    raw = hit = []                                   # 不是合法正则 → 当字面量
+                if raw and not hit:
+                    pass                                             # 命中的全是中国节点，已剔除
+                elif hit:
                     out += hit
                 else:
                     print(f"  ⚠ sing-box 模板里的 {x!r} 既不是已有出站、当正则也匹配不到节点，原样保留")
@@ -2450,7 +2511,10 @@ def build_singbox_sub(nodes, tpl_url):
         elif x == A_GROUPS:
             new_ob += country_objs                                   # 分组锚点 → 国家 urltest 组
         elif isinstance(x, dict) and isinstance(x.get("outbounds"), list):
-            x["outbounds"] = expand_list(x["outbounds"]); new_ob.append(x)
+            x["outbounds"] = expand_list(x["outbounds"], x.get("tag", ""))
+            if cn_tags and x.get("tag") == DIRECT_GROUP:
+                x["outbounds"] = _cn_into_direct(x["outbounds"], cn_tags)
+            new_ob.append(x)
         else:
             new_ob.append(x)
     cfg["outbounds"] = new_ob
@@ -2538,11 +2602,15 @@ def _sr_country_groups(names_list, existing=()):
        重名硬失败已实测确认；小火箭是 iOS 客户端没法在这里跑，但同段里出现两条同名定义
        本身就是歧义的，一并防住。）"""
     present = detect_countries(names_list)
-    if not present:                                      # 没有任何国家 → 不建组（含"其他随机"），与 mihomo 一致
-        return "", ""
+    cn, _ = cn_split(names_list)
     U = "url=http://www.gstatic.com/generate_204,interval=120,tolerance=30,timeout=5"
     existing = set(existing)
     lines, gnames = [], []
+    if cn and CN_GROUP not in existing:                  # 🇨🇳中国随机：国内地址测速，不进 gnames
+        lines.append(f"{CN_GROUP} = url-test,{','.join(cn)},url={CN_TEST_URL},"
+                     "interval=120,tolerance=30,timeout=5")
+    if not present:                                      # 没有任何国家 → 不建国家组（含"其他随机"），与 mihomo 一致
+        return "\n".join(lines), ""
     for gname, pat, _ in present:
         rx = re.compile(pat)
         members = [t for t in names_list if rx.search(_norm_us_flag(t))]
@@ -2551,7 +2619,8 @@ def _sr_country_groups(names_list, existing=()):
         gnames.append(gname)                             # 名字照样展开（指向模板里的同名组）
     if OTHER_GROUP:
         rxs = [re.compile(p) for _, p, _ in present]
-        omembers = [t for t in names_list if not any(r.search(_norm_us_flag(t)) for r in rxs)]
+        omembers = [t for t in names_list if not any(r.search(_norm_us_flag(t)) for r in rxs)
+                    and not is_cn_node(t)]
         if omembers:
             if OTHER_GROUP not in existing:
                 lines.append(f"{OTHER_GROUP} = url-test,{','.join(omembers)},{U}")
@@ -2586,6 +2655,46 @@ def _sr_fill_names(tpl, frag):
         return _SR_NAMES_RE.sub(rep, line)
     return re.sub(r"(?m)^.*" + A_NAMES + r".*$", lambda m: one(m.group(0)), tpl)
 
+def _sr_cn_isolate(tpl, names):
+    """小火箭的中国节点隔离（见 CN_PAT 那段）。没有中国节点时原样返回。
+
+       🎯直连：DIRECT 后面插 🇨🇳中国随机，中国单节点插在第一个 key=value 参数前。
+       出国组：`policy-regex-filter=.*` 会把中国节点一起收进去。小火箭的正则引擎这里跑
+       不了、没法验证负向前瞻，所以不去改正则，而是把这一项换成【显式列出的非中国节点】
+       ——跟国家组的"显式列成员"同一个思路。只动 `.*` 这一种写法：别的正则是模板作者
+       自己圈的范围，不替他改。全是中国节点时不剔除（cn_split）。"""
+    cn, drop = cn_split(names)
+    if not cn:
+        return tpl
+    keep = [n for n in names if n and n not in cn]
+    m = re.search(r"(?ms)^\[Proxy Group\][ \t]*\n(.*?)(?=^\[|\Z)", tpl)
+    if not m:
+        return tpl
+
+    def one(line):
+        if "=" not in line or line.lstrip().startswith("#"):
+            return line
+        gname, body = (x.strip() for x in line.split("=", 1))
+        items = body.split(",")
+        first_kv = next((i for i, it in enumerate(items) if "=" in it), len(items))
+        if gname == DIRECT_GROUP:
+            pol = items[1:first_kv]
+            if CN_GROUP not in pol:
+                pol.insert(pol.index("DIRECT") + 1 if "DIRECT" in pol else 0, CN_GROUP)
+            pol += [n for n in cn if n not in pol]
+            items = items[:1] + pol + items[first_kv:]
+        elif drop and gname not in CN_KEEP and "policy-regex-filter=.*" in items:
+            items = [it for it in items if it != "policy-regex-filter=.*"]
+            first_kv = next((i for i, it in enumerate(items) if "=" in it), len(items))
+            have = set(items[1:first_kv])
+            items = items[:first_kv] + [n for n in keep if n not in have] + items[first_kv:]
+        else:
+            return line
+        return f"{gname} = {','.join(items)}"
+
+    body = "\n".join(one(l) for l in m.group(1).split("\n"))
+    return tpl[:m.start(1)] + body + tpl[m.end(1):]
+
 def build_shadowrocket_sub(nodes, tpl_url):
     lines, names_list = [], []
     for key, d in nodes:
@@ -2606,6 +2715,7 @@ def build_shadowrocket_sub(nodes, tpl_url):
     out = _fill_block(out, A_NODES, "\n".join(lines))           # 块锚点整行替换，缩进容错
     out = _fill_block(out, A_GROUPS, groups_txt)
     out = _sr_fill_names(out, names_frag)                       # 行内锚点（按行去重）
+    out = _sr_cn_isolate(out, names_list + static)
     open(SR_FILE, "w").write(out)
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
@@ -2644,22 +2754,113 @@ def _mihomo_country(names, existing=()):
        想额外多一个组就换个名字）。被跳过的组名仍拼进 🌍全球加速——那个引用会指向模板里
        的同名组，效果不变；即便你自己也把它写进了某个 proxies 列表，重复引用 mihomo 是允许的。"""
     present = detect_countries(names)
-    if not present:
-        return "", ""
+    cn, _ = cn_split(names)
     # hidden: true 让国家组不占面板卡片位（仍可在🌍全球加速里选到）；显式写在组上，
     # 覆盖 <<: *COUNTRY_COMMON，自定义模板不改锚点也生效。
     existing = set(existing)
     lines, gnames = [], []
+    if cn and CN_GROUP not in existing:
+        # 🇨🇳中国随机：只挂在 🎯直连 下（_mihomo_cn_isolate），不进 gnames。
+        # exclude-filter 踢掉同时带其它国家标记的（🇨🇳台湾 / 深港中转），国内地址测速。
+        lines.append(f"  - {{name: \"{CN_GROUP}\", <<: *COUNTRY_COMMON, filter: '{CN_PAT}', "
+                     f"exclude-filter: '{OTHER_CC_PAT}', url: \"{CN_TEST_URL}\", hidden: true}}")
+    if not present:
+        return "\n".join(lines), ""
     for gname, pat, _ in present:
         if gname not in existing:
             lines.append(f"  - {{name: \"{gname}\", <<: *COUNTRY_COMMON, filter: '{pat}', hidden: true}}")
         gnames.append(gname)
     if OTHER_GROUP and other_members(names, present):          # 有漏网节点才建"其他随机"
         if OTHER_GROUP not in existing:
-            allpat = "|".join(p for _, p, _ in present)
+            # 中国节点也排掉（服务器这边 other_members 已经不算它们），按名字精确排（见 cn_exact_re）
+            allpat = "|".join([p for _, p, _ in present] + ([cn_exact_re(cn)] if cn else []))
             lines.append(f"  - {{name: \"{OTHER_GROUP}\", <<: *COUNTRY_COMMON, exclude-filter: '{allpat}', hidden: true}}")
         gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f', "{g}"' for g in gnames)
+
+_MH_ANCHOR_DEF_RE = re.compile(r"(?m)^[ \t]*-[ \t]*&([\w-]+)[ \t]*(\{.*\})[ \t]*$")
+_MH_MERGE_RE = re.compile(r"<<:[ \t]*\*([\w-]+)")
+_MH_INCLUDE_ALL_RE = re.compile(r"(?:^|[{,])[ \t]*include-all:[ \t]*true[ \t]*(?=[,}])")
+
+def _mh_scalar(line, key):
+    """行内 flow mapping 里 key 的标量值：返回 (起, 止, 值) 或 None。认单引号/双引号/裸值。"""
+    m = re.search(r"(?:^|[{,])[ \t]*" + re.escape(key) +
+                  r":[ \t]*('(?:[^']|'')*'|\"(?:[^\"\\]|\\.)*\"|[^,}]*)", line)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    if raw.startswith("'"):
+        val = raw[1:-1].replace("''", "'")
+    elif raw.startswith('"'):
+        try: val = json.loads(raw)
+        except ValueError: val = raw[1:-1]
+    else:
+        val = raw
+    return m.start(1), m.end(1), val
+
+def _mh_sq(v):
+    return "'" + v.replace("'", "''") + "'"
+
+def _mihomo_cn_isolate(tpl, names):
+    """mihomo 的中国节点隔离（见 CN_PAT 那段）。没有中国节点时原样返回。
+
+       🎯直连：proxies 里 DIRECT 后面插 🇨🇳中国随机；组本身没有 include-all 的，补上
+       include-all + filter（中国节点）+ exclude-filter（其它国家标记），把中国单节点扫进来。
+       注意这里绝不能加 exclude-type: direct —— 它会把 proxies 里的 DIRECT 一起踢掉。
+       出国组：proxy-groups 里凡是 include-all（自己写的，或经 <<: *锚点 继承的）且不在
+       CN_KEEP 里的组，exclude-filter 追加中国节点的精确名单（cn_exact_re）；原来有
+       exclude-filter 的合并成 (?:原来的)|(?:名单)。全是中国节点时不剔除（cn_split）。
+
+       只处理单行 `- {...}` 写法（作者模板和国家组都是这样）。多行块写法的组不认识，
+       原样保留、打一行提示——漏掉隔离不会让配置坏掉，只是回到改动前的行为。"""
+    cn, drop = cn_split(names)
+    if not cn:
+        return tpl
+    m = re.search(r"(?m)^proxy-groups:[ \t]*$", tpl)
+    if not m:
+        return tpl
+    anchors = {a: body for a, body in _MH_ANCHOR_DEF_RE.findall(tpl)}
+    exact = cn_exact_re(cn)
+    lines = tpl[m.end():].split("\n")
+    skipped = []
+    for i, line in enumerate(lines):
+        if line and not line[0].isspace() and i > 0:
+            break                                          # 下一个顶级键：proxy-groups 段结束
+        st = line.strip()
+        gm = _GNAME_RE.search(line)
+        if not gm or not st.startswith("-"):
+            continue
+        gname = (gm.group(1) or gm.group(2) or gm.group(3) or "").strip().strip("\"'")
+        if not (st.startswith("- {") and st.endswith("}")):
+            skipped.append(gname)
+            continue
+        merged = [anchors.get(a, "") for a in _MH_MERGE_RE.findall(line)]
+        has_ia = bool(_MH_INCLUDE_ALL_RE.search(line)) or any(_MH_INCLUDE_ALL_RE.search(b) for b in merged)
+        cut = line.rstrip().rfind("}")
+        if gname == DIRECT_GROUP:
+            pm = re.search(r"proxies:[ \t]*\[([^\]]*)\]", line)
+            if pm and CN_GROUP not in pm.group(1):
+                items = [x.strip() for x in pm.group(1).split(",") if x.strip()]
+                bare = [x.strip("\"'") for x in items]
+                items.insert(bare.index("DIRECT") + 1 if "DIRECT" in bare else 0, f'"{CN_GROUP}"')
+                line = line[:pm.start(1)] + ",".join(items) + line[pm.end(1):]
+                cut = line.rstrip().rfind("}")
+            if not has_ia:
+                line = (line[:cut].rstrip() + f", include-all: true, filter: {_mh_sq(CN_PAT)}, "
+                        f"exclude-filter: {_mh_sq(OTHER_CC_PAT)}" + line[cut:])
+            lines[i] = line
+        elif drop and has_ia and gname not in CN_KEEP:
+            own = _mh_scalar(line, "exclude-filter")
+            if own:
+                a, b, v = own
+                lines[i] = line[:a] + _mh_sq(f"(?:{v})|(?:{exact})") + line[b:]
+            else:
+                inh = next((x for x in (_mh_scalar(b, "exclude-filter") for b in merged) if x), None)
+                v = f"(?:{inh[2]})|(?:{exact})" if inh else exact
+                lines[i] = line[:cut].rstrip() + f", exclude-filter: {_mh_sq(v)}" + line[cut:]
+    if skipped:
+        print(f"  ⓘ mihomo 模板里这些组不是单行写法，没做中国节点隔离：{'、'.join(skipped)}")
+    return tpl[:m.end()] + "\n".join(lines)
 
 def _fill_block(tpl, anchor, block):
     """按整行替换独占一行的块锚点：连同该行的前导缩进一起换成 block（block 自带缩进）。
@@ -3080,6 +3281,7 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _fill_block(tpl, A_NODES, "\n".join(ylines))
     tpl = _fill_block(tpl, A_GROUPS, groups_yaml)
     tpl = _mihomo_fill_names(tpl, names_frag)                  # 行内锚点：填国家组名
+    tpl = _mihomo_cn_isolate(tpl, _node_names(nodes) + static)  # 中国节点：进 🎯直连、出国组剔除
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
     tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
     open(CFG_FILE, "w").write(tpl)
