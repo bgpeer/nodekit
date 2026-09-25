@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.174"
+SCRIPT_VERSION = "1.5.175"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4184,8 +4184,18 @@ def do_heal_trace(q, play=True):
                           f"那份旧的半截信息一直没换掉。点名补一次（先清掉再探）："
                           f"media-stack heal {_hit_stem(key, (uid, iid)) or name}{RST}")
                 elif _got[1] and not _got[0]:
-                    print(f"  {DIM}  → 只有浏览器那张脸读得出：这个盘按 UA 挡人。「4 挂载路径 →"
-                          f" 选盘 → 直链方式」里给它开「伪装成浏览器」{RST}")
+                    # 【只给真有这个开关的盘指路】「伪装成浏览器」是本机 nginx 改 UA，
+                    # 只对视频字节走本机的盘有用。1.5.166 不分盘一律指过去，仓库主人
+                    # 照着去夸克那一屏找，根本没有这一项。
+                    _mp, _px = mount_of_path(d, _tp)
+                    if _px:
+                        print(f"  {DIM}  → 只有浏览器那张脸读得出：这个盘按 UA 挡人。「4 挂载路径 →"
+                              f" {_mp} → 直链方式 → 探测 UA」改成「伪装成浏览器」{RST}")
+                    else:
+                        print(f"  {DIM}  → 只有浏览器那张脸读得出（这一次）。{_mp or '这个盘'} 是 302"
+                              f" 直链的盘：Emby 探测是直接去网盘 CDN 的，不经过本机，本机改不了"
+                              f"它的 UA，所以这个盘没有「伪装成浏览器」这一项。补上之后又被盖掉"
+                              f"的，这一场一停脚本会马上再补一次、再写回进度（1.5.174 起）{RST}")
                 else:
                     print(f"  {DIM}  → ffprobe 自己也读不全。时长索引在文件末尾的 mp4 要多跳"
                           f"一次去读尾巴，这一跳被拦了。把这几行发给仓库主人{RST}")
@@ -13968,6 +13978,23 @@ STORAGE_COLS = ("web_proxy", "webdav_policy", "proxy_range", "down_proxy_url")
 def _truthy(v):
     """sqlite 里的布尔值。gorm 存 0/1，但换个版本存 "true" 也不奇怪，都认。"""
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def mount_of_path(d, path):
+    """网盘里这个路径归哪个盘 → (挂载点, 视频字节走不走本机)。认不出 → ("", None)。
+
+    「走本机」= 代理型（开了本机代理，或者 WebDAV 这类只能代理的）—— 只有这种盘，
+    本机 nginx 改得到 Emby 探测时的 UA。302 直链的盘（夸克、阿里……），Emby 跟着 302
+    直接去网盘 CDN，那一跳不经过本机。
+    """
+    best = None
+    for _sid, mp, drv, _add, cols in _storage_rows(d):
+        mp = str(mp or "")
+        if mp and (path == mp or path.startswith(mp.rstrip("/") + "/")):
+            if best is None or len(mp) > len(best[0]):
+                best = (mp, _truthy(cols.get("web_proxy"))
+                        or str(drv or "").lower() in PROXY_ONLY_DRIVERS)
+    return best or ("", None)
 
 
 def _storage_rows(d, strict=False):
