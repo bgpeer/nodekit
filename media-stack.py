@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.163"
+SCRIPT_VERSION = "1.5.164"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3813,6 +3813,24 @@ def do_heal_trace(q, play=True):
                    "补一次掉一次。跑一次「7 更新」会关掉")
     elif _mon is False:
         _trace_row("✔", "所在库实时监控", "关着")
+    if st0["streams"] and not st0["ticks"]:
+        # 【有轨道没时长 → 看一眼文件本身】见 file_layout。只读几段 box 头，几十 KB
+        try:
+            with open(_strm_host_path(d, _ip), encoding="utf-8") as f:
+                _tp = strm_target_path(f.read())
+            _raw = ((_ol_api("/api/fs/get", {"path": _tp, "password": ""},
+                             _ol_token(d), timeout=60).get("data") or {})
+                    .get("raw_url", "")) if _tp else ""
+        except Exception:
+            _raw = ""
+        _has, _fs = file_layout_says(file_layout(_raw)) if _raw else (None, "拿不到直链，看不了")
+        _trace_row("✔" if _has else "✖" if _has is False else "·", "文件本身", _fs)
+        if _has is False:
+            print(f"  {DIM}  → 不是脚本、也不是 Emby 的毛病：Emby 只读文件头。要么等网盘转好码"
+                  f"（走 m3u8），要么转封装成普通 mp4 再传：ffmpeg -i 原文件 -c copy "
+                  f"-movflags +faststart 新.mp4{RST}")
+        elif _has:
+            print(f"  {DIM}  → 文件里写着时长，Emby 没读到 —— 这是要查的，把这一屏发给仓库主人{RST}")
     _nh = heal_nohead_at(iid)
     if _nh:
         try:
@@ -10794,6 +10812,152 @@ def _netdisk_head_ok(raw_url, timeout=HEAL_PRE_T):
     return False, THROTTLED_WHY
 
 
+def _range_get(raw_url, start, n, timeout=30):
+    """拉 [start, start+n) 这一段 → (字节, 文件总长 或 None)。拉不到抛异常。"""
+    req = urllib.request.Request(
+        raw_url, headers={"User-Agent": BROWSER_UA,
+                          "Range": f"bytes={start}-{start + n - 1}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = None
+        cr = r.headers.get("Content-Range") or ""
+        if "/" in cr and cr.rsplit("/", 1)[1].strip().isdigit():
+            total = int(cr.rsplit("/", 1)[1])
+        return r.read(n), total
+
+
+def _mp4_boxes(buf, base=0):
+    """把 buf 里一层的 box 列出来 → [(类型, 在文件里的偏移, 头长, 总长)]。读到半截就停。"""
+    import struct
+    out, i = [], 0
+    while i + 8 <= len(buf):
+        size, typ = struct.unpack(">I4s", buf[i:i + 8])
+        hl = 8
+        if size == 1:
+            if i + 16 > len(buf):
+                break
+            size = struct.unpack(">Q", buf[i + 8:i + 16])[0]
+            hl = 16
+        typ = typ.decode("latin-1")
+        if size == 0:
+            size = -1                 # 一直到文件末尾
+        elif size < hl:
+            break                     # 不像 box 了
+        out.append((typ, base + i, hl, size))
+        if size < 0:
+            break
+        i += size
+    return out
+
+
+def file_layout(raw_url, max_req=10):
+    """看文件本身有没有写总时长 —— 只读几段 box 头，几十 KB。→ dict，看不了返回 None。
+
+    【为什么要有】FC2-4954902：播放器显示 29:04，Emby 探来探去只有轨道没时长。两种
+    可能长得一模一样：文件里写着时长、Emby 没读到（该查脚本 / Emby）；文件头里本来
+    就没写（分段式 mp4：moov 里总时长是 0，每一段的时长散在后面的 moof 里，播放器
+    靠文件尾的索引算出来，Emby 只读文件头就拿不到）。不看文件就只能猜 —— 这一轮
+    已经猜错过两次了。
+
+    返回：kind（mp4 / mkv / ts / 其它）、boxes（顶层 box 顺序）、frag（有 moof / mvex）、
+    mvhd_s（moov 里写的总时长秒数）、mehd_s（分段总时长）、sidx（有没有分段索引）。
+    """
+    import struct
+    try:
+        head, total = _range_get(raw_url, 0, 65536)
+    except Exception:
+        return None
+    if head[:4] == b"\x1a\x45\xdf\xa3":
+        return {"kind": "mkv"}
+    if head[:1] == b"\x47" and len(head) > 376 and head[188:189] == b"\x47":
+        return {"kind": "ts"}
+    if head[4:8] not in (b"ftyp", b"styp", b"moov", b"free", b"mdat", b"wide", b"skip"):
+        return {"kind": "其它"}
+    info = {"kind": "mp4", "boxes": [], "frag": False, "mvhd_s": None,
+            "mehd_s": None, "sidx": False, "total": total}
+    off, buf, reqs, moov = 0, head, 1, None
+    while True:
+        bx = _mp4_boxes(buf, off)
+        if not bx:
+            break
+        for typ, at, hl, size in bx:
+            info["boxes"].append(typ)
+            if typ in ("moof", "mvex"):
+                info["frag"] = True
+            if typ == "sidx":
+                info["sidx"] = True
+            if typ == "moov":
+                moov = (at, hl, size)
+        typ, at, hl, size = bx[-1]
+        nxt = at + size
+        # 拿到 moov 就够判断了；再往后是一段一段的 moof/mdat，看前几个就知道是分段式
+        if size < 0 or (moov and len(info["boxes"]) >= 6) or reqs >= max_req \
+                or (total and nxt >= total):
+            break
+        if nxt <= off + len(buf) - 8:
+            break                     # 这一段里已经读完了、又没东西了
+        try:
+            buf, total2 = _range_get(raw_url, nxt, 4096)
+        except Exception:
+            break
+        total = total or total2
+        off, reqs = nxt, reqs + 1
+    info["total"] = total
+    if moov:
+        at, hl, size = moov
+        try:
+            body = (head[at + hl:at + size] if at + size <= len(head)
+                    else _range_get(raw_url, at + hl, min(size - hl, 4 << 20))[0])
+        except Exception:
+            body = b""
+        for typ, cat, chl, csize in _mp4_boxes(body):
+            c = body[cat + chl:cat + csize]
+            if typ == "mvhd" and len(c) >= 32:
+                if c[0] == 1:
+                    ts, du = struct.unpack(">IQ", c[20:32])
+                else:
+                    ts, du = struct.unpack(">II", c[12:20])
+                info["mvhd_s"] = du / ts if ts else 0
+            if typ == "mvex":
+                info["frag"] = True
+                for t2, a2, h2, s2 in _mp4_boxes(c):
+                    if t2 == "mehd":
+                        d2 = c[a2 + h2:a2 + s2]
+                        du = (struct.unpack(">Q", d2[4:12])[0] if d2[:1] == b"\x01"
+                              else struct.unpack(">I", d2[4:8])[0])
+                        ts = 0
+                        for tt, aa, hh, ss in _mp4_boxes(body):
+                            if tt == "mvhd":
+                                m = body[aa + hh:aa + ss]
+                                ts = (struct.unpack(">I", m[20:24])[0] if m[:1] == b"\x01"
+                                      else struct.unpack(">I", m[12:16])[0])
+                        info["mehd_s"] = du / ts if ts else None
+    return info
+
+
+def file_layout_says(info):
+    """把 file_layout 的结果说成一句人话 → (文件里有没有写时长 True/False/None, 说明)。"""
+    if not info:
+        return None, "文件看不了（拿不到那一段）"
+    k = info.get("kind")
+    if k == "mkv":
+        return None, "mkv —— 时长写在文件头的 Info 里，一般读得到"
+    if k == "ts":
+        return False, "ts —— 这种格式本来就不写总时长，Emby 只能靠码率估，常常估不出"
+    if k != "mp4":
+        return None, "认不出是什么格式"
+    mv, me = info.get("mvhd_s"), info.get("mehd_s")
+    order = "→".join(info.get("boxes", [])[:6])
+    if info.get("frag"):
+        if (me or 0) > 1 or info.get("sidx"):
+            return True, (f"分段式 mp4，但写了总时长"
+                          f"（{(me or mv or 0) / 60:.0f} 分钟）；顺序 {order}")
+        return False, (f"分段式 mp4，文件头里总时长是 {mv or 0:.0f} 秒、没写分段总长 —— "
+                       f"播放器靠文件尾的索引算出来，Emby 只读文件头拿不到；顺序 {order}")
+    if mv:
+        return True, f"普通 mp4，文件里写着 {mv / 60:.0f} 分钟；顺序 {order}"
+    return False, f"普通 mp4，但文件里写的总时长是 0；顺序 {order}"
+
+
 def heal_pace():
     """这一批探几个。撞过限流就是砍过半的那个数，一直顺就是上限。"""
     try:
@@ -11729,6 +11893,15 @@ def _heal_one(d, key, _it, base, token):
         return "retry", name, el(), "只探到时长，没有音视频轨（这样点开会 load fail）"
     if streams and not mins:
         _rt = "、".join(_tried) or "-"
+        # 【先看文件本身】"有轨道没时长"有两种，长得一模一样：文件里写着时长、Emby
+        # 没读到；文件头里本来就没写。不看文件就只能猜（FC2-4954902 猜错过两次）。
+        # 只在这一种结局才看，几十 KB。
+        _has, _say_f = file_layout_says(file_layout(raw)) if "整文件" in _tried else (None, "")
+        if _has is False:
+            heal_nohead_mark(iid)     # 下次点开不再白拉整文件，只等 m3u8
+            return ("retry", name, el(),
+                    "文件里没写总时长（" + _say_f.split(" ——")[0].split("，")[0]
+                    + "）；只有网盘转码后走 m3u8 能补")
         if _half and not _cleared:
             # 【有轨道、没时长，而且探之前就是这个样子、没清掉】Emby 手里那份半截
             # 信息它不肯丢，探测请求直接拿旧的交差。
@@ -11737,15 +11910,19 @@ def _heal_one(d, key, _it, base, token):
                     f"（{_CLEAR_WHY.get(str(iid)) or '原因不明'}）；试了 {_rt}")
         # 【探之前是干净的，探完才有轨道没时长】那就不是 Emby 偷懒，是【这个文件的
         # 文件头里就没有时长】。分段式 mp4、ts 这类要把整个文件读完才知道多长，
-        # Emby 只读文件头。（FC2-4954902 起初被当成这一种，后来查明不是：播放器读得出
-        # 29:04，是清半截那一刷一直被 Emby 400 拒掉 —— 见 _clear_half_info。）
+        # Emby 只读文件头。（FC2-4954902 在这两种之间猜错过两次 —— 播放器读得出 29:04
+        # 并不说明文件头里写着，播放器会去读文件尾的索引。现在由上面 file_layout 看
+        # 文件说了算；看不了（_has 为 None）才退回这一句。）
         # 以前这一种也说成"Emby 拿着半截信息没重新探"—— 叫人往错的方向查。
         # 这种只有 m3u8 那条路救得了（播放列表里每一段都带秒数）：网盘转好码之后
         # 再点开，或者整队那一轮轮到它，就会走 m3u8。
         # 【说明压在 60 字以内】流水一行只留说明的前 60 个字，关键的"试了哪条路"
         # 放后面会被截掉
-        if "整文件" in _tried:
+        if "整文件" in _tried and _has is None:
             heal_nohead_mark(iid)     # 下次点开就不再白拉整文件了，只等 m3u8
+        if _has:
+            return ("retry", name, el(),
+                    f"文件里写着时长，Emby 却没读到（探之前是干净的）；试了 {_rt}")
         return ("retry", name, el(),
                 f"探到轨道但文件头里没时长（分段 mp4/ts 常见）；试了 {_rt}"
                 + ("；没转码版，转好码后走 m3u8 就有" if "m3u8" not in _tried else ""))
