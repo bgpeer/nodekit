@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.175"
+SCRIPT_VERSION = "1.5.176"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11441,18 +11441,29 @@ def heal_log(lines):
     """
     if not lines:
         return
+    # 【加锁、追加写】以前是"整份读出来、接上新的、整份写回去"。看片后那一轮
+    # （heal-tick）和补积压那一轮（整队）是两个进程，同时写的时候后写的那个拿自己
+    # 读到的旧内容整份盖回去，先写的那几行就没了。实测：FC2-4894253 点开播了
+    # 28 分钟、明明补上了 43 分钟，流水里一个字没有；「马上再补一次」后面也没有结果。
     try:
         os.makedirs(TRAFFIC_DIR, exist_ok=True)
-        old = []
-        if os.path.exists(HEAL_LOG):
-            with open(HEAL_LOG, encoding="utf-8", errors="replace") as f:
-                old = f.read().splitlines()
-        keep = (old + list(lines))[-HEAL_LOG_KEEP:]
-        with open(HEAL_LOG, "w", encoding="utf-8") as f:
-            f.write("\n".join(keep) + "\n")
+        import fcntl
+        # 0600 在创建那一刻就给上：先建后 chmod 的话，中间有一小段别人读得到片名
+        _fd = os.open(HEAL_LOG, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(_fd, "a+", encoding="utf-8", errors="replace") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)     # 关文件时自动放锁
+            f.write("\n".join(lines) + "\n")
+            f.flush()
+            # 【超了才修剪】多留两成再剪，别每写一行都整份重写一遍
+            f.seek(0)
+            rows = f.read().splitlines()
+            if len(rows) > max(HEAL_LOG_KEEP * 1.2, HEAL_LOG_KEEP + 1):
+                f.seek(0)
+                f.truncate()
+                f.write("\n".join(rows[-HEAL_LOG_KEEP:]) + "\n")
         # 【root-only】里面有片名
         os.chmod(HEAL_LOG, 0o600)
-    except OSError:
+    except (OSError, ImportError):
         pass                          # 记不上账不该把补时长本身弄挂
 
 
