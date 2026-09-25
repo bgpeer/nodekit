@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.169"
+SCRIPT_VERSION = "1.5.170"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -100,6 +100,8 @@ HLS_PORT_BASE = 9010
 # 不然 hls_ready() 会永远说"没装好"（或者更坏：永远说"装好了"）。
 HLS_LOC_MARK = "(?:emby/)?videos/"
 HLS_UNIT = "/etc/systemd/system/media-stack-hls.service"
+# 常驻盯着 nginx 日志：一有人按下播放，立刻跑一轮 heal-tick（见 do_heal_daemon）
+HEAL_DAEMON_UNIT = "/etc/systemd/system/media-stack-heald.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
 # 缓存太久会指到一条过期的地址上；太短又会把 MediaWarp 问烦。5 分钟是折中。
 HLS_BASE_TTL = 300
@@ -2103,6 +2105,158 @@ WantedBy=multi-user.target
     return want
 
 
+def heal_daemon_active():
+    """「点了立刻补」的常驻服务在不在跑 → True / False；没有 systemctl → None。"""
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        r = subprocess.run(["systemctl", "is-active", os.path.basename(HEAL_DAEMON_UNIT)],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() == "active"
+    except Exception:
+        return None
+
+
+def remove_heal_daemon():
+    """停掉并删掉「点了立刻补」的常驻服务。卸载时走这里。"""
+    if not os.path.exists(HEAL_DAEMON_UNIT):
+        return
+    unit = os.path.basename(HEAL_DAEMON_UNIT)
+    try:
+        sh(f"systemctl disable --now {unit}", timeout=60)
+        os.remove(HEAL_DAEMON_UNIT)
+        sh("systemctl daemon-reload", timeout=60)
+    except Exception:
+        pass
+
+
+def sync_heal_daemon(quiet=True):
+    """装上（或重启）「点了立刻补」的常驻服务。返回它现在开着没有。
+
+    【为什么要有】仓库主人：「时长补慢了一点点」。点下播放之后，每分钟那一轮 cron
+    要等 0~60 秒才轮到，探本身只要 10 秒上下 —— 慢的是等。常驻进程一秒看一眼 nginx
+    日志，看见按下播放就马上跑一轮 heal-tick。
+    【它只是个扳机】探什么、探几次、防死循环，全是 heal-tick 自己那一套 —— 这里不另起
+    一套规矩。每分钟的 cron 照旧留着兜底：常驻进程挂了，退回原来的一分钟。
+    """
+    if not shutil.which("systemctl"):
+        if not quiet:
+            warn("这台机器没有 systemctl，「点了立刻补」装不了 —— 照旧每分钟看一次。")
+        return False
+    unit = os.path.basename(HEAL_DAEMON_UNIT)
+    want = f"""[Unit]
+Description=media-stack play-start watcher
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {os.path.realpath(__file__)} heal-daemon
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+"""
+    try:
+        try:
+            with open(HEAL_DAEMON_UNIT, encoding="utf-8") as f:
+                cur = f.read()
+        except OSError:
+            cur = ""
+        if cur != want:
+            with open(HEAL_DAEMON_UNIT, "w", encoding="utf-8") as f:
+                f.write(want)
+            sh("systemctl daemon-reload", timeout=60)
+            sh(f"systemctl enable {unit}", timeout=60)
+        # 【每次都重启】脚本刚换过的话，跑着的还是旧代码
+        sh(f"systemctl restart {unit}", timeout=60)
+        if not quiet:
+            info("已起「点了立刻补」常驻服务（按下播放几秒内就开始补时长）")
+        return True
+    except Exception as e:
+        warn(f"「点了立刻补」没装上（照旧每分钟看一次）：{_short_err(e)}")
+        return False
+
+
+# 常驻服务看见有人按下播放、还没被 heal-tick 读走时，就放着这个文件。
+# heal-tick 读完 nginx 那一段就删掉它；rescue_linger 看见它就收手，把锁让出来。
+HEAL_KICK = TRAFFIC_DIR + "/heal-kick"
+HEAL_DAEMON_POLL = 1.0        # 多久看一眼 nginx 日志（秒）
+HEAL_DAEMON_RESPAWN = 3.0     # 按下播放还没被读走时，多久再扣一次扳机（秒）
+
+
+def do_heal_daemon():
+    """常驻：一秒看一眼 nginx 日志，看见按下播放（PlaybackInfo）就跑一轮 heal-tick。
+
+    【不动 heal-tick 的偏移】它自己按字节记一份只在内存里的位置；heal_ngx 那个偏移
+    仍然只归 heal-tick。所以常驻进程怎么样都不会让 heal-tick 漏读 —— 最坏也就是
+    退回每分钟一次。
+    【读走了才算完】按下播放那一行的末尾在第几个字节记下来，heal-tick 的偏移越过它
+    才算读走了；没读走（锁被占着、上一轮还在盯着播放）就每 HEAL_DAEMON_RESPAWN 秒
+    再扣一次。
+    【脚本换了就退出】自动更新是原地替换文件的；退出之后 systemd 用新代码拉起来。
+    """
+    me = os.path.realpath(__file__)
+    try:
+        m0 = os.stat(me).st_mtime
+    except OSError:
+        m0 = 0
+    off = ino = None
+    pend, pend_ino = 0, None
+    last = 0.0
+    kids = []
+    click = re.compile(rb"/items/\d+/playbackinfo", re.I)
+    while True:
+        time.sleep(HEAL_DAEMON_POLL)
+        kids = [k for k in kids if k.poll() is None]
+        try:
+            if os.stat(me).st_mtime != m0:
+                return
+        except OSError:
+            pass
+        try:
+            st = os.stat(NGX_ACCESS_LOG)
+        except OSError:
+            continue
+        if off is None or ino != st.st_ino or st.st_size < off:
+            off, ino = st.st_size, st.st_ino      # 刚起来 / 轮转了：从末尾开始看
+            continue
+        if st.st_size > off:
+            try:
+                with open(NGX_ACCESS_LOG, "rb") as f:
+                    f.seek(off)
+                    buf = f.read(NGX_TAIL_MAX)
+            except OSError:
+                continue
+            cut = buf.rfind(b"\n") + 1
+            if not cut:
+                continue                          # 半行，下一秒再读
+            if click.search(buf[:cut]):
+                pend, pend_ino = off + cut, ino
+            off += cut
+        if not pend:
+            continue
+        mk = ms_state().get("heal_ngx") or {}
+        if mk.get("ino") == pend_ino and int(mk.get("off") or 0) >= pend:
+            pend = 0                              # heal-tick 读走了
+            continue
+        try:
+            os.makedirs(os.path.dirname(HEAL_KICK), exist_ok=True)
+            open(HEAL_KICK, "w").close()
+        except OSError:
+            pass
+        if time.monotonic() - last >= HEAL_DAEMON_RESPAWN:
+            last = time.monotonic()
+            try:
+                kids.append(subprocess.Popen(["sh", "-c", cron_cmd("heal-tick")],
+                                             stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL))
+            except OSError:
+                pass
+
+
 def keepalive_state(d):
     try:
         with open(os.path.join(d, "keepalive.json")) as f:
@@ -3385,6 +3539,8 @@ def rescue_linger(key=None):
                 if e.get("seen") and not e.get("end") and now - int(e["seen"]) < 150]
         if not live:
             return
+        if os.path.exists(HEAL_KICK):
+            return                    # 有人刚按下播放 —— 把锁让出来，那一集要紧
         if key is None:
             key = read_yaml_scalar(os.path.join(ms_install_dir(), "mediawarp", "config",
                                                 "config.yaml"), "auth")
@@ -3448,6 +3604,11 @@ def do_heal_tick(hot_only=False):
     # 读不到（没域名、没 nginx）才退回 docker logs —— 后者每次都要从头扫一遍，
     # 每分钟一次就不便宜了。
     ids = nginx_played_ids()
+    if ids is not None:
+        try:
+            os.remove(HEAL_KICK)      # 常驻服务等的那几行这一轮读走了
+        except OSError:
+            pass
     # 【按下播放 ≠ 正在播】None = 读不到 nginx 日志，分不出来
     clicks = set(NGX_CLICKS) if ids is not None else None
     if ids is None:
@@ -3824,6 +3985,12 @@ def do_heal_trace(q, play=True):
     _site = _emby_site_local()
     if _st and _site:
         _trace_row("✔", "点播放的信号", "从 nginx 访问日志读（按字节增量，便宜）")
+        _on = heal_daemon_active()
+        if _on:
+            _trace_row("✔", "点了立刻补", "常驻服务开着：按下播放几秒内就开始补")
+        elif _on is False:
+            _trace_row("⚠", "点了立刻补", "常驻服务没在跑 —— 退回每分钟看一次。"
+                       "跑一次「7 更新」会装上 / 拉起来")
     else:
         _trace_row("·", "点播放的信号", "没有 nginx 那份日志，从 MediaWarp 容器日志读")
 
@@ -8027,6 +8194,7 @@ def do_update(from_menu=False):
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
     install_heal_cron(d)      # 「有人看过片就补时长」的轻量轮，见 do_heal_tick
+    sync_heal_daemon()        # 按下播放几秒内就补，见 do_heal_daemon
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
@@ -8127,6 +8295,7 @@ def do_uninstall():
         for c in ("emby", "openlist", "autofilm", "mediawarp", "homepage"):
             sh(f"docker rm -f {c}")
     ok("容器已删除")
+    remove_heal_daemon()      # 常驻进程：卸完不该还有一个 media-stack 的进程在跑
 
     if os.path.exists(NGX_SITE):
         os.remove(NGX_SITE)
@@ -8377,6 +8546,7 @@ DOMAIN={cfg['domain']}
     install_sync_cron(cfg["install_dir"])
     install_warm_cron(cfg["install_dir"])
     install_heal_cron(cfg["install_dir"])
+    sync_heal_daemon()
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
@@ -18851,6 +19021,9 @@ if __name__ == "__main__":
                 warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
                 print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
                       f"把那一轮停掉。{RST}")
+        elif arg == "heal-daemon":        # systemd 起的常驻：按下播放就扣 heal-tick 的扳机
+            require_root()
+            do_heal_daemon()
         elif arg == "heal-tick":          # cron 每分钟调的：有人看过片才补一轮
             require_root()
             refresh_heal_cron()           # 自动更新只换脚本，cron 的节奏靠这一句跟上
