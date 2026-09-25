@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.168"
+SCRIPT_VERSION = "1.5.169"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3365,6 +3365,47 @@ def rescue_progress(key):
     save_ms_state(heal_rescue=st)
     heal_log(logs)
     return fixed
+
+
+# 【进度抢救：位置看得更勤一点】tick 一分钟一次，只靠它看位置的话，写回去的续播点
+# 会比真正停下的地方早最多一分钟（实测 FC2-4954902_2：播到 2:15，写回 1:44）。
+# 有正在播、要抢救的那一集时，tick 干完活再每 HEAL_RESCUE_POLL_S 秒看一眼，最多
+# 看 HEAL_RESCUE_LINGER_S 秒 —— 只问本机 Emby，不碰网盘；没有要盯的就立刻退出。
+HEAL_RESCUE_POLL_S = 10
+HEAL_RESCUE_LINGER_S = 40
+
+
+def rescue_linger(key=None):
+    """tick 的尾巴：要抢救的那一集还在播，就每 10 秒记一次位置。不结账（结账归下一轮）。"""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < HEAL_RESCUE_LINGER_S:
+        st = dict(ms_state().get("heal_rescue") or {})
+        now = int(time.time())
+        live = [i for i, e in st.items()
+                if e.get("seen") and not e.get("end") and now - int(e["seen"]) < 150]
+        if not live:
+            return
+        if key is None:
+            key = read_yaml_scalar(os.path.join(ms_install_dir(), "mediawarp", "config",
+                                                "config.yaml"), "auth")
+            if not key:
+                return
+        time.sleep(HEAL_RESCUE_POLL_S)
+        try:
+            sessions = _emby("/Sessions", key, timeout=20) or []
+        except Exception:
+            return
+        st = dict(ms_state().get("heal_rescue") or {})
+        hit = False
+        for se in sessions:
+            iid = str((se.get("NowPlayingItem") or {}).get("Id") or "")
+            if iid in st and iid in live:
+                st[iid]["pos"] = max(0, int((se.get("PlayState") or {}).get("PositionTicks") or 0))
+                st[iid]["seen"] = int(time.time())
+                hit = True
+        save_ms_state(heal_rescue=st)
+        if not hit:
+            return                    # 停了：最后记下的位置离停下的地方不到 10 秒
 
 
 def do_heal_tick(hot_only=False):
@@ -18833,6 +18874,9 @@ if __name__ == "__main__":
                 if has_tty():
                     info("整队补时长正在后台跑 —— 这一轮只补你刚点开的那几条。")
                 _timed("补时长heal", lambda: do_heal_tick(hot_only=True))
+            # 【还攥着 heal-tick 那把锁，顺手把正在播的那几集盯紧一点】见 rescue_linger
+            if not has_tty():
+                rescue_linger()
         elif arg == "heal-trace":         # 替你按一次播放，掐表看多久补上、卡在哪
             require_root()                # 要读 nginx 日志和流水，都是 root-only 的
             _a = [x for x in sys.argv[2:] if x != "--no-play"]
