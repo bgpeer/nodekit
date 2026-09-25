@@ -20,7 +20,7 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-24a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-25a"          # 见 link-history.sh 里的说明：CDN 会缓存
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -238,6 +238,19 @@ try:
     pick = int(os.environ.get("MS_N") or "1")
 except ValueError:
     pick = 1
+# 【第二个参数超出个数时当集号用】「遮天 177」一共才匹配 14 个，177 不可能是"第几个"，
+# 人想查的是第177集。以前悄悄退回第 1 个，查的是第170集，结论全对不上号。
+_raw = (os.environ.get("MS_N") or "").strip()
+if _raw and not (1 <= pick <= len(hit)):
+    _by = [x for x in hit
+           if re.search(r"(?<!\d)" + re.escape(_raw) + r"(?!\d)",
+                        f"{x.get('Name') or ''} {os.path.basename(str(x.get('Path') or ''))}")]
+    if _by:
+        hit = _by
+        pick = 1
+        print(f"  {D}「{_raw}」超出个数，按集号挑：{_by[0].get('Name')}{X}")
+    else:
+        print(f"  {Y}没找到名字里带「{_raw}」的，退回查第 1 个{X}")
 pick = pick if 1 <= pick <= len(hit) else 1
 it = hit[pick - 1]
 if len(hit) > 1:
