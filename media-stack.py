@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.158"
+SCRIPT_VERSION = "1.5.159"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3655,6 +3655,29 @@ def _trace_row(mark, label, text):
     print(f"  {col}{mark}{RST} {pad(label, 18)}{text}", flush=True)
 
 
+def _hit_stem(key, h):
+    """条目对应的 strm 文件名（不带扩展名）。问不到返回 ""。"""
+    try:
+        p = _emby(f"/Users/{h[0]}/Items/{h[1]}", key, timeout=20).get("Path") or ""
+    except Exception:
+        return ""
+    return os.path.splitext(os.path.basename(p))[0]
+
+
+def _list_hits(key, hits, n=10):
+    """对上好几个时列出来。【同名的要带文件名】—— FC2-4954902 这种一部拆成 _1、_2
+    两个文件，Emby 里是两个一模一样的名字，只列名字等于让人两个都挑不中。"""
+    names = [h[2] for h in hits]
+    for h in hits[:n]:
+        tail = ""
+        if names.count(h[2]) > 1:
+            stem = _hit_stem(key, h)
+            tail = f"  {DIM}（文件 {stem}）{RST}" if stem else ""
+        print(f"    {DIM}·{RST} {str(h[2])[:60]}{tail}")
+    if len(hits) > n:
+        print(f"    {DIM}……还有 {len(hits) - n} 个{RST}")
+
+
 def do_heal_trace(q, play=True):
     """media-stack heal-trace <片名>：替你按一次播放，掐表看它多久补上、卡在哪一节。"""
     d = ms_install_dir()
@@ -3728,11 +3751,9 @@ def do_heal_trace(q, play=True):
         return
     if len(hits) > 1:
         warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只掐一集，多给几个词：")
-        for h in hits[:10]:
-            print(f"    {DIM}·{RST} {h[2]}")
-        if len(hits) > 10:
-            print(f"    {DIM}……还有 {len(hits) - 10} 个{RST}")
-        print(f"  {DIM}比如：media-stack heal-trace 完美世界 287{RST}")
+        _list_hits(key, hits)
+        print(f"  {DIM}比如：media-stack heal-trace 完美世界 287；同名的写文件名，"
+              f"比如 media-stack heal-trace {_hit_stem(key, hits[0]) or 'FC2-xxxx_1'}{RST}")
         return
     uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
     st0 = _trace_item(key, uid, iid)
@@ -4022,8 +4043,10 @@ def do_heal_watch(q):
     if len(hits) != 1:
         warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只盯一部。"
              + ("" if hits else "换个写法试试。"))
-        for h in hits[:10]:
-            print(f"    {DIM}·{RST} {h[2]}")
+        if hits:
+            _list_hits(key, hits)
+            print(f"  {DIM}同名的写文件名，比如 media-stack heal-watch "
+                  f"{_hit_stem(key, hits[0]) or 'FC2-xxxx_1'}{RST}")
         return
     uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
     try:
@@ -11490,6 +11513,7 @@ def _heal_one(d, key, _it, base, token):
     if _m3u8:
         _routes.append(("m3u8", _m3u8))
     _routes.append(("整文件", url))
+    _tried = []                       # 这一次真的走过哪几条路 —— 写进结局，别只剩一个「-」
     mins, streams, probed = 0, False, True
     streams_hot = False               # 还原【之前】有没有轨道，见下面那一档
     _via = ""
@@ -11498,6 +11522,7 @@ def _heal_one(d, key, _it, base, token):
     # 那个老毛病上。代价是每条路多一次本机 Emby 读，不碰网盘。
     for _kind, _u in _routes:
         _via = _kind
+        _tried.append(_kind)
         probed = True
         try:
             # 临时切成 URL 形式 —— 只在这几秒钟里是这个样子
@@ -11587,12 +11612,24 @@ def _heal_one(d, key, _it, base, token):
         # 看起来一切正常，点开却是 load fail。重试往往就成了，所以进重试名单。
         return "retry", name, el(), "只探到时长，没有音视频轨（这样点开会 load fail）"
     if streams and not mins:
-        # 【有轨道、没时长：Emby 没重新探】手里那份半截信息它不肯丢，探测请求直接拿
-        # 旧的交差。以前落到下面那条「没有音视频轨」—— 明明有轨道，话是错的，还判了
-        # dead。这不是源的问题，是那半截没清掉，下次再试。
+        _rt = "、".join(_tried) or "-"
+        if _half and not _cleared:
+            # 【有轨道、没时长，而且探之前就是这个样子、没清掉】Emby 手里那份半截
+            # 信息它不肯丢，探测请求直接拿旧的交差。
+            return ("retry", name, el(),
+                    f"只有轨道没有时长 —— Emby 拿着之前那份半截信息没重新探"
+                    f"（先清过一次，没清掉；试了 {_rt}）")
+        # 【探之前是干净的，探完才有轨道没时长】那就不是 Emby 偷懒，是【这个文件的
+        # 文件头里就没有时长】。实测撞上的：FC2-4954902，探之前 0B / 0bps，探完有轨道、
+        # 时长 0。分段式 mp4、ts 这类要把整个文件读完才知道多长，Emby 只读文件头。
+        # 以前这一种也说成"Emby 拿着半截信息没重新探"—— 叫人往错的方向查。
+        # 这种只有 m3u8 那条路救得了（播放列表里每一段都带秒数）：网盘转好码之后
+        # 再点开，或者整队那一轮轮到它，就会走 m3u8。
+        # 【说明压在 60 字以内】流水一行只留说明的前 60 个字，关键的"试了哪条路"
+        # 放后面会被截掉
         return ("retry", name, el(),
-                "只有轨道没有时长 —— Emby 拿着之前那份半截信息没重新探"
-                + ("（先清过一次，没清掉）" if _half and not _cleared else ""))
+                f"探到轨道但文件头里没时长（分段 mp4/ts 常见）；试了 {_rt}"
+                + ("；没转码版，转好码后走 m3u8 就有" if "m3u8" not in _tried else ""))
     if probed:
         # 【探测跑完了、Emby 什么都没找到 = 确定的答案，不是线路抖了一下】
         # 这种再探两次只是把同一个答案买三遍，而一遍的价钱是「全库 × 每个几 MB」。
