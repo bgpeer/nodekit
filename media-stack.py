@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.235"
+SCRIPT_VERSION = "1.5.236"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4243,14 +4243,21 @@ def someone_playing(key, cache_s=0):
 manual_mb = [0.0]          # 最近一次 fill_covers 一共拉了多少 MB（手动那一屏报给人看）
 
 
-def strm_in_mount(d, emby_path, mp):
-    """这个 strm 条目是不是这个盘的（读本机 strm 里写的网盘路径，不碰网盘）。"""
+def strm_in_mount(d, emby_path, mp, mounts=None):
+    """这个 strm 条目是不是这个盘的（读本机 strm 里写的网盘路径，不碰网盘）。
+
+    【点哪个盘只截哪个盘】仓库主人：「我点哪个盘他就运行哪个盘的截图，别搞得我点这个盘
+    把其他盘给扫了」。按前缀认，而且【认最长的那个挂载点】：OpenList 允许 /quark 底下
+    再挂一个 /quark/sub，只看前缀的话点 /quark 会把 /quark/sub 那个盘也截了。"""
     try:
         with open(_strm_host_path(d, emby_path), encoding="utf-8") as f:
             tp = strm_target_path(f.read()) or ""
     except (OSError, TypeError):
         return False
-    return tp == mp or tp.startswith(mp.rstrip("/") + "/")
+    under = lambda m: bool(m) and (tp == m or tp.startswith(m.rstrip("/") + "/"))
+    if not under(mp):
+        return False
+    return not any(under(m) and len(m) > len(mp) for m in (mounts or ()))
 
 
 def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False):
@@ -4296,7 +4303,8 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
 
     allc = cover_candidates(key, d)
     if mount:
-        allc = [x for x in allc if strm_in_mount(d, x[3], mount)]
+        _mts = [str(r[1] or "") for r in _storage_rows(d)]
+        allc = [x for x in allc if strm_in_mount(d, x[3], mount, _mts)]
     todo = (allc if manual else [x for x in allc if not _skip(x[1])])[:room]
     _gave = sum(1 for x in allc if int((fails.get(x[1]) or {}).get("n") or 0) >= COVER_MAX_TRIES)
     if say and _gave and not manual:
@@ -18612,7 +18620,8 @@ def _covers_menu(d, mp):
         print(f"  上一次　{time.strftime('%m-%d %H:%M', time.localtime(last['t']))}　"
               f"截成 {last['n']}/{last['of']} 张　用了约 {CYAN}{last['mb']:.0f} MB{RST}"
               + ("　（中途停了）" if last.get("cut") else ""))
-    todo = [x for x in cover_candidates(key, d) if strm_in_mount(d, x[3], mp)]
+    _mts = [str(r[1] or "") for r in _storage_rows(d)]
+    todo = [x for x in cover_candidates(key, d) if strm_in_mount(d, x[3], mp, _mts)]
     if not todo:
         ok("这个盘的片都有图了。")
         return
