@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.207"
+SCRIPT_VERSION = "1.5.208"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2062,15 +2062,20 @@ def hls_wanted(d):
 # video_preview，和挂载页面用的是同一个），302 给播放器。视频字节照旧是手机直连网盘。
 # 别的盘 / 没开的盘 / 这一部没有转码版本 → 原样交回 MediaWarp，行为和以前一模一样。
 ALI_TC_LEVELS = ("QHD", "FHD", "HD", "SD", "LD")          # 从高到低
-ALI_TC_NAMES = {"QHD": "2K", "FHD": "1080P", "HD": "720P", "SD": "540P", "LD": "360P"}
 ALI_TC_TTL = 600          # 一部片的转码地址缓存多久（阿里给的地址几小时才过期，留足余量）
 ALI_DRIVERS = ("aliyundriveopen",)
 
 
+# 【只有「原画 / 自动最高」两档】仓库主人：「为什么要设置三个段位，把它搞成自动识别
+# 不就好了」—— 删掉了「最高 720P / 540P」（经他同意）。自动 = 这部片有的最高一档，
+# 封顶 1080P（和挂载页面那个播放器一致；2K 那档码率高，跨境拉不动）。
+ALI_TC_AUTO = "FHD"
+
+
 def ali_tc_mounts():
-    """开了「转码流」的阿里盘 → {挂载点: 最高画质}。"""
+    """开了「转码流」的阿里盘 → {挂载点: 封顶档位}。老版本存的 HD / SD 一律按自动算。"""
     v = ms_state().get("ali_transcode") or {}
-    return {m: q for m, q in v.items() if q in ALI_TC_LEVELS}
+    return {m: ALI_TC_AUTO for m, q in v.items() if q in ALI_TC_LEVELS}
 
 
 def ali_tc_pick(data, pref):
@@ -17526,8 +17531,7 @@ def _ali_tc_menu(d, mp):
     """阿里盘在 Emby 里播原画还是阿里的转码流。"""
     cur = ali_tc_mounts().get(mp, "")
     # 【屏上只放选项 + 一行提示】仓库主人：「写这么多干什么，后面这个提示用高亮」
-    opts = [("", "原画")] + [(q, f"阿里转码流 · 最高 {ALI_TC_NAMES[q]}")
-                             for q in ("FHD", "HD", "SD")]
+    opts = [("", "原画"), (ALI_TC_AUTO, "阿里转码流（自动最高）")]
     print("\n" + "-" * 60)
     print(f"  {BOLD}{mp}{RST} 在 Emby 里播什么")
     print("-" * 60)
@@ -17555,7 +17559,7 @@ def _ali_tc_menu(d, mp):
     if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
         apply_nginx_site(cfg3)
     if q and on:
-        ok(f"{mp} 在 Emby 里改播阿里转码流（最高 {ALI_TC_NAMES[q]}）—— 现在去点一部试试")
+        ok(f"{mp} 在 Emby 里改播阿里转码流（自动最高）—— 现在去点一部试试")
     elif q:
         warn("本机那个转发服务没起来，Emby 里照旧播原画。跑「6 链路体检」看原因。")
     else:
@@ -17700,7 +17704,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         if isali:
             _q = ali_tc_mounts().get(mp)
             print(f"  7. Emby 播放画质     当前：{CYAN}"
-                  + (f"阿里转码流 · 最高 {ALI_TC_NAMES[_q]}" if _q else "原画") + RST)
+                  + ("阿里转码流（自动最高）" if _q else "原画") + RST)
         if has115 and mounted:
             print(f"  7. 网盘扫码登录")
         elif has115:
