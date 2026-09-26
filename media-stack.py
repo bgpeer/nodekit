@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.222"
+SCRIPT_VERSION = "1.5.223"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -18366,8 +18366,11 @@ def set_resume_max():
     """「3 后补参数 → 8」：播到百分之几算播放完。存进状态，有 API Key 就当场对齐到各库。"""
     cur = resume_max_pct()
     print()
-    tip(f"{RESUME_MAX_LO}–100，100 = 播完才算，中途退出都记位置（Emby 默认 90）")
-    raw = ask(f"播到几%算播放完（当前 {cur}，回车不改）").strip().rstrip("%％")
+    # 「所有媒体库」= 所有指向 strm 的库（tune_strm_libraries 只动这些）；用户自己另建的
+    # 本地库不碰。仓库主人要求屏上写明是所有媒体库的视频都按这个算。
+    tip("所有媒体库的视频都按这个算；100 = 播完才算，中途退出都记位置")
+    raw = ask(f"播到几%算播放完（{RESUME_MAX_LO}–100，当前 {cur}，回车不改）"
+              ).strip().rstrip("%％")
     if not raw:
         print("没有改动。")
         return
