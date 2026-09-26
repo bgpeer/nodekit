@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.201"
+SCRIPT_VERSION = "1.5.202"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1328,6 +1328,7 @@ def gen_nginx_site(cfg):
         gate_on = heal_gate_ready()
     except Exception:
         gate_on = False
+    ali_on = bool(ali_tc_mounts())
     spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
     if spoof:
         # 两级判断，两个都成立才换：
@@ -1386,6 +1387,15 @@ def gen_nginx_site(cfg):
         # 这条 location 只拦【以 .ts/.m4s 结尾】的那一类，交给本机的小服务回一个
         # 302 指回网盘 —— 视频字节仍然是客户端直连网盘拉的，VPS 只出一个头。
         # 【没有盘用转码流就整段不生成】不给不用的人留一条指向不存在服务的路。
+        _px_mw = f"""        proxy_pass http://127.0.0.1:{port};
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_redirect  off;
+        proxy_buffering off;
+        proxy_read_timeout 3600s;"""
         hls = (f"""
     # 转码流的分片（见 media-stack.py 的 do_hls_fix）：只回 302，不过视频字节
     location ~* ^/(?:emby/)?videos/[0-9]+/[^/]+\\.(?:ts|m4s)$ {{
@@ -1394,6 +1404,24 @@ def gen_nginx_site(cfg):
         proxy_redirect off;
     }}
 """ if sub == "emby" and hls_on else "")
+        # 【阿里转码流】开了的盘，开播那一下先问本机那个小服务：该走转码的回 302 到阿里的
+        # m3u8，别的回 X-Accel-Redirect 原样交给 MediaWarp。服务没起来（502/504）也交给
+        # MediaWarp —— 这一段坏了最多是退回原画，绝不挡播放。
+        if sub == "emby" and hls_on and ali_on:
+            hls += f"""
+    # 阿里转码流（见 media-stack.py 的 ALI_TC_LEVELS 那段）
+    location ~* ^/(?:emby/)?videos/[0-9]+/(?:stream|original)(?:\\.[a-z0-9]+)?$ {{
+        proxy_pass http://127.0.0.1:{hls_port()};
+        proxy_set_header Host $host;
+        proxy_redirect off;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 30s;
+        error_page 502 503 504 = @ms_mw;
+    }}
+    location @ms_mw {{
+{_px_mw}
+    }}
+"""
         # 【先补时长再开播】按下播放的第一个请求（PlaybackInfo）先问一声 do_heal_gate：
         # 这一集缺时长就当场补好再放行，Emby 从这一场一开始就有时长、自己记得住进度。
         # 问不到 / 超时（5xx）→ error_page 原样放行：这一段只会让开播晚几秒，绝不挡播放。
@@ -2011,10 +2039,77 @@ def hls_wanted(d):
     拿这个返回值做决定的地方都要先判 None，见 gen_nginx_site / sync_hls_service。
     """
     try:
-        return [mp for _s, mp, _d, add, _c in _storage_rows(d, strict=True)
-                if is_hls_mode(add)]
+        rows = _storage_rows(d, strict=True)
     except Exception:
         return None
+    tcm = ali_tc_mounts()
+    return [mp for _s, mp, drv, add, _c in rows
+            if is_hls_mode(add)
+            or (mp in tcm and str(drv or "").lower() in ALI_DRIVERS)]
+
+
+# ── 阿里云盘的转码流（给 Emby 用）──────────────────────────────────────────
+# 仓库主人：「阿里云盘在挂载里面播放还挺快的……为什么不先做一个设置 emby 改阿里的转码流」。
+# 挂载页面那个「阿里云视频播放器」播的是阿里自己转好的 m3u8（右下角那个 SD），码率低、
+# 手机直连阿里国内的 CDN，所以流畅；Emby 里播的是原片（1080P mkv），开放平台接口还限速。
+# 阿里的 OpenList 驱动没有夸克那种 link_method 开关，所以由本机那个小服务（do_hls_fix）
+# 接住开了这个开关的盘的 /Videos/<id>/stream：问 OpenList 要转码地址（fs/other 的
+# video_preview，和挂载页面用的是同一个），302 给播放器。视频字节照旧是手机直连网盘。
+# 别的盘 / 没开的盘 / 这一部没有转码版本 → 原样交回 MediaWarp，行为和以前一模一样。
+ALI_TC_LEVELS = ("QHD", "FHD", "HD", "SD", "LD")          # 从高到低
+ALI_TC_NAMES = {"QHD": "2K", "FHD": "1080P", "HD": "720P", "SD": "540P", "LD": "360P"}
+ALI_TC_TTL = 600          # 一部片的转码地址缓存多久（阿里给的地址几小时才过期，留足余量）
+ALI_DRIVERS = ("aliyundriveopen",)
+
+
+def ali_tc_mounts():
+    """开了「转码流」的阿里盘 → {挂载点: 最高画质}。"""
+    v = ms_state().get("ali_transcode") or {}
+    return {m: q for m, q in v.items() if q in ALI_TC_LEVELS}
+
+
+def ali_tc_pick(data, pref):
+    """从 video_preview 的回包里挑一条：不高于 pref 的最高那档；都没有就取有的里最高的。"""
+    try:
+        info_ = (data or {}).get("video_preview_play_info") or data or {}
+        tasks = info_.get("live_transcoding_task_list") or []
+    except AttributeError:
+        return "", ""
+    have = {str(t.get("template_id") or "").upper(): t.get("url")
+            for t in tasks if t.get("url") and str(t.get("status") or "finished") == "finished"}
+    order = list(ALI_TC_LEVELS)
+    start = order.index(pref) if pref in order else 1
+    for q in order[start:] + order[:start]:
+        if have.get(q):
+            return have[q], q
+    return "", ""
+
+
+_ALI_OL_TOK = ["", 0.0]
+
+
+def ali_preview_url(d, tp, pref):
+    """向 OpenList 要这个文件的阿里转码地址 → (m3u8 地址, 档位)。没有 → ("", "")。
+
+    和挂载页面「阿里云视频播放器」同一个接口（fs/other 的 video_preview）。
+    OpenList 的登录令牌缓存一小时；被拒（401）就重登一次。"""
+    for _i in range(2):
+        if not _ALI_OL_TOK[0] or time.time() - _ALI_OL_TOK[1] > 3600 or _i:
+            _ALI_OL_TOK[0], _ALI_OL_TOK[1] = _ol_token(d), time.time()
+        if not _ALI_OL_TOK[0]:
+            return "", ""
+        try:
+            r = _ol_api("/api/fs/other", {"path": tp, "password": "",
+                                          "method": "video_preview"},
+                        _ALI_OL_TOK[0], timeout=20)
+        except Exception:
+            return "", ""
+        if r.get("code") == 401:
+            continue
+        if r.get("code") != 200:
+            return "", ""
+        return ali_tc_pick(r.get("data"), pref)
+    return "", ""
 
 
 def do_hls_fix():
@@ -2096,6 +2191,43 @@ def do_hls_fix():
             cache[vid] = (base, time.time())
         return base
 
+    paths, ali = {}, {}
+
+    def ali_of(vid):
+        """这一集该不该走阿里转码流 → m3u8 地址（不该 / 拿不到 → ""）。"""
+        tcm = ali_tc_mounts()
+        if not tcm or not key:
+            return ""
+        now = time.time()
+        with lock:
+            hit = ali.get(vid)
+            if hit and now - hit[1] < (ALI_TC_TTL if hit[0] else HLS_BASE_FAIL_TTL):
+                return hit[0]
+        url = ""
+        try:
+            ip = paths.get(vid)
+            if ip is None:
+                it = (_emby(f"/Items?Ids={vid}&Fields=Path", key, timeout=10)
+                      .get("Items") or [{}])[0]
+                ip = paths[vid] = str(it.get("Path") or "")
+            hp = _strm_host_path(d, ip)
+            if hp:
+                with open(hp, encoding="utf-8") as f:
+                    tp = strm_target_path(f.read())
+                mp = next((m for m in sorted(tcm, key=len, reverse=True)
+                           if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
+                if mp:
+                    url, _q = ali_preview_url(d, tp, tcm[mp])
+        except Exception:
+            url = ""
+        with lock:
+            ali[vid] = (url, time.time())
+            if url:
+                # 分片是相对路径时，被客户端拼回 Emby 的那些也要能指回去（见 base_of）
+                head = url.split("?", 1)[0]
+                cache[vid] = (head[:head.rfind("/") + 1], time.time())
+        return url
+
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nginx"        # 不自报家门，跟别处口径一致
@@ -2105,6 +2237,21 @@ def do_hls_fix():
             pass                        # 日志走 nginx 那份，这里不另堆
 
         def _go(self):
+            ms = re.match(r"^/(?:[Ee]mby/)?[Vv]ideos/(\d+)/(?:stream|original)(?:\.\w+)?(?:\?|$)",
+                          self.path, re.I)
+            if ms:
+                # 【阿里转码流】开了开关的盘 → 302 到阿里的 m3u8；别的一律原样交回 MediaWarp
+                url = ali_of(ms.group(1))
+                if url:
+                    self.send_response(302)
+                    self.send_header("Location", url)
+                    self.send_header("Cache-Control", "no-store")
+                else:
+                    self.send_response(200)
+                    self.send_header("X-Accel-Redirect", "@ms_mw")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             m = re.match(r"^/(?:[Ee]mby/)?[Vv]ideos/(\d+)/(.+)$", self.path)
             tail = m.group(2) if m else ""
             ext = tail.split("?", 1)[0].rsplit(".", 1)[-1].lower()
@@ -17505,6 +17652,49 @@ def _one_drive_link_menu(d, mp):
                              "挂载页面和外部播放器不受影响")
 
 
+def _ali_tc_menu(d, mp):
+    """阿里盘在 Emby 里播原画还是阿里的转码流。"""
+    cur = ali_tc_mounts().get(mp, "")
+    opts = [("", "原画", "网盘里是什么就播什么；开放平台接口被限速（约 0.8 Mbps），1080P 常卡")]
+    opts += [(q, f"阿里转码流 · 最高 {ALI_TC_NAMES[q]}",
+              "和挂载页面「阿里云视频播放器」同一路，流畅；画质按这一档往下取")
+             for q in ("FHD", "HD", "SD")]
+    print("\n" + "-" * 60)
+    print(f"  {BOLD}{mp}{RST} 在 Emby 里播什么")
+    print("-" * 60)
+    for i, (q, name, why) in enumerate(opts, 1):
+        star = f"  {GREEN}← 现在{RST}" if q == cur else ""
+        print(f"  {i}. {name}{star}")
+        print(f"     {DIM}{why}{RST}")
+    print("  0. 返回")
+    print(f"  {DIM}视频字节都不走 VPS。没有转码版本的片子（刚传上去、阿里还没转完）"
+          f"自动按原画播。{RST}")
+    c = ask("请选择").strip()
+    if not c.isdigit() or not 1 <= int(c) <= len(opts):
+        print("没有改动。")
+        return
+    q = opts[int(c) - 1][0]
+    if q == cur:
+        print("没有改动。")
+        return
+    tc = dict(ms_state().get("ali_transcode") or {})
+    if q:
+        tc[mp] = q
+    else:
+        tc.pop(mp, None)
+    save_ms_state(ali_transcode=tc)
+    on = sync_hls_service(d)
+    cfg3 = rebuild_cfg_from_disk(d)
+    if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
+        apply_nginx_site(cfg3)
+    if q and on:
+        ok(f"{mp} 在 Emby 里改播阿里转码流（最高 {ALI_TC_NAMES[q]}）—— 现在去点一部试试")
+    elif q:
+        warn("本机那个转发服务没起来，Emby 里照旧播原画。跑「6 链路体检」看原因。")
+    else:
+        ok(f"{mp} 在 Emby 里改回原画")
+
+
 def _scan_of(mp):
     """这个盘现在扫什么，一句话。给菜单那一列用。
 
@@ -17647,6 +17837,11 @@ def _drive_menu(d, mp, drv, mounted=True):
               + ("" if (ms_state().get("rename_by_drive") or {}).get(mp)
                  else f"  {DIM}（跟默认）{RST}"))
         has115 = "115" in str(drv)
+        isali = mounted and str(drv or "").lower() in ALI_DRIVERS
+        if isali:
+            _q = ali_tc_mounts().get(mp)
+            print(f"  7. Emby 播放画质     当前：{CYAN}"
+                  + (f"阿里转码流 · 最高 {ALI_TC_NAMES[_q]}" if _q else "原画") + RST)
         if has115 and mounted:
             print(f"  7. 网盘扫码登录")
         elif has115:
@@ -17666,6 +17861,9 @@ def _drive_menu(d, mp, drv, mounted=True):
             continue
         if not mounted and c == "8":
             qr115_login()
+            continue
+        if isali and c == "7":
+            _ali_tc_menu(d, mp)
             continue
         if c == "1":
             _drive_paths_menu(d, mp)
