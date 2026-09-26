@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.202"
+SCRIPT_VERSION = "1.5.203"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -13363,6 +13363,31 @@ def heal_workers():
     return 1 if heal_pace() <= HEAL_PACE_MIN else HEAL_WORKERS
 
 
+def ali_item_m3u8(iid, key):
+    """这个条目在阿里盘上 → 阿里转码 m3u8 地址（没有转码版本回 ""）；不在阿里盘上 → None。
+
+    档位：这个盘在 Emby 里设了转码流就按那一档（探出来的就是播的那一路）；没设就取最高那档，
+    探出来的分辨率离原片最近。时长各档都一样。"""
+    d = ms_install_dir()
+    it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+    hp = _strm_host_path(d, str(it.get("Path") or ""))
+    if not hp:
+        return None
+    with open(hp, encoding="utf-8") as f:
+        tp = strm_target_path(f.read())
+    if not tp:
+        return None
+    best = ""
+    for _s, mp, drv, _a, _c in _storage_rows(d):
+        mp = str(mp or "")
+        if (str(drv or "").lower() in ALI_DRIVERS and mp
+                and (tp == mp or tp.startswith(mp.rstrip("/") + "/")) and len(mp) > len(best)):
+            best = mp
+    if not best:
+        return None
+    return ali_preview_url(d, tp, ali_tc_mounts().get(best) or "QHD")[0]
+
+
 def hls_probe_url(iid, key):
     """这个条目走转码流的话，MediaWarp 会 302 到一份 m3u8 —— 返回那个地址，否则 ""。
 
@@ -13378,6 +13403,16 @@ def hls_probe_url(iid, key):
     不是转码流、或者这个文件在网盘那边没有转码版本（夸克对很多电影就没有，会
     回落成原画），这里就返回 "" —— 调用方照旧走原来那条路，行为不退步。
     """
+    # 【阿里盘先问阿里自己的转码版】仓库主人：「阿里补时长也改成读转码的 m3u8」。
+    # 阿里的驱动没有夸克那种转码开关，问 MediaWarp 只会拿到原片（还要走一次被限速的
+    # 换直链）。所以阿里盘直接向 OpenList 要转码 m3u8；没有转码版本就回 ""，调用方
+    # 照旧走整文件 —— 不再白问一次 MediaWarp。
+    try:
+        _a = ali_item_m3u8(iid, key)
+        if _a is not None:
+            return _a
+    except Exception:
+        pass
     self_touch(iid)                   # 这是补时长自己的请求，别被当成有人点了播放
     try:
         op = urllib.request.build_opener(_NoRedirect)
