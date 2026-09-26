@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.233"
+SCRIPT_VERSION = "1.5.234"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4240,11 +4240,30 @@ def someone_playing(key, cache_s=0):
     return on
 
 
-def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
+manual_mb = [0.0]          # 最近一次 fill_covers 一共拉了多少 MB（手动那一屏报给人看）
+
+
+def strm_in_mount(d, emby_path, mp):
+    """这个 strm 条目是不是这个盘的（读本机 strm 里写的网盘路径，不碰网盘）。"""
+    try:
+        with open(_strm_host_path(d, emby_path), encoding="utf-8") as f:
+            tp = strm_target_path(f.read()) or ""
+    except (OSError, TypeError):
+        return False
+    return tp == mp or tp.startswith(mp.rstrip("/") + "/")
+
+
+def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False):
     """给没封面的截一帧。返回截成了几张。say 给了就把每一张的结果打出来（手动跑时）。
 
-    【有人在看片就不截】截一张要去网盘拉几 MB，跟看片的人抢同一个账号的速度。"""
-    if someone_playing(key):
+    【有人在看片就不截】截一张要去网盘拉几 MB，跟看片的人抢同一个账号的速度。
+
+    mount / manual：「4 挂载路径 → 选盘 → 截封面」—— 仓库主人：「每个盘做一个按钮，
+    这个只有你点一次这个盘没有刮削的没图的全部刷新一次，不受自动的限制」。
+    manual=True 时不管每小时几张、一天几张 / 几 MB、失败隔多久再试、有没有人在看；
+    只留【每一张】的保险（不认跳转的源不拉、一张超过 COVER_ONE_MB 当场掐）—— 那不是
+    自动的限制，是防一张片拉掉几个 GB。手动截的流量不记进自动那本账。"""
+    if not manual and someone_playing(key):
         if say:
             say("有人在看片 —— 截封面先让路，等没人看了再截（每小时那一轮会接着来）。")
         return 0
@@ -4257,12 +4276,12 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         save_ms_state(cover_fail={}, cover_day=day, cover_meter_v=2)
     # 【流量闸】一张正常的封面是几 MB。一天用掉 COVER_DAY_MB 就停 —— 张数封顶管不住
     # "一张拉了一个 GB"那种
-    if float(day.get("mb") or 0) >= COVER_DAY_MB:
+    if not manual and float(day.get("mb") or 0) >= COVER_DAY_MB:
         if say:
             say(f"今天截封面已经用了 {float(day.get('mb') or 0):.0f} MB"
                 f"（一天最多 {COVER_DAY_MB} MB），明天接着来。")
         return 0
-    room = min(limit, COVER_DAY_MAX - int(day.get("n") or 0))
+    room = (10 ** 9 if manual else min(limit, COVER_DAY_MAX - int(day.get("n") or 0)))
     if room <= 0:
         if say:
             say(f"今天已经截了 {day.get('n')} 张（一天最多 {COVER_DAY_MAX}），明天接着来。")
@@ -4276,9 +4295,11 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
                 or _now - float(f.get("t") or 0) < COVER_RETRY_H * 3600)
 
     allc = cover_candidates(key, d)
-    todo = [x for x in allc if not _skip(x[1])][:room]
+    if mount:
+        allc = [x for x in allc if strm_in_mount(d, x[3], mount)]
+    todo = (allc if manual else [x for x in allc if not _skip(x[1])])[:room]
     _gave = sum(1 for x in allc if int((fails.get(x[1]) or {}).get("n") or 0) >= COVER_MAX_TRIES)
-    if say and _gave:
+    if say and _gave and not manual:
         say(f"· {_gave} 部截了 {COVER_MAX_TRIES} 次都没成，不再试"
             f"（想重来：media-stack covers --retry）")
     if not todo:
@@ -4292,9 +4313,10 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         base = ""
     made = dict(ms_state().get("cover_made") or {})
     done, logs = 0, []
+    manual_mb[0] = 0.0
     meter, _mlab = _heal_meter()
     for uid, iid, name, path, secs in todo:
-        if someone_playing(key, cache_s=30):
+        if not manual and someone_playing(key, cache_s=30):
             if say:
                 say("有人开始看片了 —— 剩下的先不截，让路。")
             break
@@ -4347,9 +4369,11 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             if jpg or _cover_meter_mb(_rx0, meter) > COVER_ONE_MB:
                 break
         ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
-        day["n"] = int(day.get("n") or 0) + 1
         _mb = _cover_meter_mb(_rx0, meter)
-        day["mb"] = round(float(day.get("mb") or 0) + _mb, 1)
+        manual_mb[0] += _mb
+        if not manual:
+            day["n"] = int(day.get("n") or 0) + 1
+            day["mb"] = round(float(day.get("mb") or 0) + _mb, 1)
         # 【一张就吃掉几十 MB = 这个源跳不过去】多半是不认 Range、只能从头顺着读。
         # 再试也一样贵，直接判"不再试"
         _heavy = _mb > COVER_ONE_MB or (no_range and not jpg)
@@ -4372,7 +4396,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
                     + f"  {_mb:.0f}MB  {str(name)[:40]}{_log_tag(iid)}")
         if say:
             say(("✔ " if ok_ else "✖ ") + logs[-1].split("---- 封面：", 1)[1])
-        if float(day["mb"]) >= COVER_DAY_MB:
+        if not manual and float(day.get("mb") or 0) >= COVER_DAY_MB:
             if say:
                 say(f"今天截封面的流量到 {COVER_DAY_MB} MB 了，剩下的明天再截。")
             break
@@ -18528,6 +18552,11 @@ def _drive_menu(d, mp, drv, mounted=True):
             print(f"  7. ＋ 添加 WebDAV")
         elif not mounted:
             print(f"  7. 扫码挂上")
+        # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
+        cov_no = ""
+        if mounted:
+            cov_no = "8" if (isali or has115 or isdav) else "7"
+            print(f"  {cov_no}. 截封面              {DIM}没图的全部截一次{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -18535,6 +18564,9 @@ def _drive_menu(d, mp, drv, mounted=True):
             return
         if not mounted and c in ("1", "2", "3", "5"):
             warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— 先选 7 挂上。")
+            continue
+        if cov_no and c == cov_no:
+            _covers_menu(d, mp)
             continue
         if isdav and c == "7":
             _add_webdav_flow(d)
@@ -18564,6 +18596,29 @@ def _drive_menu(d, mp, drv, mounted=True):
             qr115_login()
         else:
             print("无效选择。")
+
+
+def _covers_menu(d, mp):
+    """「截封面」：这个盘里没图的，全部截一次。不受自动那几道闸，但要花 VPS 流量。"""
+    key = read_emby_api_key(d)
+    if not key:
+        warn("没有 Emby API Key（「3 后补参数 → 1」），问不了 Emby。")
+        return
+    todo = [x for x in cover_candidates(key, d) if strm_in_mount(d, x[3], mp)]
+    if not todo:
+        ok("这个盘的片都有图了。")
+        return
+    tip("从网盘拉片子截帧，消耗 VPS 流量（每张几 MB；一张超过 40 MB 当场掐断）")
+    if not ask_yn(f"{mp} 有 {len(todo)} 部没图，全部截一次？", False):
+        print("没有改动。")
+        return
+    try:
+        n = fill_covers(d, key, say=lambda t: print(f"  {t}"), mount=mp, manual=True)
+    except KeyboardInterrupt:
+        print()
+        warn("已中断。")
+        return
+    ok(f"截成 {n}/{len(todo)} 张，用了约 {manual_mb[0]:.0f} MB")
 
 
 def _apply_autofilm_cron(d):
