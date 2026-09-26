@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.203"
+SCRIPT_VERSION = "1.5.204"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -17690,20 +17690,18 @@ def _one_drive_link_menu(d, mp):
 def _ali_tc_menu(d, mp):
     """阿里盘在 Emby 里播原画还是阿里的转码流。"""
     cur = ali_tc_mounts().get(mp, "")
-    opts = [("", "原画", "网盘里是什么就播什么；开放平台接口被限速（约 0.8 Mbps），1080P 常卡")]
-    opts += [(q, f"阿里转码流 · 最高 {ALI_TC_NAMES[q]}",
-              "和挂载页面「阿里云视频播放器」同一路，流畅；画质按这一档往下取")
-             for q in ("FHD", "HD", "SD")]
+    # 【屏上只放选项 + 一行提示】仓库主人：「写这么多干什么，后面这个提示用高亮」
+    opts = [("", "原画")] + [(q, f"阿里转码流 · 最高 {ALI_TC_NAMES[q]}")
+                             for q in ("FHD", "HD", "SD")]
     print("\n" + "-" * 60)
     print(f"  {BOLD}{mp}{RST} 在 Emby 里播什么")
     print("-" * 60)
-    for i, (q, name, why) in enumerate(opts, 1):
+    for i, (q, name) in enumerate(opts, 1):
         star = f"  {GREEN}← 现在{RST}" if q == cur else ""
         print(f"  {i}. {name}{star}")
-        print(f"     {DIM}{why}{RST}")
     print("  0. 返回")
-    print(f"  {DIM}视频字节都不走 VPS。没有转码版本的片子（刚传上去、阿里还没转完）"
-          f"自动按原画播。{RST}")
+    print(f"  {YELLOW}{BOLD}提示：原画如果没有阿里会员会被阿里限速（约 0.8 Mbps）。"
+          f"阿里转码有损画质最高 1080P{RST}")
     c = ask("请选择").strip()
     if not c.isdigit() or not 1 <= int(c) <= len(opts):
         print("没有改动。")
