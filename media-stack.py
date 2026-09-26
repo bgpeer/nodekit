@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.214"
+SCRIPT_VERSION = "1.5.215"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10994,7 +10994,7 @@ def last_played_ts(key):
     return best if asked else None
 
 
-def items_without_duration(key, scope=None):
+def items_without_duration(key, scope=None, need="any"):
     """Emby 里还没探测出时长的影视条目 [(id, 名字), ...]。
 
     scope 只有两个取值，而且【都不是用户设的】：默认只给出【你点开过的】那批
@@ -11067,6 +11067,10 @@ def items_without_duration(key, scope=None):
             no_streams = not ((i.get("MediaStreams") or [])
                               or any(s.get("MediaStreams") for s in srcs))
             if not (no_dur or no_streams):
+                continue
+            # need="duration"：只要缺【时长】的 —— 体检用。仓库主人：「兄弟和老婆有时长只是
+            # 没有刮削」—— 只缺轨道的点开时会先补再播，不影响进度记忆，不该算成问题
+            if need == "duration" and not no_dur:
                 continue
             if want is not None and str(i.get("Id")) not in want:
                 continue          # 没点开过，补出来的进度条给谁用
@@ -13266,10 +13270,15 @@ def heal_media_info(d, key, budget=None, items=None):
         _loose = [x for x in allpend if heal_unstuck(x[1], _now_s)]
         if _loose:
             allpend = [x for x in allpend if not heal_unstuck(x[1], _now_s)]
-            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
-                      f"跳过 {len(_loose)} 个补上又掉了的（{HEAL_STICK_H} 小时内不再探）："
-                      + "、".join(str(x[2])[:20] for x in _loose[:6])
-                      + ("…" if len(_loose) > 6 else "")])
+            # 【同一批只记一次】真机流水一天 24 行一模一样的「跳过 34 个…」，把真正补了什么
+            # 挤得找不到。名单变了才再记
+            _sig = ",".join(sorted(str(x[1]) for x in _loose))
+            if ms_state().get("heal_loose_sig") != _sig:
+                save_ms_state(heal_loose_sig=_sig)
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+                          f"跳过 {len(_loose)} 个补上又掉了的（{HEAL_STICK_H} 小时内不再探）："
+                          + "、".join(str(x[2])[:20] for x in _loose[:6])
+                          + ("…" if len(_loose) > 6 else "")])
             if not allpend:
                 return
     # 【没探也要进流水】cron 那几轮的输出全进 /dev/null。只记"探了什么"不记"为什么
@@ -20468,23 +20477,26 @@ def do_healthcheck():
                 # 互相打架。实际规则是：没点开过的不补（补出来的进度条没人用），点开那一刻
                 # 「先补再播」当场补上；只补点开过的那批。所以没点开过的是正常状态，不报错。
                 # 缺时长 → 看一半退出会被当成看完；缺轨道 → 点开时现场探一次，源在限流就 load fail
-                _inb_items = items_without_duration(key)
+                _inb_items = items_without_duration(key, need="duration")
                 _inb = len(_inb_items)
+                _clk = len(items_without_duration(key))       # 点开过、缺时长或轨道的
+                _trk = max(0, _clk - _inb)                     # 其中只缺轨道的
                 _per = min(max(HEAL_LIMIT, len(nodur) // 8), heal_pace())
-                _rest = len(nodur) - _inb
+                _rest = len(nodur) - _clk
                 _how = "点开时先补再播" if heal_gate_ready() else "点开时现场探一次"
                 if _inb:
                     names = "、".join(x[2] for x in _inb_items[:3]) + (
                         f" 等 {_inb} 个" if _inb > 3 else "")
                     _hc("条目时长", "warn",
-                        f"点开过还没补上：{names}"
-                        + (f"{DIM}　另 {_rest} 个没点开过（{_how}）{RST}" if _rest else ""))
+                        f"点开过还缺时长：{names}"
+                        + (f"{DIM}　另 {_trk} 个只缺音视频轨、{_rest} 个没点开过（{_how}）{RST}"))
                     todo.append((f"{_inb} 个点开过的条目还没补上时长 —— 看一半退出会被当成看完",
                                  f"在自动补（每批 {_per} 个），不用管；急的话 "
                                  f"media-stack heal <片名> 马上补那一部"))
                 else:
                     _hc("条目时长", "ok",
-                        f"点开过的都有{DIM}　另 {_rest} 个没点开过（{_how}）{RST}")
+                        f"点开过的都有时长{DIM}　另 {_trk} 个只缺音视频轨、"
+                        f"{_rest} 个没点开过（{_how}）{RST}")
             elif slibs:
                 _hc("条目时长", "ok", "都有")
 
