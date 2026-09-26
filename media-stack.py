@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.204"
+SCRIPT_VERSION = "1.5.205"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -16444,13 +16444,12 @@ def _qr115_show(uid, at=0):
     print(f"  {BOLD}当前令牌{RST}   {GREEN}{BOLD}{uid}{RST}{age}")
     print(f"  {BOLD}二维码{RST}     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
     print()
-    print(f"  {DIM}OpenList → 管理 → 存储 → 添加 → 驱动选「115 网盘」，然后：{RST}")
-    print(f"     Cookie       {DIM}留空{RST}")
-    print(f"     二维码令牌   {GREEN}上面那串{RST}")
-    print(f"     二维码源     {GREEN}{BOLD}网页{RST}"
-          f"   {DIM}← 必须是网页，选安卓/TV 会报「系统已下架」{RST}")
-    print(f"     根文件夹ID   {GREEN}{BOLD}0{RST}")
-    print(f"     挂载路径     {GREEN}{BOLD}/115{RST}   {DIM}（自己定，别和已有的重名）{RST}")
+    if _QR115_AUTOMOUNT[0]:
+        return                        # 脚本自己去 OpenList 挂，不用教人手填
+    print(f"  OpenList → 管理 → 存储 → 添加 → 驱动「115 网盘」：")
+    print(f"     Cookie 留空 · 二维码令牌 {GREEN}上面那串{RST} · 二维码源 {GREEN}{BOLD}网页{RST}"
+          f" · 根文件夹ID {GREEN}{BOLD}0{RST} · 挂载路径 {GREEN}{BOLD}/115{RST}")
+    tip("二维码源必须选「网页」，选安卓 / TV 会报「系统已下架」")
 
 
 def _qr115_new():
@@ -16471,11 +16470,10 @@ def _qr115_new():
 
     _qr115_show(uid)
     print()
-    print(f"  {BOLD}怎么扫{RST}：手机浏览器打开上面那个二维码地址 → 长按存图 →")
-    print(f"          115 App → 扫一扫 → {BOLD}从相册{RST}选那张图 → 确认登录")
-    print(f"  {DIM}（二维码和手机是同一台设备，扫不了自己的屏幕，只能走相册）{RST}")
+    print(f"  {BOLD}怎么扫{RST}：手机浏览器打开二维码地址 → 长按存图 → "
+          f"115 App 扫一扫 → {BOLD}从相册{RST}选图 → 确认登录")
     print()
-    info("等你扫码确认，最多 5 分钟。Ctrl-C 可以中断，令牌已经存下来了。")
+    info("等你扫码确认，最多 5 分钟（Ctrl-C 可中断）")
 
     state, last_err = None, ""
     deadline = time.time() + 300
@@ -16581,13 +16579,12 @@ def _add115_flow(d):
         ok(f"115 已挂上：{MOUNT_115}")
     elif good:
         warn(f"存储建好了，但 OpenList 说：{why}")
-        print(f"  {DIM}多半是令牌过期了 —— 选「7 网盘扫码登录」再扫一次，"
-              f"然后到 OpenList 里把这个存储的令牌换成新的。{RST}")
+        tip("多半是令牌过期了：选「7 网盘扫码登录」再扫一次，到 OpenList 里换上新令牌")
     else:
         err(f"没挂上：{why}")
         ask("\n按回车返回...")
         return False
-    print(f"  {DIM}接下来：1 扫描路径，加上要进 Emby 的目录。{RST}")
+    tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -16626,8 +16623,6 @@ def qr115_login():
         print("-" * 60)
         print(f"  {BOLD}115 网盘扫码登录{RST}")
         print("-" * 60)
-        print(f"  {DIM}OpenList 的「115 网盘」驱动要一个「二维码令牌」，但它自己不生成")
-        print(f"  二维码，界面上也没说这串东西从哪来。这个按钮替你走完 115 的扫码流程。{RST}")
         if uid:
             _qr115_show(uid, at)
             print()
@@ -16635,20 +16630,15 @@ def qr115_login():
             st_code, st_txt = qr115_status(uid, st.get("qr115_tm"), st.get("qr115_sign"))
             col = {2: GREEN, -1: RED, -2: RED}.get(st_code, YELLOW)
             print(f"\r\x1b[2K  {BOLD}状态{RST}       {col}{st_txt}{RST}")
-            if st_code == 2:
-                print(f"  {DIM}直接拿去填 OpenList 就行。{RST}")
-            elif st_code in (-1, -2):
-                print(f"  {DIM}这串已经没用了，选 1 重新制作。{RST}")
-            else:
-                print(f"  {DIM}扫码会话是分钟级的，隔一段时间没扫就会失效 —— "
-                      f"拿不准就选 1 重做一个，很快。{RST}")
+            if st_code in (-1, -2):
+                print(f"  {DIM}选 1 重新制作。{RST}")
         else:
             print()
             print(f"  {DIM}还没生成过令牌。{RST}")
         print()
         # 一个按钮按当前状态走两条路:没有就直接做,有了先问 —— 刷新会让旧令牌作废,
         # 而用户很可能只是回来看一眼那串东西,不该顺手把它废掉
-        print(f"  1. 制作二维码" + (f"{DIM}（已有一个，会先问要不要刷新）{RST}" if uid else ""))
+        print(f"  1. 制作二维码")
         print(f"  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -16659,9 +16649,7 @@ def qr115_login():
             continue
         if uid:
             print()
-            warn("已经有一个令牌了，重新制作会让上面那串立刻作废。")
-            print(f"  {DIM}OpenList 里如果已经用它挂好了存储，那个存储不受影响"
-                  f"（它早换成 cookie 了）。{RST}")
+            tip("重新制作会让上面那串立刻作废（已经挂好的存储不受影响）")
             if not ask_yn("确定要重新制作吗？", False):
                 continue
         _qr115_new()
@@ -17059,13 +17047,11 @@ def _drive_paths_menu(d, mp):
         eaten = [p for p in exp if p not in merged]
         added = [p for p in merged if p not in exp]
         if not added:
-            print(f"  {DIM}{'、'.join(got)} 已经在正在扫的路径底下了 ——"
-                  f" 父目录扫的时候本来就包含它，没有加。{RST}")
+            print(f"  {DIM}{'、'.join(got)} 已经包含在别的扫描路径里，没有加{RST}")
             continue
         save_ms_state(scan_spec=merged)
         if eaten:
-            print(f"  {DIM}去掉 {'、'.join(eaten)}：它在刚加的路径底下，"
-                  f"留着也是扫同一批文件{RST}")
+            print(f"  {DIM}去掉 {'、'.join(eaten)}（已包含在刚加的路径里）{RST}")
         _apply_scan_paths(d, f"加了 {'、'.join(added)}，")
 
 
@@ -17133,19 +17119,17 @@ def _rename_menu(d, mp=None):
         else:
             print(f"  默认（没单独设过的盘都用它）当前："
                   f"{CYAN}{BOLD}{names.get(dflt, dflt)}{RST}")
-        print(f"  {DIM}清洗＝去掉 [[豆瓣6].1分] 这类前缀、4K/国粤双语/BD1080p 这类标记，"
-              f"留下「片名 (年份)」。{RST}")
-        print(f"  {DIM}名字本来就规矩的一个都不动；清出来只剩数字的（集号）也不动。{RST}")
         print(f"  1. 网盘原名")
         print(f"  2. 清洗后的名字")
         if mp:
             print(f"  3. 跟默认走{DIM}（{names.get(dflt, dflt)}）{RST}")
         # 【按钮名是个名词，不是一句话】别的每一行都是两三个字的标签，只有这一行
         # 原来写成「先看看会改成什么（只看，不动文件）」—— 菜单是用来扫的。
-        print(f"  4. 预览              {DIM}只列，不动文件{RST}")
+        print(f"  4. 预览")
         print(f"  5. 撞名的怎么办      当前：{CYAN}"
               + ("加后缀区分" if clash_policy() == "suffix" else "保持原样") + RST)
         print(f"  0. 返回")
+        tip("清洗 = 去掉评分、4K、国粤双语这类标记，只留「片名 (年份)」；只改本机 strm，不动网盘")
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
@@ -17161,14 +17145,11 @@ def _rename_menu(d, mp=None):
                 print(f"    → {GREEN}{b}{RST}")
             if len(pv) > 15:
                 print(f"  {DIM}… 还有 {len(pv) - 15} 个{RST}")
-            print(f"  {DIM}改的只是本机 strm 的文件名，网盘里的文件一个都不碰。{RST}")
             continue
         if c == "5":
             print()
-            print(f"  {DIM}两个不同的文件清出同一个片名时怎么办。{RST}")
-            print(f"  1. 保持原样{DIM}　这几个不改名，顶着网盘原名留在库里{RST}")
-            print(f"  2. 加后缀区分{DIM}　把原名里被清掉的标记接回片名后面："
-                  f"片名 (2015) - BD720P，一部都不少{RST}")
+            print(f"  1. 保持原样")
+            print(f"  2. 加后缀区分        {DIM}片名 (2015) - BD720P{RST}")
             print(f"  0. 返回")
             v = ask("请选择").strip()
             if v == "1":
@@ -17199,8 +17180,6 @@ def _rename_menu(d, mp=None):
         n = len(rename_preview(d, mp))
         if n and ask_yn(f"现在就把这 {n} 个 strm 改过来？", True):
             migrate_strm_layout(d, key)
-        elif n:
-            print(f"  {DIM}下一轮「5 生成媒体库」或每天的对齐会做。{RST}")
         return
 
 
@@ -17285,39 +17264,31 @@ def _alipan_channel_menu(d, mp):
     tok_fits = ((shape == "jwt" and other == "default")
                 or (shape == "other" and other == "alipanTV"))
     print()
-    for k, (name, why, page) in ALIPAN_TYPES.items():
+    for k, (name, _why, _page) in ALIPAN_TYPES.items():
         star = f"  {GREEN}← 现在{RST}" if k == cur else ""
-        print(f"  {DIM}·{RST} {BOLD}{name}{RST} {DIM}[{k}]{RST}{star}")
-        print(f"      {DIM}{why}{RST}")
-    print()
+        print(f"  · {name}{star}")
     print(f"  1. 换成「{ALIPAN_TYPES[other][0]}」")
     print("  0. 返回")
+    tip("开放平台接口被阿里限速（约 0.8 Mbps）；TV 客户端接口不限速，但要另扫 TV 版二维码取令牌")
     if ask("请选择").strip() != "1":
         print("没有改动。")
         return
 
     if tok_fits:
         print()
-        print(f"  {DIM}库里现有的令牌正好是「{ALIPAN_TYPES[other][2]}」那条路取的，"
-              f"不用重新扫码。{RST}")
+        print(f"  {DIM}现有的令牌就是这条路的，不用重新扫码。{RST}")
         if not ask_yn(f"直接换成「{ALIPAN_TYPES[other][0]}」？", True):
             print("没有改动。")
             return
         _write_addition(d, [(sid, mp)], {"alipan_type": other})
-        print(f"  {DIM}挂上没有：跑「6 链路体检」，或者 bash tools/ali-token.sh{RST}")
         return
 
-    # 【先把令牌要到手，再动类型】只翻类型 = 必定挂不上，见函数开头
+    # 【先把令牌要到手，再动类型】只翻类型 = 必定挂不上，见函数开头。
+    # 那个网站是第三方的，会挂：弹「获取秘钥失败」是它自己的接口没通，不是你填错了
     print()
-    warn("类型和令牌必须一起换，只改类型这个盘会挂不上。")
     print(f"  取令牌：{CYAN}{BOLD}https://api.oplist.org/{RST}"
-          f"　选 {BOLD}{ALIPAN_TYPES[other][2]}{RST}　只要{BOLD}刷新令牌{RST}")
-    # 【那个网站是第三方的，会挂】实测点「获取 Token」直接弹「获取秘钥失败」——
-    # 那是它自己的接口返回了非 200，跟这边的配置无关，重试或换国内站有时就好了。
-    # 不写这一句的话，人会以为是自己哪一步做错了，在配置里反复折腾。
-    print(f"  {DIM}它弹「获取秘钥失败」= 那个网站自己的接口没通，不是你填错了。"
-          f"换 https://api.oplist.org.cn/ 或者过一会儿再试{RST}")
-    print()
+          f"（打不开换 .cn）　选「{ALIPAN_TYPES[other][2]}」　只要刷新令牌")
+    tip("类型和令牌必须一起换；网站弹「获取秘钥失败」是它自己没通，过一会儿再试")
     tok = ask("把刷新令牌粘在这里（留空取消）").strip()
     if not tok:
         print("已取消，一个字都没改。")
@@ -17326,33 +17297,18 @@ def _alipan_channel_menu(d, mp):
     # 形态和要换的通道对不上就是刚才那个坑，当场拦住比事后报错强。
     looks_jwt = tok.count(".") == 2 and tok.startswith("ey")
     if (other == "alipanTV") == looks_jwt:
-        warn(f"这串看着不像「{ALIPAN_TYPES[other][2]}」取的令牌。")
-        # 【把证据摆出来，别只说"看着不像"】JWT 里的 aud 就是发它的那个应用 id，而开放平台
-        # 发的直链里那个 ap= 参数是同一个值。两边一样，就说明这串还是开放平台那条路取的。
-        # 【为什么必须拦住】这种配错【当场是好的】：刚换完能换直链、能播，一小时内访问令牌
-        # 到期、拿它去续，官方 API 回空，整个盘掉线 —— 已经发生过两次。
-        aud = _jwt_field(tok, "aud")
-        if aud:
-            print(f"  {DIM}它的 aud（发证应用）= {aud}{RST}")
-            print(f"  {DIM}开放平台发的直链里 ap= 就是这个值 —— 同一个应用，"
-                  f"也就是说这串是「{ALIPAN_TYPES['default'][2]}」那条路取的{RST}")
-        print(f"  {YELLOW}配错的表现很骗人：现在能用，一小时内令牌一续期就整个盘掉线{RST}")
-        # 【多半不是你选错了】看过 api.oplist.org 的前端源码（public/static/login.js）：
-        # 扫完码去兑换令牌那一步调的是 /alicloud/callback，参数里【没有 driver_txt】——
-        # 扫 TV 码和扫 OAuth2 码走的是同一个兑换接口。所以扫了 TV 的二维码、
-        # 拿回来的照样可能是开放平台的令牌。实测就是这样。
-        # 不写这一句，人会以为是自己选错了下拉框，反复重扫、甚至把存储删掉重建。
-        if other == "alipanTV":
-            print(f"  {DIM}顺带：那个站扫完码去兑换的那一步（/alicloud/callback）"
-                  f"参数里不带类型，扫 TV 码也可能拿回开放平台的令牌 —— "
-                  f"多半不是你选错了。重扫、删存储重建都改不了这一点{RST}")
+        # 【必须拦住】这种配错当场是好的，一小时内令牌续期时官方 API 回空、整个盘掉线
+        # （发生过两次）。JWT 的 aud 就是发证应用 id，和开放平台直链里 ap= 同一个值。
+        # api.oplist.org 扫完码兑换那一步（/alicloud/callback）不带类型，扫 TV 码也可能
+        # 拿回开放平台的令牌 —— 多半不是用户选错了
+        warn(f"这串不像「{ALIPAN_TYPES[other][2]}」取的令牌")
+        tip("配错了现在能用，一小时内令牌续期就整个盘掉线")
         if not ask_yn("仍然用它？", False):
             print("已取消，一个字都没改。")
             return
     _write_addition(d, [(sid, mp)],
                     {"alipan_type": other, "refresh_token": tok},
                     quiet_keys=("refresh_token",))
-    print(f"  {DIM}挂上没有：跑「6 链路体检」，或者 bash tools/ali-token.sh{RST}")
 
 
 def _ali_storages(d):
@@ -17576,13 +17532,9 @@ def _one_drive_link_menu(d, mp):
             _alipan_channel_menu(d, mp)
             continue
         print()
-        for v, name, why in opts:
+        for j, (v, name, _w) in enumerate(opts, 1):
             star = f"  {GREEN}← 现在{RST}" if v == cur else ""
-            print(f"  {DIM}·{RST} {BOLD}{name}{RST}" + opt_tag(key, v) + star)
-            print(f"      {DIM}{why}{RST}")
-        print()
-        for j, (_v, name, _w) in enumerate(opts, 1):
-            print(f"  {j}. 换成「{name}」")
+            print(f"  {j}. {name}" + opt_tag(key, v) + star)
         print("  0. 返回")
         t = ask("请选择").strip()
         if not (t.isdigit() and 1 <= int(t) <= len(opts)):
@@ -17599,38 +17551,18 @@ def _one_drive_link_menu(d, mp):
         if where == "ua":
             # 【这一项不写 OpenList 的库，写 nginx】所以要当场重生成站点配置。
             # apply_nginx_site 自带 nginx -t + 失败回滚，节点配置动不了。
+            _drv0 = next((r[2] for r in _storage_rows(d) if r[1] == mp), "")
             if val == "spoof":
-                warn("开了之后，这个盘的探测会真的打到上游去。")
-                print(f"  {DIM}上游按 UA 挡人的话这条能救活；但探测量大，上游也可能"
-                      f"转而按频率限【整个源】—— 表现是挂载页面也连不上。{RST}")
-                _drv0 = next((r[2] for r in _storage_rows(d) if r[1] == mp), "")
-                if has_cdn_link(_drv0):
-                    # 【这个开关是给 WebDAV 源准备的】阿里、夸克、115 这类网盘发的
-                    # 直链常常绑请求方，换了 UA 反而直接被拒。它们只有在被强行改成
-                    # 本机代理之后才会看见这一项 —— 那本身多半就是个误操作。
-                    print(f"  {YELLOW}这个盘有自己的 CDN 直链，而那种直链常常"
-                          f"【绑请求方】—— 换了 UA 反而可能被拒。{RST}")
-                    print(f"  {DIM}这个开关是给「上游按 UA 挡人」的 WebDAV 源准备的，"
-                          f"套到这类盘上多半帮倒忙。{RST}")
-                print(f"  {DIM}开完去挂载页面播一部片子确认一下；不对劲就回这里关掉。{RST}")
+                # 开：探测真的打到上游，上游可能改按频率限整个源；自带 CDN 直链的盘
+                # （阿里、夸克、115）直链常绑请求方，换 UA 反而可能被拒
+                tip("开了之后探测会真的打到上游，上游可能转而限流整个源"
+                    + ("；这个盘有自己的 CDN 直链，换 UA 反而可能被拒" if has_cdn_link(_drv0) else ""))
                 if not ask_yn(f"确定给 {mp} 开启？", False):
                     print("没有改动。")
                     continue
             else:
-                # 【关掉也要拦一下，而且拦得比开启还要紧】开启是"多一层伪装"，
-                # 关掉是【可能直接把这个盘弄成播不了】：上游按 UA 挡探测的源，
-                # 关掉之后 Emby 的 ffprobe 就是 403/429，条目有时长、媒体流 0 条、
-                # 点开 load fail。上一版这一支一句话都没有，静默就关了 ——
-                # 实测代价：整个盘当场播不了，而人不知道是这一下造成的。
-                warn("关掉之后，Emby 的探测会用 ffmpeg 的 UA（Lavf/…）去问上游。")
-                print(f"  {DIM}上游要是按 UA 挡探测（403/429），这个盘会变成"
-                      f"「条目有时长、媒体流 0 条、点开 load fail」—— 也就是整个盘"
-                      f"播不了。这个开关本来就是为那种源加的。{RST}")
-                print(f"  {YELLOW}别拿速度数字做这个决定{RST}"
-                      f"{DIM}（why-stall.sh 的 ④b 量的是快慢，不是过不过得去；"
-                      f"而且开着的时候那张表本身就是被改写过的）。{RST}")
-                print(f"  {DIM}关完【立刻去 Emby 里点开一部这个盘的片子】，"
-                      f"播不了就回这里开回来。{RST}")
+                # 关：上游按 UA 挡探测的源，关掉就是「有时长、媒体流 0 条、点开 load fail」
+                tip("关掉后，上游若按 UA 挡探测，整个盘都会播不了 —— 关完马上去 Emby 点一部试")
                 if not ask_yn(f"确定给 {mp} 关闭？", False):
                     print("没有改动。")
                     continue
@@ -17642,31 +17574,15 @@ def _one_drive_link_menu(d, mp):
                 warn("没有域名或证书，nginx 站点没有重新生成 —— 这个开关暂时不生效。")
             continue
         if where == "source" and val == "proxy":
-            # 【这一步不能静默】切过去之后每一个字节都走他的 VPS 出口，而流量是要
-            # 花钱的、也是会被跑光的。名字后面那句黄字是给"选之前"看的，这里再拦
-            # 一道是给"真的按下去"那一刻看的。
-            warn(f"{mp} 的视频会全程走你的 VPS 出口流量 —— 看一部 1.5 GB 的片，"
-                 f"就是 1.5 GB 出境。")
+            # 每个字节都走 VPS 出口，来回两份流量；而且【不解除网盘限速】—— 实测阿里被限到
+            # ~4 Mbps 时换成本机代理，那部 16.6 Mbps 的片子当场 load fail
+            _drv0 = next((r[2] for r in _storage_rows(d) if r[1] == mp), "")
+            tip(f"{mp} 的视频会全程走 VPS 流量（来回两份）"
+                + ("，而且不会解除网盘限速" if has_cdn_link(_drv0) else ""))
             if not ask_yn(f"确定把 {mp} 切成本机代理？", False):
                 print("没有改动。")
                 continue
         if where == "source":
-            if val == "proxy":
-                warn("本机代理：视频的每个字节都要经过你的 VPS，来回两份流量。")
-                _drv0 = next((r[2] for r in _storage_rows(d) if r[1] == mp), "")
-                if has_cdn_link(_drv0):
-                    # 【说清楚它不解除限速】实测撞过：阿里被开放平台接口限到 ~4 Mbps，
-                    # 用户以为过一遍自己的 VPS 能绕开，换完那部 16.6 Mbps 的片子当场
-                    # load fail —— 而在这之前用 302 直链是能看的。
-                    # 本机代理没有解除任何限速，只是在中间加了一跳，瓶颈那一段没变。
-                    print(f"  {YELLOW}而且它【不会解除网盘的限速】{RST}"
-                          f"{DIM} —— 只是把「播放器 → 网盘」变成「播放器 → 你的 VPS "
-                          f"→ 网盘」，慢的那一段一个字节都没变，还多一次转发。{RST}")
-                    print(f"  {DIM}这个盘本来就有 CDN 直链（播放器直连网盘）。"
-                          f"嫌慢的话该改的是「接口通道」，不是这里。{RST}")
-                if not ask_yn("确定换成本机代理？", False):
-                    print("没有改动。")
-                    continue
             _write_storage(d, [(sid, mp)],
                            columns=next(u for k, _n, _w, u in SOURCE_MODES if k == val))
         else:
@@ -17687,6 +17603,11 @@ def _one_drive_link_menu(d, mp):
                              "挂载页面和外部播放器不受影响")
 
 
+def tip(text):
+    """屏上的提示：一行、黄色粗体。仓库主人：「写这么多干什么，后面这个提示用高亮」。"""
+    print(f"  {YELLOW}{BOLD}提示：{text}{RST}")
+
+
 def _ali_tc_menu(d, mp):
     """阿里盘在 Emby 里播原画还是阿里的转码流。"""
     cur = ali_tc_mounts().get(mp, "")
@@ -17700,8 +17621,7 @@ def _ali_tc_menu(d, mp):
         star = f"  {GREEN}← 现在{RST}" if q == cur else ""
         print(f"  {i}. {name}{star}")
     print("  0. 返回")
-    print(f"  {YELLOW}{BOLD}提示：原画如果没有阿里会员会被阿里限速（约 0.8 Mbps）。"
-          f"阿里转码有损画质最高 1080P{RST}")
+    tip("原画如果没有阿里会员会被阿里限速（约 0.8 Mbps）。阿里转码有损画质最高 1080P")
     c = ask("请选择").strip()
     if not c.isdigit() or not 1 <= int(c) <= len(opts):
         print("没有改动。")
@@ -17756,15 +17676,13 @@ def _skip_dirs_menu(d, mp):
                 n = sum(x[2] for x in tg if x[1] == p)
                 print(f"  {i:>2}. {p}   {DIM}命中 {k} 个目录 · {n} 个 strm{RST}")
         else:
-            print(f"  {DIM}（没有规则，整个盘都扫）{RST}")
-        print(f"  {DIM}这个盘现在有 {strm_count(d, mp)} 个 strm{RST}")
+            print(f"  {DIM}没有规则{RST}")
         # 【脚本知道该挡哪个目录，就别让用户自己去找】那些 0B / 0bps 点不开的条目，
         # 本地看得见：strm 树里还挂着 BDMV 的就是。连它们的公共上级目录一起算出来，
         # 做成一个按键 —— 用户来这一屏，要的本来就是这件事。
         _nd = len(dead_disc_dirs(d, mp))
         if _nd:
-            print(f"  {YELLOW}这个盘有 {_nd} 套蓝光原盘{RST}"
-                  f"{DIM}（BDMV 目录树，进库就是 0B / 0bps、点开 load fail）{RST}")
+            print(f"  {YELLOW}这个盘有 {_nd} 套蓝光原盘{RST}")
         print("-" * 60)
         print("  1. 添加")
         print("  2. 删除")
@@ -17777,12 +17695,10 @@ def _skip_dirs_menu(d, mp):
             return
         if c == "3":
             print()
-            print(f"  {DIM}蓝光原盘（BDMV 目录树）不是一个文件，是一整棵目录树，"
-                  f"而 strm 里只装得下一条指向单个文件的地址。{RST}")
-            print(f"  1. 不进库{DIM}　默认。删的只是本地 strm，网盘一个字节不动{RST}")
-            print(f"  2. 压成单个 strm{DIM}　取 BDMV 里最大的片段＝正片。"
-                  f"那多半是 20 GB / 24 Mbps / TrueHD，跨境线路未必拉得动{RST}")
+            print(f"  1. 不进库")
+            print(f"  2. 压成单个 strm")
             print(f"  0. 返回")
+            tip("压成单个 strm 取的是 BDMV 里最大的片段，多半 20 GB 以上，跨境未必拉得动")
             v = ask("请选择").strip()
             if v in ("1", "2"):
                 save_ms_state(disc_policy=("skip" if v == "1" else "collapse"))
@@ -17815,8 +17731,7 @@ def _skip_dirs_menu(d, mp):
                 continue
             gone = pats.pop(int(v) - 1)
             set_skip_dirs(mp, pats)
-            ok(f"已删掉规则 {gone}")
-            print(f"  {DIM}那些目录下一次扫描就会重新生成出来。{RST}")
+            ok(f"已删掉规则 {gone}（下一次扫描就回来）")
             continue
         else:
             print("无效选择。")
@@ -17834,12 +17749,9 @@ def _skip_dirs_menu(d, mp):
             print(f"  {DIM}… 还有 {len(tg2) - 6} 个{RST}")
         if not n:
             continue
-        print(f"  {DIM}删的只是本机生成的 strm，{RST}{BOLD}网盘里的片子一个都不碰{RST}"
-              f"{DIM} —— 规则删掉再扫一次就全回来。{RST}")
-        if ask_yn("现在就清掉，不等下一轮对齐？", True):
+        tip("删的只是本机的 strm，网盘里的片子一个都不碰；规则删掉再扫一次就回来")
+        if ask_yn("现在就清掉？", True):
             apply_skip_dirs(d, only=mp)
-            print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 ——"
-                  f"「5 生成媒体库」最后会通知扫描，每天的对齐也会做。{RST}")
 
 
 def _drive_menu(d, mp, drv, mounted=True):
@@ -17853,7 +17765,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         tp = title_policy_of(mp)
         print("\n" + "=" * 60)
         print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}"
-              + ("" if mounted else f"   {YELLOW}未挂载 —— 先选 7 扫码挂上{RST}"))
+              + ("" if mounted else f"   {YELLOW}未挂载{RST}"))
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
         print(f"  2. 生成媒体库        {DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}")
@@ -17878,9 +17790,8 @@ def _drive_menu(d, mp, drv, mounted=True):
         if has115 and mounted:
             print(f"  7. 网盘扫码登录")
         elif has115:
-            print(f"  7. 扫码挂上          {DIM}115 App 扫一下，脚本自己在 OpenList 里挂成 "
-                  f"{mp}{RST}")
-            print(f"  8. 只拿令牌          {DIM}自己去 OpenList 手填（想挂到别的路径时用）{RST}")
+            print(f"  7. 扫码挂上")
+            print(f"  8. 只拿令牌（自己去 OpenList 填）")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -17945,10 +17856,7 @@ def _global_cron_menu(d):
               f"或者 docker restart autofilm 之后再试。{RST}")
         return
     print()
-    print(f"  {DIM}填每天几点扫，北京时间，像 05:15 或 5.15 都认。0 = 关掉自动扫描"
-          f"（还可以随时手动点「立即扫描」）。{RST}")
-    print(f"  {DIM}挑个没人看片的时刻 —— 扫库和播放抢的是同一个网盘账号。{RST}")
-    v = ask("每天几点（北京时间）", "").strip()
+    v = ask("每天几点扫（北京时间，如 04:20；0 = 关）", "").strip()
     if not v:
         print("没有改动。")
         return
@@ -17964,9 +17872,6 @@ def _global_cron_menu(d):
     cron = bj_to_cron(int(m.group(1)), int(m.group(2)), shift)
     save_ms_state(strm_cron_global=cron)
     ok(f"全局定时：每天 {int(m.group(1)):02d}:{m.group(2)}（北京时间）")
-    print(f"  {DIM}写进配置的是 {cron}"
-          f"　—— AutoFilm 的时钟比北京时间{'慢' if shift >= 0 else '快'} "
-          f"{abs(shift) // 60} 小时{abs(shift) % 60} 分，已经换算过{RST}")
     _apply_autofilm_cron(d)
 
 
@@ -17984,12 +17889,8 @@ def _scan_menu(d, mount=None, label=""):
         print(f"  {BOLD}生成媒体库{RST}   "
               f"{CYAN}{label or '、'.join(only_mounts(mount)) or '所有网盘'}{RST}")
         print("-" * 60)
-        print(f"  1. 立即扫描"
-              + (f"{DIM}    只扫这{'几个' if len(only_mounts(mount)) > 1 else '个'}盘，"
-                 f"别的盘一个目录都不列{RST}" if mount
-                 else f"{DIM}    所有盘扫一遍{RST}"))
-        print(f"  2. 定时扫描{DIM}（0={'跟全局' if mount else '关'}）{RST}    "
-              f"当前：{CYAN}{cur}{RST}")
+        print("  1. 立即扫描")
+        print(f"  2. 定时扫描          当前：{CYAN}{cur}{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -18002,10 +17903,8 @@ def _scan_menu(d, mount=None, label=""):
             _global_cron_menu(d)
         elif c == "2":
             print()
-            print(f"  {DIM}填每几小时扫一次（1-24）。0 = 不单独设，跟全局那个定时走。{RST}")
-            print(f"  {DIM}扫得勤，新片进库快，但每一轮都要跟播放抢同一个网盘账号 ——"
-                  f"限流严的盘（公共 WebDAV 源）别调太勤。{RST}")
-            v = ask("每几小时", "0").strip()
+            tip("扫得太勤会和播放抢网盘账号，公共 WebDAV 源别调太勤")
+            v = ask("每几小时扫一次（1-24，0 = 跟全局）", "0").strip()
             if not v.isdigit() or int(v) > 24:
                 print("要填 0-24 的整数，没有改动。")
                 continue
@@ -18058,9 +17957,7 @@ def _rest_menu(d):
         print(f"  6. 不扫的目录        当前："
               + (f"{CYAN}{_sk} 条{RST}" if _sk else f"{DIM}无{RST}")
               + (f"  {DIM}（按盘设）{RST}" if len(rest) > 1 else ""))
-        print(f"  7. 组里单个盘的设置  "
-              + (f"{DIM}{len(rest)} 个盘，点进去和它自己那一屏一样{RST}" if rest
-                 else f"{DIM}没有剩余的盘{RST}"))
+        print(f"  7. 组里单个盘的设置")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -18083,8 +17980,7 @@ def _rest_menu(d):
             # 【关着就扫不了】关着时这些盘根本没有扫描任务，触发也没东西可触发。
             # 直说，比让人点进去看一个空菜单强。
             if not on:
-                warn("自动路径开关是关的 —— 这组盘没有扫描任务，扫不了。")
-                print(f"  {DIM}先用「1 自动路径开关」打开。{RST}")
+                warn("自动路径开关是关的，先用「1」打开。")
             elif not rest:
                 warn("没有剩余的盘（每个盘都单独设过路径了）。")
             else:
@@ -18130,9 +18026,7 @@ def _mount_order_menu(stores):
     print()
     for i, (mp, drv, _st) in enumerate(stores, 1):
         print(f"  {i:>2}. {driver_cn(drv)} {mp}")
-    print(f"  {DIM}按新的先后输入上面的编号，空格隔开（比如 3 2 1 4）；"
-          f"只写几个也行，没写的按现在的先后跟在后面。直接回车 = 不改{RST}")
-    raw = ask("新的顺序").replace(",", " ").replace("，", " ").split()
+    raw = ask("新的顺序（编号空格隔开，如 3 2 1 4；回车不改）").replace(",", " ").replace("，", " ").split()
     if not raw:
         print("没有改动。")
         return
@@ -18198,7 +18092,7 @@ def mount_paths_menu():
         if no115:
             n += 1
             print(f"  {n:>2}. {pad(f'115 网盘 {MOUNT_115}', 26)}"
-                  f"{DIM}{pad(_scan_of(MOUNT_115), 18)}{RST}{YELLOW}未挂载 · 点进去扫码挂上{RST}")
+                  f"{DIM}{pad(_scan_of(MOUNT_115), 18)}{RST}{YELLOW}未挂载{RST}")
         print(f"  {n + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
         print(f"  {n + 2:>2}. 调整顺序            "
@@ -18207,8 +18101,6 @@ def mount_paths_menu():
         # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
         # 装完那一刻网盘还没挂，没有它就是死局（见 do_strm 的说明）。
         # 两个入口做同一件事，只会让人问"这俩有什么区别"。
-        print(f"  {DIM}   单个盘点进去有「生成媒体库」（立即扫 / 定时）；"
-              f"全部一起扫在主菜单的「5 生成媒体库」{RST}")
 
         # 返回也要占一行。这一屏原来只在提示里写「0 = 返回」，而别的每一屏
         # 都是列成 "0. 返回" —— 同一套菜单里两种写法，回车能不能退出还得试。
@@ -18320,32 +18212,32 @@ def params_menu():
         d = ms_install_dir()
         cur = read_emby_api_key(d) if is_installed(d) else ""
         print("\n" + "-" * 60)
-        print(f"  {BOLD}后补参数{RST}{DIM}（装完之后再填的东西）{RST}")
+        print(f"  {BOLD}后补参数{RST}")
         print("-" * 60)
         state = (f"{GREEN}已填{RST}" if cur else f"{YELLOW}空 · 302 不生效{RST}")
         # 顺带把「有没有启用统一密码」也显示出来,省得进去才发现没开
         sec = os.path.join(d, ".secrets")
         has_ba = bool(read_env(sec, "BA_PASS", fallback=os.path.join(d, ".env")))
         ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
-        print(f"  1. 添加 API 密钥（Emby API Key）   当前：{state}")
-        print(f"  2. 修改用户名 / 密码（浏览器弹框那层）  当前：{ba_state}")
+        print(f"  1. Emby API Key      当前：{state}")
+        print(f"  2. 浏览器弹框账号    当前：{ba_state}")
         # 【直链方式 / 片名用哪个 / 115 扫码登录 都搬去「4 挂载路径」了】
         # 它们全是【一个盘一个样】的东西：直链方式只有夸克/UC 的驱动才有，
         # 片名该跟文件名还是跟刮削也是每个盘各不相同 —— 放在这里当全局开关，
         # 本身就是把它们摆错了地方。扫描路径同理。
         mt_state = ((f"{GREEN}已安装{RST}" if metatube_on(d) else f"{DIM}未安装{RST}")
                     if is_installed(d) else f"{DIM}未安装{RST}")
-        print(f"  3. MetaTube 刮削插件（番号识别）  当前：{mt_state}")
+        print(f"  3. MetaTube 刮削插件 当前：{mt_state}")
         # 【这里只报"用哪份"，一个字都不多】规则文件路径、几条、哪几个库名 ——
         # 这些进到菜单里会随库数一起长，7 条就要折两行，几十条整屏都是它。
         # 点进第 4 项那一屏本来就全列着，重复一遍只是把菜单撑丑。
         _rsrc = (f"{CYAN}自定义{RST}" if rules_source() == "custom"
                  else f"{DIM}作者的{RST}") if is_installed(d) else ""
-        print(f"  4. 按关键词自动建媒体库（规则用哪份链接）  当前：{_rsrc}")
+        print(f"  4. 自动建库规则      当前：{_rsrc}")
         if metatube_on(d):
             mtl = [n for n, _i, on, _o in metatube_libraries(
                 read_emby_api_key(d) or "") if on]
-            print(f"  5. MetaTube 在哪些库生效  当前："
+            print(f"  5. MetaTube 生效的库 当前："
                   + (f"{CYAN}{'、'.join(mtl)}{RST}" if mtl else f"{DIM}都不启用{RST}"))
         # 目录缓存直接决定「列目录」快不快 —— 命中缓存 0.3 秒，走真实接口十几秒
         # 还会被限流。当前值摆在菜单上，和直链方式一个道理。
@@ -18357,13 +18249,11 @@ def params_menu():
         else:
             dc_state = f"{DIM}未挂网盘{RST}"
         _dcm = "" if ms_state().get("dir_cache_manual") else f"{DIM}　脚本自动维护{RST}"
-        print(f"  6. 目录缓存时长{DIM}（列目录老超时就调大这个）{RST}  "
-              f"当前：{dc_state}{_dcm}")
+        print(f"  6. 目录缓存时长      当前：{dc_state}{_dcm}")
         _ef = ep_fix_setting()
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
-        print(f"  7. 给剧集补季集编号{DIM}（旁挂 .nfo，不改文件名、不动网盘）"
-              f"{RST}  当前：{ef_state}")
+        print(f"  7. 剧集季集编号      当前：{ef_state}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -20970,16 +20860,14 @@ def main_menu():
     while True:
         installed = is_installed()
         print("\n" + "=" * 60)
-        print(f"  {BOLD}自建 Emby · 网盘直链媒体服务器{RST}   "
-              f"{DIM}v{SCRIPT_VERSION}{RST}")
-        print(f"  {DIM}Emby + OpenList + AutoFilm + MediaWarp（302 直链）{RST}")
+        print(f"  {BOLD}自建 Emby · 网盘直链{RST}   {DIM}v{SCRIPT_VERSION}{RST}")
         print("=" * 60)
         print(f"  状态：" + (f"{GREEN}已安装{RST}  {DIM}{ms_install_dir()}{RST}"
                             if installed else f"{YELLOW}未安装{RST}"))
         print("-" * 60)
-        print("  1. 安装" + ("（已装，重跑可改配置）" if installed else ""))
-        print("  2. 使用信息（地址 / 账号密码 / 常用命令）")
-        print("  3. 后补参数（Emby API Key 等装完才拿得到的东西）")
+        print("  1. 安装" + ("（重跑可改配置）" if installed else ""))
+        print("  2. 使用信息")
+        print("  3. 后补参数")
         # 装完网盘还没挂，所以这一步只能等用户在 OpenList 里挂好之后自己点。
         # 没有这个按钮的话，不敲命令的人就卡在「OpenList 里有文件、Emby 里空的」
         # 挂载路径单开一屏（原来埋在「后补参数」里，是个要手打整串路径的输入框）：
@@ -20990,11 +20878,11 @@ def main_menu():
             _sp = (f"{CYAN}{_n} 个目录{RST}" if _n else f"{YELLOW}一个都没选{RST}")
         else:
             _sp = f"{DIM}未安装{RST}"
-        print(f"  4. 挂载路径（哪些网盘进 Emby·每个盘一个开关）  当前：{_sp}")
-        print("  5. 生成媒体库（网盘挂好、或在网盘里整理过片子之后点这个）")
-        print("  6. 链路体检（卡住 / 不出片子时先跑这个）")
-        print("  7. 更新（拉最新镜像 + 按新版本刷新配置）")
-        print("  8. 流量账本（谁在什么时刻吃了流量·全天记账）")
+        print(f"  4. 挂载路径          当前：{_sp}")
+        print("  5. 生成媒体库")
+        print("  6. 链路体检")
+        print("  7. 更新")
+        print("  8. 流量账本")
         print("  9. 卸载")
         print("  0. 返回")
         print("-" * 60)
