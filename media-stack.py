@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.228"
+SCRIPT_VERSION = "1.5.229"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1329,6 +1329,10 @@ def gen_nginx_site(cfg):
     except Exception:
         gate_on = False
     ali_on = bool(ali_tc_mounts())
+    try:
+        p115_on = bool(pan115_mounts(ms_install_dir()))
+    except Exception:
+        p115_on = False
     spoof = [m for m in ua_spoof_mounts() if m.startswith("/")]
     if spoof:
         # 两级判断，两个都成立才换：
@@ -1407,9 +1411,9 @@ def gen_nginx_site(cfg):
         # 【阿里转码流】开了的盘，开播那一下先问本机那个小服务：该走转码的回 302 到阿里的
         # m3u8，别的回 X-Accel-Redirect 原样交给 MediaWarp。服务没起来（502/504）也交给
         # MediaWarp —— 这一段坏了最多是退回原画，绝不挡播放。
-        if sub == "emby" and hls_on and ali_on:
+        if sub == "emby" and hls_on and (ali_on or p115_on):
             hls += f"""
-    # 阿里转码流（见 media-stack.py 的 ALI_TC_LEVELS 那段）
+    # 阿里转码流 / 115 按播放器 UA 换链（见 media-stack.py 的 ALI_TC_LEVELS、pan115_mounts）
     location ~* ^/(?:emby/)?videos/[0-9]+/(?:stream|original)(?:\\.[a-z0-9]+)?$ {{
         proxy_pass http://127.0.0.1:{hls_port()};
         proxy_set_header Host $host;
@@ -2054,8 +2058,9 @@ def hls_wanted(d):
     except Exception:
         return None
     tcm = ali_tc_mounts()
+    p115 = set(pan115_mounts(d, rows))
     return [mp for _s, mp, drv, add, _c in rows
-            if is_hls_mode(add)
+            if is_hls_mode(add) or mp in p115
             or (mp in tcm and str(drv or "").lower() in ALI_DRIVERS)]
 
 
@@ -2102,6 +2107,52 @@ def ali_tc_pick(data, pref):
 
 
 _ALI_OL_TOK = ["", 0.0]
+
+
+# ── 115 的直链按 UA 签发（给 Emby 用）───────────────────────────────────────
+# 真机：115 挂上、strm 生成、条目也进了库，点播放转几圈就退出。
+# OpenList 的 115 驱动换链用的是【请求方的 UA】（drivers/115/driver.go：
+# DownloadWithUA(pickCode, args.Header.Get("User-Agent"))），115 的 CDN 只认拿这个 UA 来
+# 下载的人。而 MediaWarp 问 OpenList 要 raw_url 时带的是它自己的 Go-http-client ——
+# 于是 302 给播放器的那条链，播放器拿自己的 UA 去下，115 一律拒。
+# 所以 115 的盘也由本机那个小服务（do_hls_fix）接住 /Videos/<id>/stream：拿【播放器
+# 自己的 UA】去问 OpenList 要直链，302 给它。视频字节照旧手机直连 115，不过 VPS。
+# 开了本机代理的 115 不接：那种 raw_url 是 OpenList 自己的地址，原路交给 MediaWarp 就对。
+P115_TTL = 600            # 同一集、同一个 UA 的直链缓存多久（115 的链几小时才过期）
+
+
+def pan115_mounts(d, rows=None):
+    """要由本机服务按 UA 换链的 115 盘的挂载点。"""
+    try:
+        rows = _storage_rows(d) if rows is None else rows
+    except Exception:
+        return []
+    return [mp for _s, mp, drv, _a, cols in rows
+            if mp and "115" in str(drv or "") and not _truthy((cols or {}).get("web_proxy"))]
+
+
+def ol_tok_cached(d, fresh=False):
+    """OpenList 登录令牌，缓存一小时（阿里转码流和 115 换链共用）。"""
+    if fresh or not _ALI_OL_TOK[0] or time.time() - _ALI_OL_TOK[1] > 3600:
+        _ALI_OL_TOK[0], _ALI_OL_TOK[1] = _ol_token(d), time.time()
+    return _ALI_OL_TOK[0]
+
+
+def pan115_url(d, tp, ua):
+    """用播放器的 UA 向 OpenList 要这个 115 文件的直链。拿不到 → ""。"""
+    for i in range(2):
+        tok = ol_tok_cached(d, fresh=bool(i))
+        if not tok:
+            return ""
+        try:
+            r = _ol_api("/api/fs/get", {"path": tp, "password": ""}, tok,
+                        timeout=20, ua=ua or PLAYER_UA)
+        except Exception:
+            return ""
+        if r.get("code") == 401:
+            continue
+        return str(((r.get("data") or {}).get("raw_url")) or "") if r.get("code") == 200 else ""
+    return ""
 
 
 def ali_preview_url(d, tp, pref):
@@ -2253,6 +2304,50 @@ def do_hls_fix():
                 cache[vid] = (head[:head.rfind("/") + 1], time.time())
         return url
 
+    p115c, m115 = {}, [[], 0.0]
+
+    def target_of(vid):
+        """条目 id → strm 里写的网盘路径（/115/xx/片.mp4）。拿不到 → ""。"""
+        ip = paths.get(vid)
+        if ip is None:
+            it = (_emby(f"/Items?Ids={vid}&Fields=Path", key, timeout=10)
+                  .get("Items") or [{}])[0]
+            ip = paths[vid] = str(it.get("Path") or "")
+        hp = _strm_host_path(d, ip)
+        if not hp:
+            return ""
+        with open(hp, encoding="utf-8") as f:
+            return strm_target_path(f.read())
+
+    def p115_of(vid, ua):
+        """115 的盘：拿播放器自己的 UA 换一条直链（见 pan115_mounts）。不是 115 / 拿不到 → ""。"""
+        now = time.time()
+        if now - m115[1] > 60:
+            m115[0], m115[1] = pan115_mounts(d), now
+        if not m115[0] or not key:
+            return ""
+        k = (vid, ua)
+        with lock:
+            hit = p115c.get(k)
+            if hit and now - hit[1] < (P115_TTL if hit[0] or hit[2] else HLS_BASE_FAIL_TTL):
+                return hit[0]
+        url, not115 = "", False
+        try:
+            tp = target_of(vid)
+            mp = next((m for m in sorted(m115[0], key=len, reverse=True)
+                       if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
+            if mp:
+                url = pan115_url(d, tp, ua)
+            else:
+                not115 = True           # 不是 115 的条目：这个答案不会变，按长的缓存
+        except Exception:
+            url = ""
+        with lock:
+            if len(p115c) > 2000:
+                p115c.clear()
+            p115c[k] = (url, time.time(), not115)
+        return url
+
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nginx"        # 不自报家门，跟别处口径一致
@@ -2265,8 +2360,10 @@ def do_hls_fix():
             ms = re.match(r"^/(?:[Ee]mby/)?[Vv]ideos/(\d+)/(?:stream|original)(?:\.\w+)?(?:\?|$)",
                           self.path, re.I)
             if ms:
-                # 【阿里转码流】开了开关的盘 → 302 到阿里的 m3u8；别的一律原样交回 MediaWarp
-                url = ali_of(ms.group(1))
+                # 【阿里转码流】开了开关的盘 → 302 到阿里的 m3u8；
+                # 【115】拿播放器自己的 UA 换链 → 302；别的一律原样交回 MediaWarp
+                url = (ali_of(ms.group(1))
+                       or p115_of(ms.group(1), self.headers.get("User-Agent") or ""))
                 if url:
                     self.send_response(302)
                     self.send_header("Location", url)
@@ -13884,8 +13981,10 @@ def _heal_one(d, key, _it, base, token):
                 f"文件头里没时长（{int((time.time() - _nohead) // 3600)} 小时前探明）；"
                 f"网盘还没转码版，没 m3u8 可走")
     try:
+        # 【带上 PLAYER_UA】下面先拿 PLAYER_UA 拉文件头；115 的直链按换链时的 UA 签发，
+        # 不带的话换出来的链只认 Python-urllib，文件头一律被拒（见 pan115_mounts）
         got0 = (_ol_api("/api/fs/get", {"path": p, "password": ""},
-                        token, timeout=120).get("data") or {})
+                        token, timeout=120, ua=PLAYER_UA).get("data") or {})
         sign, raw = got0.get("sign", ""), got0.get("raw_url", "")
     except Exception as e:
         return "retry", name, el(), f"换直链失败：{_short_err(e)}"
@@ -16689,6 +16788,9 @@ def _add115_flow(d):
     good, why = ol_create_115(d, uid, mount)
     if good and not why:
         ok(f"115 已挂上：{mount}")
+        # 115 的直链按 UA 签发，Emby 里播要靠本机服务按播放器 UA 换链（见 pan115_mounts）
+        if not refresh_hls(d):
+            warn("本机换链服务没起来，Emby 里播 115 会转圈 —— 跑一次「7 更新」")
     elif good:
         warn(f"存储建好了，但 OpenList 说：{why}")
         tip("多半是令牌过期了：选「7 网盘扫码登录」再扫一次，到 OpenList 里换上新令牌")
@@ -18208,6 +18310,7 @@ def _drive_menu(d, mp, drv, mounted=True):
               + ("" if (ms_state().get("rename_by_drive") or {}).get(mp)
                  else f"  {DIM}（跟默认）{RST}"))
         has115 = "115" in str(drv)
+        isdav = str(drv or "").lower() == "webdav"
         isali = mounted and str(drv or "").lower() in ALI_DRIVERS
         if isali:
             _q = ali_tc_mounts().get(mp)
@@ -18218,6 +18321,8 @@ def _drive_menu(d, mp, drv, mounted=True):
         elif has115:
             print(f"  7. 扫码挂上")
             print(f"  8. 只拿令牌（自己去 OpenList 填）")
+        elif isdav:
+            print(f"  7. ＋ 添加 WebDAV")
         elif not mounted:
             print(f"  7. 扫码挂上")
         print("  0. 返回")
@@ -18226,7 +18331,10 @@ def _drive_menu(d, mp, drv, mounted=True):
         if c in ("0", "", "q"):
             return
         if not mounted and c in ("1", "2", "3", "5"):
-            warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— 先选 7 扫码挂上。")
+            warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— 先选 7 挂上。")
+            continue
+        if isdav and c == "7":
+            _add_webdav_flow(d)
             continue
         if not mounted and c == "7":
             _add115_flow(d) if has115 else _add_qtv_flow(d)
@@ -18522,8 +18630,11 @@ def mount_paths_menu():
                   f"{col}{pad(where, 20)}{RST}"
                   + opt_tag("__source__", "proxy" if _vps.get(mp) else "direct"))
         n = len(stores)
-        # 【常驻的几栏】没挂的 115、没挂的夸克 TV、添加 WebDAV —— 点进去就能在这台机器上
-        # 挂，不用去 OpenList 网页（见 _drive_menu 的 mounted、_add_webdav_flow）。
+        # 【常驻的几栏】没挂的 115、没挂的夸克 TV、没挂的 WebDAV —— 点进去就能在这台机器上
+        # 挂，不用去 OpenList 网页（见 _drive_menu 的 mounted）。
+        # 【「＋ 添加 WebDAV」在 WebDAV 那一屏里】仓库主人：「他不应该是在 4 WebDAV 里面吗？
+        # 应该是放在 7 ＋ 添加 WebDAV」。一个 WebDAV 都没有时，这一栏就是「WebDAV 未挂载」，
+        # 入口照样在（第四节：入口不准依附在会消失的东西上）。
         extra = []
         if no115:
             extra.append((f"{pad('115 网盘', 19)}{YELLOW}未挂载{RST}",
@@ -18531,7 +18642,9 @@ def mount_paths_menu():
         if not any(str(x[1]) == DRIVER_QTV for x in stores):
             extra.append((f"{pad(driver_cn(DRIVER_QTV), 19)}{YELLOW}未挂载{RST}",
                           lambda: _drive_menu(d, MOUNT_QTV, DRIVER_QTV, mounted=False)))
-        extra.append(("＋ 添加 WebDAV", lambda: _add_webdav_flow(d)))
+        if not any(str(x[1]).lower() == "webdav" for x in stores):
+            extra.append((f"{pad(driver_cn(DRIVER_DAV), 19)}{YELLOW}未挂载{RST}",
+                          lambda: _drive_menu(d, MOUNT_DAV, DRIVER_DAV, mounted=False)))
         extra.append((f"{pad('♻ 剩余网盘（自动）', 19)}"
                       + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"),
                       lambda: _rest_menu(d)))
@@ -19647,15 +19760,20 @@ def public_visitors(limit=20000):
     return total, sorted(hits.items(), key=lambda kv: -kv[1])
 
 
-def _ol_api(path, body, token=None, timeout=60, method="POST"):
+def _ol_api(path, body, token=None, timeout=60, method="POST", ua=None):
     """OpenList 的接口。method="GET" 时不带 body —— 它的几条查询接口只认 GET，
-    发成 POST 会回 405，而那种失败长得像"接口不存在"。"""
+    发成 POST 会回 405，而那种失败长得像"接口不存在"。
+
+    ua：fs/get 换直链时 OpenList 会把【这个请求的 UA】带去网盘（server/handles/fsread.go
+    里 LinkArgs.Header = c.Request.Header）。115 的直链按 UA 签发，谁拿着链去下载，
+    换链时就得用谁的 UA —— 见 pan115_mounts。只发给本机 OpenList。"""
     req = urllib.request.Request(
         f"http://127.0.0.1:{OPENLIST_PORT}{path}",
         data=json.dumps(body).encode() if method != "GET" else None,
         method=method,
         headers={"Content-Type": "application/json",
-                 **({"Authorization": token} if token else {})})
+                 **({"Authorization": token} if token else {}),
+                 **({"User-Agent": ua} if ua else {})})
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
