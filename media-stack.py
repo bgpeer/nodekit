@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.225"
+SCRIPT_VERSION = "1.5.226"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -16616,14 +16616,42 @@ def ol_create_115(d, uid, mount=MOUNT_115):
 
 
 def norm_mount_115(raw):
-    """把用户输入的挂载路径规整成 /xxx。空 = 默认 MOUNT_115；不合法返回 None。
+    """115 的挂载路径：空 = MOUNT_115。见 norm_mount。"""
+    return norm_mount(raw, MOUNT_115)
+
+
+def mount_taken(mount, used):
+    """mount 跟已有的挂载点撞不撞：重名、或者一个套在另一个里面（/quark/115）。
+    OpenList 里这样的两个路径会互相遮住。"""
+    return any(mount == u or mount.startswith(u.rstrip("/") + "/")
+               or u.startswith(mount + "/") for u in used if u and u != "/")
+
+
+def ask_mount(d, default):
+    """扫码 / 填表之前先问挂到哪。返回规整好的路径；不合法或撞了返回 ""（已提示过）。
+
+    输错了直接回上一屏再点，不在这里打转 —— 死循环里没有退路。
+    """
+    used = [mp for mp, *_x in openlist_storages(d) if mp]
+    mount = norm_mount(ask(f"挂到哪个路径（回车用 {default}）"), default)
+    if mount is None:
+        warn("路径不能是 / ，也不能带空格或 ?#\\ 这些字符。")
+        return ""
+    if mount_taken(mount, used):
+        warn(f"{mount} 跟 OpenList 里已有的盘撞了，换一个路径。")
+        return ""
+    return mount
+
+
+def norm_mount(raw, default):
+    """把用户输入的挂载路径规整成 /xxx。空 = default；不合法返回 None。
 
     「115网盘」→「/115网盘」，「/a/b/」→「/a/b」。根目录 / 不行（会盖住所有盘），
     空格和 ?#\\ 不行：OpenList 的路径和 strm 里的 URL 都会被它们弄坏。
     """
     raw = (raw or "").strip()
     if not raw:
-        return MOUNT_115
+        return default
     p = "/" + raw.strip("/")
     if p == "/" or re.search(r"[\s?#\\]", p) or "//" in p:
         return None
@@ -16641,16 +16669,8 @@ def _add115_flow(d):
     # 【扫码前先问挂到哪】仓库主人：「扫码前先问挂到哪个路径，这样可以手动输入路径，
     # 不输入回车直接就用默认的」—— 他想挂成 /115网盘 这种自己起的名字。
     # 先问后扫：扫码会话只有几分钟，扫完再让人想名字、输错了重来，令牌就过期了。
-    # 输错了直接回上一屏再点 7，不在这里打转 —— 死循环里没有退路。
-    used = [mp for mp, *_x in openlist_storages(d) if mp]
-    mount = norm_mount_115(ask(f"挂到哪个路径（回车用 {MOUNT_115}）"))
-    if mount is None:
-        warn("路径不能是 / ，也不能带空格或 ?#\\ 这些字符。")
-        return False
-    # 跟已有的盘重名、或者套在别的盘里面（/quark/115）都不行：OpenList 里路径会互相遮住
-    if any(mount == u or mount.startswith(u.rstrip("/") + "/")
-           or u.startswith(mount + "/") for u in used if u != "/"):
-        warn(f"{mount} 跟 OpenList 里已有的盘撞了，换一个路径。")
+    mount = ask_mount(d, MOUNT_115)
+    if not mount:
         return False
     _QR115_AUTOMOUNT[0] = True
     try:
@@ -16672,6 +16692,264 @@ def _add115_flow(d):
         ask("\n按回车返回...")
         return False
     tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
+    ask("\n按回车继续...")
+    return True
+
+
+# ============================================================================ 在 VPS 上挂夸克 TV / WebDAV
+# 仓库主人：「其他的几个盘可以像这样在 VPS 上挂载吗」→「做吧，WebDAV 和夸克 TV 都加上」。
+# 阿里云盘没做：它的令牌要走 OpenList 官方的第三方授权网页，按 CLAUDE.md「躲不掉的
+# 泄漏不自己拍板」，照旧在 OpenList 网页里挂。
+DRIVER_QTV = "QuarkTV"
+MOUNT_QTV = "/quark"
+DRIVER_DAV = "WebDav"
+MOUNT_DAV = "/webdav"
+
+
+def has_driver_storage(d, drv):
+    """OpenList 里有没有这个驱动的存储（任何挂载点）。"""
+    return any(str(x[1]) == drv for x in openlist_storages(d))
+
+
+def _ol_storage_body(mount, driver, addition, proxy=False):
+    """建存储的请求体。跟 OpenList 表单的默认值一致（见 ol_create_115）。"""
+    return {"mount_path": mount, "driver": driver, "order": 0, "remark": "",
+            "cache_expiration": 30, "web_proxy": proxy,
+            "webdav_policy": "native_proxy" if proxy else "302_redirect",
+            "down_proxy_url": "", "enable_sign": False, "order_by": "name",
+            "order_direction": "asc", "extract_folder": "",
+            "addition": json.dumps(addition)}
+
+
+def _ol_storage_id(d, mount):
+    return next((sid for sid, mp, *_x in _storage_rows(d) if mp == mount), None)
+
+
+def _ol_drop_storage(d, mount, tok):
+    """撤掉这一轮自己刚建、从来没挂成功过的存储。挂不上还留着一条报错的存储，
+    「未挂载」那一栏就没了、盘却用不了 —— 两头落空。"""
+    sid = _ol_storage_id(d, mount)
+    if sid is None:
+        return
+    try:
+        _ol_api(f"/api/admin/storage/delete?id={sid}", {}, tok, timeout=30)
+    except Exception:
+        pass
+
+
+def _ol_reload_storage(d, mount, tok):
+    """停用再启用，让 OpenList 重新走一遍这个驱动的 Init。返回 "" = 起来了，否则原因。"""
+    sid = _ol_storage_id(d, mount)
+    if sid is None:
+        return "存储不见了"
+    try:
+        _ol_api(f"/api/admin/storage/disable?id={sid}", {}, tok, timeout=30)
+        r = _ol_api(f"/api/admin/storage/enable?id={sid}", {}, tok, timeout=60)
+    except Exception as e:
+        return _short_err(e)
+    return "" if r.get("code") == 200 else str(r.get("message") or "启用失败")
+
+
+QTV_QR_RE = re.compile(r"data:image/(?:jpeg|png);base64,([A-Za-z0-9+/=]+)")
+
+
+def qr_modules(px, w, h):
+    """灰度像素 → QR 的模块矩阵（True = 黑）。认不出来返回 None。
+
+    夸克 TV 登录给的是一张 460×460 的二维码【图片】（塞在 OpenList 的报错里），终端
+    显示不了图。把它还原成模块矩阵，再用半格字符画出来，手机截图后夸克 App 从相册
+    扫得出来。只认规规矩矩的机器生成码：找黑色外框 → 用左上角定位块（7 个模块宽）
+    量出模块大小 → 按网格取中心点。
+    """
+    if not px or len(px) < w * h:
+        return None
+    lo, hi = min(px), max(px)
+    if hi - lo < 64:
+        return None
+    thr = (lo + hi) / 2
+    rows = [y for y in range(h) if any(px[y * w + x] < thr for x in range(w))]
+    cols = [x for x in range(w) if any(px[y * w + x] < thr for y in range(h))]
+    if not rows or not cols:
+        return None
+    x0, x1, y0, y1 = cols[0], cols[-1], rows[0], rows[-1]
+    yr = min(y1, y0 + 2)
+    run = 0
+    while x0 + run <= x1 and px[yr * w + x0 + run] < thr:
+        run += 1
+    if run < 7:
+        return None
+    size = x1 - x0 + 1
+    n = round(size / (run / 7))
+    n = min(range(21, 178, 4), key=lambda v: abs(v - n))
+    m = size / n
+    grid = []
+    for r in range(n):
+        line = []
+        for c in range(n):
+            cx, cy = int(x0 + (c + 0.5) * m), int(y0 + (r + 0.5) * m)
+            vals = [px[min(h - 1, max(0, cy + dy)) * w + min(w - 1, max(0, cx + dx))]
+                    for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
+            line.append(sum(vals) / 9 < thr)
+        grid.append(line)
+    # 三个定位块的外圈必须全黑、第二圈全白，否则就是没认对，别画一张扫不出来的图
+    for (r0, c0) in ((0, 0), (0, n - 7), (n - 7, 0)):
+        for i in range(7):
+            for j in range(7):
+                ring = max(abs(i - 3), abs(j - 3))
+                if grid[r0 + i][c0 + j] != (ring != 2):
+                    return None
+    return grid
+
+
+def qr_lines(grid, quiet=3):
+    """模块矩阵 → 终端行。一个字符 = 1 列 × 2 行模块，颜色写死（白底黑码），
+    深色、浅色终端都一样；四周留白边，扫码器要靠它找边。"""
+    n = len(grid)
+    full = n + 2 * quiet
+    W = [[False] * full for _ in range(full + (full % 2))]
+    for r in range(n):
+        for c in range(n):
+            W[r + quiet][c + quiet] = grid[r][c]
+    out = []
+    for r in range(0, len(W), 2):
+        top, bot = W[r], W[r + 1]
+        ch = "".join("█" if not t and not b else "▀" if not t else "▄" if not b else " "
+                     for t, b in zip(top, bot))
+        out.append(f"  \x1b[97;40m{ch}{RST}")
+    return out
+
+
+def qr_from_jpeg_b64(b64, side=400):
+    """base64 的二维码图片 → 终端行。用 Emby 容器里的 ffmpeg 解图（本机未必有图像库）。
+    画不出来返回 []。"""
+    try:
+        img = base64.b64decode(b64)
+    except Exception:
+        return []
+    for fp in EMBY_FFMPEG_PATHS:
+        try:
+            r = subprocess.run(["docker", "exec", "-i", "emby", fp, "-v", "error",
+                                "-i", "pipe:0", "-vf", f"scale={side}:{side}:flags=area",
+                                "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"],
+                               input=img, capture_output=True, timeout=30)
+        except (subprocess.TimeoutExpired, OSError):
+            return []
+        if r.returncode in (126, 127):
+            continue
+        grid = qr_modules(r.stdout, side, side)
+        return qr_lines(grid) if grid else []
+    return []
+
+
+def _add_qtv_flow(d):
+    """问挂载路径 → 在 OpenList 里建夸克 TV 存储 → 把它给的二维码画在屏上 → 扫完重新加载。
+
+    驱动自己的流程（OpenList drivers/quark_uc_tv）：没有 refresh_token 时 Init 申请
+    登录码，把 query_token 存进 addition，然后【报错】，报错里是二维码图片；扫码确认后
+    再 Init 一次，它拿 query_token 换 refresh_token，存储就起来了。所以这里是：建 →
+    取报错里的图 → 等人扫 → 停用再启用。
+    直链方式跟 OpenList 表单的默认一样（原画直链），要换走这个盘的「3 直链方式」。
+    """
+    mount = ask_mount(d, MOUNT_QTV)
+    if not mount:
+        return False
+    tok = _ol_token(d)
+    if not tok:
+        err("登不上 OpenList（它在跑吗？）")
+        return False
+    add = {"root_folder_id": "0", "order_by": "updated_at", "order_direction": "desc",
+           "refresh_token": "", "device_id": "", "query_token": "",
+           "link_method": "download"}
+    info(f"正在 OpenList 里建 {mount} ...")
+    try:
+        r = _ol_api("/api/admin/storage/create",
+                    _ol_storage_body(mount, DRIVER_QTV, add), tok, timeout=60)
+    except Exception as e:
+        err(f"没建成：{_short_err(e)}")
+        return False
+    if r.get("code") == 200:
+        ok(f"夸克 TV 已挂上：{mount}")
+        return True
+    msg = str(r.get("message") or "")
+    m = QTV_QR_RE.search(msg)
+    if not m:
+        _ol_drop_storage(d, mount, tok)
+        err(f"没拿到登录二维码：{_short_err(re.sub(r'<[^>]+>', '', msg))}")
+        return False
+    lines = qr_from_jpeg_b64(m.group(1))
+    print()
+    if lines:
+        print("\n".join(lines))
+        print()
+        tip("夸克 App 扫一扫（截图后从相册选也行），手机上点确认")
+    else:
+        tip("二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
+    while True:
+        c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
+        if c == "q":
+            _ol_drop_storage(d, mount, tok)
+            warn("没挂上，已撤掉刚建的存储。")
+            return False
+        why = _ol_reload_storage(d, mount, _ol_token(d) or tok)
+        if not why:
+            ok(f"夸克 TV 已挂上：{mount}")
+            tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
+            ask("\n按回车继续...")
+            return True
+        warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
+
+
+def _ask_secret(prompt):
+    """输密码不回显 —— 这一屏会被截图发出去。"""
+    try:
+        import getpass
+        return getpass.getpass(f"{prompt}: ")
+    except Exception:
+        return ask(prompt)
+
+
+def _add_webdav_flow(d):
+    """在 VPS 上挂一个 WebDAV：地址、用户名、密码、挂到哪。
+
+    WebDAV 在网盘侧没有 CDN 直链，只能本机代理（见 apply_drive_defaults），所以一建就是
+    本机代理，结果那一行当场说走 VPS 流量。密码只发给本机的 OpenList，不上屏、不进日志。
+    """
+    addr = ask("WebDAV 地址（http:// 或 https:// 开头，回车取消）").strip()
+    if not addr:
+        return False
+    if not re.match(r"^https?://[^\s/]+", addr):
+        warn("地址要以 http:// 或 https:// 开头。")
+        return False
+    user = ask("用户名").strip()
+    pw = _ask_secret("密码")
+    used = [mp for mp, *_x in openlist_storages(d) if mp]
+    dflt = next(p for p in [MOUNT_DAV] + [f"{MOUNT_DAV}{i}" for i in range(2, 100)]
+                if not mount_taken(p, used))
+    mount = ask_mount(d, dflt)
+    if not mount:
+        return False
+    tok = _ol_token(d)
+    if not tok:
+        err("登不上 OpenList（它在跑吗？）")
+        return False
+    add = {"vendor": "other", "address": addr, "username": user, "password": pw,
+           "root_folder_path": "/", "tls_insecure_skip_verify": False}
+    info(f"正在 OpenList 里挂上 {mount} ...")
+    try:
+        r = _ol_api("/api/admin/storage/create",
+                    _ol_storage_body(mount, DRIVER_DAV, add, proxy=True), tok, timeout=60)
+    except Exception as e:
+        err(f"没挂上：{_short_err(e)}")
+        return False
+    if r.get("code") != 200:
+        _ol_drop_storage(d, mount, tok)
+        # 报错里可能带着地址（还可能带着 user:pass@），抹掉
+        why = re.sub(r"https?://\S+", "<地址>", str(r.get("message") or ""))
+        err(f"没挂上：{_short_err(why)[:60]}")
+        tip("多半是地址、用户名或密码不对；已撤掉，重新添加一次")
+        return False
+    ok(f"WebDAV 已挂上：{mount}　{YELLOW}⚠ 走 VPS 流量{RST}")
+    tip("接下来在「4 挂载路径」里点它 → 1 扫描路径，加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -17855,7 +18133,7 @@ def _drive_menu(d, mp, drv, mounted=True):
     同一屏、同样的几项，要挂上才能做的那几项点了会先让去扫码。"""
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
     while True:
-        if not mounted and has_115_storage(d):
+        if not mounted and has_driver_storage(d, drv):
             return                    # 刚扫码挂上了：回外层，那边会按真实的盘重新列
         ch, switchable = drive_channel(d, mp, drv) if mounted else ("原画直链", False)
         tp = title_policy_of(mp)
@@ -17889,6 +18167,8 @@ def _drive_menu(d, mp, drv, mounted=True):
         elif has115:
             print(f"  7. 扫码挂上")
             print(f"  8. 只拿令牌（自己去 OpenList 填）")
+        elif not mounted:
+            print(f"  7. 扫码挂上")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -17898,9 +18178,9 @@ def _drive_menu(d, mp, drv, mounted=True):
             warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— 先选 7 扫码挂上。")
             continue
         if not mounted and c == "7":
-            _add115_flow(d)
+            _add115_flow(d) if has115 else _add_qtv_flow(d)
             continue
-        if not mounted and c == "8":
+        if not mounted and c == "8" and has115:
             qr115_login()
             continue
         if isali and c == "7":
@@ -18190,13 +18470,23 @@ def mount_paths_menu():
                   f"{col}{pad(where, 20)}{RST}"
                   + opt_tag("__source__", "proxy" if _vps.get(mp) else "direct"))
         n = len(stores)
+        # 【常驻的几栏】没挂的 115、没挂的夸克 TV、添加 WebDAV —— 点进去就能在这台机器上
+        # 挂，不用去 OpenList 网页（见 _drive_menu 的 mounted、_add_webdav_flow）。
+        extra = []
         if no115:
-            n += 1
-            print(f"  {n:>2}. {pad('115 网盘', 19)}{YELLOW}未挂载{RST}")
-        print(f"  {n + 1:>2}. {pad('♻ 剩余网盘（自动）', 19)}"
-              + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
-        print(f"  {n + 2:>2}. {pad('调整顺序', 19)}"
-              f"{DIM}补时长、截封面按上面的先后来{RST}")
+            extra.append((f"{pad('115 网盘', 19)}{YELLOW}未挂载{RST}",
+                          lambda: _drive_menu(d, MOUNT_115, DRIVER_115, mounted=False)))
+        if not any(str(x[1]) == DRIVER_QTV for x in stores):
+            extra.append((f"{pad(driver_cn(DRIVER_QTV), 19)}{YELLOW}未挂载{RST}",
+                          lambda: _drive_menu(d, MOUNT_QTV, DRIVER_QTV, mounted=False)))
+        extra.append(("＋ 添加 WebDAV", lambda: _add_webdav_flow(d)))
+        extra.append((f"{pad('♻ 剩余网盘（自动）', 19)}"
+                      + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"),
+                      lambda: _rest_menu(d)))
+        extra.append((f"{pad('调整顺序', 19)}{DIM}补时长、截封面按上面的先后来{RST}",
+                      lambda: stores and _mount_order_menu(stores)))
+        for j, (txt, _fn) in enumerate(extra, n + 1):
+            print(f"  {j:>2}. {txt}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
         # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
         # 装完那一刻网盘还没挂，没有它就是死局（见 do_strm 的说明）。
@@ -18210,16 +18500,11 @@ def mount_paths_menu():
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if not c.isdigit() or not 1 <= int(c) <= n + 2:
+        if not c.isdigit() or not 1 <= int(c) <= n + len(extra):
             print("无效选择。")
             continue
-        if int(c) == n + 2:
-            if stores:
-                _mount_order_menu(stores)
-        elif int(c) == n + 1:
-            _rest_menu(d)
-        elif no115 and int(c) == n:
-            _drive_menu(d, MOUNT_115, DRIVER_115, mounted=False)
+        if int(c) > n:
+            extra[int(c) - n - 1][1]()
         else:
             mp, drv, _st = stores[int(c) - 1]
             _drive_menu(d, mp, drv)
