@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.200"
+SCRIPT_VERSION = "1.5.201"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5654,14 +5654,21 @@ def follow_new_storages(d):
     只在【集合真的变了】的时候才写配置和重启，所以按小时跑没有代价。
     固定路径模式不碰 —— 那是用户明确指定的范围，替他扩大不是帮忙。
     """
-    cfg = rebuild_cfg_from_disk(d)
-    if cfg.get("scan_spec") != SCAN_AUTO:
+    # 【看的是「剩余网盘」开没开，不是老的整体 auto】仓库主人：「剩余网盘是不是我只需要
+    # 在挂载里面挂载好了，VPS 这边不需要填入路径，只要把剩余网盘开着他就能扫出来」——
+    # 就该是这样。可以前这里只认老的 scan_spec == auto：一旦有哪个盘单独设过路径
+    # （夸克设了 /quark/夸克挂载），剩余开着也不跟新挂的盘，要等下次「7 更新」或改设置
+    # 重新生成配置才带上。
+    if not auto_rest_on():
         return []
+    cfg = rebuild_cfg_from_disk(d)
     af = os.path.join(d, "autofilm", "config", "config.yaml")
     now = set(cfg.get("scan_paths") or [])
     old = set(read_yaml_all(af, "source_dir") or [])
     if not now or now == old:
         return []
+    if autofilm_busy():
+        return []                     # 正在扫，别重启打断它；下一轮再跟
     try:
         with open(af, "w") as f:
             f.write(gen_autofilm_conf(cfg))
@@ -14014,6 +14021,19 @@ def _af_mem(log):
         if m:
             running.discard(m.group(1))
     return mem, running
+
+
+def autofilm_busy():
+    """AutoFilm 这次启动以来有没有任务开始了还没完成（正在扫）。问不到当不忙。"""
+    try:
+        r = sh("docker inspect -f '{{.State.StartedAt}}' autofilm", timeout=30)
+        started = (r.stdout or "").strip()
+        if r.returncode != 0 or not started:
+            return False
+        lg = sh(f"docker logs --since {started} autofilm", timeout=60)
+        return bool(_af_mem((lg.stdout or "") + (lg.stderr or ""))[1])
+    except Exception:
+        return False
 
 
 def autofilm_schedule_fix(d=None, fresh=False):
