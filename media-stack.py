@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.209"
+SCRIPT_VERSION = "1.5.210"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1622,6 +1622,7 @@ case "${1:-info}" in
   covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
   covers --retry 截失败过的也重新试一遍
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
+  ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
@@ -1790,6 +1791,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" heal-trace "$@" ;;
+  ali-check)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" ali-check "$@" ;;
   play-watch)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -4517,6 +4523,103 @@ def _session_of(key, iid):
 
 _HOW_CN = {"DirectPlay": "直接播放（手机直连网盘）", "DirectStream": "服务器转发（不转码）",
            "Transcode": "服务器转码"}
+
+
+def _url_expiry_min(u, now=None):
+    """地址里带的过期时刻 → 还剩几分钟（认不出 → None）。只看参数名和时间戳，不看别的值。
+
+    认这几种：x-oss-expires / Expires / expires（Unix 秒），auth_key（「过期时刻-随机-uid-md5」）。"""
+    now = now or time.time()
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlsplit(u).query)
+    except ValueError:
+        return None
+    for k in ("x-oss-expires", "Expires", "expires"):
+        v = (qs.get(k) or [""])[0]
+        if v.isdigit():
+            return int(round((int(v) - now) / 60))
+    v = (qs.get("auth_key") or [""])[0].split("-", 1)[0]
+    if v.isdigit() and len(v) >= 10:
+        return int(round((int(v) - now) / 60))
+    return None
+
+
+def _qs_names(u):
+    try:
+        return sorted(urllib.parse.parse_qs(urllib.parse.urlsplit(u).query).keys())
+    except ValueError:
+        return []
+
+
+def do_ali_check(q):
+    """media-stack ali-check <片名>：看阿里转码流这一部的地址长什么样、多久过期。只读。
+
+    【为什么要有】真机（龙虎门）：连播二十多分钟后卡一下，播放器从头重开了一次再接着播。
+    服务器这边分片全是 302 —— 失败在「手机 → 阿里 CDN」那一段，服务器日志里看不见。
+    要分清是 CDN 偶尔抽风，还是分片签名到期了，就得知道地址带不带有效期、有多久。
+    【不泄漏】不打印地址本身、域名和任何参数的值，只打参数名、分钟数、状态码。
+    """
+    d = ms_install_dir()
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key，问不了 Emby。")
+        return
+    hits = find_strm_items(key, q)
+    if len(hits) != 1:
+        warn(f"「{q}」对上了 {len(hits)} 个 —— 要正好一个" + ("：" if hits else "。"))
+        if hits:
+            _list_hits(key, hits)
+        return
+    iid, name = str(hits[0][1]), hits[0][2]
+    try:
+        it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+        with open(_strm_host_path(d, str(it.get("Path") or "")), encoding="utf-8") as f:
+            tp = strm_target_path(f.read())
+    except Exception as e:
+        warn(f"读不到这一部的 strm：{_short_err(e)}")
+        return
+    print(f"\n  {BOLD}阿里转码流检查{RST}  {name}")
+    u1, lv = ali_preview_url(d, tp, ALI_TC_AUTO)
+    if not u1:
+        warn("阿里没给这一部转码地址（还没转完，或者不在阿里盘上）")
+        return
+    e1 = _url_expiry_min(u1)
+    print(f"  播放列表地址  档位 {lv}　参数 {'、'.join(_qs_names(u1)) or '无'}　"
+          + (f"有效期还剩 {e1} 分钟" if e1 is not None else "看不出有效期"))
+    try:
+        req = urllib.request.Request(u1, headers={"User-Agent": PLAYER_UA})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read(1 << 20).decode("utf-8", "replace")
+        segs = [ln.strip() for ln in body.splitlines() if ln.strip() and not ln.startswith("#")]
+    except Exception as e:
+        warn(f"拉不到播放列表：{_short_err(e)}")
+        return
+    if not segs:
+        warn("播放列表里没有分片")
+        return
+    s0 = urllib.parse.urljoin(u1, segs[0])
+    e2 = _url_expiry_min(s0)
+    print(f"  分片          共 {len(segs)} 个　写法 "
+          + ("相对路径" if not segs[0].lower().startswith("http") else "完整地址")
+          + f"　参数 {'、'.join(_qs_names(s0)) or '无'}　"
+          + (f"有效期还剩 {e2} 分钟" if e2 is not None else "看不出有效期"))
+    try:
+        req = urllib.request.Request(s0, headers={"User-Agent": PLAYER_UA, "Range": "bytes=0-1023"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            st = r.status
+    except urllib.error.HTTPError as e:
+        st = e.code
+    except Exception as e:
+        st = _short_err(e)
+    print(f"  拉第一个分片  {st}")
+    u2, _ = ali_preview_url(d, tp, ALI_TC_AUTO)
+    same = bool(u2) and u2.split("?", 1)[0].rsplit("/", 1)[0] == u1.split("?", 1)[0].rsplit("/", 1)[0]
+    print(f"  再要一次地址  分片目录{'一样' if same else '变了'}")
+    mins = [x for x in (e1, e2) if x is not None]
+    if mins and min(mins) < 120:
+        tip(f"阿里给的地址大约 {min(mins)} 分钟后过期 —— 连着播超过这么久，播放器会卡一下重开")
+    elif mins:
+        tip("地址有效期够长，偶尔卡一下多半是阿里 CDN 那一下慢了")
 
 
 def do_play_watch(q, minutes=15):
@@ -20871,6 +20974,9 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("sync"):
                 _timed("每日对齐", do_sync)
+        elif arg == "ali-check":          # 阿里转码流这一部的地址多久过期（只读）
+            require_root()
+            do_ali_check(" ".join(sys.argv[2:]).strip())
         elif arg == "play-watch":         # 你用手机播，它盯着：字节走没走服务器、Emby 怎么播的
             require_root()
             _a, _mn = list(sys.argv[2:]), 15
