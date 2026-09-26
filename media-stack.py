@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.197"
+SCRIPT_VERSION = "1.5.198"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -16252,17 +16252,17 @@ def _qr115_show(uid, at=0):
 
 
 def _qr115_new():
-    """申请一个新二维码，并等扫码确认。"""
+    """申请一个新二维码，并等扫码确认。返回 (令牌, 状态)：状态 2 = 确认成功。"""
     info("正在向 115 申请二维码...")
     try:
         d = (_qr115_get(QR115_TOKEN).get("data") or {})
         uid, tm, sign = d.get("uid"), d.get("time"), d.get("sign")
     except Exception as e:
         err(f"申请失败：{_short_err(e)}")
-        return
+        return "", None
     if not uid:
         err("115 没有返回二维码信息，稍后再试。")
-        return
+        return "", None
     # time/sign 也存下来：下次进菜单要拿它们回查这个令牌还有没有效
     save_ms_state(qr115_uid=uid, qr115_tm=tm, qr115_sign=sign,
                   qr115_at=int(time.time()))
@@ -16299,8 +16299,9 @@ def _qr115_new():
 
     if state == 2:
         ok("扫码确认成功")
-        print(f"  {YELLOW}现在就去 OpenList 保存{RST}{DIM} —— 这个会话是一次性的，"
-              f"保存那一下才真正去兑换。{RST}")
+        if not _QR115_AUTOMOUNT[0]:
+            print(f"  {YELLOW}现在就去 OpenList 保存{RST}{DIM} —— 这个会话是一次性的，"
+                  f"保存那一下才真正去兑换。{RST}")
     elif state == -1:
         warn("二维码过期了，重新制作一个。")
     elif state == -2:
@@ -16309,6 +16310,103 @@ def _qr115_new():
         warn("没等到确认。令牌还在，扫完码可以直接去 OpenList 保存试试。")
         if last_err:
             print(f"  {DIM}最后一次查询状态失败：{last_err}{RST}")
+    return uid, state
+
+
+# 扫码是从「挂上 115」那一栏进来的：成功后由脚本自己去 OpenList 建存储，不用再教人手填
+_QR115_AUTOMOUNT = [False]
+MOUNT_115 = "/115"
+DRIVER_115 = "115 Cloud"
+
+
+def has_115_storage(d):
+    """OpenList 里有没有挂着 115（任何挂载点）。"""
+    return any("115" in str(drv) for _mp, drv, _st, _r, _m in openlist_storages(d))
+
+
+def ol_create_115(d, uid, mount=MOUNT_115):
+    """拿扫码确认过的令牌，在 OpenList 里建一个 115 存储。返回 (成没成, 说明)。
+
+    和手填时一模一样的几栏：Cookie 留空、二维码令牌、二维码源「网页」（选安卓 / TV 会报
+    「系统已下架」）、根文件夹 0。保存那一下 OpenList 才去兑换令牌。
+    令牌只发给本机的 OpenList，不上屏、不进日志。
+    """
+    tok = _ol_token(d)
+    if not tok:
+        return False, "登不上 OpenList（它在跑吗？）"
+    body = {"mount_path": mount, "driver": DRIVER_115, "order": 0, "remark": "",
+            "cache_expiration": 30, "web_proxy": False, "webdav_policy": "302_redirect",
+            "down_proxy_url": "", "enable_sign": False, "order_by": "name",
+            "order_direction": "asc", "extract_folder": "",
+            "addition": json.dumps({"cookie": "", "qrcode_token": uid,
+                                    "qrcode_source": "web", "page_size": 1000,
+                                    "limit_rate": 2, "root_folder_id": "0"})}
+    # limit_rate 2 是 OpenList 表单里的默认值 —— 走接口不填就是 0，别让它和手填的不一样
+    try:
+        r = _ol_api("/api/admin/storage/create", body, tok, timeout=90)
+    except Exception as e:
+        return False, _short_err(e)
+    if r.get("code") == 200:
+        return True, ""
+    msg = str(r.get("message") or r)
+    # 存储已经建了、只是兑换令牌失败：OpenList 会把它留在表里，状态里写着原因
+    return has_115_storage(d), re.sub(r"https?://\S+", "<地址>", msg)[:120]
+
+
+def _add115_menu(d):
+    """「115 网盘 · 未挂载」那一栏：扫码 → 脚本自己在 OpenList 里挂上 /115。
+
+    【这一栏必须一直在】仓库主人：「这个口子留在这里就是没有加路径，随时可以加的啊，
+    就算我不用那别人要用怎么办」。以前 115 的入口挂在「已挂好的 115 盘」下面，OpenList
+    里一删，连扫码登录一起没了，想挂回来只能自己去 OpenList 手填令牌。
+    """
+    while True:
+        print("\n" + "=" * 60)
+        print(f"  {BOLD}115 网盘{RST}   {DIM}还没挂到 OpenList 上{RST}")
+        print("=" * 60)
+        print(f"  1. 扫码挂上          {DIM}115 App 扫一下，脚本自己在 OpenList 里挂成 "
+              f"{MOUNT_115}{RST}")
+        print(f"  2. 只拿令牌          {DIM}自己去 OpenList 手填（想挂到别的路径时用）{RST}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "2":
+            qr115_login()
+            if has_115_storage(d):
+                return
+            continue
+        if c != "1":
+            print("无效选择。")
+            continue
+        if MOUNT_115 in [mp for mp, *_x in openlist_storages(d)]:
+            warn(f"OpenList 里已经有一个挂在 {MOUNT_115} 的存储了（不是 115）—— "
+                 f"选 2 拿令牌，自己挂到别的路径。")
+            continue
+        _QR115_AUTOMOUNT[0] = True
+        try:
+            uid, state = _qr115_new()
+        finally:
+            _QR115_AUTOMOUNT[0] = False
+        if state != 2:
+            ask("\n按回车返回...")
+            continue
+        info(f"正在 OpenList 里挂上 {MOUNT_115} ...")
+        good, why = ol_create_115(d, uid)
+        if good and not why:
+            ok(f"115 已挂上：{MOUNT_115}")
+        elif good:
+            warn(f"存储建好了，但 OpenList 说：{why}")
+            print(f"  {DIM}多半是令牌过期了 —— 进 115 那一栏选「网盘扫码登录」再扫一次，"
+                  f"然后到 OpenList 里把这个存储的令牌换成新的。{RST}")
+        else:
+            err(f"没挂上：{why}")
+            ask("\n按回车返回...")
+            continue
+        print(f"  {DIM}接下来：在「挂载路径」里点进 115 → 1 扫描路径，加上要进 Emby 的目录。{RST}")
+        ask("\n按回车继续...")
+        return
 
 
 def qr115_status(uid, tm, sign):
@@ -17792,7 +17890,9 @@ def mount_paths_menu():
         print("\n" + "=" * 60)
         print(f"  {BOLD}挂载路径{RST}{DIM}（哪些网盘要进 Emby，各自扫哪些目录）{RST}")
         print("=" * 60)
-        if not stores:
+        # 【115 这一栏一直在】没挂的时候也留着，点进去扫码就能挂上，见 _add115_menu
+        no115 = not any("115" in str(x[1]) for x in stores)
+        if not stores and not no115:
             print(f"  {YELLOW}OpenList 里还没挂任何网盘。{RST}")
             ask("\n按回车返回...")
             return
@@ -17812,9 +17912,14 @@ def mount_paths_menu():
             print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 26)}"
                   f"{col}{pad(where, 18)}{RST}"
                   + opt_tag("__source__", "proxy" if _vps.get(mp) else "direct"))
-        print(f"  {len(stores) + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
+        n = len(stores)
+        if no115:
+            n += 1
+            print(f"  {n:>2}. {pad(f'115 网盘 {MOUNT_115}', 26)}"
+                  f"{DIM}{pad('未挂载', 18)}{RST}{YELLOW}扫码挂上{RST}")
+        print(f"  {n + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
-        print(f"  {len(stores) + 2:>2}. 调整顺序            "
+        print(f"  {n + 2:>2}. 调整顺序            "
               f"{DIM}补时长、截封面按上面的先后来{RST}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
         # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
@@ -17831,13 +17936,16 @@ def mount_paths_menu():
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if not c.isdigit() or not 1 <= int(c) <= len(stores) + 2:
+        if not c.isdigit() or not 1 <= int(c) <= n + 2:
             print("无效选择。")
             continue
-        if int(c) == len(stores) + 2:
-            _mount_order_menu(stores)
-        elif int(c) == len(stores) + 1:
+        if int(c) == n + 2:
+            if stores:
+                _mount_order_menu(stores)
+        elif int(c) == n + 1:
             _rest_menu(d)
+        elif no115 and int(c) == n:
+            _add115_menu(d)
         else:
             mp, drv, _st = stores[int(c) - 1]
             _drive_menu(d, mp, drv)
