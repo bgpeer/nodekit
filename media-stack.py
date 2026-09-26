@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.220"
+SCRIPT_VERSION = "1.5.221"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11174,6 +11174,10 @@ def tune_strm_libraries(key):
     except Exception:
         return 0
     n_changed, miss_all = 0, set()
+    changed = {}                                  # 改了什么 → 几个库
+
+    def _bump(what):
+        changed[what] = changed.get(what, 0) + 1
     for lb in libs:
         if not is_strm_lib(lb):
             continue
@@ -11225,38 +11229,30 @@ def tune_strm_libraries(key):
         if bad:
             warn(f"「{lb.get('Name')}」有选项没改动成功："
                  f"{'、'.join(f'{k}={now.get(k)}' for k in bad)}")
-            print(f"  {DIM}Emby 收下了请求但没生效，这个版本的接口可能不吃这些字段。{RST}")
+            # Emby 收下了请求但没生效 —— 这个版本的接口不吃这些字段
             continue
         n_changed += 1
-        name = lb.get("Name")
+        # 【屏上按"改了什么"各打一行，不按库打】原来每个库一行、还各带两行解释，
+        # 四个库一改就刷满一屏（仓库主人：「把这个打印出来干什么」）。只在真改动时打，
+        # 改好以后下次更新 diff 为空，一行都不出。各项为什么要改，见 STRM_LIB_OPTIONS
+        # 和 STRM_LIB_TOGGLES 的注释。
         if "MinResumeDurationSeconds" in diff or "MinResumePct" in diff:
-            ok(f"媒体库「{name}」续播门槛：{was.get('MinResumeDurationSeconds')}秒/"
-               f"{was.get('MinResumePct')}% → {RESUME_MIN_SECONDS}秒/{RESUME_MIN_PCT}%")
-            print(f"  {DIM}默认的 120 秒是按电影长度定的，短片子永远够不到，"
-                  f"表现为「长的记得住、短的记不住」。{RST}")
+            _bump(f"续播门槛 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%")
         if "MaxResumePct" in diff:
-            ok(f"媒体库「{name}」看到 {RESUME_MAX_PCT}% 才算看完"
-               f"（原来 {was.get('MaxResumePct')}%）")
+            _bump(f"看到 {RESUME_MAX_PCT}% 才算看完")
         if "EnableMultiVersionByFiles" in diff or "EnableMultiVersionByMetadata" in diff:
-            ok(f"媒体库「{name}」已关闭多版本自动合并")
-            print(f"  {DIM}Emby 默认会把名字相近的文件并成同一部片的多个「版本」。"
-                  f"网盘库里那基本都是误判 —— 少一部片，而且进度条会坏。{RST}")
-            print(f"  {DIM}关掉之后有几个文件就有几个条目。已经并在一起的，"
-                  f"下一次扫描会拆开。{RST}")
+            _bump("关掉多版本合并")
         if "EnableRealtimeMonitor" in diff:
-            ok(f"媒体库「{name}」关掉了实时监控")
-            print(f"  {DIM}补时长探完写回 strm，实时监控看见文件动过，1 分多钟后自己刷新"
-                  f"一遍，把刚补上的音视频轨清掉 —— 补一次掉一次。{RST}")
-            print(f"  {DIM}新文件照样进库：脚本发现 strm 数变了会叫 Emby 扫。{RST}")
+            _bump("关掉实时监控")
             # 【之前"补上又掉了"的那批立刻放回来】它们是被实时监控清掉的，不是补不住。
             # 不清这张表的话，要白等 HEAL_STICK_H 小时才会再探。
             save_ms_state(heal_ok={})
         _tog = [h for names, _v, h in STRM_LIB_TOGGLES
                 if _pick_opt_key(was, names) in diff]
         if _tog:
-            ok(f"媒体库「{name}」关掉了会拉视频的选项：{'、'.join(_tog)}")
-            print(f"  {DIM}这些在本地片库上是好东西，代价只是读一遍本地磁盘；"
-                  f"而这里的文件是 strm，Emby 得把视频从网盘拉过来才能做。{RST}")
+            _bump(f"关掉会拉视频的选项（{'、'.join(_tog)}）")
+    for what, n in changed.items():
+        ok(f"{n} 个媒体库：{what}")
     save_ms_state(lib_opt_missing=sorted(miss_all))
     return n_changed
 
