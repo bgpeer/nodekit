@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.223"
+SCRIPT_VERSION = "1.5.224"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -17835,8 +17835,9 @@ def _drive_menu(d, mp, drv, mounted=True):
         ch, switchable = drive_channel(d, mp, drv) if mounted else ("原画直链", False)
         tp = title_policy_of(mp)
         print("\n" + "=" * 60)
+        # 没挂的 115 不印挂载点：/115 是脚本扫码挂时才用的名字，用户手动挂可能叫别的
         print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}"
-              + ("" if mounted else f"   {YELLOW}未挂载{RST}"))
+              if mounted else f"  {BOLD}{driver_cn(drv)}{RST}   {YELLOW}未挂载{RST}")
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
         print(f"  2. 生成媒体库        {DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}")
@@ -18145,28 +18146,31 @@ def mount_paths_menu():
             return
         # 【这一屏只管设置，不报状态】存储通不通归「6 链路体检」——
         # 那边是真去列一次目录、换一次直链，比这里读一个陈年字段准得多。
-        # 【必须带挂载点，光有驱动名认不出是哪个盘】驱动名不唯一：挂两个 WebDAV
-        # （一个公益源、一个自己的）时，这一列就是两行一模一样的「WebDAV」，
-        # 点进去才知道是哪个。挂载点是用户自己在 OpenList 里起的名字，那才是他认得的那个。
-        # 【流量提示要在这一屏，不能非点进去才看见】这一屏才是"我这几个盘各是
-        # 什么情况"的地方。走不走 VPS 流量是选盘时最该一眼看到的事。
+        # 【挂载点只在认不出来时才带】原来每行都是「驱动名 挂载点  扫描路径」，而扫描路径
+        # 本来就以挂载点开头（/七米蓝影视/mov/电影），同一个名字印两遍、一行还折成两行；
+        # 115 没挂时印的「/115」更是脚本自己定的名字，用户可能挂成 /115网盘（仓库主人：
+        # 「感觉不妥，应该都干净一点」）。
+        # 但驱动名不唯一：挂两个 WebDAV 时两行都叫「WebDAV」，这时才把挂载点带上 ——
+        # 挂载点是用户自己在 OpenList 里起的名字，那才是他认得的那个。
+        # 【流量提示要在这一屏，不能非点进去才看见】走不走 VPS 流量是选盘时最该一眼看到的事。
         _vps = {m2: (_truthy(c2.get("web_proxy"))
                      or str(d2 or "").lower() in PROXY_ONLY_DRIVERS)
                 for _s2, m2, d2, _a2, c2 in _storage_rows(d)}
+        _cn = [driver_cn(x[1]) for x in stores]
         for i, (mp, drv, _st) in enumerate(stores, 1):
             where = _scan_of(mp)
             col = CYAN if where != "未加路径" else DIM
-            print(f"  {i:>2}. {pad(f'{driver_cn(drv)} {mp}', 26)}"
-                  f"{col}{pad(where, 18)}{RST}"
+            name = driver_cn(drv) + (f" {mp}" if _cn.count(driver_cn(drv)) > 1 else "")
+            print(f"  {i:>2}. {pad(name, 19)}"
+                  f"{col}{pad(where, 20)}{RST}"
                   + opt_tag("__source__", "proxy" if _vps.get(mp) else "direct"))
         n = len(stores)
         if no115:
             n += 1
-            print(f"  {n:>2}. {pad(f'115 网盘 {MOUNT_115}', 26)}"
-                  f"{DIM}{pad(_scan_of(MOUNT_115), 18)}{RST}{YELLOW}未挂载{RST}")
-        print(f"  {n + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
+            print(f"  {n:>2}. {pad('115 网盘', 19)}{YELLOW}未挂载{RST}")
+        print(f"  {n + 1:>2}. {pad('♻ 剩余网盘（自动）', 19)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
-        print(f"  {n + 2:>2}. 调整顺序            "
+        print(f"  {n + 2:>2}. {pad('调整顺序', 19)}"
               f"{DIM}补时长、截封面按上面的先后来{RST}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
         # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
