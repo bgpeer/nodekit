@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.211"
+SCRIPT_VERSION = "1.5.212"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3859,7 +3859,11 @@ def traffic_report(day=None):
     for c, (a, b) in sorted(per.items(), key=lambda kv: -kv[1][0]):
         pct = f"{a * 100 / rx:.0f}%" if rx else "-"
         print(f"    {c:<14} ↓{_gb(a):>9}  ↑{_gb(b):>9}   {DIM}{pct}{RST}")
-    h_rx = max(0, rx - sum(v[0] for v in per.values()))
+    # 【按小时算完再加】直接拿全天的「网卡 − 各容器」会被容器之间的流量压成 0：真机那天
+    # openlist 把 12 GB 转给 emby，两边各记一次，容器加起来比网卡还多，宿主机一栏显示 0 B，
+    # 可按小时看它每小时都有一百多 MB（代理节点）。夜里容器在互传、白天容器几乎不动，
+    # 按小时各减各的，白天那些就不会被夜里的抵消掉。上行没有按小时的分来源数，照旧整天算。
+    h_rx = sum(max(0, hours[h][0] - sum(hsrc.get(h, {}).values())) for h in hours)
     h_tx = max(0, tx - sum(v[1] for v in per.values()))
     print(f"    {_padw('宿主机·非容器', 15)}↓{_gb(h_rx):>9}  ↑{_gb(h_tx):>9}   "
           f"{DIM}至少这么多（代理节点在这里）{RST}")
