@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.215"
+SCRIPT_VERSION = "1.5.216"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -18383,7 +18383,9 @@ def _hc_wait(label, secs):
     停在上一行不动 —— 最需要它说话的时刻，它反而一声不吭。
     这里先打一行不换行的占位，_hc 用 \\r + 清行覆盖掉它。
     """
-    print(f"    {pad(label, 20)}{DIM}测试中…最多 {secs} 秒{RST}", end="", flush=True)
+    # 【短，别折行】这一行靠 \r 擦掉；标签长（列目录 /quark/夸克挂载）时在手机上折成两行，
+    # 擦掉的只有最后一行，真机屏上留着「…测试中…最多 120 秒    列目录 /quark/夸」
+    print(f"    {pad(label[:12], 20)}{DIM}测试中（最多 {secs} 秒）{RST}", end="", flush=True)
 
 
 def _mmss(n):
@@ -19353,12 +19355,10 @@ def netdisk_load(d, key=""):
                             + (f" {pct:.0f}%" if isinstance(pct, (int, float)) else ""))
         except Exception:
             pass
-    # AutoFilm 空闲时是不写日志的（它在等下一次定时），所以近两分钟有日志
-    # 基本就等于它正在跑。只陈述观察到的东西，不替它下判断。
-    r = sh("docker logs --since 2m autofilm", timeout=20)
-    n = len([x for x in ((r.stdout or "") + (r.stderr or "")).splitlines() if x.strip()])
-    if n:
-        busy.append(f"AutoFilm 近 2 分钟有 {n} 行日志（在生成 strm）")
+    # 【看有没有任务开始了还没完成，不看"近两分钟有几行日志"】真机：刚「7 更新」完，
+    # AutoFilm 重启打了 21 行启动日志，体检说它「在生成 strm」—— 其实一个任务都没跑
+    if autofilm_busy():
+        busy.append("AutoFilm 正在扫网盘生成 strm")
     return "；".join(busy[:3])
 
 
@@ -19618,12 +19618,10 @@ def do_healthcheck():
                                    + (f"\n{' ' * 27}{DIM}同时在敲网盘：{load}{RST}"
                                       if load else ""))
             listed_ok.append((p, n_items))
+            # 第一次慢、再打一次就快：路是通的，那一行 ⚠ 已经说清，不进问题清单
+            # （清单里那条的建议是「不用改」—— 不用改的东西不该算问题）
             if el2 is not None and code2 == 200 and el2 < 5:
-                todo.append((f"列 {p} 第一次用了 {el:.0f} 秒，紧接着再列只要 {el2:.1f} 秒"
-                             f" —— 线路是通的，慢在第一次的一次性开销"
-                             + (f"（同一刻 {load}）" if load else ""),
-                             "不用改网络。「生成媒体库」要是扫到一半停了，"
-                             "错开后台扫库的时间再点一次"))
+                pass
             elif st == "bad" and load:
                 todo.append((f"列 {p} 用了 {el:.0f} 秒 —— 但同一刻 {load}，"
                              f"这个数字量的是排队，不一定是线路",
