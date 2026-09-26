@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.216"
+SCRIPT_VERSION = "1.5.217"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -18385,7 +18385,10 @@ def _hc_wait(label, secs):
     """
     # 【短，别折行】这一行靠 \r 擦掉；标签长（列目录 /quark/夸克挂载）时在手机上折成两行，
     # 擦掉的只有最后一行，真机屏上留着「…测试中…最多 120 秒    列目录 /quark/夸」
-    print(f"    {pad(label[:12], 20)}{DIM}测试中（最多 {secs} 秒）{RST}", end="", flush=True)
+    # 【先擦掉本行】同一项要测两次（慢了再打一发）时，第二个占位直接接在第一个后面，
+    # 两段拼起来又折行 —— 1.5.216 真机屏上还是留了「测试中（最多 120 秒）    列目录 /quark/」
+    print(f"\r\x1b[2K    {pad(label[:12], 20)}{DIM}测试中（最多 {secs} 秒）{RST}",
+          end="", flush=True)
 
 
 def _mmss(n):
@@ -19745,11 +19748,31 @@ def do_healthcheck():
                 todo.append((f"{mount} 换不到直链，302 不可能生效",
                              "看 docker logs --tail 50 openlist"))
             elif el > 8:
-                _hc(label, "bad",
-                    f"{RED}{el:.1f} 秒{RST}  太慢（正常 < 2 秒）  →  {raw.split('/')[2]}")
-                todo.append((f"{mount} 换一次直链要 {el:.0f} 秒，播放会卡在开头甚至超时",
-                             "网盘接口到本机的线路问题，服务端改不了；"
-                             "缓存已开 2h，同一部片只慢第一次"))
+                # 慢了就对同一个文件再换一次。第二次快（OpenList / MediaWarp 的直链缓存接住了），
+                # 说明只有首播慢一次、之后都走缓存 —— 线路那头服务端改不了，列进问题清单也
+                # 没有能做的事，只留一行 ⚠。两次都慢才是缓存没接住，那才是真问题。
+                # （实测 1.5.216：换直链 /quark 14.6 秒 ✖ + 一条「服务端改不了」的待办，
+                #   同一屏的 302 直链 /quark 却是通的）
+                _hc_wait(label, 60)
+                t1 = time.monotonic()
+                try:
+                    r2 = _ol_api("/api/fs/get", {"path": fp, "password": ""},
+                                 token, timeout=60)
+                    el2 = time.monotonic() - t1
+                    ok2 = bool((r2.get("data") or {}).get("raw_url"))
+                except Exception:
+                    el2, ok2 = time.monotonic() - t1, False
+                host = raw.split('/')[2]
+                if ok2 and el2 <= 2:
+                    _hc(label, "warn", f"{el:.1f} 秒  →  再换一次 {el2:.1f} 秒  "
+                                       f"只有首播慢，之后走缓存  →  {host}")
+                else:
+                    _hc(label, "bad", f"{RED}{el:.1f} 秒{RST}  →  再换一次 {el2:.1f} 秒  "
+                                      f"两次都慢  →  {host}")
+                    todo.append((f"{mount} 换一次直链要 {el:.0f} 秒，再换一次还要 "
+                                 f"{el2:.0f} 秒，每次开播都会卡在开头",
+                                 "直链缓存没接住：3 后补参数 → 看直链缓存时长；"
+                                 "还不行就 docker restart openlist"))
             elif _is_internal_host(raw.split("/")[2]):
                 # 代理型存储（WebDAV 源、本地目录）在网盘侧没有 CDN 直链，OpenList 只能回
                 # 自己的 /d/ 地址 —— 而那个地址是按【请求里的 Host】拼的。
