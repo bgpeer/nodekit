@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.229"
+SCRIPT_VERSION = "1.5.230"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1627,6 +1627,7 @@ case "${1:-info}" in
   covers --retry 截失败过的也重新试一遍
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
+  115-check <片名>        115 这一部卡在哪一段（只读）
   play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
@@ -1800,6 +1801,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" ali-check "$@" ;;
+  115-check)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" 115-check "$@" ;;
   play-watch)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -4711,6 +4717,94 @@ def do_ali_check(q):
         tip(f"阿里给的地址大约 {min(mins)} 分钟后过期 —— 连着播超过这么久，播放器会卡一下重开")
     elif mins:
         tip("地址有效期够长，偶尔卡一下多半是阿里 CDN 那一下慢了")
+
+
+def _p115_get(url, ua, n=1 << 20, timeout=20):
+    """拿 ua 拉 url 的前 n 字节 → (状态码或原因, 字节数, 秒)。只读。"""
+    t = time.monotonic()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": ua, "Range": f"bytes=0-{n - 1}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            got = len(r.read(n))
+            return r.status, got, time.monotonic() - t
+    except urllib.error.HTTPError as e:
+        return e.code, 0, time.monotonic() - t
+    except Exception as e:
+        return _short_err(e)[:30], 0, time.monotonic() - t
+
+
+def do_p115_check(q):
+    """media-stack 115-check <片名>：115 这一部一段一段查，卡在哪一段就报哪一段。只读。
+
+    【为什么要有】1.5.229 让本机服务拿播放器的 UA 去换 115 的直链，真机仍然 0 B/s 退出。
+    手机上永远只有一句"播不了"，而可能坏的地方有好几段：nginx 没把请求交给服务、服务没
+    认出是 115、OpenList 换不到链、链拿到了但 115 不认（UA 之外还绑了别的，比如 IP）。
+    【不泄漏】不打印直链、域名、参数值，只打状态码、字节数和速度。
+    """
+    d = ms_install_dir()
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key，问不了 Emby。")
+        return
+    hits = find_strm_items(key, q)
+    if len(hits) != 1:
+        warn(f"「{q}」对上了 {len(hits)} 个 —— 要正好一个" + ("：" if hits else "。"))
+        if hits:
+            _list_hits(key, hits)
+        return
+    iid, name = str(hits[0][1]), hits[0][2]
+    print(f"\n  {BOLD}115 检查{RST}  {name}")
+    try:
+        it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+        with open(_strm_host_path(d, str(it.get("Path") or "")), encoding="utf-8") as f:
+            tp = strm_target_path(f.read())
+    except Exception as e:
+        warn(f"读不到这一部的 strm：{_short_err(e)}")
+        return
+    mts = pan115_mounts(d)
+    in115 = any(tp == m or tp.startswith(m.rstrip("/") + "/") for m in mts)
+    _hc("是不是 115", "ok" if in115 else "bad",
+        "是" if in115 else f"不在要换链的 115 盘里（{'、'.join(mts) or '一个都没有'}）")
+    _hc("换链服务", "ok" if hls_ready() else "bad", "在跑" if hls_ready() else "没在跑 —— 跑「7 更新」")
+    # 手机那边最近几次要视频，nginx 回的是什么：302 = 服务接住了；别的 = 没走到服务
+    try:
+        with open(NGX_ACCESS_LOG, "rb") as f:
+            f.seek(max(0, os.path.getsize(NGX_ACCESS_LOG) - (4 << 20)))
+            rows = _ngx_item_lines(f.read().decode("utf-8", "replace"), iid)
+        vids = [r for r in rows if "/videos/" in r[2].lower()][-5:]
+    except OSError:
+        vids = []
+    _hc("手机最近要视频", "ok" if vids and all(str(r[3]) == "302" for r in vids)
+        else ("skip" if not vids else "warn"),
+        "　".join(str(r[3]) for r in vids) if vids else "日志里还没有 —— 先在手机上点一次播放")
+    # 服务自己回什么（拿一个播放器 UA 当手机）
+    loc, st = "", ""
+    try:
+        op = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(f"http://127.0.0.1:{hls_port()}/emby/videos/{iid}/stream",
+                                     headers={"User-Agent": PLAYER_UA})
+        try:
+            op.open(req, timeout=40).close()
+            st = "200"
+        except urllib.error.HTTPError as e:
+            st, loc = str(e.code), e.headers.get("Location") or ""
+    except Exception as e:
+        st = _short_err(e)[:30]
+    _hc("服务回", "ok" if loc else "bad",
+        "302 到 115 的直链" if loc else f"{st}（没给直链 —— OpenList 换不到，或者没认出是 115）")
+    if not loc:
+        return
+    s1, n1, t1 = _p115_get(loc, PLAYER_UA)
+    _hc("本机拿同一个 UA 下", "ok" if s1 in (200, 206) and n1 else "bad",
+        f"{s1}　{n1 // 1024} KB / {t1:.1f} 秒" + (f"　{n1 / 1024 / max(t1, 0.01):.0f} KB/s" if n1 else ""))
+    s2, _n2, _t2 = _p115_get(loc, HTTP_UA, n=1024)
+    _hc("换一个 UA 下", "ok" if s2 not in (200, 206) else "warn",
+        f"{s2}　" + ("115 认 UA（换了就拒），和预期一样" if s2 not in (200, 206)
+                    else "换了 UA 也给 —— 这条链不绑 UA"))
+    if s1 in (200, 206) and n1:
+        tip("本机拿得到字节：链是好的。手机还播不了的话，多半是 115 还绑了 IP（链是服务器换的，手机在另一个网络）")
+    else:
+        tip("本机拿同一个 UA 都下不动：是换出来的链本身不能用，截这一屏给作者")
 
 
 def do_play_watch(q, minutes=15):
@@ -21537,6 +21631,9 @@ if __name__ == "__main__":
         elif arg == "ali-check":          # 阿里转码流这一部的地址多久过期（只读）
             require_root()
             do_ali_check(" ".join(sys.argv[2:]).strip())
+        elif arg == "115-check":          # 115 这一部卡在哪一段（只读）
+            require_root()
+            do_p115_check(" ".join(sys.argv[2:]).strip())
         elif arg == "play-watch":         # 你用手机播，它盯着：字节走没走服务器、Emby 怎么播的
             require_root()
             _a, _mn = list(sys.argv[2:]), 15
