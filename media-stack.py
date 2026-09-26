@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.227"
+SCRIPT_VERSION = "1.5.228"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8070,8 +8070,11 @@ def auto_libraries_apply(d, key, quiet=False):
             ids = [i for n, i, _on, _o in metatube_libraries(key) if n in set(mt_libs)]
             if set_metatube_libraries(key, ids):
                 ok(f"MetaTube 只在 {'、'.join(mt_libs) or '（无）'} 生效")
-        # 新库要扫一次才有内容。刚扫过就不会真去扫（见 emby_scan_wait 的去重）
-        emby_scan_wait(key, timeout=900, label="扫描新建的媒体库")
+        # 新库 / 新补的路径要扫一次才有内容。【必须 force】去重只看"本地 strm 数变没变"，
+        # 可这里变的是 Emby 那边（库多了一条路径），本地一个文件没动 —— 实测：115 新挂的
+        # AV影片 目录，生成完先扫了一遍（那时还没有库指向它），补上路径后这一遍被去重跳过，
+        # 屏上写着「补了 1 条路径」，库里却一部都没有。
+        emby_scan_wait(key, timeout=900, label="扫描新建的媒体库", force=True)
     if not quiet:
         print(f"  {DIM}规则文件：{lib_rules_path(d)}"
               f"（改仓库里那份，「7 更新」会拉下来）{RST}")
