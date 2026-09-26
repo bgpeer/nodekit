@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.224"
+SCRIPT_VERSION = "1.5.225"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -16615,17 +16615,42 @@ def ol_create_115(d, uid, mount=MOUNT_115):
     return has_115_storage(d), re.sub(r"https?://\S+", "<地址>", msg)[:120]
 
 
+def norm_mount_115(raw):
+    """把用户输入的挂载路径规整成 /xxx。空 = 默认 MOUNT_115；不合法返回 None。
+
+    「115网盘」→「/115网盘」，「/a/b/」→「/a/b」。根目录 / 不行（会盖住所有盘），
+    空格和 ?#\\ 不行：OpenList 的路径和 strm 里的 URL 都会被它们弄坏。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return MOUNT_115
+    p = "/" + raw.strip("/")
+    if p == "/" or re.search(r"[\s?#\\]", p) or "//" in p:
+        return None
+    return p
+
+
 def _add115_flow(d):
-    """扫码 → 脚本自己在 OpenList 里挂上 /115。返回挂没挂上。
+    """问挂载路径 → 扫码 → 脚本自己在 OpenList 里挂上 115（默认 /115）。返回挂没挂上。
 
     从 115 那一屏的「7 扫码挂上」进来（没挂的时候）。
     【那一屏必须一直在】仓库主人：「这个口子留在这里就是没有加路径，随时可以加的啊，
     就算我不用那别人要用怎么办……你看夸克里面有多少功能 115 网盘为什么就这样子」。
     以前 115 的入口挂在「已挂好的 115 盘」下面，OpenList 里一删，整屏连同扫码一起没了。
     """
-    if MOUNT_115 in [mp for mp, *_x in openlist_storages(d)]:
-        warn(f"OpenList 里已经有一个挂在 {MOUNT_115} 的存储了（不是 115）—— "
-             f"选 8 只拿令牌，自己挂到别的路径。")
+    # 【扫码前先问挂到哪】仓库主人：「扫码前先问挂到哪个路径，这样可以手动输入路径，
+    # 不输入回车直接就用默认的」—— 他想挂成 /115网盘 这种自己起的名字。
+    # 先问后扫：扫码会话只有几分钟，扫完再让人想名字、输错了重来，令牌就过期了。
+    # 输错了直接回上一屏再点 7，不在这里打转 —— 死循环里没有退路。
+    used = [mp for mp, *_x in openlist_storages(d) if mp]
+    mount = norm_mount_115(ask(f"挂到哪个路径（回车用 {MOUNT_115}）"))
+    if mount is None:
+        warn("路径不能是 / ，也不能带空格或 ?#\\ 这些字符。")
+        return False
+    # 跟已有的盘重名、或者套在别的盘里面（/quark/115）都不行：OpenList 里路径会互相遮住
+    if any(mount == u or mount.startswith(u.rstrip("/") + "/")
+           or u.startswith(mount + "/") for u in used if u != "/"):
+        warn(f"{mount} 跟 OpenList 里已有的盘撞了，换一个路径。")
         return False
     _QR115_AUTOMOUNT[0] = True
     try:
@@ -16635,10 +16660,10 @@ def _add115_flow(d):
     if state != 2:
         ask("\n按回车返回...")
         return False
-    info(f"正在 OpenList 里挂上 {MOUNT_115} ...")
-    good, why = ol_create_115(d, uid)
+    info(f"正在 OpenList 里挂上 {mount} ...")
+    good, why = ol_create_115(d, uid, mount)
     if good and not why:
-        ok(f"115 已挂上：{MOUNT_115}")
+        ok(f"115 已挂上：{mount}")
     elif good:
         warn(f"存储建好了，但 OpenList 说：{why}")
         tip("多半是令牌过期了：选「7 网盘扫码登录」再扫一次，到 OpenList 里换上新令牌")
