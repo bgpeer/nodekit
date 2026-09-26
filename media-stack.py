@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.213"
+SCRIPT_VERSION = "1.5.214"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -19361,10 +19361,6 @@ def do_healthcheck():
     播放卡在开头。每一个都只能靠翻容器日志一层层挖，而真正的报错往往被几百行访问日志淹掉。
     这里的每一项都对应一个真实踩过的坑，不是凭空设计的检查表。
     """
-    # 体检当场数出来的"没时长"个数。下面「每日对齐」那一行要拿它跟
-    # 上次跑完时记下的数字对一下 —— 不对一下就会出现「条目时长 ✔ 都有」
-    # 和「还有 8 个没时长」同屏打架，用户没法判断该信哪个。
-    live_nodur = None
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
@@ -19874,9 +19870,11 @@ def do_healthcheck():
             "mediawarp 的配置文件被写空了 —— 容器现在还在跑（配置在内存里），"
             "但只要它重启一次就整个起不来，表现是所有片子都放不了",
             "跑一次「7 更新」重新生成。生成失败的话看那一步的报错"))
+    # 开了阿里转码流的盘不参与（见 link_ttl_of）—— 真机：2h 后面还写着「按 AliyundriveOpen 定的」
+    _tcm = ali_tc_mounts()
     _short = {drv: LINK_LIFE_MIN[str(drv).lower()]
               for _mp, drv, _s, _r, _m in openlist_storages(d)
-              if str(drv).lower() in LINK_LIFE_MIN}
+              if str(drv).lower() in LINK_LIFE_MIN and _mp not in _tcm}
     _shortest = sorted(_short, key=lambda k: _short[k])
     if _ttl_cur and _ttl_cur != _ttl_want:
         _hc("直链缓存", "bad",
@@ -20460,10 +20458,6 @@ def do_healthcheck():
             # 【体检报全库，不报"这一轮会探的那批"】用户来体检是想知道"还差多少"，
             # 而不是"下一批探几个"。范围设成只补一部分时，下面会把这件事说明白。
             nodur = items_without_duration(key, "all")
-            # 【留给「每日对齐」那一行用】那一行印的是上次跑完时记下的数字，
-            # 印之前得先跟现在的实际情况对一下 —— 不然会出现「条目时长 ✔ 都有」
-            # 和「还有 8 个没时长」同屏打架，用户没法判断该信哪个。
-            live_nodur = len(nodur)
             if nodur:
                 # 必须把片名列出来。只报个数字的话，用户看到"某个媒体库没有进度条
                 # 记忆"会以为是那个库的设置没生效 —— 而实际上门槛早就调好了，
@@ -20714,14 +20708,8 @@ def do_healthcheck():
                 fixed = sy.get("nodur_before", 0) - sy.get("nodur_after", 0)
                 if fixed > 0:
                     did.append(f"补了 {fixed} 个时长")
-                if sy.get("nodur_after"):
-                    # live_nodur 是这次体检【当场数】出来的。上次跑完还差几个，
-                    # 不代表现在还差 —— 中间每小时的对齐任务一直在补。
-                    if live_nodur == 0:
-                        did.append(f"{DIM}（那次跑完还差 {sy['nodur_after']} 个"
-                                   f"时长，现在都齐了）{RST}")
-                    else:
-                        did.append(f"{YELLOW}还有 {live_nodur} 个没时长{RST}")
+                # 【还差多少时长不在这儿说】上面「条目时长」那行已经按口径（点开过的才算）
+                # 说了；这里再印一个全库的数（真机「还有 2759 个没时长」）只会跟它打架
                 if sy.get("missing"):
                     did.append(f"{YELLOW}{sy['missing']} 个没被 Emby 收录{RST}")
                 st2, note2 = _stale_note(int(hrs * 60), 24 * 60, "天", late=1.5)
