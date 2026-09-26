@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.199"
+SCRIPT_VERSION = "1.5.200"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -17800,11 +17800,34 @@ def _rest_menu(d):
               f"{CYAN}{names.get(title_policy())}{RST}")
         print(f"  5. 名称重定义        当前：{CYAN}"
               + ("清洗后的名字" if rename_policy() == "on" else "网盘原名") + RST)
+        # 【剩余组也要能管到每个盘】仓库主人：「剩余网盘应该包含挂在里面的全部路径，
+        # 里面的功能应该更多」。组里的盘各有各的开关（不扫的目录、115 扫码……），
+        # 以前只能先给它单独加路径、让它离开这个组，才点得进它自己那一屏。
+        _sk = sum(len(skip_dirs_of(m)) for m in rest)
+        print(f"  6. 不扫的目录        当前："
+              + (f"{CYAN}{_sk} 条{RST}" if _sk else f"{DIM}无{RST}")
+              + (f"  {DIM}（按盘设）{RST}" if len(rest) > 1 else ""))
+        print(f"  7. 组里单个盘的设置  "
+              + (f"{DIM}{len(rest)} 个盘，点进去和它自己那一屏一样{RST}" if rest
+                 else f"{DIM}没有剩余的盘{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
+        if c in ("6", "7"):
+            if not rest:
+                warn("没有剩余的盘（每个盘都单独设过路径了）。")
+                continue
+            mp = _pick_mount(rest, "哪个盘")
+            if not mp:
+                continue
+            if c == "6":
+                _skip_dirs_menu(d, mp)
+            else:
+                drv = next((dv for m, dv, *_x in openlist_storages(d) if m == mp), "")
+                _drive_menu(d, mp, drv)
+            continue
         if c == "2":
             # 【关着就扫不了】关着时这些盘根本没有扫描任务，触发也没东西可触发。
             # 直说，比让人点进去看一个空菜单强。
@@ -17834,6 +17857,16 @@ def _rest_menu(d):
                 continue
         save_ms_state(auto_rest=(not on))
         _apply_scan_paths(d, "自动" + ("打开" if not on else "关掉") + "，")
+
+
+def _pick_mount(mounts, what="哪一个"):
+    """从几个挂载点里挑一个。只有一个就直接是它。取消返回 ""。"""
+    if len(mounts) == 1:
+        return mounts[0]
+    for i, m in enumerate(mounts, 1):
+        print(f"  {i:>2}. {m}")
+    t = ask(f"{what}？（编号，回车取消）").strip()
+    return mounts[int(t) - 1] if t.isdigit() and 1 <= int(t) <= len(mounts) else ""
 
 
 def _mount_order_menu(stores):
