@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.217"
+SCRIPT_VERSION = "1.5.218"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -19658,7 +19658,9 @@ def do_healthcheck():
     if _dcs:
         _low = [f"{mp} {ce} 分钟" for _s, mp, _dv, ce in _dcs if ce and ce <= 30]
         _txt = "　".join(f"{mp} {ce} 分钟" for _s, mp, _dv, ce in _dcs)
-        if _low and hstat and hstat.get("bad"):
+        # 【跟上面「列目录历史」同一个口径】原来只要 24 小时里失败过 1 次就报「常超时」——
+        # 实测 1.5.217：41 次失败 1 次、21 小时前、中位 1.4 秒，历史那行 ✔，这行却 ⚠。
+        if _low and hstat and hst != "ok":
             # 【区分"脚本还没来得及设"和"用户自己设成这样"】前者不是待办，
             # 跑一次更新就好了；后者才需要提醒他这个值和他的线路对不上。
             # 【这里只摆事实，不再劝人调长】缓存调长确实能让列目录少碰网盘接口，
