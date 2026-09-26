@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.198"
+SCRIPT_VERSION = "1.5.199"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -16353,60 +16353,41 @@ def ol_create_115(d, uid, mount=MOUNT_115):
     return has_115_storage(d), re.sub(r"https?://\S+", "<地址>", msg)[:120]
 
 
-def _add115_menu(d):
-    """「115 网盘 · 未挂载」那一栏：扫码 → 脚本自己在 OpenList 里挂上 /115。
+def _add115_flow(d):
+    """扫码 → 脚本自己在 OpenList 里挂上 /115。返回挂没挂上。
 
-    【这一栏必须一直在】仓库主人：「这个口子留在这里就是没有加路径，随时可以加的啊，
-    就算我不用那别人要用怎么办」。以前 115 的入口挂在「已挂好的 115 盘」下面，OpenList
-    里一删，连扫码登录一起没了，想挂回来只能自己去 OpenList 手填令牌。
+    从 115 那一屏的「7 扫码挂上」进来（没挂的时候）。
+    【那一屏必须一直在】仓库主人：「这个口子留在这里就是没有加路径，随时可以加的啊，
+    就算我不用那别人要用怎么办……你看夸克里面有多少功能 115 网盘为什么就这样子」。
+    以前 115 的入口挂在「已挂好的 115 盘」下面，OpenList 里一删，整屏连同扫码一起没了。
     """
-    while True:
-        print("\n" + "=" * 60)
-        print(f"  {BOLD}115 网盘{RST}   {DIM}还没挂到 OpenList 上{RST}")
-        print("=" * 60)
-        print(f"  1. 扫码挂上          {DIM}115 App 扫一下，脚本自己在 OpenList 里挂成 "
-              f"{MOUNT_115}{RST}")
-        print(f"  2. 只拿令牌          {DIM}自己去 OpenList 手填（想挂到别的路径时用）{RST}")
-        print("  0. 返回")
-        print("-" * 60)
-        c = ask("请选择").strip()
-        if c in ("0", "", "q"):
-            return
-        if c == "2":
-            qr115_login()
-            if has_115_storage(d):
-                return
-            continue
-        if c != "1":
-            print("无效选择。")
-            continue
-        if MOUNT_115 in [mp for mp, *_x in openlist_storages(d)]:
-            warn(f"OpenList 里已经有一个挂在 {MOUNT_115} 的存储了（不是 115）—— "
-                 f"选 2 拿令牌，自己挂到别的路径。")
-            continue
-        _QR115_AUTOMOUNT[0] = True
-        try:
-            uid, state = _qr115_new()
-        finally:
-            _QR115_AUTOMOUNT[0] = False
-        if state != 2:
-            ask("\n按回车返回...")
-            continue
-        info(f"正在 OpenList 里挂上 {MOUNT_115} ...")
-        good, why = ol_create_115(d, uid)
-        if good and not why:
-            ok(f"115 已挂上：{MOUNT_115}")
-        elif good:
-            warn(f"存储建好了，但 OpenList 说：{why}")
-            print(f"  {DIM}多半是令牌过期了 —— 进 115 那一栏选「网盘扫码登录」再扫一次，"
-                  f"然后到 OpenList 里把这个存储的令牌换成新的。{RST}")
-        else:
-            err(f"没挂上：{why}")
-            ask("\n按回车返回...")
-            continue
-        print(f"  {DIM}接下来：在「挂载路径」里点进 115 → 1 扫描路径，加上要进 Emby 的目录。{RST}")
-        ask("\n按回车继续...")
-        return
+    if MOUNT_115 in [mp for mp, *_x in openlist_storages(d)]:
+        warn(f"OpenList 里已经有一个挂在 {MOUNT_115} 的存储了（不是 115）—— "
+             f"选 8 只拿令牌，自己挂到别的路径。")
+        return False
+    _QR115_AUTOMOUNT[0] = True
+    try:
+        uid, state = _qr115_new()
+    finally:
+        _QR115_AUTOMOUNT[0] = False
+    if state != 2:
+        ask("\n按回车返回...")
+        return False
+    info(f"正在 OpenList 里挂上 {MOUNT_115} ...")
+    good, why = ol_create_115(d, uid)
+    if good and not why:
+        ok(f"115 已挂上：{MOUNT_115}")
+    elif good:
+        warn(f"存储建好了，但 OpenList 说：{why}")
+        print(f"  {DIM}多半是令牌过期了 —— 选「7 网盘扫码登录」再扫一次，"
+              f"然后到 OpenList 里把这个存储的令牌换成新的。{RST}")
+    else:
+        err(f"没挂上：{why}")
+        ask("\n按回车返回...")
+        return False
+    print(f"  {DIM}接下来：1 扫描路径，加上要进 Emby 的目录。{RST}")
+    ask("\n按回车继续...")
+    return True
 
 
 def qr115_status(uid, tm, sign):
@@ -17618,19 +17599,23 @@ def _skip_dirs_menu(d, mp):
                   f"「5 生成媒体库」最后会通知扫描，每天的对齐也会做。{RST}")
 
 
-def _drive_menu(d, mp, drv):
-    """单个网盘的设置。"""
+def _drive_menu(d, mp, drv, mounted=True):
+    """单个网盘的设置。mounted=False：OpenList 里还没挂上（目前只有 115 会这样常驻）——
+    同一屏、同样的几项，要挂上才能做的那几项点了会先让去扫码。"""
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
     while True:
-        ch, switchable = drive_channel(d, mp, drv)
+        if not mounted and has_115_storage(d):
+            return                    # 刚扫码挂上了：回外层，那边会按真实的盘重新列
+        ch, switchable = drive_channel(d, mp, drv) if mounted else ("原画直链", False)
         tp = title_policy_of(mp)
         print("\n" + "=" * 60)
-        print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}")
+        print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}"
+              + ("" if mounted else f"   {YELLOW}未挂载 —— 先选 7 扫码挂上{RST}"))
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
         print(f"  2. 生成媒体库        {DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}")
         # 数字不进这一行，理由见上一屏同样的地方：右边就是行首的编号
-        has_sw = switchable and drive_links(d, mp, drv)
+        has_sw = mounted and switchable and drive_links(d, mp, drv)
         print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}"
               + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"))
         print(f"  4. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
@@ -17642,13 +17627,26 @@ def _drive_menu(d, mp, drv):
               + ("" if (ms_state().get("rename_by_drive") or {}).get(mp)
                  else f"  {DIM}（跟默认）{RST}"))
         has115 = "115" in str(drv)
-        if has115:
+        if has115 and mounted:
             print(f"  7. 网盘扫码登录")
+        elif has115:
+            print(f"  7. 扫码挂上          {DIM}115 App 扫一下，脚本自己在 OpenList 里挂成 "
+                  f"{mp}{RST}")
+            print(f"  8. 只拿令牌          {DIM}自己去 OpenList 手填（想挂到别的路径时用）{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
+        if not mounted and c in ("1", "2", "3", "5"):
+            warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— 先选 7 扫码挂上。")
+            continue
+        if not mounted and c == "7":
+            _add115_flow(d)
+            continue
+        if not mounted and c == "8":
+            qr115_login()
+            continue
         if c == "1":
             _drive_paths_menu(d, mp)
         elif c == "2":
@@ -17890,7 +17888,7 @@ def mount_paths_menu():
         print("\n" + "=" * 60)
         print(f"  {BOLD}挂载路径{RST}{DIM}（哪些网盘要进 Emby，各自扫哪些目录）{RST}")
         print("=" * 60)
-        # 【115 这一栏一直在】没挂的时候也留着，点进去扫码就能挂上，见 _add115_menu
+        # 【115 这一栏一直在】没挂的时候也留着，点进去扫码就能挂上，同一屏，见 _drive_menu 的 mounted
         no115 = not any("115" in str(x[1]) for x in stores)
         if not stores and not no115:
             print(f"  {YELLOW}OpenList 里还没挂任何网盘。{RST}")
@@ -17916,7 +17914,7 @@ def mount_paths_menu():
         if no115:
             n += 1
             print(f"  {n:>2}. {pad(f'115 网盘 {MOUNT_115}', 26)}"
-                  f"{DIM}{pad('未挂载', 18)}{RST}{YELLOW}扫码挂上{RST}")
+                  f"{DIM}{pad(_scan_of(MOUNT_115), 18)}{RST}{YELLOW}未挂载 · 点进去扫码挂上{RST}")
         print(f"  {n + 1:>2}. {pad('♻ 剩余网盘（自动）', 24)}"
               + (f"{GREEN}开{RST}" if auto_rest_on() else f"{DIM}关{RST}"))
         print(f"  {n + 2:>2}. 调整顺序            "
@@ -17945,7 +17943,7 @@ def mount_paths_menu():
         elif int(c) == n + 1:
             _rest_menu(d)
         elif no115 and int(c) == n:
-            _add115_menu(d)
+            _drive_menu(d, MOUNT_115, DRIVER_115, mounted=False)
         else:
             mp, drv, _st = stores[int(c) - 1]
             _drive_menu(d, mp, drv)
