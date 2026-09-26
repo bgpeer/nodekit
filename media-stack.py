@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.210"
+SCRIPT_VERSION = "1.5.211"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -3786,8 +3786,24 @@ def _gb(n):
         return f"{n / 1024:.0f} KB"
     return f"{n} B"
 
+TRAFFIC_TASK_SHOW_S = 60      # 按任务那段只逐条列跑了这么久以上的；短的按名字合成一行
+
+
 def traffic_report(day=None):
-    """把某一天的账本摊开：总账 / 按来源 / 按小时。"""
+    """把某一天的账本摊开。
+
+    【合计放在最后】仓库主人：「这个账本上翻翻不到头了，消耗了多少流量都看不到」。以前总账在
+    最上面，下面是按任务 —— 补时长每分钟看一眼就记一行，一天一千多行，把总账顶出屏幕。
+    现在顺序是：按小时 → 按任务（只列跑了一分钟以上的，秒级的按名字合成一行）→ 按来源 →
+    全天合计。停下来的时候，屏幕最下面就是答案。
+
+    几条口径（原来印在屏上，挪进注释）：
+      · 物理网卡是唯一真出过网的数；按来源是容器自己的网口，含容器之间的流量，加起来可能比网卡多
+      · 宿主机 = 网卡 − 各容器，主要是代理节点（sing-box / xray，systemd 服务，不在容器里），
+        另有系统更新、证书续期、docker pull；容器间流量会把它压小，所以只说「至少」
+      · openlist 是唯一真正出境拉网盘数据的一环：它占网卡下行的比例高 → Emby 这边在吃；低 → 节点在吃
+      · 按任务的「窗口内网卡」含同一时段别的活动，只能当上限看；heal 自测的数比它准
+    """
     day = day or time.strftime("%Y-%m-%d")
     rx, tx, per, hours, rows = _traffic_read(day)
     print("\n" + "=" * 60)
@@ -3795,101 +3811,75 @@ def traffic_report(day=None):
     print("=" * 60)
     if not rows:
         if not os.path.exists(TRAFFIC_CRON):
-            warn("账本还没开始记 —— 定时任务没装。")
-            print(f"  {DIM}跑一次「7 更新」会自动补上，之后每 {TRAFFIC_EVERY_MIN} "
-                  f"分钟记一笔。{RST}")
+            warn("账本还没开始记 —— 定时任务没装，跑一次「7 更新」会补上。")
         else:
-            info(f"这一天没有记录（刚装上？每 {TRAFFIC_EVERY_MIN} 分钟才记一笔）")
+            info(f"这一天没有记录（每 {TRAFFIC_EVERY_MIN} 分钟才记一笔）")
         return
-    cover = rows * TRAFFIC_EVERY_MIN
-    print(f"  记了 {rows} 格，覆盖约 {cover // 60} 小时 {cover % 60} 分")
-    print(f"  {BOLD}物理网卡  ↓{_gb(rx)}  ↑{_gb(tx)}{RST}"
-          f"   {DIM}← 只有这一份是真出过网的{RST}")
-    print("-" * 60)
-    print(f"  {BOLD}按来源（容器自己的网口，含容器之间的流量，加起来可能比网卡多）{RST}")
-    if per:
-        for c, (a, b) in sorted(per.items(), key=lambda kv: -kv[1][0]):
-            pct = f"{a * 100 / rx:.0f}%" if rx else "-"
-            print(f"    {c:<14} ↓{_gb(a):>9}  ↑{_gb(b):>9}   {DIM}占网卡下行 {pct}{RST}")
-    else:
-        print(f"    {DIM}这一天没有容器在跑{RST}")
-    # 【宿主机那一行不能省】代理节点（sing-box / xray）是 systemd 服务，跑在宿主机上、
-    # 不在任何容器里 —— 它的流量永远不会出现在上面几行。少了这一行，用户看到"容器全是
-    # 0、网卡却跑了 43 MB"只会觉得这张表坏了。现场第一次看就是这个反应。
-    #
-    # 用减法是有偏差的：容器之间的流量（emby 找 nginx 要文件头）算进了容器、却没经过
-    # 网卡，会把这个差值压小，极端情况压成负数 —— 所以夹到 0，并且措辞是"至少"。
-    c_rx = sum(v[0] for v in per.values())
-    c_tx = sum(v[1] for v in per.values())
-    h_rx, h_tx = max(0, rx - c_rx), max(0, tx - c_tx)
-    # 中文是双宽，:<14 按【字符数】补空格会把这一行顶歪（容器名都是 ASCII，按 14 列排）。
-    _lab = "宿主机·非容器"          # 短到能排进 14 列；"不在容器里"在下面那句里讲
-    print(f"    {_padw(_lab, 15)}↓{_gb(h_rx):>9}  ↑{_gb(h_tx):>9}   "
-          f"{DIM}至少这么多{RST}")
-    print(f"  {DIM}宿主机这一行主要是【代理节点】sing-box / xray —— 它们是 systemd 服务，"
-          f"不在容器里；{RST}")
-    print(f"  {DIM}另外还有系统更新、证书续期、docker pull。这一格算法是"
-          f"「网卡 − 各容器」，容器之间的流量会把它压小，所以只说「至少」。{RST}")
-    ol = per.get("openlist", [0, 0])[0]
-    if rx:
-        print("-" * 60)
-        print(f"  {BOLD}openlist 从网盘拉了 {_gb(ol)}，占网卡下行 {ol * 100 / rx:.0f}%{RST}")
-        print(f"  {DIM}它是整条链路上唯一真正出境拉数据的一环。这个占比就是"
-              f"「流量到底是 Emby 吃的、还是节点吃的」的答案：{RST}")
-        print(f"  {DIM}  占比高 → Emby 这边（探测 / 补时长 / 扫库）；"
-              f"占比低 → 剩下的是代理节点转发的。{RST}")
-    # heal 是唯一自己量过流量的任务（拿网卡接收差实测），而它又是最大的单项开销，
-    # 所以单独给一行：一眼看出今天用了多少、有没有超上限。
-    if day == time.strftime("%Y-%m-%d"):
-        _hd = ms_state().get("heal_day") or {}
-        if _hd.get("date") == day and float(_hd.get("mb") or 0) > 0:
-            _used = float(_hd["mb"])
-            _over = _used > HEAL_DAY_MB
-            _tag = f"{YELLOW}超了{RST}" if _over else f"{GREEN}没超{RST}"
-            print("-" * 60)
-            print(f"  {BOLD}补时长 heal 今天自测用掉 {_used:.0f} MB / 上限 "
-                  f"{HEAL_DAY_MB} MB{RST}（{_tag}，探了 {int(_hd.get('probes') or 0)} 次）")
-            print(f"  {DIM}这个数是 heal 自己拿网卡接收差量的，比下面「窗口内网卡」准。"
-                  f"账本在菜单「8 流量账本」。{RST}")
 
-    tasks = _traffic_tasks(day)
-    if tasks:
-        rows = _traffic_rows(day)
-        print("-" * 60)
-        print(f"  {BOLD}按任务（定时任务各跑在什么时候，那段时间网卡跑了多少）{RST}")
-        for t0, t1, name, note in tasks:
-            # 一格覆盖的是"上一格到这一格"这段，所以窗口要往后放一格才盖得住
-            win = [r for r in rows if t0 <= r[0] <= t1 + TRAFFIC_EVERY_MIN * 60]
-            w_rx = sum(r[1] for r in win)
-            dur = max(0, t1 - t0)
-            when = time.strftime("%H:%M", time.localtime(t0))
-            span = f"{dur // 60} 分" if dur >= 60 else f"{dur} 秒"
-            tail = f"   {DIM}{note}{RST}" if note else ""
-            print(f"    {when}  {_padw(name, 13)}跑了 {span:<6} "
-                  f"窗口内网卡 ↓{_gb(w_rx)}{tail}")
-        print(f"  {DIM}「窗口内网卡」是把落在这段时间里的格子加起来，"
-              f"里面也含同一时段别的活动（比如你正好在用代理），只能当上限看。{RST}")
-        print(f"  {DIM}heal 那行括号里的数是它自己拿网卡差实测的，比这个准。{RST}")
-
-    print("-" * 60)
-    print(f"  {BOLD}按小时（网卡下行 · 后面是这一小时的大头是谁）{RST}")
+    # ---- 按小时
+    print(f"  {BOLD}按小时{RST}{DIM}（网卡下行 · 这一小时的大头）{RST}")
     peak = max((v[0] for v in hours.values()), default=0)
     hsrc = _traffic_hour_src(day)
     for h in sorted(hours):
         a, b = hours[h]
         bar = "#" * int(a * 12 / peak) if peak else ""
-        # 这一小时谁占大头：容器按收字节排前两名，再补一个"宿主机"（网卡减各容器）。
-        # 有了这一栏，「每小时稳定 110 MB」这种问题当场就能定位到人。
         src = hsrc.get(h, {})
         top = sorted(src.items(), key=lambda kv: -kv[1])[:2]
         host = max(0, a - sum(src.values()))
         who = "  ".join(f"{n} {_gb(v)}" for n, v in top if v > 0)
         if host > 0:
             who = (who + "  " if who else "") + f"宿主机 {_gb(host)}"
-        print(f"    {h} 时   ↓{_gb(a):>9}  ↑{_gb(b):>9}  {bar:<12} {DIM}{who}{RST}")
+        print(f"    {h} 时 ↓{_gb(a):>9}  {bar:<12} {DIM}{who}{RST}")
+
+    # ---- 按任务：只列跑得久的；秒级的（补时长每分钟看一眼）按名字合成一行
+    tasks = _traffic_tasks(day)
+    if tasks:
+        trows = _traffic_rows(day)
+        long_, short = [], {}
+        for t0, t1, name, note in tasks:
+            if t1 - t0 >= TRAFFIC_TASK_SHOW_S:
+                long_.append((t0, t1, name, note))
+            else:
+                short[name] = short.get(name, 0) + 1
+        print("-" * 60)
+        print(f"  {BOLD}按任务{RST}{DIM}（跑了 1 分钟以上的；窗口内网卡只能当上限看）{RST}")
+        for t0, t1, name, note in long_:
+            win = [r for r in trows if t0 <= r[0] <= t1 + TRAFFIC_EVERY_MIN * 60]
+            dur = max(0, t1 - t0)
+            print(f"    {time.strftime('%H:%M', time.localtime(t0))}  {_padw(name, 13)}"
+                  f"跑了 {dur // 60} 分  ↓{_gb(sum(r[1] for r in win))}"
+                  + (f"   {DIM}{note}{RST}" if note else ""))
+        if short:
+            print(f"    {DIM}另外 " + "、".join(f"{n} {k} 次" for n, k in short.items())
+                  + f"，每次不到 1 分钟{RST}")
+
+    # ---- 按来源
     print("-" * 60)
-    print(f"  {DIM}账本在 {TRAFFIC_DIR}/traffic-{day}.tsv，留最近 "
-          f"{TRAFFIC_KEEP_DAYS} 天。{RST}")
+    print(f"  {BOLD}按来源{RST}{DIM}（容器自己的网口，占网卡下行）{RST}")
+    for c, (a, b) in sorted(per.items(), key=lambda kv: -kv[1][0]):
+        pct = f"{a * 100 / rx:.0f}%" if rx else "-"
+        print(f"    {c:<14} ↓{_gb(a):>9}  ↑{_gb(b):>9}   {DIM}{pct}{RST}")
+    h_rx = max(0, rx - sum(v[0] for v in per.values()))
+    h_tx = max(0, tx - sum(v[1] for v in per.values()))
+    print(f"    {_padw('宿主机·非容器', 15)}↓{_gb(h_rx):>9}  ↑{_gb(h_tx):>9}   "
+          f"{DIM}至少这么多（代理节点在这里）{RST}")
+
+    # ---- 合计（最后，停下来就能看到）
+    print("-" * 60)
+    cover = rows * TRAFFIC_EVERY_MIN
+    print(f"  {BOLD}全天合计  ↓{_gb(rx)}  ↑{_gb(tx)}{RST}"
+          f"   {DIM}物理网卡 · 覆盖 {cover // 60} 小时 {cover % 60} 分{RST}")
+    if rx:
+        ol = per.get("openlist", [0, 0])[0]
+        print(f"  网盘拉取（openlist）↓{_gb(ol)}，占 {ol * 100 / rx:.0f}%"
+              f"{DIM}　高 = Emby 这边在吃，低 = 代理节点在吃{RST}")
+    if day == time.strftime("%Y-%m-%d"):
+        _hd = ms_state().get("heal_day") or {}
+        if _hd.get("date") == day and float(_hd.get("mb") or 0) > 0:
+            _used = float(_hd["mb"])
+            print(f"  补时长自测 {_used:.0f} MB / 上限 {HEAL_DAY_MB} MB"
+                  + (f"  {YELLOW}超了{RST}" if _used > HEAL_DAY_MB else ""))
+    print(f"  {DIM}账本：{TRAFFIC_DIR}/traffic-{day}.tsv（留 {TRAFFIC_KEEP_DAYS} 天）{RST}")
 
 def traffic_menu():
     """菜单入口：默认看今天，也能翻前几天。"""
