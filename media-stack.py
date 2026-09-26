@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.208"
+SCRIPT_VERSION = "1.5.209"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2168,6 +2168,15 @@ def do_hls_fix():
                 ttl = HLS_BASE_TTL if hit[0] else HLS_BASE_FAIL_TTL
                 if now - hit[1] < ttl:
                     return hit[0]
+        # 【阿里转码流的盘先问阿里】真机（龙虎门）：每隔约 5 分钟卡一次缓冲，看着像"一章播完
+        # 才缓冲下一章"。其实是这里的缓存 HLS_BASE_TTL 一过期，就去问 MediaWarp —— 阿里盘在
+        # MediaWarp 那里只有原画地址（不是 m3u8），于是判成"没有分片目录"，那一刻的分片全部 404，
+        # 播放器卡住重试。ali_of 自己有缓存，命中时不出网；拿到了会顺手把分片目录写回 cache。
+        if ali_of(vid):
+            with lock:
+                hit = cache.get(vid)
+            if hit and hit[0]:
+                return hit[0]
         base = ""
         op = urllib.request.build_opener(_NoRedirect)
         for _i in range(HLS_BASE_TRIES):
