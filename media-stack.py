@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.219"
+SCRIPT_VERSION = "1.5.220"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11122,10 +11122,12 @@ STRM_LIB_OPTIONS = {
 RESUME_MIN_SECONDS = STRM_LIB_OPTIONS["MinResumeDurationSeconds"]
 RESUME_MIN_PCT     = STRM_LIB_OPTIONS["MinResumePct"]
 # 看到多少才算看完。Emby 默认 90%：没片尾的片子（网盘里很多是剪掉片头片尾的）最后
-# 十分钟还在演正片，退出就被判成看完、续播点清掉。仓库主人要的是 99%。
+# 十分钟还在演正片，退出就被判成看完、续播点清掉。先按仓库主人说的改成 99%，他接着说
+# 「或者不设置这一项，播到哪里就是哪里」—— 100% = 只有真播到最后才算看完，中途退出
+# 一律记位置。代价：有片尾的片子看到字幕就退，会一直留在「继续观看」里，要手动点 ✔。
 # 【只在这个库真有这个键时才写】这个接口静默忽略不认识的字段（见 STRM_LIB_TOGGLES），
 # 老版本 Emby 没有这个库级选项，硬写进去回读对不上，每次更新都会报「没改动成功」。
-RESUME_MAX_PCT = 99
+RESUME_MAX_PCT = 100
 
 # 【会让 Emby 跨境去拉视频文件的那几个开关】，一律关掉。
 #
