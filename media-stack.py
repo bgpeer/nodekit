@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.226"
+SCRIPT_VERSION = "1.5.227"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -10001,6 +10001,8 @@ DOMAIN={cfg['domain']}
 
     # ---- 管理命令 ----
     install_cli(cfg["install_dir"])
+    # 全新安装时 OpenList 里还没有盘：把「按驱动给默认值」的账本立起来，之后挂的都算新盘
+    mark_drive_defaults_empty(cfg["install_dir"])
     install_keepalive(cfg["install_dir"])
     install_sync_cron(cfg["install_dir"])
     install_warm_cron(cfg["install_dir"])
@@ -16848,7 +16850,9 @@ def _add_qtv_flow(d):
     登录码，把 query_token 存进 addition，然后【报错】，报错里是二维码图片；扫码确认后
     再 Init 一次，它拿 query_token 换 refresh_token，存储就起来了。所以这里是：建 →
     取报错里的图 → 等人扫 → 停用再启用。
-    直链方式跟 OpenList 表单的默认一样（原画直链），要换走这个盘的「3 直链方式」。
+    直链方式默认【转码流】—— 仓库主人：「夸克应该默认转码流的，原画好卡」。跨境线路上
+    原画拉不动，转码流靠分片重定向（do_hls_fix）在 Emby 里能播；挂上后当场装好那一套。
+    要换走这个盘的「3 直链方式」。
     """
     mount = ask_mount(d, MOUNT_QTV)
     if not mount:
@@ -16859,7 +16863,7 @@ def _add_qtv_flow(d):
         return False
     add = {"root_folder_id": "0", "order_by": "updated_at", "order_direction": "desc",
            "refresh_token": "", "device_id": "", "query_token": "",
-           "link_method": "download"}
+           "link_method": "streaming"}
     info(f"正在 OpenList 里建 {mount} ...")
     try:
         r = _ol_api("/api/admin/storage/create",
@@ -16868,7 +16872,8 @@ def _add_qtv_flow(d):
         err(f"没建成：{_short_err(e)}")
         return False
     if r.get("code") == 200:
-        ok(f"夸克 TV 已挂上：{mount}")
+        ok(f"夸克 TV 已挂上：{mount}　转码流")
+        refresh_hls(d)
         return True
     msg = str(r.get("message") or "")
     m = QTV_QR_RE.search(msg)
@@ -16892,7 +16897,9 @@ def _add_qtv_flow(d):
             return False
         why = _ol_reload_storage(d, mount, _ol_token(d) or tok)
         if not why:
-            ok(f"夸克 TV 已挂上：{mount}")
+            ok(f"夸克 TV 已挂上：{mount}　转码流")
+            if not refresh_hls(d):
+                warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「7 更新」")
             tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
             ask("\n按回车继续...")
             return True
@@ -17767,6 +17774,22 @@ def has_cdn_link(drv):
     return str(drv or "").lower() not in PROXY_ONLY_DRIVERS
 
 
+def mark_drive_defaults_empty(d):
+    """OpenList 里一个盘都没有、账本还没立：立成空的，之后挂的都算新盘（偏好项才生效）。
+
+    【"读不到"不能当成"没有"】_storage_rows 出错时静默回 []，要是这时把账本立成空的，
+    老机器上已有的夸克下一轮全被当成新盘改成转码流 —— 正是 apply_drive_defaults 骂的
+    那件事。所以严格读，读不到就什么都不记。
+    """
+    if ms_state().get("drive_defaults") is not None:
+        return
+    try:
+        if not [r for r in _storage_rows(d, strict=True) if r[1] and r[1] != "/"]:
+            save_ms_state(drive_defaults=[])
+    except Exception:
+        pass
+
+
 def apply_drive_defaults(d, quiet=False):
     """第一次见到一个盘时，按驱动把「直链方式」调到实测能播的那一档。返回动了几个盘。
 
@@ -17813,7 +17836,8 @@ def apply_drive_defaults(d, quiet=False):
     转码流，而转码流当时在 Emby 里根本走不通，从此一点播放就转圈；撤掉那个默认值
     也救不回来，因为设置已经落盘了。
 
-    偏好项现在【是空的】。这个分类留着，是为了让下一个想往里加东西的人先撞到这堵墙。
+    偏好项现在只有一条：新挂的夸克 TV 默认转码流（仓库主人点名要的，理由见函数里）。
+    这个分类留着，是为了让下一个想往里加东西的人先撞到这堵墙：不这样这个盘还能用吗？
     替用户做一次选择是帮忙，反复把他的选择改回来是耍流氓。
     """
     _st = ms_state()
@@ -17825,6 +17849,11 @@ def apply_drive_defaults(d, quiet=False):
     # 升级那一轮（键不存在）把所有盘都过一遍，好把必需项补上；之后只看新挂的。
     rows = _all if _fresh else [r for r in _all if r[1] not in seen]
     if not rows:
+        # 【一个盘都没有时就把账本立起来】不然全新安装的机器上，第一个挂上的盘撞上的是
+        # "键不存在 = 老机器升上来"那条分支，偏好项（新夸克默认转码流）对它永远不生效。
+        # 一个盘都没有，就不存在"用户调好的设置被改掉"这回事。
+        if _fresh and not _all:
+            mark_drive_defaults_empty(d)
         return 0
     proxy, said = [], []
     # ── 必需项 ────────────────────────────────────────────────────
@@ -17837,11 +17866,21 @@ def apply_drive_defaults(d, quiet=False):
             proxy.append((sid, mp))
             said.append((mp, ["本机代理"]))
     # ── 偏好项：只对真正新挂的盘，而且老机器升上来那一轮（_fresh）一律跳过 ──
-    # 【现在一条都没有】往这里加任何东西之前，先问一句："不这样这个盘还能用吗？"
-    # 能用，就说明它是偏好，而偏好不该替别人做决定 —— 当年那条「夸克默认转码流」
-    # 就是这么把人家好好的 302 原画直链改坏的。
+    # 往这里加任何东西之前，先问一句："不这样这个盘还能用吗？"能用，就说明它是偏好，
+    # 而偏好不该替别人做决定 —— 除非仓库主人点名要，而且只动新挂的盘。
+    # 【第一条偏好项：新挂的夸克 TV 默认转码流】仓库主人：「夸克应该默认转码流的，原画好卡」。
+    # 当年那条「夸克默认转码流」错在两处：Emby 里转码流那时根本播不了（分片相对路径打回
+    # Emby，一路 401），而且它把【已有的】盘也改了。现在分片重定向（do_hls_fix）装上后
+    # 转码流在 Emby 里能播（实测 10.9 MB/s 对原画 306 KB/s）；也只动【真正新挂】的盘 ——
+    # 升级那一轮（_fresh）一个都不碰，用户已经调过的永远不碰。调用方（do_strm）紧跟着就
+    # 装分片重定向、刷 nginx。
+    pref = []
     if not _fresh:
-        pass
+        for sid, mp, drv, add, cols in rows:
+            if (str(drv or "").lower() == "quarktv"
+                    and str((add or {}).get("link_method") or "download") == "download"):
+                pref.append((sid, mp))
+                said.append((mp, ["转码流"]))
     # 【不管有没有改，都记下来】"看过了、按驱动不用改"和"改过了"对下一轮是同一件事：
     # 别再碰它。只记改过的话，默认值就是对的那些盘会被反复重新判断，用户以后自己
     # 关掉某一项，下一轮又被打开。
@@ -17863,6 +17902,8 @@ def apply_drive_defaults(d, quiet=False):
     if proxy:
         _write_storage(d, proxy, columns={"web_proxy": 1,
                                           "webdav_policy": "native_proxy"})
+    if pref:
+        _write_addition(d, pref, {"link_method": "streaming"})
     return len(said)
 
 
@@ -17956,16 +17997,23 @@ def _one_drive_link_menu(d, mp):
             # 全靠它；而不用转码流的人不该多一个常驻进程。nginx 那条 location 也
             # 是跟着有没有盘用转码流生成的，所以两边一起刷。
             if key == "link_method":
-                on = sync_hls_service(d)
-                cfg3 = rebuild_cfg_from_disk(d)
-                if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
-                    apply_nginx_site(cfg3)
+                on = refresh_hls(d)
                 if val == "streaming":
                     if on:
                         info("转码流的分片重定向已就绪 —— Emby 里现在能播转码流了")
                     else:
                         warn("分片重定向没起来，Emby 里播转码流还会转圈；"
                              "挂载页面和外部播放器不受影响")
+
+
+def refresh_hls(d):
+    """有盘换了转码流（或换回原画）之后：装/拆分片重定向服务，再刷 nginx 那条 location。
+    两半缺一不可（见 do_strm 那段）。返回服务现在开着没有。"""
+    on = sync_hls_service(d)
+    cfg3 = rebuild_cfg_from_disk(d)
+    if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
+        apply_nginx_site(cfg3)
+    return on
 
 
 def tip(text):
@@ -18434,6 +18482,7 @@ def mount_paths_menu():
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
+    mark_drive_defaults_empty(d)          # 头一回来挂盘的新机器：之后挂的都算新盘
     while True:
         stores = [(mp, drv, st) for mp, drv, st, _r, _m in openlist_storages(d)
                   if mp and mp != "/"]
