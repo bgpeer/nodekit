@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.206"
+SCRIPT_VERSION = "1.5.207"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4560,6 +4560,14 @@ def do_play_watch(q, minutes=15):
                            "why": set(), "kbps": 0, "pos": 0, "t0": time.monotonic()}
                     scenes.append(cur)
                     print(f"  {BOLD}── 第 {cur['n']} 场（{t} 按下播放）{RST}")
+                elif kind == "要视频" and (cur is None or cur.get("ended")):
+                    # 【没问播放信息就直接要视频也算一场】Hills 续播时常常跳过 PlaybackInfo
+                    # （详情页早拿过了），上来就是 stream 302 + 分片。以前只认 PlaybackInfo，
+                    # 于是明明播了半天，结尾却报「没看到按下播放」。
+                    cur = {"n": len(scenes) + 1, "t": t, "via_vps": 0, "r302": 0, "how": set(),
+                           "why": set(), "kbps": 0, "pos": 0, "t0": time.monotonic()}
+                    scenes.append(cur)
+                    print(f"  {BOLD}── 第 {cur['n']} 场（{t} 直接开始要视频）{RST}")
                 if cur is not None and kind == "要视频":
                     if st in (301, 302, 307):
                         cur["r302"] += 1
