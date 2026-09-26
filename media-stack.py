@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.232"
+SCRIPT_VERSION = "1.5.233"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4136,7 +4136,7 @@ def cover_candidates(key, d=None):
     return [x[:5] for x in out]
 
 
-def cover_frame(url, sec, timeout=COVER_FRAME_T, ua=None):
+def cover_frame(url, sec, timeout=COVER_FRAME_T, ua=None, watch=None):
     """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → (JPEG 字节, 截不到的原因)。
 
     -ss 放在 -i 前面：先按索引跳过去再读，只拉那一小段。UA 用浏览器那张脸 ——
@@ -4151,13 +4151,15 @@ def cover_frame(url, sec, timeout=COVER_FRAME_T, ua=None):
             "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", "-f", "mjpeg", "pipe:1"]
     for fp in EMBY_FFMPEG_PATHS:
         try:
-            r = emby_exec([fp] + args, timeout)
+            r = emby_exec([fp] + args, timeout, watch=watch)
         except subprocess.TimeoutExpired:
             return b"", f"{timeout} 秒没截完"
         except OSError:
             return b"", "跑不了 docker"
         if r.returncode in (126, 127):
             continue
+        if r.returncode == -9 and watch is not None:
+            return b"", "流量超了，已掐断"
         out = r.stdout or b""
         if out[:2] == b"\xff\xd8" and len(out) > 2000:
             return out, ""
@@ -4181,6 +4183,24 @@ def emby_set_image(key, iid, jpg, typ="Primary"):
             return 200 <= r.status < 300
     except Exception:
         return False
+
+
+def range_ok(url, ua):
+    """这个地址认不认跳转（HTTP Range）→ True / False / None（问不出）。只拉几百字节。
+
+    【截封面前先问一声】不认 Range 的源，ffmpeg 的 -ss 只能从头顺着读到那一秒 ——
+    真机 1.5.232：一张封面拉了 1872 MB 还没截到。问一声只花几百字节：回 206 = 能跳；
+    回 200 = 服务器把整个文件从头发过来了，这种源截封面必然是从头拉，直接别截。"""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": ua,
+                                                   "Range": "bytes=1048576-1048831"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read(256)
+            return r.status == 206
+    except urllib.error.HTTPError as e:
+        return True if e.code == 416 else None
+    except Exception:
+        return None
 
 
 def _cover_meter_mb(rx0, meter=None):
@@ -4300,9 +4320,14 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             except Exception:
                 pass
         url = routes[0] if routes else ""
-        why, jpg, at = "", b"", 0.0
+        why, jpg, at, no_range = "", b"", 0.0, False
         _rx0 = meter()
         for url in routes:
+            # 【整文件那条先问认不认跳转】放在读时长之前 —— 不认跳转的源上，读时长
+            # （moov 在文件尾的 mp4）一样要从头拉。m3u8 的分片本来就小，不用问
+            if ".m3u8" not in url.lower() and range_ok(url, PLAYER_UA) is False:
+                why, no_range = "这个源不认跳转，截封面只能从头拉整部片", True
+                continue
             if not secs:
                 # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
                 secs, _n, _e = emby_ffprobe(url, PLAYER_UA)
@@ -4315,7 +4340,8 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             # 【先播放器那张脸，不成换浏览器那张】见 PLAYER_UA：夸克对浏览器脸限速到几十 KB/s，
             # 截一帧要跳到中间读几 MB，用浏览器脸多半超时 —— 前几轮「截不到画面」里就有这种
             for _ua in (PLAYER_UA, BROWSER_UA):
-                jpg, why = cover_frame(url, at, ua=_ua)
+                jpg, why = cover_frame(url, at, ua=_ua,
+                                       watch=lambda: _cover_meter_mb(_rx0, meter) > COVER_ONE_MB)
                 if jpg or _cover_meter_mb(_rx0, meter) > COVER_ONE_MB:
                     break
             if jpg or _cover_meter_mb(_rx0, meter) > COVER_ONE_MB:
@@ -4326,7 +4352,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         day["mb"] = round(float(day.get("mb") or 0) + _mb, 1)
         # 【一张就吃掉几十 MB = 这个源跳不过去】多半是不认 Range、只能从头顺着读。
         # 再试也一样贵，直接判"不再试"
-        _heavy = _mb > COVER_ONE_MB
+        _heavy = _mb > COVER_ONE_MB or (no_range and not jpg)
         if ok_:
             done += 1
             made[iid] = int(time.time())
@@ -4335,8 +4361,8 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             _f = fails.get(iid) or {}
             fails[iid] = {"n": COVER_MAX_TRIES if _heavy else int(_f.get("n") or 0) + 1,
                           "t": int(time.time())}
-            if _heavy:
-                why = f"拉了 {_mb:.0f} MB 还没截到，这个源跳不到中间"
+            if _heavy and not no_range:
+                why = f"拉了 {_mb:.0f} MB 还没截到，这个源跳不到中间，已掐断"
         logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
                     + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
                        if ok_ else "没截成（" + ("拿不到地址" if not url else
@@ -12992,7 +13018,7 @@ def _kill_tagged(tag):
     return n
 
 
-def emby_exec(argv, timeout, text=False):
+def emby_exec(argv, timeout, text=False, watch=None):
     """在 Emby 容器里跑一条命令，【超时就连容器里那个进程一起杀掉】。
 
     【真机】一夜 15 GB：截封面的 ffmpeg 在 Emby 容器里跑，subprocess 的 timeout 只杀得掉
@@ -13002,12 +13028,35 @@ def emby_exec(argv, timeout, text=False):
     所以给进程打个记号（环境变量），超时之后按记号去 /proc 里找出来杀掉。
     """
     tag = secrets.token_hex(8)
-    try:
-        return subprocess.run(["docker", "exec", "-e", f"MS_EXEC_TAG={tag}", "emby"] + argv,
-                              capture_output=True, text=text, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tagged(tag)
-        raise
+    cmd = ["docker", "exec", "-e", f"MS_EXEC_TAG={tag}", "emby"] + argv
+    if watch is None:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=text, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tagged(tag)
+            raise
+    # 【watch：跑着的时候每半秒问一声要不要掐掉】真机（1.5.232）：截一张封面拉了 1872 MB。
+    # 只在一次截帧【跑完之后】才看流量，而一次最多跑 COVER_FRAME_T 秒 —— 碰上不认跳转的源，
+    # ffmpeg 这 60 秒里从头顺着拉，七米蓝那种源一秒几 MB，两条路 × 两张脸就是几个 GB。
+    # 所以边跑边看，超了当场连容器里的进程一起杀。
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text)
+    t_end = time.monotonic() + timeout
+    while True:
+        try:
+            out, errb = p.communicate(timeout=0.5)
+            return subprocess.CompletedProcess(cmd, p.returncode, out, errb)
+        except subprocess.TimeoutExpired:
+            pass
+        if time.monotonic() > t_end:
+            _kill_tagged(tag)
+            p.kill()
+            p.communicate()
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        if watch():
+            _kill_tagged(tag)
+            p.kill()
+            out, _e = p.communicate()
+            return subprocess.CompletedProcess(cmd, -9, out, "" if text else b"")
 
 
 def emby_ffprobe(url, ua=None, timeout=150):
