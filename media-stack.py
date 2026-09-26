@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.218"
+SCRIPT_VERSION = "1.5.219"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11121,6 +11121,11 @@ STRM_LIB_OPTIONS = {
 # 体检那边要单独引用，避免两处各写一份魔法数字
 RESUME_MIN_SECONDS = STRM_LIB_OPTIONS["MinResumeDurationSeconds"]
 RESUME_MIN_PCT     = STRM_LIB_OPTIONS["MinResumePct"]
+# 看到多少才算看完。Emby 默认 90%：没片尾的片子（网盘里很多是剪掉片头片尾的）最后
+# 十分钟还在演正片，退出就被判成看完、续播点清掉。仓库主人要的是 99%。
+# 【只在这个库真有这个键时才写】这个接口静默忽略不认识的字段（见 STRM_LIB_TOGGLES），
+# 老版本 Emby 没有这个库级选项，硬写进去回读对不上，每次更新都会报「没改动成功」。
+RESUME_MAX_PCT = 99
 
 # 【会让 Emby 跨境去拉视频文件的那几个开关】，一律关掉。
 #
@@ -11154,7 +11159,6 @@ def _pick_opt_key(opts, names):
             return n
     return ""
 
-# MaxResumePct 不动 —— 那条是按比例算的，长短本来就公平。
 
 
 def tune_strm_libraries(key):
@@ -11175,6 +11179,11 @@ def tune_strm_libraries(key):
         diff = {k: v for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v}
         # 会跨境拉视频的那几个开关，按【这个库真的有的键名】来关（见 STRM_LIB_TOGGLES）
         missing = []
+        if "MaxResumePct" in o:
+            if o.get("MaxResumePct") != RESUME_MAX_PCT:
+                diff["MaxResumePct"] = RESUME_MAX_PCT
+        else:
+            missing.append("看完门槛")
         for names, val, human in STRM_LIB_TOGGLES:
             k = _pick_opt_key(o, names)
             if not k:
@@ -11223,6 +11232,9 @@ def tune_strm_libraries(key):
                f"{was.get('MinResumePct')}% → {RESUME_MIN_SECONDS}秒/{RESUME_MIN_PCT}%")
             print(f"  {DIM}默认的 120 秒是按电影长度定的，短片子永远够不到，"
                   f"表现为「长的记得住、短的记不住」。{RST}")
+        if "MaxResumePct" in diff:
+            ok(f"媒体库「{name}」看到 {RESUME_MAX_PCT}% 才算看完"
+               f"（原来 {was.get('MaxResumePct')}%）")
         if "EnableMultiVersionByFiles" in diff or "EnableMultiVersionByMetadata" in diff:
             ok(f"媒体库「{name}」已关闭多版本自动合并")
             print(f"  {DIM}Emby 默认会把名字相近的文件并成同一部片的多个「版本」。"
@@ -20269,6 +20281,8 @@ def do_healthcheck():
             for lb in slibs:
                 o = lb.get("LibraryOptions") or {}
                 off = [k for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v]
+                if "MaxResumePct" in o and o.get("MaxResumePct") != RESUME_MAX_PCT:
+                    off.append("MaxResumePct")
                 if off:
                     stale[lb.get("Name") or "?"] = off
             if slibs and stale:
@@ -20281,6 +20295,8 @@ def do_healthcheck():
                     what.append("续播门槛还是默认值（短片子不会有记忆）")
                 if allk & {"EnableMultiVersionByFiles", "EnableMultiVersionByMetadata"}:
                     what.append("多版本合并没关（名字相近的片子会被并成一部，进度条也会坏）")
+                if "MaxResumePct" in allk:
+                    what.append(f"看完门槛不是 {RESUME_MAX_PCT}%（没片尾的片子会被提前判成看完）")
                 if "EnableRealtimeMonitor" in allk:
                     what.append("实时监控没关（补上的时长/轨道 1 分多钟后就被它清掉）")
                 _hc("媒体库选项", "bad", f"{names}  {YELLOW}{'；'.join(what)}{RST}")
@@ -20298,6 +20314,7 @@ def do_healthcheck():
                          if _miss else "")
                 _hc("媒体库选项", "ok",
                     f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、"
+                    f"{'' if '看完门槛' in _miss else f'看到 {RESUME_MAX_PCT}% 算看完、'}"
                     f"多版本合并已关、实时监控已关{_tail}")
 
             # 【私密库要能一眼验证】"以为遮住了、其实没遮"是这个功能唯一会真出事
