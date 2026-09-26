@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.234"
+SCRIPT_VERSION = "1.5.235"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -18556,7 +18556,9 @@ def _drive_menu(d, mp, drv, mounted=True):
         cov_no = ""
         if mounted:
             cov_no = "8" if (isali or has115 or isdav) else "7"
-            print(f"  {cov_no}. 截封面              {DIM}没图的全部截一次{RST}")
+            _cl = cover_manual_last(mp)
+            print(f"  {cov_no}. 截封面              "
+                  + (f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -18604,6 +18606,12 @@ def _covers_menu(d, mp):
     if not key:
         warn("没有 Emby API Key（「3 后补参数 → 1」），问不了 Emby。")
         return
+    # 【上一次花了多少摆在最前面】仓库主人：「每次点进去能看到上一次截图所消耗的流量」
+    last = cover_manual_last(mp)
+    if last:
+        print(f"  上一次　{time.strftime('%m-%d %H:%M', time.localtime(last['t']))}　"
+              f"截成 {last['n']}/{last['of']} 张　用了约 {CYAN}{last['mb']:.0f} MB{RST}"
+              + ("　（中途停了）" if last.get("cut") else ""))
     todo = [x for x in cover_candidates(key, d) if strm_in_mount(d, x[3], mp)]
     if not todo:
         ok("这个盘的片都有图了。")
@@ -18612,13 +18620,26 @@ def _covers_menu(d, mp):
     if not ask_yn(f"{mp} 有 {len(todo)} 部没图，全部截一次？", False):
         print("没有改动。")
         return
+    got, cut = [0], False
     try:
-        n = fill_covers(d, key, say=lambda t: print(f"  {t}"), mount=mp, manual=True)
+        got[0] = fill_covers(d, key, say=lambda t: print(f"  {t}"), mount=mp, manual=True)
     except KeyboardInterrupt:
         print()
         warn("已中断。")
-        return
-    ok(f"截成 {n}/{len(todo)} 张，用了约 {manual_mb[0]:.0f} MB")
+        cut = True
+    # 【中断了也记】拉掉的流量是真的，下次点进来得看得见
+    rec = dict(ms_state().get("cover_manual") or {})
+    rec[mp] = {"t": int(time.time()), "n": got[0], "of": len(todo),
+               "mb": round(manual_mb[0], 1), **({"cut": True} if cut else {})}
+    save_ms_state(cover_manual=rec)
+    if not cut:
+        ok(f"截成 {got[0]}/{len(todo)} 张，用了约 {manual_mb[0]:.0f} MB")
+
+
+def cover_manual_last(mp):
+    """这个盘上一次手动截封面的记录 {t, n, of, mb[, cut]}；没截过 → None。"""
+    v = (ms_state().get("cover_manual") or {}).get(mp)
+    return v if isinstance(v, dict) and v.get("t") else None
 
 
 def _apply_autofilm_cron(d):
