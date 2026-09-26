@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.212"
+SCRIPT_VERSION = "1.5.213"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -8916,6 +8916,7 @@ def link_ttl_of(d):
     mins = LINK_TTL_H * 60
     scanned = read_yaml_all(os.path.join(d, "autofilm", "config", "config.yaml"),
                             "source_dir") or []
+    tcm = ali_tc_mounts()
     for mp, drv, _st, _root, _mode in openlist_storages(d):
         life = LINK_LIFE_MIN.get(str(drv).lower())
         if not life or not mp:
@@ -8923,6 +8924,11 @@ def link_ttl_of(d):
         root = mp.rstrip("/")
         if not any(p == root or p.startswith(root + "/") for p in scanned):
             continue          # 挂着但没进 Emby —— 不该让它拖累别的盘
+        if mp in tcm:
+            # 【开了阿里转码流的盘不算】Emby 播它走的是阿里转码地址，不经 MediaWarp 的缓存；
+            # 只有「这一部阿里还没转完」才退回原画直链 —— 那种少数情况由开播前验直链
+            # （link_stale_fix）兜着。不然它一个盘把夸克的缓存从 2 小时压到 9 分钟。
+            continue
         mins = min(mins, int(life * LINK_TTL_SAFE))
     if mins >= 60 and mins % 60 == 0:
         return f"{mins // 60}h", mins
@@ -8939,9 +8945,10 @@ def ttl_squeezed_by(d):
     scanned = read_yaml_all(os.path.join(d, "autofilm", "config", "config.yaml"),
                             "source_dir") or []
     out = []
+    tcm = ali_tc_mounts()
     for mp, drv, _st, _root, _mode in openlist_storages(d):
         life = LINK_LIFE_MIN.get(str(drv).lower())
-        if not life or not mp:
+        if not life or not mp or mp in tcm:      # 开了阿里转码流的不算，见 link_ttl_of
             continue
         root = mp.rstrip("/")
         if not any(p == root or p.startswith(root + "/") for p in scanned):
@@ -17659,7 +17666,17 @@ def _ali_tc_menu(d, mp):
         tc[mp] = q
     else:
         tc.pop(mp, None)
+    _ttl0 = link_ttl_of(d)[0]
     save_ms_state(ali_transcode=tc)
+    # 【直链缓存时长跟着变】开了转码流的阿里盘不再压短全局缓存（见 link_ttl_of），
+    # MediaWarp 只在启动时读配置 —— 值变了就重写并重启它
+    if link_ttl_of(d)[0] != _ttl0:
+        try:
+            _mw = os.path.join(d, "mediawarp", "config", "config.yaml")
+            write_atomic(_mw, gen_mediawarp_conf(rebuild_cfg_from_disk(d)), 0o600)
+            subprocess.run(["docker", "restart", "mediawarp"], capture_output=True, timeout=120)
+        except Exception as e:
+            warn(f"MediaWarp 配置没重写成（跑一次「7 更新」会补上）：{_short_err(e)}")
     on = sync_hls_service(d)
     cfg3 = rebuild_cfg_from_disk(d)
     if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
@@ -18316,7 +18333,10 @@ def params_menu():
 def _hc(label, state, detail=""):
     icon = {"ok": f"{GREEN}✔{RST}", "warn": f"{YELLOW}⚠{RST}",
             "bad": f"{RED}✖{RST}", "skip": f"{DIM}—{RST}"}[state]
-    print(f"\r\x1b[2K    {pad(label, 20)}{icon}  {detail}")
+    lab = pad(label, 20)
+    if not lab.endswith(" "):
+        lab += " "                    # 标签比这一列长时（列目录 /quark/夸克挂载）别跟 ✔ 粘在一起
+    print(f"\r\x1b[2K    {lab}{icon}  {detail}")
 
 
 def _hc_group(title, why):
@@ -19041,6 +19061,9 @@ def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
         loc = e.headers.get("Location", "")
         host = loc.split("/")[2] if "://" in loc else loc[:40]
         bare = host.split(":")[0]
+        # 【bare 在下面几行里就是安装人自己的 OpenList 域名】真机体检印出了完整域名
+        # （「302 → list.<真域名> → 本机代理出字节」），而体检是要截图发出去的 —— 打码
+        _mb = mask_host(bare)
         if _is_internal_host(host):
             # 【必须报是哪个盘】这条以前只说「302 → 内部地址」，用户在多盘环境里
             # 无从知道是哪一个 —— 而它测的只是媒体库里排在前面的那一部，
@@ -19058,11 +19081,11 @@ def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
                     # 【本机代理的盘就该停在这儿】它在网盘侧没有 CDN 直链，字节从
                     # OpenList 出来是它唯一的路。报成故障会让人去改本来就对的配置。
                     if proxied:
-                        return "ok", (f"302 → {bare} → {GREEN}本机代理出字节{RST}"
+                        return "ok", (f"302 → {_mb} → {GREEN}本机代理出字节{RST}"
                                       f"  {DIM}HTTP {r2.status}；这个盘在网盘侧没有 "
                                       f"CDN 直链，这就是它的正常形态（视频过本机带宽）"
                                       f"{RST}")
-                    return "bad", (f"302 → {bare} 之后没有再跳转（HTTP {r2.status}）"
+                    return "bad", (f"302 → {_mb} 之后没有再跳转（HTTP {r2.status}）"
                                    f"  {RED}视频会经过本机{RST}")
             except urllib.error.HTTPError as e2:
                 if e2.code in (403, 429):
@@ -19070,11 +19093,11 @@ def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
                     # 上游回什么状态码它就原样写回什么。403 = 上游不认这个 UA，
                     # 429 = 上游在限频。都不是配置错，改配置一点用都没有。
                     return "bad", (
-                        f"{bare} 返回 HTTP {e2.code}  "
+                        f"{_mb} 返回 HTTP {e2.code}  "
                         f"{RED}{'上游网盘拒绝了这次请求' if e2.code == 403 else '上游网盘在限流'}"
                         f"{RST}{DIM}（这个码是上游发的，OpenList 只是原样转回来）{RST}")
                 if e2.code not in (301, 302, 303, 307, 308):
-                    return "bad", f"{bare} 返回 HTTP {e2.code}  {RED}换直链失败{RST}"
+                    return "bad", f"{_mb} 返回 HTTP {e2.code}  {RED}换直链失败{RST}"
                 loc = e2.headers.get("Location", "")
                 host = loc.split("/")[2] if "://" in loc else loc[:40]
                 bare = host.split(":")[0]
@@ -19082,7 +19105,7 @@ def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
                     return "bad", f"第二跳 → {host}  {RED}内部地址，客户端连不上{RST}"
                 two_hop = True
             except Exception as ex:
-                return "bad", f"{bare} 那一跳失败：{_short_err(ex)}"
+                return "bad", f"{_mb} 那一跳失败：{_short_err(ex)}"
         else:
             two_hop = False
 
@@ -19096,7 +19119,7 @@ def probe_302(key, own_host="", want_kind="", item=None, proxied=False):
             kind = "原画"
         else:
             kind = ""
-        head = f"302 →{' ' + own_host + ' →' if two_hop else ''} {host}"
+        head = f"302 →{' ' + mask_host(own_host) + ' →' if two_hop else ''} {host}"
         tail = (f"（{kind}，" if kind else "（") + "视频直达网盘，不经过本机）"
         # 实际拿到的形态和设置里的直链方式对不上，几乎一定是【直链缓存还没过期】：
         # MediaWarp 的 alist_api_ttl 是 2 小时，刚切换完，老地址还在缓存里。
@@ -19480,16 +19503,15 @@ def do_healthcheck():
         # 被限到 0.5 MB/s（≈4 Mbps）；而挂载页面放的是阿里的转码流（1 Mbps 上下），所以
         # "挂载能放、Emby 卡死"—— 两边根本不是同一路流。17 Mbps 的原盘在 4 Mbps 上必卡。
         if drv.lower() == "aliyundriveopen" and (mode or "default") == "default":
-            _hc(f"接口 {mp}", "warn",
-                f"alipan_type=default{DIM}　开放平台的下载接口，"
-                f"阿里限速到 0.5 MB/s 左右{RST}")
-            todo.append((
-                f"{mp} 走的是阿里开放平台【下载】接口，被限速到 0.5 MB/s 上下 —— "
-                f"码率高的片子必卡（挂载页面不卡是因为那边放的是转码流，不是原片）",
-                "OpenList → 存储 → 这个盘 → 编辑 → 「阿里盘账户类型」改成 "
-                "alipanTV（TV 接口，和夸克必须选 QuarkTV 是一个道理）。"
-                "多半要按新类型重新取一次刷新令牌，不限速通常还要超级会员。"
-                "不想折腾就把大码率的片子放夸克，阿里放压过的"))
+            if mp in ali_tc_mounts():
+                # 【开了阿里转码流就不是问题了】Emby 播的是转码流，不走这条被限速的下载接口
+                _hc(f"接口 {mp}", "ok", f"Emby 走阿里转码流{DIM}（不受开放平台限速）{RST}")
+            else:
+                _hc(f"接口 {mp}", "warn",
+                    f"alipan_type=default{DIM}　开放平台下载接口，阿里限速到 0.5 MB/s 左右{RST}")
+                todo.append((
+                    f"{mp} 走阿里开放平台下载接口，限速 0.5 MB/s 上下，码率高的片子必卡",
+                    f"4 挂载路径 → {mp} → 7 Emby 播放画质 → 阿里转码流（自动最高）"))
 
     # ---- 列目录 ----
     listed_ok = []
@@ -19637,12 +19659,10 @@ def do_healthcheck():
             # 但代价是网盘里刚加的片子要等这么久才看得见 —— 而"点进去就能看到新片"
             # 恰恰是用户对这套东西最基本的预期。两头都是实实在在的代价，
             # 该由他自己选，体检的活是把两头说清楚，不是替他决定。
+            # 调长能少碰被限流的接口（3 后补参数 → 6），代价是新加的片子要等这么久才看得见
             _hc("目录缓存", "warn",
-                f"{_txt}  {YELLOW}短缓存 + 列目录老超时{RST}"
-                f"{DIM}（大部分列目录都在走真实接口，而网盘对它限流）{RST}")
-            print(f"      {DIM}调长能少碰这个接口（3 后补参数 → 6），"
-                  f"代价是网盘里新加的片子要等这么久才看得见。{RST}")
-            print(f"      {DIM}想两头都要：缓存留短，别在凌晨扫库那会儿翻挂载。{RST}")
+                f"{_txt}  {YELLOW}短缓存 + 列目录常超时{RST}"
+                f"{DIM}（调长：3 后补参数 → 6，代价是新片晚一点看得见）{RST}")
         else:
             _hc("目录缓存", "ok", _txt)
 
@@ -19740,9 +19760,9 @@ def do_healthcheck():
                 # 所以判据换成【MediaWarp 用的是哪个地址】，那才是真正决定 302 落点的东西。
                 if _mw_addr and not _is_internal_host(
                         urllib.parse.urlsplit(_mw_addr).netloc or _mw_addr):
-                    _hc(label, "ok", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
-                                     f"{DIM}（体检是从本机问的所以回本机地址；"
-                                     f"MediaWarp 走 {mask_host(_mw_addr)}，302 出去的是对外地址）{RST}")
+                    # 体检是从本机问的所以回本机地址；MediaWarp 走对外地址，302 出去的是那个
+                    _hc(label, "ok", f"{el:.1f} 秒  {DIM}→ 本机代理（对外走 "
+                                     f"{mask_host(_mw_addr)}）{RST}")
                 else:
                     _hc(label, "bad", f"{el:.1f} 秒  →  {raw.split('/')[2]}  "
                                       f"{RED}本机地址，外网放不了{RST}")
@@ -19879,14 +19899,11 @@ def do_healthcheck():
             f"{YELLOW}{_ttl_cur}{RST}  {DIM}被 {_mp0} 压短了"
             f"（别的盘本来能撑 {LINK_TTL_H} 小时）{RST}")
         todo.append((
-            f"直链缓存只有 {_ttl_cur} —— 这个值是对的（缓存不能比直链本身活得长，"
-            f"{_mp0} 的直链只活 {_who[0][2] if _who else '?'} 分钟），但它是【全局】的，"
-            f"把别的盘一起压短了。代价：缓存一过期，再点开同一部片就要重新换一条直链，"
-            f"而换到的 CDN 节点好不好是随机的 ——「同一部片早上能播、下午播不了、"
-            f"别的片还可以」就是这么来的。直链预热也因此对不上节奏，会整轮跳过",
-            f"想换回来：把 {_mp0} 从 Emby 的扫描范围里拿出来（「4 挂载路径」里改），"
-            f"它在 OpenList 挂载页面照样能用；改完跑一次「7 更新」重算。"
-            f"不改也行 —— 那就是接受每 {_ttl_cur} 重抽一次直链"))
+            f"直链缓存只有 {_ttl_cur}，被 {_mp0} 压短了（它的直链只活 "
+            f"{_who[0][2] if _who else '?'} 分钟），别的盘也跟着每 {_ttl_cur} 重换一次直链",
+            (f"阿里盘：4 挂载路径 → {_mp0} → 7 Emby 播放画质 → 阿里转码流，它就不再压短缓存"
+             if _who and str(_who[0][1]).lower() in ALI_DRIVERS else
+             f"把 {_mp0} 从 Emby 扫描范围里拿出来（4 挂载路径），再跑「7 更新」")))
     elif _ttl_cur:
         _hc("直链缓存", "ok", f"{_ttl_cur}"
             + (f"  {DIM}按 {'、'.join(_shortest)} 的直链有效期定的{RST}"
@@ -19947,25 +19964,25 @@ def do_healthcheck():
         # 于是每秒好几条 401。不看日志根本联想不到画质开关。
         _hls = [mp for _s, mp, _d, add, _c in _storage_rows(d)
                 if is_hls_mode(add)]
-        if _hls and hls_ready():
+        # 【一行说完】以前「画质开关」「直链方式」两行说的是同一件事，后一行还指着一个
+        # 早就挪了位置的菜单（「2 切换」）。阿里转码流也并进这一行。
+        _tc = sorted(ali_tc_mounts())
+        _ways = ([f"{m} 转码流" for m in _hls] + [f"{m} 阿里转码流" for m in _tc]) or \
+                [LINK_METHODS.get(cur, (cur,))[0]]
+        if not _hls or hls_ready():
             # 【修好了就别再报警】转码流走的是网盘的播放通道，实测比原画快几十倍
-            # （10.9 MB/s 对 306 KB/s）。装了分片重定向之后 Emby 里就能播 ——
-            # 这时候还报 warn，只会把人赶回慢 36 倍的那一档。
-            _hc("画质开关", "ok",
-                f"{'、'.join(_hls)} 走{CYAN}转码流{RST}"
-                f"{DIM}（分片重定向已装，比原画快几十倍）{RST}")
-        elif _hls:
-            _hc("画质开关", "warn",
+            # （10.9 MB/s 对 306 KB/s）。装了分片重定向之后 Emby 里就能播
+            _hc("直链方式", "ok", "　".join(_ways))
+        else:
+            _hc("直链方式", "warn",
                 f"{'、'.join(_hls)} 设的是{CYAN}转码流{RST}  "
                 f"{YELLOW}但分片重定向没装，Emby 里播不了{RST}")
+            # m3u8 里的分片是相对路径，客户端会拼到 /emby/Videos/<条目id>/ 上 → 401，
+            # 要靠分片重定向指回网盘
             todo.append((
-                f"{'、'.join(_hls)} 用的是转码流，但分片重定向服务没装上",
-                "转码流走网盘的播放通道，比原画快几十倍；Emby 里要靠分片重定向"
-                "把分片地址指回网盘（m3u8 里写的是相对路径，客户端会拼到 "
-                "/emby/Videos/<条目id>/ 上 → 401）。跑一次「7 更新」会自动装；"
-                "装不上时屏上会写原因（端口占满 / 没有 systemctl）"))
-        _hc("直链方式", "ok", f"{LINK_METHODS.get(cur, (cur,))[0]}"
-                             f"{DIM}（卡顿就去 4 挂载路径 → 选那个盘 → 2 切换）{RST}")
+                f"{'、'.join(_hls)} 用的是转码流，但分片重定向服务没装上，Emby 里播不了",
+                "跑一次「7 更新」会自动装；装不上时屏上会写原因"))
+
     if key:
         _hc("Emby API Key", "ok", "已填")
     else:
@@ -20013,7 +20030,9 @@ def do_healthcheck():
         if _tot:
             _pct = _av * 100 // _tot
             _n_strm = strm_count(d)
-            _st = "ok" if _pct >= 25 else ("warn" if _pct >= 12 else "bad")
+            # 【按绝对值判，不按百分比】真机 4 GB 的机器可用 697 MiB（17%）被报成
+            # 「这时候播放会失败」—— 其实完全够用。真正出事是只剩一两百 MiB 的时候
+            _st = "ok" if _av >= 500 else ("warn" if _av >= 250 else "bad")
             # swap 吃满是个独立的坏信号：真到这一步，机器已经在拿硬盘当内存用，
             # 播放卡顿是必然的 —— 哪怕 MemAvailable 看着还有一点余量
             _sw = ""
@@ -20024,15 +20043,13 @@ def do_healthcheck():
                              + (f"   {DIM}{_n_strm} 个 strm{RST}" if _n_strm else "")
                              + _sw)
             if _st != "ok":
-                todo.append((f"内存只剩 {_pct}%（{_av} MiB）—— 这时候播放会失败，"
-                             f"而链路各项还是绿的：不是链路坏了，是整台机器没内存了",
+                todo.append((f"内存只剩 {_av} MiB —— 再少播放就会失败（链路各项照样是绿的）",
                              # 【别先入为主怪 Emby】实测那次就是这么判断错的：
                              # 一看"扫库 + 卡死"就归因给刮削，而 ps 摆出来真凶是
                              # 十个叠在一起的 cron 进程。所以这里给的是分辨的办法，
                              # 不是结论 —— 容器和宿主机进程都要看一眼。
-                             "先看下面「后台在跑」里那行「任务并发」。然后两条一起跑，"
-                             "谁大谁是凶手：docker stats --no-stream 看容器，"
-                             "ps -eo rss,comm --sort=-rss | head 看宿主机进程"))
+                             "docker stats --no-stream 看容器、ps -eo rss,comm --sort=-rss | head "
+                             "看宿主机进程，谁大谁是凶手"))
     except (OSError, ValueError):
         pass
 
@@ -20330,24 +20347,15 @@ def do_healthcheck():
                 _ep = sum(1 for i in _noid if i.get("Type") == "Episode")
                 _mv = len(_noid) - _ep
                 _how = []
+                # TMDb 按片名查、MetaTube 按番号查；自己起的名字两边都查不到。
+                # 剧集要季集编号（「剧名/Season 01/剧名 - S01E01.mp4」），电影要片名和年份
                 if _ep:
-                    _how.append(
-                        f"其中 {_ep} 个是【剧集】：Emby 靠季集编号认它们，"
-                        "文件名里没有 SxxExx 就谁都认不出来。"
-                        "网盘里理想的结构是「剧名/Season 01/剧名 - S01E01.mp4」；"
-                        "不想建季文件夹的话，至少把文件名改成"
-                        "「剧名 - S01E231.mp4」这种")
+                    _how.append(f"{_ep} 个剧集改成「剧名 - S01E01.mp4」")
                 if _mv:
-                    _how.append(
-                        f"其中 {_mv} 个是【电影】：改成「片名 (年份).mp4」，"
-                        "成人片用番号命名（字母-数字那种）最准")
+                    _how.append(f"{_mv} 个电影改成「片名 (年份).mp4」（成人片用番号）")
                 todo.append((
-                    f"{len(_noid)} 个条目一个刮削源都没匹配上 —— 没有海报、简介和年份，"
-                    f"界面上是灰方块。刮削器是整个库共用的，所以这跟"
-                    f"「有的片有封面有的没有」不矛盾：差别在文件名能不能被查到",
-                    "TMDb 按片名查、MetaTube 按番号查，自己起的名字两边都没有对应"
-                    "条目，配多少刮削器都查不出来。"
-                    + "；".join(_how) + "。改完点「5 生成媒体库」"))
+                    f"{len(_noid)} 个条目没有刮削源认得出，没有海报和简介",
+                    "；".join(_how) + "，改完点「5 生成媒体库」"))
             elif key:
                 _hc("刮削结果", "ok", "条目都刮到了信息")
 
@@ -20461,39 +20469,28 @@ def do_healthcheck():
                 # 记忆"会以为是那个库的设置没生效 —— 而实际上门槛早就调好了，
                 # 缺的只是【某一部片子】的时长。一个是库的问题，一个是条目的问题，
                 # 排查方向完全相反，光给数字分不出来。
-                names = "、".join(x[2] for x in nodur[:3])
-                if len(nodur) > 3:
-                    names += f" 等 {len(nodur)} 个"
-                # 【必须说"还要多久"】只报个数字的话，人没法判断"它到底在不在补"——
-                # 而它确实在补，只是每小时一批。不说清楚，看到两千多个只会以为没在跑。
-                # 【跟 heal 用同一个配额】不然屏上说 300、实际在跑 20，
-                # 人只会以为它没在动 —— 而它正在按上游能受的速度慢慢补。
+                # 【只有「点开过还没补上」的才算问题】真机那屏同时写着「✖ 2759 个没探到」
+                # 和「剩下的不补」，下面问题清单又说「已经在自动补、约 10 小时补完」—— 三句话
+                # 互相打架。实际规则是：没点开过的不补（补出来的进度条没人用），点开那一刻
+                # 「先补再播」当场补上；只补点开过的那批。所以没点开过的是正常状态，不报错。
+                # 缺时长 → 看一半退出会被当成看完；缺轨道 → 点开时现场探一次，源在限流就 load fail
+                _inb_items = items_without_duration(key)
+                _inb = len(_inb_items)
                 _per = min(max(HEAL_LIMIT, len(nodur) // 8), heal_pace())
-                _hrs = max(1, -(-len(nodur) // _per))    # 向上取整
-                _hc("条目时长", "bad",
-                    f"{names}  {YELLOW}没探到媒体信息（时长或音视频轨）—— "
-                    f"缺时长的进度条记不住；缺轨道的每次点开都要现场探一次{RST}")
-                # 【范围不是"全库"时必须说出来】不然屏上写着 2583 个没时长，而后台
-                # 每轮只挑几十个在补，用户会以为它卡住了 —— 其实是它按设置只补
-                # 「你可能会点开的那批」，剩下的是【故意不补】的。
-                # 【这个数是全库的，而补的只是你点开过的那批】不说清楚的话，屏上
-                # 写着还差两千多个、而后台每轮只动几个，看着就像卡住了 —— 其实剩下
-                # 那些是【故意不补】的：没点开过的条目，补出来的进度条给谁用。
-                _inb = len(items_without_duration(key))
-                print(f"    {' ':<20}{DIM}其中你点开过的有 {_inb} 个，补的就是这批"
-                      f"（一批 {_per} 个）{RST}")
-                print(f"    {' ':<20}{DIM}剩下的不补：点开照样能播（现场探一次，"
-                      f"慢几秒），而那一次点开就会把它排进来{RST}")
-                todo.append((f"{len(nodur)} 个条目没探到媒体信息。只缺时长的，"
-                             f"看一半退出会被当成看完；【连音视频轨都没有】的更麻烦 —— "
-                             f"Emby 只能在你点播放那一刻现场探一次，源那会儿给得出数据"
-                             f"就能播（开播多等几秒），正在限流或挡 UA 就是 load fail。"
-                             f"等于每次播放都押一次运气，补上就不用押了",
-                             f"【已经在自动补了】每小时一批、一批 {_per} 个，"
-                             f"约 {_hrs} 小时补完，不用管它。想快一点就点"
-                             "「5 生成媒体库」，它会另外在后台再补一批（最多 200 个）。"
-                             "补一个要从网盘拉一段文件头，所以有意压着速度 —— "
-                             "不限量实测一天能打掉 80 GB 流量"))
+                _rest = len(nodur) - _inb
+                _how = "点开时先补再播" if heal_gate_ready() else "点开时现场探一次"
+                if _inb:
+                    names = "、".join(x[2] for x in _inb_items[:3]) + (
+                        f" 等 {_inb} 个" if _inb > 3 else "")
+                    _hc("条目时长", "warn",
+                        f"点开过还没补上：{names}"
+                        + (f"{DIM}　另 {_rest} 个没点开过（{_how}）{RST}" if _rest else ""))
+                    todo.append((f"{_inb} 个点开过的条目还没补上时长 —— 看一半退出会被当成看完",
+                                 f"在自动补（每批 {_per} 个），不用管；急的话 "
+                                 f"media-stack heal <片名> 马上补那一部"))
+                else:
+                    _hc("条目时长", "ok",
+                        f"点开过的都有{DIM}　另 {_rest} 个没点开过（{_how}）{RST}")
             elif slibs:
                 _hc("条目时长", "ok", "都有")
 
@@ -20546,12 +20543,8 @@ def do_healthcheck():
                     f"{len(_wrong)} 组剧集在【电影】类型的库里"
                     f"\n{' ' * 27}{DIM}{_names}"
                     f"{'…' if len(_wrong) > 3 else ''}{RST}")
-                todo.append((f"「{_wrong[0][0]}」看着是剧集（{_wrong[0][1]} 集），"
-                             f"却在电影类型的库「{_wrong[0][2]}」里 —— "
-                             f"每一集会变成一部独立电影，没有季集结构",
-                             f"给它单独建一个【电视剧】类型的库指向那个文件夹。"
-                             f"另外文件名要 Emby 解析得出集数才行，"
-                             f"「剧名 - S01E12.mp4」这种最稳，中文「第12集」它常认不出"))
+                todo.append((f"{len(_wrong)} 组剧集在电影类型的库里，每一集会变成一部独立电影",
+                             "给它们单独建【电视剧】类型的库；文件名用「剧名 - S01E12.mp4」最稳"))
             else:
                 _hc("剧集布局", "ok", f"{len(_eps)} 组剧集，都在电视剧库里")
 
@@ -20638,7 +20631,11 @@ def do_healthcheck():
     # 【装了但从没跑成 和 刚装上 长得一样，但都不能打绿勾】这台机器上栽过一次：
     # 三条任务全被锁死，而体检那几行一直绿着。
     if os.path.exists(HEAL_CRON):
-        _ht = int(ms_state().get("heal_tick") or 0)
+        # 【取最近的那一次】开播前那道门（heal-gate）补完只记 heal_last，不碰 heal_tick ——
+        # 真机体检写着「28 小时前跑过一轮」，后面紧跟着同一天 17:03 开播前补的那一轮
+        _hl0 = ms_state().get("heal_last") or {}
+        _ht = max(int(ms_state().get("heal_tick") or 0),
+                  int(_hl0.get("ts") or 0) if isinstance(_hl0, dict) else 0)
         if not _ht:
             _hc("补时长（看片后）", "skip",
                 f"已装，还没跑过（每 {HEAL_TICK_MIN} 分钟看一眼，"
@@ -20656,11 +20653,11 @@ def do_healthcheck():
                          f"约 {_hl.get('mb', 0):.0f} MB"
                          + ("，" + "、".join(f"{k} {v}" for k, v in _via.items())
                             if _via else "") + f"{RST}")
+            # 看过片才跑，所以久没跑 = 久没看片，不是故障
             _hc("补时长（看片后）", "ok",
                 (f"{_hm} 分钟前跑过一轮" if _hm < 120
                  else f"{_hm // 60} 小时前跑过一轮") + _bits
-                + f"{DIM}　（看过片才跑，所以久没跑 = 久没看片，不是故障）"
-                  f"　明细：media-stack heal-log{RST}")
+                + f"{DIM}　明细：media-stack heal-log{RST}")
     else:
         _hc("补时长（看片后）", "warn",
             "没装 —— 刚看完的那一集要等到下个整点才有进度条")
@@ -20872,7 +20869,7 @@ def do_healthcheck():
         print(f"\n  {YELLOW}{BOLD}发现 {len(todo)} 个问题{RST}")
         for i, (what, how) in enumerate(todo, 1):
             print(f"  {i}. {what}")
-            print(f"     {DIM}→ {how}{RST}")
+            print(f"     {YELLOW}→ {how}{RST}")
     else:
         print(f"\n  {GREEN}{BOLD}全部正常。{RST}"
               f"{DIM}播放仍然卡的话，多半是播放设备到网盘那条线，不在服务器这边。{RST}")
