@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.231"
+SCRIPT_VERSION = "1.5.232"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2144,20 +2144,37 @@ def ol_tok_cached(d, fresh=False):
     return _ALI_OL_TOK[0]
 
 
+P115_TRIES = 3            # 换链一共问几次（3×8 秒 + 2×1.5 秒 < nginx 那边的 30 秒）
+P115_GAP = 1.5            # 两次之间隔几秒
+P115_T = 8                # 每次最多等几秒
+
+
 def pan115_url(d, tp, ua):
-    """用播放器的 UA 向 OpenList 要这个 115 文件的直链。拿不到 → ""。"""
-    for i in range(2):
-        tok = ol_tok_cached(d, fresh=bool(i))
+    """用播放器的 UA 向 OpenList 要这个 115 文件的直链。拿不到 → ""。
+
+    【失败要当场再试】真机：同一部片 07:19 连着两次「没拿到直链」，07:20 就拿到了；
+    手机那两次要视频也正是两个 404 —— 这里一回空，就交回 MediaWarp，它也换不到，
+    播放器拿到 404 直接退出。115 的接口按频率挡（OpenList 那边还压着每秒 2 次），
+    隔一两秒再问往往就给了。播放器在等，所以只多等几秒。"""
+    fresh = False
+    for i in range(P115_TRIES):
+        if i:
+            time.sleep(P115_GAP)
+        tok = ol_tok_cached(d, fresh=fresh)
+        fresh = False
         if not tok:
             return ""
         try:
             r = _ol_api("/api/fs/get", {"path": tp, "password": ""}, tok,
-                        timeout=20, ua=ua or PLAYER_UA)
+                        timeout=P115_T, ua=ua or PLAYER_UA)
         except Exception:
-            return ""
-        if r.get("code") == 401:
             continue
-        return str(((r.get("data") or {}).get("raw_url")) or "") if r.get("code") == 200 else ""
+        if r.get("code") == 401:
+            fresh = True
+            continue
+        raw = str(((r.get("data") or {}).get("raw_url")) or "") if r.get("code") == 200 else ""
+        if raw:
+            return raw
     return ""
 
 
@@ -4166,9 +4183,16 @@ def emby_set_image(key, iid, jpg, typ="Primary"):
         return False
 
 
-def _cover_meter_mb(rx0):
-    """从 rx0 到现在物理网卡收了多少 MB（读不到返回 0）。"""
-    rx1 = _host_rx_bytes()
+def _cover_meter_mb(rx0, meter=None):
+    """从 rx0 到现在 meter 读数涨了多少 MB（读不到返回 0）。
+
+    【不能用物理网卡】仓库主人：「截图为什么不是优先级的，难道还没开始额度就被用光了」
+    —— 是的。原来量的是整块网卡，这台机器同时是代理节点：截一帧的那一分钟里谁在用
+    节点下东西，全记到封面头上。一张封面被记成几百 MB → 判成「这个源跳不到中间，不再试」，
+    一天 500 MB 的闸也当场被别人的流量填满，新片一张都截不到。
+    改用 _heal_meter（openlist + emby 两个容器）：截帧的 ffmpeg 就在 emby 里跑，
+    它拉的字节只落在这两个容器上。"""
+    rx1 = (meter or _host_rx_bytes)()
     return max(0.0, (rx1 - rx0) / 1048576) if (rx0 is not None and rx1 is not None) else 0.0
 
 
@@ -4205,6 +4229,12 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             say("有人在看片 —— 截封面先让路，等没人看了再截（每小时那一轮会接着来）。")
         return 0
     day = _cover_day()
+    # 【旧账作废一次】1.5.232 之前的「不再试」和今天的流量数，是拿整块网卡量出来的
+    # （见 _cover_meter_mb），多半是别人的流量。清一次，让被冤枉的片重新排队。
+    # 【必须放在流量闸前面】今天的数已经被冤枉到超过闸的话，放后面就永远走不到这儿。
+    if ms_state().get("cover_meter_v") != 2:
+        day = {"date": day.get("date"), "n": int(day.get("n") or 0)}
+        save_ms_state(cover_fail={}, cover_day=day, cover_meter_v=2)
     # 【流量闸】一张正常的封面是几 MB。一天用掉 COVER_DAY_MB 就停 —— 张数封顶管不住
     # "一张拉了一个 GB"那种
     if float(day.get("mb") or 0) >= COVER_DAY_MB:
@@ -4242,6 +4272,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
         base = ""
     made = dict(ms_state().get("cover_made") or {})
     done, logs = 0, []
+    meter, _mlab = _heal_meter()
     for uid, iid, name, path, secs in todo:
         if someone_playing(key, cache_s=30):
             if say:
@@ -4270,7 +4301,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
                 pass
         url = routes[0] if routes else ""
         why, jpg, at = "", b"", 0.0
-        _rx0 = _host_rx_bytes()
+        _rx0 = meter()
         for url in routes:
             if not secs:
                 # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
@@ -4285,13 +4316,13 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None):
             # 截一帧要跳到中间读几 MB，用浏览器脸多半超时 —— 前几轮「截不到画面」里就有这种
             for _ua in (PLAYER_UA, BROWSER_UA):
                 jpg, why = cover_frame(url, at, ua=_ua)
-                if jpg or _cover_meter_mb(_rx0) > COVER_ONE_MB:
+                if jpg or _cover_meter_mb(_rx0, meter) > COVER_ONE_MB:
                     break
-            if jpg or _cover_meter_mb(_rx0) > COVER_ONE_MB:
+            if jpg or _cover_meter_mb(_rx0, meter) > COVER_ONE_MB:
                 break
         ok_ = bool(jpg) and emby_set_image(key, iid, jpg)
         day["n"] = int(day.get("n") or 0) + 1
-        _mb = _cover_meter_mb(_rx0)
+        _mb = _cover_meter_mb(_rx0, meter)
         day["mb"] = round(float(day.get("mb") or 0) + _mb, 1)
         # 【一张就吃掉几十 MB = 这个源跳不过去】多半是不认 Range、只能从头顺着读。
         # 再试也一样贵，直接判"不再试"
