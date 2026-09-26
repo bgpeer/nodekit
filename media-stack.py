@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.221"
+SCRIPT_VERSION = "1.5.222"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11128,6 +11128,16 @@ RESUME_MIN_PCT     = STRM_LIB_OPTIONS["MinResumePct"]
 # 【只在这个库真有这个键时才写】这个接口静默忽略不认识的字段（见 STRM_LIB_TOGGLES），
 # 老版本 Emby 没有这个库级选项，硬写进去回读对不上，每次更新都会报「没改动成功」。
 RESUME_MAX_PCT = 100
+# 仓库主人随后要了个旋钮：「在后补参数里面设置一个按钮调节，_% 算播放完」。
+# 默认值还是上面那个，改过就存在状态里（resume_max_pct）。下限 50：Emby 网页里
+# 这一项也是 50 起，再低就是"看一半就算看完"，续播点基本存不住。
+RESUME_MAX_LO = 50
+
+
+def resume_max_pct():
+    """播到百分之几算看完。状态里没有 / 不合法就用默认 RESUME_MAX_PCT。"""
+    v = ms_state().get("resume_max_pct")
+    return v if isinstance(v, int) and RESUME_MAX_LO <= v <= 100 else RESUME_MAX_PCT
 
 # 【会让 Emby 跨境去拉视频文件的那几个开关】，一律关掉。
 #
@@ -11175,6 +11185,7 @@ def tune_strm_libraries(key):
         return 0
     n_changed, miss_all = 0, set()
     changed = {}                                  # 改了什么 → 几个库
+    max_pct = resume_max_pct()
 
     def _bump(what):
         changed[what] = changed.get(what, 0) + 1
@@ -11186,8 +11197,8 @@ def tune_strm_libraries(key):
         # 会跨境拉视频的那几个开关，按【这个库真的有的键名】来关（见 STRM_LIB_TOGGLES）
         missing = []
         if "MaxResumePct" in o:
-            if o.get("MaxResumePct") != RESUME_MAX_PCT:
-                diff["MaxResumePct"] = RESUME_MAX_PCT
+            if o.get("MaxResumePct") != max_pct:
+                diff["MaxResumePct"] = max_pct
         else:
             missing.append("看完门槛")
         for names, val, human in STRM_LIB_TOGGLES:
@@ -11239,7 +11250,7 @@ def tune_strm_libraries(key):
         if "MinResumeDurationSeconds" in diff or "MinResumePct" in diff:
             _bump(f"续播门槛 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%")
         if "MaxResumePct" in diff:
-            _bump(f"看到 {RESUME_MAX_PCT}% 才算看完")
+            _bump(f"播到 {max_pct}% 算播放完")
         if "EnableMultiVersionByFiles" in diff or "EnableMultiVersionByMetadata" in diff:
             _bump("关掉多版本合并")
         if "EnableRealtimeMonitor" in diff:
@@ -18314,6 +18325,7 @@ def params_menu():
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
         print(f"  7. 剧集季集编号      当前：{ef_state}")
+        print(f"  8. 几%算播放完       当前：{CYAN}{resume_max_pct()}%{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -18342,10 +18354,42 @@ def params_menu():
             set_dir_cache()
         elif c == "7":
             set_episode_fix()
+        elif c == "8":
+            set_resume_max()
         else:
             print("无效选择。")
             continue
         ask("\n按回车返回...")
+
+
+def set_resume_max():
+    """「3 后补参数 → 8」：播到百分之几算播放完。存进状态，有 API Key 就当场对齐到各库。"""
+    cur = resume_max_pct()
+    print()
+    tip(f"{RESUME_MAX_LO}–100，100 = 播完才算，中途退出都记位置（Emby 默认 90）")
+    raw = ask(f"播到几%算播放完（当前 {cur}，回车不改）").strip().rstrip("%％")
+    if not raw:
+        print("没有改动。")
+        return
+    try:
+        v = int(raw)
+    except ValueError:
+        v = -1
+    if not RESUME_MAX_LO <= v <= 100:
+        warn(f"要 {RESUME_MAX_LO}–100 的整数。")
+        return
+    save_ms_state(resume_max_pct=v)
+    d = ms_install_dir()
+    key = read_emby_api_key(d) if is_installed(d) else ""
+    if not key:
+        ok(f"已存：播到 {v}% 算播放完")
+        warn("没有 Emby API Key，等填了 Key 后每小时对齐时落地。")
+        return
+    n = tune_strm_libraries(key)                  # 改了的话它自己打那一行 ✔
+    if "看完门槛" in (ms_state().get("lib_opt_missing") or []):
+        warn("这个 Emby 版本的媒体库没有这一项，设了也不生效。")
+    elif not n:
+        ok(f"播到 {v}% 算播放完")
 
 
 # ============================================================================ 链路体检
@@ -20279,7 +20323,7 @@ def do_healthcheck():
             for lb in slibs:
                 o = lb.get("LibraryOptions") or {}
                 off = [k for k, v in STRM_LIB_OPTIONS.items() if o.get(k) != v]
-                if "MaxResumePct" in o and o.get("MaxResumePct") != RESUME_MAX_PCT:
+                if "MaxResumePct" in o and o.get("MaxResumePct") != resume_max_pct():
                     off.append("MaxResumePct")
                 if off:
                     stale[lb.get("Name") or "?"] = off
@@ -20294,7 +20338,7 @@ def do_healthcheck():
                 if allk & {"EnableMultiVersionByFiles", "EnableMultiVersionByMetadata"}:
                     what.append("多版本合并没关（名字相近的片子会被并成一部，进度条也会坏）")
                 if "MaxResumePct" in allk:
-                    what.append(f"看完门槛不是 {RESUME_MAX_PCT}%（没片尾的片子会被提前判成看完）")
+                    what.append(f"算播放完的门槛不是 {resume_max_pct()}%")
                 if "EnableRealtimeMonitor" in allk:
                     what.append("实时监控没关（补上的时长/轨道 1 分多钟后就被它清掉）")
                 _hc("媒体库选项", "bad", f"{names}  {YELLOW}{'；'.join(what)}{RST}")
@@ -20312,7 +20356,7 @@ def do_healthcheck():
                          if _miss else "")
                 _hc("媒体库选项", "ok",
                     f"续播 {RESUME_MIN_SECONDS} 秒/{RESUME_MIN_PCT}%、"
-                    f"{'' if '看完门槛' in _miss else f'看到 {RESUME_MAX_PCT}% 算看完、'}"
+                    f"{'' if '看完门槛' in _miss else f'播到 {resume_max_pct()}% 算播放完、'}"
                     f"多版本合并已关、实时监控已关{_tail}")
 
             # 【私密库要能一眼验证】"以为遮住了、其实没遮"是这个功能唯一会真出事
