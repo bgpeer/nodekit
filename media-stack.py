@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.230"
+SCRIPT_VERSION = "1.5.231"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4791,8 +4791,37 @@ def do_p115_check(q):
     except Exception as e:
         st = _short_err(e)[:30]
     _hc("服务回", "ok" if loc else "bad",
-        "302 到 115 的直链" if loc else f"{st}（没给直链 —— OpenList 换不到，或者没认出是 115）")
+        "302 到 115 的直链" if loc else f"{st}（没给直链）")
     if not loc:
+        # 【服务没给链就当场自己问一遍 OpenList，把它的原话摆出来】真机 1.5.230：这一行 ✖、
+        # 手机那边 MediaWarp 也是 404 —— 两条路都换不到链，而补时长走 /d/ 却补上了。
+        # 光说"换不到"没法往下查，得看 OpenList 回的是什么。
+        tok = ol_tok_cached(d, fresh=True)
+        for lab, ua in (("OpenList 换链", PLAYER_UA), ("不带 UA 再换", None)):
+            try:
+                r = _ol_api("/api/fs/get", {"path": tp, "password": ""}, tok, timeout=40, ua=ua)
+                raw = str((r.get("data") or {}).get("raw_url") or "")
+                msg = re.sub(r"https?://\S+", "<地址>", str(r.get("message") or ""))[:80]
+                why = (("拿到直链" if raw else "code 200 但 raw_url 是空的")
+                       if r.get("code") == 200 else f"code {r.get('code')}　{msg}")
+                okk = r.get("code") == 200 and bool(raw)
+            except Exception as e:
+                why, okk = _short_err(e)[:80], False
+            _hc(lab, "ok" if okk else "bad", why)
+        try:
+            op = urllib.request.build_opener(_NoRedirect)
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{OPENLIST_PORT}/d" + urllib.parse.quote(tp),
+                headers={"User-Agent": PLAYER_UA})
+            try:
+                op.open(req, timeout=40).close()
+                ds = "200（没跳转）"
+            except urllib.error.HTTPError as e:
+                ds = f"{e.code}" + ("　跳转到网盘" if e.headers.get("Location") else "")
+        except Exception as e:
+            ds = _short_err(e)[:60]
+        _hc("OpenList /d/", "ok" if "跳转" in ds else "warn", ds)
+        tip("把这一屏截给作者")
         return
     s1, n1, t1 = _p115_get(loc, PLAYER_UA)
     _hc("本机拿同一个 UA 下", "ok" if s1 in (200, 206) and n1 else "bad",
