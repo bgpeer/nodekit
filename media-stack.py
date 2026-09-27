@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.239"
+SCRIPT_VERSION = "1.5.240"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11264,6 +11264,7 @@ def find_strm_items(key, q):
     words = [w for w in str(q or "").lower().split() if w]
     if not words:
         return out
+    stems = []                        # 和 out 一一对应：每个条目的文件名（不带扩展名）
     for lb in libs:
         pid = lb.get("ItemId")
         if not pid or not is_strm_lib(lb):
@@ -11280,6 +11281,15 @@ def find_strm_items(key, q):
             if all(w in hay for w in words):
                 out.append((uid, i.get("Id"), i.get("Name") or "?",
                             _is_fresh_item(i)))
+                stems.append(os.path.splitext(os.path.basename(str(i.get("Path") or "")))[0]
+                             .strip().lower())
+    # 【文件名正好对上的优先】真机：「龙虎门 (2006)」和「龙虎门 (2006) 1080P」两个文件，
+    # 前一个的名字是后一个的一部分 —— 怎么加词都对上两个，前一个永远点不中。
+    # 输入跟某个文件名一模一样，就只要那一个。
+    if len(out) > 1:
+        exact = [x for x, st in zip(out, stems) if st == str(q or "").strip().lower()]
+        if exact:
+            return exact
     return out
 
 
