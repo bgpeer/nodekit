@@ -206,7 +206,7 @@ def find_video(root, budget=120):
         return "", "这个盘是空的"
     if queue:
         return "", (f"翻了 {used} 个目录都没翻到视频，而且 {STRM_ROOT} 下面也没有"
-                    f"这个盘的 strm —— 先跑一次「5 生成媒体库」，再回来跑这个脚本")
+                    f"这个盘的 strm —— 先跑一次「4 生成媒体库」，再回来跑这个脚本")
     return "", f"{seen} 个条目里没有视频文件"
 
 
@@ -269,7 +269,7 @@ for mp, add in dav:
     elif code in (401, 403):
         print(f"    {R}✖ 上游回 {code} —— 这个盘的账号密码上游不认{X}")
         print(f"    {D}那它现在能播只能是靠别的（比如上游认 IP）。"
-              f"先去「4 挂载路径」把这个盘的凭据核一遍。{X}")
+              f"先去「3 挂载路径」把这个盘的凭据核一遍。{X}")
     else:
         print(f"    {Y}上游回 {code}{X}  {D}{el:.2f} 秒 —— 既不是直链也不是字节，"
               f"照实摆在这儿，别替它圆{X}")

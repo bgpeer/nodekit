@@ -67,7 +67,7 @@ DIR="${MS_DIR:-/opt/media-stack}"
 
 KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
         "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
-[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「3 后补参数」）"; exit 1; }
+[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「7 设置」）"; exit 1; }
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
@@ -260,7 +260,7 @@ if not Q:
         print(f"  {B}挑一个盘跑：{X}"
               f"  bash why-stall.sh {sorted(have.items(), key=lambda kv: -kv[1])[0][0]}")
     else:
-        print(f"  {D}{STRM_ROOT} 下面一个 strm 都没有 —— 先点「5 生成媒体库」。{X}")
+        print(f"  {D}{STRM_ROOT} 下面一个 strm 都没有 —— 先点「4 生成媒体库」。{X}")
     raise SystemExit(0)
 
 it = None
@@ -283,7 +283,7 @@ if Q.startswith("/"):
             break
     if not it:
         print(f"  {R}✖ 挑了几部，都在 Emby 库里找不到对应条目{X}")
-        print(f"  {D}点一次「5 生成媒体库」再回来。{X}")
+        print(f"  {D}点一次「4 生成媒体库」再回来。{X}")
         raise SystemExit(1)
 else:
     try:
@@ -424,7 +424,7 @@ if r.get("code") != 200:
         else:
             print(f"  {R}✖ 父目录里确实没有这个名字了{X}")
             print(f"  {D}上游把它删了或改名了，本地这条 strm 是废的。"
-                  f"点一次「5 生成媒体库」。{X}")
+                  f"点一次「4 生成媒体库」。{X}")
     if r.get("code") != 200:
         raise SystemExit(1)
 dat = r.get("data") or {}
@@ -466,7 +466,7 @@ if ("m3u8" in _lowraw or "video-play" in _lowraw or "transcod" in _lowraw
     print(f"  {D}转码流在 Emby 里播不了：302 过去是 m3u8，而 m3u8 里的分片写的是"
           f"相对路径，播放器会把它拼到 /emby/Videos/<条目id>/ 上，于是分片请求"
           f"全打回 Emby → 一路 401 → 一直转圈。{X}")
-    print(f"  {B}改法：media-stack → 4 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链{X}")
+    print(f"  {B}改法：media-stack → 3 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链{X}")
     print(f"  {D}（脚本 v1.5.110 起不再把新装的机器默认设成转码流，但【已经设过的"
           f"不会自动改回来】—— 得自己动手。）{X}")
 
@@ -524,7 +524,7 @@ if _loc:
         print(f"  {D}整条链每一步都「成功」—— strm 对、OpenList 认得、直链在这台"
               f"机器上也拉得动 —— 只有最后那个地址是废的。客户端上只有一句 "
               f"load fail 或者一直转圈。{X}")
-        print(f"  {B}修：media-stack → 7 更新{X}"
+        print(f"  {B}修：media-stack → 8 更新{X}"
               f"{D}（会把 MediaWarp 问 OpenList 的地址改成对外地址，"
               f"脚本要 v1.5.58 以上）{X}")
         print(f"  {D}改完已经缓存的旧地址要等直链缓存过期才换掉；"
@@ -977,7 +977,7 @@ for label, u, hdr in routes:
             print(f"    {Y}→ 403，而且是 0 秒就回的 —— 这不是慢，是 OpenList "
                   f"【不让代理这个盘】{X}")
             print(f"    {D}/p/ 只对开了「本机代理」的存储开放。这条路【没测成】，"
-                  f"不是它不行 —— 要真试，先去 4 挂载路径 → 这个盘 → 打开本机代理。{X}")
+                  f"不是它不行 —— 要真试，先去 3 挂载路径 → 这个盘 → 打开本机代理。{X}")
         else:
             print(f"    {R}→ 请求被拒了好几次，这一段没测成{X}"
                   f"  {D}（拒的那几个码就在上面，429/500 = 源在限流或掐连接）{X}")
@@ -1151,7 +1151,7 @@ if _cdn:
                       f"这个源不挡，它只是对不同的脸给不同的速度，方向正好相反。{X}")
             else:
                 print(f"  {D}能动的地方：这个盘的「伪装成浏览器」开关"
-                      f"（4 挂载路径 → 这个盘），它会把出去的 UA 换成浏览器那个。{X}")
+                      f"（3 挂载路径 → 这个盘），它会把出去的 UA 换成浏览器那个。{X}")
             # 【前面那些数字是戴哪张脸量的，必须说】不说的话，人会拿一个系统性
             # 偏低的数去做决定 —— 而这正是这次的实际情况：③④ 全程用的是浏览器 UA。
             # 开关开着的时候不说这句：那时候"浏览器那一行"和被改写的那几行戴的是
@@ -1244,7 +1244,7 @@ if mw_inner:
     print(f"  {R}✖ MediaWarp 给客户端的是内网地址（见 ②c）{X}")
     print(f"  {D}上面这些都是在这台机器上拉的 —— 手机拿到 {safe(mw_host)} "
           f"这个地址，连解析都解析不了。取流这一段量得再好也没用。{X}")
-    print(f"  {B}这一条先修：media-stack → 7 更新{X}")
+    print(f"  {B}这一条先修：media-stack → 8 更新{X}")
 print()
 if not ok and not bad:
     # 【一条都没测成的时候别往下判】下面那几支都是在比"哪条行哪条不行"，
@@ -1255,7 +1255,7 @@ elif len(done) > 1 and ok and bad:
     print(f"  {B}两条路结果不一样 —— 这就是可以直接动手的地方{X}")
     if "本机代理" in ok[0]["label"]:
         print(f"  {G}走你的 VPS 稳，走网盘 CDN 卡{X}")
-        print(f"  {B}改法：media-stack → 4 挂载路径 → 选这个盘 → 本机代理{X}")
+        print(f"  {B}改法：media-stack → 3 挂载路径 → 选这个盘 → 本机代理{X}")
         print(f"  {D}代价是视频全程过你的 VPS，吃出口流量；换来的是不卡。{X}")
     else:
         print(f"  {G}走网盘 CDN 稳，走你的 VPS 卡{X}")
@@ -1598,7 +1598,7 @@ else:
               f"【转码流】。转码流给的是 m3u8，而 m3u8 里的分片写的是相对路径，"
               f"播放器把它拼到 /emby/Videos/<id>/ 上，于是分片请求全打回 Emby → 401"
               f" → 一直转圈。{X}")
-        print(f"  {B}改法：4 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链{X}")
+        print(f"  {B}改法：3 挂载路径 → 选这个盘 → 3 直链方式 → 原画直链{X}")
     if codes.get("404"):
         _n404 = codes["404"]
         _tot = sum(codes.values())
@@ -1733,7 +1733,7 @@ fi
 EACH="${MS_SECS:-30}"
 DRV="$(python3 "$PYF" "$KEY" "$OLPW" "$DATA_ROOT" "$DOMAIN" "$EACH" "--drives" "$MWLOG" "$MWSTART")"
 if [ -z "$DRV" ]; then
-  echo "  ✖ 一个盘都没找到（$DATA_ROOT/strm 下面没有 strm）—— 先点「5 生成媒体库」"
+  echo "  ✖ 一个盘都没找到（$DATA_ROOT/strm 下面没有 strm）—— 先点「4 生成媒体库」"
   exit 1
 fi
 N="$(printf '%s\n' "$DRV" | grep -c .)"

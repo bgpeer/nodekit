@@ -33,7 +33,7 @@ DIR="${MS_DIR:-/opt/media-stack}"
 
 KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
         "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
-[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「3 后补参数」）"; exit 1; }
+[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「7 设置」）"; exit 1; }
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
@@ -175,12 +175,12 @@ hit = [i for i in items
 if not hit:
     print(f"  {R}✖ Emby 里没有匹配「{safe(Q)}」的条目{X}")
     # 【先数一数，别急着下结论】库里有没有东西是当场能数出来的。上一版不数，
-    # 张口就说「strm 还没进库，点 5 生成媒体库」—— 而那是三种可能里最少见的
+    # 张口就说「strm 还没进库，点 4 生成媒体库」—— 而那是三种可能里最少见的
     # 一种。实测把说明里的占位词原样敲进来，得到的就是这句，于是人以为库没建，
     # 去重扫一遍，白等半小时，回来还是同一句话。
     if not items:
         print(f"  {D}Emby 库里一个条目都没有 —— 这种情况才轮得到重建库。{X}")
-        print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，完了看它最后那段"
+        print(f"  {B}修：点一次「4 生成媒体库」{X}{D}，完了看它最后那段"
               f"「Emby 媒体库可以指向这些路径」有没有建库。{X}")
         raise SystemExit
     print(f"  {D}库里现在有 {len(items)} 个条目，所以多半只是【片名对不上】——"
@@ -233,7 +233,7 @@ if len(hit) > 1:
         print(f"  {Y}⚠ 这里面有 {len(_disc)} 条是【蓝光原盘】条目"
               f"（容器 bluray、大小 0B），点它必定 load fail{X}")
         print(f"  {D}要播的是容器 mkv/mp4 那几条。原盘那几条点一次"
-              f"「5 生成媒体库」会被压成正常条目。{X}")
+              f"「4 生成媒体库」会被压成正常条目。{X}")
 try:
     pick = int(os.environ.get("MS_N") or "1")
 except ValueError:
@@ -351,8 +351,8 @@ if not size and not secs and not looks_disc:
     print(f"  {Y}⚠ Emby 还没探到这一条的媒体信息（大小 0B、时长 0）{X}")
     print(f"  {D}这【不一定】是播不了的原因，但它自己就是个毛病：续播点是按时长算"
           f"百分比的，分母为 0 那套逻辑整个失效 —— 停止播放直接判「已看完」。{X}")
-    print(f"  {D}补时长是「5 生成媒体库」之后在后台跑的（每 3 分钟一轮），"
-          f"补到哪儿了看「6 链路体检」的「条目时长」那一行。{X}")
+    print(f"  {D}补时长是「4 生成媒体库」之后在后台跑的（每 3 分钟一轮），"
+          f"补到哪儿了看「5 链路体检」的「条目时长」那一行。{X}")
     print(f"  {D}下面接着往下查 —— 探不到时长往往【正是】因为下面某一段不通。{X}")
 
 if looks_disc:
@@ -362,7 +362,7 @@ if looks_disc:
           f"播放要按索引在片段之间跳，那需要 Emby 拿得到本地目录；{X}")
     print(f"  {D}而 strm 里只装得下一条指向【单个文件】的地址。所以这类条目必定"
           f"0B / 0bps / load fail —— 跟网盘是哪家、直链怎么设都无关。{X}")
-    print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，它会把原盘压成一个 strm"
+    print(f"  {B}修：点一次「4 生成媒体库」{X}{D}，它会把原盘压成一个 strm"
           f"（取 BDMV 里最大的那个片段＝正片）。脚本要 v1.5.50 以上。{X}")
     print(f"  {D}压完之后 Emby 里这一条会消失、换成一条正常的电影条目。{X}")
     raise SystemExit
@@ -380,7 +380,7 @@ if not hpath:
 if not os.path.isfile(hpath):
     print(f"  {R}✖ 宿主机上找不到这个 strm{X}  {D}{hpath}{X}")
     print(f"  {D}Emby 库里有条目、磁盘上没文件 —— 点开当然什么都拿不到。{X}")
-    print(f"  {B}修：点一次「5 生成媒体库」{X}")
+    print(f"  {B}修：点一次「4 生成媒体库」{X}")
     raise SystemExit
 try:
     body = open(hpath, encoding="utf-8", errors="replace").read().strip()
@@ -389,18 +389,18 @@ except OSError as e:
     raise SystemExit
 if not body:
     print(f"  {R}✖ strm 文件是空的{X}  {D}{hpath}{X}")
-    print(f"  {B}修：点一次「5 生成媒体库」{X}")
+    print(f"  {B}修：点一次「4 生成媒体库」{X}")
     raise SystemExit
 if body.lower().startswith(("http://", "https://")):
     print(f"  {R}✖ strm 是 URL 形式{X}  {D}{safe(body)[:70]}…{X}")
     print(f"  {D}MediaWarp 的 alist_strm 【只认路径形式】，拿到 URL 会把整条当成"
           f"网盘路径去查，查不到就不 302 —— 正好是「挂载能播、Emby 转圈」。{X}")
-    print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，它开头会统一改回路径形式{X}")
+    print(f"  {B}修：点一次「4 生成媒体库」{X}{D}，它开头会统一改回路径形式{X}")
     raise SystemExit
 print(f"  {G}✔{X} 路径形式  {D}{body}{X}")
 if re.search(r"/(BDMV|CERTIFICATE)/", body, re.I):
     print(f"  {R}✖ 它指向的是蓝光原盘目录里的一个片段{X}")
-    print(f"  {B}修：点一次「5 生成媒体库」{X}{D}（v1.5.50 以上会把原盘压成一条）{X}")
+    print(f"  {B}修：点一次「4 生成媒体库」{X}{D}（v1.5.50 以上会把原盘压成一条）{X}")
 
 # ================= ③ OpenList 认不认这条网盘路径 =================
 print()
@@ -463,7 +463,7 @@ else:
         if "object not found" not in msg.lower():
             raise SystemExit
         # 【"找不到"有两种，处置相反，不能都说成"文件被删了"】
-        #   · 上游真的删了 / 改名了      → 点「5 生成媒体库」重建，本地那条 strm 是废的
+        #   · 上游真的删了 / 改名了      → 点「4 生成媒体库」重建，本地那条 strm 是废的
         #   · 这一轮列目录没列全 / 撞限流 → 文件好好的，过一会儿自己就好；重建反而会把
         #                                  一批还活着的 strm 当成失效删掉
         # 两者当场就能分开：去列它的父目录（带 refresh，绕开缓存），看那个名字在不在。
@@ -484,7 +484,7 @@ else:
         if rl.get("code") != 200:
             print(f"  {Y}父目录也列不出来{X}  {D}{safe(rl.get('message'))[:100]}{X}")
             print(f"  {D}这不是「文件没了」，是【这个源现在列不动】—— 上游那台 WebDAV "
-                  f"在抖或者在限流。别急着点「5 生成媒体库」：那一步会把列不到的"
+                  f"在抖或者在限流。别急着点「4 生成媒体库」：那一步会把列不到的"
                   f"当成还在（三态判据），但也修不好这个，等它缓过来再说。{X}")
         else:
             names = [str(x.get("name") or "")
@@ -503,7 +503,7 @@ else:
                 near = [n for n in names if n[:8] == want[:8]][:3]
                 print(f"  {D}那一层现在有 {len(names)} 个条目"
                       + (f"，名字接近的：{'、'.join(near)}" if near else "") + f"{X}")
-                print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，本地那条 strm 会被清掉{X}")
+                print(f"  {B}修：点一次「4 生成媒体库」{X}{D}，本地那条 strm 会被清掉{X}")
         raise SystemExit
 
 def drive_setting(mount):
@@ -575,7 +575,7 @@ if not loc:
               f"之后每次换直链都被拒。已经缓存过直链的片子照样能放，"
               f"所以看着像「有的能放有的不能放」。{X}")
     else:
-        print(f"  {D}下一步：跑「6 链路体检」看这个存储的实测结果。{X}")
+        print(f"  {D}下一步：跑「5 链路体检」看这个存储的实测结果。{X}")
     raise SystemExit
 host = re.sub(r"^[a-z]+://([^/]+).*", r"\1", loc)
 kind = "HLS 分片流" if ".m3u8" in loc.lower() else "整文件"
@@ -621,7 +621,7 @@ if via_vps:
           f"直链，OpenList 只能回自己的 /d/ 地址 —— 而那个地址的主机名是"
           f"【谁来问就按谁用的主机名拼】。MediaWarp 在容器里用 http://openlist:5244"
           f"去问，拿回来的就是 openlist:5244。{X}")
-    print(f"  {B}修：跑一次「7 更新」{X}{D}（脚本要 v1.5.58 以上）{X}")
+    print(f"  {B}修：跑一次「8 更新」{X}{D}（脚本要 v1.5.58 以上）{X}")
     # 【别再让人去填「网站 URL」】OpenList v4 已经没有那个设置了，翻遍设置页也找不到，
     # 而这条提示让人来回找了好几轮。能改的只有【问它的人】：MediaWarp 的 alist_strm.addr。
     print(f"  {D}OpenList v4 没有「网站 URL」这个设置，翻设置页是找不到的。"
@@ -874,7 +874,7 @@ except urllib.error.HTTPError as e:
     if e.code == 403:
         print(f"  {D}403 常见两种：直链绑了取它的那台机器的 IP/UA；"
               f"或者签名过期。前者要把这个盘的「回源方式」改成本机代理"
-              f"（4 挂载路径 → 选那个盘 → 2 直链方式）。{X}")
+              f"（3 挂载路径 → 选那个盘 → 2 直链方式）。{X}")
 except Exception as e:
     print(f"  {R}✖ 拉不动：{safe(e)}{X}")
     _es = safe(e)
@@ -890,7 +890,7 @@ except Exception as e:
         print(f"    {B}docker restart mediawarp{X}  {D}丢掉缓存的直链，再点一次（会换一条新的）；"
               f"或者等 {TTL} 自己过期。{X}")
         print(f"  {D}隔一会儿再跑一次这个脚本：好了 = 就是那一条链的运气；一直超时 = 这台机器到"
-              f"网盘 CDN 的线路有问题，跑「6 链路体检」看看。{X}")
+              f"网盘 CDN 的线路有问题，跑「5 链路体检」看看。{X}")
 def mw_uptime():
     """MediaWarp 容器跑了多少秒。读不到返回 None —— 【读不到就是不知道，不是 0】。
 
@@ -1048,7 +1048,7 @@ else:
         routes.append(("经过", "经过 nginx（播放器走的就是这条）", probe_url))
 
     # 【改写开没开，是读出来的，不是猜出来的】上一版从状态码倒推，于是开关明明已经
-    # 开了，它还叫人去开 —— 而且叫的还是过时的做法（「7 更新」）。配置文件就在本机。
+    # 开了，它还叫人去开 —— 而且叫的还是过时的做法（「8 更新」）。配置文件就在本机。
     NGXC = "/etc/nginx/conf.d/media-stack.conf"
     mount = "/" + body.strip("/").split("/")[0] if body.startswith("/") else ""
     try:
@@ -1164,7 +1164,7 @@ else:
         elif _a == 403 and _b == 403:
             print(f"  {R}✖ UA 改写没顶上{X}  {D}同一个 UA 两路都是 403{X}")
             if not _rw_on:
-                print(f"  {B}修：给这个盘开「探测 UA」{X}{D} —— 4 挂载路径 → 选 "
+                print(f"  {B}修：给这个盘开「探测 UA」{X}{D} —— 3 挂载路径 → 选 "
                       f"{mount or '那个盘'} → 2 直链方式 → 探测 UA → 伪装成浏览器"
                       f"（脚本要 v1.5.61 以上）{X}")
             else:
@@ -1182,7 +1182,7 @@ else:
     elif not _ours:
         print(f"  {Y}这条是网盘 CDN 的直链，不经过本机 nginx —— 改写不了它的 UA{X}")
         print(f"  {D}真被 CDN 按 UA 挡住时，只能把这个盘的「回源方式」改成本机代理"
-              f"（4 挂载路径 → 选那个盘 → 2 直链方式），代价是视频过本机带宽。{X}")
+              f"（3 挂载路径 → 选那个盘 → 2 直链方式），代价是视频过本机带宽。{X}")
 
     # ---- 这个源现在到底卡在哪 ----
     print()
@@ -1193,7 +1193,7 @@ else:
             print(f"  {D}（绕过那一路还有 {_n_busy} 发 429/500：上游对【没改写过的】"
                   f"请求仍然限量，改写这条路正好躲开了它）{X}")
         print(f"  {D}条目还是缺媒体流的话，那只是补探测还没轮到它 —— "
-              f"跑「6 链路体检」看还差多少个，它按小时在后台推进。{X}")
+              f"跑「5 链路体检」看还差多少个，它按小时在后台推进。{X}")
     elif _r_busy and _r_busy >= _r_403:
         print(f"  {R}✖ 主要卡在【量】上{X}  {D}{_r_busy}/{_r_all} 发是 429/500 —— "
               f"上游嫌请求太密，跟 UA 无关（浏览器 UA 一样吃）{X}")

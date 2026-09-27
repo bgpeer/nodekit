@@ -204,7 +204,7 @@ if [ -n "$AF" ]; then
   echo
   if [ "${BAD:-0}" -gt 0 ]; then
     echo -e "  ${R}✗ 有 $BAD 个任务是 overwrite: true —— 就是它每天把 strm 全重写一遍。${X}"
-    echo -e "  ${Y}    进菜单 16 点『7 更新』会按新模板重写这份配置（overwrite 改成 false）。${X}"
+    echo -e "  ${Y}    进菜单 16 点『8 更新』会按新模板重写这份配置（overwrite 改成 false）。${X}"
   elif [ "${OKN:-0}" -gt 0 ]; then
     echo -e "  ${G}✓ $OKN 个任务都是 overwrite: false${X}"
     echo -e "  ${Y}    那 strm 的 mtime 还天天变就是别的东西在写，看 ④e 的分布和下面的时刻。${X}"
@@ -271,7 +271,7 @@ cat <<'TXT'
                  —— 补好时长之后就不再发生，这正是 heal 值得做的理由
   AutoFilm 扫库  只列目录、写 strm，不读视频内容，很小
   预热直链       64 KB/部 × 10 部/轮 ≈ 15 MB/天
-  镜像更新       docker pull，一次几百 MB，只在点『7 更新』时
+  镜像更新       docker pull，一次几百 MB，只在点『8 更新』时
   看片           0 —— MediaWarp 302 把播放器直接指去网盘，视频流不经过这台机
 TXT
 echo
