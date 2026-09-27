@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.241"
+SCRIPT_VERSION = "1.5.242"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -5221,11 +5221,18 @@ def rescue_progress(key):
                 f"{_mmss(upos) if upos else '0'}、时长 {ticks / 6e8:.0f} 分")
         _tail = f"  {e.get('name') or iid}{_log_tag(iid)}"
         _ts = time.strftime('%Y-%m-%d %H:%M:%S')
-        if upos > 0:
+        # 【Emby 的续播点比看到的旧一大截 = 这一场它没记上】真机遮天 178：播到 3 分 26 秒
+        # 退出（盯梢从 Emby 自己的会话里看到的），详情页还是「继续播放 00:33」—— 上一场的。
+        # 原来只要续播点不是 0 就当"它自己记住了"，这种旧值一律放过。比看到的位置早
+        # HEAL_RESCUE_STALE_S 秒以上才算没记上；比看到的晚（最后一眼之后又播了一会儿）照旧信它。
+        stale = upos > 0 and pos > 0 and upos < pos - HEAL_RESCUE_STALE_S * 10 ** 7
+        if upos > 0 and not stale:
             st.pop(iid, None)         # Emby 自己记住了，不碰
             if e.get("nodur"):
                 logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 它自己记住了，不用动{_tail}")
             continue
+        if stale and not settled:
+            continue                  # Emby 可能还在记这一场，等满了再看
         if not played and not settled:
             continue                  # 还没打勾：多半是 Emby 还没把这一场记完，下一轮再看
         if not ticks and not settled:
@@ -5276,6 +5283,9 @@ def rescue_progress(key):
 # 有正在播、要抢救的那一集时，tick 干完活再每 HEAL_RESCUE_POLL_S 秒看一眼，最多
 # 看 HEAL_RESCUE_LINGER_S 秒 —— 只问本机 Emby，不碰网盘；没有要盯的就立刻退出。
 HEAL_RESCUE_POLL_S = 10
+# Emby 的续播点比最后看到的位置早这么多秒以上，就当这一场它没记上（见 rescue_progress）。
+# 要大于看位置的间隔（linger 时 10 秒一眼，平时一分钟一眼），免得把正常的误差当成没记上
+HEAL_RESCUE_STALE_S = 90
 HEAL_RESCUE_LINGER_S = 40
 
 
@@ -6161,10 +6171,17 @@ def do_heal_watch(q):
     # 「完美世界 287 90」—— 只有多于一个词时最后那个数字才当分钟。
     words = q.split()
     mins = HEAL_WATCH_MIN
+    hits = None
     if len(words) > 1 and words[-1].isdigit():
-        mins = max(1, min(HEAL_WATCH_MAX, int(words[-1])))
-        q = " ".join(words[:-1])
-    hits = find_strm_items(key, q)
+        # 【整串先对一次】真机：「heal-watch 遮天 178」—— 178 被当成了分钟，剩下的「遮天」
+        # 对上 14 个。整串能正好对上一部，那个数字就是集号，不是分钟
+        hits = find_strm_items(key, q)
+        if len(hits) != 1:
+            mins = max(1, min(HEAL_WATCH_MAX, int(words[-1])))
+            q = " ".join(words[:-1])
+            hits = None
+    if hits is None:
+        hits = find_strm_items(key, q)
     if len(hits) != 1:
         warn(f"「{q}」对上了 {len(hits)} 个 —— 一次只盯一部。"
              + ("" if hits else "换个写法试试。"))
