@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.243"
+SCRIPT_VERSION = "1.5.244"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1418,7 +1418,7 @@ def gen_nginx_site(cfg):
         # 【阿里转码流】开了的盘，开播那一下先问本机那个小服务：该走转码的回 302 到阿里的
         # m3u8，别的回 X-Accel-Redirect 原样交给 MediaWarp。服务没起来（502/504）也交给
         # MediaWarp —— 这一段坏了最多是退回原画，绝不挡播放。
-        if sub == "emby" and hls_on and (ali_on or p115_on):
+        if sub == "emby" and hls_on and (ali_on or p115_on or hls_direct_on()):
             hls += f"""
     # 阿里转码流 / 115 按播放器 UA 换链（见 media-stack.py 的 ALI_TC_LEVELS、pan115_mounts）
     location ~* ^/(?:emby/)?videos/[0-9]+/(?:stream|original)(?:\\.[a-z0-9]+)?$ {{
@@ -1635,6 +1635,7 @@ case "${1:-info}" in
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
+  hls-direct on|off       试验：转码流分片直连网盘（不再每段绕服务器），默认关
   play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
@@ -1808,6 +1809,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" ali-check "$@" ;;
+  hls-direct)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" hls-direct "$@" ;;
   115-check)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -2134,6 +2140,36 @@ _ALI_OL_TOK = ["", 0.0]
 P115_TTL = 600            # 同一集、同一个 UA 的直链缓存多久（115 的链几小时才过期）
 
 
+# ── 转码流：播放列表改好再给手机，分片直连网盘（试验，默认关）──────────────────
+# 真机（遮天 179）：Emby 里每次开播都只有一两百 KB/s、三四十秒后才上来；同一集在 OpenList
+# 网页里开头 3 秒、11 MB/s，夸克 App 也是一点就播。两边的播放地址都是 VPS 去要的，差别只在
+# Emby 这条路：m3u8 里分片写的是相对路径，播放器把每一段都先发回东京，本机服务回 302 再去
+# 夸克 —— 每段多一趟「手机 ↔ 东京」。
+# 试验：开播那一下由本机服务把 m3u8 取来（几 KB），相对路径改成夸克的完整地址再交给播放器，
+# 之后每一段手机直连夸克。视频字节照旧不过 VPS。
+# 【没把握的一处，所以默认关】播放列表换成由 VPS 去取：要是网盘按「取列表的 IP」签分片，手机
+# 拿着就会被拒。开了播不了就关掉，一切照旧。media-stack hls-direct on / off
+HLS_DIRECT_TTL = 300       # 同一集改好的播放列表缓存多久（秒）
+
+
+def hls_direct_on():
+    return bool(ms_state().get("hls_direct"))
+
+
+def m3u8_absolutize(text, base_url):
+    """把播放列表里的相对地址（分片行、URI="..."）按 base_url 补成完整地址。其余原样。"""
+    out = []
+    for ln in text.splitlines():
+        t = ln.strip()
+        if t and not t.startswith("#"):
+            ln = urllib.parse.urljoin(base_url, t)
+        elif 'URI="' in t:
+            ln = re.sub(r'URI="([^"]+)"',
+                        lambda mm: 'URI="' + urllib.parse.urljoin(base_url, mm.group(1)) + '"', ln)
+        out.append(ln)
+    return "\n".join(out) + "\n"
+
+
 def pan115_mounts(d, rows=None):
     """要由本机服务按 UA 换链的 115 盘的挂载点。"""
     try:
@@ -2378,6 +2414,48 @@ def do_hls_fix():
             p115c[k] = (url, time.time(), not115)
         return url
 
+    plc, hdon = {}, [False, 0.0]
+
+    def direct_on():
+        if time.time() - hdon[1] > 30:
+            hdon[0], hdon[1] = hls_direct_on(), time.time()
+        return hdon[0]
+
+    def playlist_of(vid, ua):
+        """转码流的这一集：取 m3u8、把分片补成完整地址（见 m3u8_absolutize）。不是 m3u8 → ""。"""
+        now = time.time()
+        with lock:
+            hit = plc.get(vid)
+            if hit and now - hit[1] < (HLS_DIRECT_TTL if hit[0] else HLS_BASE_FAIL_TTL):
+                return hit[0]
+        body = ""
+        try:
+            op = urllib.request.build_opener(_NoRedirect)
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
+                f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
+                headers={"User-Agent": HTTP_UA})
+            loc = ""
+            try:
+                op.open(req, timeout=15).close()
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location") or ""
+            if ".m3u8" in loc.split("?", 1)[0].lower():
+                r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
+                with urllib.request.urlopen(r2, timeout=15) as r:
+                    txt = r.read(2 << 20).decode("utf-8", "replace")
+                    final = r.geturl() or loc
+                if txt.lstrip().startswith("#EXTM3U"):
+                    body = m3u8_absolutize(txt, final)
+                    head = final.split("?", 1)[0]
+                    with lock:
+                        cache[vid] = (head[:head.rfind("/") + 1], time.time())
+        except Exception:
+            body = ""
+        with lock:
+            plc[vid] = (body, time.time())
+        return body
+
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nginx"        # 不自报家门，跟别处口径一致
@@ -2394,6 +2472,19 @@ def do_hls_fix():
                 # 【115】拿播放器自己的 UA 换链 → 302；别的一律原样交回 MediaWarp
                 url = (ali_of(ms.group(1))
                        or p115_of(ms.group(1), self.headers.get("User-Agent") or ""))
+                # 【试验：转码流的播放列表改好再给】见 m3u8_absolutize 上面那段
+                pl = ("" if url or not direct_on()
+                      else playlist_of(ms.group(1), self.headers.get("User-Agent") or ""))
+                if pl:
+                    data = pl.encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(data)
+                    return
                 if url:
                     self.send_response(302)
                     self.send_header("Location", url)
@@ -22059,6 +22150,18 @@ if __name__ == "__main__":
         elif arg == "ali-check":          # 阿里转码流这一部的地址多久过期（只读）
             require_root()
             do_ali_check(" ".join(sys.argv[2:]).strip())
+        elif arg == "hls-direct":         # 试验：转码流分片直连网盘（on / off）
+            require_root()
+            _v = (sys.argv[2] if len(sys.argv) > 2 else "").lower()
+            if _v in ("on", "off"):
+                save_ms_state(hls_direct=(_v == "on"))
+                refresh_hls(ms_install_dir())
+                ok(f"转码流分片直连：{'开（试验）' if _v == 'on' else '关'}")
+                if _v == "on":
+                    tip("开了播不了就 media-stack hls-direct off，一切照旧")
+            else:
+                print(f"转码流分片直连（试验）：{'开' if hls_direct_on() else '关'}"
+                      f"　用法：media-stack hls-direct on | off")
         elif arg == "115-check":          # 115 这一部卡在哪一段（只读）
             require_root()
             do_p115_check(" ".join(sys.argv[2:]).strip())
