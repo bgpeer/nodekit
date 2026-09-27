@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.240"
+SCRIPT_VERSION = "1.5.241"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4697,6 +4697,30 @@ def _ngx_item_lines(buf, iid):
     return out
 
 
+def _ngx_file_lines(buf, tp):
+    """nginx 日志里【OpenList 出这个文件】的请求（/d/… 或 /p/…）→ 同 _ngx_item_lines 的格式。
+
+    【代理型的盘，字节不在 Emby 那一栏】七米蓝这类 WebDAV：Emby 那边的 stream 回的是 302，
+    跳到 list 子域的 /d/…，OpenList 在那儿替网盘出字节 —— 这些请求里没有条目 id，
+    _ngx_item_lines 一条都认不出，于是盯梢写「经服务器 0.0 MB」，而实际整部片都过了 VPS。
+    按 strm 里写的网盘路径认（日志里是百分号编码的，先解开再比）。"""
+    out = []
+    if not tp:
+        return out
+    for ln in buf.splitlines():
+        if "/d/" not in ln and "/p/" not in ln:
+            continue
+        mt = _NGX_LINE.search(ln)
+        if not mt:
+            continue
+        u = urllib.parse.unquote(mt.group("u").split("?")[0])
+        if u not in ("/d" + tp, "/p" + tp):
+            continue
+        out.append((mt.group("t").split(" ")[0].split(":", 1)[-1], mt.group("m"), u,
+                    int(mt.group("st")), int(mt.group("b")), mt.group("ua")[:40]))
+    return out
+
+
 def _session_of(key, iid):
     """Emby 此刻正在播这个条目的那一场 → {方式, 原因, 码率, 位置, 暂停}；没在播 → None。"""
     try:
@@ -4953,6 +4977,12 @@ def do_play_watch(q, minutes=15):
         return
     uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
     try:
+        _it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+        with open(_strm_host_path(d, str(_it.get("Path") or "")), encoding="utf-8") as f:
+            tp = strm_target_path(f.read()) or ""
+    except Exception:
+        tp = ""
+    try:
         off = os.stat(NGX_ACCESS_LOG).st_size
     except OSError:
         warn("没有 nginx 那份访问日志 —— 看不了字节走没走服务器（客户端是直连 IP:端口？）")
@@ -4972,12 +5002,15 @@ def do_play_watch(q, minutes=15):
                     buf = f.read(NGX_TAIL_MAX)
                 cut = buf.rfind(b"\n") + 1
                 off += cut
-                rows = _ngx_item_lines(buf[:cut].decode("utf-8", "replace"), iid)
+                _txt = buf[:cut].decode("utf-8", "replace")
+                rows = sorted(_ngx_item_lines(_txt, iid) + _ngx_file_lines(_txt, tp),
+                              key=lambda r: r[0])
             except OSError:
                 rows = []
             for t, mth, u, st, b, ua in rows:
                 kind = ("按下播放" if u.lower().endswith("/playbackinfo") else
-                        "要视频" if "/videos/" in u.lower() else "其它")
+                        "要视频" if ("/videos/" in u.lower() or u.startswith(("/d/", "/p/")))
+                        else "其它")
                 # 【新的一场】上一场结束了；或者 Emby 那边一直没见到它在播（外部播放器有时
                 # 不报），那就按"隔了半分钟以上的又一次按下播放"算新的一场。同一场开播时
                 # 客户端常连问两三次 PlaybackInfo，不能每问一次就算一场
@@ -5003,7 +5036,8 @@ def do_play_watch(q, minutes=15):
                         cur["via_vps"] += b
                 print(f"  {DIM}{t}  {kind:<4} {mth:<4} {st}  "
                       f"{('跳走（302）' if st in (301, 302, 307) else f'{b / 1048576:.1f} MB 经服务器')}"
-                      f"  {u.split('/')[-1][:24]}  {ua}{RST}")
+                      f"  {('本机代理出字节' if u.startswith(('/d/', '/p/')) else u.split('/')[-1][:24])}"
+                      f"  {ua}{RST}")
             ss = _session_of(key, iid)
             if cur is not None and ss:
                 cur["how"].add(ss["how"])
