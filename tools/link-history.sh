@@ -23,7 +23,8 @@ LINES="${2:-20000}"
 # 【把版本打出来】这些脚本是 curl 下来跑的，而 raw 有 CDN 缓存：改完立刻拉，
 # 拿到的可能还是几分钟前那份。跑出来的结果对不上，人只会以为"改了没用"。
 # 屏幕上有个版本号，一眼就能分清是"没改对"还是"拿的是旧的"。
-TOOL_VER="2026-08-30f"
+TOOL_VER="2026-09-27a"
+export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 command -v docker >/dev/null 2>&1 || { echo "✖ 没有 docker"; exit 1; }
@@ -36,6 +37,15 @@ trap 'rm -f "$LOG"' EXIT
 docker logs --tail "$LINES" mediawarp >"$LOG" 2>&1
 
 python3 - "$Q" "$LOG" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import re, sys
 from urllib.parse import urlsplit, unquote
 
@@ -240,6 +250,15 @@ DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' \
 [ -n "$DATA_ROOT" ] || DATA_ROOT="${MS_DIR:-/opt/media-stack}/media"
 
 python3 - "$KEY" "$Q" "$DATA_ROOT" <<'PY2'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json, os, re, sys, time, urllib.request, urllib.error
 KEY, Q, DATA_ROOT = sys.argv[1], sys.argv[2], sys.argv[3]
 EMBY, MW = "http://127.0.0.1:8096", "http://127.0.0.1:9000"

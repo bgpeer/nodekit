@@ -20,7 +20,8 @@
 # 猜是猜不出来的，一段一段问，坏在哪一段就报哪一段。
 set -u
 
-TOOL_VER="2026-09-25a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -47,6 +48,15 @@ TTL="$(sed -nE 's/^[[:space:]]*alist_api_ttl:[[:space:]]*"?([^"[:space:]#]+).*/\
 export MS_KEY="$KEY" MS_OLPW="$OLPW" MS_DATA_ROOT="$DATA_ROOT" MS_Q="$Q" MS_N="$N" MS_TTL="$TTL"
 export MS_DIR="$DIR"
 python3 - <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import datetime, json, os, re, subprocess, time, urllib.error, urllib.parse, urllib.request
 
 EMBY = "http://127.0.0.1:8096"
@@ -614,6 +624,10 @@ bare = host.split(":")[0]
 # 指的就是夸克的 CDN。判据现成在手里，只是没拿来用。
 via_vps = (bare in ("openlist", "emby", "mediawarp", "autofilm", "localhost")
            or bare.startswith(("127.", "172.1", "172.2", "172.3", "10.", "192.168.")))
+# 【302 到 OpenList 自己的 /d/、/p/】代理型的盘（WebDAV 源）：地址是对外的 list 子域，
+# 但字节照样是 VPS 去上游拉了再吐出来。上一版只认内网名，这种盘慢了就念"直连网盘 CDN、
+# 不过你的 VPS"，正好说反（真机 1.5.247，七米蓝）。
+via_ol = urllib.parse.urlsplit(loc).path.startswith(("/d/", "/p/"))
 if via_vps:
     print()
     print(f"  {R}✖ 302 指向的是内网地址，播放器根本连不上{X}  {D}{host}{X}")
@@ -668,7 +682,7 @@ try:
         print(f"  {R}✖ 不够：这部片要 {need:.1f} Mbps，实测只有 {mbps:.1f}{X}")
         print(f"  {D}能开播，但会边放边等 —— 拖进度条之后尤其明显。{X}")
         # 【这两种盘慢的原因完全不同，说错了会让人去改一套本来没病的配置】
-        if via_vps:
+        if via_vps or via_ol:
             print(f"  {D}代理型存储（WebDAV 源）的视频【全程经过你的 VPS】，"
                   f"所以这里量到的就是 VPS 到上游那台服务器的速度，"
                   f"换播放器、改 Emby 设置都改不了它。{X}")

@@ -16,7 +16,8 @@
 #   4. 网盘对这个文件单独限速                 → 同上，速度差一个量级就是它
 set -u
 
-TOOL_VER="2026-08-30c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 SLOW="${1:-}"
@@ -47,6 +48,15 @@ hr() { printf '%s\n' "----------------------------------------------------------
 # ---- 找条目：电影和剧集都要找，按集号 / 片名 / 文件名匹配 ----
 find_item() {   # $1=要找的东西 -> "Id<TAB>Name<TAB>Path"
   python3 - "$EMBY" "$KEY" "$1" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json,sys,urllib.request,urllib.parse
 emby,key,q=sys.argv[1],sys.argv[2],sys.argv[3]
 out,start=[],0
@@ -78,6 +88,15 @@ PY
 
 media_info() {  # $1=ItemId
   python3 - "$EMBY" "$KEY" "$1" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json,sys,urllib.request
 emby,key,iid=sys.argv[1],sys.argv[2],sys.argv[3]
 u=f"{emby}/Items?Ids={iid}&Fields=MediaSources,Path&api_key={key}"
@@ -117,6 +136,15 @@ PY
 # ---- 302 + 实测速度（认得出 HLS 和整文件两种）----
 probe() {       # $1=ItemId
   python3 - "$MW" "$KEY" "$1" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import re, sys, time, urllib.request, urllib.error
 BOLD, RST = "\033[1m", "\033[0m"
 mw, key, iid = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -364,6 +392,15 @@ hr
 echo "  Emby 现在有没有在转码"
 hr
 python3 - "$EMBY" "$KEY" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json,sys,urllib.request
 emby,key=sys.argv[1],sys.argv[2]
 try: d=json.load(urllib.request.urlopen(f"{emby}/Sessions?api_key={key}",timeout=30))

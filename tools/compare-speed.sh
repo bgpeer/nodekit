@@ -12,7 +12,8 @@
 # 「挂载里随便拖、Emby 卡死」十有八九就是这个差别，而不是脚本或线路的问题。
 set -u
 
-TOOL_VER="2026-08-30c"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 Q="${1:-}"
@@ -28,6 +29,15 @@ OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head
 [ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key，先跑「7 设置」"; exit 1; }
 
 python3 - "$KEY" "$OLPW" "$DATA_ROOT" "$Q" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json, os, re, sys, time, urllib.parse, urllib.request, urllib.error
 KEY, OLPW, DATA_ROOT, Q = sys.argv[1:5]
 EMBY, MW, OL = "http://127.0.0.1:8096", "http://127.0.0.1:9000", "http://127.0.0.1:5244"
