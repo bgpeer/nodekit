@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.244"
+SCRIPT_VERSION = "1.5.245"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1635,7 +1635,7 @@ case "${1:-info}" in
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
-  hls-direct on|off       试验：转码流分片直连网盘（不再每段绕服务器），默认关
+  hls-direct on|off       转码流分片直连网盘（不再每段绕服务器），默认开
   play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
@@ -2147,13 +2147,18 @@ P115_TTL = 600            # 同一集、同一个 UA 的直链缓存多久（115
 # 夸克 —— 每段多一趟「手机 ↔ 东京」。
 # 试验：开播那一下由本机服务把 m3u8 取来（几 KB），相对路径改成夸克的完整地址再交给播放器，
 # 之后每一段手机直连夸克。视频字节照旧不过 VPS。
-# 【没把握的一处，所以默认关】播放列表换成由 VPS 去取：要是网盘按「取列表的 IP」签分片，手机
-# 拿着就会被拒。开了播不了就关掉，一切照旧。media-stack hls-direct on / off
+# 【先做成默认关的试验，真机验过了改成默认开】播放列表换成由 VPS 去取，怕的是网盘按
+# 「取列表的 IP」签分片、手机拿着被拒。1.5.244 真机（遮天 178 / 179）：开播就 4.6~4.9 MB/s，
+# 仓库主人：「可以播，现在开头没有一卡一卡的」。所以 1.5.245 起默认开；某个源真不认，
+# media-stack hls-direct off 关掉，一切照旧。
+# 【阿里转码流不走这条】阿里的分片签名只有十几分钟（见 ali-check），列表一次写死完整地址，
+# 长片播到后面会过期；它照旧走相对路径 + 本机 302，那条路每次都按新的地址指。
 HLS_DIRECT_TTL = 300       # 同一集改好的播放列表缓存多久（秒）
 
 
 def hls_direct_on():
-    return bool(ms_state().get("hls_direct"))
+    """默认开；只有明确关过（media-stack hls-direct off）才关。"""
+    return ms_state().get("hls_direct") is not False
 
 
 def m3u8_absolutize(text, base_url):
@@ -22156,11 +22161,11 @@ if __name__ == "__main__":
             if _v in ("on", "off"):
                 save_ms_state(hls_direct=(_v == "on"))
                 refresh_hls(ms_install_dir())
-                ok(f"转码流分片直连：{'开（试验）' if _v == 'on' else '关'}")
+                ok(f"转码流分片直连：{'开' if _v == 'on' else '关'}")
                 if _v == "on":
                     tip("开了播不了就 media-stack hls-direct off，一切照旧")
             else:
-                print(f"转码流分片直连（试验）：{'开' if hls_direct_on() else '关'}"
+                print(f"转码流分片直连：{'开' if hls_direct_on() else '关'}"
                       f"　用法：media-stack hls-direct on | off")
         elif arg == "115-check":          # 115 这一部卡在哪一段（只读）
             require_root()
