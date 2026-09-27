@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.249"
+SCRIPT_VERSION = "1.5.250"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9199,6 +9199,11 @@ def align_library(d, key, heal=True, migrate=True):
     zeroed = clear_impossible_progress(key)
     # 库选项改过就必须重扫（见上），哪怕文件数一个没变
     scan_if_grown(d, key, force=bool(n_tuned))
+    # 【扫完再清空壳】扫库任务回 Completed 也不一定删得掉本地已经没了的条目，见 prune_emby_ghosts
+    try:
+        prune_emby_ghosts(d, key, quiet=not has_tty())
+    except Exception as e:
+        warn(f"清空壳条目失败：{_short_err(e)}")
     # 【必须排在扫描之后】路径变过的条目要等 Emby 重新扫出来才找得到。
     # 这一趟同时做两件事：把现有进度记下来，把新条目缺的补回去。
     try:
@@ -12042,6 +12047,78 @@ def emby_strm_paths(key):
                 if p.endswith(".strm"):
                     known.add(p)
     return known
+
+
+GHOST_MAX_PCT = 20          # 空壳超过库里这么多成，多半是 strm 树整个不见了，不动
+
+
+def emby_ghost_items(d, key):
+    """Emby 里还挂着、本地 strm 却已经没了的条目 → [(条目 id, 片名, 容器内路径)]。问不出来 → None。
+
+    【为什么要自己找】真机 9/28：星际探索两个、What If 四个、鹿鼎记的原盘条目，本地文件
+    早没了（脚本清掉的原盘、网盘改名后清掉的旧路径），Emby 的扫库任务回「Completed」，
+    条目却一个没删 —— 列表里同名同海报排着，点开必定播不了，日志一片 FileNotFound。
+    只认【文件和目录都不存在】的：原盘条目的 Path 是一个目录，目录还在就不算。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return None
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return None
+    out = []
+    for lb in libs or []:
+        pid = lb.get("ItemId")
+        if not pid or not is_strm_lib(lb):
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true"
+                      f"&IncludeItemTypes=Movie,Episode,Video&Fields=Path", key)
+        except Exception:
+            return None                # 有一个库问不到就整个放弃，别误删
+        for i in r.get("Items") or []:
+            cp = str(i.get("Path") or "")
+            hp = _strm_host_path(d, cp)
+            if hp and not os.path.lexists(hp):
+                out.append((str(i.get("Id")), str(i.get("Name") or "?"), cp))
+    return out
+
+
+def prune_emby_ghosts(d, key, quiet=True):
+    """把 emby_ghost_items 找到的空壳告诉 Emby（这几条路径已删除）。返回清掉几个。
+
+    【只发"已删除"通知，不调删除条目的接口】Emby 的删除条目接口会连磁盘上的文件、甚至
+    整个所在文件夹一起删 —— 那个文件夹里可能还有同一部剧别的集。通知只让 Emby 把这几条
+    从库里拿掉，本地和网盘一个字节都不碰。
+    【刹车】strm 树整个不在、或者空壳占了库里两成以上，更像是挂载 / 目录出了问题，
+    这时候删库里的条目会把观看记录一起带走，宁可不动。
+    """
+    if not key or not os.path.isdir(strm_root(d)) or not strm_count(d):
+        return 0
+    ghosts = emby_ghost_items(d, key)
+    if not ghosts:
+        return 0
+    total = len(emby_strm_paths(key) or ()) or 1
+    if len(ghosts) * 100 > GHOST_MAX_PCT * max(total, len(ghosts)) and len(ghosts) > 20:
+        if not quiet:
+            warn(f"Emby 里有 {len(ghosts)} 个条目本地找不到文件，太多了，这轮不动"
+                 f"（更像是目录出了问题）")
+        return 0
+    done = 0
+    for i in range(0, len(ghosts), EMBY_TARGETED_MAX):
+        part = ghosts[i:i + EMBY_TARGETED_MAX]
+        if emby_notify_changes(key, [(cp, "Deleted") for _i, _n, cp in part],
+                               timeout=60, quiet=True):
+            done += len(part)
+    left = emby_ghost_items(d, key)
+    n = len(ghosts) - len(left or []) if left is not None else done
+    if n and not quiet:
+        ok(f"Emby 里 {n} 个点开必定播不了的空壳条目已清掉（本地文件早就没了）")
+    if left and not quiet:
+        warn(f"还有 {len(left)} 个空壳 Emby 没收下，下一轮再试：{left[0][1]}")
+    return max(n, 0)
 
 
 def emby_notify_changes(key, changes, timeout=90, quiet=False):
@@ -21798,6 +21875,13 @@ def do_healthcheck():
                              "在网盘里给每部片子单独建一个文件夹，再点「4 生成媒体库」"))
             elif slibs and n:
                 _hc("Emby 收录", "ok", f"{n} 个 strm 都收进去了")
+            _gh = emby_ghost_items(d, key) if slibs else []
+            if _gh:
+                _hc("空壳条目", "warn",
+                    f"{len(_gh)} 个 Emby 条目本地文件已经没了  {YELLOW}{_gh[0][1]}{RST}"
+                    + (" 等" if len(_gh) > 1 else ""))
+                todo.append((f"{len(_gh)} 个条目点开必定播不了（本地 strm 早就删了，Emby 还留着）",
+                             "每小时对齐会自动清；等不及就点「4 生成媒体库」"))
         except Exception as e:
             _hc("Emby 媒体库", "warn", _short_err(e))
 
