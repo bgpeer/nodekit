@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.237"
+SCRIPT_VERSION = "1.5.238"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2902,7 +2902,7 @@ def do_heal_gate():
                             link_stale_fix(iid, key)
                         except Exception:
                             pass
-                    if ev is None:
+                    if ev is None and heal_auto_on():
                         need = strm_items_need_heal(key, [iid])
                         if need:
                             with lock:
@@ -4001,8 +4001,8 @@ def traffic_report(day=None):
         _hd = ms_state().get("heal_day") or {}
         if _hd.get("date") == day and float(_hd.get("mb") or 0) > 0:
             _used = float(_hd["mb"])
-            print(f"  补时长自测 {_used:.0f} MB / 上限 {HEAL_DAY_MB} MB"
-                  + (f"  {YELLOW}超了{RST}" if _used > HEAL_DAY_MB else ""))
+            print(f"  补时长自测 {_used:.0f} MB / 上限 {heal_day_mb()} MB"
+                  + (f"  {YELLOW}超了{RST}" if _used > heal_day_mb() else ""))
     print(f"  {DIM}账本：{TRAFFIC_DIR}/traffic-{day}.tsv（留 {TRAFFIC_KEEP_DAYS} 天）{RST}")
 
 def traffic_menu():
@@ -5317,6 +5317,9 @@ def do_heal_tick(hot_only=False):
     # 【先盯着第一次点开的那几场播放】见 rescue_progress。放在最前面：下面好几个分支
     # 会提前返回，而这一步每一轮都得跑
     rescue_progress(key)
+    if not heal_auto_on():
+        _say("自动补时长关着（3 后补参数 → 10）。手动补：media-stack heal <片名>")
+        return
     # 【两个信号，任一说"有人点过播放"就跑】
     #   · MediaWarp 日志里最近有没有播放请求 —— 最硬：那是请求本身，按下播放那一刻
     #     就有，不依赖 Emby 里哪个字段什么时候更新
@@ -5708,7 +5711,7 @@ def do_heal_trace(q, play=True):
     # 【点开的那一集不受额度管】只报一句，免得人以为这条链会被额度卡住
     _bl, _used = heal_budget("整队")
     _trace_row("✔", "今天的额度", f"点开的那一集不受限{DIM}（额度只管补积压："
-               f"已用 {_used:.0f}/{HEAL_DAY_MB} MB，还剩 {_bl:.0f}）{RST}")
+               f"已用 {_used:.0f}/{heal_day_mb()} MB，还剩 {_bl:.0f}）{RST}")
     try:
         _st = os.stat(NGX_ACCESS_LOG)
     except OSError:
@@ -8958,7 +8961,7 @@ def align_library(d, key, heal=True, migrate=True):
         # 根本没法判断是没跑还是跑了没用。这一步失败不该拦住后面的对齐，
         # 但必须让人知道它失败了。
         warn(f"按规则文件对齐媒体库的刮削器/语言失败：{_short_err(e)}")
-    if heal:
+    if heal and heal_auto_on():
         # 【这一步必须单独记账】heal 在这儿是嵌在 align_library 里跑的，而 align_library
         # 被每小时的 do_warm 调用 —— 于是账本里它顶着"直链预热"的名字，看不出真身。
         # 现场数据：账本里一条 heal 都没有，而"直链预热"跑了 22 分、窗口 973 MB，
@@ -8983,7 +8986,7 @@ def align_library(d, key, heal=True, migrate=True):
                 _h_st = ms_state().get("heal_day") or {}
                 traffic_mark("补时长heal", _h_t0,
                              f"（当天自测累计 {float(_h_st.get('mb') or 0):.0f} MB / "
-                             f"上限 {HEAL_DAY_MB} MB，{int(_h_st.get('probes') or 0)} 次）")
+                             f"上限 {heal_day_mb()} MB，{int(_h_st.get('probes') or 0)} 次）")
     normalize_strm_files(d)           # heal 中途被打断的兜底
     # 剧集 strm 改名成带季集编号的。【必须排在 scan_if_grown 之前】——
     # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
@@ -12769,7 +12772,24 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 【兜底闸门，不是菜单项】日常已经由"只补点开过的"压到几十 MB，这个数是给意外情况
 # 留的保险（比如一口气看了一百部、或者哪天判据又出漏洞）。不做成可调的：多一个旋钮
 # 就多一份"设错了怎么办"。
-HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）。用满就停，明天接着
+HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）的【默认值】。用满就停，明天接着
+# 【后来做成了可调的】仓库主人：「做一个按钮开关，默认开，里面还可以设置每日流量上限默认
+# 2G，如果有的人片多可以加大上限比如 200G，如果有的人流量不够用也可以关掉，关掉还写个提示
+# 可能保存不了进度记忆」。上面那句"不做成可调的"是早先的判断，用户要的是能调 ——
+# 见 heal_day_mb / heal_auto_on，「3 后补参数 → 10」。
+HEAL_DAY_MB_LO, HEAL_DAY_MB_HI = 100, 1024 * 1024
+
+
+def heal_day_mb():
+    """补时长每天的流量上限（MB）。没设过 / 不合法 → HEAL_DAY_MB。"""
+    v = ms_state().get("heal_day_mb")
+    return v if isinstance(v, int) and HEAL_DAY_MB_LO <= v <= HEAL_DAY_MB_HI else HEAL_DAY_MB
+
+
+def heal_auto_on():
+    """自动补时长开没开。默认开。关了：开播前那道门、看片后、每小时 / 每天那轮都不补；
+    手动的 media-stack heal [片名] 照常能用。"""
+    return ms_state().get("heal_auto") is not False
 # 【这 2048 只管补积压；你点开的那一集不设额度闸】
 # 实测撞上的：半夜整队补积压那几轮探了 172 次、花掉 2365 MB，把当天额度用得一干
 # 二净。晚上点开两集新片，自动那条路读到了、挑出来了，然后「今天的额度用完了」。
@@ -13402,7 +13422,7 @@ def heal_budget(how=None):
     """
     st = ms_state().get("heal_day") or {}
     used = float(st.get("mb") or 0) if st.get("date") == time.strftime("%Y-%m-%d") else 0.0
-    return max(0.0, HEAL_DAY_MB - used), used
+    return max(0.0, heal_day_mb() - used), used
 
 
 def heal_budget_applies(how):
@@ -13650,7 +13670,7 @@ def heal_media_info(d, key, budget=None, items=None):
     # 【没探也要进流水】cron 那几轮的输出全进 /dev/null。只记"探了什么"不记"为什么
     # 没探"，翻流水的人看到的就是一片空白 —— 和"根本没触发"长得一模一样。
     if _left <= 0 and not _nolimit:
-        _cap_mb = HEAL_DAY_MB
+        _cap_mb = heal_day_mb()
         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
                   f"没探：今天的额度用完了（约 {_used:.0f}/{_cap_mb} MB），"
                   f"{len(allpend)} 个没轮上"])
@@ -13789,7 +13809,7 @@ def heal_media_info(d, key, budget=None, items=None):
     _heal_summary(done, len(pend))
     _left2, _used2 = heal_budget()
     print(f"  {DIM}这轮花了约 {_spent:.0f} MB（{_how}）；今天累计 {_used2:.0f} MB / "
-          f"上限 {HEAL_DAY_MB} MB，还剩 {_left2:.0f} MB{RST}")
+          f"上限 {heal_day_mb()} MB，还剩 {_left2:.0f} MB{RST}")
     if _over or (_left2 <= 0 and not _nolimit):
         print(f"  {YELLOW}今天的额度用完了，后面几轮不再探，明天零点自动清零。{RST}")
         if _over:
@@ -15220,12 +15240,12 @@ def do_strm(only=None):
         # 关系，没道理让用户对着它干等。
         _nodur = len(items_without_duration(key))
         try:
-            for _sub in ("warm", "heal"):
+            for _sub in ("warm",) + (("heal",) if heal_auto_on() else ()):
                 subprocess.Popen(
                     [sys.executable, os.path.realpath(__file__), _sub],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
-            if _nodur:
+            if _nodur and heal_auto_on():
                 print(f"  {DIM}后台在给 {_nodur} 个条目补时长，不用等{RST}")
         except Exception as e:
             warn(f"后台任务没起来（不影响本次生成）：{_short_err(e)}")
@@ -19103,6 +19123,9 @@ def params_menu():
         print(f"  8. 几%算播放完       当前：{CYAN}{resume_max_pct()}%{RST}")
         print(f"  9. 自动截封面        当前："
               + (f"{CYAN}开{RST}" if cover_auto_on() else f"{DIM}关{RST}"))
+        print(f"  10. 自动补时长       当前："
+              + (f"{CYAN}开 · 每天 {_mb_txt(heal_day_mb())}{RST}" if heal_auto_on()
+                 else f"{YELLOW}关{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -19135,10 +19158,60 @@ def params_menu():
             set_resume_max()
         elif c == "9":
             set_cover_auto()
+        elif c == "10":
+            heal_auto_menu()
         else:
             print("无效选择。")
             continue
         ask("\n按回车返回...")
+
+
+def _mb_txt(mb):
+    """2048 → 2 GB，500 → 500 MB。"""
+    return f"{mb / 1024:g} GB" if mb >= 1024 and mb % 1024 == 0 else f"{mb} MB"
+
+
+def heal_auto_menu():
+    """「3 后补参数 → 10」：自动补时长的开关和每天流量上限。"""
+    while True:
+        print()
+        print(f"  1. 开关              当前："
+              + (f"{CYAN}开{RST}" if heal_auto_on() else f"{YELLOW}关{RST}"))
+        print(f"  2. 每天流量上限      当前：{CYAN}{_mb_txt(heal_day_mb())}{RST}")
+        print("  0. 返回")
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            if heal_auto_on():
+                # 【关掉是会丢东西的，要说清楚】新片没时长 = Emby 把看一半的当成看完
+                print(f"  {RED}{BOLD}关掉后：新片点开时不补时长，看一半退出可能被当成看完、"
+                      f"进度记不住。{RST}")
+                tip("手动补某一部：media-stack heal <片名>")
+                if ask_yn("确定关掉自动补时长？", False):
+                    save_ms_state(heal_auto=False)
+                    ok("自动补时长：关")
+                else:
+                    print("没有改动。")
+            else:
+                save_ms_state(heal_auto=True)
+                ok("自动补时长：开")
+        elif c == "2":
+            tip(f"管的是补积压那一轮；你刚点开的那一部不受这个限。默认 {_mb_txt(HEAL_DAY_MB)}")
+            raw = ask(f"每天最多多少（MB 或 GB，比如 500 / 2G / 200G，回车不改）").strip().upper()
+            if not raw:
+                print("没有改动。")
+                continue
+            m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(G|GB|M|MB)?", raw)
+            v = (int(float(m.group(1)) * (1024 if (m.group(2) or "M").startswith("G") else 1))
+                 if m else -1)
+            if not HEAL_DAY_MB_LO <= v <= HEAL_DAY_MB_HI:
+                warn(f"要在 {HEAL_DAY_MB_LO} MB 到 {HEAL_DAY_MB_HI // 1024} GB 之间。")
+                continue
+            save_ms_state(heal_day_mb=v)
+            ok(f"补时长每天最多 {_mb_txt(v)}")
+        else:
+            print("无效选择。")
 
 
 def set_cover_auto():
@@ -21364,7 +21437,8 @@ def do_healthcheck():
                 _trk = max(0, _clk - _inb)                     # 其中只缺轨道的
                 _per = min(max(HEAL_LIMIT, len(nodur) // 8), heal_pace())
                 _rest = len(nodur) - _clk
-                _how = "点开时先补再播" if heal_gate_ready() else "点开时现场探一次"
+                _how = ("自动补时长关着" if not heal_auto_on() else
+                        "点开时先补再播" if heal_gate_ready() else "点开时现场探一次")
                 if _inb:
                     names = "、".join(x[2] for x in _inb_items[:3]) + (
                         f" 等 {_inb} 个" if _inb > 3 else "")
@@ -21372,8 +21446,10 @@ def do_healthcheck():
                         f"点开过还缺时长：{names}"
                         + (f"{DIM}　另 {_trk} 个只缺音视频轨、{_rest} 个没点开过（{_how}）{RST}"))
                     todo.append((f"{_inb} 个点开过的条目还没补上时长 —— 看一半退出会被当成看完",
-                                 f"在自动补（每批 {_per} 个），不用管；急的话 "
-                                 f"media-stack heal <片名> 马上补那一部"))
+                                 (f"在自动补（每批 {_per} 个），不用管；急的话 "
+                                  f"media-stack heal <片名> 马上补那一部") if heal_auto_on()
+                                 else ("自动补时长关着：3 后补参数 → 10 打开，"
+                                       "或者 media-stack heal <片名> 手动补那一部")))
                 else:
                     _hc("条目时长", "ok",
                         f"点开过的都有时长{DIM}　另 {_trk} 个只缺音视频轨、"
@@ -21517,7 +21593,11 @@ def do_healthcheck():
 
     # 【装了但从没跑成 和 刚装上 长得一样，但都不能打绿勾】这台机器上栽过一次：
     # 三条任务全被锁死，而体检那几行一直绿着。
-    if os.path.exists(HEAL_CRON):
+    if not heal_auto_on():
+        # 用户自己关的：不算故障，但要看得见 —— 进度记不住多半就是这个
+        _hc("补时长（看片后）", "warn",
+            f"关着（3 后补参数 → 10）{DIM}　新片看一半退出可能被当成看完{RST}")
+    elif os.path.exists(HEAL_CRON):
         # 【取最近的那一次】开播前那道门（heal-gate）补完只记 heal_last，不碰 heal_tick ——
         # 真机体检写着「28 小时前跑过一轮」，后面紧跟着同一天 17:03 开播前补的那一轮
         _hl0 = ms_state().get("heal_last") or {}
