@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.247"
+SCRIPT_VERSION = "1.5.248"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9106,6 +9106,12 @@ def align_library(d, key, heal=True, migrate=True):
     【不含 prune】它是破坏性的、而且要跨境列目录，代价高，留给每日对齐。
     【但要管 Emby 扫描】strm 数一变就通知 Emby 扫一次，数没变一个请求都不发。
     """
+    # 【每小时也放一遍修改时间】Emby 自己的定时扫库不经过脚本，AutoFilm 凌晨重写完
+    # 到它扫之间，这一步能先把"内容没变"的放回原样。见 strm_mtime_guard
+    try:
+        strm_mtime_guard(d)
+    except Exception:
+        pass
     follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
 
     # 【必须在这儿也来一遍】strm 不是只有点「4 生成媒体库」才会产生 —— AutoFilm 自己的
@@ -10826,6 +10832,65 @@ SCAN_DEDUP_SEC = 300      # 刚扫完这么久之内、本地又没变，就不�
 _scan_state = {"done_at": 0.0, "strm": -1}
 
 
+STRM_MTIME_FILE = "strm_mtimes.json"
+
+
+def strm_mtime_guard(d):
+    """内容没变、只是被重写过的 strm，把修改时间放回原来那个。返回放回了几个。
+
+    【为什么要有】真机 9/27：七米蓝 2739 个 strm 里 2545 个在北京时间 04:22 一起变成了
+    "新文件"（建于 = 改于 = 那一刻）—— 正是 AutoFilm 04:20 那一轮。随后的扫库里 Emby 看见
+    它们"改过"，挨个重读；strm 是路径形式、读不到（日志里一片 No such file），于是把
+    探测好的轨道全清了，只剩时长。续播记录没丢（条目还是那个条目），丢的是探测。
+    夸克、阿里那几天没被重写，所以一个没丢。
+
+    【怎么堵】每个 strm 记一笔（内容摘要, 修改时间）。下次扫库前再看：内容一字不差、
+    只有修改时间变了 → 放回记下的那个，Emby 就不会当它改过。内容真变了（改名、换了
+    路径、URL 改回路径）→ 不动，记下新的，让 Emby 照常重读 —— 那种就该重读。
+    只读写本地几千个几十字节的小文件，不碰网盘。
+    """
+    import hashlib
+    root = strm_root(d)
+    mf = os.path.join(d, STRM_MTIME_FILE)
+    try:
+        with open(mf, encoding="utf-8") as f:
+            old = json.load(f)
+    except Exception:
+        old = {}
+    new, fixed = {}, 0
+    for dirpath, _dn, files in os.walk(root):
+        for fn in files:
+            if not fn.endswith(".strm"):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                with open(p, "rb") as f:
+                    h = hashlib.sha1(f.read()).hexdigest()[:16]
+                st = os.stat(p)
+            except OSError:
+                continue
+            rel = os.path.relpath(p, root)
+            was = old.get(rel)
+            mt = st.st_mtime_ns
+            if was and was[0] == h and was[1] != mt:
+                try:
+                    os.utime(p, ns=(st.st_atime_ns, was[1]))
+                    mt = was[1]
+                    fixed += 1
+                except OSError:
+                    pass
+            new[rel] = [h, mt]
+    try:
+        tmp = mf + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(new, f, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, mf)
+    except OSError:
+        pass
+    return fixed
+
+
 def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
     """让 Emby 扫一次媒体库并【等它扫完】。返回是否确认扫完。
 
@@ -10844,6 +10909,11 @@ def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
     """
     if not key:
         return False
+    # 【扫库前先把"只是被重写过"的 strm 的修改时间放回去】见 strm_mtime_guard
+    try:
+        strm_mtime_guard(ms_install_dir())
+    except Exception:
+        pass
     now_n = -1
     try:
         now_n = strm_count(ms_install_dir())
@@ -16938,6 +17008,10 @@ def set_episode_fix():
         return
     # 【必须让 Emby 重扫】nfo 是扫描的时候才读的，不重扫集号还是旧的
     try:
+        try:
+            strm_mtime_guard(d)          # 见它的说明：只被重写过的别让 Emby 当成改过
+        except Exception:
+            pass
         _emby("/Library/Refresh", key, method="POST", timeout=60)
         ok("已通知 Emby 重扫，集号过一会儿就更新")
         print(f"  {DIM}扫描在后台跑，片子多的话要等几分钟。{RST}")
