@@ -38,7 +38,7 @@ MW="http://127.0.0.1:9000"
 
 if [ -z "$KEY" ]; then
   echo "✖ 读不到 Emby API Key（$DIR/mediawarp/config/config.yaml 里的 auth）"
-  echo "  先跑 media-stack 的「3 后补参数」把 Key 填上。"
+  echo "  先跑 media-stack 的「7 设置」把 Key 填上。"
   exit 1
 fi
 
@@ -401,7 +401,7 @@ cat <<'TIP'
                                             码率看「流码率」那行 —— 那是网盘
                                             那边定的档位，不是原片码率
     · 「余量」小于 1.5x                   → 边放边等，这就是卡的直接原因。
-                                            去「3 后补参数 → 3」把直链方式
+                                            去「7 设置 → 3」把直链方式
                                             从「转码流」换成「原画」试试：
                                             原画是直接拉整文件，不经过网盘的
                                             转码服务器，通常更稳

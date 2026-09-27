@@ -25,7 +25,7 @@ DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1
 # OpenList 的密码在 .secrets，取不到就退回 .env（老版本装的写在那儿）
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
-[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key，先跑「3 后补参数」"; exit 1; }
+[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key，先跑「7 设置」"; exit 1; }
 
 python3 - "$KEY" "$OLPW" "$DATA_ROOT" "$Q" <<'PY'
 import json, os, re, sys, time, urllib.parse, urllib.request, urllib.error

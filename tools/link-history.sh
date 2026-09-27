@@ -204,7 +204,7 @@ if len(hosts) == 1:
     print(f"  {D}历史上从头到尾都是同一条路：{h}（{k}）{X}")
     if stalled:
         print(f"  {B}但当下换不到直链{X}{D} —— 这不是快慢的事，是这个盘现在取不到"
-              f"地址。跑「6 链路体检」看那个存储的实测结果{X}")
+              f"地址。跑「5 链路体检」看那个存储的实测结果{X}")
     else:
         # 【别替测量下结论】"路没变"是日志能证明的；"所以是速度变了"不是 ——
         # 这一屏只看得见去了哪，看不见跑多快。指到能量的那个工具就够了。
@@ -231,7 +231,7 @@ echo "================================================================"
 echo "  现在实测一次（和点播放走同一条路）"
 echo "================================================================"
 if [ -z "$KEY" ]; then
-  echo "  读不到 Emby API Key，测不了。先跑「3 后补参数 → 1」"
+  echo "  读不到 Emby API Key，测不了。先跑「7 设置 → 1」"
   exit 0
 fi
 
@@ -313,7 +313,7 @@ if hpath and os.path.isfile(hpath):
         print(f"  {R}✖ strm 是 URL 形式{X}  {D}{body[:70]}…{X}")
         print(f"  {D}MediaWarp 的 alist_strm 只认路径形式，拿到 URL 会当成网盘路径"
               f"去查，查不到就不 302 —— 正好是「挂载能播、Emby 转圈」。{X}")
-        print(f"  {B}修：点一次「5 生成媒体库」{X}{D}，它开头会把所有 strm "
+        print(f"  {B}修：点一次「4 生成媒体库」{X}{D}，它开头会把所有 strm "
               f"统一回路径形式{X}")
     else:
         print(f"  {D}strm 路径形式 ✔  {body[:70]}{X}")
@@ -322,7 +322,7 @@ elif hpath:
     print(f"  {D}Emby 库里有条目、磁盘上没文件 —— 播放器点开当然什么都拿不到。{X}")
     # 【是整个盘没了还是就这一个】差别很大：整盘没了多半是那个盘没被扫、
     # 或者被当成孤儿目录清掉了；只少一个文件更像是网盘里那个文件被删/改名了。
-    # 两种都靠「5 生成媒体库」重建，但知道是哪种才知道要不要回头看挂载路径。
+    # 两种都靠「4 生成媒体库」重建，但知道是哪种才知道要不要回头看挂载路径。
     parts = cpath[len("/data/strm/"):].split("/")
     drive_dir = (DATA_ROOT.rstrip("/") + "/strm/" + "/".join(parts[:2])
                  if len(parts) >= 2 else "")
@@ -334,9 +334,9 @@ elif hpath:
     elif drive_dir:
         print(f"  {Y}这个盘的 strm 目录整个都不在{X}"
               f"  {D}{drive_dir}{X}")
-        print(f"  {D}整盘的 strm 都没了 —— 回「4 挂载路径」确认这个盘有没有被扫，"
-              f"再点「5 生成媒体库」{X}")
-    print(f"  {B}修：点一次「5 生成媒体库」{X}")
+        print(f"  {D}整盘的 strm 都没了 —— 回「3 挂载路径」确认这个盘有没有被扫，"
+              f"再点「4 生成媒体库」{X}")
+    print(f"  {B}修：点一次「4 生成媒体库」{X}")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -372,7 +372,7 @@ if not loc:
     elif body.lower().startswith(("http://", "https://")):
         print(f"  {D}上面已经指出原因了：strm 是 URL 形式。{X}")
     else:
-        print(f"  {D}下一步：跑「6 链路体检」看那个存储的实测结果；"
+        print(f"  {D}下一步：跑「5 链路体检」看那个存储的实测结果；"
               f"存储是好的就 docker restart mediawarp{X}")
     raise SystemExit
 

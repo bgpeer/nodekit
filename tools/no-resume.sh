@@ -34,7 +34,7 @@ DIR="${MS_DIR:-/opt/media-stack}"
 
 KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
         "$DIR/mediawarp/config/config.yaml" 2>/dev/null | head -1)"
-[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「3 后补参数」）"; exit 1; }
+[ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「7 设置」）"; exit 1; }
 
 export MS_KEY="$KEY" MS_Q="$Q" MS_N="$N" MS_DIR="$DIR"
 python3 - <<'PY'
@@ -252,7 +252,7 @@ else:
     else:
         print(f"  {R}✖ 门槛没设对{X}  {D}默认的 120 秒 / 5% 会让短片永远存不下"
               f"续播点 —— 表现是「长的记得住、短的记不住」。{X}")
-        print(f"  {B}修：跑一次「7 更新」{X}{D}（它每小时也会自己对一次）{X}")
+        print(f"  {B}修：跑一次「8 更新」{X}{D}（它每小时也会自己对一次）{X}")
 
 # ================================================================ 补时长的队列
 print()

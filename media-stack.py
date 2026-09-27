@@ -43,9 +43,9 @@ import zipfile
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-# 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
+# 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.245"
+SCRIPT_VERSION = "1.5.246"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1015,7 +1015,7 @@ def gen_autofilm_conf(cfg):
     """
     paths = list(cfg.get("scan_paths") or [])
     head = f"""# 由 media-stack.py 自动生成，「更新」会重新生成本文件，别手改。
-# 要改扫描哪些路径：emby → 4 挂载路径
+# 要改扫描哪些路径：emby → 3 挂载路径
 alist:
   - id: openlist
     # base_url 走容器内网:AutoFilm 自己调接口列目录,不必绕一圈公网。
@@ -1099,7 +1099,7 @@ def gen_mediawarp_conf(cfg):
     """MediaWarp：反代在 Emby 前面，拦截播放请求并 302 到网盘直链。
 
     【直链缓存时长在函数里现算，不要求调用方传】cfg 是好几条路各自拼出来的，每加
-    一个键就得每条路都记得填，漏一条就是 KeyError —— 而这个函数一炸，整个「7 更新」
+    一个键就得每条路都记得填，漏一条就是 KeyError —— 而这个函数一炸，整个「8 更新」
     就断在半路。
     """
     ttl = cfg.get("link_ttl") or link_ttl_of(cfg.get("install_dir")
@@ -1352,7 +1352,7 @@ def gen_nginx_site(cfg):
             "# 一律 403，而浏览器 UA 撞几次限流之后能拿到 206/200。OpenList 是透明",
             "# 代理，会把客户端的 UA 原样带去上游 —— 所以在这里换掉，上游看见的就是",
             "# 换过的。这是 Emby「有时长、媒体流 0 条、点开 load fail」的根因。",
-            "# 只对下面这几个盘生效，是在「4 挂载路径 → 选盘 → 2 直链方式」里开的。",
+            "# 只对下面这几个盘生效，是在「3 挂载路径 → 选盘 → 2 直链方式」里开的。",
             "map $uri $ms_hit {",
             "    default 0;",
         ]
@@ -1474,7 +1474,7 @@ server {{
     ssl_certificate_key {cfg['key']};
 
     # 单独一份访问日志:和节点的日志混在一起就分不出是谁在敲媒体服务了。
-    # 「6 链路体检」靠它统计有多少陌生外网 IP 访问过 —— 这几个服务是公网可达的,
+    # 「5 链路体检」靠它统计有多少陌生外网 IP 访问过 —— 这几个服务是公网可达的,
     # 拿到域名就能敲门,总得有个地方能看见。logrotate 的默认规则匹配
     # /var/log/nginx/*.log,不用额外配置轮转。
     access_log {NGX_ACCESS_LOG};
@@ -1630,7 +1630,7 @@ case "${1:-info}" in
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
-  covers         没刮到封面的片，现在就截一帧当封面（每小时自动截默认关，见 3 后补参数 → 9）
+  covers         没刮到封面的片，现在就截一帧当封面（每小时自动截默认关，见 7 设置 → 9）
   covers --retry 截失败过的也重新试一遍
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
@@ -1643,7 +1643,7 @@ case "${1:-info}" in
                   (默认盯 20 分钟；要跨过整点那一轮就写 90)
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
-  check           链路体检(等同菜单里的「6 链路体检」)
+  check           链路体检(等同菜单里的「5 链路体检」)
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
   selfupdate      只把脚本换成仓库里的最新版(不动镜像、不重启容器)
@@ -1781,7 +1781,7 @@ case "${1:-info}" in
     shift || true
     exec python3 "$S" heal "$@" ;;
   check|doctor|healthcheck)
-    # 【一路都在让人"跑 6 链路体检"，而命令行敲不到】Python 那边
+    # 【一路都在让人"跑 5 链路体检"，而命令行敲不到】Python 那边
     # `elif arg in ("check", "doctor", "healthcheck")` 早就有，壳里一直没有。
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -3541,7 +3541,7 @@ def do_selfupdate():
             # 【cur 必须在这儿读】这一行以前直接 f.write(cur)，而 cur 从没定义过 ——
             # 于是【只要仓库里有新版】就 NameError，被下面的 except 吞成一条 error，
             # 本机这份一个字节都没换。自动更新从那以后一次都没成过，修好的东西只有
-            # 手动「7 更新」才到得了机器上。已是最新的那条分支走不到这儿，所以平时
+            # 手动「8 更新」才到得了机器上。已是最新的那条分支走不到这儿，所以平时
             # 看起来一切正常。
             with open(me, encoding="utf-8") as f:
                 cur = f.read()
@@ -3586,7 +3586,7 @@ def install_selfupdate_cron(install_dir):
 def install_sync_cron(install_dir):
     """装每天一次的自动对齐任务。
 
-    清失效 strm、调续播门槛、补时长这三件事以前只在手点「5 生成媒体库」时才跑，而
+    清失效 strm、调续播门槛、补时长这三件事以前只在手点「4 生成媒体库」时才跑，而
     AutoFilm 每天那次定时【只生成、不做后面三步】，于是有两个洞：
 
       · 网盘里删掉/挪走的片子，Emby 里一直留着点不开的条目
@@ -3618,7 +3618,7 @@ def install_sync_cron(install_dir):
 def do_precache():
     """AutoFilm 开扫【之前】几分钟，把要扫的那几个盘的目录缓存刷掉。安静跑。
 
-    【补的是自动那条路上的一个洞】手点「5 生成媒体库」第一步就清缓存，所以点了就能
+    【补的是自动那条路上的一个洞】手点「4 生成媒体库」第一步就清缓存，所以点了就能
     把新片扫进来；而每天凌晨那条自动的路【从来不清】—— AutoFilm 到点就去列目录，
     OpenList 手里要是还压着一份旧的，它当然一个新文件都看不见，任务照样报"完成"。
     用户看到的就是"我记得设过每天自动扫描，怎么新片没进来"，而且查不出所以然：
@@ -3935,7 +3935,7 @@ def _traffic_prune():
         pass
 
 def traffic_install_cron():
-    """装账本的 cron。跟别的定时任务一样，「7 更新」会按当前版本重装。"""
+    """装账本的 cron。跟别的定时任务一样，「8 更新」会按当前版本重装。"""
     try:
         txt = ("# media-stack 流量账本：每 %d 分钟记一笔网卡和各容器的增量。\n"
                "# 临时采样只看得见当下在跑的东西，而吃流量的几件事都是间歇性的，\n"
@@ -4034,7 +4034,7 @@ def traffic_report(day=None):
     print("=" * 60)
     if not rows:
         if not os.path.exists(TRAFFIC_CRON):
-            warn("账本还没开始记 —— 定时任务没装，跑一次「7 更新」会补上。")
+            warn("账本还没开始记 —— 定时任务没装，跑一次「8 更新」会补上。")
         else:
             info(f"这一天没有记录（每 {TRAFFIC_EVERY_MIN} 分钟才记一笔）")
         return
@@ -4147,9 +4147,9 @@ def do_warm():
     warm_links(d, key)
     try:
         cover_prefer_scrape(key)      # 先让刮削的顶掉截帧的（只问刮削器，不拉片子）
-        # 【自动截封面默认关】仓库主人：「把那个自动截图的取消了吧，要么在后补参数里面加个
-        # 开关，默认关，不然有的截不到一直在那里空转消耗流量」。要截就去「4 挂载路径 →
-        # 选盘 → 截封面」手点；想要每小时自动截，「3 后补参数 → 9」打开。
+        # 【自动截封面默认关】仓库主人：「把那个自动截图的取消了吧，要么在设置里面加个
+        # 开关，默认关，不然有的截不到一直在那里空转消耗流量」。要截就去「3 挂载路径 →
+        # 选盘 → 截封面」手点；想要每小时自动截，「7 设置 → 9」打开。
         if cover_auto_on():
             fill_covers(d, key)       # 再给还没封面的截一帧
     except Exception:
@@ -4377,7 +4377,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
 
     【有人在看片就不截】截一张要去网盘拉几 MB，跟看片的人抢同一个账号的速度。
 
-    mount / manual：「4 挂载路径 → 选盘 → 截封面」—— 仓库主人：「每个盘做一个按钮，
+    mount / manual：「3 挂载路径 → 选盘 → 截封面」—— 仓库主人：「每个盘做一个按钮，
     这个只有你点一次这个盘没有刮削的没图的全部刷新一次，不受自动的限制」。
     manual=True 时不管每小时几张、一天几张 / 几 MB、失败隔多久再试、有没有人在看；
     只留【每一张】的保险（不认跳转的源不拉、一张超过 COVER_ONE_MB 当场掐）—— 那不是
@@ -4574,7 +4574,7 @@ def do_covers(retry=False):
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if not key:
-        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
         return
     if retry:
         save_ms_state(cover_fail={})
@@ -4711,7 +4711,7 @@ def do_play_speed(q, wait=5, ua="player"):
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if not key:
-        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
         return
     hits = find_strm_items(key, q)
     if not hits:
@@ -4989,7 +4989,7 @@ def do_p115_check(q):
     in115 = any(tp == m or tp.startswith(m.rstrip("/") + "/") for m in mts)
     _hc("是不是 115", "ok" if in115 else "bad",
         "是" if in115 else f"不在要换链的 115 盘里（{'、'.join(mts) or '一个都没有'}）")
-    _hc("换链服务", "ok" if hls_ready() else "bad", "在跑" if hls_ready() else "没在跑 —— 跑「7 更新」")
+    _hc("换链服务", "ok" if hls_ready() else "bad", "在跑" if hls_ready() else "没在跑 —— 跑「8 更新」")
     # 手机那边最近几次要视频，nginx 回的是什么：302 = 服务接住了；别的 = 没走到服务
     try:
         with open(NGX_ACCESS_LOG, "rb") as f:
@@ -5068,7 +5068,7 @@ def do_play_watch(q, minutes=15):
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if not key:
-        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
         return
     hits = find_strm_items(key, q)
     if not hits:
@@ -5459,13 +5459,13 @@ def do_heal_tick(hot_only=False):
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth")
     if not key:
-        _say("没有 Emby API Key（「3 后补参数」里填）。")
+        _say("没有 Emby API Key（「7 设置」里填）。")
         return
     # 【先盯着第一次点开的那几场播放】见 rescue_progress。放在最前面：下面好几个分支
     # 会提前返回，而这一步每一轮都得跑
     rescue_progress(key)
     if not heal_auto_on():
-        _say("自动补时长关着（3 后补参数 → 10）。手动补：media-stack heal <片名>")
+        _say("自动补时长关着（7 设置 → 10）。手动补：media-stack heal <片名>")
         return
     # 【两个信号，任一说"有人点过播放"就跑】
     #   · MediaWarp 日志里最近有没有播放请求 —— 最硬：那是请求本身，按下播放那一刻
@@ -5815,7 +5815,7 @@ def do_heal_trace(q, play=True):
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if not key:
-        warn("没有 Emby API Key（「3 后补参数」里填），问不了 Emby。")
+        warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
         return
     if not (q or "").strip():
         warn("要告诉我是哪一集，比如：media-stack heal-trace 完美世界 287")
@@ -5832,7 +5832,7 @@ def do_heal_trace(q, play=True):
         ctxt = None
     if ctxt is None:
         _trace_row("✖", "看片后补时长", "定时任务没装 —— 点开之后不会有任何东西来补。"
-                   "跑一次「7 更新」装上")
+                   "跑一次「8 更新」装上")
     else:
         m = re.search(r"^\*/(\d+) \* \* \* \* ", ctxt, re.M)
         n = int(m.group(1)) if m else 0
@@ -5875,7 +5875,7 @@ def do_heal_trace(q, play=True):
                        "按下播放几秒内就开始补")
         elif _on is False:
             _trace_row("⚠", "点了立刻补", "没装上 / 闹钟没开 —— 退回每分钟看一次。"
-                       "跑一次「7 更新」会装上")
+                       "跑一次「8 更新」会装上")
         _g = heal_gate_active()
         _gn = False
         try:
@@ -5889,7 +5889,7 @@ def do_heal_trace(q, play=True):
         elif _g is not None:
             _trace_row("⚠", "先补再播", ("nginx 不带 auth_request 模块，用不了 —— "
                        "照旧点开之后再补" if _g and not heal_gate_nginx_ok()
-                       else "没装上 —— 照旧点开之后再补。跑一次「7 更新」会装上"))
+                       else "没装上 —— 照旧点开之后再补。跑一次「8 更新」会装上"))
     else:
         _trace_row("·", "点播放的信号", "没有 nginx 那份日志，从 MediaWarp 容器日志读")
 
@@ -5950,7 +5950,7 @@ def do_heal_trace(q, play=True):
     _mon = item_lib_monitor(key, _ip) if _ip else None
     if _mon:
         _trace_row("✖", "所在库实时监控", "开着 —— 补上的轨道 1 分多钟后会被它清掉，"
-                   "补一次掉一次。跑一次「7 更新」会关掉")
+                   "补一次掉一次。跑一次「8 更新」会关掉")
     elif _mon is False:
         _trace_row("✔", "所在库实时监控", "关着")
     if st0["streams"] and not st0["ticks"]:
@@ -6008,7 +6008,7 @@ def do_heal_trace(q, play=True):
                     # 照着去夸克那一屏找，根本没有这一项。
                     _mp, _px = mount_of_path(d, _tp)
                     if _px:
-                        print(f"  {DIM}  → 只有浏览器那张脸读得出：这个盘按 UA 挡人。「4 挂载路径 →"
+                        print(f"  {DIM}  → 只有浏览器那张脸读得出：这个盘按 UA 挡人。「3 挂载路径 →"
                               f" {_mp} → 直链方式 → 探测 UA」改成「伪装成浏览器」{RST}")
                     else:
                         print(f"  {DIM}  → 只有浏览器那张脸读得出（这一次）。{_mp or '这个盘'} 是 302"
@@ -6263,7 +6263,7 @@ def do_heal_watch(q):
         return
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if not key:
-        warn("没有 Emby API Key（「3 后补参数」里填）。")
+        warn("没有 Emby API Key（「7 设置」里填）。")
         return
     if not (q or "").strip():
         warn("要告诉我是哪一部，比如：media-stack heal-watch 窃听风云2")
@@ -6305,7 +6305,7 @@ def do_heal_watch(q):
     _mon = item_lib_monitor(key, _p)
     if _mon:
         warn("它所在的媒体库开着实时监控 —— 补上的轨道 1 分多钟后多半会被它清掉。"
-             "跑一次「7 更新」会关掉（关掉不影响新片进库）。")
+             "跑一次「8 更新」会关掉（关掉不影响新片进库）。")
     hr()
     s0 = _watch_snapshot(key, uid, iid, host)
     if s0 and s0["streams"] and s0["ticks"]:
@@ -6374,7 +6374,7 @@ def do_heal_watch(q):
                     # 轨道被清 —— 实时监控看见 strm 被写过，自己刷新了一遍
                     print(f"  {DIM}它所在的库开着实时监控：补时长写回 strm 之后，监控"
                           f"隔一会儿自己刷新这个条目，那一刻 Emby 探不到，就把轨道清了。"
-                          f"跑一次「7 更新」关掉它，再盯一次。{RST}")
+                          f"跑一次「8 更新」关掉它，再盯一次。{RST}")
                 print(f"  {DIM}把这一屏发给仓库主人（尤其是「探测那一刻 Emby 回的」那一行）。{RST}")
                 return
             prev = cur
@@ -6392,7 +6392,7 @@ def follow_new_storages(d):
     """扫描路径设成「自动」时，把新挂的网盘补进 AutoFilm 的配置。
 
     auto 模式只在【重新生成配置那一刻】才去读 OpenList 已挂载的存储，而那一刻只发生
-    在装机、改设置、点「5 生成媒体库」的时候。用户在 OpenList 里挂上一个新网盘之后，
+    在装机、改设置、点「4 生成媒体库」的时候。用户在 OpenList 里挂上一个新网盘之后，
     AutoFilm 的 source_dir 里根本没有它，那个盘里的片子永远不会变成 strm —— 而且不会
     有任何报错。
 
@@ -6402,7 +6402,7 @@ def follow_new_storages(d):
     # 【看的是「剩余网盘」开没开，不是老的整体 auto】仓库主人：「剩余网盘是不是我只需要
     # 在挂载里面挂载好了，VPS 这边不需要填入路径，只要把剩余网盘开着他就能扫出来」——
     # 就该是这样。可以前这里只认老的 scan_spec == auto：一旦有哪个盘单独设过路径
-    # （夸克设了 /quark/夸克挂载），剩余开着也不跟新挂的盘，要等下次「7 更新」或改设置
+    # （夸克设了 /quark/夸克挂载），剩余开着也不跟新挂的盘，要等下次「8 更新」或改设置
     # 重新生成配置才带上。
     if not auto_rest_on():
         return []
@@ -6815,7 +6815,7 @@ def lib_rules(d=None):
     """当前生效的关键词规则，以及它是从哪来的。返回 (规则列表, 来源说明)。
 
     【来源是一个显式的单选，不是隐式优先级】作者的 / 自定义链接，选哪个用哪个；
-    「5 生成媒体库」「每小时对齐」「体检」「7 更新」全走这个函数，所以自动跟着走。
+    「4 生成媒体库」「每小时对齐」「体检」「8 更新」全走这个函数，所以自动跟着走。
 
     本机覆盖文件还认（老版本的 a/d 菜单写过它）。它仍然盖过链接，但会在菜单和体检里
     【明写出来】并给出删除命令，不再是一层看不见的东西。
@@ -7207,7 +7207,7 @@ def drop_empty_auto_libraries(d, key):
         warn(f"这些库底下一个 strm 都没有，可网盘里还有东西："
              f"{'、'.join(lagging)}")
         print(f"  {DIM}不是该删的库，是 strm 没生成出来 —— 多半 AutoFilm 那一轮"
-              f"扫失败了。跑「6 链路体检」看网盘通不通。{RST}")
+              f"扫失败了。跑「5 链路体检」看网盘通不通。{RST}")
     if gone:
         ok(f"删掉 {len(gone)} 个空媒体库：{'、'.join(gone)}")
         print(f"  {DIM}本地一个 strm 都没有，网盘也明确回答那儿没东西了"
@@ -8263,7 +8263,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         if not (interactive and has_tty()):
             print(f"  {DIM}剧集编号：有 {len(und)} 个可以补，但这是后台在跑、没法问你。"
                   f"在规则文件里给这些库写一行 episode_number: true 就不用管了，"
-                  f"或者到「3 后补参数 → 7」开一下{RST}")
+                  f"或者到「7 设置 → 7」开一下{RST}")
         else:
             print()
             info(f"剧集库里有 {len(und)} 个条目，Emby 认错了集号或者没认出来。")
@@ -8484,15 +8484,15 @@ def apply_libraries(d, key, plan):
 
 
 def auto_libraries_apply(d, key, quiet=False):
-    """按规则把该建的媒体库建上。不问，不交互 —— 给「5 生成媒体库」用。
+    """按规则把该建的媒体库建上。不问，不交互 —— 给「4 生成媒体库」用。
 
-    规则原来只在「3 后补参数 → 4」按 y 的时候才跑，于是用户改完网盘文件夹名、点「5」，
+    规则原来只在「7 设置 → 4」按 y 的时候才跑，于是用户改完网盘文件夹名、点「4」，
     期待的"扫完顺手把库建好"什么都没发生。
 
     不问是对的：只建【不存在的】库，不动用户已有的任何东西，重叠的直接跳过并说明。
     """
     # 【这里也要拉一次仓库版】用户在 GitHub 上改完规则，接着点的多半是
-    # 「5 生成媒体库」而不是「7 更新」—— 他刚整理完网盘，想的是"扫一遍把库建好"。
+    # 「4 生成媒体库」而不是「8 更新」—— 他刚整理完网盘，想的是"扫一遍把库建好"。
     # 只在更新里拉的话，他会看到规则没生效，以为改的地方不对。
     # fetch 失败不影响后面：用本机现有的那份跑。
     try:
@@ -8551,7 +8551,7 @@ def auto_libraries_apply(d, key, quiet=False):
         emby_scan_wait(key, timeout=900, label="扫描新建的媒体库", force=True)
     if not quiet:
         print(f"  {DIM}规则文件：{lib_rules_path(d)}"
-              f"（改仓库里那份，「7 更新」会拉下来）{RST}")
+              f"（改仓库里那份，「8 更新」会拉下来）{RST}")
 
 
 def auto_libraries():
@@ -8620,7 +8620,7 @@ def auto_libraries():
             # 缓存还在就不联网 —— 断网也切得回去，这正是各存一份的用处
             if not os.path.exists(lib_rules_path(d)):
                 fetch_lib_rules(d, "author")
-            print(f"  {DIM}「5 生成媒体库」和每小时的对齐任务从现在起都用它。{RST}")
+            print(f"  {DIM}「4 生成媒体库」和每小时的对齐任务从现在起都用它。{RST}")
         elif c == "2":
             if not cust:
                 warn("还没填自定义链接（先按 3 填）")
@@ -8635,7 +8635,7 @@ def auto_libraries():
                     warn("这条链接拉不下来、或者内容里解析不出规则")
                     print(f"  {DIM}先按 4 重试；一直不行就按 3 换一条。"
                           f"在切回作者的之前，用的是内置默认那份。{RST}")
-            print(f"  {DIM}「5 生成媒体库」和每小时的对齐任务从现在起都用它。{RST}")
+            print(f"  {DIM}「4 生成媒体库」和每小时的对齐任务从现在起都用它。{RST}")
         elif c == "3":
             if cust:
                 print()
@@ -8695,7 +8695,7 @@ def auto_libraries():
                 n_mt = set_metatube_libraries(key, ids)
                 if n_mt:
                     ok(f"MetaTube 生效范围已调整（{n_mt} 个库有变化）")
-            print(f"  {DIM}回菜单点「5 生成媒体库」让 Emby 扫一次，"
+            print(f"  {DIM}回菜单点「4 生成媒体库」让 Emby 扫一次，"
                   f"新库里的片子才会出来。{RST}")
             return
         else:
@@ -8945,7 +8945,7 @@ def migrate_strm_layout(d, key, wait=True):
             ok(f"{back} 个条目的续播点已贴回")
         elif saved:
             warn(f"{len(saved)} 个续播点没能贴回 —— 条目可能还没扫出来，"
-                 f"等下一轮对齐或再点一次「5 生成媒体库」")
+                 f"等下一轮对齐或再点一次「4 生成媒体库」")
     return n
 
 
@@ -9089,8 +9089,8 @@ def align_library(d, key, heal=True, migrate=True):
     """
     follow_new_storages(d)            # 新挂的网盘要先进扫描范围，否则后面全是空的
 
-    # 【必须在这儿也来一遍】strm 不是只有点「5 生成媒体库」才会产生 —— AutoFilm 自己的
-    # 定时任务也会按新配置生成。实测翻过车：「7 更新」重写了 autofilm 配置，它的 cron
+    # 【必须在这儿也来一遍】strm 不是只有点「4 生成媒体库」才会产生 —— AutoFilm 自己的
+    # 定时任务也会按新配置生成。实测翻过车：「8 更新」重写了 autofilm 配置，它的 cron
     # 到点按新布局生成了 cloud/quark/…，而旧的那批没人搬，两份并存。
     # 【调用方刚挪过就别再挪一遍】do_strm 那条路上 migrate 就在几行之前，再来一次
     # 是白挪 2600 个文件、白让 Emby 重扫一轮。
@@ -9102,7 +9102,7 @@ def align_library(d, key, heal=True, migrate=True):
     # 关掉，已经被并成「版本」的那几个条目还是合的，得重扫才拆开。tune 自己说"下一次
     # 扫描会拆开"，可那次扫描没人发起。
     n_tuned = tune_strm_libraries(key)   # 库级：续播门槛、多版本合并
-    # heal=False 是「5 生成媒体库」用的：那条路把补时长扔后台单独跑，
+    # heal=False 是「4 生成媒体库」用的：那条路把补时长扔后台单独跑，
     # 不能在这儿再跑一遍（会撞锁、也会让用户白等一次）
     try:                              # 库级：刮削器/语言按规则文件对齐
         _r = lib_rules(d)[0]
@@ -9148,7 +9148,7 @@ def align_library(d, key, heal=True, migrate=True):
     # 路是用户手点「4」在看着的，可以问；cron 那条路不问，用记住的答案。
     try:
         # 【别拿 heal 当"有没有人在看"】它俩没关系，而且正好反了：
-        # 「5 生成媒体库」是用户手点、看着的，传的却是 heal=False；
+        # 「4 生成媒体库」是用户手点、看着的，传的却是 heal=False；
         # cron 那轮没人看，传的是 heal=True。真正的判据是 has_tty()。
         _nr, _nd = fix_episode_strm_names(d, lib_rules(d)[0], key,
                                           interactive=has_tty())
@@ -9197,7 +9197,7 @@ def scan_if_grown(d, key, force=False):
 def do_sync():
     """每天自动跑的对齐：把 Emby 的状态和网盘、和当前媒体库配置拉齐。
 
-    就是「5 生成媒体库」末尾那几步，减掉触发 AutoFilm 那一段（那个有它自己的定时任务）。
+    就是「4 生成媒体库」末尾那几步，减掉触发 AutoFilm 那一段（那个有它自己的定时任务）。
     全程不问任何问题 —— 没人在终端前面。
 
     顺序是有讲究的：
@@ -9224,7 +9224,7 @@ def do_sync():
         # 一遍 —— 不然用户在菜单里清干净了，第二天早上那批条目又回到库里。
         rec["skipped"] = apply_skip_dirs(d, quiet=True)
         # 原盘目录压成单个 strm。放这儿是因为上一轮"问不到片段大小"的那些要有机会重试，
-        # 而且新扫进来的原盘不必等到用户下次手动点「5」才可播。
+        # 而且新扫进来的原盘不必等到用户下次手动点「4」才可播。
         rec["bluray"], rec["bluray_stuck"] = collapse_bluray_folders(d, quiet=True)
         rec["pruned"] = prune_dead_strm(d)   # 每日对齐不设预算：凌晨没人等
         if not key:
@@ -9334,7 +9334,7 @@ def cron_human(cron):
     """
     p = cron.split()
     if cron.strip() == NEVER_CRON:
-        return "不自动扫描（要手动点「5 生成媒体库」）"
+        return "不自动扫描（要手动点「4 生成媒体库」）"
     m = re.search(r"\*/(\d+)", cron)
     if m and len(p) == 6:
         return f"每 {m.group(1)} 小时一次"          # 这一种不受时区影响
@@ -9597,7 +9597,7 @@ def show_info():
                   + (f"{DIM}　接口 {mode}{RST}" if mode else ""))
         if any(s != "work" for _m, _d, s, _r, _x in stores):
             print(f"      {YELLOW}有存储上次初始化时报过错{RST}"
-                  f"{DIM} —— 跑「6 链路体检」看现在通不通、怎么修{RST}")
+                  f"{DIM} —— 跑「5 链路体检」看现在通不通、怎么修{RST}")
 
     # strm 数量是判断「Emby 里为什么是空的」最直接的指标，放在容器状态前面
     n = strm_count(d)
@@ -9610,7 +9610,7 @@ def show_info():
             print(f"      自动生成 {cron_human(cron)}")
     else:
         print(f"      {YELLOW}{BOLD}0 个 strm —— Emby 里现在是空的{RST}")
-        tip(f"先在 OpenList 里挂网盘（夸克根文件夹ID 填 0），再点「5 生成媒体库」")
+        tip(f"先在 OpenList 里挂网盘（夸克根文件夹ID 填 0），再点「4 生成媒体库」")
 
     if metatube_on(d):
         print(f"\n  {BOLD}▸ MetaTube 番号刮削{RST}")
@@ -9619,7 +9619,7 @@ def show_info():
 
     # 容器只报「几个在跑」。以前这里直接贴 docker compose ps 的原始输出,在手机上
     # 每行都折成三四行,IMAGE/COMMAND/PORTS 糊成一片,而真正要看的只有"跑没跑"。
-    # 详细状态在「6 链路体检」里。
+    # 详细状态在「5 链路体检」里。
     print(f"\n  {BOLD}▸ 容器{RST}")
     want = ["emby", "openlist", "autofilm", "mediawarp"]
     if os.path.isdir(os.path.join(d, "homepage")):
@@ -9642,7 +9642,7 @@ def show_info():
             if re.search(r"^\s*auth:\s*$", f.read(), re.M):
                 print()
                 warn("Emby API Key 还是空的 —— 302 直链不会生效！")
-                tip("Emby → 设置 → 高级 → API 密钥 → 新建，填到「3 后补参数 → 1」")
+                tip("Emby → 设置 → 高级 → API 密钥 → 新建，填到「7 设置 → 1」")
     except OSError:
         pass
     print()
@@ -10087,7 +10087,7 @@ def do_update(from_menu=False):
     # v4 已经把它去掉了，那边靠的是上面重新生成的 mediawarp 配置里那个 addr。
     ensure_openlist_site_url(d, cfg, quiet=True)
     if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
-        warn("Emby API Key 是空的，302 直链不会生效 —— 到「3 后补参数 → 1」填上")
+        warn("Emby API Key 是空的，302 直链不会生效 —— 到「7 设置 → 1」填上")
 
     # CLI 也要跟着换:它是脚本生成的,里面的命令逻辑会随版本变
     # (比如 strm 从"只重启容器"改成"真的跑一次任务")。不重装一遍就拿不到。
@@ -10174,7 +10174,7 @@ def do_update(from_menu=False):
     # 慢的时候实测 66 秒 —— 而更新本身早就做完了，人却被钉在屏幕前等一个和更新毫无关系的
     # 结果。而且这个位置天生容易误报：上面刚把容器全重启，OpenList 起来还要几秒初始化
     # 存储，在那之前列目录会报 object not found，看着像网盘挂了，其实只是问得太早。
-    # 网盘通不通归「6 链路体检」管，那边测得更细，而且是用户主动去问的时候才跑。
+    # 网盘通不通归「5 链路体检」管，那边测得更细，而且是用户主动去问的时候才跑。
     print()
     ok(f"更新完成（脚本 v{SCRIPT_VERSION}）")
     purge_node_rule(d)
@@ -10185,7 +10185,7 @@ def do_update(from_menu=False):
         tune_strm_libraries(_k2)
         # 【刮削器/语言也要在这儿对一次】库选项的对齐一直分在两处：续播门槛和多版本合并
         # （tune_strm_libraries）就在上面这行，更新时会跑；刮削器和语言
-        # （sync_library_options）只挂在「5 生成媒体库」和定时任务上，更新这条路一次都不
+        # （sync_library_options）只挂在「4 生成媒体库」和定时任务上，更新这条路一次都不
         # 经过 —— 而用户的预期是"更新 = 新逻辑在我机器上生效"。同样是库选项，没有道理分开。
         try:
             _r2 = lib_rules(d)[0]
@@ -10320,7 +10320,7 @@ def main():
             break
         warn("填一条路径、多条逗号隔开、或者 y（自动）。")
     # 这一步 OpenList 还没挂任何网盘,auto 现在展开必然是空的 —— 那不是错,
-    # 装完加了存储再点「5 生成媒体库」就会带上。这里只是先把意图记下来。
+    # 装完加了存储再点「4 生成媒体库」就会带上。这里只是先把意图记下来。
     cfg["scan_paths"] = resolve_scan_paths(cfg["install_dir"], cfg["scan_spec"])
     print(f"  {DIM}下面这个时刻按【北京时间】算（调度器已钉在 {AUTOFILM_TZ}），"
           f"和服务器在哪无关。{RST}")
@@ -10516,7 +10516,7 @@ DOMAIN={cfg['domain']}
     print(f"     保存 → 用网盘手机 App 扫码 → 扫完把该存储{BOLD}先禁用再启用{RST}，token 才生效")
     print("  2) 打开 Emby 完成首次安装向导 → 设置 → 高级 → API 密钥 → 新建并复制")
     print("  3) 重跑本脚本，在「Emby API Key」那步粘贴进去")
-    print(f"  4) 重跑本脚本 → {BOLD}5 生成媒体库{RST}（也可以敲 media-stack strm）")
+    print(f"  4) 重跑本脚本 → {BOLD}4 生成媒体库{RST}（也可以敲 media-stack strm）")
     print(f"  5) Emby 添加媒体库，路径指向 {BOLD}{STRM_PATH}{RST}")
     print(f"  6) {YELLOW}重要{RST}：该媒体库高级设置里关掉「章节图像提取」和「实时监控」，")
     print("     否则 Emby 会为了截图去拉整部影片，把网盘刷到限流。")
@@ -10533,7 +10533,7 @@ def mediawarp_conf_path(install_dir=None):
 def save_emby_api_key(install_dir, key):
     """把 API Key 另存一份到 .secrets。
 
-    【为什么要存两份】这个 Key 以前只活在 mediawarp 的配置文件里，而那份配置是「7 更新」
+    【为什么要存两份】这个 Key 以前只活在 mediawarp 的配置文件里，而那份配置是「8 更新」
     每次整份重写的，重写用的值又是从它自己上一版里读回来的 —— 一条自己咬自己的链：那个
     文件一旦损坏或被写空，Key 就没了，而更新还会理直气壮地拿一个空值再生成一遍。
     """
@@ -10634,7 +10634,7 @@ def set_emby_api_key():
     info("重启 MediaWarp...")
     if subprocess.run(["docker", "restart", "mediawarp"],
                       capture_output=True).returncode != 0:
-        err("重启失败，MediaWarp 可能没在跑。用「7 更新」或 media-stack start 拉起来。")
+        err("重启失败，MediaWarp 可能没在跑。用「8 更新」或 media-stack start 拉起来。")
         return
     time.sleep(3)
     ok("MediaWarp 已重启")
@@ -10813,7 +10813,7 @@ def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
     必须等：迁移时要靠"先扫一次看到文件没了"来让 Emby 真正删掉旧条目。没等完就去重新生成
     的话，Emby 一次扫描里同时看到删和加，会当成没变过，旧条目的错误媒体信息就留下来了。
 
-    【同一趟里不重复扫】「5 生成媒体库」这条路上原来最多扫三遍：挪完 strm 扫一次、生成
+    【同一趟里不重复扫】「4 生成媒体库」这条路上原来最多扫三遍：挪完 strm 扫一次、生成
     流程自己扫一次、按规则建了新库再扫一次。每一遍都是让 Emby 把两千多个文件重新过一遍，
     而中间本地【一个文件都没变】—— 第二遍第三遍纯属让人干等。所以：距上一次扫完不到
     SCAN_DEDUP_SEC 秒、且这中间本地 strm 数没变，就直接返回。
@@ -11605,7 +11605,7 @@ STRM_LIB_OPTIONS = {
     # 这就是"剧集补得住、电影补不住"：脚本自己建的库一直是关的（见 _emby_add_library），
     # 在 Emby 网页里建的库是 Emby 默认的开。这里以前只在建库时关，没对已有的库对齐。
     # 关掉不丢东西：strm 是脚本和 AutoFilm 批量生成的，数一变脚本自己会叫 Emby 扫
-    # （见 scan_if_grown，每小时一次，「5 生成媒体库」当场扫）。
+    # （见 scan_if_grown，每小时一次，「4 生成媒体库」当场扫）。
     "EnableRealtimeMonitor": False,
 }
 # 体检那边要单独引用，避免两处各写一份魔法数字
@@ -11618,7 +11618,7 @@ RESUME_MIN_PCT     = STRM_LIB_OPTIONS["MinResumePct"]
 # 【只在这个库真有这个键时才写】这个接口静默忽略不认识的字段（见 STRM_LIB_TOGGLES），
 # 老版本 Emby 没有这个库级选项，硬写进去回读对不上，每次更新都会报「没改动成功」。
 RESUME_MAX_PCT = 100
-# 仓库主人随后要了个旋钮：「在后补参数里面设置一个按钮调节，_% 算播放完」。
+# 仓库主人随后要了个旋钮：「在设置里面设置一个按钮调节，_% 算播放完」。
 # 默认值还是上面那个，改过就存在状态里（resume_max_pct）。下限 50：Emby 网页里
 # 这一项也是 50 起，再低就是"看一半就算看完"，续播点基本存不住。
 RESUME_MAX_LO = 50
@@ -11950,7 +11950,7 @@ def emby_notify_changes(key, changes, timeout=90, quiet=False):
     changes 是 [(容器内路径, "Created" | "Deleted")]。
 
     【为什么值得单独走这条路】全库扫描是让 Emby 把两千多个 strm 挨个过一遍，几分钟起步。
-    而点一次「5 生成媒体库」真正变动的常常只有十几条 —— 为了这十几条让人等几分钟，还每次
+    而点一次「4 生成媒体库」真正变动的常常只有十几条 —— 为了这十几条让人等几分钟，还每次
     都等。Emby 自己有这个接口（它的媒体库监视器用的就是它），给一份变动清单，它只碰这几条。
 
     【返回 True 必须是"确认收进去了"】不确认就报成功是这里最坏的做法：新片没进库，而屏上
@@ -12209,7 +12209,7 @@ def collapse_bluray_folders(d, quiet=False, only=None):
             ok(f"{gone} 套蓝光原盘没有进库{DIM}（BDMV 目录树，进了库也是 0B / 0bps、"
                f"点开 load fail）{RST}")
             print(f"  {DIM}网盘上的原盘一个字节都没动。想要的话："
-                  f"「4 挂载路径 → 选盘 → 5 不扫的目录 → 3 原盘怎么办」"
+                  f"「3 挂载路径 → 选盘 → 5 不扫的目录 → 3 原盘怎么办」"
                   f"改成压成单个 strm，再扫一次就回来。{RST}")
         return 0, 0
     tok = _ol_token(d)
@@ -12410,7 +12410,7 @@ def strm_dirs_uncovered(d, key):
 def report_not_in_emby(d, key, only=None):
     """把 Emby 没收录的 strm 摆出来，并说清楚该怎么改。
 
-    单独一个函数是因为「5 生成媒体库」和「6 链路体检」都要用，而这段话的价值全在措辞上 ——
+    单独一个函数是因为「4 生成媒体库」和「5 链路体检」都要用，而这段话的价值全在措辞上 ——
     只说"少了 1 个"等于没说，得指名道姓 + 给出可执行的改法。
 
     【必须先看文件是不是独占一个文件夹】原来无条件按「同一个文件夹里放了多部片子」去讲，可
@@ -12456,7 +12456,7 @@ def report_not_in_emby(d, key, only=None):
         print(f"  {DIM}  · 或者给这个文件夹单独加一个媒体库 —— 保持分类，"
               f"但每加一个新文件夹都要手动加一次{RST}")
         print(f"  {DIM}Emby → 设置 → 媒体库 → 选中库 → 编辑文件夹。"
-              f"改完回来点一次「5 生成媒体库」。{RST}")
+              f"改完回来点一次「4 生成媒体库」。{RST}")
         if not (shared or alone):
             return len(missing)
         print()
@@ -12473,7 +12473,7 @@ def report_not_in_emby(d, key, only=None):
               f"另一部要么被忽略，要么被并成前一部的一个「版本」。{RST}")
         print(f"  {DIM}并成「版本」还会连累进度条：那个条目挂着两个源，探测失败的那个"
               f"时长是 0，续播点就存不下来。{RST}")
-        print(f"  {YELLOW}先看「6 链路体检」的「媒体库选项」那一行。{RST}"
+        print(f"  {YELLOW}先看「5 链路体检」的「媒体库选项」那一行。{RST}"
               f"{DIM} 本脚本会自动关掉多版本合并，"
               f"关掉之后有几个文件就有几个条目，这一条通常就不会再出现。{RST}")
         print(f"  {DIM}如果那一行是打勾的、这里还在报，才需要动文件：把这几个挪进"
@@ -12504,7 +12504,7 @@ def report_not_in_emby(d, key, only=None):
               f"'{os.path.basename(alone[0][0])[:28]}'{RST}")
         print(f"  {DIM}日志里没有它 = Emby 压根没扫到（原因 1）；"
               f"有它但报解析失败 = 名字问题（原因 2/3）。{RST}")
-    print(f"  {DIM}改完回来点一次「5 生成媒体库」。{RST}")
+    print(f"  {DIM}改完回来点一次「4 生成媒体库」。{RST}")
     return len(missing)
 
 
@@ -12566,7 +12566,7 @@ def _strm_sidecars(strm_path):
     return out
 
 
-# 「5 生成媒体库」里核对失效 strm 最多花这么久。超了就记下游标，下次接着走。
+# 「4 生成媒体库」里核对失效 strm 最多花这么久。超了就记下游标，下次接着走。
 # 每日对齐那次不设限 —— 凌晨跑，没人等。
 PRUNE_BUDGET = 60
 # 本地目录在这么多天内动过的，下一轮优先核对 —— 刚生成过新 strm 的地方，
@@ -12643,7 +12643,7 @@ def _prune_order(by_dir, dir_local, d, budget):
     """核对顺序：先查有理由怀疑的，剩下的照旧游标轮转。
 
     【别无差别地绕圈】几百个目录按字典序轮转、每次只有 budget 秒，绕完一圈要点五六次
-    「5」。而绝大多数目录这次根本没动过，问它们是纯粹的重复劳动 —— 片子越多越明显。
+    「4」。而绝大多数目录这次根本没动过，问它们是纯粹的重复劳动 —— 片子越多越明显。
 
     有理由怀疑的就两类：
       · 上一轮没问出结果的  —— 旧条目赖着不走，来源就是它们
@@ -12855,7 +12855,7 @@ def prune_dead_strm(d, budget=None, only=None):
             warn(f"{m} 下面 {n} 个文件【全部】判定为已删除 —— 这轮先不动。")
         print(f"  {DIM}整个盘都判死，更像是存储掉线或根文件夹ID 填错，而不是你真把它清空了。")
         print(f"  先去 OpenList 点一下这个挂载点确认还列得出东西。真是你删的话，")
-        print(f"  下次再点「5 生成媒体库」结论一样就会删掉，无非晚一轮。{RST}")
+        print(f"  下次再点「4 生成媒体库」结论一样就会删掉，无非晚一轮。{RST}")
         if not dead:
             return 0
 
@@ -12921,7 +12921,7 @@ HEAL_GAP    = 8          # 隔开一点，别撞夸克的频率限制（和预�
 # 【补时长必须后台跑】这一步天生慢（每个条目要跨境换直链 + 让 Emby 去网盘拉文件头，
 # 一个最坏 3 分钟），而它跟"生成媒体库成没成功"毫无关系 —— 没道理把最慢的一步钉在用户
 # 面前。而且失败的多半是当时线路在抖，隔几分钟再试往往就成了。
-# 所以「5」把它扔后台：一轮一轮走，中间隔 HEAL_RETRY_MIN 分钟，直到没有待探的、
+# 所以「4」把它扔后台：一轮一轮走，中间隔 HEAL_RETRY_MIN 分钟，直到没有待探的、
 # 或者用满 HEAL_BG_BUDGET。
 # 【探不出来的要放弃，不能无限重试】轮转游标只保证"不把名额占死"，不保证"别再探"。
 # 当库里绝大多数条目都探不出音视频轨时（网盘上是残缺文件、Emby 不认的格式、上游按
@@ -12941,7 +12941,7 @@ HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）的【默认值】�
 # 【后来做成了可调的】仓库主人：「做一个按钮开关，默认开，里面还可以设置每日流量上限默认
 # 2G，如果有的人片多可以加大上限比如 200G，如果有的人流量不够用也可以关掉，关掉还写个提示
 # 可能保存不了进度记忆」。上面那句"不做成可调的"是早先的判断，用户要的是能调 ——
-# 见 heal_day_mb / heal_auto_on，「3 后补参数 → 10」。
+# 见 heal_day_mb / heal_auto_on，「7 设置 → 10」。
 HEAL_DAY_MB_LO, HEAL_DAY_MB_HI = 100, 1024 * 1024
 
 
@@ -12957,7 +12957,7 @@ def heal_auto_on():
     return ms_state().get("heal_auto") is not False
 
 
-# 【每个盘还有一个自己的开关，只能单独关、不能单独开】仓库主人：「后补参数里面设置流量上限
+# 【每个盘还有一个自己的开关，只能单独关、不能单独开】仓库主人：「设置里面设置流量上限
 # 和自动补时长总开关，每个独立盘可以设置一个单独补时长开关但是没有流量上限设置，流量上限
 # 也是计在总开关里面……总开关如果关着，独立盘将全部自动关闭，独立盘打开不了会提示先打开
 # 总开关，所以独立盘只能独立关不能独立开」。存的是【关掉的盘】的名单：没列进来的就跟总开关走。
@@ -14810,12 +14810,12 @@ def _heal_summary(done, total):
     elif done:
         warn(f"{done}/{total} 个成功")
         # 【别再让用户去点菜单】每小时的对齐任务本来就会重跑这一步，而且只挑
-        # 没探到的。原来那句"再点一次「5 生成媒体库」"是在让人干本来会自动发生
+        # 没探到的。原来那句"再点一次「4 生成媒体库」"是在让人干本来会自动发生
         # 的事，还会让他以为不点就永远不修。
         print(f"  {DIM}没成功的多半是当时网盘那条线在抖。每小时的对齐任务会自动重试，")
         print(f"  只补没探到的那些，已经好的不重来 —— 不用管它。{RST}")
     else:
-        warn(f"{total} 个都没探到 —— 网盘接口现在多半不通，跑「6 链路体检」看看。")
+        warn(f"{total} 个都没探到 —— 网盘接口现在多半不通，跑「5 链路体检」看看。")
         print(f"  {DIM}每小时的对齐任务会自动重试，线路恢复后会自己补上。{RST}")
 
 
@@ -14909,7 +14909,7 @@ def autofilm_schedule_fix(d=None, fresh=False):
     cfg_path = os.path.join(d, "autofilm", "config", "config.yaml")
     try:
         disk_txt = open(cfg_path, encoding="utf-8").read()
-        # fresh：「7 更新」刚自己重写过配置，那个"刚动过"就是它自己，不是有人在手动扫
+        # fresh：「8 更新」刚自己重写过配置，那个"刚动过"就是它自己，不是有人在手动扫
         if not fresh and time.time() - os.path.getmtime(cfg_path) < AF_CFG_QUIET_S:
             return ""
         want_txt = gen_autofilm_conf(rebuild_cfg_from_disk(d))
@@ -15430,7 +15430,7 @@ def do_strm(only=None):
         align_library(d, key, heal=False, migrate=False)
         auto_libraries_apply(d, key)  # 按关键词规则把该建的库建上
         report_not_in_emby(d, key, only)
-        # 【后台跑】跟「7 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
+        # 【后台跑】跟「8 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
         # 关系，没道理让用户对着它干等。
         _nodur = len(items_without_duration(key))
@@ -15446,7 +15446,7 @@ def do_strm(only=None):
         except Exception as e:
             warn(f"后台任务没起来（不影响本次生成）：{_short_err(e)}")
     else:
-        warn("没有 Emby API Key，没法自动触发扫描 —— 到「3 后补参数 → 1」填上")
+        warn("没有 Emby API Key，没法自动触发扫描 —— 到「7 设置 → 1」填上")
 
     # 【建库说明只在还有没建库的路径时才打】以前每扫一次都铺一整屏"怎么建库、内容类型
     # 别选错、首选语言别留空、文件名要像 流浪地球 (2019).mkv"—— 库早建好了还天天看。
@@ -15711,7 +15711,7 @@ def sync_private_libraries(d, key, rules):
 def sync_library_options(d, key, rules):
     """把规则文件里的刮削器/语言设置同步到 Emby。返回改了几个库。
 
-    这才是这份规则文件该有的样子 —— 改一行 yaml、跑一次「5」，Emby 那边跟着变，不用进
+    这才是这份规则文件该有的样子 —— 改一行 yaml、跑一次「4」，Emby 那边跟着变，不用进
     六个页面挨个勾。（实测现场：动漫库的剧集/播出季/集三层、元数据和图像六个列表，一个
     刮削器都没勾上，只有本地 Nfo 是开的。）
 
@@ -15719,7 +15719,7 @@ def sync_library_options(d, key, rules):
       · 规则里写了 scrapers/image_scrapers → 以 yaml 为准，覆盖 Emby 里的
       · 没写 → 只在【名单没配好】时才动手（一个刮削器都没有、或只剩 MetaTube），用户
         自己在 Emby 里精简过的名单不碰 —— 只要还留着一个正经刮削器就算数
-    不这样分的话，用户在 Emby 界面上的任何调整都会被下一次「5」抹掉。
+    不这样分的话，用户在 Emby 界面上的任何调整都会被下一次「4」抹掉。
     """
     by_name = {r["name"]: r for r in rules}
     try:
@@ -16142,7 +16142,7 @@ def set_metatube_libraries(key, enable_ids):
             if not tos:
                 warn(f"「{name}」还没有刮削器名单（Emby 要扫过一次才会生成），"
                      f"这次跳过 MetaTube")
-                print(f"  {DIM}扫完之后再跑一次「5 生成媒体库」就会戴上；"
+                print(f"  {DIM}扫完之后再跑一次「4 生成媒体库」就会戴上；"
                       f"急的话在 Emby 的媒体库设置里手动勾 MetaTube。{RST}")
                 continue
         for t in tos:
@@ -16413,7 +16413,7 @@ LINK_SWITCHES = (
                                "跨境线路上 4K 原盘经常拉不动"),
       ("streaming", "转码流",   "走网盘的播放通道，实测比原画快几十倍"
                                "（10.9 MB/s 对 306 KB/s）；Emby 里要装分片重定向才能播，"
-                               "「7 更新」会自动装"))),
+                               "「8 更新」会自动装"))),
     ("download_api", "取直链的接口",
      (("official",    "官方接口",   "网盘官方的下载接口，最稳；有的账号会被它限速"),
       ("crack",       "非官方接口", "绕开官方那条，速度常常快一截；网盘一改就失效"),
@@ -16776,7 +16776,7 @@ def reload_storages(d, mounts):
                 # 盘真的没起来 —— 这才是要动手的情况
                 print(f"  {RED}这个盘现在的状态是 {_st}{RST}"
                       f"{DIM} —— 它这轮列不出目录。去 OpenList 网页上把它"
-                      f"停用再启用一次，或者等线路缓过来再点一次「5 生成媒体库」。{RST}")
+                      f"停用再启用一次，或者等线路缓过来再点一次「4 生成媒体库」。{RST}")
             else:
                 print(f"  {DIM}这一步只是清目录缓存，已有的片子一个都不受影响 ——"
                       f"最多是这一轮看不到网盘里刚加的新片。{RST}")
@@ -16834,7 +16834,7 @@ def dir_cache_auto_apply(d):
     n = _apply_dir_cache(d, auto, DIR_CACHE_DEFAULT)
     save_ms_state(dir_cache_migrated=True)
     if n:
-        print(f"  {DIM}想调回长的（列目录老超时的话有用）：3 后补参数 → 6。"
+        print(f"  {DIM}想调回长的（列目录老超时的话有用）：7 设置 → 6。"
               f"手动设过之后脚本就再也不碰它。{RST}")
     return n
 
@@ -16899,7 +16899,7 @@ def set_episode_fix():
     save_ms_state(ep_fix=want, ep_fix_v=EP_FIX_V)
     ok(f"已改成：{'开' if want else '关'}")
     # 【开关一拨就当场做完，别让人再去点「4」】上一版只存了个设置就回菜单，
-    # 改名要等下一次「5 生成媒体库」或者下一轮定时任务。用户开完立刻去 Emby 看，
+    # 改名要等下一次「4 生成媒体库」或者下一轮定时任务。用户开完立刻去 Emby 看，
     # 看到的还是旧名字，只会以为开关没用 —— 实测就是这么被问回来的。
     # 「7 片名用哪个」那边早就是当场套用的，这里照它办。
     key = (read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
@@ -16907,7 +16907,7 @@ def set_episode_fix():
     # 【开也好关也好，都走同一条路】关掉不能一把梭 drop_episode_nfo(d)：那会把
     # 规则文件里写了 episode_number: true 的库也一起清了。fix_ 里按库分得清清楚楚。
     if not key:
-        warn("没有 Emby API Key，这次改动要等下次点「5 生成媒体库」才落地。")
+        warn("没有 Emby API Key，这次改动要等下次点「4 生成媒体库」才落地。")
         return
     try:
         n, _dup = fix_episode_strm_names(d, _rules, key, interactive=False)
@@ -16924,7 +16924,7 @@ def set_episode_fix():
         print(f"  {DIM}扫描在后台跑，片子多的话要等几分钟。{RST}")
     except Exception as e:
         warn(f"通知 Emby 扫描失败：{_short_err(e)}")
-        print(f"  {DIM}点一次「5 生成媒体库」也会扫。{RST}")
+        print(f"  {DIM}点一次「4 生成媒体库」也会扫。{RST}")
 
 
 def set_dir_cache():
@@ -16982,7 +16982,7 @@ def set_dir_cache():
     if not _apply_dir_cache(d, stores, want):
         print(f"  {DIM}没有需要改的 —— 每个存储都已经是 {want} 分钟。{RST}")
     print()
-    print(f"  {DIM}观察一天，再看「6 链路体检」里「列目录历史」那张探测图，"
+    print(f"  {DIM}观察一天，再看「5 链路体检」里「列目录历史」那张探测图，"
           f"X（失败）应该变少。{RST}")
 
 
@@ -17249,7 +17249,7 @@ def _add115_flow(d):
         ok(f"115 已挂上：{mount}")
         # 115 的直链按 UA 签发，Emby 里播要靠本机服务按播放器 UA 换链（见 pan115_mounts）
         if not refresh_hls(d):
-            warn("本机换链服务没起来，Emby 里播 115 会转圈 —— 跑一次「7 更新」")
+            warn("本机换链服务没起来，Emby 里播 115 会转圈 —— 跑一次「8 更新」")
     elif good:
         warn(f"存储建好了，但 OpenList 说：{why}")
         tip("多半是令牌过期了：选「7 网盘扫码登录」再扫一次，到 OpenList 里换上新令牌")
@@ -17463,7 +17463,7 @@ def _add_qtv_flow(d):
         if not why:
             ok(f"夸克 TV 已挂上：{mount}　转码流")
             if not refresh_hls(d):
-                warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「7 更新」")
+                warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「8 更新」")
             tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
             ask("\n按回车继续...")
             return True
@@ -17520,7 +17520,7 @@ def _add_webdav_flow(d):
         tip("多半是地址、用户名或密码不对；已撤掉，重新添加一次")
         return False
     ok(f"WebDAV 已挂上：{mount}　{YELLOW}⚠ 走 VPS 流量{RST}")
-    tip("接下来在「4 挂载路径」里点它 → 1 扫描路径，加上要进 Emby 的目录")
+    tip("接下来在「3 挂载路径」里点它 → 1 扫描路径，加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -18035,7 +18035,7 @@ def _title_menu(d, mp=None):
         apply_title_policy(d, key)
     else:
         print(f"  {DIM}没有 Emby API Key，改不到已有条目上 —— "
-              f"先去「3 后补参数 → 1」填上。{RST}")
+              f"先去「7 设置 → 1」填上。{RST}")
 
 
 def _rename_menu(d, mp=None):
@@ -18462,7 +18462,7 @@ def apply_drive_defaults(d, quiet=False):
         if proxy:
             print(f"  {YELLOW}⚠ 本机代理 = 视频全程走你的 VPS 流量{RST}"
                   f"{DIM}（这类驱动在网盘侧没有 CDN 直链，只有这一条路）{RST}")
-        print(f"  {DIM}想换：4 挂载路径 → 选盘 → 3 直链方式。{RST}")
+        print(f"  {DIM}想换：3 挂载路径 → 选盘 → 3 直链方式。{RST}")
     if proxy:
         _write_storage(d, proxy, columns={"web_proxy": 1,
                                           "webdav_policy": "native_proxy"})
@@ -18621,7 +18621,7 @@ def _ali_tc_menu(d, mp):
             write_atomic(_mw, gen_mediawarp_conf(rebuild_cfg_from_disk(d)), 0o600)
             subprocess.run(["docker", "restart", "mediawarp"], capture_output=True, timeout=120)
         except Exception as e:
-            warn(f"MediaWarp 配置没重写成（跑一次「7 更新」会补上）：{_short_err(e)}")
+            warn(f"MediaWarp 配置没重写成（跑一次「8 更新」会补上）：{_short_err(e)}")
     on = sync_hls_service(d)
     cfg3 = rebuild_cfg_from_disk(d)
     if cfg3.get("has_domain") and os.path.exists(cfg3.get("crt") or ""):
@@ -18629,7 +18629,7 @@ def _ali_tc_menu(d, mp):
     if q and on:
         ok(f"{mp} 在 Emby 里改播阿里转码流（自动最高）—— 现在去点一部试试")
     elif q:
-        warn("本机那个转发服务没起来，Emby 里照旧播原画。跑「6 链路体检」看原因。")
+        warn("本机那个转发服务没起来，Emby 里照旧播原画。跑「5 链路体检」看原因。")
     else:
         ok(f"{mp} 在 Emby 里改回原画")
 
@@ -18842,7 +18842,7 @@ def _drive_menu(d, mp, drv, mounted=True):
 def _heal_mount_toggle(mp):
     """单个盘的补时长开关：只能单独关、不能单独开（总开关关着时开不了）。"""
     if not heal_auto_on():
-        tip("总开关关着，所有盘都不自动补时长 —— 先到「3 后补参数 → 10」打开总开关")
+        tip("总开关关着，所有盘都不自动补时长 —— 先到「7 设置 → 10」打开总开关")
         return
     off = heal_off_mounts()
     if mp in off:
@@ -18863,7 +18863,7 @@ def _covers_menu(d, mp):
     """「截封面」：这个盘里没图的，全部截一次。不受自动那几道闸，但要花 VPS 流量。"""
     key = read_emby_api_key(d)
     if not key:
-        warn("没有 Emby API Key（「3 后补参数 → 1」），问不了 Emby。")
+        warn("没有 Emby API Key（「7 设置 → 1」），问不了 Emby。")
         return
     # 【上一次花了多少摆在最前面】仓库主人：「每次点进去能看到上一次截图所消耗的流量」
     last = cover_manual_last(mp)
@@ -18914,7 +18914,7 @@ def _apply_autofilm_cron(d):
         return True
     except Exception as e:
         warn(f"写 AutoFilm 配置失败：{_short_err(e)}")
-        print(f"  {DIM}跑一次「7 更新」也会重新生成。{RST}")
+        print(f"  {DIM}跑一次「8 更新」也会重新生成。{RST}")
         return False
 
 
@@ -19122,7 +19122,7 @@ def _mount_order_menu(stores):
 def mount_paths_menu():
     """挂载路径：一个盘一屏，各管各的。
 
-    【为什么不是一个输入框】原来扫描路径埋在「后补参数」里，要把所有路径用逗号连成一串手
+    【为什么不是一个输入框】原来扫描路径埋在「设置」里，要把所有路径用逗号连成一串手
     打进去 —— 加一个盘得把已有的全部重打一遍，在手机 ssh 上根本没法编辑。
     【为什么一个盘一个子菜单】每个盘要管的有四件事：扫哪些目录、直链方式、片名用哪个、
     115 还要扫码登录，而它们全都是一个盘一个样的东西。
@@ -19148,7 +19148,7 @@ def mount_paths_menu():
             print(f"  {YELLOW}OpenList 里还没挂任何网盘。{RST}")
             ask("\n按回车返回...")
             return
-        # 【这一屏只管设置，不报状态】存储通不通归「6 链路体检」——
+        # 【这一屏只管设置，不报状态】存储通不通归「5 链路体检」——
         # 那边是真去列一次目录、换一次直链，比这里读一个陈年字段准得多。
         # 【挂载点只在认不出来时才带】原来每行都是「驱动名 挂载点  扫描路径」，而扫描路径
         # 本来就以挂载点开头（/七米蓝影视/mov/电影），同一个名字印两遍、一行还折成两行；
@@ -19192,7 +19192,7 @@ def mount_paths_menu():
         for j, (txt, _fn) in enumerate(extra, n + 1):
             print(f"  {j:>2}. {txt}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
-        # 扫描是个动作。而且主菜单那个「5 生成媒体库」是新手唯一找得到的入口 ——
+        # 扫描是个动作。而且主菜单那个「4 生成媒体库」是新手唯一找得到的入口 ——
         # 装完那一刻网盘还没挂，没有它就是死局（见 do_strm 的说明）。
         # 两个入口做同一件事，只会让人问"这俩有什么区别"。
 
@@ -19287,7 +19287,7 @@ def drop_orphan_strm_dirs(d, paths, unknown=()):
         except OSError as e:
             warn(f"{x} 没删干净：{_short_err(e)}")
     ok(f"删掉 {gone} 个 strm")
-    print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 —— 「5 生成媒体库」"
+    print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 —— 「4 生成媒体库」"
           f"最后会通知扫描，每小时的对齐任务也会做。{RST}")
     print(f"  {YELLOW}媒体库本身还在 Emby 里{RST}{DIM}，路径指向的目录现在是空的。"
           f"不想要就去 Emby 的「媒体库」里把它删掉。{RST}")
@@ -19296,12 +19296,12 @@ def drop_orphan_strm_dirs(d, paths, unknown=()):
 
 
 def params_menu():
-    """后补参数：装完之后才拿得到、需要回头再填的东西。"""
+    """设置：装完之后才拿得到、需要回头再填的东西。"""
     while True:
         d = ms_install_dir()
         cur = read_emby_api_key(d) if is_installed(d) else ""
         print("\n" + "-" * 60)
-        print(f"  {BOLD}后补参数{RST}")
+        print(f"  {BOLD}设置{RST}")
         print("-" * 60)
         state = (f"{GREEN}已填{RST}" if cur else f"{YELLOW}空 · 302 不生效{RST}")
         # 顺带把「有没有启用统一密码」也显示出来,省得进去才发现没开
@@ -19310,7 +19310,7 @@ def params_menu():
         ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
         print(f"  1. Emby API Key      当前：{state}")
         print(f"  2. 浏览器弹框账号    当前：{ba_state}")
-        # 【直链方式 / 片名用哪个 / 115 扫码登录 都搬去「4 挂载路径」了】
+        # 【直链方式 / 片名用哪个 / 115 扫码登录 都搬去「3 挂载路径」了】
         # 它们全是【一个盘一个样】的东西：直链方式只有夸克/UC 的驱动才有，
         # 片名该跟文件名还是跟刮削也是每个盘各不相同 —— 放在这里当全局开关，
         # 本身就是把它们摆错了地方。扫描路径同理。
@@ -19368,7 +19368,7 @@ def params_menu():
                                                 "config.yaml"), "auth")
                   if is_installed(d0) else "")
             if not metatube_on(d0):
-                warn("MetaTube 没装，先在「5」里装。")
+                warn("MetaTube 没装，先在「4 生成媒体库」里装。")
             elif not k0:
                 warn("没有 Emby API Key，先填「1」。")
             else:
@@ -19395,7 +19395,7 @@ def _mb_txt(mb):
 
 
 def heal_auto_menu():
-    """「3 后补参数 → 10」：自动补时长的开关和每天流量上限。"""
+    """「7 设置 → 10」：自动补时长的开关和每天流量上限。"""
     while True:
         print()
         print(f"  1. 开关              当前："
@@ -19438,8 +19438,8 @@ def heal_auto_menu():
 
 
 def set_cover_auto():
-    """「3 后补参数 → 9」：每小时自动截封面，开 / 关。默认关。"""
-    tip("开了每小时自动给没图的截一帧，会消耗 VPS 流量；关了也能在「4 挂载路径 → 选盘」手动截")
+    """「7 设置 → 9」：每小时自动截封面，开 / 关。默认关。"""
+    tip("开了每小时自动给没图的截一帧，会消耗 VPS 流量；关了也能在「3 挂载路径 → 选盘」手动截")
     c = ask(f"1 开 / 2 关（当前 {'开' if cover_auto_on() else '关'}，回车不改）").strip()
     want = {"1": True, "2": False}.get(c)
     if want is None:
@@ -19450,7 +19450,7 @@ def set_cover_auto():
 
 
 def set_resume_max():
-    """「3 后补参数 → 8」：播到百分之几算播放完。存进状态，有 API Key 就当场对齐到各库。"""
+    """「7 设置 → 8」：播到百分之几算播放完。存进状态，有 API Key 就当场对齐到各库。"""
     cur = resume_max_pct()
     print()
     # 「所有媒体库」= 所有指向 strm 的库（tune_strm_libraries 只动这些）；用户自己另建的
@@ -19896,8 +19896,8 @@ def warm_links(d, key, limit=None):
                   f"直链，而换到的 CDN 节点好不好是随机的 —— "
                   f"「同一部片早上能播、下午播不了」就是这么来的。{RST}")
             print(f"  {DIM}要换回来：把 {_mp} 从 Emby 的扫描范围里拿出来"
-                  f"（「4 挂载路径」里改），它在 OpenList 挂载页面照样能用；"
-                  f"改完跑一次「7 更新」重算这个值。{RST}")
+                  f"（「3 挂载路径」里改），它在 OpenList 挂载页面照样能用；"
+                  f"改完跑一次「8 更新」重算这个值。{RST}")
         return 0, 0
     busy = netdisk_load(d, key)
     if busy:
@@ -20045,7 +20045,7 @@ def warm_links(d, key, limit=None):
                 dead.append((name[:24], why))
                 tip = ("网盘接口一直没回话，线路慢，下一轮再试"
                        if ("timed out" in why or "timeout" in why.lower() or not why)
-                       else f"{why} —— 下一轮再试；一直这样就跑「6 链路体检」")
+                       else f"{why} —— 下一轮再试；一直这样就跑「5 链路体检」")
                 print(f"\r  {DIM}·{RST} {name[:24]}  {YELLOW}没热上{RST}"
                       f"{DIM}（{tip}）{RST}\033[K")
                 continue
@@ -20123,12 +20123,12 @@ def warm_links(d, key, limit=None):
             print(f"  {DIM}全是 {code} —— 这不是网盘慢，是 MediaWarp 换直链被拒了。"
                   f"最常见的原因：OpenList 重启过，它手里的令牌作废了。{RST}")
             print(f"  {DIM}敲这一条再试：{RST}{BOLD}docker restart mediawarp{RST}")
-            print(f"  {DIM}还是不行就跑「6 链路体检」。{RST}")
+            print(f"  {DIM}还是不行就跑「5 链路体检」。{RST}")
         else:
             print(f"  {DIM}网盘接口这会儿多半在抖，下一轮（{WARM_EVERY_H} 小时后）"
                   f"会自动再试 —— 你什么都不用做。{RST}")
     else:
-        warn("一个都没接上 —— 网盘接口可能正好在抖，跑「6 链路体检」看看。")
+        warn("一个都没接上 —— 网盘接口可能正好在抖，跑「5 链路体检」看看。")
     return done, len(cut)
 
 
@@ -20507,7 +20507,7 @@ def netdisk_load(d, key=""):
                             + (f" {pct:.0f}%" if isinstance(pct, (int, float)) else ""))
         except Exception:
             pass
-    # 【看有没有任务开始了还没完成，不看"近两分钟有几行日志"】真机：刚「7 更新」完，
+    # 【看有没有任务开始了还没完成，不看"近两分钟有几行日志"】真机：刚「8 更新」完，
     # AutoFilm 重启打了 21 行启动日志，体检说它「在生成 strm」—— 其实一个任务都没跑
     if autofilm_busy():
         busy.append("AutoFilm 正在扫网盘生成 strm")
@@ -20668,7 +20668,7 @@ def do_healthcheck():
                     f"alipan_type=default{DIM}　开放平台下载接口，阿里限速到 0.5 MB/s 左右{RST}")
                 todo.append((
                     f"{mp} 走阿里开放平台下载接口，限速 0.5 MB/s 上下，码率高的片子必卡",
-                    f"4 挂载路径 → {mp} → 7 Emby 播放画质 → 阿里转码流（自动最高）"))
+                    f"3 挂载路径 → {mp} → 7 Emby 播放画质 → 阿里转码流（自动最高）"))
 
     # ---- 列目录 ----
     listed_ok = []
@@ -20782,7 +20782,7 @@ def do_healthcheck():
                 todo.append((f"列 {p} 用了 {el:.0f} 秒，「生成媒体库」很可能扫到一半就超时",
                              "此刻没有别的东西在占网盘，两次都慢，是接口到本机的线路问题。"
                              "把扫描路径收窄到具体的媒体目录"
-                             "（主菜单 4 挂载路径），目录少了成功率高很多"))
+                             "（主菜单 3 挂载路径），目录少了成功率高很多"))
 
     # 单次读数说服不了任何人。「列目录 55 秒」到底是这一下赶上了，还是它就没快过？
     # 保活每 KEEPALIVE_MIN 分钟本来就在测同一条路径，把结果攒起来，这个问题就不用
@@ -20816,10 +20816,10 @@ def do_healthcheck():
             # 但代价是网盘里刚加的片子要等这么久才看得见 —— 而"点进去就能看到新片"
             # 恰恰是用户对这套东西最基本的预期。两头都是实实在在的代价，
             # 该由他自己选，体检的活是把两头说清楚，不是替他决定。
-            # 调长能少碰被限流的接口（3 后补参数 → 6），代价是新加的片子要等这么久才看得见
+            # 调长能少碰被限流的接口（7 设置 → 6），代价是新加的片子要等这么久才看得见
             _hc("目录缓存", "warn",
                 f"{_txt}  {YELLOW}短缓存 + 列目录常超时{RST}"
-                f"{DIM}（调长：3 后补参数 → 6，代价是新片晚一点看得见）{RST}")
+                f"{DIM}（调长：7 设置 → 6，代价是新片晚一点看得见）{RST}")
         else:
             _hc("目录缓存", "ok", _txt)
 
@@ -20922,7 +20922,7 @@ def do_healthcheck():
                                       f"两次都慢  →  {host}")
                     todo.append((f"{mount} 换一次直链要 {el:.0f} 秒，再换一次还要 "
                                  f"{el2:.0f} 秒，每次开播都会卡在开头",
-                                 "直链缓存没接住：3 后补参数 → 看直链缓存时长；"
+                                 "直链缓存没接住：7 设置 → 看直链缓存时长；"
                                  "还不行就 docker restart openlist"))
             elif _is_internal_host(raw.split("/")[2]):
                 # 代理型存储（WebDAV 源、本地目录）在网盘侧没有 CDN 直链，OpenList 只能回
@@ -20947,7 +20947,7 @@ def do_healthcheck():
                         f"{mount} 是代理型存储（WebDAV、本地目录），OpenList 只能回自己的"
                         f"地址；而 MediaWarp 现在用 {mask_host(_mw_addr) or '内网地址'} 去问它，"
                         f"于是 302 出去的是容器内网名，手机电视解析不了",
-                        "跑一次「7 更新」：它会把 MediaWarp 问 OpenList 的地址改成对外地址"
+                        "跑一次「8 更新」：它会把 MediaWarp 问 OpenList 的地址改成对外地址"
                         "（探不通会自动退回，不会把别的盘搞坏）"))
             elif el > 2:
                 _hc(label, "warn",
@@ -20962,7 +20962,7 @@ def do_healthcheck():
             _m = _msg.lower()
             if "empty token" in _m or "refresh token" in _m:
                 _fix = ("令牌和「阿里盘账户类型」不配对。"
-                        "4 挂载路径 → 选那个盘 → 2 直链方式，按提示换")
+                        "3 挂载路径 → 选那个盘 → 2 直链方式，按提示换")
             elif "not init" in _m or "storage not found" in _m:
                 _fix = ("这个存储没初始化成功。OpenList → 存储 → 找到它 → "
                         "先停用再启用；还不行就查它的令牌")
@@ -21007,7 +21007,7 @@ def do_healthcheck():
                      f"本地目录）—— 它们在网盘侧没有 CDN 直链，OpenList 只能回自己的"
                      f"地址，而那个地址是按请求里的 Host 拼的，于是 302 出去的是容器"
                      f"内网名，手机电视解析不了，表现为 load fail",
-                     f"跑一次「7 更新」：它会把这个地址改成 {_want_addr or '对外地址'}"
+                     f"跑一次「8 更新」：它会把这个地址改成 {_want_addr or '对外地址'}"
                      f"（探不通会自动退回内网地址，不会把别的盘搞坏）"))
 
     # ---- 302 端到端 ----
@@ -21050,7 +21050,7 @@ def do_healthcheck():
         todo.append((
             "mediawarp 的配置文件被写空了 —— 容器现在还在跑（配置在内存里），"
             "但只要它重启一次就整个起不来，表现是所有片子都放不了",
-            "跑一次「7 更新」重新生成。生成失败的话看那一步的报错"))
+            "跑一次「8 更新」重新生成。生成失败的话看那一步的报错"))
     # 开了阿里转码流的盘不参与（见 link_ttl_of）—— 真机：2h 后面还写着「按 AliyundriveOpen 定的」
     _tcm = ali_tc_mounts()
     _short = {drv: LINK_LIFE_MIN[str(drv).lower()]
@@ -21066,7 +21066,7 @@ def do_healthcheck():
             f"【已经过期】的地址 302 给播放器，播放器报 load fail / 打不开。"
             f"刚放过的片子能再放（地址还新），搁一阵子的就不行 —— "
             f"表现正是「刚挂好能放，过一会儿又放不了」",
-            f"跑一次「7 更新」，它会按已挂的盘把这个值重算成 {_ttl_want}"))
+            f"跑一次「8 更新」，它会按已挂的盘把这个值重算成 {_ttl_want}"))
     elif _ttl_cur and _ttl_min < LINK_TTL_H * 60:
         # 【值是对的，但这是个取舍，不是"正常"】上一版在这儿打绿勾，于是没人知道
         # 夸克的缓存被从 2 小时压到了 9 分钟，更没人知道这个取舍可以换回来。
@@ -21080,9 +21080,9 @@ def do_healthcheck():
         todo.append((
             f"直链缓存只有 {_ttl_cur}，被 {_mp0} 压短了（它的直链只活 "
             f"{_who[0][2] if _who else '?'} 分钟），别的盘也跟着每 {_ttl_cur} 重换一次直链",
-            (f"阿里盘：4 挂载路径 → {_mp0} → 7 Emby 播放画质 → 阿里转码流，它就不再压短缓存"
+            (f"阿里盘：3 挂载路径 → {_mp0} → 7 Emby 播放画质 → 阿里转码流，它就不再压短缓存"
              if _who and str(_who[0][1]).lower() in ALI_DRIVERS else
-             f"把 {_mp0} 从 Emby 扫描范围里拿出来（4 挂载路径），再跑「7 更新」")))
+             f"把 {_mp0} 从 Emby 扫描范围里拿出来（3 挂载路径），再跑「8 更新」")))
     elif _ttl_cur:
         _hc("直链缓存", "ok", f"{_ttl_cur}"
             + (f"  {DIM}按 {'、'.join(_shortest)} 的直链有效期定的{RST}"
@@ -21110,7 +21110,7 @@ def do_healthcheck():
         if "不是 302" in msg302:
             todo.append(("MediaWarp 没有拦截播放请求，视频会经过本机中转",
                          "检查 mediawarp/config.yaml 的 http_strm.enable 是不是 true、"
-                         f"prefix_list 是不是 {STRM_PATH}；「7 更新」会重新生成"))
+                         f"prefix_list 是不是 {STRM_PATH}；「8 更新」会重新生成"))
         elif "内部地址" in msg302:
             # 【别一口咬定 public_url】这条以前只有那一个说法，而实测撞到的是
             # 另一个原因：被测的那部片在 WebDAV 挂载上，那类驱动在网盘侧根本
@@ -21121,7 +21121,7 @@ def do_healthcheck():
                          "先对照上面「换直链」那几行：如果只有某一个盘的直链是"
                          "本机地址，那是那个盘的驱动（WebDAV、本地目录这类）没有"
                          "CDN 直链，改配置没用；如果所有盘都这样，才是 autofilm 的"
-                         "public_url 填成了内部地址，「7 更新」会重新生成"))
+                         "public_url 填成了内部地址，「8 更新」会重新生成"))
         else:
             # 【别再说"上一行的换直链失败"】那句话在换直链三行全绿时就是自相矛盾。
             # 走到这一支的多半是第二跳出了状况（上游限流、签名过期、网盘超时），
@@ -21160,13 +21160,13 @@ def do_healthcheck():
             # 要靠分片重定向指回网盘
             todo.append((
                 f"{'、'.join(_hls)} 用的是转码流，但分片重定向服务没装上，Emby 里播不了",
-                "跑一次「7 更新」会自动装；装不上时屏上会写原因"))
+                "跑一次「8 更新」会自动装；装不上时屏上会写原因"))
 
     if key:
         _hc("Emby API Key", "ok", "已填")
     else:
         _hc("Emby API Key", "bad", "空 —— 302 不会生效")
-        todo.append(("MediaWarp 没有 Emby API Key", "3 后补参数 → 1 添加 API 密钥"))
+        todo.append(("MediaWarp 没有 Emby API Key", "7 设置 → 1 添加 API 密钥"))
 
     # 【负载和内存要一起看】实测撞过一次，而我第一时间判断错了：看到"扫库 + 卡死"
     # 就归因给 Emby 刮削吃内存，可 docker stats 摆出来是 emby 280 MiB、
@@ -21238,7 +21238,7 @@ def do_healthcheck():
     n = strm_count(d)
     _hc("strm 文件", "ok" if n else "bad", f"{n} 个" if n else "0 个 —— Emby 里一定是空的")
     if not n:
-        todo.append(("一个 strm 都没有", "先确认上面的列目录正常，再点「5 生成媒体库」"))
+        todo.append(("一个 strm 都没有", "先确认上面的列目录正常，再点「4 生成媒体库」"))
     if key:
         try:
             u = (f"http://127.0.0.1:8096/Library/VirtualFolders?api_key={key}")
@@ -21356,7 +21356,7 @@ def do_healthcheck():
                     f"媒体库「{_bad[0]}」的刮削器名单不对 —— "
                     f"{'一个刮削器都没启用' if _bad[0] in nofetch else '只剩 MetaTube，TheMovieDb 被挤掉了'}，"
                     f"表现就是「条目都在、一张海报都没有」",
-                    "跑一次「5 生成媒体库」会按规则文件把默认刮削器写进去 —— "
+                    "跑一次「4 生成媒体库」会按规则文件把默认刮削器写进去 —— "
                     "只对规则文件里有名字的库生效。自己在 Emby 里另建的库归你自己管："
                     "Emby → 设置 → 媒体库 → 点该库 → 手动勾"))
 
@@ -21384,7 +21384,7 @@ def do_healthcheck():
                 todo.append((
                     f"媒体库「{empty[0]}」指向的目录已经空了，但 Emby 里的条目还在 —— "
                     f"首页轮播、「继续观看」还会推这些片，点开必然放不了",
-                    f"脚本自己建的库，跑「5 生成媒体库」时会去问网盘 —— "
+                    f"脚本自己建的库，跑「4 生成媒体库」时会去问网盘 —— "
                     f"网盘明确回答那儿没东西了就自动删掉，问不出来（超时、"
                     f"存储掉线）就留着等下一轮。你手建的不碰，"
                     f"到 Emby → 设置 → 媒体库 → 「{empty[0]}」→ 删除。"
@@ -21439,7 +21439,7 @@ def do_healthcheck():
                 _hc("媒体库选项", "bad", f"{names}  {YELLOW}{'；'.join(what)}{RST}")
                 todo.append((f"媒体库「{names.split('、')[0]}」的选项还是 Emby 默认值，"
                              f"对网盘库不合适",
-                             "点「5 生成媒体库」或「7 更新」会立刻调好；"
+                             "点「4 生成媒体库」或「8 更新」会立刻调好；"
                              "不管的话每小时的预热任务也会跟上（最多等 1 小时）"))
             elif slibs:
                 # 【这个 Emby 版本没有的选项，在这儿报一次就够】原来是每次更新
@@ -21481,7 +21481,7 @@ def do_healthcheck():
                         f"{'、'.join(_leak)}{RST}")
                     todo.append((
                         f"标了 private 的媒体库，非管理员账号「{_leak[0]}」还能看见",
-                        "跑一次「7 更新」或「5 生成媒体库」会自动收权限；"
+                        "跑一次「8 更新」或「4 生成媒体库」会自动收权限；"
                         "还不行就 Emby → 设置 → 用户 → 点该用户 → 取消勾选那个库"))
                 else:
                     _hc("私密媒体库", "ok",
@@ -21539,14 +21539,14 @@ def do_healthcheck():
                     _how.append(f"{_mv} 个电影改成「片名 (年份).mp4」（成人片用番号）")
                 todo.append((
                     f"{len(_noid)} 个条目没有刮削源认得出，没有海报和简介",
-                    "；".join(_how) + "，改完点「5 生成媒体库」"))
+                    "；".join(_how) + "，改完点「4 生成媒体库」"))
             elif key:
                 _hc("刮削结果", "ok", "条目都刮到了信息")
 
             # ---- 剧集编号 ----
             # 【写下 ≠ 生效，必须在体检里看得见】用户几轮回来说"还是没变"，
             # 而脚本那边一路打印"已补上季集编号" —— 两边对不上话，因为
-            # 核对只在「5 生成媒体库」里做，而用户看的是这里。
+            # 核对只在「4 生成媒体库」里做，而用户看的是这里。
             if key:
                 _eps = _episode_items(key)
                 _nfo = count_episode_nfo(d)
@@ -21580,7 +21580,7 @@ def do_healthcheck():
                             f"{len(_off)} 个剧集的季集编号不对 —— "
                             f"该是 S{_ws:02d}E{_we:02d}，"
                             f"界面上显示的是第 {_gs} 季第 {_ge} 集",
-                            "点一次「5 生成媒体库」：脚本会走「编辑元数据」那个"
+                            "点一次「4 生成媒体库」：脚本会走「编辑元数据」那个"
                             "接口把编号直接写进 Emby，不经过刮削器。"
                             "写完还是不对就到 Emby 里点这一集 → 编辑元数据手工填，"
                             "或者把这个库改成 episode_number: false"
@@ -21635,7 +21635,7 @@ def do_healthcheck():
                     todo.append((
                         f"{len(_noimg)} 个剧集没有自己的缩略图 —— "
                         f"界面上显示的是整部剧的封面",
-                        "点一次「5 生成媒体库」会去刮分集图（只刮图，"
+                        "点一次「4 生成媒体库」会去刮分集图（只刮图，"
                         "不碰编号和片名）。刮削源那边本来就没有分集图的剧，"
                         "刮不回来也正常"))
                 elif _tot:
@@ -21671,7 +21671,7 @@ def do_healthcheck():
                     todo.append((f"{_inb} 个点开过的条目还没补上时长 —— 看一半退出会被当成看完",
                                  (f"在自动补（每批 {_per} 个），不用管；急的话 "
                                   f"media-stack heal <片名> 马上补那一部") if heal_auto_on()
-                                 else ("自动补时长关着：3 后补参数 → 10 打开，"
+                                 else ("自动补时长关着：7 设置 → 10 打开，"
                                        "或者 media-stack heal <片名> 手动补那一部")))
                 else:
                     _hc("条目时长", "ok",
@@ -21691,7 +21691,7 @@ def do_healthcheck():
                 todo.append((f"{len(miss)} 个 strm 生成了但 Emby 不认，"
                              f"表现是「网盘里加了片子，Emby 里不出来」",
                              "同一个文件夹里放多部片子时 Emby 只认其中一部；"
-                             "在网盘里给每部片子单独建一个文件夹，再点「5 生成媒体库」"))
+                             "在网盘里给每部片子单独建一个文件夹，再点「4 生成媒体库」"))
             elif slibs and n:
                 _hc("Emby 收录", "ok", f"{n} 个 strm 都收进去了")
         except Exception as e:
@@ -21767,7 +21767,7 @@ def do_healthcheck():
             todo.insert(0, (
                 f"后台定时任务叠了 {len(tasks)} 个 —— 每个进程要占一百多兆内存，"
                 f"堆多了会把内存和 swap 吃穿，表现就是「视频放不了」",
-                "跑一次「7 更新」：会先杀掉卡住的，再给三条 cron 装上互斥锁和超时。"
+                "跑一次「8 更新」：会先杀掉卡住的，再给三条 cron 装上互斥锁和超时。"
                 "急的话先手动清：pkill -f 'media-stack.py (keepalive|warm|sync)'"))
         else:
             _hc("任务并发", "ok", f"{desc}{DIM}　没有堆积{RST}")
@@ -21777,7 +21777,7 @@ def do_healthcheck():
     if not os.path.exists(KEEPALIVE_CRON):
         _hc("链路保活", "warn", "没装 —— 冷启动第一次播放会转圈几十秒")
         todo.append(("保活定时任务没装",
-                     "跑一次「7 更新」会自动补上"))
+                     "跑一次「8 更新」会自动补上"))
     elif not ka:
         _hc("链路保活", "skip", f"已装，还没跑过（每 {KEEPALIVE_MIN} 分钟一次）")
     else:
@@ -21793,7 +21793,7 @@ def do_healthcheck():
                     "先看 cron 装没装：cat /etc/cron.d/media-stack-keepalive；"
                     "手动跑一次看报什么错："
                     f"python3 {os.path.realpath(__file__)} keepalive；"
-                    "跑一次「7 更新」会按当前版本重装这三条 cron"))
+                    "跑一次「8 更新」会按当前版本重装这三条 cron"))
         else:
             _hc("链路保活", "warn",
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
@@ -21805,21 +21805,21 @@ def do_healthcheck():
             _hint = (f"，openlist 占 {_ol * 100 / _rx:.0f}%" if _rx else "")
             _hc("流量账本", "ok",
                 f"今天已记 {_rows} 格，网卡 ↓{_gb(_rx)}{_hint}"
-                f"{DIM}　详细看「8 流量账本」{RST}")
+                f"{DIM}　详细看「6 流量账本」{RST}")
         else:
             _hc("流量账本", "skip",
                 f"已装，今天还没记到（每 {TRAFFIC_EVERY_MIN} 分钟一格）")
     else:
         _hc("流量账本", "warn", "没装 —— 流量跑超了只能靠临时采样猜")
         todo.append(("流量账本定时任务没装，事后查不了「谁在什么时刻吃了流量」",
-                     "跑一次「7 更新」会自动补上"))
+                     "跑一次「8 更新」会自动补上"))
 
     # 【装了但从没跑成 和 刚装上 长得一样，但都不能打绿勾】这台机器上栽过一次：
     # 三条任务全被锁死，而体检那几行一直绿着。
     if not heal_auto_on():
         # 用户自己关的：不算故障，但要看得见 —— 进度记不住多半就是这个
         _hc("补时长（看片后）", "warn",
-            f"关着（3 后补参数 → 10）{DIM}　新片看一半退出可能被当成看完{RST}")
+            f"关着（7 设置 → 10）{DIM}　新片看一半退出可能被当成看完{RST}")
     elif os.path.exists(HEAL_CRON):
         # 【取最近的那一次】开播前那道门（heal-gate）补完只记 heal_last，不碰 heal_tick ——
         # 真机体检写着「28 小时前跑过一轮」，后面紧跟着同一天 17:03 开播前补的那一轮
@@ -21856,7 +21856,7 @@ def do_healthcheck():
         todo.append((
             "「看过片就补时长」那条定时任务没装 —— 补时长只剩每小时那一轮，"
             "刚看完的一集最多要等一小时才有进度条，这一小时里每看一集都在丢进度",
-            "跑一次「7 更新」会自动补上"))
+            "跑一次「8 更新」会自动补上"))
 
     if os.path.exists(WARM_CRON):
         wm = warm_state(d)
@@ -21879,11 +21879,11 @@ def do_healthcheck():
                     f"每小时对齐该每 {WARM_EVERY_H} 小时跑一次，实际已经 "
                     f"{wmin // 60} 小时没跑了 —— 新加的片子和新建的库不会自动补时长和续播门槛",
                     "和「链路保活」多半是同一个原因（cron 没在工作）。"
-                    "跑一次「7 更新」会重装这三条 cron"))
+                    "跑一次「8 更新」会重装这三条 cron"))
     else:
         _hc("每小时对齐", "warn", "没装 —— 新片要等每天凌晨那一轮才补时长和续播门槛")
         todo.append(("每小时对齐没装，新片要等到第二天凌晨才有进度条记忆",
-                     "跑一次「7 更新」会自动补上"))
+                     "跑一次「8 更新」会自动补上"))
 
     if os.path.exists(SYNC_CRON):
         # 光说"装了、排在几点"不够。用户第二天发现问题还在时，要能当场分辨
@@ -21919,11 +21919,11 @@ def do_healthcheck():
                         f"每日对齐该一天跑一次，实际已经 {hrs:.0f} 小时没跑了 —— "
                         f"新建的媒体库、新加的片子不会自动补时长和续播门槛",
                         "和上面「链路保活」多半是同一个原因（cron 没在工作）。"
-                        "跑一次「7 更新」会重装这三条 cron"))
+                        "跑一次「8 更新」会重装这三条 cron"))
     else:
-        _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「5 生成媒体库」")
+        _hc("每日对齐", "warn", "没装 —— 新加的媒体库要手动点「4 生成媒体库」")
         todo.append(("每日自动对齐没装，新建媒体库的续播门槛不会自动跟上",
-                     "跑一次「7 更新」会自动补上"))
+                     "跑一次「8 更新」会自动补上"))
 
     # ---- 网盘扫描（AutoFilm 自己的定时任务）----
     # 【这一行以前没有，而它才是"新片子会不会自己进来"的答案】上面那些定时任务都是
@@ -21941,15 +21941,15 @@ def do_healthcheck():
     if not _afc:
         _hc("网盘扫描", "warn", "读不到 AutoFilm 的定时配置 —— 新片子可能不会自己进来")
         todo.append(("AutoFilm 的定时扫描读不到，新加的片子不会自动进 Emby",
-                     "跑一次「7 更新」会按当前版本重新生成它的配置"))
+                     "跑一次「8 更新」会按当前版本重新生成它的配置"))
     else:
         _hc("网盘扫描", "ok" if "autofilm" in running else "bad",
             f"AutoFilm {cron_human(_afc)}"
             + ("" if "autofilm" in running else f"　{RED}容器没在跑{RST}")
-            + f"　{DIM}新片子靠它变成 strm；等不及就点「5 生成媒体库」{RST}")
+            + f"　{DIM}新片子靠它变成 strm；等不及就点「4 生成媒体库」{RST}")
 
     # 【自动更新只管脚本】这一行要说清楚这个边界，否则用户看到"自动更新 ✔"
-    # 会以为镜像也在自动跟，然后一年不点「7 更新」
+    # 会以为镜像也在自动跟，然后一年不点「8 更新」
     if os.path.exists(SELFUP_CRON):
         try:
             with open(os.path.join(d, "selfupdate.json")) as f:
@@ -21959,7 +21959,7 @@ def do_healthcheck():
         if not su:
             _hc("脚本自动更新", "skip",
                 f"已装，排在北京时间 {SELFUP_HOUR_CST}，还没到点跑过"
-                f"{DIM}（只换脚本，镜像仍归「7 更新」）{RST}")
+                f"{DIM}（只换脚本，镜像仍归「8 更新」）{RST}")
         else:
             _h = (time.time() - su.get("ts", 0)) / 3600
             _when = f"{_h:.0f} 小时前" if _h >= 1 else f"{_h * 60:.0f} 分钟前"
@@ -21968,29 +21968,29 @@ def do_healthcheck():
                 _hc("脚本自动更新", "warn",
                     f"{_when}检查失败：{su.get('error', '')[:40]}")
                 todo.append(("脚本自动更新拉不到最新版，仓库里修好的东西到不了这台机器",
-                             "多半是网络问题，能等就等下一轮；急的话手动跑「7 更新」"))
+                             "多半是网络问题，能等就等下一轮；急的话手动跑「8 更新」"))
             elif su.get("changed"):
                 _hc("脚本自动更新", _st,
                     f"{_when}升到 v{su.get('to', '?')}"
-                    f"{DIM}（只换脚本，镜像仍归「7 更新」）{RST}{_note}")
+                    f"{DIM}（只换脚本，镜像仍归「8 更新」）{RST}{_note}")
             else:
                 _hc("脚本自动更新", _st,
                     f"{_when}检查过，已是最新"
-                    f"{DIM}（只换脚本，镜像仍归「7 更新」）{RST}{_note}")
+                    f"{DIM}（只换脚本，镜像仍归「8 更新」）{RST}{_note}")
     else:
-        _hc("脚本自动更新", "warn", "没装 —— 仓库里修好的东西要手动点「7 更新」才到")
+        _hc("脚本自动更新", "warn", "没装 —— 仓库里修好的东西要手动点「8 更新」才到")
         todo.append(("脚本自动更新没装，修复不会自己到这台机器上",
-                     "跑一次「7 更新」会自动补上"))
+                     "跑一次「8 更新」会自动补上"))
 
     _hc_group("其它", "背景信息和到期提醒")
 
-    # 版本必须看得见。全用 :latest 标签，「7 更新」每次都会拉最新的 —— 但用户
+    # 版本必须看得见。全用 :latest 标签，「8 更新」每次都会拉最新的 —— 但用户
     # 无从知道自己手上是哪一版，也就没法判断某个毛病是不是升级带来的、或者
     # 已经被上游修掉了。能问出版本号的就报版本号，问不出的报镜像构建日期
     vers = stack_versions(read_emby_api_key(d) or "")
     if vers:
         _hc("版本", "ok", "  ".join(f"{k} {v}" for k, v in vers.items()))
-        print(f"     {DIM}镜像都是 :latest，「7 更新」会拉最新版{RST}")
+        print(f"     {DIM}镜像都是 :latest，「8 更新」会拉最新版{RST}")
 
     # ---- 网盘授权令牌 ----
     # 看的是【长期凭据 refresh_token】，不是请求 URL 里那个几天就换一次的
@@ -22029,7 +22029,7 @@ def do_healthcheck():
                                  "认不出来的话去 Emby/OpenList 改密码，"
                                  f"完整日志 {NGX_ACCESS_LOG}"))
         else:
-            _hc("公网访问", "skip", f"还没有日志（下次「7 更新」刷新 nginx 配置后就有）")
+            _hc("公网访问", "skip", f"还没有日志（下次「8 更新」刷新 nginx 配置后就有）")
 
     if cfg["has_domain"] and os.path.exists(cfg["crt"]):
         r = sh(f"openssl x509 -enddate -noout -in {cfg['crt']}", timeout=20)
@@ -22075,22 +22075,23 @@ def main_menu():
         print("-" * 60)
         print("  1. 安装" + ("（重跑可改配置）" if installed else ""))
         print("  2. 使用信息")
-        print("  3. 后补参数")
-        # 装完网盘还没挂，所以这一步只能等用户在 OpenList 里挂好之后自己点。
-        # 没有这个按钮的话，不敲命令的人就卡在「OpenList 里有文件、Emby 里空的」
-        # 挂载路径单开一屏（原来埋在「后补参数」里，是个要手打整串路径的输入框）：
+        # 挂载路径单开一屏（原来埋在「设置」里，是个要手打整串路径的输入框）：
         # 加一个网盘是最常做的事之一，而且每个盘一个开关才是它的真实形态。
+        # 顺序照「装 → 挂 → 建库 → 查 → 调」排；设置（原名「后补参数」）放到后面。
         if installed:
             _c0 = rebuild_cfg_from_disk(ms_install_dir())
             _n = len(_c0["scan_paths"])
             _sp = (f"{CYAN}{_n} 个目录{RST}" if _n else f"{YELLOW}一个都没选{RST}")
         else:
             _sp = f"{DIM}未安装{RST}"
-        print(f"  4. 挂载路径          当前：{_sp}")
-        print("  5. 生成媒体库")
-        print("  6. 链路体检")
-        print("  7. 更新")
-        print("  8. 流量账本")
+        print(f"  3. 挂载路径          当前：{_sp}")
+        # 装完网盘还没挂，所以这一步只能等用户在 OpenList 里挂好之后自己点。
+        # 没有这个按钮的话，不敲命令的人就卡在「OpenList 里有文件、Emby 里空的」
+        print("  4. 生成媒体库")
+        print("  5. 链路体检")
+        print("  6. 流量账本")
+        print("  7. 设置")
+        print("  8. 更新")
         print("  9. 卸载")
         print("  0. 返回")
         print("-" * 60)
@@ -22102,19 +22103,19 @@ def main_menu():
         elif c == "2":
             show_info()
         elif c == "3":
-            params_menu()
-            continue          # 子菜单自己管停顿，回来别再多按一次回车
-        elif c == "4":
             mount_paths_menu()
-        elif c == "5":
+        elif c == "4":
             _scan_menu(ms_install_dir())
-        elif c == "6":
+        elif c == "5":
             do_healthcheck()
-        elif c == "7":
-            do_update(from_menu=True)
-        elif c == "8":
+        elif c == "6":
             traffic_menu()
             continue          # 子菜单自己管停顿
+        elif c == "7":
+            params_menu()
+            continue          # 子菜单自己管停顿，回来别再多按一次回车
+        elif c == "8":
+            do_update(from_menu=True)
         elif c == "9":
             do_uninstall()
         else:
