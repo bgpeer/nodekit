@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.238"
+SCRIPT_VERSION = "1.5.239"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2875,7 +2875,7 @@ def do_heal_gate():
     def _bg(item, ev):
         _mark(item[1], True)
         try:
-            heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=[item])
+            heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=[item], auto=True)
         except Exception:
             pass
         finally:
@@ -5431,7 +5431,7 @@ def do_heal_tick(hot_only=False):
         rescue_arm(hot)
         rescue_mark_nodur(hot)
         _PROBED.clear()
-        heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot)
+        heal_media_info(d, key, budget=HEAL_TICK_BUDGET, items=hot, auto=True)
         # 【没轮到探的，退回冷却和次数、排回队列】这一轮时间到了、或者撞上限流整轮
         # 拉停了，排在后面的几集一个请求都没发出去 —— 却已经记了冷却和次数，下次点开
         # 就会被一次根本没发生的探测挡住。
@@ -5482,7 +5482,7 @@ def do_heal_tick(hot_only=False):
     # 而砍掉的那一刻 strm 正可能停在【URL 形式】上（还原写在 finally 里，
     # SIGTERM 不走 finally）。留在磁盘上的 URL 形式 strm 会让 MediaWarp 认不出，
     # 表现是"挂载能播、Emby 一直转圈"。所以这一轮只领一小段预算，跑不完的下一轮接着。
-    heal_media_info(d, key, budget=HEAL_TICK_BUDGET)
+    heal_media_info(d, key, budget=HEAL_TICK_BUDGET, auto=True)
     # 【跑完留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"——
     # 这台机器上已经栽过一次：三条任务全被锁死，而体检那行一直是绿的。
     save_ms_state(heal_tick=int(time.time()))
@@ -8887,7 +8887,8 @@ def do_heal(q=None):
                 ok("补完了。")
             return                      # 全补齐了
         _before = len(pend)
-        heal_media_info(d, key, budget=(HEAL_BUDGET * 3 if full else None))
+        heal_media_info(d, key, budget=(HEAL_BUDGET * 3 if full else None),
+                        auto=os.environ.get("MS_HEAL_AUTO") == "1")
         seen += HEAL_LIMIT
         _left = items_without_duration(key)
         if not _left:
@@ -8979,7 +8980,7 @@ def align_library(d, key, heal=True, migrate=True):
         else:
             _h_t0 = time.time()
             try:
-                heal_media_info(d, key)   # 条目级：补时长
+                heal_media_info(d, key, auto=True)   # 条目级：补时长
             finally:
                 if _mine:
                     release_task_lock("heal")
@@ -12790,6 +12791,34 @@ def heal_auto_on():
     """自动补时长开没开。默认开。关了：开播前那道门、看片后、每小时 / 每天那轮都不补；
     手动的 media-stack heal [片名] 照常能用。"""
     return ms_state().get("heal_auto") is not False
+
+
+# 【每个盘还有一个自己的开关，只能单独关、不能单独开】仓库主人：「后补参数里面设置流量上限
+# 和自动补时长总开关，每个独立盘可以设置一个单独补时长开关但是没有流量上限设置，流量上限
+# 也是计在总开关里面……总开关如果关着，独立盘将全部自动关闭，独立盘打开不了会提示先打开
+# 总开关，所以独立盘只能独立关不能独立开」。存的是【关掉的盘】的名单：没列进来的就跟总开关走。
+def heal_off_mounts():
+    return [m for m in (ms_state().get("heal_off_mounts") or []) if isinstance(m, str)]
+
+
+def heal_mount_on(mp):
+    """这个盘会不会自动补时长 = 总开关开着 且 这个盘没被单独关。"""
+    return heal_auto_on() and mp not in heal_off_mounts()
+
+
+def heal_drop_off_mounts(d, items):
+    """把【单独关了补时长】的盘上的条目筛掉（条目第 5 位是 Emby 路径）。只给自动那几条用。"""
+    off = heal_off_mounts()
+    if not off or not items:
+        return list(items or [])
+    mts = [str(r[1] or "") for r in _storage_rows(d)]
+    keep = []
+    for it in items:
+        path = str(it[4]) if len(it) > 4 else ""
+        if path and any(strm_in_mount(d, path, m, mts) for m in off):
+            continue
+        keep.append(it)
+    return keep
 # 【这 2048 只管补积压；你点开的那一集不设额度闸】
 # 实测撞上的：半夜整队补积压那几轮探了 172 次、花掉 2365 MB，把当天额度用得一干
 # 二净。晚上点开两集新片，自动那条路读到了、挑出来了，然后「今天的额度用完了」。
@@ -13571,7 +13600,7 @@ def heal_order(d, pend):
         return list(pend)
 
 
-def heal_media_info(d, key, budget=None, items=None):
+def heal_media_info(d, key, budget=None, items=None, auto=False):
     """给没有时长的条目补上媒体信息。进度条、续播、已看标记全靠这一步。
 
     Emby 拿不到时长时续播逻辑整个失效 —— 它按时长的百分比判断存不存续播点，分母为 0 就
@@ -13597,6 +13626,8 @@ def heal_media_info(d, key, budget=None, items=None):
     # 而"这一条被记进放弃名单了"恰恰是最常见的那种卡住：自动那条轮子从此绕着它走，
     # 屏上一个字都不说，人只能一遍遍点播放然后纳闷。
     allpend = list(items) if items is not None else items_without_duration(key)
+    if auto:
+        allpend = heal_drop_off_mounts(d, allpend)   # 单独关了补时长的盘不补
     if not allpend:
         return
     if items is None:
@@ -15244,7 +15275,8 @@ def do_strm(only=None):
                 subprocess.Popen(
                     [sys.executable, os.path.realpath(__file__), _sub],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True)
+                    start_new_session=True,
+                    env={**os.environ, "MS_HEAL_AUTO": "1"})   # 自动那一路：认各盘的开关
             if _nodur and heal_auto_on():
                 print(f"  {DIM}后台在给 {_nodur} 个条目补时长，不用等{RST}")
         except Exception as e:
@@ -18589,12 +18621,16 @@ def _drive_menu(d, mp, drv, mounted=True):
         elif not mounted:
             print(f"  7. 扫码挂上")
         # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
-        cov_no = ""
+        cov_no = heal_no = ""
         if mounted:
             cov_no = "8" if (isali or has115 or isdav) else "7"
             _cl = cover_manual_last(mp)
             print(f"  {cov_no}. 截封面              "
                   + (f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
+            heal_no = str(int(cov_no) + 1)
+            print(f"  {heal_no}. 补时长              当前："
+                  + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
+                     f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -18605,6 +18641,9 @@ def _drive_menu(d, mp, drv, mounted=True):
             continue
         if cov_no and c == cov_no:
             _covers_menu(d, mp)
+            continue
+        if heal_no and c == heal_no:
+            _heal_mount_toggle(mp)
             continue
         if isdav and c == "7":
             _add_webdav_flow(d)
@@ -18634,6 +18673,26 @@ def _drive_menu(d, mp, drv, mounted=True):
             qr115_login()
         else:
             print("无效选择。")
+
+
+def _heal_mount_toggle(mp):
+    """单个盘的补时长开关：只能单独关、不能单独开（总开关关着时开不了）。"""
+    if not heal_auto_on():
+        tip("总开关关着，所有盘都不自动补时长 —— 先到「3 后补参数 → 10」打开总开关")
+        return
+    off = heal_off_mounts()
+    if mp in off:
+        save_ms_state(heal_off_mounts=[m for m in off if m != mp])
+        ok(f"{mp} 补时长：开（跟总开关走，流量算在总上限里）")
+        return
+    print(f"  {RED}{BOLD}关掉后：{mp} 的新片点开时不补时长，看一半退出可能被当成看完、"
+          f"进度记不住。{RST}")
+    tip("手动补某一部：media-stack heal <片名>")
+    if ask_yn(f"确定关掉 {mp} 的自动补时长？", False):
+        save_ms_state(heal_off_mounts=off + [mp])
+        ok(f"{mp} 补时长：关")
+    else:
+        print("没有改动。")
 
 
 def _covers_menu(d, mp):
@@ -21624,7 +21683,9 @@ def do_healthcheck():
             _hc("补时长（看片后）", "ok",
                 (f"{_hm} 分钟前跑过一轮" if _hm < 120
                  else f"{_hm // 60} 小时前跑过一轮") + _bits
-                + f"{DIM}　明细：media-stack heal-log{RST}")
+                + f"{DIM}　明细：media-stack heal-log{RST}"
+                + (f"{YELLOW}　单独关着：{'、'.join(heal_off_mounts())}{RST}"
+                   if heal_off_mounts() else ""))
     else:
         _hc("补时长（看片后）", "warn",
             "没装 —— 刚看完的那一集要等到下个整点才有进度条")
