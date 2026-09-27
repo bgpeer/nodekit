@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.236"
+SCRIPT_VERSION = "1.5.237"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1623,7 +1623,7 @@ case "${1:-info}" in
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
-  covers         没刮到封面的片，现在就截一帧当封面（平时每小时自动补一批）
+  covers         没刮到封面的片，现在就截一帧当封面（每小时自动截默认关，见 3 后补参数 → 9）
   covers --retry 截失败过的也重新试一遍
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
@@ -4043,8 +4043,12 @@ def do_warm():
     align_library(d, key)
     warm_links(d, key)
     try:
-        cover_prefer_scrape(key)      # 先让刮削的顶掉截帧的
-        fill_covers(d, key)           # 再给还没封面的截一帧
+        cover_prefer_scrape(key)      # 先让刮削的顶掉截帧的（只问刮削器，不拉片子）
+        # 【自动截封面默认关】仓库主人：「把那个自动截图的取消了吧，要么在后补参数里面加个
+        # 开关，默认关，不然有的截不到一直在那里空转消耗流量」。要截就去「4 挂载路径 →
+        # 选盘 → 截封面」手点；想要每小时自动截，「3 后补参数 → 9」打开。
+        if cover_auto_on():
+            fill_covers(d, key)       # 再给还没封面的截一帧
     except Exception:
         pass                          # 封面是锦上添花，别连累预热那一行的时间戳
     # 【跑完必须留个时间戳】否则体检没办法分辨"在跑"和"装了但从没跑成"。
@@ -4243,6 +4247,11 @@ def someone_playing(key, cache_s=0):
 manual_mb = [0.0]          # 最近一次 fill_covers 一共拉了多少 MB（手动那一屏报给人看）
 
 
+def cover_auto_on():
+    """每小时自动截封面开没开。默认关（见 do_warm）。"""
+    return bool(ms_state().get("cover_auto"))
+
+
 def strm_in_mount(d, emby_path, mp, mounts=None):
     """这个 strm 条目是不是这个盘的（读本机 strm 里写的网盘路径，不碰网盘）。
 
@@ -4272,7 +4281,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
     自动的限制，是防一张片拉掉几个 GB。手动截的流量不记进自动那本账。"""
     if not manual and someone_playing(key):
         if say:
-            say("有人在看片 —— 截封面先让路，等没人看了再截（每小时那一轮会接着来）。")
+            say("有人在看片 —— 截封面先让路，等没人看了再截。")
         return 0
     day = _cover_day()
     # 【旧账作废一次】1.5.232 之前的「不再试」和今天的流量数，是拿整块网卡量出来的
@@ -4472,8 +4481,7 @@ def do_covers(retry=False):
         ok(f"{n0} 张截帧封面换成了刮削找到的正式封面。")
     say = lambda t: print(f"  {t}")
     n = fill_covers(d, key, say=say)
-    info(f"这一轮截成了 {n} 张。每张大约拉几 MB；平时每小时自动补一批，一天最多 "
-         f"{COVER_DAY_MAX} 张。回 Emby 里下拉刷新就能看见。")
+    info(f"这一轮截成了 {n} 张，用了约 {manual_mb[0]:.0f} MB。回 Emby 里下拉刷新就能看见。")
 
 
 # ============================================================================ 第一次播放测速
@@ -19093,6 +19101,8 @@ def params_menu():
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
         print(f"  7. 剧集季集编号      当前：{ef_state}")
         print(f"  8. 几%算播放完       当前：{CYAN}{resume_max_pct()}%{RST}")
+        print(f"  9. 自动截封面        当前："
+              + (f"{CYAN}开{RST}" if cover_auto_on() else f"{DIM}关{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -19123,10 +19133,24 @@ def params_menu():
             set_episode_fix()
         elif c == "8":
             set_resume_max()
+        elif c == "9":
+            set_cover_auto()
         else:
             print("无效选择。")
             continue
         ask("\n按回车返回...")
+
+
+def set_cover_auto():
+    """「3 后补参数 → 9」：每小时自动截封面，开 / 关。默认关。"""
+    tip("开了每小时自动给没图的截一帧，会消耗 VPS 流量；关了也能在「4 挂载路径 → 选盘」手动截")
+    c = ask(f"1 开 / 2 关（当前 {'开' if cover_auto_on() else '关'}，回车不改）").strip()
+    want = {"1": True, "2": False}.get(c)
+    if want is None:
+        print("没有改动。")
+        return
+    save_ms_state(cover_auto=want)
+    ok(f"自动截封面：{'开' if want else '关'}")
 
 
 def set_resume_max():
@@ -21543,7 +21567,8 @@ def do_healthcheck():
             when3 = f"{wmin // 60} 小时前" if wmin >= 60 else f"{wmin} 分钟前"
             _hc("每小时对齐", st3,
                 f"{when3}跑过"
-                f"{DIM}（新片的续播门槛、补时长、封面）{RST}{note3}")
+                f"{DIM}（新片的续播门槛、补时长"
+                f"{'、截封面' if cover_auto_on() else ''}）{RST}{note3}")
             if st3 == "bad":
                 todo.append((
                     f"每小时对齐该每 {WARM_EVERY_H} 小时跑一次，实际已经 "
