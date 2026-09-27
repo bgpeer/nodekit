@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.250"
+SCRIPT_VERSION = "1.5.251"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1644,6 +1644,7 @@ case "${1:-info}" in
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「5 链路体检」)
+  traffic [日期]  流量账本：每 5 分钟谁吃了多少流量(等同菜单里的「6 流量账本」)
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
   selfupdate      只把脚本换成仓库里的最新版(不动镜像、不重启容器)
@@ -1834,6 +1835,13 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" covers "$@" ;;
+  traffic)
+    # 【壳里必须有它】README 和体检都写着「命令行看：media-stack traffic [日期]」，
+    # 上一版壳里却没有这一条，敲下去就是「未知命令」（真机 9/28）
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" traffic "$@" ;;
   heal-log)
     # 【流水里有片名，所以要 root】Python 那边也再拦一道
     S=/etc/bgpeer/media-stack.py
