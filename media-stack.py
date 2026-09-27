@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.246"
+SCRIPT_VERSION = "1.5.247"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4970,6 +4970,9 @@ def do_p115_check(q):
     if not key:
         warn("没有 Emby API Key，问不了 Emby。")
         return
+    if not q:
+        warn("要带片名：media-stack 115-check 片名")
+        return
     hits = find_strm_items(key, q)
     if len(hits) != 1:
         warn(f"「{q}」对上了 {len(hits)} 个 —— 要正好一个" + ("：" if hits else "。"))
@@ -4979,12 +4982,17 @@ def do_p115_check(q):
     iid, name = str(hits[0][1]), hits[0][2]
     print(f"\n  {BOLD}115 检查{RST}  {name}")
     try:
-        it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+        it = (_emby(f"/Items?Ids={iid}&Fields=Path,MediaSources", key, timeout=15)
+              .get("Items") or [{}])[0]
         with open(_strm_host_path(d, str(it.get("Path") or "")), encoding="utf-8") as f:
             tp = strm_target_path(f.read())
     except Exception as e:
         warn(f"读不到这一部的 strm：{_short_err(e)}")
         return
+    try:
+        _br = int(((it.get("MediaSources") or [{}])[0].get("Bitrate")) or 0)
+    except (TypeError, ValueError, AttributeError):
+        _br = 0
     mts = pan115_mounts(d)
     in115 = any(tp == m or tp.startswith(m.rstrip("/") + "/") for m in mts)
     _hc("是不是 115", "ok" if in115 else "bad",
@@ -5054,7 +5062,15 @@ def do_p115_check(q):
     _hc("换一个 UA 下", "ok" if s2 not in (200, 206) else "warn",
         f"{s2}　" + ("115 认 UA（换了就拒），和预期一样" if s2 not in (200, 206)
                     else "换了 UA 也给 —— 这条链不绑 UA"))
-    if s1 in (200, 206) and n1:
+    # 【先比速度，再猜 IP】真机 1.5.246：没开会员的 115，本机 68 KB/s、手机 50~60 KB/s，
+    # 片子是 2.2 Mbps（要约 275 KB/s）—— 播四五秒卡、第二次卡住 Hills 就退。手机明明拿到了
+    # 字节，上一版却提示"多半绑了 IP"，把人往错的方向带。速度不够就直说速度不够。
+    _kbs = n1 / 1024 / max(t1, 0.01) if n1 else 0
+    _need = _br / 8 / 1024
+    if s1 in (200, 206) and n1 and _need and _kbs < _need * 0.9:
+        tip(f"链是好的，但 115 只给 {_kbs:.0f} KB/s，这部要约 {_need:.0f} KB/s —— "
+            f"播几秒就卡、卡久了播放器退出（115 没开会员就是这样限速）")
+    elif s1 in (200, 206) and n1:
         tip("本机拿得到字节：链是好的。手机还播不了的话，多半是 115 还绑了 IP（链是服务器换的，手机在另一个网络）")
     else:
         tip("本机拿同一个 UA 都下不动：是换出来的链本身不能用，截这一屏给作者")
@@ -5069,6 +5085,9 @@ def do_play_watch(q, minutes=15):
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if not key:
         warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
+        return
+    if not q:
+        warn("要带片名：media-stack play-watch 片名")
         return
     hits = find_strm_items(key, q)
     if not hits:
