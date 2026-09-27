@@ -55,7 +55,8 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-19n"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——
@@ -88,6 +89,15 @@ docker logs --tail 4000 mediawarp >"$MWLOG" 2>&1 || : >"$MWLOG"
 MWSTART="$(docker inspect -f '{{.State.StartedAt}}' mediawarp 2>/dev/null || true)"
 
 cat >"$PYF" <<'PY'
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json, os, re, socket, subprocess, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 

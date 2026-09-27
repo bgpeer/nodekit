@@ -14,7 +14,8 @@
 # 同时量物理网卡和每个容器，谁在跑一目了然。
 set -u
 
-TOOL_VER="2026-09-15a"
+TOOL_VER="2026-09-27a"
+export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
@@ -221,6 +222,15 @@ fi
 
 sec "④c Emby 自己的定时任务最近跑了什么"
 python3 - <<'PY' 2>/dev/null || echo "  （问不到 Emby，跳过）"
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json, os, re, urllib.request
 cfg = "/opt/media-stack/mediawarp/config/config.yaml"
 key = ""
@@ -250,6 +260,15 @@ PY
 
 sec "⑤ 补时长（heal）自己记的账"
 python3 - <<'PY' 2>/dev/null || echo "  （读不到 /etc/bgpeer/media-stack.json）"
+import sys as _ms_sys, os as _ms_os
+_MS_DOM = _ms_os.environ.get("MS_DOMAIN", "")
+if len(_MS_DOM) > 3:
+    # 【不上屏自己的域名】这一屏是会被截图发出来的：凡是打印出来的字，域名一律换成占位
+    class _MsMask:
+        def __init__(self, w): self._w = w
+        def write(self, t): return self._w.write(str(t).replace(_MS_DOM, "<你的域名>"))
+        def __getattr__(self, a): return getattr(self._w, a)
+    _ms_sys.stdout, _ms_sys.stderr = _MsMask(_ms_sys.stdout), _MsMask(_ms_sys.stderr)
 import json
 st = json.load(open("/etc/bgpeer/media-stack.json"))
 day, seen, fail = (st.get("heal_day") or {}), (st.get("heal_seen") or {}), (st.get("heal_fail") or {})
