@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「7 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.242"
+SCRIPT_VERSION = "1.5.243"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1143,8 +1143,15 @@ cache:
   # 注意是"进了 Emby"不是"挂在 OpenList 上"—— 没被扫进媒体库的盘不会被换直链,
   # 让它去压别人的缓存,只会把夸克那种能撑 30 小时的盘一起拖慢。
   alist_api_ttl: {ttl}
-  image_ttl: 10m
-  subtitle_ttl: 2h
+  # 【图片、字幕两份缓存关掉：各白占 300 MB 内存】仓库主人问「这个内存是不是不够用了」——
+  # 真机 docker stats：mediawarp 1.005 GiB，比 Emby（916 MiB）还大，而它刚重启 3 分钟。
+  # 源码里每一种缓存都是 bigcache.New(DefaultConfig(ttl))：1024 个分片、按 60 万条 × 500 字节
+  # 预分配，一份就是约 300 MB，开着的三份（直链 / 图片 / 字幕）正好一个 G。
+  # 直链那份必须留（上面 alist_api_ttl 那一大段）；图片是本机 Emby 自己出的、它有自己的
+  # 缓存，这一层只省一跳本机转发；字幕一部片取一次。两份关掉只慢几毫秒，省下约 600 MB。
+  # 0s = 不建这份缓存（router.go 里 ImageTTL > 0 / SubtitleTTL > 0 才挂中间件）。
+  image_ttl: 0s
+  subtitle_ttl: 0s
 
 web:
   enable: false
