@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.248"
+SCRIPT_VERSION = "1.5.249"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9168,6 +9168,17 @@ def align_library(d, key, heal=True, migrate=True):
                              f"（当天自测累计 {float(_h_st.get('mb') or 0):.0f} MB / "
                              f"上限 {heal_day_mb()} MB，{int(_h_st.get('probes') or 0)} 次）")
     normalize_strm_files(d)           # heal 中途被打断的兜底
+    # 【原盘和「不扫的目录」每小时也清一遍】AutoFilm 每一轮都会把它们重新生成出来，
+    # 以前只有每日对齐和「4 生成媒体库」清 —— 中间那段时间里，下面这步 scan_if_grown
+    # 一看 strm 数涨了就叫 Emby 扫，原盘就以「bluray 0B」进了库，和能播的那几份同名
+    # 同海报排在一起（真机：鹿鼎记 4 个里 1 个、神龙教 3 个里 1 个，点开必定 load fail）。
+    # 只删本地 strm，不碰网盘；原盘压成单 strm（collapse）那一档要列网盘目录，留给每日那轮。
+    try:
+        apply_skip_dirs(d, quiet=True)
+        if disc_policy() == "skip":
+            collapse_bluray_folders(d, quiet=True)
+    except Exception as e:
+        warn(f"清原盘 / 不扫的目录失败：{_short_err(e)}")
     # 剧集 strm 改名成带季集编号的。【必须排在 scan_if_grown 之前】——
     # 改完要让 Emby 重扫才认得出来。interactive 跟着 heal 走：heal=True 的那条
     # 路是用户手点「4」在看着的，可以问；cron 那条路不问，用记住的答案。
