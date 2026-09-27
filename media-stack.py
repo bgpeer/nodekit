@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.251"
+SCRIPT_VERSION = "1.5.252"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4355,6 +4355,31 @@ def someone_playing(key, cache_s=0):
     return on
 
 
+_HELD_AT = [0.0, None]
+
+
+def heal_backlog_hold(key, cache_s=0):
+    """整队补时长现在该不该让路 → 让路的原因；"" = 不用让。
+
+    【「点了立刻补」醒着，整队一律不补】仓库主人：「应该我点哪一集就探测哪一集，如果
+    已经被探测过有时长那就不探测，但是也不能去找别的没探测的片去探测。那个自动探测是
+    在这 30 分钟小程序沉睡之后才能自动去探测，那个小程序开着的时候不可以自动探测。」
+    真机 9/28 早上：遮天 178 开播只有几百 KB/s、过一阵才上几 MB，同一小时账本里
+    openlist 下了 393 MB —— 常驻服务一醒，整队就跟着去网盘拉别的片的开头。
+    醒着 = 最后一次点播放后 HEAL_DAEMON_IDLE_S 秒内（醒来没点播放的是 HEAL_DAEMON_WAKE_S）。
+    常驻服务没装 / 问不到时，退回看 Emby 此刻有没有人在播。
+    """
+    if cache_s and time.monotonic() - _HELD_AT[0] < cache_s and _HELD_AT[1] is not None:
+        return _HELD_AT[1]
+    why = ""
+    if heal_daemon_active() == "awake":
+        why = "「点了立刻补」醒着（最后一次点播放后 30 分钟内）"
+    elif someone_playing(key):
+        why = "有人在看片"
+    _HELD_AT[0], _HELD_AT[1] = time.monotonic(), why
+    return why
+
+
 manual_mb = [0.0]          # 最近一次 fill_covers 一共拉了多少 MB（手动那一屏报给人看）
 
 
@@ -4390,9 +4415,11 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
     manual=True 时不管每小时几张、一天几张 / 几 MB、失败隔多久再试、有没有人在看；
     只留【每一张】的保险（不认跳转的源不拉、一张超过 COVER_ONE_MB 当场掐）—— 那不是
     自动的限制，是防一张片拉掉几个 GB。手动截的流量不记进自动那本账。"""
-    if not manual and someone_playing(key):
+    # 【自动截封面跟整队补时长同一条规矩】「点了立刻补」醒着就不去网盘拉别的片，见 heal_backlog_hold
+    _why = "" if manual else heal_backlog_hold(key)
+    if _why:
         if say:
-            say("有人在看片 —— 截封面先让路，等没人看了再截。")
+            say(f"{_why} —— 截封面先让路，等它睡了再截。")
         return 0
     day = _cover_day()
     # 【旧账作废一次】1.5.232 之前的「不再试」和今天的流量数，是拿整块网卡量出来的
@@ -4444,7 +4471,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
     manual_mb[0] = 0.0
     meter, _mlab = _heal_meter()
     for uid, iid, name, path, secs in todo:
-        if not manual and someone_playing(key, cache_s=30):
+        if not manual and heal_backlog_hold(key, cache_s=10):
             if say:
                 say("有人开始看片了 —— 剩下的先不截，让路。")
             break
@@ -14025,12 +14052,20 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     # 那一分钟后台正在同时补龙虎门、变形金刚、大话西游……好几路一起去网盘拉原片开头。
     # 同一个网盘账号，服务器这边拉得越凶，手机那一路越慢。补积压不急，等没人看了再补；
     # 刚点开的那一集（开播前 / 看片后）照补不误 —— 那是人在等的
+    # 【手动敲的整队不让路】终端里亲手敲 media-stack heal（不带片名），就是现在要补；
+    # 让路管的是自动那几条（每小时、每日、生成媒体库之后、看片后顺带的整队）
     global _HEAL_YIELD
-    _HEAL_YIELD = (_how_try == "整队")
-    if _how_try == "整队" and someone_playing(key):
-        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（整队）让路："
-                  f"有人在看片，等没人看了再补"])
+    _HEAL_YIELD = (_how_try == "整队" and not has_tty())
+    _why = heal_backlog_hold(key) if _HEAL_YIELD else ""
+    if _why:
+        # 【同一个原因只记一次】醒着那半小时每分钟一轮，一轮一行会把流水淹掉
+        if ms_state().get("heal_hold_sig") != _why:
+            save_ms_state(heal_hold_sig=_why)
+            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（整队）让路："
+                      f"{_why}，等它睡了再补；只补你点开的那一集"])
         return
+    if _HEAL_YIELD:
+        save_ms_state(heal_hold_sig="")
     if _how_try == "整队":
         _now_s = time.time()
         _loose = [x for x in allpend if heal_unstuck(x[1], _now_s)]
@@ -14883,8 +14918,8 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
     def run(_it):
         if stop.is_set():
             return None               # 已经拉停了，排队没轮到的直接作废
-        if _HEAL_YIELD and someone_playing(key, cache_s=30):
-            stop.set()                # 补到一半有人开播了：剩下的这一轮不补了，让路
+        if _HEAL_YIELD and heal_backlog_hold(key, cache_s=10):
+            stop.set()                # 补到一半有人点了播放：剩下的这一轮不补了，让路
             return None
         return (_it,) + _heal_one(d, key, _it, base, token)
 
