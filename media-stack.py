@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.256"
+SCRIPT_VERSION = "1.5.257"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -1644,6 +1644,7 @@ case "${1:-info}" in
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「5 链路体检」)
+  name-fix        片名纠正：文件夹名骗了 Emby 的电影，按文件名马上重认一遍
   traffic [日期]  流量账本：每 5 分钟谁吃了多少流量(等同菜单里的「6 流量账本」)
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
@@ -1835,6 +1836,10 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" covers "$@" ;;
+  name-fix)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" name-fix ;;
   traffic)
     # 【壳里必须有它】README 和体检都写着「命令行看：media-stack traffic [日期]」，
     # 上一版壳里却没有这一条，敲下去就是「未知命令」（真机 9/28）
@@ -11361,13 +11366,19 @@ def movie_name_suspects(d, key):
             continue
         try:
             r = _emby(f"/Users/{uid}/Items?ParentId={lb['ItemId']}&Recursive=true"
-                      f"&IncludeItemTypes=Movie&Fields=Path,OriginalTitle,ProductionYear,"
-                      f"ProviderIds", key, timeout=60)
+                      f"&IncludeItemTypes=Movie&Fields=Path,MediaSources,OriginalTitle,"
+                      f"ProductionYear,ProviderIds", key, timeout=60)
         except Exception:
             return None
         for it in r.get("Items") or []:
+            # 【条目的 Path 可能是文件夹】一部片单独一个文件夹时，Emby 把整个文件夹当成这部
+            # 电影，Path 是文件夹、strm 在 MediaSources 里 —— 而这正是"拿文件夹名去刮"的那种，
+            # 最该管。上一版只认 .strm 结尾的 Path，真机奇异博士（Path=…/奇异博士/1）被跳过了。
             p = str(it.get("Path") or "")
             if not p.endswith(".strm"):
+                p = next((str(x.get("Path") or "") for x in (it.get("MediaSources") or [])
+                          if str(x.get("Path") or "").endswith(".strm")), "")
+            if not p:
                 continue
             folder = os.path.basename(os.path.dirname(p))
             stem = os.path.splitext(os.path.basename(p))[0]
@@ -22718,6 +22729,30 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("traffic-sample"):
                 do_traffic_sample()      # 它自己就是记账的，不用再给自己记一笔
+        elif arg == "name-fix":           # 片名纠正：马上跑一轮，屏上说清改了哪些
+            require_root()
+            _d = ms_install_dir()
+            _k = read_yaml_scalar(os.path.join(_d, "mediawarp", "config", "config.yaml"), "auth")
+            if not _k:
+                warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
+            else:
+                _sus = movie_name_suspects(_d, _k)
+                if _sus is None:
+                    warn("问不到 Emby。")
+                elif not _sus:
+                    ok("没有文件夹名骗了 Emby 的电影。")
+                else:
+                    info(f"{len(_sus)} 部可能认错，按文件名重新识别……")
+                    _n = fix_movie_names(_d, _k, quiet=False)
+                    _nf = ms_state().get("name_fix") or {}
+                    for _it, _t, _y, _f in _sus:
+                        _st = _nf.get(str(_it.get("Id")), "")
+                        print(f"  {_it.get('Name')}  ←  文件名「{_t}」{_y or ''}  "
+                              + {"fixed": f"{GREEN}已重认{RST}",
+                                 "nomatch": f"{YELLOW}搜不到对得上的，没动{RST}",
+                                 "taken": f"{YELLOW}库里已有一个是它，没动{RST}"}.get(_st, f"{DIM}这轮没轮到{RST}"))
+                    if not _n:
+                        tip("没动的到 Emby 里「…→识别」手动指定")
         elif arg == "traffic":            # 手动看账本
             traffic_report(sys.argv[2] if len(sys.argv) > 2 else None)
         elif arg == "heal":               # 「4」扔后台的补时长；手动敲也走这条
