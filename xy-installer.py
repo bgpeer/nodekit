@@ -4402,13 +4402,32 @@ def cn_block_menu():
     """打开独立的 cn-block.py 交互菜单（屏蔽 CN 域名/IP + 白名单）。"""
     if not ensure_cn_block():
         print("拉取 cn-block.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {CN_BLOCK_LOCAL}", shell=True)
+    _run_child(f"python3 {CN_BLOCK_LOCAL}")
+
+def _run_child(cmd, **kw):
+    """跑一个有自己菜单的子脚本，等它自己退出。
+
+    【Ctrl-C 只该打断子脚本】终端按 Ctrl-C 时整个前台进程组都收到 SIGINT —— 子脚本
+    （比如 media-stack「生成媒体库」屏上写着「Ctrl-C 随时走人」）接住了，本脚本却在
+    subprocess.run 里跟着抛 KeyboardInterrupt 整个退出：满屏报错，子脚本还留在终端里
+    跟 shell 抢输入（真机 9/28：「请选择: 请选择:」）。这里接住，接着等它。
+    不用 SIG_IGN：忽略会被子进程继承，那边的 Ctrl-C 就失灵了。
+    【不经过 sh】shell=True 时中间隔着一层 sh，Ctrl-C 先把 sh 打死，这里 wait() 立刻返回，
+    本脚本以为子脚本退了、接着出自己的菜单 —— 而子脚本还活着，两层菜单抢一个终端。"""
+    import shlex
+    p = subprocess.Popen(shlex.split(cmd), **kw)
+    while True:
+        try:
+            return p.wait()
+        except KeyboardInterrupt:
+            continue
+
 
 def adguard_menu():
     """打开独立的 adguard-dns.py 交互菜单（自建 DNS · AdGuard Home）。"""
     if not ensure_remote_script(ADGUARD_URL, ADGUARD_LOCAL):
         print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {ADGUARD_LOCAL}", shell=True)
+    _run_child(f"python3 {ADGUARD_LOCAL}")
 
 def media_stack_menu():
     """打开独立的 media-stack.py（自建 Emby·网盘直链媒体服务器）。
@@ -4420,7 +4439,7 @@ def media_stack_menu():
     """
     if not ensure_remote_script(MEDIA_URL, MEDIA_LOCAL):
         print("拉取 media-stack.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {MEDIA_LOCAL}", shell=True)
+    _run_child(f"python3 {MEDIA_LOCAL}")
 
 def _ghrelay_regen():
     """重新生成三格式订阅 + 重写托管服务（含中转/新 token）。"""
@@ -4717,8 +4736,8 @@ def _run_net_optimize(args="", env_extra=None):
        脚本自带 SHA256 校验的自动更新，本地缓存旧了它会自己换到最新版再执行。"""
     if not ensure_remote_script(NETOPT_URL, NETOPT_LOCAL):
         print("拉取 net-optimize.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {NETOPT_LOCAL} {args}".strip(), shell=True,
-                   env=dict(os.environ, **(env_extra or {})))
+    _run_child(f"python3 {NETOPT_LOCAL} {args}".strip(),
+               env=dict(os.environ, **(env_extra or {})))
 
 def _ago(ts):
     """把时间戳说成人话：刚刚 / 3 小时前 / 2 天前。"""
@@ -4787,7 +4806,7 @@ def vps_check_menu():
         arg = " " + ip
     if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
         print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); return
-    subprocess.run(f"python3 {VPSCHK_LOCAL}{arg}", shell=True)
+    _run_child(f"python3 {VPSCHK_LOCAL}{arg}")
 
 def _netopt_state():
     """读网络优化当前档位。返回 (mode, mb)：
