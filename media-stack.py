@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.260"
+SCRIPT_VERSION = "1.5.261"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1637,7 +1637,8 @@ case "${1:-info}" in
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
   hls-direct on|off       转码流分片直连网盘（不再每段绕服务器），默认开
-  play-speed <片名> [--wait 秒] [--ua browser]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
+  play-speed <片名> [--wait 秒] [--ua browser] [--at 分钟]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
+                  （--at 8：从第 8 分钟开始拉 —— 播到一半卡的，趁卡的时候测同一段）
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
                   (--no-play 只看不按)
   heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
@@ -4788,7 +4789,7 @@ def _play_start(iid, msid, key):
     return out
 
 
-def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist=""):
+def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist="", start_s=0.0):
     """照播放器的样子拉 url：普通文件从头连续读；m3u8 就一个分片一个分片地读。
     playlist：本机服务已经给了改好的播放列表（分片是完整地址），就不用再去要 url。
     → {"kind", "ttfb", "bytes", "t", "per_s": [每秒 KB], "err"}"""
@@ -4837,8 +4838,27 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist=
                 sub = r2.read(1 << 20).decode("utf-8", "replace")
                 base = r2.geturl()
                 r2.close()
+                body = sub
                 segs = [urllib.parse.urljoin(base, ln.strip()) for ln in sub.splitlines()
                         if ln.strip() and not ln.startswith("#")]
+            if start_s > 0:
+                # 【从第几秒开始】按 #EXTINF 累加每段的秒数，跳过 start_s 之前的分片
+                durs, cur = [], None
+                for ln in body.splitlines():
+                    mx = re.match(r"#EXTINF:\s*([0-9.]+)", ln.strip())
+                    if mx:
+                        cur = float(mx.group(1))
+                    elif ln.strip() and not ln.startswith("#"):
+                        durs.append(cur or 0.0)
+                        cur = None
+                acc, skip = 0.0, 0
+                for dsec in durs:
+                    if acc + dsec > start_s:
+                        break
+                    acc += dsec
+                    skip += 1
+                segs = segs[skip:]
+                res["kind"] += f"，从 {acc / 60:.1f} 分开始"
             for sg in segs:
                 if res["bytes"] >= cap or time.monotonic() - t0 >= secs:
                     break
@@ -4846,6 +4866,8 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist=
                                             timeout=30) as rs:
                     _read_all(rs)
         else:
+            if start_s > 0:
+                res["kind"] += "（整文件，--at 只对转码流有用，这里从头拉）"
             res["ttfb"] = time.monotonic() - t0
             _feed(len(head))
             _read_all(r)
@@ -4858,8 +4880,12 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist=
     return res
 
 
-def do_play_speed(q, wait=5, ua="player"):
-    """media-stack play-speed <片名> [--wait 秒]：替你播两次，看第一次是不是比第二次慢。"""
+def do_play_speed(q, wait=5, ua="player", at_min=0.0):
+    """media-stack play-speed <片名> [--wait 秒] [--at 分钟]：替你播两次，看第一次是不是比第二次慢。
+
+    【--at】真机 9/28 遮天 179：开头几 MB/s，播到 8 分钟一直一两百 KB 卡着。分片是手机
+    直连网盘的，服务器看不见 —— 能做的是趁卡的时候，从服务器拉【同一集、同一个位置】的
+    分片对照：服务器也慢 = 网盘那几段慢；服务器快 = 手机到网盘那一路的事。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn("还没安装。")
@@ -4878,7 +4904,8 @@ def do_play_speed(q, wait=5, ua="player"):
         return
     uid, iid, name = hits[0][0], str(hits[0][1]), hits[0][2]
     st0 = _trace_item(key, uid, iid) or {"ticks": 0, "msid": f"mediasource_{iid}"}
-    print(f"\n  {BOLD}第一次 / 第二次播放测速{RST}  {name}")
+    print(f"\n  {BOLD}第一次 / 第二次播放测速{RST}  {name}"
+          + (f"  {DIM}从第 {at_min:g} 分钟开始{RST}" if at_min else ""))
     print(f"  {DIM}在这台服务器上替你按两次播放，每次拉 {PLAY_SPEED_S} 秒（最多 "
           f"{PLAY_SPEED_MB} MB），中间断开 {wait} 秒。测的是【服务器到网盘】这一段，"
           f"不是你手机到网盘那一段。{RST}")
@@ -4896,7 +4923,8 @@ def do_play_speed(q, wait=5, ua="player"):
         if st["err"]:
             _trace_row("✖", f"第 {n} 次", st["err"])
             return
-        sp = _pull_speed(st["loc"], ua=_ua, playlist=st.get("playlist") or "")
+        sp = _pull_speed(st["loc"], ua=_ua, playlist=st.get("playlist") or "",
+                         start_s=at_min * 60)
         rows.append((st, sp))
         avg = sp["bytes"] / sp["t"] / 1024
         _trace_row("·", f"第 {n} 次", f"PlaybackInfo {st['pi']:.1f}s → "
@@ -22815,7 +22843,16 @@ if __name__ == "__main__":
                 _i = _a.index("--ua")
                 _u = (_a[_i + 1] if _i + 1 < len(_a) else "player")
                 del _a[_i:_i + 2]
-            do_play_speed(" ".join(_a).strip(), wait=_w, ua=_u)
+            # 【--at 分钟】从片子中间某个位置开始拉 —— 播到一半卡的，要测的是那一段
+            _at = 0.0
+            if "--at" in _a:
+                _i = _a.index("--at")
+                try:
+                    _at = max(0.0, float(_a[_i + 1]))
+                    del _a[_i:_i + 2]
+                except (IndexError, ValueError):
+                    del _a[_i:]
+            do_play_speed(" ".join(_a).strip(), wait=_w, ua=_u, at_min=_at)
         elif arg == "covers":             # 没刮到封面的：截一帧当封面
             require_root()
             do_covers(retry="--retry" in sys.argv[2:])
