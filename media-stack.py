@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.261"
+SCRIPT_VERSION = "1.5.262"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2508,8 +2508,22 @@ def do_hls_fix():
             if ms:
                 # 【阿里转码流】开了开关的盘 → 302 到阿里的 m3u8；
                 # 【115】拿播放器自己的 UA 换链 → 302；别的一律原样交回 MediaWarp
-                url = (ali_of(ms.group(1))
-                       or p115_of(ms.group(1), self.headers.get("User-Agent") or ""))
+                # 【开播计时：拿列表之前那两步】真机 9/28 21:15 遮天 179：门预取等满 15 秒没取到，
+                # 而真去网盘拿列表只花了 3.9 秒 —— 卡在前面。判阿里 / 判 115 都要问一次 Emby
+                # （这集在哪个盘）、读一次 OpenList 存储表；冷的时候哪一步慢，分开记
+                _ta = time.monotonic()
+                url = ali_of(ms.group(1))
+                _tb = time.monotonic()
+                if not url:
+                    url = p115_of(ms.group(1), self.headers.get("User-Agent") or "")
+                _tc = time.monotonic()
+                if _tc - _ta > 1.5:
+                    try:
+                        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务"
+                                  f"拿列表之前　判阿里 {_tb - _ta:.1f}s、判 115 {_tc - _tb:.1f}s"
+                                  f"{_log_tag(ms.group(1))}"])
+                    except Exception:
+                        pass
                 # 【试验：转码流的播放列表改好再给】见 m3u8_absolutize 上面那段
                 pl = ("" if url or not direct_on()
                       else playlist_of(ms.group(1), self.headers.get("User-Agent") or ""))
