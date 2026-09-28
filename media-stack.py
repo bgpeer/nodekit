@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.255"
+SCRIPT_VERSION = "1.5.256"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -9303,6 +9303,10 @@ def align_library(d, key, heal=True, migrate=True):
         warn(f"给剧集 strm 补季集编号失败：{_short_err(e)}")
     apply_title_policy(d, key)        # 条目级：片名跟着网盘文件走
     split_shared_identities(d, key)   # 条目级：进度条身份互相独立
+    try:
+        fix_movie_names(d, key, quiet=not has_tty())   # 条目级：文件夹名骗了 Emby 的，按文件名重认
+    except Exception as e:
+        warn(f"片名纠正失败：{_short_err(e)}")
     # 条目级：清掉位置 > 片长的脏数据。清了哪些要往下传 —— 下面那步得知道
     # 这些"没进度"是脚本自己刚打的零，不是用户标的未播放
     zeroed = clear_impossible_progress(key)
@@ -11267,6 +11271,189 @@ def strip_nfo_ids(strm_host_path):
         return False
     print(f"  {DIM}·{RST} 已从 {os.path.basename(nfo)} 里抠掉刮削 id")
     return True
+
+
+# ============================================================================ 片名纠正
+# 仓库主人：「做一个名称筛选模块……生成媒体的时候就把这个名称识别更正」。
+# 真机 9/28：七米蓝「漫威/奇异博士/1/Doctor.Strange.2016.2160p….mkv」在 Emby 里成了
+# 《星球大战外传1：侠盗一号》。一部电影单独放一个文件夹时，Emby 拿【文件夹名】去刮削 ——
+# 这里文件夹叫「1」，拿「1」+2016 去 TMDb 一搜，最像的就是 Rogue One（中文名里正好有个 1）。
+# 【思路跟 guessit / PTN 一样，但不引依赖】这个脚本是单文件直接跑的，guessit 要拖一串包。
+# 我们要的只有两样：文件名里的片名和年份，自己解析足够。
+# 【不动文件】AutoFilm 每一轮按网盘原样镜像 strm，挪了它会再生成一份；只让 Emby 重新识别。
+NAME_JUNK_DIR = re.compile(
+    r"(?i)^(?:\d{1,3}|cd\s*\d+|dis[ck]\s*\d+|part\s*\d+|pt\s*\d+|s\d{1,2}|season\s*\d+|"
+    r"[48]k|uhd|hdr|sdr|dv|\d{3,4}[pi]|blu-?ray|bd(?:rip)?|web(?:-?dl|rip)?|remux|hevc|"
+    r"x26[45]|h\.?26[45]|原盘|蓝光|高清|超清|国语|粤语|中字|合集|系列|全集|大合集|正片|电影|movie|video|"
+    r"其他|其它|新建文件夹|new folder)$")
+NAME_STOP = re.compile(
+    r"(?i)^(?:\d{3,4}[pi]|[48]k|uhd|hdr\d*|sdr|dv|dovi|blu-?ray|bd(?:rip)?|bdremux|remux|"
+    r"web(?:-?dl|rip)?|hdtv|dvd(?:rip)?|x26[45]|h\.?26[45]|hevc|avc|aac\d*|ac3|dts\S*|truehd|"
+    r"atmos|ddp?\d?(?:\.\d)?|10bit|8bit|\d+audios?|国粤双语|国语|粤语|中字|中英双字|双语|"
+    r"proper|repack|extended|unrated|imax|director'?s)$")
+NAME_JAV = re.compile(r"(?i)(?:^|[^a-z])(?:fc2|[a-z]{2,6})[-_ ]?\d{2,7}(?:[^0-9]|$)")
+NAME_FIX_MAX = 20            # 一轮最多重新识别几部（每部两次 Emby → TMDb 的查询）
+
+
+def parse_release_name(stem):
+    """网盘文件名 → (片名, 年份或 0)。认不出返回 ("", 0)。
+
+    「Doctor.Strange.2016.2160p.BluRay…」→ ("Doctor Strange", 2016)
+    「[鹿鼎记  邵氏 4K  国粤双语]」→ ("鹿鼎记", 0)
+    「[星际探索].Ad.Astra.2019.BD-1080p…」→ ("星际探索", 2019)
+    """
+    stem = str(stem or "").strip()
+    year = 0
+    # 【开头那个不算年份】「2012.2009.1080p」—— 片名本身就叫 2012
+    ym = next((x for x in re.finditer(r"(?<![0-9])(19[2-9]\d|20[0-4]\d)(?![0-9])", stem)
+               if x.start() > 0), None)
+    if ym:
+        year = int(ym.group(1))
+    bm = re.match(r"^\s*[\[【]([^\]】]+)[\]】]", stem)
+    if bm and re.search(r"[一-鿿]", bm.group(1)):
+        t = re.split(r"\s+", bm.group(1).strip())[0]
+        return (t, year) if len(t) >= 2 else ("", 0)
+    s0 = re.sub(r"[\[【(（][^\]】)）]*[\]】)）]", " ", stem)       # 其余括号里的多半是标签
+    words = [w for w in re.split(r"[\s._]+", s0) if w]
+    out = []
+    for w in words:
+        if (year and w == str(year)) or NAME_STOP.match(w):
+            break
+        out.append(w)
+    t = " ".join(out).strip(" -")
+    if len(re.sub(r"\W", "", t)) < 2:
+        return "", 0
+    return t, year
+
+
+def _name_key(s):
+    return re.sub(r"[\W_]+", "", str(s or "").lower())
+
+
+def _name_match(want, *have):
+    w = _name_key(want)
+    if not w:
+        return True
+    for h in have:
+        k = _name_key(h)
+        if k and (w in k or k in w):
+            return True
+    return False
+
+
+def movie_name_suspects(d, key):
+    """文件夹名不像片名、而 Emby 认出来的片名和文件名对不上的电影 → [(条目, 片名, 年份, 文件夹名)]。
+    问不到返回 None。番号片、带季集号的、装了 MetaTube 的库都不管。"""
+    try:
+        libs = _emby("/Library/VirtualFolders", key) or []
+        users = _emby("/Users", key)
+    except Exception:
+        return None
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return None
+    out = []
+    for lb in libs:
+        if not lb.get("ItemId") or not is_strm_lib(lb):
+            continue
+        _fx = json.dumps((lb.get("LibraryOptions") or {}).get("TypeOptions") or [])
+        if "metatube" in _fx.lower():
+            continue
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={lb['ItemId']}&Recursive=true"
+                      f"&IncludeItemTypes=Movie&Fields=Path,OriginalTitle,ProductionYear,"
+                      f"ProviderIds", key, timeout=60)
+        except Exception:
+            return None
+        for it in r.get("Items") or []:
+            p = str(it.get("Path") or "")
+            if not p.endswith(".strm"):
+                continue
+            folder = os.path.basename(os.path.dirname(p))
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if not NAME_JUNK_DIR.match(folder.strip()):
+                continue
+            if EP_HAS_SE.search(stem) or NAME_JAV.search(stem):
+                continue
+            t, y = parse_release_name(stem)
+            if not t:
+                continue
+            if _name_match(t, it.get("Name"), it.get("OriginalTitle")):
+                continue
+            out.append((it, t, y, folder))
+    return out
+
+
+def fix_movie_names(d, key, quiet=True):
+    """把 movie_name_suspects 找到的，按文件名里的片名 + 年份让 Emby 重新识别。返回改了几部。
+
+    【对不上就不改】搜回来的结果，名字（中文名或原名）和年份（差一年以内）都对得上文件名
+    才用；一个都对不上就留着，不瞎猜 —— 猜错比不改更糟。
+    【撞身份的不改】别的条目已经是这部片（同一个 TMDb 编号）了，再认过去两个就共用观看进度，
+    split_shared_identities 下一轮又会把两边一起清掉 —— 来回拉锯。
+    【一部只试一次】结果记进状态文件，改过的、没搜到的都不再试。
+    """
+    sus = movie_name_suspects(d, key)
+    if not sus:
+        return 0
+    done = dict(ms_state().get("name_fix") or {})
+    taken = set()
+    try:
+        users = _emby("/Users", key)
+        uid = (users[0] or {}).get("Id", "")
+        for it in (_emby(f"/Users/{uid}/Items?Recursive=true&IncludeItemTypes=Movie"
+                         f"&Fields=ProviderIds", key, timeout=60).get("Items") or []):
+            tm = (it.get("ProviderIds") or {}).get("Tmdb")
+            if tm:
+                taken.add(str(tm))
+    except Exception:
+        return 0
+    n, logs = 0, []
+    for it, t, y, folder in sus[:NAME_FIX_MAX * 3]:
+        iid = str(it.get("Id"))
+        if iid in done or n >= NAME_FIX_MAX:
+            continue
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            res = _emby("/Items/RemoteSearch/Movie", key, method="POST", timeout=60,
+                        body={"SearchInfo": {"Name": t, "Year": y or None}, "ItemId": iid}) or []
+        except Exception:
+            continue                       # 问不到，下一轮再试
+        pick = None
+        for c in res:
+            cy = int(c.get("ProductionYear") or 0)
+            if y and cy and abs(cy - y) > 1:
+                continue
+            if _name_match(t, c.get("Name"), c.get("OriginalTitle")):
+                pick = c
+                break
+        tm = str((pick or {}).get("ProviderIds", {}).get("Tmdb") or "") if pick else ""
+        if not pick:
+            done[iid] = "nomatch"
+            logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」文件名是「{t}」{y or ''}，"
+                        f"搜不到对得上的，不动")
+            continue
+        if tm and tm in taken:
+            done[iid] = "taken"
+            logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」该是「{pick.get('Name')}」，"
+                        f"但库里已经有一个认成它了（会共用观看进度），不动")
+            continue
+        try:
+            _emby(f"/Items/RemoteSearch/Apply/{iid}?ReplaceAllImages=true", key,
+                  method="POST", body=pick, timeout=60)
+        except Exception:
+            continue
+        done[iid] = "fixed"
+        if tm:
+            taken.add(tm)
+        n += 1
+        logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」→「{pick.get('Name')}」"
+                    f"{pick.get('ProductionYear') or ''}（文件夹叫「{folder}」，按文件名重新识别）")
+    save_ms_state(name_fix=done)
+    heal_log(logs)
+    if n and not quiet:
+        ok(f"{n} 部电影按文件名重新识别了片名（文件夹名不像片名，Emby 认错了）")
+    return n
 
 
 def split_shared_identities(d, key):
@@ -21800,6 +21987,20 @@ def do_healthcheck():
                              "网盘片子常常在 TMDb 上没有对应条目，那就把刮削身份清掉"))
             else:
                 _hc("刮削身份", "ok", "没有条目撞身份")
+
+            # ---- 文件夹名骗了 Emby 的电影（见 fix_movie_names）----
+            _sus = movie_name_suspects(d, key) or []
+            _nf = ms_state().get("name_fix") or {}
+            _left = [x for x in _sus if _nf.get(str(x[0].get("Id"))) != "fixed"]
+            if _left:
+                _it, _t, _y, _f = _left[0]
+                _hc("片名纠正", "warn",
+                    f"{len(_left)} 部可能认错  「{_it.get('Name')}」文件名是「{_t}」"
+                    + (" 等" if len(_left) > 1 else ""))
+                todo.append((f"{len(_left)} 部电影所在文件夹名不像片名（如「{_f}」），Emby 可能认错了",
+                             "每小时对齐会按文件名自动重认；搜不到对得上的，到 Emby 里「…→识别」手动指定"))
+            elif slibs:
+                _hc("片名纠正", "ok", "没有文件夹名骗了 Emby 的电影")
 
             # ---- 一个刮削源都没认出来的条目 ----
             # 【和"撞身份"是相反的一头】那个是认得太狠、几个文件认成同一部；这个是谁都不认，
