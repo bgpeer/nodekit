@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.254"
+SCRIPT_VERSION = "1.5.255"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2161,7 +2161,9 @@ P115_TTL = 600            # 同一集、同一个 UA 的直链缓存多久（115
 # media-stack hls-direct off 关掉，一切照旧。
 # 【阿里转码流不走这条】阿里的分片签名只有十几分钟（见 ali-check），列表一次写死完整地址，
 # 长片播到后面会过期；它照旧走相对路径 + 本机 302，那条路每次都按新的地址指。
-HLS_DIRECT_TTL = 300       # 同一集改好的播放列表缓存多久（秒）
+# 【只为"门先取好、播放器紧接着来拿"那几秒】真机 9/28 play-speed：同一份播放列表隔 5 秒
+# 再用一遍，分片一段都拉不下来。缓存久了反而把用过的旧列表发给下一场，所以压短
+HLS_DIRECT_TTL = 60        # 同一集改好的播放列表缓存多久（秒）
 
 
 def hls_direct_on():
@@ -2962,6 +2964,40 @@ def is_play_click(uri):
     return bool(re.search(r"[?&]StartTimeTicks=", uri or "", re.I))
 
 
+def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S):
+    """门那一下替播放器先要一次 /stream（打给本机换链服务）→ "playlist" / "redirect" / ""。
+
+    【为什么】已经探好的一集，开播前还要走两步都要跨境连网盘的活：先验缓存里的直链
+    （link_stale_fix，2~3 秒），播放器再来要 /stream 时换链服务现取 m3u8（2.5~5 秒）——
+    真机 9/28 play-speed：PlaybackInfo 2.4s → 拿到播放列表 4.8s。一前一后，开头就等好几秒。
+    取到播放列表本身就证明缓存里的直链是活的，用不着先单独验一遍；取好的列表进换链服务
+    的缓存，播放器紧接着来要的时候直接拿走。
+      "playlist" 夸克这类转码流：列表已取好、直链是活的 → 不用再验
+      "redirect" 阿里转码流 / 115：换链服务自己现换的地址，跟 MediaWarp 的缓存无关 → 不用验
+      ""         其余（整文件走 MediaWarp 的、换链服务没装、取失败）→ 照旧去验
+    用播放器自己的 UA 去要：115 按 UA 签链，取好的正好是它要的那一条。
+    """
+    import http.client
+    if not hls_port() or not os.path.exists(HLS_UNIT):
+        return ""
+    try:
+        c = http.client.HTTPConnection("127.0.0.1", hls_port(), timeout=timeout)
+        c.request("GET", f"/emby/videos/{iid}/stream?Static=true",
+                  headers={"User-Agent": ua or PLAYER_UA})
+        r = c.getresponse()
+        ctype = (r.getheader("Content-Type") or "").lower()
+        loc = r.getheader("Location") or ""
+        r.read(2 << 20)
+        c.close()
+    except Exception:
+        return ""
+    if r.status == 200 and "mpegurl" in ctype:
+        return "playlist"
+    if r.status in (301, 302, 307) and loc:
+        return "redirect"
+    return ""
+
+
 def do_heal_gate():
     """systemd socket 拉起来的：nginx 放行 PlaybackInfo 之前来问一声。
 
@@ -3022,10 +3058,13 @@ def do_heal_gate():
                     with lock:
                         ev = busy.get(iid)
                     if ev is None and not _probe_busy_now(iid):
-                        # 【先验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
+                        # 【先替播放器把 /stream 要好】取到了就说明直链是活的，不用再验，
+                        # 播放器紧接着来要时直接命中 —— 见 gate_prefetch_stream
+                        # 【没取到才验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
                         # 之后一帧不出（遮天 181）。命中缓存又活着的，多花不到两秒
                         try:
-                            link_stale_fix(iid, key)
+                            if not gate_prefetch_stream(iid, self.headers.get("User-Agent") or ""):
+                                link_stale_fix(iid, key)
                         except Exception:
                             pass
                     if ev is None and heal_auto_on():
