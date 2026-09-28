@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.257"
+SCRIPT_VERSION = "1.5.258"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11336,12 +11336,15 @@ def _name_key(s):
 
 
 def _name_match(want, *have):
+    """两个片名算不算同一部。一个包含另一个，或者只差一两个字（「007之八爪女」和
+    「007：八爪女」—— 真机 9/28 name-fix 把 17 部认对了的 007 全报成了嫌疑）。"""
+    import difflib
     w = _name_key(want)
     if not w:
         return True
     for h in have:
         k = _name_key(h)
-        if k and (w in k or k in w):
+        if k and (w in k or k in w or difflib.SequenceMatcher(None, w, k).ratio() >= 0.75):
             return True
     return False
 
@@ -11407,8 +11410,9 @@ def fix_movie_names(d, key, quiet=True):
     sus = movie_name_suspects(d, key)
     if not sus:
         return 0
-    done = dict(ms_state().get("name_fix") or {})
-    taken = set()
+    # 【name_fix2】1.5.256/257 的判法有三处错（见下），那两版记下的「没动」不作数，重新来过
+    done = dict(ms_state().get("name_fix2") or {})
+    taken = {}                         # TMDb 编号 → 哪个条目占着
     try:
         users = _emby("/Users", key)
         uid = (users[0] or {}).get("Id", "")
@@ -11416,35 +11420,59 @@ def fix_movie_names(d, key, quiet=True):
                          f"&Fields=ProviderIds", key, timeout=60).get("Items") or []):
             tm = (it.get("ProviderIds") or {}).get("Tmdb")
             if tm:
-                taken.add(str(tm))
+                taken.setdefault(str(tm), str(it.get("Id")))
     except Exception:
         return 0
+
+    def _search(name, year, iid, lang=None):
+        si = {"Name": name, "Year": year or None}
+        if lang:
+            si["MetadataLanguage"] = lang
+        return _emby("/Items/RemoteSearch/Movie", key, method="POST", timeout=60,
+                     body={"SearchInfo": si, "ItemId": iid}) or []
+
+    def _year_ok(c, y):
+        cy = int(c.get("ProductionYear") or 0)
+        return not (y and cy and abs(cy - y) > 1)
     n, logs = 0, []
     for it, t, y, folder in sus[:NAME_FIX_MAX * 3]:
         iid = str(it.get("Id"))
         if iid in done or n >= NAME_FIX_MAX:
             continue
         stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        # 【英文文件名要用英文搜一遍来核对】识别接口回来的结果只有库语言的名字（奇异博士），
+        # 不带原名 —— 拿「Doctor Strange」跟「奇异博士」比永远对不上（真机 9/28 就这么没动）。
+        # 片名是英文时再按英文搜一次：英文名对得上的那几个 TMDb 编号，就是认可的答案。
         try:
-            res = _emby("/Items/RemoteSearch/Movie", key, method="POST", timeout=60,
-                        body={"SearchInfo": {"Name": t, "Year": y or None}, "ItemId": iid}) or []
+            res = _search(t, y, iid)
+            en_ok = set()
+            if re.fullmatch(r"[\x20-\x7e]+", t):
+                for c in _search(t, y, iid, "en"):
+                    if _year_ok(c, y) and _name_match(t, c.get("Name"), c.get("OriginalTitle")):
+                        tm0 = str((c.get("ProviderIds") or {}).get("Tmdb") or "")
+                        if tm0:
+                            en_ok.add(tm0)
         except Exception:
             continue                       # 问不到，下一轮再试
         pick = None
         for c in res:
-            cy = int(c.get("ProductionYear") or 0)
-            if y and cy and abs(cy - y) > 1:
+            if not _year_ok(c, y):
                 continue
-            if _name_match(t, c.get("Name"), c.get("OriginalTitle")):
+            if (_name_match(t, c.get("Name"), c.get("OriginalTitle"))
+                    or str((c.get("ProviderIds") or {}).get("Tmdb") or "") in en_ok):
                 pick = c
                 break
         tm = str((pick or {}).get("ProviderIds", {}).get("Tmdb") or "") if pick else ""
+        if pick and tm and tm == str((it.get("ProviderIds") or {}).get("Tmdb") or ""):
+            done[iid] = "same"             # 搜出来的就是它现在这个 —— 其实没认错
+            continue
         if not pick:
             done[iid] = "nomatch"
             logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」文件名是「{t}」{y or ''}，"
                         f"搜不到对得上的，不动")
             continue
-        if tm and tm in taken:
+        # 【占着这个编号的是它自己不算】上一版没排除自己，认对了的全报成「库里已有一个是它」
+        if tm and taken.get(tm, iid) != iid:
             done[iid] = "taken"
             logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」该是「{pick.get('Name')}」，"
                         f"但库里已经有一个认成它了（会共用观看进度），不动")
@@ -11456,11 +11484,11 @@ def fix_movie_names(d, key, quiet=True):
             continue
         done[iid] = "fixed"
         if tm:
-            taken.add(tm)
+            taken[tm] = iid
         n += 1
         logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」→「{pick.get('Name')}」"
                     f"{pick.get('ProductionYear') or ''}（文件夹叫「{folder}」，按文件名重新识别）")
-    save_ms_state(name_fix=done)
+    save_ms_state(name_fix2=done)
     heal_log(logs)
     if n and not quiet:
         ok(f"{n} 部电影按文件名重新识别了片名（文件夹名不像片名，Emby 认错了）")
@@ -22001,8 +22029,8 @@ def do_healthcheck():
 
             # ---- 文件夹名骗了 Emby 的电影（见 fix_movie_names）----
             _sus = movie_name_suspects(d, key) or []
-            _nf = ms_state().get("name_fix") or {}
-            _left = [x for x in _sus if _nf.get(str(x[0].get("Id"))) != "fixed"]
+            _nf = ms_state().get("name_fix2") or {}
+            _left = [x for x in _sus if _nf.get(str(x[0].get("Id"))) not in ("fixed", "same")]
             if _left:
                 _it, _t, _y, _f = _left[0]
                 _hc("片名纠正", "warn",
@@ -22744,11 +22772,12 @@ if __name__ == "__main__":
                 else:
                     info(f"{len(_sus)} 部可能认错，按文件名重新识别……")
                     _n = fix_movie_names(_d, _k, quiet=False)
-                    _nf = ms_state().get("name_fix") or {}
+                    _nf = ms_state().get("name_fix2") or {}
                     for _it, _t, _y, _f in _sus:
                         _st = _nf.get(str(_it.get("Id")), "")
                         print(f"  {_it.get('Name')}  ←  文件名「{_t}」{_y or ''}  "
                               + {"fixed": f"{GREEN}已重认{RST}",
+                                 "same": f"{DIM}搜出来就是它现在这个，没认错{RST}",
                                  "nomatch": f"{YELLOW}搜不到对得上的，没动{RST}",
                                  "taken": f"{YELLOW}库里已有一个是它，没动{RST}"}.get(_st, f"{DIM}这轮没轮到{RST}"))
                     if not _n:
