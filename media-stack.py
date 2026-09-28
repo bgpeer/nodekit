@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.262"
+SCRIPT_VERSION = "1.5.263"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2799,8 +2799,11 @@ def do_heal_daemon():
     # Stopped）→ 马上给进度抢救结账。仓库主人：「退出播放后他是过几秒补上的进度，
     # 不可以立即补上吗？」—— 以前要等下一分钟那一轮才发现"这一场停了"。nginx 记下
     # Stopped 这一行时 Emby 已经处理完这一场（打勾 / 清续播点），这时候去写正好。
-    # 【只认真按了播放的那一下】见 PLAY_CLICK_RE：点开详情页也会问 PlaybackInfo，不带 StartTimeTicks
-    click = re.compile(rb"/items/\d+/playbackinfo\?[^\s\"]*?\bStartTimeTicks="
+    # 【扳机只管叫醒 heal-tick，探不探由它定】它只探「按下播放」（play_clicks_in）和
+    # 「真来要视频了」的那几集 —— 翻详情页叫醒它也只是空转一轮，不拉网盘。
+    # /videos/<id>/stream|original 是开播要视频那一下（分片是 .ts，不算），从剧集列表
+    # 直接点播放、没先进详情页的那种靠它兜底
+    click = re.compile(rb"/items/\d+/playbackinfo|/videos/\d+/(?:stream|original)(?:\.\w+)?\?"
                        rb"|/sessions/playing/stopped", re.I)
     while True:
         time.sleep(HEAL_DAEMON_POLL)
@@ -3001,6 +3004,39 @@ def is_play_click(uri):
     return bool(re.search(r"[?&]StartTimeTicks=", uri or "", re.I))
 
 
+# 【从头播不带 StartTimeTicks】真机 9/29 05:24 / 05:48 吞噬星空 243：从头播放，Hills 发的
+# PlaybackInfo 跟翻详情页时一模一样（IsPlayback=true、不带 StartTimeTicks）—— 只认
+# StartTimeTicks 的话门一律放行，既不预取也不探。能分的是【次数】：点开详情页问一次，
+# 再按播放又问一次（05:24:02 → 05:24:33、05:48:53 → 05:49:16）；翻详情页每部只问一次
+# （9/28 07:24 那 20 次没有一部重复）。同一部 PBI_AGAIN_S 秒内第二次问 = 按下了播放。
+PBI_AGAIN_S = 300
+PBI_ID_RE = re.compile(r"/items/(\d+)/playbackinfo", re.I)
+
+
+def pbi_is_play(iid, uri, seen, now=None):
+    """这一次 PlaybackInfo 算不算按下播放。seen 是 {条目 id: 上一次问的时刻}，会被更新。"""
+    now = time.time() if now is None else now
+    for k in [k for k, v in seen.items() if now - v > PBI_AGAIN_S]:
+        seen.pop(k, None)
+    again = str(iid) in seen
+    seen[str(iid)] = now
+    return is_play_click(uri) or again
+
+
+def play_clicks_in(txt):
+    """nginx 日志一段里【按下播放】的条目 id：带 StartTimeTicks 的，或者同一部 PBI_AGAIN_S
+    秒内第二次问 PlaybackInfo 的（跨轮次的记在状态文件里）。"""
+    seen = {k: v for k, v in (ms_state().get("pbi_seen") or {}).items()
+            if isinstance(v, (int, float))}
+    out = set()
+    for ln in (txt or "").splitlines():
+        mm = PBI_ID_RE.search(ln)
+        if mm and pbi_is_play(mm.group(1), ln.split('"', 2)[1] if '"' in ln else ln, seen):
+            out.add(mm.group(1))
+    save_ms_state(pbi_seen=seen)
+    return out
+
+
 def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S):
     """门那一下替播放器先要一次 /stream（打给本机换链服务）→ "playlist" / "redirect" / ""。
 
@@ -3054,6 +3090,7 @@ def do_heal_gate():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     busy, lock = {}, threading.Lock()
     last = [time.monotonic()]
+    pbi_seen = {}                      # 同一部第二次问 PlaybackInfo = 按下播放，见 pbi_is_play
     _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
     def _mark(iid, on):
@@ -3090,8 +3127,10 @@ def do_heal_gate():
             try:
                 _uri = self.headers.get("X-Original-URI") or ""
                 m = re.search(r"/items/(\d+)/playbackinfo", _uri, re.I)
-                # 【只是点开详情页就直接放行】不验直链、不探测 —— 见 PLAY_CLICK_RE
-                if m and key and is_play_click(_uri):
+                # 【只是点开详情页就直接放行】不验直链、不探测 —— 见 PLAY_CLICK_RE / pbi_is_play
+                with lock:
+                    _play = bool(m) and pbi_is_play(m.group(1), _uri, pbi_seen)
+                if m and key and _play:
                     iid = m.group(1)
                     t_in = time.monotonic()
                     _tm["iid"], _tm["t0"] = iid, t_in
@@ -11833,7 +11872,7 @@ def nginx_played_ids():
         buf = b""                     # 这一段全是半行，整个留给下一轮
     save_ms_state(heal_ngx={"ino": st.st_ino, "off": off + len(buf)})
     txt = buf.decode("utf-8", "replace")
-    NGX_CLICKS.update(PLAY_CLICK_RE.findall(txt))
+    NGX_CLICKS.update(play_clicks_in(txt))
     return set(re.findall(r"/videos/(\d+)/", txt, re.I))
 
 
