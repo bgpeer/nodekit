@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.258"
+SCRIPT_VERSION = "1.5.259"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -11477,11 +11477,38 @@ def fix_movie_names(d, key, quiet=True):
             logs.append(f"{stamp}  片名纠正：「{it.get('Name')}」该是「{pick.get('Name')}」，"
                         f"但库里已经有一个认成它了（会共用观看进度），不动")
             continue
+        # 【进度要带过去】Emby 的观看记录跟着"认成哪部片"走：一重认，续播点、看没看完都留在
+        # 旧身份上。真机 9/28 奇异博士：「继续播放 26:25」改完变成「播放」。先记下，改完写回
+        ud0 = {}
+        try:
+            ud0 = (_emby(f"/Users/{uid}/Items/{iid}?Fields=UserData", key,
+                         timeout=30).get("UserData") or {})
+        except Exception:
+            pass
         try:
             _emby(f"/Items/RemoteSearch/Apply/{iid}?ReplaceAllImages=true", key,
                   method="POST", body=pick, timeout=60)
         except Exception:
             continue
+        if int(ud0.get("PlaybackPositionTicks") or 0) or ud0.get("Played") or ud0.get("IsFavorite"):
+            _put = {"PlaybackPositionTicks": int(ud0.get("PlaybackPositionTicks") or 0),
+                    "Played": bool(ud0.get("Played")),
+                    "PlayCount": int(ud0.get("PlayCount") or 0),
+                    "IsFavorite": bool(ud0.get("IsFavorite"))}
+            if ud0.get("LastPlayedDate"):
+                _put["LastPlayedDate"] = ud0["LastPlayedDate"]
+            for _ in range(5):             # 重认是后台刷新，刷完之前写进去可能又被盖掉
+                time.sleep(3)
+                try:
+                    _emby(f"/Users/{uid}/Items/{iid}/UserData", key, method="POST",
+                          body=_put, timeout=30)
+                    _now = (_emby(f"/Users/{uid}/Items/{iid}?Fields=UserData", key,
+                                  timeout=30).get("UserData") or {})
+                    if int(_now.get("PlaybackPositionTicks") or 0) == _put["PlaybackPositionTicks"] \
+                            and bool(_now.get("Played")) == _put["Played"]:
+                        break
+                except Exception:
+                    pass
         done[iid] = "fixed"
         if tm:
             taken[tm] = iid
