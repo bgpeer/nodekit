@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.253"
+SCRIPT_VERSION = "1.5.254"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2760,7 +2760,9 @@ def do_heal_daemon():
     # Stopped）→ 马上给进度抢救结账。仓库主人：「退出播放后他是过几秒补上的进度，
     # 不可以立即补上吗？」—— 以前要等下一分钟那一轮才发现"这一场停了"。nginx 记下
     # Stopped 这一行时 Emby 已经处理完这一场（打勾 / 清续播点），这时候去写正好。
-    click = re.compile(rb"/items/\d+/playbackinfo|/sessions/playing/stopped", re.I)
+    # 【只认真按了播放的那一下】见 PLAY_CLICK_RE：点开详情页也会问 PlaybackInfo，不带 StartTimeTicks
+    click = re.compile(rb"/items/\d+/playbackinfo\?[^\s\"]*?\bStartTimeTicks="
+                       rb"|/sessions/playing/stopped", re.I)
     while True:
         time.sleep(HEAL_DAEMON_POLL)
         kids = [k for k in kids if k.poll() is None]
@@ -2948,6 +2950,18 @@ KillMode=process
         return False
 
 
+# 【真按了播放 ≠ 点开详情页】真机 9/28 07:24~07:25：翻电影列表、搜鹿鼎记，半分钟里 Hills 问了
+# 20 次 PlaybackInfo（点开详情页它就要一次版本 / 音轨），门和常驻服务全当成"按下播放"，
+# 当场去网盘拉了 8 部片的开头，每部 22~91 MB，一共将近 570 MB。仓库主人：「我点哪一集就
+# 探测哪一集」。分得出来：那 20 次都不带 StartTimeTicks，11:36:40 真按播放那一次带着。
+PLAY_CLICK_RE = re.compile(r"/items/(\d+)/playbackinfo\?[^\s\"]*?\bStartTimeTicks=", re.I)
+
+
+def is_play_click(uri):
+    """这一次 PlaybackInfo 是不是真按了播放（带 StartTimeTicks）。"""
+    return bool(re.search(r"[?&]StartTimeTicks=", uri or "", re.I))
+
+
 def do_heal_gate():
     """systemd socket 拉起来的：nginx 放行 PlaybackInfo 之前来问一声。
 
@@ -2999,9 +3013,10 @@ def do_heal_gate():
         def _go(self):
             last[0] = time.monotonic()
             try:
-                m = re.search(r"/items/(\d+)/playbackinfo",
-                              self.headers.get("X-Original-URI") or "", re.I)
-                if m and key:
+                _uri = self.headers.get("X-Original-URI") or ""
+                m = re.search(r"/items/(\d+)/playbackinfo", _uri, re.I)
+                # 【只是点开详情页就直接放行】不验直链、不探测 —— 见 PLAY_CLICK_RE
+                if m and key and is_play_click(_uri):
                     iid = m.group(1)
                     t_in = time.monotonic()
                     with lock:
@@ -4659,7 +4674,8 @@ def _play_start(iid, msid, key):
     try:
         c = _local_emby_conn()
         t0 = time.monotonic()
-        c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?api_key={key}", body=b"{}",
+        c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?IsPlayback=true&StartTimeTicks=0"
+                  f"&api_key={key}", body=b"{}",  # 带 StartTimeTicks 才算真按了播放（PLAY_CLICK_RE）
                   headers={"User-Agent": HTTP_UA, "Content-Type": "application/json"})
         c.getresponse().read()
         out["pi"] = time.monotonic() - t0
@@ -5775,7 +5791,8 @@ def _trace_play(iid, msid, key):
             c = http.client.HTTPConnection("127.0.0.1", MEDIAWARP_PORT, timeout=60)
         # 【先问一次 PlaybackInfo】客户端按下播放先问它 —— heal-tick 认"按下播放"
         # 认的就是这一条（见 NGX_CLICKS）。只发 /stream 的话，它会被当成"正在播"。
-        c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?api_key={key}", body=b"{}",
+        c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?IsPlayback=true&StartTimeTicks=0"
+                  f"&api_key={key}", body=b"{}",  # 带 StartTimeTicks 才算真按了播放（PLAY_CLICK_RE）
                   headers={"User-Agent": HTTP_UA, "Content-Type": "application/json"})
         c.getresponse().read()
         c.request("GET", path, headers={"User-Agent": HTTP_UA, "Range": "bytes=0-0"})
@@ -11437,7 +11454,7 @@ def nginx_played_ids():
         buf = b""                     # 这一段全是半行，整个留给下一轮
     save_ms_state(heal_ngx={"ino": st.st_ino, "off": off + len(buf)})
     txt = buf.decode("utf-8", "replace")
-    NGX_CLICKS.update(re.findall(r"/items/(\d+)/playbackinfo", txt, re.I))
+    NGX_CLICKS.update(PLAY_CLICK_RE.findall(txt))
     return set(re.findall(r"/videos/(\d+)/", txt, re.I))
 
 
