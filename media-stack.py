@@ -45,7 +45,8 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.259"
+SCRIPT_VERSION = "1.5.260"
+_T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -2449,6 +2450,7 @@ def do_hls_fix():
             if hit and now - hit[1] < (HLS_DIRECT_TTL if hit[0] else HLS_BASE_FAIL_TTL):
                 return hit[0]
         body = ""
+        _t0, _t1, _t2, _hls = time.monotonic(), 0.0, 0.0, False
         try:
             op = urllib.request.build_opener(_NoRedirect)
             req = urllib.request.Request(
@@ -2460,7 +2462,9 @@ def do_hls_fix():
                 op.open(req, timeout=15).close()
             except urllib.error.HTTPError as e:
                 loc = e.headers.get("Location") or ""
-            if ".m3u8" in loc.split("?", 1)[0].lower():
+            _t1 = time.monotonic()
+            _hls = ".m3u8" in loc.split("?", 1)[0].lower()
+            if _hls:
                 r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
                 with urllib.request.urlopen(r2, timeout=15) as r:
                     txt = r.read(2 << 20).decode("utf-8", "replace")
@@ -2470,8 +2474,21 @@ def do_hls_fix():
                     head = final.split("?", 1)[0]
                     with lock:
                         cache[vid] = (head[:head.rfind("/") + 1], time.time())
+            _t2 = time.monotonic()
         except Exception:
             body = ""
+        # 【开播计时的后半截】慢在 MediaWarp 换地址（它要问 OpenList、OpenList 要问网盘接口），
+        # 还是慢在网盘回播放列表 —— 两截分开记。快的（1.5 秒以内）不记，免得流水被刷满。
+        _all = time.monotonic() - _t0
+        if _all > 1.5 or (_hls and not body):
+            try:
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
+                          f"MediaWarp 给地址 {(_t1 or time.monotonic()) - _t0:.1f}s"
+                          + (f"、网盘回列表 {_t2 - _t1:.1f}s" if _t1 and _t2 else "")
+                          + ("" if body or not _hls else "　没取到（交回 MediaWarp）")
+                          + f"{_log_tag(vid)}"])
+            except Exception:
+                pass
         with lock:
             plc[vid] = (body, time.time())
         return body
@@ -3022,6 +3039,7 @@ def do_heal_gate():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     busy, lock = {}, threading.Lock()
     last = [time.monotonic()]
+    _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
     def _mark(iid, on):
         # 【告诉 heal-tick：这一集门这边在补】门等满 15 秒放行之后，这一集的 PlaybackInfo
@@ -3053,6 +3071,7 @@ def do_heal_gate():
     class H(http.server.BaseHTTPRequestHandler):
         def _go(self):
             last[0] = time.monotonic()
+            _tm = {}                           # 开播计时，见下面 finally 那段
             try:
                 _uri = self.headers.get("X-Original-URI") or ""
                 m = re.search(r"/items/(\d+)/playbackinfo", _uri, re.I)
@@ -3060,6 +3079,7 @@ def do_heal_gate():
                 if m and key and is_play_click(_uri):
                     iid = m.group(1)
                     t_in = time.monotonic()
+                    _tm["iid"], _tm["t0"] = iid, t_in
                     with lock:
                         ev = busy.get(iid)
                     if ev is None and not _probe_busy_now(iid):
@@ -3068,8 +3088,13 @@ def do_heal_gate():
                         # 【没取到才验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
                         # 之后一帧不出（遮天 181）。命中缓存又活着的，多花不到两秒
                         try:
-                            if not gate_prefetch_stream(iid, self.headers.get("User-Agent") or ""):
-                                link_stale_fix(iid, key)
+                            _a = time.monotonic()
+                            _k = gate_prefetch_stream(iid, self.headers.get("User-Agent") or "")
+                            _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, _k or "没取到"
+                            if not _k:
+                                _a = time.monotonic()
+                                _tm["fix"] = link_stale_fix(iid, key) or "活的"
+                                _tm["fix_s"] = time.monotonic() - _a
                         except Exception:
                             pass
                     if ev is None and heal_auto_on():
@@ -3095,6 +3120,26 @@ def do_heal_gate():
             self.send_header("Content-Length", "0")
             self.end_headers()
             last[0] = time.monotonic()
+            # 【开播计时】仓库主人：「时间长了不看突然去播放……差不多要 20 秒才连接成功跑流量，
+            # 20 秒之前都是 0b」。热的时候怎么测都正常，只有冷的那一下才看得见 —— 所以每次真按
+            # 播放都把门里各步花了多久记进流水，冷的那次事后翻得出来。只记秒数，不记地址。
+            if _tm.get("iid"):
+                try:
+                    _it = (_emby(f"/Items?Ids={_tm['iid']}", key, timeout=10).get("Items") or [{}])[0]
+                    _nm = " ".join(x for x in (_it.get("SeriesName"), _it.get("Name")) if x)[:40]
+                except Exception:
+                    _nm = ""
+                _parts = []
+                if _boot[0] is not None:
+                    _parts.append(f"门刚被叫醒（脚本加载 {_boot[0]:.1f}s）")
+                    _boot[0] = None
+                if "pre" in _tm:
+                    _parts.append(f"预取播放列表 {_tm['pre']:.1f}s（{_tm['pre_k']}）")
+                if "fix_s" in _tm:
+                    _parts.append(f"验直链 {_tm['fix_s']:.1f}s（{_tm['fix']}）")
+                _all = time.monotonic() - _tm["t0"]
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：{_nm or _tm['iid']}　"
+                          + "、".join(_parts) + f"　门里共 {_all:.1f}s{_log_tag(_tm['iid'])}"])
 
         do_GET = do_POST = do_HEAD = _go
 
