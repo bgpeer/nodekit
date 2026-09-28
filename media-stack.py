@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.252"
+SCRIPT_VERSION = "1.5.253"
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
 SELF_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/media-stack.py"
@@ -4650,8 +4650,12 @@ def _local_emby_conn(timeout=60):
 
 def _play_start(iid, msid, key):
     """像播放器一样按下播放：PlaybackInfo（经过「先补再播」），再要 /stream 的 302。
-    → {"pi": PlaybackInfo 秒数, "go": 拿到直链秒数, "loc": 直链, "err": 说明}"""
-    out = {"pi": 0.0, "go": 0.0, "loc": "", "err": ""}
+    → {"pi": PlaybackInfo 秒数, "go": 拿到直链秒数, "loc": 直链, "playlist": 播放列表, "err": 说明}
+
+    【200 + 播放列表 也是直连】1.5.245 起转码流默认由本机服务把 m3u8 取来、分片补成完整地址
+    直接回给播放器（见 m3u8_absolutize），不再 302。上一版只认 302，真机 9/28 遮天 180 就被
+    说成「走的是本机代理」—— 而分片其实都是直连夸克的。"""
+    out = {"pi": 0.0, "go": 0.0, "loc": "", "playlist": "", "err": ""}
     try:
         c = _local_emby_conn()
         t0 = time.monotonic()
@@ -4665,18 +4669,23 @@ def _play_start(iid, msid, key):
                   headers={"User-Agent": HTTP_UA})
         r = c.getresponse()
         out["loc"] = r.getheader("Location") or ""
+        if not out["loc"] and r.status == 200 and "mpegurl" in (r.getheader("Content-Type") or "").lower():
+            _pl = r.read(2 << 20).decode("utf-8", "replace")
+            if _pl.lstrip().startswith("#EXTM3U"):
+                out["playlist"] = _pl
         r.close()
         c.close()
         out["go"] = time.monotonic() - t1
-        if not out["loc"]:
+        if not out["loc"] and not out["playlist"]:
             out["err"] = f"没给 302（HTTP {r.status}）—— 这个盘走的是本机代理，不是直链"
     except Exception as e:
         out["err"] = _short_err(e)
     return out
 
 
-def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None):
+def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist=""):
     """照播放器的样子拉 url：普通文件从头连续读；m3u8 就一个分片一个分片地读。
+    playlist：本机服务已经给了改好的播放列表（分片是完整地址），就不用再去要 url。
     → {"kind", "ttfb", "bytes", "t", "per_s": [每秒 KB], "err"}"""
     res = {"kind": "文件", "ttfb": 0.0, "bytes": 0, "t": 0.0, "per_s": [], "err": ""}
     cap = cap_mb << 20
@@ -4701,14 +4710,20 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None):
 
     hdr = {"User-Agent": ua or PLAYER_UA}
     try:
-        r = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=30)
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        head = r.read(8)
+        if playlist:
+            r, ctype, head = None, "application/vnd.apple.mpegurl", b"#EXTM3U"
+        else:
+            r = urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=30)
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            head = r.read(8)
         if head.startswith(b"#EXTM3U") or "mpegurl" in ctype:
             res["kind"] = "转码流（m3u8）"
-            body = (head + r.read(1 << 20)).decode("utf-8", "replace")
-            base = r.geturl()
-            r.close()
+            if playlist:
+                body, base = playlist, url or ""
+            else:
+                body = (head + r.read(1 << 20)).decode("utf-8", "replace")
+                base = r.geturl()
+                r.close()
             segs = [urllib.parse.urljoin(base, ln.strip()) for ln in body.splitlines()
                     if ln.strip() and not ln.startswith("#")]
             if segs and segs[0].split("?")[0].endswith(".m3u8"):     # 多码率的总表
@@ -4776,16 +4791,19 @@ def do_play_speed(q, wait=5, ua="player"):
         if st["err"]:
             _trace_row("✖", f"第 {n} 次", st["err"])
             return
-        sp = _pull_speed(st["loc"], ua=_ua)
+        sp = _pull_speed(st["loc"], ua=_ua, playlist=st.get("playlist") or "")
         rows.append((st, sp))
         avg = sp["bytes"] / sp["t"] / 1024
-        _trace_row("·", f"第 {n} 次", f"PlaybackInfo {st['pi']:.1f}s → 拿到直链 {st['go']:.1f}s → "
+        _trace_row("·", f"第 {n} 次", f"PlaybackInfo {st['pi']:.1f}s → "
+                   f"{'拿到播放列表' if st.get('playlist') else '拿到直链'} {st['go']:.1f}s → "
                    f"首字节 {sp['ttfb']:.1f}s；{sp['kind']}，{sp['t']:.0f} 秒拉了 "
                    f"{sp['bytes'] / 1048576:.1f} MB，平均 {avg:.0f} KB/s"
                    + (f"；{sp['err']}" if sp["err"] else ""))
         print(f"  {DIM}{'':20}每秒 KB：{' '.join(str(x) for x in sp['per_s'][:20])}{RST}")
     (s1, p1), (s2, p2) = rows
-    same = s1["loc"].split("?")[0] == s2["loc"].split("?")[0]
+    _k = lambda st: (st["loc"] or next((ln for ln in (st.get("playlist") or "").splitlines()
+                                        if ln.strip() and not ln.startswith("#")), "")).split("?")[0]
+    same = _k(s1) == _k(s2)
     _trace_row("·", "两次的直链", "同一条（MediaWarp 缓存的）" if same else "换了一条")
     a1 = p1["bytes"] / p1["t"]
     a2 = p2["bytes"] / p2["t"]

@@ -55,7 +55,7 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-28a"          # 见 link-history.sh 里的说明：CDN 会缓存
 export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
 echo "  ${0##*/}  版本 $TOOL_VER"
 
@@ -306,6 +306,30 @@ else:
     hit = [i for i in (res.get("Items") or [])
            if str(i.get("Path") or "").endswith(".strm")]
     if not hit:
+        # 【Emby 的搜索不认集号】「180」搜不出「第180集」（真机 9/28 遮天）。搜不到就自己
+        # 翻一遍全库：集号对上的排最前，其次片名、文件名里含这个词的 —— 跟 why-slow.sh 一样
+        try:
+            _all, _st = [], 0
+            while True:
+                _r = emby(f"/Items?Recursive=true&IncludeItemTypes=Movie,Episode,Video"
+                          f"&Fields=Path,MediaSources,MediaStreams,IndexNumber"
+                          f"&StartIndex={_st}&Limit=500")
+                _b = _r.get("Items") or []
+                _all += _b
+                _st += len(_b)
+                if not _b or _st >= int(_r.get("TotalRecordCount") or 0):
+                    break
+        except Exception:
+            _all = []
+        for i in _all:
+            _p = str(i.get("Path") or "")
+            if not _p.endswith(".strm"):
+                continue
+            if Q.isdigit() and str(i.get("IndexNumber") or "") == Q:
+                hit.insert(0, i)
+            elif Q in str(i.get("Name") or "") or Q in _p.rsplit("/", 1)[-1]:
+                hit.append(i)
+    if not hit:
         print(f"  {R}✖ 库里找不到带 strm 的条目：{Q}{X}")
         _have = sorted(drives_here(rows))
         print(f"  {D}换个更短的关键词；或者直接填挂载点"
@@ -468,6 +492,16 @@ if ol_size and secs_len:
 # 播不了（302 过去是 m3u8，分片是相对路径，被播放器拼回 /emby/Videos/<id>/ → 401
 # → 一直转圈），而客户端上只有"转圈"两个字，不点名根本想不到是这个开关。
 _lowraw = raw.lower()
+_hls_svc = os.path.exists("/etc/systemd/system/media-stack-hls.service")
+if _hls_svc and ("m3u8" in _lowraw or "video-play" in _lowraw or "transcod" in _lowraw
+                 or "/hls" in _lowraw):
+    # 【装了换链服务，转码流在 Emby 里是能播的】下面那段"播不了、改原画"是换链服务出现
+    # 以前的结论；现在分片由本机服务补成完整地址、手机直连网盘。这个脚本只会按字节范围
+    # 拉整文件，量不了分片流 —— 说清楚，指到能量的那个命令去。
+    print(f"  {Y}这个盘走的是转码流（一集切成很多小分片），这个脚本按整文件拉，量不准它{X}")
+    print(f"  {B}改用：media-stack play-speed <片名>{X}"
+          f"{D}  —— 按分片一段一段拉，每秒速度都列出来{X}")
+    raise SystemExit(0)
 if ("m3u8" in _lowraw or "video-play" in _lowraw or "transcod" in _lowraw
         or "/hls" in _lowraw):
     print(f"  {R}✖ 这条直链给的是【转码流】，不是原文件{X}")
