@@ -55,8 +55,9 @@
 # 一部 10 Mbps 的片拉 45 秒 ≈ 56 MB，两条路各一遍 ≈ 112 MB。跑之前屏上会先报数。
 set -u
 
-TOOL_VER="2026-09-28a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-29a"          # 见 link-history.sh 里的说明：CDN 会缓存
 export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
+export PYTHONUNBUFFERED=1   # 接了 | head / | tee 也边跑边出字，不然看着像卡死（真机 9/29）
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 # 【不填就把每个盘都跑一遍】原来这里没填就直接退出，只留一句带尖括号的用法 ——

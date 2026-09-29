@@ -16,8 +16,9 @@
 # 路径从接口里取，不用手打中文 —— 裸 curl 打中文路径要自己转义，上一版就是这么 404 的。
 set -u
 
-TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-29a"          # 见 link-history.sh 里的说明：CDN 会缓存
 export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
+export PYTHONUNBUFFERED=1   # 接了 | head / | tee 也边跑边出字，不然看着像卡死（真机 9/29）
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 DIR="${MS_DIR:-/opt/media-stack}"
