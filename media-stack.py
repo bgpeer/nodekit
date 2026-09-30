@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.263"
+SCRIPT_VERSION = "1.5.264"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -3047,6 +3047,7 @@ def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S):
     的缓存，播放器紧接着来要的时候直接拿走。
       "playlist" 夸克这类转码流：列表已取好、直链是活的 → 不用再验
       "redirect" 阿里转码流 / 115：换链服务自己现换的地址，跟 MediaWarp 的缓存无关 → 不用验
+      "timeout"  等满了还没回 —— 换链服务还在取，不再多验一遍（多等 4 秒没用）
       ""         其余（整文件走 MediaWarp 的、换链服务没装、取失败）→ 照旧去验
     用播放器自己的 UA 去要：115 按 UA 签链，取好的正好是它要的那一条。
     """
@@ -3062,6 +3063,13 @@ def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S):
         loc = r.getheader("Location") or ""
         r.read(2 << 20)
         c.close()
+    except (TimeoutError, OSError) as e:
+        # 【等满了 ≠ 取不到】换链服务还在替它取（真机 9/30 21:21 吞噬星空 240：MediaWarp 给地址
+        # 就花了 13.6 秒），这时候再去验一遍直链只是多等 4 秒 —— 播放器紧接着来要时，换链服务
+        # 那边多半已经取好了
+        if "timed out" in str(e).lower() or isinstance(e, TimeoutError):
+            return "timeout"
+        return ""
     except Exception:
         return ""
     if r.status == 200 and "mpegurl" in ctype:
@@ -3144,7 +3152,8 @@ def do_heal_gate():
                         try:
                             _a = time.monotonic()
                             _k = gate_prefetch_stream(iid, self.headers.get("User-Agent") or "")
-                            _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, _k or "没取到"
+                            _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, {
+                                "timeout": "等满了，换链服务还在取", "": "没取到"}.get(_k, _k)
                             if not _k:
                                 _a = time.monotonic()
                                 _tm["fix"] = link_stale_fix(iid, key) or "活的"
