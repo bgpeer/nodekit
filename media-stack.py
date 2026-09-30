@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.265"
+SCRIPT_VERSION = "1.5.266"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1647,6 +1647,8 @@ case "${1:-info}" in
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「5 链路体检」)
   name-fix        片名纠正：文件夹名骗了 Emby 的电影，按文件名马上重认一遍
+  quark-login     本机自己扫码登一份夸克 TV（不动 OpenList 的夸克盘）
+  quark-res <片名> 夸克给这一部的所有清晰度（只读；要先 quark-login）
   traffic [日期]  流量账本：每 5 分钟谁吃了多少流量(等同菜单里的「6 流量账本」)
   302             跟踪 MediaWarp 日志，用来验证直链是否生效
   update          拉最新镜像并重启
@@ -1842,6 +1844,10 @@ case "${1:-info}" in
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     exec python3 "$S" name-fix ;;
+  quark-login|quark-res)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" "$@" ;;
   traffic)
     # 【壳里必须有它】README 和体检都写着「命令行看：media-stack traffic [日期]」，
     # 上一版壳里却没有这一条，敲下去就是「未知命令」（真机 9/28）
@@ -18179,6 +18185,281 @@ def _add_qtv_flow(d):
         warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
 
 
+# ============================================================================ 夸克 TV：本机自己的一份登录
+# 【为什么要自己登一份】OpenList 的夸克 TV 驱动在「转码流」方式下，取的是夸克回的
+# 清晰度列表里【第一条有地址的】（drivers/quark_uc_tv getTranscodingLink）。真机 9/29
+# FC2-120222：夸克 App 里有 720P / 360P 转码，OpenList 拿到的第一条却是 1080P 原片 mp4 ——
+# 原片被限速、拖进度也慢。要自己挑清晰度，就得自己能问夸克。
+# 【为什么不借 OpenList 的 token】它的 access_token 只在内存里；拿它库里的 refresh_token
+# 去换，换一次 refresh_token 就轮换了，OpenList 手上那张作废，盘当场掉线。所以另扫一次码，
+# 用【另一个设备号】登，两边互不相干。
+# 【不泄漏】refresh_token / device_id 只存 QTV_OWN（0600），屏上、日志里一律不打。
+# 发往夸克的请求用它 TV 客户端那张脸（跟 OpenList 驱动一模一样）—— 换成别的 UA 它不认。
+# 换 token 那一步要经过 extscreen（OpenList 驱动本来就走它，不是新多出来的第三方）。
+QTV_OWN = BGP_DIR + "/quark-tv.json"
+QTV_API = "https://open-api-drive.quark.cn"
+QTV_CODE_API = "http://api.extscreen.com/quarkdrive"
+QTV_CLIENT_ID = "d3194e61504e493eb6222857bccfed94"
+QTV_SIGN_KEY = "kw2dvtd7p4t3pjl2d9ed9yc8yej8kw2d"
+QTV_APP_VER = "1.8.2.2"
+QTV_UA = ("Mozilla/5.0 (Linux; U; Android 13; zh-cn; M2004J7AC Build/UKQ1.231108.001) "
+          "AppleWebKit/533.1 (KHTML, like Gecko) Mobile Safari/533.1")
+QTV_DEV = {"device_brand": "Xiaomi", "platform": "tv", "device_name": "M2004J7AC",
+           "device_model": "M2004J7AC", "build_device": "M2004J7AC",
+           "build_product": "M2004J7AC", "device_gpu": "Adreno (TM) 550",
+           "activity_rect": "{}", "channel": "GENERAL"}
+QTV_RES_ALL = "low,normal,high,super,2k,4k"
+
+
+def qtv_own():
+    try:
+        with open(QTV_OWN) as f:
+            v = json.load(f)
+            return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def qtv_own_save(v):
+    os.makedirs(BGP_DIR, exist_ok=True)
+    write_atomic(QTV_OWN, json.dumps(v, ensure_ascii=False) + "\n", mode=0o600)
+    try:
+        os.chmod(QTV_OWN, 0o600)       # 旧文件改名顶上去时权限跟新文件走，这里再钉一次
+    except OSError:
+        pass
+
+
+def qtv_sign(method, path, dev_id, tm=None):
+    """(毫秒时间戳, x-pan-token, req_id) —— 跟驱动 generateReqSign 同一套算法。"""
+    import hashlib
+    tm = tm or str(int(time.time() * 1000))
+    tok = hashlib.sha256(f"{method}&{path}&{tm}&{QTV_SIGN_KEY}".encode()).hexdigest()
+    rid = hashlib.md5((dev_id + tm).encode()).hexdigest()
+    return tm, tok, rid
+
+
+def qtv_req(path, params, dev_id, access="", timeout=20):
+    """GET 夸克 TV 接口 → JSON。HTTP 报错也把它回的 JSON 读出来（错误码在里面）。"""
+    tm, tok, rid = qtv_sign("GET", path, dev_id)
+    q = {"req_id": rid, "access_token": access, "app_ver": QTV_APP_VER,
+         "device_id": dev_id, **QTV_DEV, **params}
+    req = urllib.request.Request(f"{QTV_API}{path}?{urllib.parse.urlencode(q)}", headers={
+        "Accept": "application/json, text/plain, */*", "User-Agent": QTV_UA,
+        "x-pan-tm": tm, "x-pan-token": tok, "x-pan-client-id": QTV_CLIENT_ID})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            raise e
+
+
+def qtv_token_invalid(r):
+    e = str(r.get("error_info") or "").lower()
+    return ((r.get("status") == -1 and r.get("errno") in (10001, 11001))
+            or any(k in e for k in ("access token", "access_token", "token无效", "token 无效")))
+
+
+def qtv_exchange(own, code="", refresh=""):
+    """拿登录码 / refresh_token 换 access_token。成功把新的两张都存进 QTV_OWN
+    （refresh_token 会轮换，旧的当场作废，不存就等于登出）。失败抛异常。"""
+    dev = own["device_id"]
+    _tm, _tok, rid = qtv_sign("POST", "/token", dev)
+    body = {"req_id": rid, "app_ver": QTV_APP_VER, "device_id": dev, **QTV_DEV,
+            **({"refresh_token": refresh} if refresh else {"code": code})}
+    req = urllib.request.Request(f"{QTV_CODE_API}/token", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": QTV_UA}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as r:
+        v = json.load(r)
+    dat = v.get("data") or {}
+    if v.get("code") != 200 or not dat.get("refresh_token"):
+        raise RuntimeError(str(v.get("message") or dat.get("error_info") or "换不到 token")[:60])
+    own.update(refresh_token=dat["refresh_token"], access_token=dat.get("access_token", ""),
+               access_exp=int(time.time()) + int(dat.get("expires_in") or 3600) - 120)
+    qtv_own_save(own)
+    return own["access_token"]
+
+
+def qtv_call(path, params, timeout=20):
+    """用本机自己那份登录问夸克。没登过 → None；token 过期自动换一次再问。"""
+    own = qtv_own()
+    if not own.get("refresh_token") or not own.get("device_id"):
+        return None
+    acc = own.get("access_token", "")
+    if not acc or int(own.get("access_exp") or 0) < time.time():
+        acc = qtv_exchange(own, refresh=own["refresh_token"])
+    r = qtv_req(path, params, own["device_id"], acc, timeout=timeout)
+    if qtv_token_invalid(r):
+        acc = qtv_exchange(own, refresh=own["refresh_token"])
+        r = qtv_req(path, params, own["device_id"], acc, timeout=timeout)
+    return r
+
+
+def do_quark_login():
+    """media-stack quark-login：本机自己扫码登一份夸克 TV（跟 OpenList 那份互不相干）。"""
+    import hashlib
+    own = qtv_own()
+    # 设备号一台机器只生一次：每登一次换一个，夸克那边的「已登录设备」会越堆越多
+    own.setdefault("device_id", hashlib.md5(str(time.time_ns()).encode()).hexdigest())
+    try:
+        r = qtv_req("/oauth/authorize", {"auth_type": "code", "client_id": QTV_CLIENT_ID,
+                                         "scope": "netdisk", "qrcode": "1",
+                                         "qr_width": "460", "qr_height": "460"},
+                    own["device_id"])
+    except Exception as e:
+        warn(f"问不到夸克：{_short_err(e)}")
+        return False
+    qr, qt = r.get("qr_data") or "", r.get("query_token") or ""
+    if not qr or not qt:
+        warn(f"夸克没给登录二维码：{str(r.get('error_info') or r.get('message') or '')[:60]}")
+        return False
+    b64 = qr.split(",", 1)[1] if qr.startswith("data:") else qr
+    lines = qr_from_jpeg_b64(b64)
+    print()
+    if not lines:
+        warn("二维码画不出来（要借 Emby 容器解图，Emby 在跑吗？）")
+        return False
+    print("\n".join(lines))
+    print()
+    tip("夸克 App 扫一扫，手机上点确认（这是本机自己的一份，不动 OpenList 的夸克盘）")
+    while True:
+        c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
+        if c == "q":
+            return False
+        try:
+            rc = qtv_req("/oauth/code", {"client_id": QTV_CLIENT_ID, "scope": "netdisk",
+                                        "query_token": qt}, own["device_id"])
+            code = rc.get("code") or ""
+            if not isinstance(code, str) or not code:
+                warn("还没确认")
+                continue
+            qtv_exchange(own, code=code)
+        except Exception as e:
+            warn(f"还没登上：{_short_err(e)[:60]}")
+            continue
+        ok("夸克 TV 已登录（本机自己的一份）")
+        return True
+
+
+def _qtv_mount_of(d, tp):
+    """这个 OpenList 路径落在哪个夸克 TV 盘上 → (挂载点, 根目录 fid)。不在 → ("", "")。"""
+    best = ("", "")
+    for _sid, mp, drv, add, *_x in _storage_rows(d):
+        if drv != DRIVER_QTV:
+            continue
+        if (tp == mp or tp.startswith(mp.rstrip("/") + "/")) and len(mp) > len(best[0]):
+            best = (mp, str((add or {}).get("root_folder_id") or "0"))
+    return best
+
+
+def qtv_fid(d, tp):
+    """OpenList 路径 → 夸克文件 fid。先问 OpenList 的目录列表（对象里带 id，不去取直链），
+    问不到再用本机那份登录从盘根一层层往下找。找不到返回 ""。"""
+    par, name = tp.rsplit("/", 1)
+    tok = _ol_token(d)
+    if tok:
+        try:
+            r = _ol_api("/api/fs/list", {"path": par or "/", "password": "", "page": 1,
+                                         "per_page": 0, "refresh": False}, tok, timeout=60)
+            for o in ((r.get("data") or {}).get("content") or []):
+                if o.get("name") == name and o.get("id"):
+                    return str(o["id"])
+        except Exception:
+            pass
+    mp, fid = _qtv_mount_of(d, tp)
+    if not mp:
+        return ""
+    for part in [x for x in tp[len(mp):].split("/") if x]:
+        nxt, page = "", 0
+        while not nxt:
+            r = qtv_call("/file", {"method": "list", "parent_fid": fid, "order_by": "3",
+                                   "desc": "1", "category": "", "source": "", "ex_source": "",
+                                   "list_all": "0", "page_size": "100",
+                                   "page_index": str(page)}) or {}
+            dat = r.get("data") or {}
+            files = dat.get("files") or []
+            nxt = next((str(f.get("fid")) for f in files if f.get("filename") == part), "")
+            page += 1
+            if nxt or not files or page * 100 >= int(dat.get("total_count") or 0):
+                break
+        if not nxt:
+            return ""
+        fid = nxt
+    return fid
+
+
+def _qtv_kind(u):
+    """地址是分片转码流还是整个文件 —— 只看路径后缀，不打地址。"""
+    p = urllib.parse.urlsplit(u or "").path.lower()
+    return ("分片 m3u8" if p.endswith(".m3u8") else
+            "整文件 " + (p.rsplit(".", 1)[-1] if "." in p.rsplit("/", 1)[-1] else "?")) if u else "没给地址"
+
+
+def do_quark_res(q):
+    """media-stack quark-res <片名>：夸克给这一部的所有清晰度（只读，不改任何设置）。
+
+    列分辨率、宽高、分片流还是整文件、码率、大小、转码状态；标出 OpenList 现在拿的是哪条。
+    【不泄漏】地址只报是 m3u8 还是整文件，不打域名、路径、参数。"""
+    d = ms_install_dir()
+    if not qtv_own().get("refresh_token"):
+        warn("本机还没登夸克：先跑 media-stack quark-login")
+        return
+    if q.startswith("/"):
+        tp, name = q, q.rsplit("/", 1)[-1]
+    else:
+        key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+        if not key:
+            warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
+            return
+        hits = find_strm_items(key, q)
+        if len(hits) != 1:
+            warn(f"「{q}」对上了 {len(hits)} 个 —— 要正好一个" + ("：" if hits else "。"))
+            if hits:
+                _list_hits(key, hits)
+            return
+        iid, name = str(hits[0][1]), hits[0][2]
+        try:
+            it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+            with open(_strm_host_path(d, str(it.get("Path") or "")), encoding="utf-8") as f:
+                tp = strm_target_path(f.read())
+        except Exception as e:
+            warn(f"读不到这一部的 strm：{_short_err(e)}")
+            return
+    try:
+        fid = qtv_fid(d, tp)
+        r = qtv_call("/file", {"method": "streaming", "group_by": "source", "fid": fid,
+                               "resolution": QTV_RES_ALL, "support": "dolby_vision"}) if fid else None
+    except Exception as e:
+        warn(f"问不到夸克：{_short_err(e)[:60]}")
+        return
+    if not fid:
+        warn("找不到这一部在夸克上的文件（不在夸克盘上？）")
+        return
+    dat = (r or {}).get("data") or {}
+    vis = dat.get("video_info") or []
+    if not vis:
+        warn(f"夸克没给清晰度：{str((r or {}).get('error_info') or '')[:60]}")
+        return
+    print(f"\n  {BOLD}夸克清晰度{RST}  {name}"
+          + (f"  {DIM}默认 {dat.get('default_resolution')}{RST}" if dat.get("default_resolution") else ""))
+    first = next((i for i, v in enumerate(vis) if v.get("url")), -1)
+    for i, v in enumerate(vis):
+        br = float(v.get("bitrate") or 0)
+        sz = int(v.get("size") or 0)
+        w, h = v.get("width"), v.get("height")
+        print(f"  {'→' if i == first else ' '} {str(v.get('resolution') or '?'):<7}"
+              f"{(f'{w}×{h}' if w and h else ''):<11}{_qtv_kind(v.get('url')):<11}"
+              + (f"码率 {br:g}  " if br else "")
+              + (f"{sz / 1048576:.0f} MB  " if sz else "")
+              + f"{DIM}{v.get('trans_status') or ''}"
+              + ("" if v.get("accessable", 1) else "  不可用（要会员？）") + RST)
+    if first >= 0:
+        print(f"  {DIM}→ = OpenList 现在拿的那条（第一条有地址的）{RST}")
+
+
 def _ask_secret(prompt):
     """输密码不回显 —— 这一屏会被截图发出去。"""
     try:
@@ -22951,6 +23232,16 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("traffic-sample"):
                 do_traffic_sample()      # 它自己就是记账的，不用再给自己记一笔
+        elif arg == "quark-login":        # 本机自己扫码登一份夸克 TV
+            require_root()
+            do_quark_login()
+        elif arg == "quark-res":          # 夸克给这一部的所有清晰度（只读）
+            require_root()
+            _q = " ".join(sys.argv[2:]).strip()
+            if not _q:
+                print("用法：media-stack quark-res <片名>")
+            else:
+                do_quark_res(_q)
         elif arg == "name-fix":           # 片名纠正：马上跑一轮，屏上说清改了哪些
             require_root()
             _d = ms_install_dir()
