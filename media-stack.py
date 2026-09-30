@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.268"
+SCRIPT_VERSION = "1.5.269"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1607,7 +1607,8 @@ CLI_TEMPLATE = r'''#!/usr/bin/env bash
 set -uo pipefail
 D="${MEDIA_STACK_DIR:-__DIR__}"
 C="${D}/docker-compose.yml"
-b=$'\\e[1m'; r=$'\\e[0m'; y=$'\\e[33m'
+# 【这份模板是原样写出去的（Python 原始字符串），这里只能是一个反斜杠】两个的话 bash 印出来就是字面的 \\e[1m（真机 9/30）
+b=$'\e[1m'; r=$'\e[0m'; y=$'\e[33m'
 
 # 以 emby 这个名字调用且不带参数时，默认就是「把面板地址甩出来」
 [[ "$(basename "$0")" == "emby" && $# -eq 0 ]] && set -- panel
