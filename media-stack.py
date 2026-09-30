@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.269"
+SCRIPT_VERSION = "1.5.270"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2460,7 +2460,8 @@ def do_hls_fix():
         1080P 原片被限速，播一下卡一下）。顺带省掉 MediaWarp 换地址那十几秒。"""
         now = time.time()
         if now - qtvm[1] > 60:
-            qtvm[0], qtvm[1] = (qtv_stream_mounts(d) if qtv_own().get("refresh_token") else []), now
+            qtvm[0], qtvm[1] = (qtv_stream_mounts(d) if qtv_pick_on() and qtv_own().get("refresh_token")
+                                else []), now
         if not qtvm[0] or not key:
             return "", ""
         try:
@@ -18635,6 +18636,14 @@ def qtv_play_url(d, tp, fids=None):
     return v["url"], QTV_TIER_CN.get(qtv_tier(v), str(v.get("resolution") or ""))
 
 
+def qtv_pick_on():
+    """「转码最多降一档」开没开。【默认关】真机 9/30 FC2-120222：转码流从服务器拉只有 73 KB/s
+    （要 123 才播得动，原片那次 115）—— 夸克对转码流一样限速；开播前多问一次夸克又花了
+    2.6~18 秒，门等满 15 秒没等到。仓库主人：「还不如没改之前的」。功能留着，开关在夸克 TV
+    盘设置里（8 Emby 播放画质）。"""
+    return ms_state().get("qtv_pick") is True
+
+
 def qtv_stream_mounts(d, rows=None):
     """设成转码流的夸克 TV 盘的挂载点。"""
     try:
@@ -18713,7 +18722,8 @@ def do_quark_res(q):
               + ("" if v.get("accessable", 1) else "  不可用（要会员？）") + RST)
     if first >= 0:
         print(f"  {DIM}→ = OpenList 拿的那条（第一条有地址的）{RST}")
-    print(f"  {DIM}★ = Emby 里播的那条（转码最多降一档）{RST}" if pick else
+    print((f"  {DIM}★ = Emby 里播的那条（转码最多降一档）{RST}" if qtv_pick_on() else
+           f"  {DIM}★ = 打开「转码最多降一档」后播的那条（现在关着）{RST}") if pick else
           f"  {DIM}没有够格的转码（低于下一档的不要），Emby 里照旧播原片{RST}")
 
 
@@ -19753,7 +19763,8 @@ def _one_drive_link_menu(d, mp):
             star = f"  {GREEN}← 现在{RST}" if v == cur else ""
             print(f"  {j}. {name}" + opt_tag(key, v) + star)
         print("  0. 返回")
-        if key == "link_method" and any(r[2] == DRIVER_QTV for r in _storage_rows(d) if r[1] == mp):
+        if (key == "link_method" and qtv_pick_on()
+                and any(r[2] == DRIVER_QTV for r in _storage_rows(d) if r[1] == mp)):
             # 仓库主人：「分辨率最多只能降一点不能降太多」—— 选档规则见 qtv_pick
             tip("走转码画质比原码低一个画质（4K变1080P）")
         t = ask("请选择").strip()
@@ -19813,7 +19824,7 @@ def _one_drive_link_menu(d, mp):
             if key == "link_method":
                 on = refresh_hls(d)
                 if val == "streaming":
-                    if (not qtv_own().get("refresh_token")
+                    if (qtv_pick_on() and not qtv_own().get("refresh_token")
                             and any(r[2] == DRIVER_QTV for r in _storage_rows(d) if r[1] == mp)):
                         tip("先跑 media-stack quark-login，不然夸克给哪条播哪条（常常是原片）")
                     if on:
@@ -20029,6 +20040,8 @@ def _drive_menu(d, mp, drv, mounted=True):
             # 本机自己那份夸克登录（选清晰度用，见 qtv_pick），跟 OpenList 那份互不相干
             print(f"  7. 扫码登录          当前："
                   + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token") else f"{YELLOW}未登录{RST}"))
+            print(f"  8. Emby 播放画质     当前：{CYAN}"
+                  + ("转码最多降一档" if qtv_pick_on() else "OpenList 给的第一条") + RST)
         if isali:
             _q = ali_tc_mounts().get(mp)
             print(f"  7. Emby 播放画质     当前：{CYAN}"
@@ -20045,7 +20058,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
         cov_no = heal_no = ""
         if mounted:
-            cov_no = "8" if (isali or has115 or isdav or isqtv) else "7"
+            cov_no = "9" if isqtv else "8" if (isali or has115 or isdav) else "7"
             _cl = cover_manual_last(mp)
             print(f"  {cov_no}. 截封面              "
                   + (f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
@@ -20077,6 +20090,18 @@ def _drive_menu(d, mp, drv, mounted=True):
                     continue
             do_quark_login()
             ask("\n按回车继续...")
+            continue
+        if isqtv and c == "8":
+            if qtv_pick_on():
+                save_ms_state(qtv_pick=False)
+                ok("已改回 OpenList 给的第一条")
+            elif not qtv_own().get("refresh_token"):
+                warn("先选 7 扫码登录")
+            else:
+                tip("开播要多问一次夸克（实测慢 3~18 秒），而且转码流一样被限速")
+                if ask_yn("确定改成转码最多降一档？", False):
+                    save_ms_state(qtv_pick=True)
+                    ok("已改成转码最多降一档（1 分钟内生效）")
             continue
         if not mounted and c == "7":
             _add115_flow(d) if has115 else _add_qtv_flow(d)
