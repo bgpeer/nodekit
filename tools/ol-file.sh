@@ -14,8 +14,9 @@
 #   ③ 拉 1 MiB     慢 = 地址拿到了但拉不动，那是限速/线路
 set -u
 
-TOOL_VER="2026-09-27a"          # 见 link-history.sh 里的说明：CDN 会缓存
+TOOL_VER="2026-09-29a"          # 见 link-history.sh 里的说明：CDN 会缓存
 export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
+export PYTHONUNBUFFERED=1   # 接了 | head / | tee 也边跑边出字，不然看着像卡死（真机 9/29）
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 P="${1:-}"

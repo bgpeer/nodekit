@@ -23,8 +23,9 @@ LINES="${2:-20000}"
 # 【把版本打出来】这些脚本是 curl 下来跑的，而 raw 有 CDN 缓存：改完立刻拉，
 # 拿到的可能还是几分钟前那份。跑出来的结果对不上，人只会以为"改了没用"。
 # 屏幕上有个版本号，一眼就能分清是"没改对"还是"拿的是旧的"。
-TOOL_VER="2026-09-27a"
+TOOL_VER="2026-09-29a"
 export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
+export PYTHONUNBUFFERED=1   # 接了 | head / | tee 也边跑边出字，不然看着像卡死（真机 9/29）
 echo "  ${0##*/}  版本 $TOOL_VER"
 
 command -v docker >/dev/null 2>&1 || { echo "✖ 没有 docker"; exit 1; }

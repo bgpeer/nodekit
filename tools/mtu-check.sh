@@ -23,8 +23,9 @@
 # 【输出里的公网 IP 会打码】方便你直接截图贴出来问人。
 set -u
 
-TOOL_VER="2026-09-27a"
+TOOL_VER="2026-09-29a"
 export MS_DOMAIN="$(sed -nE 's/^DOMAIN=(.*)$/\1/p' "${MS_DIR:-/opt/media-stack}/.env" 2>/dev/null | head -1)"   # 只用来在屏上盖掉自己的域名
+export PYTHONUNBUFFERED=1   # 接了 | head / | tee 也边跑边出字，不然看着像卡死（真机 9/29）
 # 【别用 $0】这个脚本的正常用法就是 curl ... | bash，那时候 $0 是 "bash"，
 # 标题会变成「bash 版本 ...」、下面的用法提示会变成「bash bash <IP>」。
 SELF="mtu-check.sh"
