@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.267"
+SCRIPT_VERSION = "1.5.268"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -17813,6 +17813,17 @@ def _qr115_show(uid, at=0):
     tip("二维码源必须选「网页」，选安卓 / TV 会报「系统已下架」")
 
 
+def _qr115_lines(uid):
+    """115 的二维码图 → 终端行。取不到 / 画不出 → []（屏上还有链接）。"""
+    try:
+        req = urllib.request.Request(QR115_IMAGE.format(uid), headers={"User-Agent": HTTP_UA})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            img = r.read(1 << 20)
+    except Exception:
+        return []
+    return qr_from_jpeg_b64(base64.b64encode(img).decode())
+
+
 def _qr115_new():
     """申请一个新二维码，并等扫码确认。返回 (令牌, 状态)：状态 2 = 确认成功。"""
     info("正在向 115 申请二维码...")
@@ -17830,9 +17841,13 @@ def _qr115_new():
                   qr115_at=int(time.time()))
 
     _qr115_show(uid)
-    print()
-    print(f"  {BOLD}怎么扫{RST}：手机浏览器打开二维码地址 → 长按存图 → "
-          f"115 App 扫一扫 → {BOLD}从相册{RST}选图 → 确认登录")
+    # 【码直接画在屏上，链接照留】仓库主人：「链接也要保留因为怕有的 ssh 做得不好扫不了」
+    lines = _qr115_lines(uid)
+    if lines:
+        print("\n".join(lines))
+        print()
+    tip("115 App 扫一扫" + ("上面的码；扫不了就" if lines else "：")
+        + "手机浏览器打开二维码地址 → 存图 → 从相册选图")
     print()
     info("等你扫码确认，最多 5 分钟（Ctrl-C 可中断）")
 
@@ -17849,11 +17864,11 @@ def _qr115_new():
             state, last_err = None, _short_err(e)
         if state in (2, -1, -2):
             break
-        tip = {0: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(state)
-        if tip is None:
-            tip = f"重试中（{last_err[:24]}）" if last_err else f"状态 {state}"
+        msg = {0: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(state)
+        if msg is None:
+            msg = f"重试中（{last_err[:24]}）" if last_err else f"状态 {state}"
         left = int(deadline - time.time())
-        print(f"\r    {DIM}{pad(tip, 40)}还剩 {left // 60}:{left % 60:02d}{RST}",
+        print(f"\r    {DIM}{pad(msg, 40)}还剩 {left // 60}:{left % 60:02d}{RST}",
               end="", flush=True)
         time.sleep(2)
     print("\r\x1b[2K", end="")
@@ -18075,15 +18090,29 @@ def qr_modules(px, w, h):
         return None
     x0, x1, y0, y1 = cols[0], cols[-1], rows[0], rows[-1]
     yr = min(y1, y0 + 2)
+    # 外框最边上那一列常被缩放抹成灰的（真机图 460 → 400），从这一行第一个黑点量起
+    xs = next((x for x in range(x0, min(x1, x0 + 6) + 1) if px[yr * w + x] < thr), x0)
     run = 0
-    while x0 + run <= x1 and px[yr * w + x0 + run] < thr:
+    while xs + run <= x1 and px[yr * w + xs + run] < thr:
         run += 1
+    run += xs - x0
     if run < 7:
         return None
     size = x1 - x0 + 1
-    n = round(size / (run / 7))
-    n = min(range(21, 178, 4), key=lambda v: abs(v - n))
-    m = size / n
+    n0 = round(size / (run / 7))
+    n0 = min(range(21, 178, 4), key=lambda v: abs(v - n0))
+    # 【量出来的边长差一档很常见】图缩放过（460 → 400）再加上 jpeg 的毛边，定位块那一截
+    # 量出来的模块宽会偏一点，边长就差 4 个模块（一个版本）。相邻两档也试，定位块对得上的才算
+    for n in (n0, n0 - 4, n0 + 4):
+        if n < 21:
+            continue
+        grid = _qr_sample(px, w, h, x0, y0, size / n, n, thr)
+        if grid:
+            return grid
+    return None
+
+
+def _qr_sample(px, w, h, x0, y0, m, n, thr):
     grid = []
     for r in range(n):
         line = []
@@ -18100,6 +18129,9 @@ def qr_modules(px, w, h):
                 ring = max(abs(i - 3), abs(j - 3))
                 if grid[r0 + i][c0 + j] != (ring != 2):
                     return None
+    # 时序线必须黑白相间 —— 定位块碰巧对上、网格却错位的，靠这一条拦下
+    if any(grid[6][k] != (k % 2 == 0) or grid[k][6] != (k % 2 == 0) for k in range(8, n - 8)):
+        return None
     return grid
 
 
@@ -18121,13 +18153,13 @@ def qr_lines(grid, quiet=3):
     return out
 
 
-def qr_from_jpeg_b64(b64, side=400):
-    """base64 的二维码图片 → 终端行。用 Emby 容器里的 ffmpeg 解图（本机未必有图像库）。
-    画不出来返回 []。"""
+def qr_grid_from_b64(b64, side=400):
+    """base64 的二维码图片（jpeg / png 都行）→ 模块矩阵。用 Emby 容器里的 ffmpeg 解图
+    （本机未必有图像库）。认不出返回 None。"""
     try:
         img = base64.b64decode(b64)
     except Exception:
-        return []
+        return None
     for fp in EMBY_FFMPEG_PATHS:
         try:
             r = subprocess.run(["docker", "exec", "-i", "emby", fp, "-v", "error",
@@ -18135,12 +18167,138 @@ def qr_from_jpeg_b64(b64, side=400):
                                 "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"],
                                input=img, capture_output=True, timeout=30)
         except (subprocess.TimeoutExpired, OSError):
-            return []
+            return None
         if r.returncode in (126, 127):
             continue
-        grid = qr_modules(r.stdout, side, side)
-        return qr_lines(grid) if grid else []
-    return []
+        return qr_modules(r.stdout, side, side)
+    return None
+
+
+def qr_from_jpeg_b64(b64, side=400):
+    """base64 的二维码图片 → 终端行。画不出来返回 []。"""
+    grid = qr_grid_from_b64(b64, side)
+    return qr_lines(grid) if grid else []
+
+# 【二维码 → 文字】终端扫不了码的时候（有的 SSH 客户端画出来行距对不上），把二维码里写的
+# 那串地址也打出来，手机上直接点开。只认版本 1~20（登录码一两百个字符，远用不到更大），
+# 不做纠错 —— 图是网盘接口现生成的，干净；读错就不给（下面只认 http 开头、全是可见字符）。
+# 两张表抄自二维码标准（每档：(块数, 每块数据字节数)；校正图形的中心坐标）。
+QR_BLOCKS = ((((1, 19),), ((1, 16),), ((1, 13),), ((1, 9),)), (((1, 34),), ((1, 28),), ((1, 22),), ((1, 16),)), (((1, 55),), ((1, 44),), ((2, 17),), ((2, 13),)), (((1, 80),), ((2, 32),), ((2, 24),), ((4, 9),)), (((1, 108),), ((2, 43),), ((2, 15), (2, 16)), ((2, 11), (2, 12))), (((2, 68),), ((4, 27),), ((4, 19),), ((4, 15),)), (((2, 78),), ((4, 31),), ((2, 14), (4, 15)), ((4, 13), (1, 14))), (((2, 97),), ((2, 38), (2, 39)), ((4, 18), (2, 19)), ((4, 14), (2, 15))), (((2, 116),), ((3, 36), (2, 37)), ((4, 16), (4, 17)), ((4, 12), (4, 13))), (((2, 68), (2, 69)), ((4, 43), (1, 44)), ((6, 19), (2, 20)), ((6, 15), (2, 16))), (((4, 81),), ((1, 50), (4, 51)), ((4, 22), (4, 23)), ((3, 12), (8, 13))), (((2, 92), (2, 93)), ((6, 36), (2, 37)), ((4, 20), (6, 21)), ((7, 14), (4, 15))), (((4, 107),), ((8, 37), (1, 38)), ((8, 20), (4, 21)), ((12, 11), (4, 12))), (((3, 115), (1, 116)), ((4, 40), (5, 41)), ((11, 16), (5, 17)), ((11, 12), (5, 13))), (((5, 87), (1, 88)), ((5, 41), (5, 42)), ((5, 24), (7, 25)), ((11, 12), (7, 13))), (((5, 98), (1, 99)), ((7, 45), (3, 46)), ((15, 19), (2, 20)), ((3, 15), (13, 16))), (((1, 107), (5, 108)), ((10, 46), (1, 47)), ((1, 22), (15, 23)), ((2, 14), (17, 15))), (((5, 120), (1, 121)), ((9, 43), (4, 44)), ((17, 22), (1, 23)), ((2, 14), (19, 15))), (((3, 113), (4, 114)), ((3, 44), (11, 45)), ((17, 21), (4, 22)), ((9, 13), (16, 14))), (((3, 107), (5, 108)), ((3, 41), (13, 42)), ((15, 24), (5, 25)), ((15, 15), (10, 16))))
+QR_ALIGN = ((), (6, 18), (6, 22), (6, 26), (6, 30), (6, 34), (6, 22, 38), (6, 24, 42), (6, 26, 46), (6, 28, 50), (6, 30, 54), (6, 32, 58), (6, 34, 62), (6, 26, 46, 66), (6, 26, 48, 70), (6, 26, 50, 74), (6, 30, 54, 78), (6, 30, 56, 82), (6, 30, 58, 86), (6, 34, 62, 90))
+QR_MASKS = (lambda i, j: (i + j) % 2 == 0, lambda i, j: i % 2 == 0, lambda i, j: j % 3 == 0,
+            lambda i, j: (i + j) % 3 == 0, lambda i, j: (i // 2 + j // 3) % 2 == 0,
+            lambda i, j: (i * j) % 2 + (i * j) % 3 == 0,
+            lambda i, j: ((i * j) % 2 + (i * j) % 3) % 2 == 0,
+            lambda i, j: ((i + j) % 2 + (i * j) % 3) % 2 == 0)
+
+
+def _qr_fmt(data):
+    """5 位（纠错档 + 掩码）→ 15 位格式信息（BCH 校验 + 固定异或）。"""
+    d = data << 10
+    for k in range(4, -1, -1):
+        if d & (1 << (k + 10)):
+            d ^= 0b10100110111 << k
+    return ((data << 10) | d) ^ 0b101010000010010
+
+
+def qr_decode(grid):
+    """模块矩阵（True = 黑）→ 二维码里写的文字。认不出返回 ""。"""
+    try:
+        n = len(grid)
+        ver = (n - 17) // 4
+        if n != 17 + 4 * ver or not 1 <= ver <= len(QR_BLOCKS):
+            return ""
+        # 格式信息：竖着那一份（左上 + 左下）
+        raw = 0
+        for i in range(15):
+            r = i if i < 6 else i + 1 if i < 8 else n - 15 + i
+            raw |= int(bool(grid[r][8])) << i
+        best = min(range(32), key=lambda x: bin(_qr_fmt(x) ^ raw).count("1"))
+        if bin(_qr_fmt(best) ^ raw).count("1") > 3:
+            return ""
+        ec, mk = {1: 0, 0: 1, 3: 2, 2: 3}[best >> 3], QR_MASKS[best & 7]
+        # 哪些格子是功能图形（不装数据）
+        res = [[False] * n for _ in range(n)]
+        def box(r0, c0, r1, c1):
+            for r in range(max(0, r0), min(n, r1 + 1)):
+                for c in range(max(0, c0), min(n, c1 + 1)):
+                    res[r][c] = True
+        box(0, 0, 8, 8); box(0, n - 8, 8, n - 1); box(n - 8, 0, n - 1, 8)
+        box(6, 0, 6, n - 1); box(0, 6, n - 1, 6)
+        al = QR_ALIGN[ver - 1]
+        for r in al:
+            for c in al:
+                # 跟定位块重叠的三个不放；落在时序线上的照放（版本 7 起就有）
+                if not ((r <= 8 and c <= 8) or (r <= 8 and c >= n - 9) or (r >= n - 9 and c <= 8)):
+                    box(r - 2, c - 2, r + 2, c + 2)
+        if ver >= 7:
+            box(n - 11, 0, n - 9, 5); box(0, n - 11, 5, n - 9)
+        # 之字形读数据位
+        bits, row, inc = [], n - 1, -1
+        col = n - 1
+        while col > 0:
+            if col == 6:
+                col -= 1
+            while 0 <= row < n:
+                for c in (col, col - 1):
+                    if not res[row][c]:
+                        bits.append(int(bool(grid[row][c])) ^ int(mk(row, c)))
+                row += inc
+            row -= inc
+            inc = -inc
+            col -= 2
+        cw = [int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits) - 7, 8)]
+        # 数据字节是按块交错放的，拆回来（纠错字节在后面，不要）
+        blocks = [k for cnt, k in QR_BLOCKS[ver - 1][ec] for _ in range(cnt)]
+        outs, p = [[] for _ in blocks], 0
+        for i in range(max(blocks)):
+            for b, k in enumerate(blocks):
+                if i < k:
+                    outs[b].append(cw[p]); p += 1
+        s = "".join(f"{x:08b}" for o in outs for x in o)
+        # 逐段解：数字 / 字母数字 / 字节，碰到 0000 结束
+        txt, i = "", 0
+        an = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:"
+        while i + 4 <= len(s):
+            mode = s[i:i + 4]; i += 4
+            if mode == "0000":
+                break
+            big = ver >= 10
+            if mode == "0100":
+                nb = 16 if big else 8
+                cnt = int(s[i:i + nb], 2); i += nb
+                txt += bytes(int(s[i + 8 * k:i + 8 * k + 8], 2) for k in range(cnt)).decode("utf-8")
+                i += 8 * cnt
+            elif mode == "0010":
+                nb = 11 if big else 9
+                cnt = int(s[i:i + nb], 2); i += nb
+                for _ in range(cnt // 2):
+                    v = int(s[i:i + 11], 2); i += 11
+                    txt += an[v // 45] + an[v % 45]
+                if cnt % 2:
+                    txt += an[int(s[i:i + 6], 2)]; i += 6
+            elif mode == "0001":
+                nb = 12 if big else 10
+                cnt = int(s[i:i + nb], 2); i += nb
+                while cnt > 0:
+                    w = min(3, cnt)
+                    ln = {3: 10, 2: 7, 1: 4}[w]
+                    txt += str(int(s[i:i + ln], 2)).zfill(w); i += ln; cnt -= w
+            else:
+                return ""
+        return txt
+    except Exception:
+        return ""
+
+
+def qr_link_of(b64, side=400):
+    """base64 的二维码图 → (终端行, 码里的链接)。链接只认 http 开头、全是可见字符的。"""
+    grid = qr_grid_from_b64(b64, side)
+    if not grid:
+        return [], ""
+    t = qr_decode(grid)
+    return qr_lines(grid), (t if re.fullmatch(r"https?://[\x21-\x7e]+", t or "") else "")
+
 
 
 def _add_qtv_flow(d):
@@ -18181,12 +18339,14 @@ def _add_qtv_flow(d):
         _ol_drop_storage(d, mount, tok)
         err(f"没拿到登录二维码：{_short_err(re.sub(r'<[^>]+>', '', msg))}")
         return False
-    lines = qr_from_jpeg_b64(m.group(1))
+    lines, link = qr_link_of(m.group(1))
     print()
     if lines:
         print("\n".join(lines))
         print()
-        tip("夸克 App 扫一扫（截图后从相册选也行），手机上点确认")
+        if link:
+            print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
+        tip("夸克 App 扫一扫，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
     else:
         tip("二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
     while True:
@@ -18351,14 +18511,16 @@ def do_quark_login():
         warn(f"夸克没给登录二维码：{str(r.get('error_info') or r.get('message') or '')[:60]}")
         return False
     b64 = qr.split(",", 1)[1] if qr.startswith("data:") else qr
-    lines = qr_from_jpeg_b64(b64)
+    lines, link = qr_link_of(b64)
     print()
     if not lines:
         warn("二维码画不出来（要借 Emby 容器解图，Emby 在跑吗？）")
         return False
     print("\n".join(lines))
     print()
-    tip("夸克 App 扫一扫，手机上点确认（这是本机自己的一份，不动 OpenList 的夸克盘）")
+    if link:
+        print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
+    tip("夸克 App 扫一扫，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
     while True:
         c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
         if c == "q":
@@ -19861,6 +20023,11 @@ def _drive_menu(d, mp, drv, mounted=True):
         has115 = "115" in str(drv)
         isdav = str(drv or "").lower() == "webdav"
         isali = mounted and str(drv or "").lower() in ALI_DRIVERS
+        isqtv = mounted and drv == DRIVER_QTV
+        if isqtv:
+            # 本机自己那份夸克登录（选清晰度用，见 qtv_pick），跟 OpenList 那份互不相干
+            print(f"  7. 扫码登录          当前："
+                  + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token") else f"{YELLOW}未登录{RST}"))
         if isali:
             _q = ali_tc_mounts().get(mp)
             print(f"  7. Emby 播放画质     当前：{CYAN}"
@@ -19877,7 +20044,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
         cov_no = heal_no = ""
         if mounted:
-            cov_no = "8" if (isali or has115 or isdav) else "7"
+            cov_no = "8" if (isali or has115 or isdav or isqtv) else "7"
             _cl = cover_manual_last(mp)
             print(f"  {cov_no}. 截封面              "
                   + (f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
@@ -19901,6 +20068,14 @@ def _drive_menu(d, mp, drv, mounted=True):
             continue
         if isdav and c == "7":
             _add_webdav_flow(d)
+            continue
+        if isqtv and c == "7":
+            if qtv_own().get("refresh_token"):
+                tip("重新扫码会换掉本机这份登录（OpenList 的夸克盘不受影响）")
+                if not ask_yn("确定重新扫码？", False):
+                    continue
+            do_quark_login()
+            ask("\n按回车继续...")
             continue
         if not mounted and c == "7":
             _add115_flow(d) if has115 else _add_qtv_flow(d)
