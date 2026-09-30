@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.270"
+SCRIPT_VERSION = "1.5.271"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20047,7 +20047,11 @@ def _drive_menu(d, mp, drv, mounted=True):
             print(f"  7. Emby 播放画质     当前：{CYAN}"
                   + ("阿里转码流（自动最高）" if _q else "原画") + RST)
         if has115 and mounted:
-            print(f"  7. 网盘扫码登录")
+            # 【登没登看 OpenList 里这个盘在不在工作】115 的登录凭据在 OpenList 那边；
+            # 盘状态不是 work（cookie 失效、令牌过期）就是掉线了，要重新扫
+            _st = next((st for m0, _d0, st, *_x in openlist_storages(d) if m0 == mp), "")
+            print(f"  7. 网盘扫码登录      当前："
+                  + (f"{CYAN}已登录{RST}" if _st == "work" else f"{YELLOW}掉线了（重新扫码）{RST}"))
         elif has115:
             print(f"  7. 扫码挂上")
             print(f"  8. 只拿令牌（自己去 OpenList 填）")
