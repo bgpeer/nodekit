@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.264"
+SCRIPT_VERSION = "1.5.265"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2443,13 +2443,36 @@ def do_hls_fix():
             hdon[0], hdon[1] = hls_direct_on(), time.time()
         return hdon[0]
 
+    pl_busy = {}                       # 条目 id → 正在取的那一路的 Event（见 playlist_of）
+
     def playlist_of(vid, ua):
-        """转码流的这一集：取 m3u8、把分片补成完整地址（见 m3u8_absolutize）。不是 m3u8 → ""。"""
+        """转码流的这一集：取 m3u8、把分片补成完整地址（见 m3u8_absolutize）。不是 m3u8 → ""。
+
+        【同一集同时只取一路】门预取等满 15 秒先放行，播放器紧接着自己来要 —— 那时门那一路
+        还在等 MediaWarp（真机 9/30 吞噬星空 240：光 MediaWarp 给地址就 13.6 秒）。以前第二路
+        会再问一遍 MediaWarp，两路一起从日本敲网盘接口，谁都快不了。现在后来的等先来的取完直接用。"""
         now = time.time()
         with lock:
             hit = plc.get(vid)
             if hit and now - hit[1] < (HLS_DIRECT_TTL if hit[0] else HLS_BASE_FAIL_TTL):
                 return hit[0]
+            ev = pl_busy.get(vid)
+            mine = ev is None
+            if mine:
+                ev = pl_busy[vid] = threading.Event()
+        if not mine:
+            ev.wait(40)
+            with lock:
+                hit = plc.get(vid)
+            return hit[0] if hit else ""
+        try:
+            return _playlist_fetch(vid, ua)
+        finally:
+            with lock:
+                pl_busy.pop(vid, None)
+            ev.set()
+
+    def _playlist_fetch(vid, ua):
         body = ""
         _t0, _t1, _t2, _hls = time.monotonic(), 0.0, 0.0, False
         try:
