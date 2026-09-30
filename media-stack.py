@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.266"
+SCRIPT_VERSION = "1.5.267"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2450,6 +2450,25 @@ def do_hls_fix():
         return hdon[0]
 
     pl_busy = {}                       # 条目 id → 正在取的那一路的 Event（见 playlist_of）
+    qtvm, qfid = [[], 0.0], {}
+
+    def qtv_of(vid):
+        """夸克 TV 转码流的盘：自己问夸克挑一条（转码最多降一档，见 qtv_pick）→ (m3u8, 档位)。
+        不是这种盘 / 本机没登夸克 / 没有够格的转码 → ("", "")，照旧问 MediaWarp。
+        【为什么不信 OpenList 那条】它拿第一条有地址的，常常就是原片整文件（真机 FC2-120222：
+        1080P 原片被限速，播一下卡一下）。顺带省掉 MediaWarp 换地址那十几秒。"""
+        now = time.time()
+        if now - qtvm[1] > 60:
+            qtvm[0], qtvm[1] = (qtv_stream_mounts(d) if qtv_own().get("refresh_token") else []), now
+        if not qtvm[0] or not key:
+            return "", ""
+        try:
+            tp = target_of(vid)
+            if not any(tp == m or tp.startswith(m.rstrip("/") + "/") for m in qtvm[0]):
+                return "", ""
+            return qtv_play_url(d, tp, qfid)
+        except Exception:
+            return "", ""
 
     def playlist_of(vid, ua):
         """转码流的这一集：取 m3u8、把分片补成完整地址（见 m3u8_absolutize）。不是 m3u8 → ""。
@@ -2479,19 +2498,20 @@ def do_hls_fix():
             ev.set()
 
     def _playlist_fetch(vid, ua):
-        body = ""
+        body, _qn = "", ""
         _t0, _t1, _t2, _hls = time.monotonic(), 0.0, 0.0, False
         try:
-            op = urllib.request.build_opener(_NoRedirect)
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
-                f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
-                headers={"User-Agent": HTTP_UA})
-            loc = ""
-            try:
-                op.open(req, timeout=15).close()
-            except urllib.error.HTTPError as e:
-                loc = e.headers.get("Location") or ""
+            loc, _qn = qtv_of(vid)
+            if not loc:
+                op = urllib.request.build_opener(_NoRedirect)
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
+                    f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
+                    headers={"User-Agent": HTTP_UA})
+                try:
+                    op.open(req, timeout=15).close()
+                except urllib.error.HTTPError as e:
+                    loc = e.headers.get("Location") or ""
             _t1 = time.monotonic()
             _hls = ".m3u8" in loc.split("?", 1)[0].lower()
             if _hls:
@@ -2510,10 +2530,11 @@ def do_hls_fix():
         # 【开播计时的后半截】慢在 MediaWarp 换地址（它要问 OpenList、OpenList 要问网盘接口），
         # 还是慢在网盘回播放列表 —— 两截分开记。快的（1.5 秒以内）不记，免得流水被刷满。
         _all = time.monotonic() - _t0
-        if _all > 1.5 or (_hls and not body):
+        if _all > 1.5 or (_hls and not body) or _qn:     # 自己挑了档的每次都记，好对得上
             try:
                 heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
-                          f"MediaWarp 给地址 {(_t1 or time.monotonic()) - _t0:.1f}s"
+                          + (f"自己问夸克（转码 {_qn}）" if _qn else "MediaWarp 给地址")
+                          + f" {(_t1 or time.monotonic()) - _t0:.1f}s"
                           + (f"、网盘回列表 {_t2 - _t1:.1f}s" if _t1 and _t2 else "")
                           + ("" if body or not _hls else "　没取到（交回 MediaWarp）")
                           + f"{_log_tag(vid)}"])
@@ -16970,7 +16991,7 @@ def driver_cn(drv):
 LINK_METHODS = {
     "download":  ("原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                             "跨境线路上 4K 原盘经常拉不动"),
-    "streaming": ("转码流",   "网盘自己转码后的流，码率低一个量级，卡的时候选它；"
+    "streaming": ("转码流（有损画质）", "网盘自己转码后的流，码率低一个量级，卡的时候选它；"
                             "转码在网盘那边做，不吃本机 CPU"),
 }
 
@@ -17122,7 +17143,7 @@ LINK_SWITCHES = (
     ("link_method", "画质",
      (("download",  "原画直链", "画质最好（网盘里是什么就播什么），但码率高；"
                                "跨境线路上 4K 原盘经常拉不动"),
-      ("streaming", "转码流",   "走网盘的播放通道，实测比原画快几十倍"
+      ("streaming", "转码流（有损画质）", "走网盘的播放通道，实测比原画快几十倍"
                                "（10.9 MB/s 对 306 KB/s）；Emby 里要装分片重定向才能播，"
                                "「8 更新」会自动装"))),
     ("download_api", "取直链的接口",
@@ -17131,7 +17152,7 @@ LINK_SWITCHES = (
       ("crack_video", "非官方·视频", "同上，取的是视频那条地址"))),
     ("use_transcoding_address", "画质",
      ((False, "原画直链", "发原始文件的下载地址"),
-      (True,  "转码流",   "发网盘转码后的地址，码率低、卡的时候选它"))),
+      (True,  "转码流（有损画质）", "发网盘转码后的地址，码率低、卡的时候选它"))),
 )
 
 # 上面哪些是【画质】开关（"播出来是什么"），其余的是【通道】开关（"从哪儿取这条地址"）。
@@ -18283,17 +18304,30 @@ def qtv_exchange(own, code="", refresh=""):
     return own["access_token"]
 
 
+_QTV_LOCK = threading.Lock()
+
+
+def _qtv_access(stale=""):
+    """拿一张能用的 access_token。【换 token 只许一路】refresh_token 换一次就轮换，
+    换链服务几路同时发现过期、各换各的，后换的那一路拿着已作废的旧票 —— 所以加锁，
+    进锁后重读一遍文件，别人刚换好的直接用。"""
+    with _QTV_LOCK:
+        own = qtv_own()
+        acc = own.get("access_token", "")
+        if acc and acc != stale and int(own.get("access_exp") or 0) >= time.time():
+            return own, acc
+        return own, qtv_exchange(own, refresh=own["refresh_token"])
+
+
 def qtv_call(path, params, timeout=20):
     """用本机自己那份登录问夸克。没登过 → None；token 过期自动换一次再问。"""
     own = qtv_own()
     if not own.get("refresh_token") or not own.get("device_id"):
         return None
-    acc = own.get("access_token", "")
-    if not acc or int(own.get("access_exp") or 0) < time.time():
-        acc = qtv_exchange(own, refresh=own["refresh_token"])
+    own, acc = _qtv_access()
     r = qtv_req(path, params, own["device_id"], acc, timeout=timeout)
     if qtv_token_invalid(r):
-        acc = qtv_exchange(own, refresh=own["refresh_token"])
+        own, acc = _qtv_access(stale=acc)
         r = qtv_req(path, params, own["device_id"], acc, timeout=timeout)
     return r
 
@@ -18391,6 +18425,63 @@ def qtv_fid(d, tp):
     return fid
 
 
+# 【转码最多降一档】仓库主人：「分辨率最多只能降一点不能降太多，不然看着不清晰那就没意思了」
+# —— 走转码画质比原码低一个画质（4K 变 1080P）。档位按夸克自己的叫法算（App 里也是这么标的：
+# high 叫 720P，哪怕真机 FC2-120222 那条实际是 960×540）；叫法认不出再看高度。
+# 同档的转码（不掉画质）有就优先；低于下一档的一律不要 —— 宁可播原片，也不给糊的。
+QTV_TIER = {"4k": 2160, "2k": 1440, "super": 1080, "high": 720, "normal": 480, "low": 360}
+QTV_LADDER = (2160, 1080, 720, 480, 360)
+QTV_TIER_CN = {2160: "4K", 1440: "2K", 1080: "1080P", 720: "720P", 480: "480P", 360: "360P"}
+
+
+def _qtv_is_m3u8(u):
+    return urllib.parse.urlsplit(u or "").path.lower().endswith(".m3u8")
+
+
+def qtv_tier(v):
+    return QTV_TIER.get(str(v.get("resolution") or "").lower()) or int(v.get("height") or 0)
+
+
+def qtv_pick(vis):
+    """夸克给的清晰度列表 → 该播的那条转码（dict）；没有够格的 → None（照旧播原片）。"""
+    raw = [qtv_tier(v) for v in vis if v.get("url") and not _qtv_is_m3u8(v["url"])]
+    orig = max(raw, default=0) or max((qtv_tier(v) for v in vis), default=0)
+    floor = next((x for x in QTV_LADDER if x < orig), 0)
+    ok = [v for v in vis if v.get("url") and _qtv_is_m3u8(v["url"])
+          and v.get("accessable", 1) and floor <= qtv_tier(v) <= orig]
+    return max(ok, key=qtv_tier) if ok else None
+
+
+def qtv_play_url(d, tp, fids=None):
+    """这个夸克文件该播的转码 m3u8 地址 + 档位名。不该 / 拿不到 → ("", "")。
+    fids：路径 → fid 的缓存（换链服务常驻时传进来，文件 id 不会变）。"""
+    if not qtv_own().get("refresh_token"):
+        return "", ""
+    fid = (fids or {}).get(tp) or qtv_fid(d, tp)
+    if not fid:
+        return "", ""
+    if fids is not None:
+        if len(fids) > 5000:
+            fids.clear()
+        fids[tp] = fid
+    r = qtv_call("/file", {"method": "streaming", "group_by": "source", "fid": fid,
+                           "resolution": QTV_RES_ALL, "support": "dolby_vision"}) or {}
+    v = qtv_pick(((r.get("data") or {}).get("video_info")) or [])
+    if not v:
+        return "", ""
+    return v["url"], QTV_TIER_CN.get(qtv_tier(v), str(v.get("resolution") or ""))
+
+
+def qtv_stream_mounts(d, rows=None):
+    """设成转码流的夸克 TV 盘的挂载点。"""
+    try:
+        rows = _storage_rows(d) if rows is None else rows
+    except Exception:
+        return []
+    return [mp for _s, mp, drv, add, *_x in rows
+            if mp and drv == DRIVER_QTV and (add or {}).get("link_method") == "streaming"]
+
+
 def _qtv_kind(u):
     """地址是分片转码流还是整个文件 —— 只看路径后缀，不打地址。"""
     p = urllib.parse.urlsplit(u or "").path.lower()
@@ -18446,18 +18537,21 @@ def do_quark_res(q):
     print(f"\n  {BOLD}夸克清晰度{RST}  {name}"
           + (f"  {DIM}默认 {dat.get('default_resolution')}{RST}" if dat.get("default_resolution") else ""))
     first = next((i for i, v in enumerate(vis) if v.get("url")), -1)
+    pick = qtv_pick(vis)
     for i, v in enumerate(vis):
         br = float(v.get("bitrate") or 0)
         sz = int(v.get("size") or 0)
         w, h = v.get("width"), v.get("height")
-        print(f"  {'→' if i == first else ' '} {str(v.get('resolution') or '?'):<7}"
+        print(f"  {'→' if i == first else ' '}{'★' if v is pick else ' '} {str(v.get('resolution') or '?'):<7}"
               f"{(f'{w}×{h}' if w and h else ''):<11}{_qtv_kind(v.get('url')):<11}"
               + (f"码率 {br:g}  " if br else "")
               + (f"{sz / 1048576:.0f} MB  " if sz else "")
               + f"{DIM}{v.get('trans_status') or ''}"
               + ("" if v.get("accessable", 1) else "  不可用（要会员？）") + RST)
     if first >= 0:
-        print(f"  {DIM}→ = OpenList 现在拿的那条（第一条有地址的）{RST}")
+        print(f"  {DIM}→ = OpenList 拿的那条（第一条有地址的）{RST}")
+    print(f"  {DIM}★ = Emby 里播的那条（转码最多降一档）{RST}" if pick else
+          f"  {DIM}没有够格的转码（低于下一档的不要），Emby 里照旧播原片{RST}")
 
 
 def _ask_secret(prompt):
@@ -19496,6 +19590,9 @@ def _one_drive_link_menu(d, mp):
             star = f"  {GREEN}← 现在{RST}" if v == cur else ""
             print(f"  {j}. {name}" + opt_tag(key, v) + star)
         print("  0. 返回")
+        if key == "link_method" and any(r[2] == DRIVER_QTV for r in _storage_rows(d) if r[1] == mp):
+            # 仓库主人：「分辨率最多只能降一点不能降太多」—— 选档规则见 qtv_pick
+            tip("走转码画质比原码低一个画质（4K变1080P）")
         t = ask("请选择").strip()
         if not (t.isdigit() and 1 <= int(t) <= len(opts)):
             print("没有改动。")
@@ -19553,6 +19650,9 @@ def _one_drive_link_menu(d, mp):
             if key == "link_method":
                 on = refresh_hls(d)
                 if val == "streaming":
+                    if (not qtv_own().get("refresh_token")
+                            and any(r[2] == DRIVER_QTV for r in _storage_rows(d) if r[1] == mp)):
+                        tip("先跑 media-stack quark-login，不然夸克给哪条播哪条（常常是原片）")
                     if on:
                         info("转码流的分片重定向已就绪 —— Emby 里现在能播转码流了")
                     else:
