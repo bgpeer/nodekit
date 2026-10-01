@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.272"
+SCRIPT_VERSION = "1.5.273"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1632,9 +1632,10 @@ case "${1:-info}" in
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
-  covers         没刮到封面的片，现在就截一帧当封面（每小时自动截默认关，见 7 设置 → 9）
+  covers         没刮到封面的片，现在就截一帧当封面（自动截默认只截新加的，见 7 设置 → 9）
   covers --retry 截失败过的也重新试一遍
   covers-mount <挂载点>  这个盘没图的全部截一次（菜单「截封面」在后台跑的就是它）
+  covers-new      生成媒体库后新加的、没刮到图的截一帧（生成完自动在后台跑）
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
@@ -1842,6 +1843,10 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" covers "$@" ;;
+  covers-new)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" covers-new ;;
   covers-mount)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -4613,6 +4618,13 @@ def cover_auto_on():
     return bool(ms_state().get("cover_auto"))
 
 
+def cover_new_on():
+    """生成媒体库后，给【这一轮新加的、没刮到图的】截一帧。默认开 —— 仓库主人：「在刚开始
+    生成媒体库时，可不可以检测到新加的片没有刮削自动生成一次截图」。跟每小时那个不一样：
+    每部只截一次、截不到就算了，不会一直在那里空转（那正是每小时那个默认关的原因）。"""
+    return ms_state().get("cover_new") is not False
+
+
 def strm_in_mount(d, emby_path, mp, mounts=None):
     """这个 strm 条目是不是这个盘的（读本机 strm 里写的网盘路径，不碰网盘）。
 
@@ -4630,7 +4642,7 @@ def strm_in_mount(d, emby_path, mp, mounts=None):
     return not any(under(m) and len(m) > len(mp) for m in (mounts or ()))
 
 
-def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False):
+def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False, only_paths=None):
     """给没封面的截一帧。返回截成了几张。say 给了就把每一张的结果打出来（手动跑时）。
 
     【有人在看片就不截】截一张要去网盘拉几 MB，跟看片的人抢同一个账号的速度。
@@ -4677,6 +4689,11 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
     if mount:
         _mts = [str(r[1] or "") for r in _storage_rows(d)]
         allc = [x for x in allc if strm_in_mount(d, x[3], mount, _mts)]
+    if only_paths is not None:
+        # 生成媒体库后只截新加的那几部。【条目的 Path 可能是文件夹】电影单独一个文件夹时
+        # Emby 记的是文件夹（见 movie_name_suspects），所以文件夹底下有新 strm 的也算
+        _dirs = {p.rsplit("/", 1)[0] for p in only_paths}
+        allc = [x for x in allc if x[3] in only_paths or x[3].rstrip("/") in _dirs]
     todo = (allc if manual else [x for x in allc if not _skip(x[1])])[:room]
     _gave = sum(1 for x in allc if int((fails.get(x[1]) or {}).get("n") or 0) >= COVER_MAX_TRIES)
     if say and _gave and not manual:
@@ -4783,6 +4800,90 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False)
     save_ms_state(cover_made=made, cover_day=day, cover_fail=fails)
     heal_log(logs)
     return done
+
+
+COVER_NEW_WAIT = 1800      # 等 Emby 扫完、刮完最多等多久（秒）
+COVER_NEW_GRACE = 180      # Emby 扫描停下来以后再等多久（刮削器下图要时间）
+COVER_NEW_Q = "media-stack-covers-new.json"
+
+
+def _cover_new_q(change=None):
+    """新加片子的待截队列（容器里的 strm 路径）。change(list) → 改完的 list。加锁读改写：
+    生成媒体库往里加、后台那一轮往外拿，两边可能同时动。"""
+    import fcntl
+    path = os.path.join(CRON_LOCK_DIR, COVER_NEW_Q)
+    try:
+        os.makedirs(CRON_LOCK_DIR, exist_ok=True)
+        with open(path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                with open(path) as f:
+                    cur = [str(x) for x in (json.load(f) or [])]
+            except Exception:
+                cur = []
+            if change is not None:
+                cur = change(cur)
+                write_atomic(path, json.dumps(cur, ensure_ascii=False) + "\n", mode=0o600)
+            return cur
+    except OSError:
+        return []
+
+
+def queue_new_covers(paths):
+    """生成媒体库这一轮新加的 → 排进队列，起后台那一轮（已经有一轮在跑就让它顺手接着截）。
+    返回排进去几个。"""
+    paths = [p for p in paths if p]
+    if not paths or not cover_new_on():
+        return 0
+    _cover_new_q(lambda cur: cur + [p for p in paths if p not in cur])
+    try:
+        subprocess.Popen([sys.executable or "python3", os.path.realpath(__file__), "covers-new"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return 0
+    return len(paths)
+
+
+def _emby_refreshing(key):
+    """Emby 这会儿在不在扫媒体库。问不到当作不在扫（别因为问不到就一直等）。"""
+    try:
+        return any(t.get("Key") == "RefreshLibrary" and t.get("State") == "Running"
+                   for t in (_emby("/ScheduledTasks", key, timeout=15) or []))
+    except Exception:
+        return False
+
+
+def do_covers_new():
+    """media-stack covers-new：生成媒体库后，给新加的、Emby 刮不到图的截一帧（后台）。
+
+    先等 Emby 扫完、刮削器把图下完（刮到图的自然就不在候选里了），有人在看片就再等等；
+    然后每部只截一次 —— 截不到就记进 heal-log 算了，不留在队列里反复试。"""
+    if not take_task_lock("covers-new"):
+        return                          # 已经有一轮在等 / 在截，新排进来的它会顺手截
+    d = ms_install_dir()
+    key = read_emby_api_key(d)
+    if not key:
+        return
+    while True:
+        if not _cover_new_q():
+            break
+        deadline, idle = time.time() + COVER_NEW_WAIT, None
+        while time.time() < deadline:
+            if _emby_refreshing(key) or heal_backlog_hold(key):
+                idle = None
+            elif idle is None:
+                idle = time.time()
+            elif time.time() - idle >= COVER_NEW_GRACE:
+                break
+            time.sleep(30)
+        batch = set(_cover_new_q())
+        try:
+            fill_covers(d, key, manual=True, only_paths=batch)
+        except Exception:
+            pass
+        _cover_new_q(lambda cur: [p for p in cur if p not in batch])
+    release_task_lock("covers-new")
 
 
 def cover_prefer_scrape(key, limit=COVER_PER_RUN):
@@ -16174,6 +16275,7 @@ def do_strm(only=None):
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
         # 关系，没道理让用户对着它干等。
         _nodur = len(items_without_duration(key))
+        _ncov = queue_new_covers(sorted(snap1 - snap0))
         try:
             for _sub in ("warm",) + (("heal",) if heal_auto_on() else ()):
                 subprocess.Popen(
@@ -16183,6 +16285,8 @@ def do_strm(only=None):
                     env={**os.environ, "MS_HEAL_AUTO": "1"})   # 自动那一路：认各盘的开关
             if _nodur and heal_auto_on():
                 print(f"  {DIM}后台在给 {_nodur} 个条目补时长，不用等{RST}")
+            if _ncov:
+                print(f"  {DIM}新加的 {_ncov} 个：等 Emby 刮完，没刮到图的后台自动截一帧，不用等{RST}")
         except Exception as e:
             warn(f"后台任务没起来（不影响本次生成）：{_short_err(e)}")
     else:
@@ -20730,7 +20834,8 @@ def params_menu():
         print(f"  7. 剧集季集编号      当前：{ef_state}")
         print(f"  8. 几%算播放完       当前：{CYAN}{resume_max_pct()}%{RST}")
         print(f"  9. 自动截封面        当前："
-              + (f"{CYAN}开{RST}" if cover_auto_on() else f"{DIM}关{RST}"))
+              + (f"{CYAN}每小时{RST}" if cover_auto_on() else
+                 f"{CYAN}只截新加的{RST}" if cover_new_on() else f"{DIM}关{RST}"))
         print(f"  10. 自动补时长       当前："
               + (f"{CYAN}开 · 每天 {_mb_txt(heal_day_mb())}{RST}" if heal_auto_on()
                  else f"{YELLOW}关{RST}"))
@@ -20823,15 +20928,17 @@ def heal_auto_menu():
 
 
 def set_cover_auto():
-    """「7 设置 → 9」：每小时自动截封面，开 / 关。默认关。"""
-    tip("开了每小时自动给没图的截一帧，会消耗 VPS 流量；关了也能在「3 挂载路径 → 选盘」手动截")
-    c = ask(f"1 开 / 2 关（当前 {'开' if cover_auto_on() else '关'}，回车不改）").strip()
-    want = {"1": True, "2": False}.get(c)
+    """「7 设置 → 9」：自动截封面。三档：每小时（含新加的）/ 只截新加的（默认）/ 关。
+    「只截新加的」= 生成媒体库后，新加进来、Emby 刮不到图的每部截一次（见 do_covers_new）。"""
+    cur = "每小时" if cover_auto_on() else "只截新加的" if cover_new_on() else "关"
+    tip("自动截会消耗 VPS 流量；关了也能在「3 挂载路径 → 选盘 → 截封面」手动截")
+    c = ask(f"1 每小时 / 2 只截新加的 / 3 关（当前 {cur}，回车不改）").strip()
+    want = {"1": (True, True), "2": (False, True), "3": (False, False)}.get(c)
     if want is None:
         print("没有改动。")
         return
-    save_ms_state(cover_auto=want)
-    ok(f"自动截封面：{'开' if want else '关'}")
+    save_ms_state(cover_auto=want[0], cover_new=want[1])
+    ok(f"自动截封面：{ {'1': '每小时', '2': '只截新加的', '3': '关'}[c] }")
 
 
 def set_resume_max():
@@ -23614,6 +23721,9 @@ if __name__ == "__main__":
                 except (IndexError, ValueError):
                     del _a[_i:]
             do_play_speed(" ".join(_a).strip(), wait=_w, ua=_u, at_min=_at)
+        elif arg == "covers-new":         # 生成媒体库后：新加的、没刮到图的截一帧（后台）
+            require_root()
+            do_covers_new()
         elif arg == "covers-mount":       # 「截封面」按钮放到后台的那一轮
             require_root()
             if len(sys.argv) > 2:
