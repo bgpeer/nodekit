@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.277"
+SCRIPT_VERSION = "1.5.278"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -110,7 +110,7 @@ HEAL_GATE_SOCK = "/run/media-stack-healgate.sock"
 # 【退出播放后详情页等一下进度】要抢救进度的那几集，在这里各放一个空文件（名字是条目 id）。
 # nginx 只对有文件的那几集，把「读详情」先送去门那边等抢救写完（见 rescue_hold），别的照旧直通。
 RESCUE_HOLD_DIR = "/run/media-stack-hold"
-RESCUE_HOLD_S = 4          # 最多等几秒；写好了马上放
+RESCUE_HOLD_S = 1          # 最多等几秒；写好了马上放（仓库主人：「感觉 1 秒就够了」）
 HEAL_GATE_SOCKET_UNIT = "/etc/systemd/system/media-stack-healgate.socket"
 HEAL_GATE_UNIT = "/etc/systemd/system/media-stack-healgate.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
@@ -5723,6 +5723,13 @@ def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
             return time.monotonic() - t0, True
     except Exception:
         return time.monotonic() - t0, True
+    # 【当场结账，不等后台那一轮】真机 10/01：等了 3.0 秒才写回 —— 那是常驻服务看见
+    # 「停止播放」→ 另起一个 heal-tick（光启动就一两秒）→ 再结账。门本来就醒着，自己结一次
+    # 只要几个本机 Emby 请求，不碰网盘；后台那一轮随后再来，看到已经写好了就不动
+    try:
+        rescue_progress(key)
+    except Exception:
+        pass
     while time.monotonic() - t0 < cap:
         if str(iid) not in (ms_state().get("heal_rescue") or {}):
             return time.monotonic() - t0, True
