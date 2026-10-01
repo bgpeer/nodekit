@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.273"
+SCRIPT_VERSION = "1.5.274"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20174,11 +20174,12 @@ def _drive_menu(d, mp, drv, mounted=True):
         if mounted:
             cov_no = "9" if isqtv else "8" if (isali or has115 or isdav) else "7"
             _cl, _cr = cover_manual_last(mp), cover_running(mp)
-            print(f"  {cov_no}. 截封面              "
+            # 【跟上面几行对齐】值那一列从第 24 列起；编号到两位数时标签少占一格
+            print(f"  {cov_no}. {pad('截封面', 19 - len(cov_no))}"
                   + (f"{YELLOW}后台截着 {_cr.get('done', 0)}/{_cr.get('of', '?')}{RST}" if _cr is not None
                      else f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
             heal_no = str(int(cov_no) + 1)
-            print(f"  {heal_no}. 补时长              当前："
+            print(f"  {heal_no}. {pad('补时长', 19 - len(heal_no))}当前："
                   + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
                      f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"))
         print("  0. 返回")
