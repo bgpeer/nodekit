@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.284"
+SCRIPT_VERSION = "1.5.285"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -16099,7 +16099,7 @@ def do_strm(only=None):
         if not ids:
             warn(f"{'、'.join(only_mounts(only))} 下面一条扫描路径都没有，"
                  f"没什么可扫的。")
-            print(f"  {DIM}先在这个盘的「1 扫描路径」里加一条。{RST}")
+            print(f"  {DIM}先在这个盘的「修改扫描路径」里加一条。{RST}")
             return
     patched, n_fire = _patch_cron(original, fire, ids)
     if not n_fire:
@@ -18250,7 +18250,7 @@ def _add115_flow(d):
         err(f"没挂上：{why}")
         ask("\n按回车返回...")
         return False
-    tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
+    tip("接下来在「2 修改扫描路径」里加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -18394,7 +18394,7 @@ def _add_ali_flow(d):
         return False
     ok(f"阿里云盘已挂上：{mount}　{ALIPAN_TYPES[kind][0]}")
     sync_alitv_service(d)
-    tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
+    tip("接下来在「2 修改扫描路径」里加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -18795,7 +18795,7 @@ def _add_qtv_flow(d):
             ok(f"夸克 TV 已挂上：{mount}　转码流")
             if not refresh_hls(d):
                 warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「8 更新」")
-            tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
+            tip("接下来在「2 修改扫描路径」里加上要进 Emby 的目录")
             ask("\n按回车继续...")
             return True
         warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
@@ -19692,7 +19692,7 @@ def _add_webdav_flow(d):
         tip("多半是地址、用户名或密码不对；已撤掉，重新添加一次")
         return False
     ok(f"WebDAV 已挂上：{mount}　{YELLOW}⚠ 走 VPS 流量{RST}")
-    tip("接下来在「3 挂载路径」里点它 → 1 扫描路径，加上要进 Emby 的目录")
+    tip("接下来在「3 挂载路径」里点它 → 1 修改扫描路径，加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -20845,7 +20845,7 @@ def _scan_of(mp):
     """这个盘现在扫什么，一句话。给菜单那一列用。
 
     【多了就不全列】一个盘挂十几条路径是正常用法（按字母分类的盘），全列出来会把外层
-    那一屏撑成一坨 —— 那一屏是一行一个盘。要看全部就进这个盘的「1 扫描路径」。
+    那一屏撑成一坨 —— 那一屏是一行一个盘。要看全部就进这个盘的「修改扫描路径」。
     """
     mine = _paths_under(explicit_scan_paths(), mp)
     if not mine:
@@ -20912,7 +20912,7 @@ def _skip_dirs_menu(d, mp):
                     rels.append(r)
             if not rels:
                 # 选中盘根 = 整个盘都不扫，那不是排除规则该干的事
-                warn("整个盘不扫的话，去「扫描路径」里把它删掉，别用这里。")
+                warn("整个盘不扫的话，去「修改扫描路径」里把它删掉，别用这里。")
                 continue
         elif c == "2":
             if not pats:
@@ -20948,9 +20948,16 @@ def _skip_dirs_menu(d, mp):
 
 
 def _drive_menu(d, mp, drv, mounted=True):
-    """单个网盘的设置。mounted=False：OpenList 里还没挂上（目前只有 115 会这样常驻）——
-    同一屏、同样的几项，要挂上才能做的那几项点了会先让去扫码。"""
+    """单个网盘的设置。mounted=False：OpenList 里还没挂上（115 / 夸克 TV / 阿里 / WebDAV 常驻）——
+    同一屏、同样的几项，要挂上才能做的那几项点了会先让去挂。
+
+    【登录排第 1、扫描路径排第 2】仓库主人：「我想把这个扫码登录移到第 1 位去，扫描路径改成第 2 位
+    叫修改扫描路径」。有登录的盘（115、夸克 TV、阿里）第 1 项是登录 / 挂上；没有登录的盘照旧从
+    「1 修改扫描路径」开始。
+    【编号按列表现排】以前每一项的编号写死在两处（打印一处、分发一处），挪一项要改一串、
+    还对不上过。现在先排一张表，编号跟着表走，打印和分发都看这张表。"""
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
+    _rn = {"on": "清洗后的名字", "off": "网盘原名"}
     while True:
         if not mounted and has_driver_storage(d, drv):
             return                    # 刚扫码挂上了：回外层，那边会按真实的盘重新列
@@ -20967,141 +20974,128 @@ def _drive_menu(d, mp, drv, mounted=True):
         print(f"  {BOLD}{driver_cn(drv)}{RST}   {_hd}"
               if mounted else f"  {BOLD}{driver_cn(drv)}{RST}   {YELLOW}未挂载{RST}")
         print("=" * 60)
-        print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
-        print(f"  2. 生成媒体库        {DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}")
-        # 数字不进这一行，理由见上一屏同样的地方：右边就是行首的编号
-        has_sw = mounted and switchable and drive_links(d, mp, drv)
-        print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}"
-              + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"))
-        print(f"  4. 片名用哪个        当前：{CYAN}{names.get(tp, tp)}{RST}")
-        _sk = skip_dirs_of(mp)
-        print(f"  5. 不扫的目录        当前："
-              + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"))
-        _rn = {"on": "清洗后的名字", "off": "网盘原名"}
-        print(f"  6. 名称重定义        当前：{CYAN}{_rn.get(rename_policy_of(mp))}{RST}"
-              + ("" if (ms_state().get("rename_by_drive") or {}).get(mp)
-                 else f"  {DIM}（跟默认）{RST}"))
         has115 = "115" in str(drv)
         isdav = str(drv or "").lower() == "webdav"
-        isali = mounted and str(drv or "").lower() in ALI_DRIVERS
+        isali_drv = str(drv or "").lower() in ALI_DRIVERS
+        isali = mounted and isali_drv
         isqtv = mounted and drv == DRIVER_QTV
         _olst = ol_storage_status(d, mp) if (isali or isqtv) else ""
         _ols = (f"{CYAN}已登录{RST}" if _olst == "work" else f"{YELLOW}掉线了（重新登录）{RST}")
+
+        # 表里每一项：(名字, 当前值那一列, 点了做什么, 要不要先挂上)
+        items = []
+        add = lambda *x: items.append(x)
+
+        def _mount_flow():
+            if has115:
+                _add115_flow(d)
+            elif isali_drv:
+                _add_ali_flow(d)
+            else:
+                _add_qtv_flow(d)
+
+        # ---- 第 1 项：登录 / 挂上（有登录的盘才有）
         if isqtv:
-            # 【两份登录分开写】7 是 OpenList 挂盘用的那份（掉了整个盘打不开）；8 是本机
-            # 自己那份（选清晰度用，见 qtv_pick），两份互不相干
-            print(f"  7. 网盘扫码登录      当前：{_ols}")
-            print(f"  8. 清晰度登录        当前："
-                  + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token") else f"{YELLOW}未登录{RST}"))
-            # 【不叫「播放画质」】原画 / 转码流在「3 直链方式 → 画质」；这一项管的是转码时挑哪一档
-            print(f"  9. 转码挑档          当前：{CYAN}"
-                  + ("转码最多降一档" if qtv_pick_on() else "OpenList 给的第一条") + RST)
-        if isali:
-            # 【阿里的原画 / 转码流挪进了「3 直链方式 → 画质」】跟夸克同一个位置（仓库主人同意）
+            # 【两份登录分开写】这一项是 OpenList 挂盘用的那份（掉了整个盘打不开）；
+            # 下面的「清晰度登录」是本机自己那份（选清晰度用，见 qtv_pick），两份互不相干
+            add("网盘扫码登录", f"当前：{_ols}",
+                lambda: (_qtv_relogin_flow(d, mp), ask("\n按回车继续...")), False)
+        elif isali:
             # 【登上了就说是哪条接口】仓库主人：「TV 接口如果登入成功了希望在后面显示写一个 TV 接口」
             _at = next((t for _s, m0, _dv, t, _sh in _ali_storages(d) if m0 == mp), "")
-            print(f"  7. 网盘扫码登录      当前：{_ols}"
-                  + (f"{CYAN} · {'TV 接口' if _at == 'alipanTV' else '开放平台接口'}{RST}"
-                     if _olst == "work" and _at else ""))
-        if has115 and mounted:
+            add("网盘扫码登录", f"当前：{_ols}"
+                + (f"{CYAN} · {'TV 接口' if _at == 'alipanTV' else '开放平台接口'}{RST}"
+                   if _olst == "work" and _at else ""),
+                lambda: _ali_relogin_flow(d, mp), False)
+        elif has115 and mounted:
             # 【登没登看 OpenList 里这个盘在不在工作】115 的登录凭据在 OpenList 那边；
             # 盘状态不是 work（cookie 失效、令牌过期）就是掉线了，要重新扫
-            _st = next((st for m0, _d0, st, *_x in openlist_storages(d) if m0 == mp), "")
-            print(f"  7. 网盘扫码登录      当前："
-                  + (f"{CYAN}已登录{RST}" if _st == "work" else f"{YELLOW}掉线了（重新扫码）{RST}"))
-        elif has115:
-            print(f"  7. 扫码挂上")
-            print(f"  8. 只拿令牌（自己去 OpenList 填）")
-        elif isdav:
-            print(f"  7. ＋ 添加 WebDAV")
-        elif not mounted and str(drv or "").lower() in ALI_DRIVERS:
-            print(f"  7. ＋ 添加阿里云盘")
-        elif not mounted:
-            print(f"  7. 扫码挂上")
-        # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
-        cov_no = heal_no = ""
+            _st = ol_storage_status(d, mp)
+            add("网盘扫码登录", "当前：" + (f"{CYAN}已登录{RST}" if _st == "work"
+                                          else f"{YELLOW}掉线了（重新扫码）{RST}"),
+                qr115_login, False)
+        elif not mounted and isali_drv:
+            add("＋ 添加阿里云盘", "", _mount_flow, False)
+        elif not mounted and not isdav:
+            add("扫码挂上", "", _mount_flow, False)
+        mount_no = str(len(items)) if (items and not mounted) else ""
+
+        # ---- 每个盘都有的六项
+        has_sw = mounted and switchable and drive_links(d, mp, drv)
+        _sk = skip_dirs_of(mp)
+        add("修改扫描路径", f"{CYAN}{_sc}{RST}", lambda: _drive_paths_menu(d, mp), True)
+        add("生成媒体库", f"{DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}",
+            lambda: _scan_menu(d, mp, f"{driver_cn(drv)} {mp}"), True)
+        add("直链方式", f"当前：{CYAN}{ch}{RST}" + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"),
+            lambda: _link_method_menu(d, [mp], driver_cn(drv)), True)
+        add("片名用哪个", f"当前：{CYAN}{names.get(tp, tp)}{RST}", lambda: _title_menu(d, mp), False)
+        add("不扫的目录", "当前：" + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"),
+            lambda: _skip_dirs_menu(d, mp), True)
+        add("名称重定义", f"当前：{CYAN}{_rn.get(rename_policy_of(mp))}{RST}"
+            + ("" if (ms_state().get("rename_by_drive") or {}).get(mp) else f"  {DIM}（跟默认）{RST}"),
+            lambda: _rename_menu(d, mp), False)
+
+        # ---- 各盘自己的
+        if isqtv:
+            def _own_login():
+                if qtv_own().get("refresh_token"):
+                    tip("重新扫码会换掉本机这份登录（OpenList 的夸克盘不受影响）")
+                    if not ask_yn("确定重新扫码？", False):
+                        return
+                do_quark_login()
+                ask("\n按回车继续...")
+
+            def _pick_toggle():
+                if qtv_pick_on():
+                    save_ms_state(qtv_pick=False)
+                    ok("已改回 OpenList 给的第一条")
+                elif not qtv_own().get("refresh_token"):
+                    warn(f"先选 {_own_no} 清晰度登录")
+                else:
+                    tip("开播要多问一次夸克（实测慢 3~18 秒），而且转码流一样被限速")
+                    if ask_yn("确定改成转码最多降一档？", False):
+                        save_ms_state(qtv_pick=True)
+                        ok("已改成转码最多降一档（1 分钟内生效）")
+            add("清晰度登录", "当前：" + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token")
+                                       else f"{YELLOW}未登录{RST}"), _own_login, False)
+            _own_no = str(len(items))
+            # 【不叫「播放画质」】原画 / 转码流在「直链方式 → 画质」；这一项管的是转码时挑哪一档
+            add("转码挑档", f"当前：{CYAN}"
+                + ("转码最多降一档" if qtv_pick_on() else "OpenList 给的第一条") + RST, _pick_toggle, False)
+        if has115 and not mounted:
+            add("只拿令牌（自己去 OpenList 填）", "", qr115_login, False)
+        if isdav:
+            add("＋ 添加 WebDAV", "", lambda: _add_webdav_flow(d), False)
+            if not mounted:
+                mount_no = str(len(items))
+        # 【截封面、补时长】挂着的盘才有，排在最后
         if mounted:
-            cov_no = "10" if isqtv else "8" if (isali or has115 or isdav) else "7"
             _cl, _cr = cover_manual_last(mp), cover_running(mp)
+            add("截封面", (f"{YELLOW}后台截着 {_cr.get('done', 0)}/{_cr.get('of', '?')}{RST}" if _cr is not None
+                         else f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"),
+                lambda: _covers_menu(d, mp), False)
+            add("补时长", "当前：" + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
+                                     f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"),
+                lambda: _heal_mount_toggle(mp), False)
+
+        for i, (label, val, _fn, _nm) in enumerate(items, 1):
+            no = str(i)
             # 【跟上面几行对齐】值那一列从第 24 列起；编号到两位数时标签少占一格
-            print(f"  {cov_no}. {pad('截封面', 19 - len(cov_no))}"
-                  + (f"{YELLOW}后台截着 {_cr.get('done', 0)}/{_cr.get('of', '?')}{RST}" if _cr is not None
-                     else f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
-            heal_no = str(int(cov_no) + 1)
-            print(f"  {heal_no}. {pad('补时长', 19 - len(heal_no))}当前："
-                  + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
-                     f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"))
+            print(f"  {no}. {pad(label, 19 - len(no))}{val}" if val else f"  {no}. {label}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if not mounted and c in ("1", "2", "3", "5"):
-            warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— 先选 7 挂上。")
-            continue
-        if cov_no and c == cov_no:
-            _covers_menu(d, mp)
-            continue
-        if heal_no and c == heal_no:
-            _heal_mount_toggle(mp)
-            continue
-        if isdav and c == "7":
-            _add_webdav_flow(d)
-            continue
-        if isqtv and c == "7":
-            _qtv_relogin_flow(d, mp)
-            ask("\n按回车继续...")
-            continue
-        if isali and c == "7":
-            _ali_relogin_flow(d, mp)
-            continue
-        if isqtv and c == "8":
-            if qtv_own().get("refresh_token"):
-                tip("重新扫码会换掉本机这份登录（OpenList 的夸克盘不受影响）")
-                if not ask_yn("确定重新扫码？", False):
-                    continue
-            do_quark_login()
-            ask("\n按回车继续...")
-            continue
-        if isqtv and c == "9":
-            if qtv_pick_on():
-                save_ms_state(qtv_pick=False)
-                ok("已改回 OpenList 给的第一条")
-            elif not qtv_own().get("refresh_token"):
-                warn("先选 8 清晰度登录")
-            else:
-                tip("开播要多问一次夸克（实测慢 3~18 秒），而且转码流一样被限速")
-                if ask_yn("确定改成转码最多降一档？", False):
-                    save_ms_state(qtv_pick=True)
-                    ok("已改成转码最多降一档（1 分钟内生效）")
-            continue
-        if not mounted and c == "7":
-            if has115:
-                _add115_flow(d)
-            elif str(drv or "").lower() in ALI_DRIVERS:
-                _add_ali_flow(d)
-            else:
-                _add_qtv_flow(d)
-            continue
-        if not mounted and c == "8" and has115:
-            qr115_login()
-            continue
-        if c == "1":
-            _drive_paths_menu(d, mp)
-        elif c == "2":
-            _scan_menu(d, mp, f"{driver_cn(drv)} {mp}")
-        elif c == "3":
-            _link_method_menu(d, [mp], driver_cn(drv))
-        elif c == "4":
-            _title_menu(d, mp)
-        elif c == "5":
-            _skip_dirs_menu(d, mp)
-        elif c == "6":
-            _rename_menu(d, mp)
-        elif c == "7" and has115:
-            qr115_login()
-        else:
+        if not (c.isdigit() and 1 <= int(c) <= len(items)):
             print("无效选择。")
+            continue
+        _label, _val, fn, need_mount = items[int(c) - 1]
+        if need_mount and not mounted:
+            warn("这个盘还没挂到 OpenList 上，这一项要挂上之后才能用 —— "
+                 + (f"先选 {mount_no} 挂上。" if mount_no else "先挂上。"))
+            continue
+        fn()
 
 
 def _heal_mount_toggle(mp):
