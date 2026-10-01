@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.286"
+SCRIPT_VERSION = "1.5.287"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19692,7 +19692,7 @@ def _add_webdav_flow(d):
         tip("多半是地址、用户名或密码不对；已撤掉，重新添加一次")
         return False
     ok(f"WebDAV 已挂上：{mount}　{YELLOW}⚠ 走 VPS 流量{RST}")
-    tip("接下来在「3 挂载路径」里点它 → 1 修改扫描路径，加上要进 Emby 的目录")
+    tip("接下来在「3 挂载路径」里点它 → 2 修改扫描路径，加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
 
@@ -20952,8 +20952,8 @@ def _drive_menu(d, mp, drv, mounted=True):
     同一屏、同样的几项，要挂上才能做的那几项点了会先让去挂。
 
     【登录排第 1、扫描路径排第 2】仓库主人：「我想把这个扫码登录移到第 1 位去，扫描路径改成第 2 位
-    叫修改扫描路径」。有登录的盘（115、夸克 TV、阿里）第 1 项是登录 / 挂上；没有登录的盘照旧从
-    「1 修改扫描路径」开始。
+    叫修改扫描路径」。有登录的盘（115、夸克 TV、阿里）第 1 项是登录 / 挂上，WebDAV 第 1 项是「＋ 添加 WebDAV」；
+    别的盘照旧从「1 修改扫描路径」开始。
     【编号按列表现排】以前每一项的编号写死在两处（打印一处、分发一处），挪一项要改一串、
     还对不上过。现在先排一张表，编号跟着表走，打印和分发都看这张表。"""
     names = {"scrape": "刮削结果", "filename": "网盘文件名"}
@@ -21014,9 +21014,12 @@ def _drive_menu(d, mp, drv, mounted=True):
             add("网盘扫码登录", "当前：" + (f"{CYAN}已登录{RST}" if _st == "work"
                                           else f"{YELLOW}掉线了（重新扫码）{RST}"),
                 qr115_login, False)
+        elif isdav:
+            # 【添加 WebDAV 也是挂盘】跟扫码挂上同一类，排第 1（仓库主人：「这个也是挂网盘的吧」）
+            add("＋ 添加 WebDAV", "", lambda: _add_webdav_flow(d), False)
         elif not mounted and isali_drv:
             add("＋ 添加阿里云盘", "", _mount_flow, False)
-        elif not mounted and not isdav:
+        elif not mounted:
             add("扫码挂上", "", _mount_flow, False)
         mount_no = str(len(items)) if (items and not mounted) else ""
 
@@ -21046,10 +21049,6 @@ def _drive_menu(d, mp, drv, mounted=True):
                 lambda: _qtv_pick_menu(), False)
         if has115 and not mounted:
             add("只拿令牌（自己去 OpenList 填）", "", qr115_login, False)
-        if isdav:
-            add("＋ 添加 WebDAV", "", lambda: _add_webdav_flow(d), False)
-            if not mounted:
-                mount_no = str(len(items))
         # 【截封面、补时长】挂着的盘才有，排在最后
         if mounted:
             _cl, _cr = cover_manual_last(mp), cover_running(mp)
