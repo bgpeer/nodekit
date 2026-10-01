@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.280"
+SCRIPT_VERSION = "1.5.281"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20968,7 +20968,11 @@ def _drive_menu(d, mp, drv, mounted=True):
             _q = ali_tc_mounts().get(mp)
             print(f"  7. Emby 播放画质     当前：{CYAN}"
                   + ("阿里转码流（自动最高）" if _q else "原画") + RST)
-            print(f"  8. 网盘扫码登录      当前：{_ols}")
+            # 【登上了就说是哪条接口】仓库主人：「TV 接口如果登入成功了希望在后面显示写一个 TV 接口」
+            _at = next((t for _s, m0, _dv, t, _sh in _ali_storages(d) if m0 == mp), "")
+            print(f"  8. 网盘扫码登录      当前：{_ols}"
+                  + (f"{CYAN} · {'TV 接口' if _at == 'alipanTV' else '开放平台接口'}{RST}"
+                     if _olst == "work" and _at else ""))
         if has115 and mounted:
             # 【登没登看 OpenList 里这个盘在不在工作】115 的登录凭据在 OpenList 那边；
             # 盘状态不是 work（cookie 失效、令牌过期）就是掉线了，要重新扫
