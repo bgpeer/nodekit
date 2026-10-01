@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.283"
+SCRIPT_VERSION = "1.5.284"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -17392,7 +17392,7 @@ LINK_SWITCHES = (
 # 上面哪些是【画质】开关（"播出来是什么"），其余的是【通道】开关（"从哪儿取这条地址"）。
 # 分开是为了那一列的措辞：一个盘没有画质开关，它走的就是原画 —— 屏上得写「原画直链」，
 # 不能只写「开放平台接口」，那句话没回答"清晰度是什么"。
-QUALITY_KEYS = ("link_method", "use_transcoding_address")
+QUALITY_KEYS = ("link_method", "use_transcoding_address", "ali_tc")
 
 
 # 【这一项每个盘都有】上面那些是某些驱动特有的字段，这个不是 —— 它是存储表自己的列。
@@ -17558,6 +17558,14 @@ def drive_links(d, mp, drv=""):
                                    "这套脚本没收录的取值，原样保留"),)
         out.append((key, "addition", title, tuple(opts), cur))
     if str(drv2 or drv or "").lower() == "aliyundriveopen":
+        # 【画质跟夸克同一个位置、同一个叫法】仓库主人：「他们居然是差不多的方式怎么搞成不同的
+        # 设置方法呢，要搞得统一用户好设置」—— 以前阿里的原画 / 转码流单独挂在盘设置的
+        # 「7 Emby 播放画质」，夸克的却在「3 直链方式 → 画质」。阿里转码流记在本脚本的状态里
+        # （不在 OpenList 的 addition），写法见 set_ali_tc
+        out.append(("ali_tc", "ali_tc", "画质",
+                    (("", "原画直链", "网盘里是什么就播什么；没开阿里会员会被限速（约 0.7 Mbps）"),
+                     (ALI_TC_AUTO, "转码流（有损画质）", "阿里自己转好的流，自动挑最高档（最高 1080P）")),
+                    ali_tc_mounts().get(mp, "")))
         # 阿里的通道不能在这里直接写：类型和令牌必须一起换，见 _alipan_channel_menu
         out.append(("alipan_type", "alipan", "接口通道",
                     tuple((k, n, w) for k, (n, w, _p) in ALIPAN_TYPES.items()),
@@ -18354,7 +18362,7 @@ def _add_ali_flow(d):
     else:
         print("  1. 开放平台接口（默认）")
         print("  2. TV 客户端接口")
-        tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；放不动就用 Emby 播放画质 → 阿里转码流")
+        tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；放不动就去「3 直链方式 → 画质」改转码流")
         kind = "alipanTV" if ask("选哪个（回车 = 1）").strip() == "2" else "default"
         tok = _ali_paste_token(kind)
         if not tok:
@@ -19065,7 +19073,7 @@ def qtv_pick_on():
     """「转码最多降一档」开没开。【默认关】真机 9/30 FC2-120222：转码流从服务器拉只有 73 KB/s
     （要 123 才播得动，原片那次 115）—— 夸克对转码流一样限速；开播前多问一次夸克又花了
     2.6~18 秒，门等满 15 秒没等到。仓库主人：「还不如没改之前的」。功能留着，开关在夸克 TV
-    盘设置里（8 Emby 播放画质）。"""
+    盘设置里（9 转码挑档）。"""
     return ms_state().get("qtv_pick") is True
 
 
@@ -20289,7 +20297,7 @@ def _rename_menu(d, mp=None):
 ALIPAN_TYPES = {
     # 【原画限速跟接口无关】真机 10/01 龙虎门：换成 TV 接口后原画直链照样 0.74 Mbps（从中间拉
     # 0.5），要 17.4 —— 限的是没开会员的账号，不是哪条接口。以前这里写「TV 接口不吃那个限速」是
-    # 没实测过的说法，把人往错的方向带。原画放不动就用「Emby 播放画质 → 阿里转码流」。
+    # 没实测过的说法，把人往错的方向带。原画放不动就去「3 直链方式 → 画质」改转码流。
     "default":  ("开放平台接口", "第三方 Open API。原画没开会员会被限速（实测约 0.7 Mbps），"
                                 "大码率的片子放不动",
                  "阿里云盘 (OAuth2) 扫码登录"),
@@ -20687,6 +20695,8 @@ def _one_drive_link_menu(d, mp):
             star = f"  {GREEN}← 现在{RST}" if v == cur else ""
             print(f"  {j}. {name}" + opt_tag(key, v) + star)
         print("  0. 返回")
+        if key == "ali_tc":
+            tip("原画没开阿里会员会被限速（约 0.7 Mbps）；转码流最高 1080P、有损画质")
         if (key == "link_method" and qtv_pick_on()
                 and any(r[2] == DRIVER_QTV for r in _storage_rows(d) if r[1] == mp)):
             # 仓库主人：「分辨率最多只能降一点不能降太多」—— 选档规则见 qtv_pick
@@ -20698,6 +20708,9 @@ def _one_drive_link_menu(d, mp):
         val = opts[int(t) - 1][0]
         if val == cur:
             print("本来就是这个，没有改动。")
+            continue
+        if where == "ali_tc":
+            set_ali_tc(d, mp, val)
             continue
         sid = next((r[0] for r in _storage_rows(d) if r[1] == mp), None)
         if sid is None:
@@ -20794,6 +20807,12 @@ def _ali_tc_menu(d, mp):
     if q == cur:
         print("没有改动。")
         return
+    set_ali_tc(d, mp, q)
+
+
+def set_ali_tc(d, mp, q):
+    """阿里盘在 Emby 里播原画（q=""）还是阿里转码流（q=ALI_TC_AUTO）。
+    「直链方式 → 画质」和老的那一屏共用这一段。"""
     tc = dict(ms_state().get("ali_transcode") or {})
     if q:
         tc[mp] = q
@@ -20974,15 +20993,14 @@ def _drive_menu(d, mp, drv, mounted=True):
             print(f"  7. 网盘扫码登录      当前：{_ols}")
             print(f"  8. 清晰度登录        当前："
                   + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token") else f"{YELLOW}未登录{RST}"))
-            print(f"  9. Emby 播放画质     当前：{CYAN}"
+            # 【不叫「播放画质」】原画 / 转码流在「3 直链方式 → 画质」；这一项管的是转码时挑哪一档
+            print(f"  9. 转码挑档          当前：{CYAN}"
                   + ("转码最多降一档" if qtv_pick_on() else "OpenList 给的第一条") + RST)
         if isali:
-            _q = ali_tc_mounts().get(mp)
-            print(f"  7. Emby 播放画质     当前：{CYAN}"
-                  + ("阿里转码流（自动最高）" if _q else "原画") + RST)
+            # 【阿里的原画 / 转码流挪进了「3 直链方式 → 画质」】跟夸克同一个位置（仓库主人同意）
             # 【登上了就说是哪条接口】仓库主人：「TV 接口如果登入成功了希望在后面显示写一个 TV 接口」
             _at = next((t for _s, m0, _dv, t, _sh in _ali_storages(d) if m0 == mp), "")
-            print(f"  8. 网盘扫码登录      当前：{_ols}"
+            print(f"  7. 网盘扫码登录      当前：{_ols}"
                   + (f"{CYAN} · {'TV 接口' if _at == 'alipanTV' else '开放平台接口'}{RST}"
                      if _olst == "work" and _at else ""))
         if has115 and mounted:
@@ -21003,7 +21021,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
         cov_no = heal_no = ""
         if mounted:
-            cov_no = "10" if isqtv else "9" if isali else "8" if (has115 or isdav) else "7"
+            cov_no = "10" if isqtv else "8" if (isali or has115 or isdav) else "7"
             _cl, _cr = cover_manual_last(mp), cover_running(mp)
             # 【跟上面几行对齐】值那一列从第 24 列起；编号到两位数时标签少占一格
             print(f"  {cov_no}. {pad('截封面', 19 - len(cov_no))}"
@@ -21034,7 +21052,7 @@ def _drive_menu(d, mp, drv, mounted=True):
             _qtv_relogin_flow(d, mp)
             ask("\n按回车继续...")
             continue
-        if isali and c == "8":
+        if isali and c == "7":
             _ali_relogin_flow(d, mp)
             continue
         if isqtv and c == "8":
@@ -21067,9 +21085,6 @@ def _drive_menu(d, mp, drv, mounted=True):
             continue
         if not mounted and c == "8" and has115:
             qr115_login()
-            continue
-        if isali and c == "7":
-            _ali_tc_menu(d, mp)
             continue
         if c == "1":
             _drive_paths_menu(d, mp)
@@ -23009,7 +23024,7 @@ def do_healthcheck():
                     f"alipan_type=default{DIM}　开放平台下载接口，阿里限速到 0.5 MB/s 左右{RST}")
                 todo.append((
                     f"{mp} 走阿里开放平台下载接口，限速 0.5 MB/s 上下，码率高的片子必卡",
-                    f"3 挂载路径 → {mp} → 7 Emby 播放画质 → 阿里转码流（自动最高）"))
+                    f"3 挂载路径 → {mp} → 3 直链方式 → 画质 → 转码流"))
 
     # ---- 列目录 ----
     listed_ok = []
@@ -23421,7 +23436,7 @@ def do_healthcheck():
         todo.append((
             f"直链缓存只有 {_ttl_cur}，被 {_mp0} 压短了（它的直链只活 "
             f"{_who[0][2] if _who else '?'} 分钟），别的盘也跟着每 {_ttl_cur} 重换一次直链",
-            (f"阿里盘：3 挂载路径 → {_mp0} → 7 Emby 播放画质 → 阿里转码流，它就不再压短缓存"
+            (f"阿里盘：3 挂载路径 → {_mp0} → 3 直链方式 → 画质 → 转码流，它就不再压短缓存"
              if _who and str(_who[0][1]).lower() in ALI_DRIVERS else
              f"把 {_mp0} 从 Emby 扫描范围里拿出来（3 挂载路径），再跑「8 更新」")))
     elif _ttl_cur:
