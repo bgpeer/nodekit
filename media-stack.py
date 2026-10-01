@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.275"
+SCRIPT_VERSION = "1.5.276"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2930,6 +2930,7 @@ def do_heal_daemon():
 # 客户端（Hills）或者前面那层 SNI 分流等不了那么久，连 PlaybackInfo 都没走完就断了。
 # 15 秒真机上是过得去的（FC2-060525 那一场）。
 HEAL_GATE_WAIT_S = 15
+HEAL_EMPTY_AGAIN_S = 3     # 探完是空的，隔几秒当场再探一次（见 _heal_one）
 # 【门那一路：strm 只切成 URL 这么几秒】Emby 一收到探测请求就把 strm 读走、拿着那个 URL
 # 去探；读走之后 strm 是什么样已经不影响这一趟探测。所以门那一路在切过去这么多秒后就
 # 先切回路径形式，不等探测跑完 —— 门等满 15 秒放行开播时，MediaWarp 看到的已经是路径
@@ -15317,6 +15318,7 @@ def _heal_one(d, key, _it, base, token):
         _routes.append(("整文件", url, _qs_live))
     _lay = None                       # file_layout 的结果，看过一次就留着
     _alt = False                      # 「不开直播流」那一趟加过没有
+    _again = False                    # 「探完是空的、当场再探一次」那一趟加过没有
     _tried = []                       # 这一次真的走过哪几条路 —— 写进结局，别只剩一个「-」
     mins, streams, probed = 0, False, True
     streams_hot = False               # 还原【之前】有没有轨道，见下面那一档
@@ -15420,6 +15422,15 @@ def _heal_one(d, key, _it, base, token):
             mins, streams = 0, False
         if mins and streams:
             break                     # 这条路成了，别再走下一条（省的就是这一趟）
+        # 【探完是空的 → 当场再探一次】真机 10/01 仙逆剧场版两部（夸克、4K、9 GB）：第一次
+        # 17~18 秒探完、什么都没有，判了「这个源没有音视频轨」；一两分钟后再点，20 / 44 秒
+        # 就探到了。源第一次读太慢，Emby 没读到东西就交差 —— 不是源坏了。仓库主人点了两三次
+        # 才补上。所以最后一条路也空手而归时，隔几秒原样再走一趟（只这一次）。
+        if (probed and not mins and not streams and not streams_hot and not _again
+                and not _alt and _routes[-1][0] == _kind):
+            _again = True
+            time.sleep(HEAL_EMPTY_AGAIN_S)
+            _routes.append((_kind, _u, _qs))
         # 【整文件探出"有轨道没时长"、而文件里明明写着 → 换「不开直播流」再探一趟】
         # 实测 FC2-4954902：普通 mp4、时长索引（moov）在文件末尾；Emby 容器里的 ffprobe
         # 直接读同一个地址，两张脸都读得出 29 分钟。可经 PlaybackInfo（开直播流）探，
@@ -15502,7 +15513,8 @@ def _heal_one(d, key, _it, base, token):
         # 现场实测一个 2727 条的库：一遍 18 GB。所以这一种一次就判放弃。
         # 判错的代价很小：体检那边照旧如实报它，HEAL_GIVEUP_DAYS 天后自动再给一次
         # 机会，想立刻重来还有 heal-reset。
-        return "dead", name, el(), "Emby 探完了，这个源没有音视频轨"
+        return "dead", name, el(), ("Emby 探了两次都是空的，这个源没有音视频轨" if _again
+                                    else "Emby 探完了，这个源没有音视频轨")
     return "retry", name, el(), "探测请求没跑成（超时），下一轮再试"
 
 
