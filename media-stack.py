@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.278"
+SCRIPT_VERSION = "1.5.279"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -18244,9 +18244,11 @@ def _add115_flow(d):
 
 # ============================================================================ 在 VPS 上挂夸克 TV / WebDAV
 # 仓库主人：「其他的几个盘可以像这样在 VPS 上挂载吗」→「做吧，WebDAV 和夸克 TV 都加上」。
-# 阿里云盘没做：它的令牌要走 OpenList 官方的第三方授权网页，按 CLAUDE.md「躲不掉的
-# 泄漏不自己拍板」，照旧在 OpenList 网页里挂。
+# 阿里云盘：令牌要走 OpenList 官方的第三方授权网页取。脚本【不替人去那个网站】（CLAUDE.md
+# 「躲不掉的泄漏不自己拍板」）—— 屏上给网址、人自己扫完把刷新令牌贴回来，脚本只管挂上。
 DRIVER_QTV = "QuarkTV"
+DRIVER_ALI = "AliyundriveOpen"
+MOUNT_ALI = "/aliyun"
 MOUNT_QTV = "/quark"
 DRIVER_DAV = "WebDav"
 MOUNT_DAV = "/webdav"
@@ -18281,6 +18283,146 @@ def _ol_drop_storage(d, mount, tok):
         _ol_api(f"/api/admin/storage/delete?id={sid}", {}, tok, timeout=30)
     except Exception:
         pass
+
+
+def ol_storage_status(d, mp):
+    """OpenList 里这个盘现在的状态（"work" = 正常；别的是它报的原因）。读不到 → ""。"""
+    return next((st for m0, _d0, st, *_x in openlist_storages(d) if m0 == mp), "")
+
+
+def _ali_paste_token(kind):
+    """屏上给取令牌的网址，让人把刷新令牌贴回来。kind = ALIPAN_TYPES 的键。
+    形态跟类型对不上要拦（见 _alipan_channel_menu）。取消返回 ""。"""
+    print()
+    print(f"  取令牌：{CYAN}{BOLD}https://api.oplist.org/{RST}"
+          f"（打不开换 .cn）　选「{ALIPAN_TYPES[kind][2]}」　手机扫码后只要刷新令牌")
+    tip("网站弹「获取秘钥失败」是它自己没通，过一会儿再试")
+    tok = _ask_secret("把刷新令牌粘在这里（留空取消）").strip()
+    if not tok:
+        return ""
+    looks_jwt = tok.count(".") == 2 and tok.startswith("ey")
+    if (kind == "alipanTV") == looks_jwt:
+        warn(f"这串不像「{ALIPAN_TYPES[kind][2]}」取的令牌")
+        tip("配错了现在能用，一小时内令牌续期就整个盘掉线")
+        if not ask_yn("仍然用它？", False):
+            return ""
+    return tok
+
+
+def _add_ali_flow(d):
+    """问挂载路径 → 选接口 → 贴刷新令牌 → 脚本自己在 OpenList 里挂上阿里云盘。返回挂没挂上。
+
+    仓库主人：「三件都做吧，这都是功能性的问题能加则加」—— 阿里删掉之后以前只能去 OpenList
+    网页加；入口要常驻（第四节），没挂也要在。"""
+    mount = ask_mount(d, MOUNT_ALI)
+    if not mount:
+        return False
+    print("  1. 开放平台接口（默认）")
+    print("  2. TV 客户端接口")
+    tip("开放平台接口被阿里限速（约 0.8 Mbps）；TV 客户端接口不限速，但要扫 TV 版二维码")
+    kind = "alipanTV" if ask("选哪个（回车 = 1）").strip() == "2" else "default"
+    tok = _ali_paste_token(kind)
+    if not tok:
+        print("已取消。")
+        return False
+    otok = _ol_token(d)
+    if not otok:
+        err("登不上 OpenList（它在跑吗？）")
+        return False
+    add = {"drive_type": "resource", "root_folder_id": "root", "refresh_token": tok,
+           "order_by": "name", "order_direction": "ASC", "use_online_api": True,
+           "alipan_type": kind, "api_url_address": "https://api.oplist.org/alicloud/renewapi",
+           "client_id": "", "client_secret": "", "remove_way": "trash",
+           "livp_download_format": "jpeg"}
+    info(f"正在 OpenList 里挂上 {mount} ...")
+    try:
+        r = _ol_api("/api/admin/storage/create", _ol_storage_body(mount, DRIVER_ALI, add),
+                    otok, timeout=90)
+    except Exception as e:
+        err(f"没挂上：{_short_err(e)}")
+        return False
+    if r.get("code") != 200:
+        _ol_drop_storage(d, mount, otok)
+        # 报错里可能带着令牌片段或地址，抹掉
+        why = re.sub(r"https?://\S+|ey[\w-]+\.[\w-]+\.[\w-]+", "<略>", str(r.get("message") or ""))
+        err(f"没挂上：{_short_err(why)[:60]}")
+        tip("多半是令牌过期了或类型选错了；已撤掉，重新添加一次")
+        return False
+    ok(f"阿里云盘已挂上：{mount}　{ALIPAN_TYPES[kind][0]}")
+    tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
+    ask("\n按回车继续...")
+    return True
+
+
+def _ali_relogin_flow(d, mp):
+    """阿里盘重新登录：贴一份新的刷新令牌（类型不变）。令牌失效、盘掉线时用。"""
+    row = next((x for x in _ali_storages(d) if x[1] == mp), None)
+    if row is None:
+        warn(f"读不到 {mp} 的存储记录。")
+        return
+    sid, _m, _dv, kind, _shape = row
+    tok = _ali_paste_token(kind or "default")
+    if not tok:
+        print("已取消，一个字都没改。")
+        return
+    _write_addition(d, [(sid, mp)], {"refresh_token": tok}, quiet_keys=("refresh_token",))
+
+
+def _qtv_relogin_flow(d, mp):
+    """OpenList 里的夸克 TV 盘重新扫码：清掉它的令牌 → 它给出新二维码 → 扫完重新加载。
+
+    跟「本机自己那份登录」（do_quark_login）是两回事：这一份是 OpenList 挂盘用的，掉了整个盘
+    就打不开。【放弃要能退回去】清令牌之前先把原来的 addition 记下，按 q 原样写回。"""
+    otok = _ol_token(d)
+    sid = _ol_storage_id(d, mp)
+    if not otok or sid is None:
+        err("登不上 OpenList，或者读不到这个盘。")
+        return False
+    try:
+        st = (_ol_api(f"/api/admin/storage/get?id={sid}", {}, otok, timeout=20,
+                      method="GET").get("data") or {})
+        old = json.loads(st.get("addition") or "{}")
+    except Exception as e:
+        err(f"读不到这个盘的设置：{_short_err(e)}")
+        return False
+    if ol_storage_status(d, mp) == "work":
+        tip("重扫期间这个夸克盘暂时打不开；按 q 放弃会恢复原来的登录")
+        if not ask_yn("确定重新扫码？", False):
+            return False
+
+    def _put(add):
+        body = dict(st, addition=json.dumps(add, ensure_ascii=False))
+        try:
+            return str(_ol_api("/api/admin/storage/update", body, otok, timeout=90).get("message") or "")
+        except Exception as e:
+            return _short_err(e)
+
+    msg = _put(dict(old, refresh_token="", query_token=""))
+    m = QTV_QR_RE.search(msg) or QTV_QR_RE.search(_ol_reload_storage(d, mp, otok))
+    if not m:
+        _put(old)
+        err("OpenList 没给出登录二维码，已恢复原来的登录。")
+        return False
+    lines, link = qr_link_of(m.group(1))
+    print()
+    if lines:
+        print("\n".join(lines))
+        print()
+        if link:
+            print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
+    tip("夸克 App 扫一扫，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else "")
+        if lines else "二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
+    while True:
+        c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
+        if c == "q":
+            _put(old)
+            warn("已放弃，恢复了原来的登录。")
+            return False
+        why = _ol_reload_storage(d, mp, _ol_token(d) or otok)
+        if not why:
+            ok(f"夸克 TV 已重新登录：{mp}")
+            return True
+        warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
 
 
 def _ol_reload_storage(d, mount, tok):
@@ -20269,16 +20411,21 @@ def _drive_menu(d, mp, drv, mounted=True):
         isdav = str(drv or "").lower() == "webdav"
         isali = mounted and str(drv or "").lower() in ALI_DRIVERS
         isqtv = mounted and drv == DRIVER_QTV
+        _olst = ol_storage_status(d, mp) if (isali or isqtv) else ""
+        _ols = (f"{CYAN}已登录{RST}" if _olst == "work" else f"{YELLOW}掉线了（重新登录）{RST}")
         if isqtv:
-            # 本机自己那份夸克登录（选清晰度用，见 qtv_pick），跟 OpenList 那份互不相干
-            print(f"  7. 扫码登录          当前："
+            # 【两份登录分开写】7 是 OpenList 挂盘用的那份（掉了整个盘打不开）；8 是本机
+            # 自己那份（选清晰度用，见 qtv_pick），两份互不相干
+            print(f"  7. 网盘扫码登录      当前：{_ols}")
+            print(f"  8. 清晰度登录        当前："
                   + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token") else f"{YELLOW}未登录{RST}"))
-            print(f"  8. Emby 播放画质     当前：{CYAN}"
+            print(f"  9. Emby 播放画质     当前：{CYAN}"
                   + ("转码最多降一档" if qtv_pick_on() else "OpenList 给的第一条") + RST)
         if isali:
             _q = ali_tc_mounts().get(mp)
             print(f"  7. Emby 播放画质     当前：{CYAN}"
                   + ("阿里转码流（自动最高）" if _q else "原画") + RST)
+            print(f"  8. 网盘扫码登录      当前：{_ols}")
         if has115 and mounted:
             # 【登没登看 OpenList 里这个盘在不在工作】115 的登录凭据在 OpenList 那边；
             # 盘状态不是 work（cookie 失效、令牌过期）就是掉线了，要重新扫
@@ -20290,12 +20437,14 @@ def _drive_menu(d, mp, drv, mounted=True):
             print(f"  8. 只拿令牌（自己去 OpenList 填）")
         elif isdav:
             print(f"  7. ＋ 添加 WebDAV")
+        elif not mounted and str(drv or "").lower() in ALI_DRIVERS:
+            print(f"  7. ＋ 添加阿里云盘")
         elif not mounted:
             print(f"  7. 扫码挂上")
         # 【截封面】挂着的盘才有；排在这个盘自己那一项（7）后面，没有 7 的就是 7
         cov_no = heal_no = ""
         if mounted:
-            cov_no = "9" if isqtv else "8" if (isali or has115 or isdav) else "7"
+            cov_no = "10" if isqtv else "9" if isali else "8" if (has115 or isdav) else "7"
             _cl, _cr = cover_manual_last(mp), cover_running(mp)
             # 【跟上面几行对齐】值那一列从第 24 列起；编号到两位数时标签少占一格
             print(f"  {cov_no}. {pad('截封面', 19 - len(cov_no))}"
@@ -20323,6 +20472,13 @@ def _drive_menu(d, mp, drv, mounted=True):
             _add_webdav_flow(d)
             continue
         if isqtv and c == "7":
+            _qtv_relogin_flow(d, mp)
+            ask("\n按回车继续...")
+            continue
+        if isali and c == "8":
+            _ali_relogin_flow(d, mp)
+            continue
+        if isqtv and c == "8":
             if qtv_own().get("refresh_token"):
                 tip("重新扫码会换掉本机这份登录（OpenList 的夸克盘不受影响）")
                 if not ask_yn("确定重新扫码？", False):
@@ -20330,12 +20486,12 @@ def _drive_menu(d, mp, drv, mounted=True):
             do_quark_login()
             ask("\n按回车继续...")
             continue
-        if isqtv and c == "8":
+        if isqtv and c == "9":
             if qtv_pick_on():
                 save_ms_state(qtv_pick=False)
                 ok("已改回 OpenList 给的第一条")
             elif not qtv_own().get("refresh_token"):
-                warn("先选 7 扫码登录")
+                warn("先选 8 清晰度登录")
             else:
                 tip("开播要多问一次夸克（实测慢 3~18 秒），而且转码流一样被限速")
                 if ask_yn("确定改成转码最多降一档？", False):
@@ -20343,7 +20499,12 @@ def _drive_menu(d, mp, drv, mounted=True):
                     ok("已改成转码最多降一档（1 分钟内生效）")
             continue
         if not mounted and c == "7":
-            _add115_flow(d) if has115 else _add_qtv_flow(d)
+            if has115:
+                _add115_flow(d)
+            elif str(drv or "").lower() in ALI_DRIVERS:
+                _add_ali_flow(d)
+            else:
+                _add_qtv_flow(d)
             continue
         if not mounted and c == "8" and has115:
             qr115_login()
@@ -20796,6 +20957,9 @@ def mount_paths_menu():
         if not any(str(x[1]) == DRIVER_QTV for x in stores):
             extra.append((f"{pad(driver_cn(DRIVER_QTV), 19)}{YELLOW}未挂载{RST}",
                           lambda: _drive_menu(d, MOUNT_QTV, DRIVER_QTV, mounted=False)))
+        if not any(str(x[1]).lower() in ALI_DRIVERS for x in stores):
+            extra.append((f"{pad(driver_cn(DRIVER_ALI), 19)}{YELLOW}未挂载{RST}",
+                          lambda: _drive_menu(d, MOUNT_ALI, DRIVER_ALI, mounted=False)))
         if not any(str(x[1]).lower() == "webdav" for x in stores):
             extra.append((f"{pad(driver_cn(DRIVER_DAV), 19)}{YELLOW}未挂载{RST}",
                           lambda: _drive_menu(d, MOUNT_DAV, DRIVER_DAV, mounted=False)))
