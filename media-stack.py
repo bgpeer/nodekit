@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.281"
+SCRIPT_VERSION = "1.5.282"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -18562,12 +18562,21 @@ def qr_lines(grid, quiet=3):
     for r in range(n):
         for c in range(n):
             W[r + quiet][c + quiet] = grid[r][c]
+    # 【每一格都画「▀」：上半格用前景色、下半格用背景色】以前白格子用前景色的「█」画，
+    # 终端两行字之间那道细缝不归字形管、露出底下的黑 —— 白处一道道黑横线。夸克那种稀一点的码
+    # 还扫得出，阿里 TV 那种密的码就被切碎了（真机 10/01：截图扫不出，网页版的图一扫就成）。
+    # 背景色会把那道缝一起填上，缝的颜色跟它下半格一致，横线就没了。
     out = []
     for r in range(0, len(W), 2):
         top, bot = W[r], W[r + 1]
-        ch = "".join("█" if not t and not b else "▀" if not t else "▄" if not b else " "
-                     for t, b in zip(top, bot))
-        out.append(f"  \x1b[97;40m{ch}{RST}")
+        line, cur = [], None
+        for t, b in zip(top, bot):
+            col = (30 if t else 97, 40 if b else 107)
+            if col != cur:
+                line.append(f"\x1b[{col[0]};{col[1]}m")
+                cur = col
+            line.append("▀")
+        out.append("  " + "".join(line) + RST)
     return out
 
 
