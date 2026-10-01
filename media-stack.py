@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.276"
+SCRIPT_VERSION = "1.5.277"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -107,6 +107,10 @@ HEAL_DAEMON_UNIT = "/etc/systemd/system/media-stack-heald.service"
 HEAL_DAEMON_PATH = "/etc/systemd/system/media-stack-heald.path"
 # 「先补时长再开播」：nginx 在放行 PlaybackInfo 之前先问它一声（见 do_heal_gate）
 HEAL_GATE_SOCK = "/run/media-stack-healgate.sock"
+# 【退出播放后详情页等一下进度】要抢救进度的那几集，在这里各放一个空文件（名字是条目 id）。
+# nginx 只对有文件的那几集，把「读详情」先送去门那边等抢救写完（见 rescue_hold），别的照旧直通。
+RESCUE_HOLD_DIR = "/run/media-stack-hold"
+RESCUE_HOLD_S = 4          # 最多等几秒；写好了马上放
 HEAL_GATE_SOCKET_UNIT = "/etc/systemd/system/media-stack-healgate.socket"
 HEAL_GATE_UNIT = "/etc/systemd/system/media-stack-healgate.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
@@ -1446,6 +1450,9 @@ def gen_nginx_site(cfg):
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_redirect  off;
         proxy_buffering off;"""
+        # 改写过地址（rewrite 到内部那一段）之后要按【原来的地址】转给后面
+        _px_ru = _px.replace(f"proxy_pass http://127.0.0.1:{port};",
+                             f"proxy_pass http://127.0.0.1:{port}$request_uri;", 1)
         gate = (f"""
     # 先补时长再开播（见 media-stack.py 的 do_heal_gate）
     location ~* ^/(?:emby/)?items/[0-9]+/playbackinfo$ {{
@@ -1464,6 +1471,33 @@ def gen_nginx_site(cfg):
         proxy_set_header X-Original-URI $request_uri;
         proxy_connect_timeout 5s;
         proxy_read_timeout {HEAL_GATE_WAIT_S + 10}s;
+    }}
+    # 退出播放后读详情：这一集在抢救进度（{RESCUE_HOLD_DIR} 里有它的文件）才先等写回，
+    # 最多 {RESCUE_HOLD_S} 秒（见 media-stack.py 的 rescue_hold）。别的条目照旧直通，不经过门
+    location ~* ^/(?:emby/)?(?:users/[^/]+/)?items/([0-9]+)$ {{
+        set $ms_iid $1;
+        if (-f {RESCUE_HOLD_DIR}/$ms_iid) {{
+            rewrite ^ /__ms_hold_item last;
+        }}
+{_px}
+    }}
+    location = /__ms_hold_item {{
+        internal;
+        auth_request /__ms_hold;
+        error_page 500 502 503 504 = @ms_item;
+{_px_ru}
+    }}
+    location @ms_item {{
+{_px_ru}
+    }}
+    location = /__ms_hold {{
+        internal;
+        proxy_pass http://unix:{HEAL_GATE_SOCK}:/hold;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Ms-Iid $ms_iid;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout {RESCUE_HOLD_S + 4}s;
     }}
 """ if sub == "emby" and gate_on else "")
         out.append(f"""
@@ -3195,6 +3229,22 @@ def do_heal_gate():
     class H(http.server.BaseHTTPRequestHandler):
         def _go(self):
             last[0] = time.monotonic()
+            if self.path.startswith("/hold"):
+                # 【退出播放后读详情：先等进度写回】见 rescue_hold。只等、不碰网盘
+                _iid = re.sub(r"\D", "", self.headers.get("X-Ms-Iid") or "")
+                try:
+                    _w, _done = rescue_hold(key, _iid) if (_iid and key) else (0.0, True)
+                    if _w >= 0.5:
+                        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情"
+                                  f"等了 {_w:.1f}s（{'写回了' if _done else '等满了，还没写回'}）"
+                                  f"{_log_tag(_iid)}"])
+                except Exception:
+                    pass
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                last[0] = time.monotonic()
+                return
             _tm = {}                           # 开播计时，见下面 finally 那段
             try:
                 _uri = self.headers.get("X-Original-URI") or ""
@@ -5636,6 +5686,50 @@ HEAL_RESCUE_UNSEEN_S = 150
 HEAL_RESCUE_END_PCT = 0.9    # 放到这个比例之后停的，当它是真看完了（Emby 的默认也是 90%）
 
 
+def rescue_hold_sync(st):
+    """让 RESCUE_HOLD_DIR 里的空文件跟抢救表对上：表里有的放一个，没了的删掉。"""
+    try:
+        os.makedirs(RESCUE_HOLD_DIR, mode=0o755, exist_ok=True)
+        want = {k for k in st if str(k).isdigit()}
+        have = set(os.listdir(RESCUE_HOLD_DIR))
+        for k in want - have:
+            open(os.path.join(RESCUE_HOLD_DIR, k), "w").close()
+        for k in have - want:
+            os.remove(os.path.join(RESCUE_HOLD_DIR, k))
+    except OSError:
+        pass
+
+
+RESCUE_HOLD_RECENT_S = 180   # 停下来多久之内读详情才等（别让挂着的老条目每次都等）
+
+
+def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
+    """「读详情」先等这一集的进度抢救写完，最多 cap 秒。返回 (等了几秒, 写完没有)。
+
+    仓库主人：「有时候我退出来进度还没有刷新然后又退出去再进来他才刷新」「Hills 刷新能慢个
+    1-2 秒就够了」。Hills 一退出就回详情页重读，抢救那边要 2~4 秒才写回（常驻服务看见
+    「停止播放」→ 叫醒 heal-tick → 写回续播点）。
+    只在三条都满足时才等：这一集在抢救表里、刚停下不久、现在没人在播它（播着的时候别的
+    设备看详情不受影响）。问不到 Emby 就不等。"""
+    t0 = time.monotonic()
+    e = (ms_state().get("heal_rescue") or {}).get(str(iid))
+    if not e:
+        return 0.0, True
+    if time.time() - max(int(e.get("seen") or 0), int(e.get("t0") or 0)) > RESCUE_HOLD_RECENT_S:
+        return 0.0, True
+    try:
+        if any(str((se.get("NowPlayingItem") or {}).get("Id") or "") == str(iid)
+               for se in (_emby("/Sessions", key, timeout=3) or [])):
+            return time.monotonic() - t0, True
+    except Exception:
+        return time.monotonic() - t0, True
+    while time.monotonic() - t0 < cap:
+        if str(iid) not in (ms_state().get("heal_rescue") or {}):
+            return time.monotonic() - t0, True
+        time.sleep(0.3)
+    return time.monotonic() - t0, False
+
+
 def rescue_arm(items):
     """把"点开时还没补上"的这几集记下来，之后的每一轮 tick 都会盯着它们。"""
     if not items:
@@ -5649,6 +5743,7 @@ def rescue_arm(items):
         e["uid"] = e.get("uid") or x[0]
         e["name"] = e.get("name") or str(x[2])[:40]
     save_ms_state(heal_rescue=st)
+    rescue_hold_sync(st)
 
 
 def rescue_mark_nodur(items):
@@ -5663,6 +5758,7 @@ def rescue_mark_nodur(items):
             e["uid"] = e.get("uid") or x[0]
             e["name"] = e.get("name") or str(x[2])[:40]
     save_ms_state(heal_rescue=st)
+    rescue_hold_sync(st)
 
 
 def rescue_progress(key):
@@ -5804,6 +5900,7 @@ def rescue_progress(key):
                     + (f"已写回续播点 {_mmss(pos)}" if pos
                        else "位置拿不到，已撤掉「已看完」") + _tail)
     save_ms_state(heal_rescue=st)
+    rescue_hold_sync(st)
     heal_log(logs)
     return fixed
 
@@ -5857,6 +5954,7 @@ def rescue_linger(key=None):
                 st[iid]["seen"] = int(time.time())
                 hit = True
         save_ms_state(heal_rescue=st)
+        rescue_hold_sync(st)
         if not hit:
             return                    # 停了：最后记下的位置离停下的地方不到 10 秒
 
