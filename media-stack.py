@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.285"
+SCRIPT_VERSION = "1.5.286"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20997,7 +20997,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         # ---- 第 1 项：登录 / 挂上（有登录的盘才有）
         if isqtv:
             # 【两份登录分开写】这一项是 OpenList 挂盘用的那份（掉了整个盘打不开）；
-            # 下面的「清晰度登录」是本机自己那份（选清晰度用，见 qtv_pick），两份互不相干
+            # 「转码挑档」里那份是本机自己的（选清晰度用，见 qtv_pick），两份互不相干
             add("网盘扫码登录", f"当前：{_ols}",
                 lambda: (_qtv_relogin_flow(d, mp), ask("\n按回车继续...")), False)
         elif isali:
@@ -21037,31 +21037,13 @@ def _drive_menu(d, mp, drv, mounted=True):
 
         # ---- 各盘自己的
         if isqtv:
-            def _own_login():
-                if qtv_own().get("refresh_token"):
-                    tip("重新扫码会换掉本机这份登录（OpenList 的夸克盘不受影响）")
-                    if not ask_yn("确定重新扫码？", False):
-                        return
-                do_quark_login()
-                ask("\n按回车继续...")
-
-            def _pick_toggle():
-                if qtv_pick_on():
-                    save_ms_state(qtv_pick=False)
-                    ok("已改回 OpenList 给的第一条")
-                elif not qtv_own().get("refresh_token"):
-                    warn(f"先选 {_own_no} 清晰度登录")
-                else:
-                    tip("开播要多问一次夸克（实测慢 3~18 秒），而且转码流一样被限速")
-                    if ask_yn("确定改成转码最多降一档？", False):
-                        save_ms_state(qtv_pick=True)
-                        ok("已改成转码最多降一档（1 分钟内生效）")
-            add("清晰度登录", "当前：" + (f"{CYAN}已登录{RST}" if qtv_own().get("refresh_token")
-                                       else f"{YELLOW}未登录{RST}"), _own_login, False)
-            _own_no = str(len(items))
-            # 【不叫「播放画质」】原画 / 转码流在「直链方式 → 画质」；这一项管的是转码时挑哪一档
-            add("转码挑档", f"当前：{CYAN}"
-                + ("转码最多降一档" if qtv_pick_on() else "OpenList 给的第一条") + RST, _pick_toggle, False)
+            # 【清晰度登录并进了转码挑档】仓库主人同意：那份本机夸克登录只给转码挑档用，单独摆一项
+            # 屏上就是两个「已登录」，还容易当成 OpenList 登录。打开转码挑档时没登录就当场扫
+            _logged = bool(qtv_own().get("refresh_token"))
+            add("转码挑档", "当前：" + (f"{CYAN}转码最多降一档{RST}" + (f"{CYAN} · 已登录{RST}" if _logged
+                                                             else f"{YELLOW} · 未登录{RST}")
+                                       if qtv_pick_on() else f"{CYAN}OpenList 给的第一条{RST}"),
+                lambda: _qtv_pick_menu(), False)
         if has115 and not mounted:
             add("只拿令牌（自己去 OpenList 填）", "", qr115_login, False)
         if isdav:
@@ -21096,6 +21078,47 @@ def _drive_menu(d, mp, drv, mounted=True):
                  + (f"先选 {mount_no} 挂上。" if mount_no else "先挂上。"))
             continue
         fn()
+
+
+def _qtv_pick_menu():
+    """夸克 TV 盘「转码挑档」：开关 + 本机那份夸克登录（以前单独叫「清晰度登录」，并进来了）。"""
+    while True:
+        on, logged = qtv_pick_on(), bool(qtv_own().get("refresh_token"))
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}转码挑档{RST}")
+        print("-" * 60)
+        print(f"  1. 开关              当前：{CYAN}{'转码最多降一档' if on else 'OpenList 给的第一条'}{RST}")
+        print(f"  2. 本机夸克登录      当前：" + (f"{CYAN}已登录{RST}" if logged else f"{YELLOW}未登录{RST}"))
+        print("  0. 返回")
+        print("-" * 60)
+        tip("这份登录只给转码挑档用（本机自己问夸克挑清晰度），跟 OpenList 那份互不相干")
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "1":
+            if on:
+                save_ms_state(qtv_pick=False)
+                ok("已改回 OpenList 给的第一条")
+                continue
+            tip("开播要多问一次夸克（实测慢 3~18 秒），而且转码流一样被限速")
+            if not ask_yn("确定改成转码最多降一档？", False):
+                continue
+            if not logged:
+                info("要先扫码登一份本机的夸克登录")
+                if not do_quark_login():
+                    warn("没登上，转码挑档没打开。")
+                    continue
+            save_ms_state(qtv_pick=True)
+            ok("已改成转码最多降一档（1 分钟内生效）")
+        elif c == "2":
+            if logged:
+                tip("重新扫码会换掉本机这份登录（OpenList 的夸克盘不受影响）")
+                if not ask_yn("确定重新扫码？", False):
+                    continue
+            do_quark_login()
+            ask("\n按回车继续...")
+        else:
+            print("无效选择。")
 
 
 def _heal_mount_toggle(mp):
