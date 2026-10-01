@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.274"
+SCRIPT_VERSION = "1.5.275"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20125,7 +20125,13 @@ def _drive_menu(d, mp, drv, mounted=True):
         tp = title_policy_of(mp)
         print("\n" + "=" * 60)
         # 没挂的 115 不印挂载点：/115 是脚本扫码挂时才用的名字，用户手动挂可能叫别的
-        print(f"  {BOLD}{driver_cn(drv)}{RST} {BOLD}{mp}{RST}   {CYAN}{_scan_of(mp)}{RST}"
+        # 【挂载点不印两遍】扫描路径本来就以挂载点开头（/quark/夸克挂载），前面再印一个 /quark
+        # 是重复 —— 阿里那种扫整个盘的就成了「/aliyun　/aliyun」（真机 10/01，仓库主人：
+        # 「应该这样显示：Quark TV　/quark/夸克挂载」）。没加路径时才把挂载点带上，不然认不出是哪个盘
+        _sc = _scan_of(mp)
+        _hd = (f"{CYAN}{_sc}{RST}" if _sc.startswith("/") or "：/" in _sc
+               else f"{BOLD}{mp}{RST}   {CYAN}{_sc}{RST}")
+        print(f"  {BOLD}{driver_cn(drv)}{RST}   {_hd}"
               if mounted else f"  {BOLD}{driver_cn(drv)}{RST}   {YELLOW}未挂载{RST}")
         print("=" * 60)
         print(f"  1. 扫描路径          {CYAN}{_scan_of(mp)}{RST}")
@@ -20513,29 +20519,31 @@ def _rest_menu(d):
         print(f"  3. 直链方式          当前：{CYAN}{ch}{RST}")
         print(f"  4. 片名用哪个        当前："
               f"{CYAN}{names.get(title_policy())}{RST}")
-        print(f"  5. 名称重定义        当前：{CYAN}"
-              + ("清洗后的名字" if rename_policy() == "on" else "网盘原名") + RST)
+        # 【5 / 6 跟单个盘那一屏同一个顺序】以前这里是 5 名称重定义、6 不扫的目录，跟单个盘
+        # 正好反着 —— 同一个数字点进去是两样东西（真机 10/01）
         # 【剩余组也要能管到每个盘】仓库主人：「剩余网盘应该包含挂在里面的全部路径，
         # 里面的功能应该更多」。组里的盘各有各的开关（不扫的目录、115 扫码……），
         # 以前只能先给它单独加路径、让它离开这个组，才点得进它自己那一屏。
         _sk = sum(len(skip_dirs_of(m)) for m in rest)
-        print(f"  6. 不扫的目录        当前："
+        print(f"  5. 不扫的目录        当前："
               + (f"{CYAN}{_sk} 条{RST}" if _sk else f"{DIM}无{RST}")
               + (f"  {DIM}（按盘设）{RST}" if len(rest) > 1 else ""))
+        print(f"  6. 名称重定义        当前：{CYAN}"
+              + ("清洗后的名字" if rename_policy() == "on" else "网盘原名") + RST)
         print(f"  7. 组里单个盘的设置")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if c in ("6", "7"):
+        if c in ("5", "7"):
             if not rest:
                 warn("没有剩余的盘（每个盘都单独设过路径了）。")
                 continue
             mp = _pick_mount(rest, "哪个盘")
             if not mp:
                 continue
-            if c == "6":
+            if c == "5":
                 _skip_dirs_menu(d, mp)
             else:
                 drv = next((dv for m, dv, *_x in openlist_storages(d) if m == mp), "")
@@ -20557,7 +20565,7 @@ def _rest_menu(d):
         if c == "4":
             _title_menu(d, None)
             continue
-        if c == "5":
+        if c == "6":
             _rename_menu(d, None)
             continue
         if c != "1":
