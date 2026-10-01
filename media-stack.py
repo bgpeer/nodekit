@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.279"
+SCRIPT_VERSION = "1.5.280"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -10684,6 +10684,10 @@ def do_update(from_menu=False):
         sync_hls_service(d)
     except Exception as e:
         warn(f"分片重定向没对上（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
+    try:
+        sync_alitv_service(d)     # 阿里 TV 本机续期：有盘指向它才在，网关变了顺手改地址
+    except Exception as e:
+        warn(f"阿里 TV 本机续期服务没对上：{_short_err(e)}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
@@ -10791,6 +10795,7 @@ def do_uninstall():
             sh(f"docker rm -f {c}")
     ok("容器已删除")
     remove_heal_daemon()      # 常驻进程：卸完不该还有一个 media-stack 的进程在跑
+    remove_alitv_service()    # 阿里 TV 本机续期服务同理
     remove_heal_gate()
 
     if os.path.exists(NGX_SITE):
@@ -18249,6 +18254,30 @@ def _add115_flow(d):
 DRIVER_QTV = "QuarkTV"
 DRIVER_ALI = "AliyundriveOpen"
 MOUNT_ALI = "/aliyun"
+ALI_OPLIST_RENEW = "https://api.oplist.org/alicloud/renewapi"   # OpenList 默认的续期地址
+
+
+def _ali_tv_scan(d):
+    """终端扫码拿 TV 令牌 → 要写进 addition 的几项（TV 接口 + 续期地址）。失败 → None。
+
+    续期先试本机那个小服务：通 → 从此不经过 api.oplist.org；不通（防火墙挡了 Docker → 本机）
+    → 照旧走 api.oplist.org，盘照样能用，屏上说一句。"""
+    tok = alitv_scan_login()
+    if not tok:
+        return None
+    url = alitv_ensure(d)
+    if not url:
+        warn("本机续期服务连不上（多半是防火墙挡了 Docker → 本机），续期照旧走 api.oplist.org")
+    return {"alipan_type": "alipanTV", "refresh_token": tok, "use_online_api": True,
+            "api_url_address": url or ALI_OPLIST_RENEW}
+
+
+def _ali_how():
+    """扫码（TV 接口，默认）还是贴令牌。返回 "scan" / "paste"。"""
+    print("  1. 扫码（TV 客户端接口，默认）")
+    print("  2. 贴令牌（自己去取令牌的网站）")
+    tip("扫码走 TV 客户端接口：不限速、续期在本机做，不经过 api.oplist.org")
+    return "paste" if ask("选哪个（回车 = 1）").strip() == "2" else "scan"
 MOUNT_QTV = "/quark"
 DRIVER_DAV = "WebDav"
 MOUNT_DAV = "/webdav"
@@ -18317,14 +18346,21 @@ def _add_ali_flow(d):
     mount = ask_mount(d, MOUNT_ALI)
     if not mount:
         return False
-    print("  1. 开放平台接口（默认）")
-    print("  2. TV 客户端接口")
-    tip("开放平台接口被阿里限速（约 0.8 Mbps）；TV 客户端接口不限速，但要扫 TV 版二维码")
-    kind = "alipanTV" if ask("选哪个（回车 = 1）").strip() == "2" else "default"
-    tok = _ali_paste_token(kind)
-    if not tok:
-        print("已取消。")
-        return False
+    if _ali_how() == "scan":
+        extra = _ali_tv_scan(d)
+        if not extra:
+            return False
+        kind, tok = "alipanTV", extra["refresh_token"]
+    else:
+        print("  1. 开放平台接口（默认）")
+        print("  2. TV 客户端接口")
+        tip("开放平台接口被阿里限速（约 0.8 Mbps）；TV 客户端接口不限速，但要扫 TV 版二维码")
+        kind = "alipanTV" if ask("选哪个（回车 = 1）").strip() == "2" else "default"
+        tok = _ali_paste_token(kind)
+        if not tok:
+            print("已取消。")
+            return False
+        extra = {}
     otok = _ol_token(d)
     if not otok:
         err("登不上 OpenList（它在跑吗？）")
@@ -18333,7 +18369,7 @@ def _add_ali_flow(d):
            "order_by": "name", "order_direction": "ASC", "use_online_api": True,
            "alipan_type": kind, "api_url_address": "https://api.oplist.org/alicloud/renewapi",
            "client_id": "", "client_secret": "", "remove_way": "trash",
-           "livp_download_format": "jpeg"}
+           "livp_download_format": "jpeg", **extra}
     info(f"正在 OpenList 里挂上 {mount} ...")
     try:
         r = _ol_api("/api/admin/storage/create", _ol_storage_body(mount, DRIVER_ALI, add),
@@ -18349,6 +18385,7 @@ def _add_ali_flow(d):
         tip("多半是令牌过期了或类型选错了；已撤掉，重新添加一次")
         return False
     ok(f"阿里云盘已挂上：{mount}　{ALIPAN_TYPES[kind][0]}")
+    sync_alitv_service(d)
     tip("接下来在「1 扫描路径」里加上要进 Emby 的目录")
     ask("\n按回车继续...")
     return True
@@ -18361,6 +18398,16 @@ def _ali_relogin_flow(d, mp):
         warn(f"读不到 {mp} 的存储记录。")
         return
     sid, _m, _dv, kind, _shape = row
+    if _ali_how() == "scan":
+        if kind != "alipanTV":
+            tip("扫码会把这个盘换成 TV 客户端接口（不限速）")
+        extra = _ali_tv_scan(d)
+        if not extra:
+            print("一个字都没改。")
+            return
+        _write_addition(d, [(sid, mp)], extra, quiet_keys=("refresh_token",))
+        sync_alitv_service(d)
+        return
     tok = _ali_paste_token(kind or "default")
     if not tok:
         print("已取消，一个字都没改。")
@@ -19094,6 +19141,488 @@ def do_quark_res(q):
     print((f"  {DIM}★ = Emby 里播的那条（转码最多降一档）{RST}" if qtv_pick_on() else
            f"  {DIM}★ = 打开「转码最多降一档」后播的那条（现在关着）{RST}") if pick else
           f"  {DIM}没有够格的转码（低于下一档的不要），Emby 里照旧播原片{RST}")
+
+
+
+# ============================================================================ AES（纯 Python）
+# 阿里 TV 那条接口的请求 / 回包都是 AES-256-CBC 加过密的（见 AliTV）。Python 自带的库里没有
+# AES，VPS 上也未必装了 cryptography —— 为了这几百字节的请求不该多装一个包，这里自己算。
+# 只给 AliTV 用，数据都很小，慢一点没关系。
+def _aes_tables():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        x = q ^ (((q << 1) | (q >> 7)) & 0xFF) ^ (((q << 2) | (q >> 6)) & 0xFF) \
+            ^ (((q << 3) | (q >> 5)) & 0xFF) ^ (((q << 4) | (q >> 4)) & 0xFF)
+        sbox[p] = x ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    inv = [0] * 256
+    for i, v in enumerate(sbox):
+        inv[v] = i
+    return sbox, inv
+
+
+_AES_S, _AES_SI = _aes_tables()
+
+
+def _xt(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+
+def _gmul(a, b):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a = _xt(a)
+        b >>= 1
+    return r
+
+
+def _aes_expand(key):
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    rcon = 1
+    for i in range(nk, 4 * (nr + 1)):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = [_AES_S[b] for b in t[1:] + t[:1]]
+            t[0] ^= rcon
+            rcon = _xt(rcon)
+        elif nk > 6 and i % nk == 4:
+            t = [_AES_S[b] for b in t]
+        w.append([a ^ b for a, b in zip(w[i - nk], t)])
+    return [sum(w[4 * r:4 * r + 4], []) for r in range(nr + 1)], nr
+
+
+def _aes_block(st, rks, nr, dec=False):
+    s = [a ^ b for a, b in zip(st, rks[nr if dec else 0])]
+    rng = range(nr - 1, 0, -1) if dec else range(1, nr)
+    for r in list(rng) + [0 if dec else nr]:
+        if not dec:
+            s = [_AES_S[b] for b in s]
+            s = [s[(i + 4 * (i % 4)) % 16] for i in range(16)]
+            if r != nr:
+                s = sum(([_gmul(c[0], 2) ^ _gmul(c[1], 3) ^ c[2] ^ c[3],
+                          c[0] ^ _gmul(c[1], 2) ^ _gmul(c[2], 3) ^ c[3],
+                          c[0] ^ c[1] ^ _gmul(c[2], 2) ^ _gmul(c[3], 3),
+                          _gmul(c[0], 3) ^ c[1] ^ c[2] ^ _gmul(c[3], 2)]
+                         for c in (s[4 * j:4 * j + 4] for j in range(4))), [])
+            s = [a ^ b for a, b in zip(s, rks[r])]
+        else:
+            s = [s[(i - 4 * (i % 4)) % 16] for i in range(16)]
+            s = [_AES_SI[b] for b in s]
+            s = [a ^ b for a, b in zip(s, rks[r])]
+            if r != 0:
+                s = sum(([_gmul(c[0], 14) ^ _gmul(c[1], 11) ^ _gmul(c[2], 13) ^ _gmul(c[3], 9),
+                          _gmul(c[0], 9) ^ _gmul(c[1], 14) ^ _gmul(c[2], 11) ^ _gmul(c[3], 13),
+                          _gmul(c[0], 13) ^ _gmul(c[1], 9) ^ _gmul(c[2], 14) ^ _gmul(c[3], 11),
+                          _gmul(c[0], 11) ^ _gmul(c[1], 13) ^ _gmul(c[2], 9) ^ _gmul(c[3], 14)]
+                         for c in (s[4 * j:4 * j + 4] for j in range(4))), [])
+    return s
+
+
+def aes_cbc_encrypt(key, iv, data):
+    """AES-CBC + PKCS7。key 16/24/32 字节，iv 16 字节。"""
+    rks, nr = _aes_expand(key)
+    pad = 16 - len(data) % 16
+    data = data + bytes([pad]) * pad
+    out, prev = b"", list(iv)
+    for i in range(0, len(data), 16):
+        prev = _aes_block([a ^ b for a, b in zip(data[i:i + 16], prev)], rks, nr)
+        out += bytes(prev)
+    return out
+
+
+def aes_cbc_decrypt(key, iv, data):
+    """AES-CBC 解密并去掉 PKCS7 填充。填充不对抛 ValueError。"""
+    if not data or len(data) % 16:
+        raise ValueError("密文长度不对")
+    rks, nr = _aes_expand(key)
+    out, prev = b"", list(iv)
+    for i in range(0, len(data), 16):
+        blk = list(data[i:i + 16])
+        out += bytes(a ^ b for a, b in zip(_aes_block(blk, rks, nr, dec=True), prev))
+        prev = blk
+    pad = out[-1]
+    if not 1 <= pad <= 16 or out[-pad:] != bytes([pad]) * pad:
+        raise ValueError("解不开（填充不对）")
+    return out[:-pad]
+
+
+# ============================================================================ 阿里云盘 TV 接口：本机自己扫码、自己续期
+# 仓库主人：「api.oplist.org 这个是第三方的……可不可以自己做一个」→「做吧，走 TV 接口」。
+# OpenList 的阿里盘设成 TV 客户端接口（alipan_type=alipanTV）时，扫码和续期原本都经
+# api.oplist.org 转一手，真正干活的是 TV 投屏软件的服务器 api.extscreen.com（夸克 TV 盘也用它）。
+# 这里照 OpenList 官方那个网站的开源代码（OpenList-APIPages 的 src/driver/alicloud_tv.ts）在本机做：
+#   · 扫码：问 extscreen 要二维码 → 阿里开放平台查扫没扫 → 拿登录码问 extscreen 换刷新令牌
+#   · 续期：本机起一个小服务（只监听 Docker 内部网络的网关，公网摸不到），OpenList 续期时问它，
+#     它再去问 extscreen —— 从此不经过 api.oplist.org
+# 【还剩一个第三方】extscreen 看得到这份令牌（跟夸克 TV 那份一样），去不掉。
+# 【不泄漏】令牌只进 OpenList 的库；设备号存 ALITV_OWN（0600）；屏上、日志里不打令牌。
+ALITV_API = "https://api.extscreen.com/aliyundrive"
+ALITV_TS_URL = "http://api.extscreen.com/timestamp"      # 只取一个时间戳，不带任何东西
+ALITV_STATUS = "https://openapi.alipan.com/oauth/qrcode/{}/status"
+ALITV_UA = ("Mozilla/5.0 (Linux; U; Android 15; zh-cn; SM-S908E Build/UKQ1.231108.001) "
+            "AppleWebKit/533.1 (KHTML, like Gecko) Mobile Safari/533.1")
+ALITV_OWN = BGP_DIR + "/alitv.json"
+ALITV_PORT = 15244                    # 本机续期服务的端口（只绑 Docker 网关）
+ALITV_UNIT = "/etc/systemd/system/media-stack-alitv.service"
+ALITV_NET = "mediastack"             # gen_compose 里 networks.mediastack.name
+
+
+class AliTV:
+    """api.extscreen.com 阿里 TV 那几个接口。请求体、回包都是 AES-256-CBC，签名见 _sign。"""
+    model, brand, akv, apv = "SM-S908E", "samsung", "2.6.1143", "1.4.0.2"
+
+    def __init__(self, dev=None, opener=None):
+        own = dev or self._own()
+        self.uid, self.mac = own["d"], own["mac"]
+        self.ts = ""
+        self._open = opener or urllib.request.urlopen
+
+    @staticmethod
+    def _own():
+        """设备号一台机器只生一次，存 0600。"""
+        try:
+            with open(ALITV_OWN) as f:
+                v = json.load(f)
+            if v.get("d") and v.get("mac"):
+                return v
+        except Exception:
+            pass
+        v = {"d": secrets.token_hex(16), "mac": str(100000000000 + secrets.randbelow(900000000000))}
+        try:
+            os.makedirs(BGP_DIR, exist_ok=True)
+            write_atomic(ALITV_OWN, json.dumps(v) + "\n", mode=0o600)
+        except OSError:
+            pass
+        return v
+
+    def _params(self, t):
+        return {"akv": self.akv, "apv": self.apv, "b": self.brand, "d": self.uid, "m": self.model,
+                "mac": "", "n": self.model, "t": t, "wifiMac": self.mac}
+
+    @staticmethod
+    def _h(chars, modifier):
+        """照 alicloud_tv.ts 的 h()：去重保序，每个字符按时间戳后几位挪一挪。"""
+        ms = str(modifier)
+        try:
+            mod = int(ms[7:] if len(ms) > 7 else "0") % 127
+        except ValueError:
+            mod = 0
+        out = ""
+        for c in dict.fromkeys(chars):
+            n = abs(ord(c) - mod - 1)
+            out += chr(n + 33 if n < 33 else n)
+        return out
+
+    def _key(self, t=None):
+        import hashlib
+        p = self._params(self.ts if t is None else t)
+        cat = "".join(str(p[k]) for k in sorted(p) if k != "t")
+        return hashlib.md5(self._h(list(cat), self.ts if t is None else t).encode()).hexdigest()
+
+    def _sign(self, method, path):
+        import hashlib
+        return hashlib.sha256(f"{method}-/api{path}-{self.ts}-{self.uid}-{self._key()}".encode()).hexdigest()
+
+    def _encrypt(self, obj):
+        iv = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(16))
+        plain = re.sub(r"\s", "", json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+        ct = aes_cbc_encrypt(self._key().encode(), iv.encode(), plain.encode())
+        return {"iv": iv, "ciphertext": base64.b64encode(ct).decode()}
+
+    def _decrypt(self, data, t):
+        key = self._key(t if t else None).encode()
+        return aes_cbc_decrypt(key, bytes.fromhex(data["iv"]),
+                               base64.b64decode(data["ciphertext"])).decode()
+
+    def _stamp(self):
+        """每次请求现取一个时间戳（签名、密钥都靠它）；取不到就用本机时间。"""
+        try:
+            req = urllib.request.Request(ALITV_TS_URL, headers={"User-Agent": ALITV_UA})
+            with self._open(req, timeout=10) as r:
+                self.ts = str((json.load(r).get("data") or {}).get("timestamp") or "")
+        except Exception:
+            self.ts = ""
+        if not self.ts:
+            self.ts = str(int(time.time()))
+
+    def _post(self, path, obj):
+        self._stamp()
+        p = self._params(self.ts)
+        hd = {"User-Agent": ALITV_UA, "Content-Type": "application/json;",
+              **{k: str(v) for k, v in p.items() if k != "mac"}, "sign": self._sign("POST", path)}
+        req = urllib.request.Request(ALITV_API + path, data=json.dumps(self._encrypt(obj)).encode(),
+                                     headers=hd, method="POST")
+        with self._open(req, timeout=20) as r:
+            v = json.load(r)
+        if v.get("code") not in (None, 200) or not isinstance(v.get("data"), dict):
+            raise RuntimeError(str(v.get("message") or v.get("code") or "回包不对")[:60])
+        return json.loads(self._decrypt(v["data"], str(v.get("t") or "")))
+
+    def qrcode(self):
+        """→ (二维码图片地址, sid)"""
+        d = self._post("/v2/qrcode", {"scopes": "user:base,file:all:read,file:all:write",
+                                      "width": 500, "height": 500})
+        if not d.get("sid"):
+            raise RuntimeError("没给二维码")
+        return str(d.get("qrCodeUrl") or ""), str(d["sid"])
+
+    def status(self, sid):
+        """→ (状态, 登录码)。状态：WaitLogin / ScanSuccess / LoginSuccess / QRCodeExpired"""
+        req = urllib.request.Request(ALITV_STATUS.format(urllib.parse.quote(sid)),
+                                     headers={"User-Agent": ALITV_UA})
+        with self._open(req, timeout=20) as r:
+            v = json.load(r)
+        return str(v.get("status") or ""), str(v.get("authCode") or "")
+
+    def token(self, code="", refresh=""):
+        """登录码 / 刷新令牌 → {refresh_token, access_token, ...}"""
+        d = self._post("/v4/token", {"refresh_token": refresh} if refresh else {"code": code})
+        if not d.get("refresh_token"):
+            raise RuntimeError("没换到令牌")
+        return d
+
+
+def alitv_scan_login(tv=None, poll=2, wait_s=300):
+    """终端里扫阿里 TV 版二维码 → 刷新令牌。失败 / 放弃返回 ""。"""
+    tv = tv or AliTV()
+    try:
+        img, sid = tv.qrcode()
+    except Exception as e:
+        warn(f"没拿到阿里的二维码：{_short_err(e)[:60]}")
+        return ""
+    lines, link = [], ""
+    try:
+        req = urllib.request.Request(img, headers={"User-Agent": ALITV_UA})
+        with tv._open(req, timeout=20) as r:
+            lines, link = qr_link_of(base64.b64encode(r.read(1 << 20)).decode())
+    except Exception:
+        pass
+    print()
+    if lines:
+        print("\n".join(lines))
+        print()
+    # 【链接照留】终端画得不好扫不了的，手机浏览器打开图片地址 → 存图 → 阿里云盘 App 从相册扫
+    print(f"  {BOLD}二维码{RST}  {CYAN}{img}{RST}")
+    tip("阿里云盘 App 扫一扫，手机上点确认" + ("；扫不了就手机浏览器打开上面的地址存图再扫" if img else ""))
+    info(f"等你扫码确认，最多 {wait_s // 60} 分钟（Ctrl-C 可中断）")
+    deadline = time.time() + wait_s
+    try:
+        while time.time() < deadline:
+            try:
+                st, code = tv.status(sid)
+            except Exception:
+                st, code = "", ""
+            if st == "LoginSuccess" and code:
+                print("\r\x1b[2K", end="")
+                try:
+                    tok = tv.token(code=code)["refresh_token"]
+                except Exception as e:
+                    warn(f"扫上了，但没换到令牌：{_short_err(e)[:60]}")
+                    return ""
+                ok("扫码确认成功")
+                return tok
+            if st == "QRCodeExpired":
+                print("\r\x1b[2K", end="")
+                warn("二维码过期了，再来一次。")
+                return ""
+            msg = {"ScanSuccess": "已扫到，请在手机上点确认…"}.get(st, "等待扫码…")
+            left = int(deadline - time.time())
+            print(f"\r    {DIM}{pad(msg, 30)}还剩 {left // 60}:{left % 60:02d}{RST}", end="", flush=True)
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print()
+        warn("已中断。")
+        return ""
+    print("\r\x1b[2K", end="")
+    warn("没等到确认。")
+    return ""
+
+
+def alitv_gateway():
+    """compose 那张 Docker 网络的网关地址（宿主机在这张网上的地址）。拿不到 → ""。"""
+    try:
+        r = subprocess.run(["docker", "network", "inspect", "-f",
+                            "{{range .IPAM.Config}}{{.Gateway}} {{end}}", ALITV_NET],
+                           capture_output=True, text=True, timeout=20)
+        gw = (r.stdout or "").split()
+        return gw[0] if r.returncode == 0 and gw and re.match(r"^\d+\.\d+\.\d+\.\d+$", gw[0]) else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def alitv_renew_url(gw=None):
+    gw = gw if gw is not None else alitv_gateway()
+    return f"http://{gw}:{ALITV_PORT}/alicloud/renewapi" if gw else ""
+
+
+def alitv_addition(tok):
+    """把一个阿里盘切到「TV 接口 + 本机续期」要写进 addition 的几项。"""
+    return {"alipan_type": "alipanTV", "refresh_token": tok, "use_online_api": True,
+            "api_url_address": alitv_renew_url()}
+
+
+def alitv_storages(d):
+    """续期指向本机那个小服务的阿里盘 → [(id, 挂载点, 续期地址)]。"""
+    out = []
+    for sid, mp, drv, add, *_x in _storage_rows(d):
+        u = str((add or {}).get("api_url_address") or "")
+        if str(drv or "").lower() in ALI_DRIVERS and f":{ALITV_PORT}/alicloud/renewapi" in u:
+            out.append((sid, mp, u))
+    return out
+
+
+def do_alitv_renewd():
+    """systemd 起的：OpenList 续期阿里 TV 令牌时来问它（照 api.oplist.org 的 /alicloud/renewapi）。
+    只绑 Docker 网关 —— 只有本机的容器连得上，公网摸不到。"""
+    import http.server
+    gw = ""
+    for _ in range(60):                     # 开机时 Docker 网络可能还没起来
+        gw = alitv_gateway()
+        if gw:
+            break
+        time.sleep(5)
+    if not gw:
+        sys.exit(1)
+    tv = AliTV()
+    lock = threading.Lock()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        server_version = "nginx"            # 不自报家门
+        sys_version = ""
+
+        def log_message(self, *_a):
+            pass
+
+        def _send(self, code, obj):
+            b = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+
+        def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            q = dict(urllib.parse.parse_qsl(u.query))
+            if u.path == "/ping":
+                return self._send(200, {"text": "ok"})   # 装好之后从 OpenList 容器里试连用
+            if u.path != "/alicloud/renewapi" or q.get("driver_txt", "alicloud_tv") != "alicloud_tv":
+                return self._send(404, {"text": "not found"})
+            if not q.get("refresh_ui"):
+                return self._send(400, {"text": "缺少刷新令牌"})
+            try:
+                with lock:
+                    d = tv.token(refresh=q["refresh_ui"])
+                self._send(200, {"refresh_token": d.get("refresh_token", ""),
+                                 "access_token": d.get("access_token", "")})
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 阿里 TV：本机续期成功"])
+            except Exception as e:
+                # OpenList 拿到空令牌会把 text 当原因报出来
+                self._send(200, {"text": f"本机续期失败：{_short_err(e)[:60]}"})
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 阿里 TV：本机续期失败"
+                          f"（{_short_err(e)[:60]}）"])
+
+    srv = http.server.ThreadingHTTPServer((gw, ALITV_PORT), H)
+    srv.daemon_threads = True
+    srv.serve_forever()
+
+
+def alitv_reachable(gw=None):
+    """从 OpenList 容器里试连本机续期服务。防火墙挡住了 Docker → 宿主机的话这里就不通。"""
+    gw = gw if gw is not None else alitv_gateway()
+    if not gw:
+        return False
+    for _ in range(5):                      # 服务刚 restart，给它几秒
+        try:
+            r = subprocess.run(["docker", "exec", "openlist", "wget", "-q", "-T", "5", "-O", "-",
+                                f"http://{gw}:{ALITV_PORT}/ping"],
+                               capture_output=True, text=True, timeout=20)
+            if r.returncode == 0 and '"ok"' in (r.stdout or ""):
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        time.sleep(2)
+    return False
+
+
+def alitv_ensure(d):
+    """把本机续期服务装上并试连。通 → 续期地址；不通 → ""（调用方退回 api.oplist.org 续期）。"""
+    if not shutil.which("systemctl"):
+        return ""
+    if not sync_alitv_service(d, force=True):
+        return ""
+    url = alitv_renew_url()
+    return url if url and alitv_reachable() else ""
+
+
+def remove_alitv_service():
+    if not os.path.exists(ALITV_UNIT):
+        return
+    try:
+        sh(f"systemctl disable --now {os.path.basename(ALITV_UNIT)}", timeout=60)
+        os.remove(ALITV_UNIT)
+        sh("systemctl daemon-reload", timeout=60)
+    except Exception:
+        pass
+
+
+def sync_alitv_service(d, quiet=True, force=False):
+    """有阿里盘的续期指向本机 → 装上（并把续期地址对上现在的网关）；没有 → 卸掉。返回开着没有。
+    force：还没有盘指向它也装（扫码切过去之前先装好、试连通了再切）。"""
+    try:
+        rows = alitv_storages(d)
+    except Exception:
+        return os.path.exists(ALITV_UNIT)
+    if not rows and not force:
+        remove_alitv_service()
+        return False
+    if not shutil.which("systemctl"):
+        warn("这台机器没有 systemctl，阿里 TV 的本机续期服务装不了。")
+        return False
+    try:
+        with open(ALITV_UNIT, "w") as f:
+            f.write(f"""[Unit]
+Description=media-stack aliyundrive TV token renew (local)
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {os.path.realpath(__file__)} alitv-renewd
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+""")
+        sh("systemctl daemon-reload", timeout=60)
+        sh(f"systemctl enable {os.path.basename(ALITV_UNIT)}", timeout=60)
+        sh(f"systemctl restart {os.path.basename(ALITV_UNIT)}", timeout=60)
+    except Exception as e:
+        warn(f"阿里 TV 本机续期服务没装上：{_short_err(e)}")
+        return False
+    # 【网关变了要跟着改】Docker 网络重建过，网关地址可能换了，OpenList 里写的旧地址就续不了期
+    want = alitv_renew_url()
+    stale = [(sid, mp) for sid, mp, u in rows if want and u != want]
+    if stale:
+        _write_addition(d, stale, {"api_url_address": want})
+    if not quiet:
+        info("阿里 TV 本机续期服务已就绪（不再经过 api.oplist.org）")
+    return True
+
 
 
 def _ask_secret(prompt):
@@ -19836,14 +20365,27 @@ def _alipan_channel_menu(d, mp):
         print("没有改动。")
         return
 
+    # 【换回开放平台时续期地址也要换回去】本机那个小服务只认 TV 的令牌
+    _back = {"api_url_address": ALI_OPLIST_RENEW} if other == "default" else {}
     if tok_fits:
         print()
         print(f"  {DIM}现有的令牌就是这条路的，不用重新扫码。{RST}")
         if not ask_yn(f"直接换成「{ALIPAN_TYPES[other][0]}」？", True):
             print("没有改动。")
             return
-        _write_addition(d, [(sid, mp)], {"alipan_type": other})
+        _write_addition(d, [(sid, mp)], {"alipan_type": other, **_back})
+        sync_alitv_service(d)
         return
+    if other == "alipanTV":
+        print()
+        if _ali_how() == "scan":
+            extra = _ali_tv_scan(d)
+            if not extra:
+                print("没有改动。")
+                return
+            _write_addition(d, [(sid, mp)], extra, quiet_keys=("refresh_token",))
+            sync_alitv_service(d)
+            return
 
     # 【先把令牌要到手，再动类型】只翻类型 = 必定挂不上，见函数开头。
     # 那个网站是第三方的，会挂：弹「获取秘钥失败」是它自己的接口没通，不是你填错了
@@ -19869,8 +20411,9 @@ def _alipan_channel_menu(d, mp):
             print("已取消，一个字都没改。")
             return
     _write_addition(d, [(sid, mp)],
-                    {"alipan_type": other, "refresh_token": tok},
+                    {"alipan_type": other, "refresh_token": tok, **_back},
                     quiet_keys=("refresh_token",))
+    sync_alitv_service(d)
 
 
 def _ali_storages(d):
@@ -23941,6 +24484,8 @@ if __name__ == "__main__":
         # 而没人拦的后果实测过，是十个进程叠在一起把内存吃穿。锁在自己手里更稳。
         elif arg == "hlsfix":             # systemd 起的常驻：转码流分片重定向
             do_hls_fix()
+        elif arg == "alitv-renewd":       # systemd 起的常驻：阿里 TV 令牌本机续期
+            do_alitv_renewd()
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
                 _timed("链路保活", do_keepalive)
