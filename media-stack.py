@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.282"
+SCRIPT_VERSION = "1.5.283"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -18276,7 +18276,7 @@ def _ali_how():
     """扫码（TV 接口，默认）还是贴令牌。返回 "scan" / "paste"。"""
     print("  1. 扫码（TV 客户端接口，默认）")
     print("  2. 贴令牌（自己去取令牌的网站）")
-    tip("扫码走 TV 客户端接口：不限速、续期在本机做，不经过 api.oplist.org")
+    tip("扫码走 TV 客户端接口：续期在本机做，不经过 api.oplist.org")
     return "paste" if ask("选哪个（回车 = 1）").strip() == "2" else "scan"
 MOUNT_QTV = "/quark"
 DRIVER_DAV = "WebDav"
@@ -18354,7 +18354,7 @@ def _add_ali_flow(d):
     else:
         print("  1. 开放平台接口（默认）")
         print("  2. TV 客户端接口")
-        tip("开放平台接口被阿里限速（约 0.8 Mbps）；TV 客户端接口不限速，但要扫 TV 版二维码")
+        tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；放不动就用 Emby 播放画质 → 阿里转码流")
         kind = "alipanTV" if ask("选哪个（回车 = 1）").strip() == "2" else "default"
         tok = _ali_paste_token(kind)
         if not tok:
@@ -18400,7 +18400,7 @@ def _ali_relogin_flow(d, mp):
     sid, _m, _dv, kind, _shape = row
     if _ali_how() == "scan":
         if kind != "alipanTV":
-            tip("扫码会把这个盘换成 TV 客户端接口（不限速）")
+            tip("扫码会把这个盘换成 TV 客户端接口")
         extra = _ali_tv_scan(d)
         if not extra:
             print("一个字都没改。")
@@ -20287,11 +20287,14 @@ def _rename_menu(d, mp=None):
 # 但有一个作用类似、而且决定播放快慢的开关：alipan_type。
 # 取值和取令牌页面上的入口一一对应，两边必须配对，见 gen 使用信息那段。
 ALIPAN_TYPES = {
-    "default":  ("开放平台接口", "第三方 Open API。阿里对它限速 —— 实测约 0.8 Mbps，"
+    # 【原画限速跟接口无关】真机 10/01 龙虎门：换成 TV 接口后原画直链照样 0.74 Mbps（从中间拉
+    # 0.5），要 17.4 —— 限的是没开会员的账号，不是哪条接口。以前这里写「TV 接口不吃那个限速」是
+    # 没实测过的说法，把人往错的方向带。原画放不动就用「Emby 播放画质 → 阿里转码流」。
+    "default":  ("开放平台接口", "第三方 Open API。原画没开会员会被限速（实测约 0.7 Mbps），"
                                 "大码率的片子放不动",
                  "阿里云盘 (OAuth2) 扫码登录"),
-    "alipanTV": ("TV 客户端接口", "走 TV 版客户端那条通道，不吃上面那个限速；"
-                                 "但要另外扫 TV 版二维码取令牌",
+    "alipanTV": ("TV 客户端接口", "走 TV 版客户端那条通道；原画照样限速（跟账号有没有会员走，"
+                                 "不看接口）；能在本机扫码、本机续期",
                  "阿里云盘 (Client) TV版扫码"),
 }
 
@@ -20369,7 +20372,7 @@ def _alipan_channel_menu(d, mp):
         print(f"  · {name}{star}")
     print(f"  1. 换成「{ALIPAN_TYPES[other][0]}」")
     print("  0. 返回")
-    tip("开放平台接口被阿里限速（约 0.8 Mbps）；TV 客户端接口不限速，但要另扫 TV 版二维码取令牌")
+    tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；换 TV 接口要另扫 TV 版二维码")
     if ask("请选择").strip() != "1":
         print("没有改动。")
         return
