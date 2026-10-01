@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.271"
+SCRIPT_VERSION = "1.5.272"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1634,6 +1634,7 @@ case "${1:-info}" in
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
   covers         没刮到封面的片，现在就截一帧当封面（每小时自动截默认关，见 7 设置 → 9）
   covers --retry 截失败过的也重新试一遍
+  covers-mount <挂载点>  这个盘没图的全部截一次（菜单「截封面」在后台跑的就是它）
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
@@ -1841,6 +1842,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" covers "$@" ;;
+  covers-mount)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" covers-mount "$@" ;;
   name-fix)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -20063,9 +20069,10 @@ def _drive_menu(d, mp, drv, mounted=True):
         cov_no = heal_no = ""
         if mounted:
             cov_no = "9" if isqtv else "8" if (isali or has115 or isdav) else "7"
-            _cl = cover_manual_last(mp)
+            _cl, _cr = cover_manual_last(mp), cover_running(mp)
             print(f"  {cov_no}. 截封面              "
-                  + (f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
+                  + (f"{YELLOW}后台截着 {_cr.get('done', 0)}/{_cr.get('of', '?')}{RST}" if _cr is not None
+                     else f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"))
             heal_no = str(int(cov_no) + 1)
             print(f"  {heal_no}. 补时长              当前："
                   + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
@@ -20160,6 +20167,19 @@ def _covers_menu(d, mp):
     if not key:
         warn("没有 Emby API Key（「7 设置 → 1」），问不了 Emby。")
         return
+    run = cover_running(mp)
+    if run is not None:
+        # 【截着的时候再点：只看进度，不再起一轮】仓库主人：「已经运行过一次你立刻又点进去运行
+        # 一次不累积」
+        print(f"  后台正在截　{run.get('done', 0)}/{run.get('of', '?')} 部　截成 {run.get('n', 0)} 张"
+              f"　已用约 {CYAN}{float(run.get('mb') or 0):.0f} MB{RST}")
+        if run.get("pid") and ask_yn("停掉后台这一轮？", False):
+            try:
+                os.kill(int(run["pid"]), signal.SIGTERM)
+                ok("已停（截好的留着，花掉的流量照记）")
+            except (OSError, ValueError):
+                warn("停不掉（它可能刚好截完了）")
+        return
     # 【上一次花了多少摆在最前面】仓库主人：「每次点进去能看到上一次截图所消耗的流量」
     last = cover_manual_last(mp)
     if last:
@@ -20175,20 +20195,90 @@ def _covers_menu(d, mp):
     if not ask_yn(f"{mp} 有 {len(todo)} 部没图，全部截一次？", False):
         print("没有改动。")
         return
-    got, cut = [0], False
+    # 【放到后台截】仓库主人：「设置成在后台运行截图，不用等着，几张图他就要搞一半天」。
+    # 同一个盘同时只有一轮（锁在 do_covers_mount 里）；连点两次，第二个进程拿不到锁自己退。
     try:
-        got[0] = fill_covers(d, key, say=lambda t: print(f"  {t}"), mount=mp, manual=True)
+        subprocess.Popen([sys.executable or "python3", os.path.abspath(__file__), "covers-mount", mp],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        warn(f"没能放到后台：{_short_err(e)}")
+        return
+    ok(f"已在后台截 {len(todo)} 部，不用等；再点进来看进度")
+
+
+def _cover_slug(mp):
+    import hashlib
+    return hashlib.md5(mp.encode("utf-8")).hexdigest()[:10]
+
+
+def _cover_run_file(mp):
+    return os.path.join(CRON_LOCK_DIR, f"media-stack-covers-{_cover_slug(mp)}.json")
+
+
+def cover_running(mp):
+    """这个盘的后台截封面在不在跑 → 进度 {done, of, n, mb, pid}；没在跑 → None。
+    以锁为准（进程怎么死内核都会放锁），进度文件只是给人看的。"""
+    sub = f"covers-{_cover_slug(mp)}"
+    if take_task_lock(sub):
+        release_task_lock(sub)
+        return None
+    try:
+        with open(_cover_run_file(mp)) as f:
+            v = json.load(f)
+            return v if isinstance(v, dict) else {}
+    except Exception:
+        return {}
+
+
+def do_covers_mount(mp):
+    """media-stack covers-mount <挂载点>：「截封面」按钮放到后台的那一轮（菜单起的，人不等）。
+    每截完一部写一次进度；被停掉（SIGTERM）也照样把花掉的流量记下来。"""
+    sub = f"covers-{_cover_slug(mp)}"
+    if not take_task_lock(sub):
+        return                          # 已经有一轮在截这个盘 —— 不叠加
+    d = ms_install_dir()
+    key = read_emby_api_key(d)
+    if not key:
+        return
+    _mts = [str(r[1] or "") for r in _storage_rows(d)]
+    todo = [x for x in cover_candidates(key, d) if strm_in_mount(d, x[3], mp, _mts)]
+    prog = {"t0": int(time.time()), "done": 0, "of": len(todo), "n": 0, "mb": 0.0,
+            "pid": os.getpid()}
+
+    def _put():
+        try:
+            write_atomic(_cover_run_file(mp), json.dumps(prog) + "\n", mode=0o600)
+        except OSError:
+            pass
+
+    def say(t):
+        if t.startswith(("✔", "✖")):
+            prog["done"] += 1
+            prog["n"] += t.startswith("✔")
+            prog["mb"] = round(manual_mb[0], 1)
+            _put()
+
+    def _stop(*_a):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _stop)
+    _put()
+    got, cut = 0, False
+    try:
+        if todo:
+            got = fill_covers(d, key, say=say, mount=mp, manual=True)
     except KeyboardInterrupt:
-        print()
-        warn("已中断。")
-        cut = True
+        cut, got = True, prog["n"]
     # 【中断了也记】拉掉的流量是真的，下次点进来得看得见
     rec = dict(ms_state().get("cover_manual") or {})
-    rec[mp] = {"t": int(time.time()), "n": got[0], "of": len(todo),
+    rec[mp] = {"t": int(time.time()), "n": got, "of": len(todo),
                "mb": round(manual_mb[0], 1), **({"cut": True} if cut else {})}
     save_ms_state(cover_manual=rec)
-    if not cut:
-        ok(f"截成 {got[0]}/{len(todo)} 张，用了约 {manual_mb[0]:.0f} MB")
+    try:
+        os.remove(_cover_run_file(mp))
+    except OSError:
+        pass
+    release_task_lock(sub)
 
 
 def cover_manual_last(mp):
@@ -23524,6 +23614,10 @@ if __name__ == "__main__":
                 except (IndexError, ValueError):
                     del _a[_i:]
             do_play_speed(" ".join(_a).strip(), wait=_w, ua=_u, at_min=_at)
+        elif arg == "covers-mount":       # 「截封面」按钮放到后台的那一轮
+            require_root()
+            if len(sys.argv) > 2:
+                do_covers_mount(sys.argv[2])
         elif arg == "covers":             # 没刮到封面的：截一帧当封面
             require_root()
             do_covers(retry="--retry" in sys.argv[2:])
