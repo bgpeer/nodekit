@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.310"
+SCRIPT_VERSION = "1.5.311"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19747,15 +19747,47 @@ def _qr_sample(px, w, h, x0, y0, m, n, thr):
     return grid
 
 
-def qr_lines(grid, quiet=3):
+# 【二维码横向拉宽】仓库主人：「这种高度不一样的二维码还是识别不了，要网页版那一种方方正正的二维码
+# 才能识别」。一个字符画 1 列 × 2 行模块，方不方取决于终端字格的高宽比：一般终端高 ≈ 2 倍宽，画出来
+# 是方的；真机手机终端（10/03）行距大，高 ≈ 2.5 倍宽，码被拉长到 1.27 倍，阿里云盘 App 扫不出。
+# 终端不告诉我们字格多高，所以让人自己挑：等扫码时输 w 回车按这几档轮着拉宽，挑中的记住，下次直接用。
+# 拉宽要多占列数，屏不够宽就不画（折行的码更没法扫），说一句先双指缩小字体。
+QR_STRETCH_STEPS = (1.0, 1.25, 1.5)
+
+
+def qr_stretch():
+    try:
+        v = float(ms_state().get("qr_stretch") or 1.0)
+    except (TypeError, ValueError):
+        v = 1.0
+    return v if v in QR_STRETCH_STEPS else 1.0
+
+
+def qr_width(grid, stretch, quiet=3):
+    """画出来占几列（含行首两个空格）。拉宽时按半个字符算（见 qr_lines）。"""
+    return 2 + (round((len(grid) + 2 * quiet) * 2 * stretch) + 1) // 2
+
+
+# 四分之一方块：键 = 哪几个小格用前景色画（左上 8、右上 4、左下 2、右下 1）。
+# 背景色总取左下那格的颜色（行缝跟它一致，见 qr_lines），所以用得到的只有不含左下的这几个
+QR_QUAD = {0: " ", 8: "▘", 4: "▝", 1: "▗", 12: "▀", 9: "▚", 5: "▐", 13: "▜"}
+
+
+def qr_lines(grid, quiet=3, stretch=None):
     """模块矩阵 → 终端行。一个字符 = 1 列 × 2 行模块，颜色写死（白底黑码），
-    深色、浅色终端都一样；四周留白边，扫码器要靠它找边。"""
+    深色、浅色终端都一样；四周留白边，扫码器要靠它找边。
+    stretch：横向拉宽倍数（见 QR_STRETCH_STEPS）；第 c 列画 round((c+1)·s) − round(c·s) 个字符。"""
+    s = qr_stretch() if stretch is None else stretch
+    if stretch is None and s != 1.0 and qr_width(grid, s, quiet) > shutil.get_terminal_size((80, 24)).columns:
+        s = 1.0                           # 记住的那档这会儿屏放不下（换了字体 / 竖屏）：折行的码更扫不了
     n = len(grid)
     full = n + 2 * quiet
     W = [[False] * full for _ in range(full + (full % 2))]
     for r in range(n):
         for c in range(n):
             W[r + quiet][c + quiet] = grid[r][c]
+    if s != 1.0:
+        return _qr_lines_wide(W, s)
     # 【每一格都画「▀」：上半格用前景色、下半格用背景色】以前白格子用前景色的「█」画，
     # 终端两行字之间那道细缝不归字形管、露出底下的黑 —— 白处一道道黑横线。夸克那种稀一点的码
     # 还扫得出，阿里 TV 那种密的码就被切碎了（真机 10/01：截图扫不出，网页版的图一扫就成）。
@@ -19764,12 +19796,42 @@ def qr_lines(grid, quiet=3):
     for r in range(0, len(W), 2):
         top, bot = W[r], W[r + 1]
         line, cur = [], None
-        for t, b in zip(top, bot):
+        for c, (t, b) in enumerate(zip(top, bot)):
             col = (30 if t else 97, 40 if b else 107)
             if col != cur:
                 line.append(f"\x1b[{col[0]};{col[1]}m")
                 cur = col
-            line.append("▀")
+            line.append("▀" * (round((c + 1) * s) - round(c * s)))
+        out.append("  " + "".join(line) + RST)
+    return out
+
+
+def _qr_lines_wide(W, s):
+    """拉宽画法：按【半个字符】分列，一个字符 = 2 × 2 小格（四分之一方块）。
+
+    【为什么不按整字符拉】真机那种字格模拟过：拉 1.25 倍按整字符分，有的模块 1 个字符宽、有的 2 个，
+    宽窄差一倍，OpenCV 一张都扫不出；按半个字符分，宽窄只差 2:3，1.25 / 1.5 倍都扫得出。
+    颜色照 ▀ 那版的规矩：背景色取左下小格的颜色，行缝跟着它，不露黑横线。"""
+    rows = []
+    for row in W:
+        o = []
+        for c, v in enumerate(row):
+            o += [v] * (round((c + 1) * 2 * s) - round(c * 2 * s))
+        if len(o) % 2:
+            o.append(False)
+        rows.append(o)
+    out = []
+    for r in range(0, len(rows), 2):
+        top, bot = rows[r], rows[r + 1]
+        line, cur = [], None
+        for c in range(0, len(top), 2):
+            tl, tr, bl, br = top[c], top[c + 1], bot[c], bot[c + 1]
+            col = (97 if bl else 30, 40 if bl else 107)        # 前景 = 跟左下相反的那色
+            k = (8 if tl != bl else 0) | (4 if tr != bl else 0) | (1 if br != bl else 0)
+            if col != cur:
+                line.append(f"\x1b[{col[0]};{col[1]}m")
+                cur = col
+            line.append(QR_QUAD[k])
         out.append("  " + "".join(line) + RST)
     return out
 
@@ -20607,24 +20669,31 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     except Exception as e:
         warn(f"没拿到阿里的二维码：{_short_err(e)[:60]}")
         return ""
-    lines, link = [], ""
+    grid = None
     try:
         req = urllib.request.Request(img, headers={"User-Agent": ALITV_UA})
         with tv._open(req, timeout=20) as r:
-            lines, link = qr_link_of(base64.b64encode(r.read(1 << 20)).decode())
+            grid = qr_grid_from_b64(base64.b64encode(r.read(1 << 20)).decode())
     except Exception:
         pass
-    print()
-    if lines:
-        print("\n".join(lines))
+
+    def _draw():
         print()
-    # 【链接照留】终端画得不好扫不了的，手机浏览器打开图片地址 → 存图 → 阿里云盘 App 从相册扫
-    print(f"  {BOLD}二维码{RST}  {CYAN}{img}{RST}")
-    tip("阿里云盘 App 扫一扫，手机上点确认" + ("；扫不了就手机浏览器打开上面的地址存图再扫" if img else ""))
-    info(f"等你扫码确认，最多 {wait_s // 60} 分钟（Ctrl-C 可中断）")
+        if grid:
+            print("\n".join(qr_lines(grid)))
+            print()
+        # 【链接照留】终端画得不好扫不了的，手机浏览器打开图片地址 → 存图 → 阿里云盘 App 从相册扫
+        print(f"  {BOLD}二维码{RST}  {CYAN}{img}{RST}")
+        tip("阿里云盘 App 扫一扫；扫不了输 w 回车把码拉宽，或手机浏览器打开上面的地址存图再扫"
+            if grid else "手机浏览器打开上面的地址存图，阿里云盘 App 从相册扫")
+        info(f"等你扫码确认，最多 {wait_s // 60} 分钟（Ctrl-C 可中断）")
+    _draw()
     deadline = time.time() + wait_s
     try:
         while time.time() < deadline:
+            if grid and qr_stretch_key(grid, poll):
+                _draw()
+                continue
             try:
                 st, code = tv.status(sid)
             except Exception:
@@ -20645,7 +20714,8 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
             msg = {"ScanSuccess": "已扫到，请在手机上点确认…"}.get(st, "等待扫码…")
             left = int(deadline - time.time())
             print(f"\r    {DIM}{pad(msg, 30)}还剩 {left // 60}:{left % 60:02d}{RST}", end="", flush=True)
-            time.sleep(poll)
+            if not grid:
+                time.sleep(poll)
     except KeyboardInterrupt:
         print()
         warn("已中断。")
@@ -20653,6 +20723,35 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     print("\r\x1b[2K", end="")
     warn("没等到确认。")
     return ""
+
+
+def qr_stretch_key(grid, wait):
+    """等扫码时最多等 wait 秒看有没有人输 w 回车。有 → 换下一档拉宽、记住，返回 True（要重画）。
+    下一档屏放不下就不换，说一句；不是终端（管道 / 后台）就只睡 wait 秒。"""
+    import select
+    try:
+        if not sys.stdin.isatty():
+            raise OSError
+        rd, _w, _x = select.select([sys.stdin], [], [], wait)
+    except (OSError, ValueError):
+        time.sleep(wait)
+        return False
+    if not rd:
+        return False
+    if sys.stdin.readline().strip().lower() != "w":
+        return False
+    cols = shutil.get_terminal_size((80, 24)).columns
+    cur = qr_stretch() if qr_width(grid, qr_stretch()) <= cols else 1.0   # 屏上现在画的那档
+    nxt = QR_STRETCH_STEPS[(QR_STRETCH_STEPS.index(cur) + 1) % len(QR_STRETCH_STEPS)]
+    need = qr_width(grid, nxt)
+    if need > cols:
+        print()
+        warn(f"拉宽到 {nxt} 倍要 {need} 列，屏幕只有 {cols} 列：双指缩小字体再输 w")
+        return False
+    save_ms_state(qr_stretch=nxt)
+    print()
+    ok(f"二维码横向 {nxt} 倍" + ("（原样）" if nxt == 1.0 else ""))
+    return True
 
 
 def alitv_gateway():
