@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.309"
+SCRIPT_VERSION = "1.5.310"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19451,11 +19451,14 @@ def _ali_tv_scan(d):
 
 
 def _ali_how():
-    """扫码（TV 接口，默认）还是贴令牌。返回 "scan" / "paste"。"""
-    print("  1. 扫码（TV 客户端接口，默认）")
+    """扫码还是贴令牌。返回 "scan" / "paste"；"" = 返回（什么都不做）。
+
+    【回车 = 返回】仓库主人：「这里的回车应该等于返回的」。以前回车 = 扫码，手一滑就进了扫码流程。"""
+    print("  1. 扫码（TV 客户端接口）")
     print("  2. 贴令牌（自己去取令牌的网站）")
+    print("  0. 返回")
     tip("扫码走 TV 客户端接口：续期在本机做，不经过 api.oplist.org")
-    return "paste" if ask("选哪个（回车 = 1）").strip() == "2" else "scan"
+    return {"1": "scan", "2": "paste"}.get(ask("请选择（回车 = 返回）").strip(), "")
 MOUNT_QTV = "/quark"
 DRIVER_DAV = "WebDav"
 MOUNT_DAV = "/webdav"
@@ -19524,17 +19527,23 @@ def _add_ali_flow(d):
     mount = ask_mount(d, MOUNT_ALI)
     if not mount:
         return False
+    how = _ali_how()
+    if not how:
+        return False
     ali_tok_forget(mount)                 # 同一个挂载点以前留的令牌可能是别的账号的
-    if _ali_how() == "scan":
+    if how == "scan":
         extra = _ali_tv_scan(d)
         if not extra:
             return False
         kind, tok = "alipanTV", extra["refresh_token"]
     else:
-        print("  1. 开放平台接口（默认）")
+        print("  1. 开放平台接口")
         print("  2. TV 客户端接口")
+        print("  0. 返回")
         tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；放不动就去「3 直链方式 → 画质」改转码流")
-        kind = "alipanTV" if ask("选哪个（回车 = 1）").strip() == "2" else "default"
+        kind = {"1": "default", "2": "alipanTV"}.get(ask("请选择（回车 = 返回）").strip(), "")
+        if not kind:
+            return False
         tok = _ali_paste_token(kind)
         if not tok:
             print("已取消。")
@@ -19577,14 +19586,18 @@ def _ali_relogin_flow(d, mp):
         warn(f"读不到 {mp} 的存储记录。")
         return
     sid, _m, _dv, kind, _shape = row
-    ali_tok_forget(mp)                    # 重新登录可能换了账号，旧账号的令牌别再被换接口时用上
-    if _ali_how() == "scan":
+    how = _ali_how()
+    if not how:
+        print("一个字都没改。")
+        return
+    if how == "scan":
         if kind != "alipanTV":
             tip("扫码会把这个盘换成 TV 客户端接口")
         extra = _ali_tv_scan(d)
         if not extra:
             print("一个字都没改。")
             return
+        ali_tok_forget(mp)                # 重新登录可能换了账号，旧账号的令牌别再被换接口时用上
         _write_addition(d, [(sid, mp)], extra, quiet_keys=("refresh_token",))
         sync_alitv_service(d)
         return
@@ -19592,6 +19605,7 @@ def _ali_relogin_flow(d, mp):
     if not tok:
         print("已取消，一个字都没改。")
         return
+    ali_tok_forget(mp)
     _write_addition(d, [(sid, mp)], {"refresh_token": tok}, quiet_keys=("refresh_token",))
 
 
@@ -21675,7 +21689,11 @@ def _alipan_channel_menu(d, mp):
         return
     if other == "alipanTV":
         print()
-        if _ali_how() == "scan":
+        how = _ali_how()
+        if not how:
+            print("没有改动。")
+            return
+        if how == "scan":
             extra = _ali_tv_scan(d)
             if not extra:
                 print("没有改动。")
