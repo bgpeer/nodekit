@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.296"
+SCRIPT_VERSION = "1.5.297"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -596,8 +596,83 @@ def gen_compose(cfg):
     networks: [mediastack]
 """)
 
-    parts.append("networks:\n  mediastack:\n    name: mediastack\n")
+    _mtu = want_net_mtu()
+    parts.append("networks:\n  mediastack:\n    name: mediastack\n"
+                 + (f"    driver_opts:\n      com.docker.network.driver.mtu: \"{_mtu}\"\n"
+                    if _mtu else ""))
     return "\n".join(parts)
+
+
+# ============================================================================ 容器网络 MTU
+# 【Docker 不跟着网卡走】新建网络一律按 1500 发包。大多数 VPS 网卡就是 1500，对得上；可有的
+# 商家给的是 1450 / 1400 甚至更小（内网转发、套了隧道）—— 容器照样按 1500 发，小包没事，
+# 大包（TLS 握手时对方的证书）过不去，表现是「容器里连网盘接口时不时卡死、本机 curl 却正常」。
+# 所以按出口网卡的 MTU 来：比 1500 小才跟着设，1500 及以上什么都不动（不往大了调）。
+def host_mtu():
+    """出口网卡（去公网那条路由走的那张）的 MTU；路由上单独写了 mtu 的取小的。读不到 → 0。"""
+    try:
+        out = subprocess.run(["ip", "-o", "route", "get", "1.1.1.1"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except Exception:
+        return 0
+    m = re.search(r"\bdev (\S+)", out or "")
+    if not m:
+        return 0
+    try:
+        with open(f"/sys/class/net/{m.group(1)}/mtu") as f:
+            mtu = int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+    r = re.search(r"\bmtu (\d+)", out or "")
+    return min(mtu, int(r.group(1))) if r else mtu
+
+
+def want_net_mtu():
+    """容器网络该设的 MTU；0 = 不用设（网卡 ≥ 1500 或读不到）。"""
+    h = host_mtu()
+    return h if 576 <= h < 1500 else 0
+
+
+def docker_net_mtu(net="mediastack"):
+    """现在这张 Docker 网络的 MTU；没单独设就是 1500；网络不在 → None。"""
+    try:
+        r = subprocess.run(["docker", "network", "inspect", net, "-f",
+                            '{{index .Options "com.docker.network.driver.mtu"}}'],
+                           capture_output=True, text=True, timeout=15)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    v = (r.stdout or "").strip()
+    try:
+        return int(v) if v and v != "<no value>" else 1500
+    except ValueError:
+        return 1500
+
+
+def sync_net_mtu(d):
+    """容器网络的 MTU 跟出口网卡对不上 → 按当前配置重写 compose、把网络重建一次。返回改了没有。
+
+    对得上（绝大多数机器）什么都不碰。重建网络要先停掉这一套容器再起来（数据卷不动）；
+    网关地址可能跟着变，阿里 TV 续期那边由 sync_alitv_service 顺手改地址。"""
+    want = want_net_mtu() or 1500
+    cur = docker_net_mtu()
+    if cur is None or cur == want:
+        return False
+    compose = os.path.join(d, "docker-compose.yml")
+    env_file = os.path.join(d, ".env")
+    try:
+        write_atomic(compose, gen_compose(rebuild_cfg_from_disk(d)))
+    except Exception as e:
+        warn(f"容器网络 MTU 没改成（{_short_err(e)}）")
+        return False
+    subprocess.run(f"docker compose -f {compose} --env-file {env_file} down",
+                   shell=True, timeout=600, capture_output=True)
+    if _compose_up(d):
+        ok(f"容器网络 MTU 跟上网卡：{cur} → {want}")
+        return True
+    warn("容器网络重建后没起全，看「5 链路体检」")
+    return False
 
 
 SCAN_AUTO = "auto"          # 扫描路径的「跟随 OpenList 已挂载存储」模式
@@ -10894,6 +10969,7 @@ def do_update(from_menu=False):
             ok("镜像已更新")
             _print_version_diff(_ver_before, _versions_settle(d))
             sh("docker image prune -f", timeout=300)
+    sync_net_mtu(d)           # 容器网络 MTU 跟出口网卡（对得上就什么都不动）
 
     # 再把脚本生成的那几份配置按当前版本重刷一遍。
     #
