@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.300"
+SCRIPT_VERSION = "1.5.301"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -114,6 +114,14 @@ RESCUE_HOLD_S = 1          # 最多等几秒；写好了马上放（仓库主人
 # 读详情时 Emby 还挂着「在播这一集」：多半是 Hills 退出时「停止播放」和「读详情」一起发出去，
 # Emby 还没处理完那一场。最多等这么久等它记完（仓库主人：「Hills 刷新能慢个 1-2 秒就够了」）
 RESCUE_HOLD_STOP_S = 2
+# 【播放器喊「停止播放」的那一刻起，读详情 / 继续观看 / 下一集列表都先等 Emby 记完】真机 10/02
+# 完美世界 286 → 下一集 287 → 288，退出回来进度没跟到 288：Hills 退出时「停止播放」和「读页面」
+# 几乎同时发，Emby 还没记完 288，页面就读走了旧的。以前只拦「抢救表里那一集的详情」，可退回去的
+# 是 286 的页面 / 剧集页，拦不到。现在「停止播放」一进 nginx 就放一个旗子（_stopping），Emby
+# 把这一场收掉（会话里那一集换了 / 没了）或者满 RESCUE_STOPPING_S 秒就拿掉；旗子在的时候，
+# 这几类读页面的请求先等它。一场「停止」只拦这一两秒
+RESCUE_STOPPING = "_stopping"
+RESCUE_STOPPING_S = 3
 HEAL_GATE_SOCKET_UNIT = "/etc/systemd/system/media-stack-healgate.socket"
 HEAL_GATE_UNIT = "/etc/systemd/system/media-stack-healgate.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
@@ -1558,6 +1566,32 @@ def gen_nginx_site(cfg):
         if (-f {RESCUE_HOLD_DIR}/$ms_iid) {{
             rewrite ^ /__ms_hold_item last;
         }}
+        if (-f {RESCUE_HOLD_DIR}/{RESCUE_STOPPING}) {{
+            rewrite ^ /__ms_hold_item last;
+        }}
+{_px}
+    }}
+    # 「停止播放」那一下：先在门那里放个旗子（马上放行，不挡它），见 stopping_begin
+    location ~* ^/(?:emby/)?sessions/playing/stopped$ {{
+        auth_request /__ms_stopping;
+        error_page 500 502 503 504 = @ms_pbi;
+{_px}
+    }}
+    location = /__ms_stopping {{
+        internal;
+        proxy_pass http://unix:{HEAL_GATE_SOCK}:/stopping;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 3s;
+    }}
+    # 剧集页 / 继续观看 / 下一集：旗子在的时候也先等 Emby 记完（见 RESCUE_STOPPING）
+    location ~* ^/(?:emby/)?(?:users/[^/]+/items(?:/resume|/latest)?|shows/nextup|shows/[0-9]+/episodes)$ {{
+        set $ms_iid "";
+        if (-f {RESCUE_HOLD_DIR}/{RESCUE_STOPPING}) {{
+            rewrite ^ /__ms_hold_item last;
+        }}
 {_px}
     }}
     location = /__ms_hold_item {{
@@ -1576,7 +1610,7 @@ def gen_nginx_site(cfg):
         proxy_set_header Content-Length "";
         proxy_set_header X-Ms-Iid $ms_iid;
         proxy_connect_timeout 3s;
-        proxy_read_timeout {RESCUE_HOLD_S + RESCUE_HOLD_STOP_S + 4}s;
+        proxy_read_timeout {RESCUE_HOLD_S + RESCUE_HOLD_STOP_S + RESCUE_STOPPING_S + 5}s;
     }}
 """ if sub == "emby" and gate_on else "")
         out.append(f"""
@@ -3542,11 +3576,23 @@ def do_heal_gate():
     class H(http.server.BaseHTTPRequestHandler):
         def _go(self):
             last[0] = time.monotonic()
+            if self.path.startswith("/stopping"):
+                # 【「停止播放」进门】放旗子、马上放行；等 Emby 收掉这一场再拿旗子 —— 另起线程
+                if key:
+                    threading.Thread(target=stopping_begin,
+                                     args=(key, self.headers.get("X-Original-URI") or "")).start()
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                last[0] = time.monotonic()
+                return
             if self.path.startswith("/hold"):
                 # 【退出播放后读详情：先等进度写回】见 rescue_hold。只等、不碰网盘
                 _iid = re.sub(r"\D", "", self.headers.get("X-Ms-Iid") or "")
                 try:
+                    _ws = stopping_wait()
                     _w, _done = rescue_hold(key, _iid) if (_iid and key) else (0.0, True)
+                    _w += _ws
                     if _w >= 0.5:
                         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情"
                                   f"等了 {_w:.1f}s（{'跟上了' if _done else '等满了，交给后台结账'}）"
@@ -6030,13 +6076,70 @@ def rescue_hold_sync(st):
     try:
         os.makedirs(RESCUE_HOLD_DIR, mode=0o755, exist_ok=True)
         want = {k for k in st if str(k).isdigit()}
-        have = set(os.listdir(RESCUE_HOLD_DIR))
+        have = {k for k in os.listdir(RESCUE_HOLD_DIR) if not k.startswith("_")}   # _stopping 不归它管
         for k in want - have:
             open(os.path.join(RESCUE_HOLD_DIR, k), "w").close()
         for k in have - want:
             os.remove(os.path.join(RESCUE_HOLD_DIR, k))
     except OSError:
         pass
+
+
+def stopping_begin(key, uri):
+    """「停止播放」进门：放旗子，等 Emby 把这一场收掉（这台设备的会话里那一集换了 / 没了）
+    或者满 RESCUE_STOPPING_S 秒再拿掉。在调用方的线程里跑完（门那边另起线程，不挡停止播放本身）。"""
+    flag = os.path.join(RESCUE_HOLD_DIR, RESCUE_STOPPING)
+    try:
+        os.makedirs(RESCUE_HOLD_DIR, mode=0o755, exist_ok=True)
+        open(flag, "w").close()
+    except OSError:
+        return
+    dev = (urllib.parse.parse_qs(urllib.parse.urlsplit(uri or "").query).get("X-Emby-Device-Id")
+           or [""])[0]
+
+    def _now_item():
+        try:
+            for se in (_emby("/Sessions", key, timeout=2) or []):
+                if not dev or se.get("DeviceId") == dev:
+                    return str((se.get("NowPlayingItem") or {}).get("Id") or "")
+        except Exception:
+            return None
+        return ""
+    t0 = time.monotonic()
+    first = _now_item()
+    try:
+        while first != "" and time.monotonic() - t0 < RESCUE_STOPPING_S:   # 会话里本来就没在播：不用等
+            cur = _now_item()
+            if first and cur is not None and cur != first:
+                time.sleep(0.3)       # 会话刚收掉，续播点那一笔可能还差一点点才落盘
+                break
+            time.sleep(0.2)
+    finally:
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
+
+
+def stopping_wait():
+    """读页面的请求：「停止播放」的旗子在就等它拿掉。返回等了几秒。旗子太老（门挂了没拿掉）就替它删。"""
+    flag = os.path.join(RESCUE_HOLD_DIR, RESCUE_STOPPING)
+    t0 = time.monotonic()
+    while True:
+        try:
+            age = time.time() - os.stat(flag).st_mtime
+        except OSError:
+            break
+        if age > RESCUE_STOPPING_S + 2:
+            try:
+                os.remove(flag)
+            except OSError:
+                pass
+            break
+        if time.monotonic() - t0 > RESCUE_STOPPING_S + 1:
+            break
+        time.sleep(0.1)
+    return time.monotonic() - t0
 
 
 RESCUE_HOLD_RECENT_S = 180   # 停下来多久之内读详情才等（别让挂着的老条目每次都等）
