@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.288"
+SCRIPT_VERSION = "1.5.289"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2858,6 +2858,38 @@ HEAL_DAEMON_IDLE_S = 1800
 # 按下播放那一下会写日志、闹钟当场把它叫醒 —— 可翻目录时一会儿睡一会儿醒，
 # 每醒一次都要重新起一个进程，不如让它多醒一会儿。
 HEAL_DAEMON_WAKE_S = 600
+# 【醒着时多久记一次进度抢救那几集的位置】tick 一分钟才看一眼，写回去的续播点会比真正
+# 停下的地方早几十秒（真机 10/02 遮天 180：播到 10:22 以后退出，详情页是 09:52）。
+# 常驻服务本来就醒着，顺手每几秒问一次本机 Emby —— 不碰网盘；没有要抢救的就一个请求都不发
+HEAL_DAEMON_POS_S = 3
+HEAL_DAEMON_PLAYCHK_S = 30    # 醒着多久问一次本机 Emby「还有没有人在播」
+
+
+def rescue_watch_pos(key):
+    """常驻服务那边：要抢救的那几集正在播，就记下此刻的位置（heal_rescue_pos）。返回有没有在播的。
+
+    只写 heal_rescue_pos 这一个键（只有这里写），不碰 heal_rescue —— 那张表 heal-tick 在
+    读改写，两边同时写会把刚结完账的条目写回来。rescue_progress 结账时取两边较新的那个。"""
+    st = ms_state().get("heal_rescue") or {}
+    cur = dict(ms_state().get("heal_rescue_pos") or {})
+    if not st:
+        if cur:
+            save_ms_state(heal_rescue_pos={})
+        return False
+    try:
+        sessions = _emby("/Sessions", key, timeout=5) or []
+    except Exception:
+        return False
+    now, live = int(time.time()), False
+    new = {k: v for k, v in cur.items() if k in st}
+    for se in sessions:
+        iid = str((se.get("NowPlayingItem") or {}).get("Id") or "")
+        if iid in st:
+            live = True
+            new[iid] = [max(0, int((se.get("PlayState") or {}).get("PositionTicks") or 0)), now]
+    if new != cur:
+        save_ms_state(heal_rescue_pos=new)
+    return live
 
 
 def do_heal_daemon():
@@ -2892,6 +2924,9 @@ def do_heal_daemon():
     kids = []
     t_wake = time.monotonic()
     t_play = None                     # 最近一次见到按下播放（这一觉醒来之后）
+    t_pos = t_chk = 0.0
+    key = read_yaml_scalar(os.path.join(ms_install_dir(), "mediawarp", "config", "config.yaml"),
+                           "auth")
     # 【两种扳机】按下播放（PlaybackInfo）→ 马上补时长；停止播放（Sessions/Playing/
     # Stopped）→ 马上给进度抢救结账。仓库主人：「退出播放后他是过几秒补上的进度，
     # 不可以立即补上吗？」—— 以前要等下一分钟那一轮才发现"这一场停了"。nginx 记下
@@ -2905,6 +2940,20 @@ def do_heal_daemon():
     while True:
         time.sleep(HEAL_DAEMON_POLL)
         kids = [k for k in kids if k.poll() is None]
+        # 【还有人在播就不睡】仓库主人：「这个在播放的时候不要关掉了吧」。一集看了半小时以上
+        # 中间没再按过播放，以前到点就睡，后台的活就跟着醒过来去抢网盘。播着就算刚按过播放，
+        # 所以「半小时」是从播完那一刻算起
+        if key and time.monotonic() - t_chk >= HEAL_DAEMON_PLAYCHK_S:
+            t_chk = time.monotonic()
+            if someone_playing(key):
+                t_play = time.monotonic()
+        if key and time.monotonic() - t_pos >= HEAL_DAEMON_POS_S:
+            t_pos = time.monotonic()
+            try:
+                if rescue_watch_pos(key):
+                    t_play = time.monotonic()     # 正在播 = 醒着
+            except Exception:
+                pass
         # 【该睡了】半小时没人按播放（醒来一次都没按过的，2 分钟）；手上的活要先干完
         _idle = (time.monotonic() - t_play > HEAL_DAEMON_IDLE_S if t_play is not None
                  else time.monotonic() - t_wake > HEAL_DAEMON_WAKE_S)
@@ -5800,6 +5849,16 @@ def rescue_progress(key):
     except Exception:
         return 0                      # 问不到就这轮不动，别把"不知道"当成"播完了"
     now, fixed, logs = int(time.time()), 0, []
+    # 常驻服务每几秒记的位置（见 rescue_watch_pos），比这里一分钟一眼新就用它的
+    _fine = ms_state().get("heal_rescue_pos") or {}
+    for iid, e in st.items():
+        _f = _fine.get(iid)
+        try:
+            _fp, _ft = int(_f[0]), int(_f[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if _ft > int(e.get("seen") or 0) and _ft >= int(e.get("t0") or 0) and not e.get("end"):
+            e["pos"], e["seen"], e["fine"] = max(0, _fp), _ft, True
     playing = {}
     for se in sessions:
         iid = str((se.get("NowPlayingItem") or {}).get("Id") or "")
@@ -5811,6 +5870,7 @@ def rescue_progress(key):
             # 【取最新的，不取最大的】人会往回拖；最后停在哪儿才是要续的地方
             e["uid"], e["pos"] = playing[iid][0], max(0, playing[iid][1])
             e["seen"] = now
+            e.pop("fine", None)
             e.pop("end", None)        # 又开播了：上一场的"停了"不算数
             continue
         if not e.get("seen"):
@@ -5875,7 +5935,9 @@ def rescue_progress(key):
         # 退出（盯梢从 Emby 自己的会话里看到的），详情页还是「继续播放 00:33」—— 上一场的。
         # 原来只要续播点不是 0 就当"它自己记住了"，这种旧值一律放过。比看到的位置早
         # HEAL_RESCUE_STALE_S 秒以上才算没记上；比看到的晚（最后一眼之后又播了一会儿）照旧信它。
-        stale = upos > 0 and pos > 0 and upos < pos - HEAL_RESCUE_STALE_S * 10 ** 7
+        # 位置是常驻服务几秒前记的（fine）：误差只有几秒，门槛跟着收紧
+        _thr = HEAL_RESCUE_STALE_FINE_S if e.get("fine") else HEAL_RESCUE_STALE_S
+        stale = upos > 0 and pos > 0 and upos < pos - _thr * 10 ** 7
         if upos > 0 and not stale:
             st.pop(iid, None)         # Emby 自己记住了，不碰
             if e.get("nodur"):
@@ -5937,6 +5999,7 @@ HEAL_RESCUE_POLL_S = 10
 # Emby 的续播点比最后看到的位置早这么多秒以上，就当这一场它没记上（见 rescue_progress）。
 # 要大于看位置的间隔（linger 时 10 秒一眼，平时一分钟一眼），免得把正常的误差当成没记上
 HEAL_RESCUE_STALE_S = 90
+HEAL_RESCUE_STALE_FINE_S = 15   # 位置是常驻服务每 HEAL_DAEMON_POS_S 秒记的那种
 HEAL_RESCUE_LINGER_S = 40
 
 
