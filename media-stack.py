@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.292"
+SCRIPT_VERSION = "1.5.293"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1434,7 +1434,7 @@ def gen_nginx_site(cfg):
         proxy_set_header Host $host;
         proxy_redirect off;
         proxy_connect_timeout 3s;
-        proxy_read_timeout 30s;
+        proxy_read_timeout {HLS_MW_BUDGET + 15}s;
         error_page 502 503 504 = @ms_mw;
     }}
     location @ms_mw {{
@@ -2226,6 +2226,14 @@ P115_TTL = 600            # 同一集、同一个 UA 的直链缓存多久（115
 # 【只为"门先取好、播放器紧接着来拿"那几秒】真机 9/28 play-speed：同一份播放列表隔 5 秒
 # 再用一遍，分片一段都拉不下来。缓存久了反而把用过的旧列表发给下一场，所以压短
 HLS_DIRECT_TTL = 60        # 同一集改好的播放列表缓存多久（秒）
+# 【MediaWarp 没给地址：换链服务替播放器再问，别把 404 交出去】真机 10/02 16:07 遮天 181：
+# 一两个小时没人看，OpenList 的目录缓存过期，现去问夸克列表时卡了 30 秒（context canceled）。
+# MediaWarp 回 502，排队等同一个地址的 Hills 拿到 404 就再也不要了 —— 一直 0 B/s。
+# 2 分半钟后再问，0.2 秒就给了。所以失败了隔几秒再问一次，总共最多替播放器扛这么久
+HLS_MW_BUDGET = 50
+HLS_MW_TRY_S = 35          # 单次最多等（MediaWarp 自己 30 秒回 502）
+HLS_MW_GAP = 2
+HLS_MW_TRIES = 4           # 最多问几次（MediaWarp 回得快的失败别连着敲上游几十次）
 
 
 def hls_direct_on():
@@ -2536,7 +2544,7 @@ def do_hls_fix():
             if mine:
                 ev = pl_busy[vid] = threading.Event()
         if not mine:
-            ev.wait(40)
+            ev.wait(HLS_MW_BUDGET + 10)
             with lock:
                 hit = plc.get(vid)
             return hit[0] if hit else ""
@@ -2548,8 +2556,8 @@ def do_hls_fix():
             ev.set()
 
     def _playlist_fetch(vid, ua):
-        body, _qn = "", ""
-        _t0, _t1, _t2, _hls = time.monotonic(), 0.0, 0.0, False
+        body, _qn, loc = "", "", ""
+        _t0, _t1, _t2, _hls, _tries = time.monotonic(), 0.0, 0.0, False, 0
         try:
             loc, _qn = qtv_of(vid)
             if not loc:
@@ -2558,10 +2566,22 @@ def do_hls_fix():
                     f"http://127.0.0.1:{MEDIAWARP_PORT}/Videos/{vid}/stream"
                     f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
                     headers={"User-Agent": HTTP_UA})
-                try:
-                    op.open(req, timeout=15).close()
-                except urllib.error.HTTPError as e:
-                    loc = e.headers.get("Location") or ""
+                _end = _t0 + HLS_MW_BUDGET
+                while True:
+                    _tries += 1
+                    _bad = False
+                    try:
+                        op.open(req, timeout=max(5.0, min(HLS_MW_TRY_S, _end - time.monotonic()))).close()
+                    except urllib.error.HTTPError as e:
+                        loc = e.headers.get("Location") or ""
+                        _bad = not loc and e.code >= 400
+                    except Exception:
+                        _bad = True           # 超时 / 断开
+                    # 【只有失败才再问】回 200（本机代理那种盘，MediaWarp 自己在转）是确定的答案
+                    if (not _bad or _tries >= HLS_MW_TRIES
+                            or time.monotonic() + HLS_MW_GAP + 5 > _end):
+                        break
+                    time.sleep(HLS_MW_GAP)
             _t1 = time.monotonic()
             _hls = ".m3u8" in loc.split("?", 1)[0].lower()
             if _hls:
@@ -2580,11 +2600,13 @@ def do_hls_fix():
         # 【开播计时的后半截】慢在 MediaWarp 换地址（它要问 OpenList、OpenList 要问网盘接口），
         # 还是慢在网盘回播放列表 —— 两截分开记。快的（1.5 秒以内）不记，免得流水被刷满。
         _all = time.monotonic() - _t0
-        if _all > 1.5 or (_hls and not body) or _qn:     # 自己挑了档的每次都记，好对得上
+        if _all > 1.5 or (_hls and not body) or _qn or _tries > 1:     # 自己挑了档的每次都记，好对得上
             try:
                 heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
                           + (f"自己问夸克（转码 {_qn}）" if _qn else "MediaWarp 给地址")
                           + f" {(_t1 or time.monotonic()) - _t0:.1f}s"
+                          + (f"（问了 {_tries} 次）" if _tries > 1 else "")
+                          + ("　没给地址" if _tries and not loc else "")
                           + (f"、网盘回列表 {_t2 - _t1:.1f}s" if _t1 and _t2 else "")
                           + ("" if body or not _hls else "　没取到（交回 MediaWarp）")
                           + f"{_log_tag(vid)}"])
