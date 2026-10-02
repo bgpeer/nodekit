@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.295"
+SCRIPT_VERSION = "1.5.296"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2234,6 +2234,17 @@ HLS_MW_BUDGET = 50
 HLS_MW_TRY_S = 35          # 单次最多等（MediaWarp 自己 30 秒回 502）
 HLS_MW_GAP = 2
 HLS_MW_TRIES = 4           # 最多问几次（MediaWarp 回得快的失败别连着敲上游几十次）
+# 【上次拿到的播放列表地址留着】真机 10/02 17:19 遮天 181：MediaWarp 的直链缓存没了（那会儿刚更新
+# 过脚本，容器重启），现问 OpenList → 夸克接口两次都卡满 30 秒（TLS 握手超时、connection reset），
+# 问了 2 次照样 404。而 44 分钟前拿到的那条 m3u8 地址带着签名、还活着。转码流的分片地址都在
+# 播放列表里写成了完整地址（m3u8_absolutize），播放器直连网盘拉，用不着 MediaWarp。
+#   · 半小时内拿到的：先试它，活的就直接用，不去碰网盘接口
+#   · 更早的（6 小时内）：MediaWarp 第一次没给地址时拿它兜底
+# 拿来用之前都会先真拉一次播放列表，死了就不用。地址带签名，文件 root-only、放 /run（重启就没）
+HLS_LAST_FILE = "/run/media-stack-hls-last.json"
+HLS_LAST_FIRST_S = 1800
+HLS_LAST_KEEP_S = 6 * 3600
+HLS_LAST_MAX = 300
 
 
 def hls_direct_on():
@@ -2353,6 +2364,12 @@ def do_hls_fix():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth") or ""
     cache, lock = {}, threading.Lock()
+    try:                                # 上次拿到的播放列表地址（见 HLS_LAST_FILE）
+        with open(HLS_LAST_FILE) as _f:
+            lastg = {str(k): list(v) for k, v in (json.load(_f) or {}).items()
+                     if isinstance(v, list) and len(v) == 2}
+    except Exception:
+        lastg = {}
 
     def base_of(vid):
         """这个条目的 m3u8 在哪个目录。问 MediaWarp，成功缓存 HLS_BASE_TTL 秒。
@@ -2555,11 +2572,53 @@ def do_hls_fix():
                 pl_busy.pop(vid, None)
             ev.set()
 
+    def _last(vid):
+        with lock:
+            hit = lastg.get(str(vid))
+        if hit and time.time() - hit[1] < HLS_LAST_KEEP_S:
+            return hit
+        return None
+
+    def _remember(vid, loc):
+        now = time.time()
+        with lock:
+            lastg[str(vid)] = [loc, now]
+            for k in [k for k, v in lastg.items() if now - v[1] > HLS_LAST_KEEP_S]:
+                lastg.pop(k, None)
+            while len(lastg) > HLS_LAST_MAX:
+                lastg.pop(min(lastg, key=lambda k: lastg[k][1]), None)
+            snap = json.dumps(lastg)
+        try:
+            write_atomic(HLS_LAST_FILE, snap, mode=0o600)
+        except Exception:
+            pass
+
+    def _pl_from(vid, loc, ua, timeout=15):
+        """真拉一次播放列表；是 #EXTM3U 就改好返回，不是 / 拉不动返回 ""。"""
+        try:
+            r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
+            with urllib.request.urlopen(r2, timeout=timeout) as r:
+                txt = r.read(2 << 20).decode("utf-8", "replace")
+                final = r.geturl() or loc
+        except Exception:
+            return ""
+        if not txt.lstrip().startswith("#EXTM3U"):
+            return ""
+        head = final.split("?", 1)[0]
+        with lock:
+            cache[vid] = (head[:head.rfind("/") + 1], time.time())
+        return m3u8_absolutize(txt, final)
+
     def _playlist_fetch(vid, ua):
-        body, _qn, loc = "", "", ""
+        body, _qn, loc, _old = "", "", "", ""
         _t0, _t1, _t2, _hls, _tries = time.monotonic(), 0.0, 0.0, False, 0
         try:
             loc, _qn = qtv_of(vid)
+            _lg = None if loc else _last(vid)
+            if _lg and time.time() - _lg[1] < HLS_LAST_FIRST_S:
+                body = _pl_from(vid, _lg[0], ua, timeout=8)
+                if body:
+                    loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
             if not loc:
                 op = urllib.request.build_opener(_NoRedirect)
                 req = urllib.request.Request(
@@ -2577,6 +2636,13 @@ def do_hls_fix():
                         _bad = not loc and e.code >= 400
                     except Exception:
                         _bad = True           # 超时 / 断开
+                    # 【第一次没给地址：先拿上次那条兜底】活的就不用再等下一次（又是 30 秒）
+                    if _bad and _lg and not _old:
+                        _old = "-"
+                        body = _pl_from(vid, _lg[0], ua, timeout=8)
+                        if body:
+                            loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
+                            break
                     # 【只有失败才再问】回 200（本机代理那种盘，MediaWarp 自己在转）是确定的答案
                     if (not _bad or _tries >= HLS_MW_TRIES
                             or time.monotonic() + HLS_MW_GAP + 5 > _end):
@@ -2584,29 +2650,26 @@ def do_hls_fix():
                     time.sleep(HLS_MW_GAP)
             _t1 = time.monotonic()
             _hls = ".m3u8" in loc.split("?", 1)[0].lower()
-            if _hls:
-                r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
-                with urllib.request.urlopen(r2, timeout=15) as r:
-                    txt = r.read(2 << 20).decode("utf-8", "replace")
-                    final = r.geturl() or loc
-                if txt.lstrip().startswith("#EXTM3U"):
-                    body = m3u8_absolutize(txt, final)
-                    head = final.split("?", 1)[0]
-                    with lock:
-                        cache[vid] = (head[:head.rfind("/") + 1], time.time())
+            if _hls and not body:
+                body = _pl_from(vid, loc, ua)
+                if body and not _qn:
+                    _remember(vid, loc)
             _t2 = time.monotonic()
         except Exception:
             body = ""
         # 【开播计时的后半截】慢在 MediaWarp 换地址（它要问 OpenList、OpenList 要问网盘接口），
         # 还是慢在网盘回播放列表 —— 两截分开记。快的（1.5 秒以内）不记，免得流水被刷满。
         _all = time.monotonic() - _t0
-        if _all > 1.5 or (_hls and not body) or _qn or _tries > 1:     # 自己挑了档的每次都记，好对得上
+        if _all > 1.5 or (_hls and not body) or _qn or _tries > 1 or (_old and _old != "-"):     # 自己挑了档的每次都记，好对得上
             try:
                 heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
-                          + (f"自己问夸克（转码 {_qn}）" if _qn else "MediaWarp 给地址")
+                          + (f"自己问夸克（转码 {_qn}）" if _qn else
+                             f"用了 {_old}拿到的地址（还活着）" if _old and _old != "-" and not _tries else
+                             "MediaWarp 给地址")
                           + f" {(_t1 or time.monotonic()) - _t0:.1f}s"
                           + (f"（问了 {_tries} 次）" if _tries > 1 else "")
                           + ("　没给地址" if _tries and not loc else "")
+                          + (f"　拿 {_old}的地址兜上了" if _old and _old != "-" and _tries else "")
                           + (f"、网盘回列表 {_t2 - _t1:.1f}s" if _t1 and _t2 else "")
                           + ("" if body or not _hls else "　没取到（交回 MediaWarp）")
                           + f"{_log_tag(vid)}"])
@@ -2700,6 +2763,10 @@ def do_hls_fix():
 
 def remove_hls_service():
     """停掉并删掉分片重定向服务。卸载、以及"没有盘再用转码流"时都走这里。"""
+    try:
+        os.remove(HLS_LAST_FILE)        # 带签名的地址，服务不在了就别留
+    except OSError:
+        pass
     if not os.path.exists(HLS_UNIT):
         return
     unit = os.path.basename(HLS_UNIT)
