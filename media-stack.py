@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.299"
+SCRIPT_VERSION = "1.5.300"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1214,8 +1214,8 @@ cache:
   #   404 | 30.3s | GET /emby/Videos/11/stream
   # 播放器等不到地址,画面就停在那儿。一部 93 分钟的电影按 10m 算要换约 9 次,
   # 等于把 9 次赌博串进一次观影。
-  # 夸克直链的 auth_key 实测有效期约 30 小时,缓存 2 小时安全余量很足,
-  # 一部片子只需要成功换一次。
+  # 夸克 TV 的地址 auth_key 里写着过期时刻:实测转码流约 3 小时、原画约 4 小时,
+  # 缓存 2 小时比它短,一部片子只需要成功换一次。
   #
   # 【但这条只对夸克成立 —— 阿里的直链只活 15 分钟】阿里发的地址里带
   # x-oss-expires=900,过期后阿里直接拒。缓存比直链本身还长,后果是
@@ -1224,7 +1224,7 @@ cache:
   # 表现就是"刚挂好能放,过一会儿就放不了了","有的片能放有的不能放"。
   # 所以这个值不是常数,要按【进了 Emby 的那些盘】取最短的那家,见 link_ttl_of()。
   # 注意是"进了 Emby"不是"挂在 OpenList 上"—— 没被扫进媒体库的盘不会被换直链,
-  # 让它去压别人的缓存,只会把夸克那种能撑 30 小时的盘一起拖慢。
+  # 让它去压别人的缓存,只会把夸克那种能撑几个小时的盘一起拖慢。
   alist_api_ttl: {ttl}
   # 【图片、字幕两份缓存关掉：各白占 300 MB 内存】仓库主人问「这个内存是不是不够用了」——
   # 真机 docker stats：mediawarp 1.005 GiB，比 Emby（916 MiB）还大，而它刚重启 3 分钟。
@@ -2044,8 +2044,10 @@ WARM_REST      = 20
 # alist_api_ttl —— 下面那个门槛就是拿它算的。
 LINK_TTL_H     = 2
 # 【各家直链自己能活多久】缓存绝对不能比这个长，长了就是把死地址 302 给播放器。
-# 数字读自直链地址本身：阿里 x-oss-expires=900 → 15 分钟；夸克 auth_key 约 30 小时。
-# 没列进来的驱动按夸克那档算（2 小时，这是这套东西一直在跑的值）。
+# 数字读自直链地址本身：阿里 x-oss-expires=900 → 15 分钟；夸克 TV 的 auth_key 真机 10/02 实测
+# 转码流 m3u8 约 3 小时、原画约 4 小时（以前记成「约 30 小时」，那是别的地址，不能照它拉长缓存）。
+# 没列进来的驱动按 LINK_TTL_H（2 小时，这套东西一直在跑的值）—— 夸克 TV 的 3 小时比它长，不用列：
+# 列进来会被当成「把缓存压短的盘」点名，屏上劝人把夸克移出媒体库，那是错的。
 LINK_LIFE_MIN = {"aliyundriveopen": 15}
 # 取最短那家之后还要再打个折 —— 缓存正好等于有效期的话，边界上那一次必死。
 LINK_TTL_SAFE = 0.6
@@ -2329,6 +2331,13 @@ HLS_REDIR = "\x00302 "
 # 30 秒回 404，之后拿 170 分钟前的地址兜上 —— 能播，可 0 B 干等了 31 秒。上次那条一直是活的，
 # 早几秒验它就行。MediaWarp 那一趟不掐断（掐了它那边也白干），让它接着取、取到了进它自己的缓存
 HLS_LAST_WAIT_S = 5
+# 【按地址自己写的过期时刻判，不按拿到多久】真机 10/02 实测夸克 TV：转码流 m3u8 一共只活约 3 小时、
+# 原画直链约 4 小时（以前记的「auth_key 约 30 小时」是另一种地址）。地址里带着过期时刻（auth_key），
+# 直接读：还剩的时间够把这一集放完（片长 + 10 分钟）才「先用」；兜底时还剩 5 分钟以上就用；
+# 已经过期的不去拉。认不出过期时刻的，照旧按拿到多久判（HLS_LAST_FIRST_S）
+HLS_LAST_SPARE_MIN = 10
+HLS_LAST_NEED_MIN = 60       # 不知道片长时，「先用」要求至少还剩这么久
+HLS_LAST_DYING_MIN = 5
 
 
 def hls_direct_on():
@@ -2660,8 +2669,33 @@ def do_hls_fix():
         with lock:
             hit = lastg.get(str(vid))
         if hit and time.time() - hit[1] < HLS_LAST_KEEP_S:
+            _rem = _url_expiry_min(hit[0])
+            if _rem is not None and _rem < HLS_LAST_DYING_MIN:
+                return None               # 地址自己写着快过期 / 已经过期了：不去拉
             return hit
         return None
+
+    rtm = {}
+
+    def _runtime_min(vid):
+        """这一集多长（分钟）；问不到 → 0。"""
+        if vid not in rtm:
+            try:
+                it = (_emby(f"/Items?Ids={vid}", key, timeout=5).get("Items") or [{}])[0]
+                rtm[vid] = int((it.get("RunTimeTicks") or 0) / 6e8)
+            except Exception:
+                return 0
+        return rtm[vid]
+
+    def _first_ok(vid, lg):
+        """上次那条能不能【不问 MediaWarp 就先用】：只认转码流，还剩的时间够放完这一集。"""
+        if ".m3u8" not in lg[0].split("?", 1)[0].lower():
+            return False
+        rem = _url_expiry_min(lg[0])
+        if rem is None:
+            return time.time() - lg[1] < HLS_LAST_FIRST_S
+        rt = _runtime_min(vid)
+        return rem >= (rt + HLS_LAST_SPARE_MIN if rt else HLS_LAST_NEED_MIN)
 
     def _remember(vid, loc):
         now = time.time()
@@ -2710,8 +2744,7 @@ def do_hls_fix():
         try:
             loc, _qn = qtv_of(vid)
             _lg = None if loc else _last(vid)
-            if (_lg and time.time() - _lg[1] < HLS_LAST_FIRST_S
-                    and ".m3u8" in _lg[0].split("?", 1)[0].lower()):
+            if _lg and _first_ok(vid, _lg):
                 body = _pl_from(vid, _lg[0], ua, timeout=8)
                 if body:
                     loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
@@ -22688,7 +22721,7 @@ def warm_links(d, key, limit=None):
             _mp, _drv, _life = _who[0]
             print(f"  {DIM}这个值按【进了 Emby 的盘】里最短命的那家算："
                   f"{_mp}（{_drv}）的直链只活 {_life} 分钟，于是全局被压到 "
-                  f"{_ttl_txt} —— 别的盘（夸克的 auth_key 实测约 30 小时）"
+                  f"{_ttl_txt} —— 别的盘（夸克 TV 实测约 3 小时）"
                   f"本来能撑 {LINK_TTL_H} 小时。{RST}")
             print(f"  {DIM}代价不只是预热：缓存一过期，再点开同一部片就要重新换一条"
                   f"直链，而换到的 CDN 节点好不好是随机的 —— "
