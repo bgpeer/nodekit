@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.307"
+SCRIPT_VERSION = "1.5.308"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1789,6 +1789,7 @@ case "${1:-info}" in
   115-check <片名>        115 这一部卡在哪一段（只读）
   hls-direct on|off       转码流分片直连网盘（不再每段绕服务器），默认开
   play-check      媒体库里每个盘挑一部过一遍播放：要地址几秒、哪一档、分片、速度（不碰进度）
+  play-report [小时]  最近 24 小时（可写 48）你自己点的播放：每个盘开播几次、要地址几秒、兜底、分片 404，夜里定时任务另列（只读本机账本）
   play-speed <片名> [--wait 秒] [--ua browser] [--at 分钟]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
                   （--at 8：从第 8 分钟开始拉 —— 播到一半卡的，趁卡的时候测同一段）
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
@@ -1987,6 +1988,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" play-speed "$@" ;;
+  play-report)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" play-report "$@" ;;
   play-check)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -2523,6 +2529,12 @@ def do_hls_fix():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                            "auth") or ""
     cache, lock = {}, threading.Lock()
+    tl = threading.local()              # 这一次请求一路上发生了什么（记进开播账本，见 play_ledger）
+
+    def _note(x):
+        n = getattr(tl, "note", None)
+        if n is not None and x not in n:
+            n.append(x)
     try:                                # 上次拿到的播放列表地址（见 HLS_LAST_FILE）
         with open(HLS_LAST_FILE) as _f:
             lastg = {str(k): list(v) for k, v in (json.load(_f) or {}).items()
@@ -2594,7 +2606,7 @@ def do_hls_fix():
             cache[vid] = (base, time.time())
         return base
 
-    paths, ali = {}, {}
+    paths, ali, seg404 = {}, {}, {}
 
     ali_busy, ali_up = {}, {}
 
@@ -2668,8 +2680,10 @@ def do_hls_fix():
             th.start()
             th.join(ALI_TC_UPGRADE_WAIT_S if upgrade else ALI_TC_DEADLINE_S if old else ALI_TC_WAIT_S)
             if out.get("url"):
+                _note(f"阿里 {out.get('tier') or ''}".strip())
                 return out["url"]
             if upgrade:
+                _note("阿里升档没问到")
                 return old or hit[0]      # 这次没问到高的：照旧用手里那条
             if old:
                 try:
@@ -2678,7 +2692,9 @@ def do_hls_fix():
                               f"（还剩 {_url_expiry_min(old)} 分钟）{_log_tag(vid)}"])
                 except Exception:
                     pass
+                _note("阿里旧地址兜底")
                 return old
+            _note("阿里没给地址")
             return ""
         finally:
             with lock:
@@ -2716,7 +2732,7 @@ def do_hls_fix():
                 cache[vid] = (head[:head.rfind("/") + 1], time.time())
         if url:
             _remember(vid, url)
-        out["url"] = url
+        out["url"], out["tier"] = url, _q
         return url
 
     p115c, m115 = {}, [[], 0.0]
@@ -2804,6 +2820,7 @@ def do_hls_fix():
                               f"{_log_tag(vid)}"])
                 except Exception:
                     pass
+                _note("115 旧直链兜底")
                 return old
             if old:
                 # 旧的验不过：接着等新的，等满 P115_WAIT_S
@@ -3075,6 +3092,16 @@ def do_hls_fix():
                           + f"{_log_tag(vid)}"])
             except Exception:
                 pass
+        if _tries > 1:
+            _note(f"重问 {_tries} 次")
+        if _old and _old != "-":
+            _note("旧地址兜底" if _tries else "旧地址直接用")
+        if _tries and not loc:
+            _note("MediaWarp 没给地址")
+        if _qn:
+            _note(f"夸克转码 {_qn}")
+        if _hls and not body:
+            _note("列表没拉到")
         with lock:
             plc[vid] = (body, time.time())
         return body
@@ -3097,10 +3124,27 @@ def do_hls_fix():
                 # 而真去网盘拿列表只花了 3.9 秒 —— 卡在前面。判阿里 / 判 115 都要问一次 Emby
                 # （这集在哪个盘）、读一次 OpenList 存储表；冷的时候哪一步慢，分开记
                 _ta = time.monotonic()
+                tl.note = []
+                _vid = ms.group(1)
+
+                def _rec(route):
+                    if self.headers.get(PLAY_PROBE_HDR):
+                        return            # 诊断命令自己打的，不是有人在播（见 PLAY_PROBE_HDR）
+                    try:
+                        tp = target_of(_vid)
+                    except Exception:
+                        tp = ""
+                    play_ledger({"ev": "stream", "iid": _vid, "mp": mount_of_path(d, tp)[0] if tp else "",
+                                 "name": os.path.splitext(os.path.basename(tp))[0][:40],
+                                 "route": route, "s": round(time.monotonic() - _ta, 1),
+                                 "note": list(getattr(tl, "note", []) or []),
+                                 "pre": bool(self.headers.get("X-Ms-Prefetch"))})
                 url = ali_of(ms.group(1))
                 _tb = time.monotonic()
+                _via = "阿里转码" if url else ""
                 if not url:
                     url = p115_of(ms.group(1), self.headers.get("User-Agent") or "")
+                    _via = "115" if url else ""
                 _tc = time.monotonic()
                 if _tc - _ta > 1.5:
                     try:
@@ -3113,6 +3157,7 @@ def do_hls_fix():
                 pl = ("" if url or not direct_on()
                       else playlist_of(ms.group(1), self.headers.get("User-Agent") or ""))
                 if pl.startswith(HLS_REDIR):
+                    _rec("原画（旧直链）")
                     self.send_response(302)
                     self.send_header("Location", pl[len(HLS_REDIR):])
                     self.send_header("Cache-Control", "no-store")
@@ -3120,6 +3165,7 @@ def do_hls_fix():
                     self.end_headers()
                     return
                 if pl:
+                    _rec("转码")
                     data = pl.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/vnd.apple.mpegurl")
@@ -3130,10 +3176,12 @@ def do_hls_fix():
                         self.wfile.write(data)
                     return
                 if url:
+                    _rec(_via)
                     self.send_response(302)
                     self.send_header("Location", url)
                     self.send_header("Cache-Control", "no-store")
                 else:
+                    _rec("原画（交给 MediaWarp）")
                     self.send_response(200)
                     self.send_header("X-Accel-Redirect", "@ms_mw")
                 self.send_header("Content-Length", "0")
@@ -3151,6 +3199,12 @@ def do_hls_fix():
                 return
             base = base_of(m.group(1))
             if not base:
+                with lock:                # 同一集一分钟只记一次（一场播放会连着要几十个分片）
+                    _k = ("seg404", m.group(1))
+                    _hit = seg404.get(_k, 0)
+                    if time.time() - _hit > 60 and not self.headers.get(PLAY_PROBE_HDR):
+                        seg404[_k] = time.time()
+                        play_ledger({"ev": "seg404", "iid": m.group(1)})
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -3694,7 +3748,7 @@ def play_clicks_in(txt):
     return out
 
 
-def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S):
+def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S, probe=False):
     """门那一下替播放器先要一次 /stream（打给本机换链服务）→ "playlist" / "redirect" / ""。
 
     【为什么】已经探好的一集，开播前还要走两步都要跨境连网盘的活：先验缓存里的直链
@@ -3714,7 +3768,8 @@ def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S):
     try:
         c = http.client.HTTPConnection("127.0.0.1", hls_port(), timeout=timeout)
         c.request("GET", f"/emby/videos/{iid}/stream?Static=true",
-                  headers={"User-Agent": ua or PLAYER_UA})
+                  headers=dict({"User-Agent": ua or PLAYER_UA, "X-Ms-Prefetch": "1"},
+                               **({PLAY_PROBE_HDR: "1"} if probe else {})))
         r = c.getresponse()
         ctype = (r.getheader("Content-Type") or "").lower()
         loc = r.getheader("Location") or ""
@@ -3836,7 +3891,8 @@ def do_heal_gate():
                         # 之后一帧不出（遮天 181）。命中缓存又活着的，多花不到两秒
                         try:
                             _a = time.monotonic()
-                            _k = gate_prefetch_stream(iid, self.headers.get("User-Agent") or "")
+                            _k = gate_prefetch_stream(iid, self.headers.get("User-Agent") or "",
+                                                      probe=bool(self.headers.get(PLAY_PROBE_HDR)))
                             _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, {
                                 "timeout": "等满了，换链服务还在取", "": "没取到"}.get(_k, _k)
                             if not _k:
@@ -3864,6 +3920,7 @@ def do_heal_gate():
                                     busy[iid] = ev
                                     threading.Thread(target=_bg, args=(need[0], ev)).start()
                     if ev is not None:
+                        _tm["heal"] = True
                         ev.wait(max(3, HEAL_GATE_WAIT_S - (time.monotonic() - t_in)))
                     else:
                         # 【别人正在探这一集】看片后 / 整队那一轮正把它的 strm 切成 URL 在探 ——
@@ -3880,6 +3937,8 @@ def do_heal_gate():
             # 【开播计时】仓库主人：「时间长了不看突然去播放……差不多要 20 秒才连接成功跑流量，
             # 20 秒之前都是 0b」。热的时候怎么测都正常，只有冷的那一下才看得见 —— 所以每次真按
             # 播放都把门里各步花了多久记进流水，冷的那次事后翻得出来。只记秒数，不记地址。
+            if _tm.get("iid") and self.headers.get(PLAY_PROBE_HDR):
+                _tm.clear()                   # play-speed 替你按的播放，不进流水和开播账本
             if _tm.get("iid"):
                 try:
                     _it = (_emby(f"/Items?Ids={_tm['iid']}", key, timeout=10).get("Items") or [{}])[0]
@@ -3897,6 +3956,8 @@ def do_heal_gate():
                 _all = time.monotonic() - _tm["t0"]
                 heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：{_nm or _tm['iid']}　"
                           + "、".join(_parts) + f"　门里共 {_all:.1f}s{_log_tag(_tm['iid'])}"])
+                play_ledger({"ev": "gate", "iid": _tm["iid"], "name": _nm, "s": round(_all, 1),
+                             "heal": bool(_tm.get("heal"))})
 
         do_GET = do_POST = do_HEAD = _go
 
@@ -4714,6 +4775,28 @@ def traffic_mark(task, t0, note=""):
     except OSError:
         pass
 
+# 【开播账本】仓库主人：「不能让他随便挑我的播放，这样会消耗流量的，你应该让他监控人工播放的」「可以
+# 监控一天的数据吗？或者两天的数据……也要监控每天凌晨刷新的数据」。换链服务和开播门本来就经手每一次
+# 真实开播，顺手各记一行：哪个盘、走哪条路、要地址几秒、用没用旧地址兜底、有没有分片 404。
+# 【一个字节都不多拉】只是往本机文件追加一行（几百字节），不发任何请求；按天一个文件，root-only，
+# 跟流量账本一起只留 TRAFFIC_KEEP_DAYS 天。看的时候用 media-stack play-report。
+# 【诊断命令自己打的请求带这个头】play-check / play-speed / 115 检查 都是照播放器的路子走一遍，
+# 不带记号就会被当成有人在播、混进开播账本。只在本机打给 nginx / 换链服务，不出网
+PLAY_PROBE_HDR = "X-Ms-Probe"
+
+
+def play_ledger(rec):
+    try:
+        os.makedirs(TRAFFIC_DIR, exist_ok=True)
+        rec.setdefault("t", int(time.time()))
+        f = f"{TRAFFIC_DIR}/plays-{time.strftime('%Y-%m-%d', time.localtime(rec['t']))}.jsonl"
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.chmod(f, 0o600)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
 def _timed(name, fn, note=None):
     """跑一个定时任务，顺手把起止时刻记进当天的任务账。
 
@@ -4799,6 +4882,8 @@ def _traffic_prune():
                 for i in range(TRAFFIC_KEEP_DAYS)}
         for n in os.listdir(TRAFFIC_DIR):
             if n.startswith("traffic-") and n.endswith(".tsv") and n[8:-4] not in keep:
+                os.remove(os.path.join(TRAFFIC_DIR, n))
+            elif n.startswith("plays-") and n.endswith(".jsonl") and n[6:-6] not in keep:
                 os.remove(os.path.join(TRAFFIC_DIR, n))
     except OSError:
         pass
@@ -5635,13 +5720,14 @@ def _play_start(iid, msid, key):
         t0 = time.monotonic()
         c.request("POST", f"/emby/Items/{iid}/PlaybackInfo?IsPlayback=true&StartTimeTicks=0"
                   f"&api_key={key}", body=b"{}",  # 带 StartTimeTicks 才算真按了播放（PLAY_CLICK_RE）
-                  headers={"User-Agent": HTTP_UA, "Content-Type": "application/json"})
+                  headers={"User-Agent": HTTP_UA, "Content-Type": "application/json",
+                           PLAY_PROBE_HDR: "1"})
         c.getresponse().read()
         out["pi"] = time.monotonic() - t0
         t1 = time.monotonic()
         c.request("GET", f"/emby/videos/{iid}/stream?MediaSourceId="
                   f"{urllib.parse.quote(str(msid))}&Static=true&api_key={key}",
-                  headers={"User-Agent": HTTP_UA})
+                  headers={"User-Agent": HTTP_UA, PLAY_PROBE_HDR: "1"})
         r = c.getresponse()
         out["loc"] = r.getheader("Location") or ""
         if not out["loc"] and r.status == 200 and "mpegurl" in (r.getheader("Content-Type") or "").lower():
@@ -5803,7 +5889,8 @@ def _play_check_one(d, key, iid, tp, mp):
         port = hls_port() if os.path.exists(HLS_UNIT) else 0
         if port:
             c = http.client.HTTPConnection("127.0.0.1", port, timeout=HLS_MW_BUDGET + 15)
-            c.request("GET", f"/emby/Videos/{iid}/stream?{q}", headers={"User-Agent": PLAYER_UA})
+            c.request("GET", f"/emby/Videos/{iid}/stream?{q}",
+                      headers={"User-Agent": PLAYER_UA, PLAY_PROBE_HDR: "1"})
             r = c.getresponse()
             loc = r.getheader("Location") or ""
             if r.status == 200 and "mpegurl" in (r.getheader("Content-Type") or "").lower():
@@ -5853,7 +5940,8 @@ def _play_check_one(d, key, iid, tp, mp):
             seg = next((ln.strip() for ln in body.splitlines() if ln.strip() and not ln.startswith("#")), "")
             if seg and not seg.startswith(("http://", "https://")) and os.path.exists(HLS_UNIT):
                 c = http.client.HTTPConnection("127.0.0.1", hls_port(), timeout=20)
-                c.request("GET", f"/emby/Videos/{iid}/{seg}", headers={"User-Agent": PLAYER_UA})
+                c.request("GET", f"/emby/Videos/{iid}/{seg}",
+                          headers={"User-Agent": PLAYER_UA, PLAY_PROBE_HDR: "1"})
                 r = c.getresponse(); r.read(); c.close()
                 out["seg"] = "分片指得回去" if r.status in (301, 302) else f"分片 {r.status}（播放器会卡住）"
         except Exception as e:
@@ -5911,6 +5999,165 @@ def do_play_check():
         tip("⚠ / ✖ 的那几个盘，把这一屏发给仓库主人；速度量的是 VPS 到网盘，手机那段会有出入")
     else:
         ok("每个盘都过了")
+
+
+# 【开播报告】仓库主人：「不能让他随便挑我的播放，这样会消耗流量的，你应该让他监控人工播放的，把监控
+# 播放的数据打印出来就可以了，可以监控一天的数据吗？或者两天的数据，别让每天凌晨自动刷新给他影响了就行，
+# 但是也要监控每天凌晨刷新的数据最好」。
+# 数据来自 play_ledger：换链服务和开播门本来就经手每一次真按播放，各记一行。报告只读本机文件，不发请求。
+# 口径：
+#   · 开播次数 = 门那一行（真按了播放）；要地址 = 换链服务那一行（门预取的那次才是真去网盘取的，
+#     播放器紧接着来拿多半是命中，秒数很小，两个都算）
+#   · 诊断命令（play-check / play-speed）带 PLAY_PROBE_HDR，不记账，所以不会混进来
+#   · 夜里那些定时任务（生成媒体库、补时长、截封面、预热……）不经过开播门，单独一节列出来，
+#     附上跑的那段时间网卡下行（含同时段别的活动，只能当上限看）
+PLAY_REPORT_SLOW_S = 10       # 要地址超过这么多秒算慢
+PLAY_REPORT_WORST = 5         # 列最慢的几次
+
+
+def _play_ledger_read(t_from, t_to):
+    out = []
+    t = t_from - 86400
+    days = []
+    while t <= t_to + 86400:
+        dd = time.strftime("%Y-%m-%d", time.localtime(t))
+        if dd not in days:
+            days.append(dd)
+        t += 3600
+    for dd in days:
+        try:
+            fh = open(f"{TRAFFIC_DIR}/plays-{dd}.jsonl", encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                    if t_from <= int(r.get("t") or 0) <= t_to:
+                        out.append(r)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    return sorted(out, key=lambda r: r["t"])
+
+
+def _med(xs):
+    xs = sorted(xs)
+    if not xs:
+        return 0.0
+    h = len(xs) // 2
+    return xs[h] if len(xs) % 2 else (xs[h - 1] + xs[h]) / 2
+
+
+def do_play_report(hours=24):
+    """media-stack play-report [小时]：最近一两天真人开播的统计 + 夜里定时任务。只读本机账本。"""
+    now = int(time.time())
+    t_from = now - hours * 3600
+    recs = _play_ledger_read(t_from, now)
+    print("\n" + "=" * 60)
+    print(f"  {BOLD}开播报告  最近 {hours} 小时{RST}")
+    print("=" * 60)
+    gates = [r for r in recs if r.get("ev") == "gate"]
+    streams = [r for r in recs if r.get("ev") == "stream"]
+    mp_of = {}
+    for r in streams:
+        if r.get("mp"):
+            mp_of[str(r.get("iid"))] = r["mp"]
+    if not gates and not streams:
+        info("这段时间没有开播记录（1.5.308 起才记）")
+    else:
+        # ---- 每个盘一段
+        drives = {}
+        for r in streams:
+            drives.setdefault(r.get("mp") or mp_of.get(str(r.get("iid"))) or "?", {"s": [], "g": 0, "n": {}, "404": 0})
+        for r in gates:
+            drives.setdefault(mp_of.get(str(r.get("iid"))) or "?", {"s": [], "g": 0, "n": {}, "404": 0})
+        for r in streams:
+            e = drives[r.get("mp") or mp_of.get(str(r.get("iid"))) or "?"]
+            e["s"].append(float(r.get("s") or 0))
+            for x in r.get("note") or []:
+                x = re.sub(r"\d+ 次$", "N 次", str(x))
+                e["n"][x] = e["n"].get(x, 0) + 1
+            e.setdefault("route", {})
+            e["route"][r.get("route") or "?"] = e["route"].get(r.get("route") or "?", 0) + 1
+        for r in gates:
+            drives[mp_of.get(str(r.get("iid"))) or "?"]["g"] += 1
+        for r in recs:
+            if r.get("ev") == "seg404":
+                drives.setdefault(mp_of.get(str(r.get("iid"))) or "?", {"s": [], "g": 0, "n": {}, "404": 0})["404"] += 1
+        print(f"  {BOLD}按盘{RST}")
+        for mp, e in sorted(drives.items(), key=lambda kv: (kv[0] == "?", kv[0])):
+            s = e["s"]
+            slow = sum(1 for x in s if x > PLAY_REPORT_SLOW_S)
+            line = (f"    {_padw(mp if mp != '?' else '（没认出盘）', 14)}开播 {e['g']} 次"
+                    + (f"　要地址 中位 {_med(s):.1f}s 最长 {max(s):.1f}s" if s else "")
+                    + (f"　{YELLOW}慢 {slow} 次{RST}" if slow else "")
+                    + (f"　{RED}分片 404 {e['404']} 次{RST}" if e["404"] else ""))
+            print(line)
+            extra = "、".join(f"{k} {v}" for k, v in sorted((e.get("route") or {}).items(), key=lambda kv: -kv[1]))
+            extra2 = "、".join(f"{k} {v}" for k, v in sorted(e["n"].items(), key=lambda kv: -kv[1]))
+            if extra or extra2:
+                print(f"      {DIM}{extra}{'　' if extra and extra2 else ''}{extra2}{RST}")
+        # ---- 开播门
+        if gates:
+            gs = [float(r.get("s") or 0) for r in gates]
+            heal = sum(1 for r in gates if r.get("heal"))
+            full = sum(1 for x in gs if x >= HEAL_GATE_WAIT_S - 0.5)
+            print("-" * 60)
+            print(f"  {BOLD}开播门{RST}　{len(gates)} 次　中位 {_med(gs):.1f}s　最长 {max(gs):.1f}s"
+                  + (f"　先补时长 {heal} 次" if heal else "")
+                  + (f"　{YELLOW}等满 {HEAL_GATE_WAIT_S}s 的 {full} 次{RST}" if full else ""))
+        # ---- 最慢的几次（门 + 要地址合在一起看，同一集 2 分钟内算一次）
+        worst = {}
+        for r in gates + streams:
+            k = (str(r.get("iid")), int(r["t"]) // 120)
+            w = worst.setdefault(k, {"t": r["t"], "iid": str(r.get("iid")), "name": "", "gate": 0.0,
+                                     "addr": 0.0, "note": []})
+            if r.get("name"):
+                w["name"] = w["name"] or r["name"]
+            if r.get("ev") == "gate":
+                w["gate"] = max(w["gate"], float(r.get("s") or 0))
+            else:
+                w["addr"] = max(w["addr"], float(r.get("s") or 0))
+                w["note"] += [x for x in (r.get("note") or []) if x not in w["note"]]
+        top = sorted(worst.values(), key=lambda w: -max(w["gate"], w["addr"]))[:PLAY_REPORT_WORST]
+        top = [w for w in top if max(w["gate"], w["addr"]) > 0]
+        if top:
+            print("-" * 60)
+            print(f"  {BOLD}最慢的 {len(top)} 次{RST}")
+            for w in top:
+                print(f"    {time.strftime('%m-%d %H:%M', time.localtime(w['t']))}  "
+                      f"{_padw(mp_of.get(w['iid']) or '?', 10)}{_padw((w['name'] or w['iid'])[:20], 22)}"
+                      f"门 {w['gate']:.1f}s　要地址 {w['addr']:.1f}s"
+                      + (f"　{DIM}{'、'.join(w['note'])}{RST}" if w["note"] else ""))
+    # ---- 夜里 / 后台定时任务：不经过开播门，单独列
+    days = sorted({time.strftime("%Y-%m-%d", time.localtime(t)) for t in range(t_from, now + 1, 3600)}
+                  | {time.strftime("%Y-%m-%d", time.localtime(now))})
+    tasks, trows = [], []
+    for dd in days:
+        tasks += [x for x in _traffic_tasks(dd) if x[1] >= t_from and x[0] <= now]
+        trows += _traffic_rows(dd)
+    print("-" * 60)
+    print(f"  {BOLD}后台定时任务{RST}{DIM}（不经过开播门，不算进上面）{RST}")
+    if not tasks:
+        print(f"    {DIM}没有记录{RST}")
+    short = {}
+    for t0, t1, name, note in tasks:
+        if t1 - t0 < TRAFFIC_TASK_SHOW_S:
+            short[name] = short.get(name, 0) + 1
+            continue
+        win = [r for r in trows if t0 <= r[0] <= t1 + TRAFFIC_EVERY_MIN * 60]
+        print(f"    {time.strftime('%m-%d %H:%M', time.localtime(t0))}  {_padw(name, 13)}"
+              f"跑了 {(t1 - t0) // 60} 分  ↓{_gb(sum(r[1] for r in win))}"
+              + (f"   {DIM}{note}{RST}" if note else ""))
+    if short:
+        print(f"    {DIM}另外 " + "、".join(f"{n} {k} 次" for n, k in short.items())
+              + f"，每次不到 1 分钟{RST}")
+    rx = sum(r[1] for r in trows if t_from <= r[0] <= now)
+    if rx:
+        print("-" * 60)
+        print(f"  {BOLD}这 {hours} 小时网卡下行 ↓{_gb(rx)}{RST}{DIM}　细账：media-stack traffic{RST}")
+    if any(r.get("ev") == "seg404" for r in recs):
+        tip("有分片 404：播放器会卡住，把这份报告发过来")
 
 
 def do_play_speed(q, wait=5, ua="player", at_min=0.0):
@@ -6233,7 +6480,7 @@ def do_p115_check(q):
     try:
         op = urllib.request.build_opener(_NoRedirect)
         req = urllib.request.Request(f"http://127.0.0.1:{hls_port()}/emby/videos/{iid}/stream",
-                                     headers={"User-Agent": PLAYER_UA})
+                                     headers={"User-Agent": PLAYER_UA, PLAY_PROBE_HDR: "1"})
         try:
             op.open(req, timeout=40).close()
             st = "200"
@@ -25523,6 +25770,13 @@ if __name__ == "__main__":
                 except (IndexError, ValueError):
                     del _a[_i:]
             do_play_watch(" ".join(_a).strip(), minutes=_mn)
+        elif arg == "play-report":        # 真人开播的统计（只读本机账本）
+            require_root()
+            try:
+                _h = max(1, min(24 * TRAFFIC_KEEP_DAYS, int(sys.argv[2])))
+            except (IndexError, ValueError):
+                _h = 24
+            do_play_report(_h)
         elif arg == "play-check":         # 每个盘挑一部过一遍播放
             require_root()
             do_play_check()
