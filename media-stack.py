@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.291"
+SCRIPT_VERSION = "1.5.292"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2889,7 +2889,8 @@ def rescue_watch_pos(key):
         iid = str((se.get("NowPlayingItem") or {}).get("Id") or "")
         if iid in st:
             live = True
-            new[iid] = [max(0, int((se.get("PlayState") or {}).get("PositionTicks") or 0)), now]
+            new[iid] = [max(0, int((se.get("PlayState") or {}).get("PositionTicks") or 0)), now,
+                        str(se.get("UserId") or "")]
     if new != cur:
         save_ms_state(heal_rescue_pos=new)
     return live
@@ -3288,7 +3289,7 @@ def do_heal_gate():
                     _w, _done = rescue_hold(key, _iid) if (_iid and key) else (0.0, True)
                     if _w >= 0.5:
                         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情"
-                                  f"等了 {_w:.1f}s（{'写回了' if _done else '等满了，还没写回'}）"
+                                  f"等了 {_w:.1f}s（{'跟上了' if _done else '等满了，交给后台结账'}）"
                                   f"{_log_tag(_iid)}"])
                 except Exception:
                     pass
@@ -5808,6 +5809,41 @@ def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
     if _was:
         time.sleep(0.3)               # 会话刚收掉，续播点那一笔可能还差一点点才落盘
     t1 = time.monotonic()
+    # 【手里有常驻服务几秒前记的位置 → 直接看 Emby 的续播点跟上没有，跟不上就先写这个】
+    # 真机 10/02 12:38 遮天 180：退出读详情等了 1.3 秒还是 13:43，再进一次才是 18:59 ——
+    # 会话已经收掉了，Emby 的续播点那一笔却还没落下；结账那边又要等 Emby 记完（等 3 分钟）
+    # 才肯写，于是详情页拿到旧的。常驻服务的位置误差只有几秒，cap 秒内 Emby 跟不上就先写它；
+    # Emby 随后自己那一笔再来，只会更准
+    try:
+        _fp, _fu = int(_fine[0] or 0), str((_fine[2:3] or [""])[0] or e.get("uid") or "")
+    except (TypeError, ValueError):
+        _fp, _fu = 0, ""
+    if _fp >= HEAL_RESCUE_MIN_S * 10 ** 7 and _fu and time.time() - _ft <= 30:
+        try:
+            while True:
+                it = _emby(f"/Users/{_fu}/Items/{iid}?Fields=UserData,MediaSources", key, timeout=3)
+                srcs = it.get("MediaSources") or []
+                ticks = (min((x.get("RunTimeTicks") or 0) for x in srcs) if srcs
+                         else (it.get("RunTimeTicks") or 0))
+                ud = it.get("UserData") or {}
+                upos = int(ud.get("PlaybackPositionTicks") or 0)
+                if ticks and _fp >= ticks * HEAL_RESCUE_END_PCT:
+                    break             # 看到结尾了：「已看完」归 Emby 自己判，走下面老路
+                if upos >= _fp - HEAL_RESCUE_STALE_FINE_S * 10 ** 7:
+                    return time.monotonic() - t0, True        # Emby 自己记上了
+                if time.monotonic() - t1 >= cap:
+                    _emby(f"/Users/{_fu}/Items/{iid}/UserData", key, method="POST",
+                          body={"PlaybackPositionTicks": _fp, "Played": False,
+                                "PlayCount": int(ud.get("PlayCount") or 0),
+                                "IsFavorite": bool(ud.get("IsFavorite"))}, timeout=3)
+                    _mm = lambda t: f"{t // 600000000} 分 {t // 10 ** 7 % 60:02d} 秒"
+                    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情，"
+                              f"Emby 还是 {_mm(upos) if upos else '0'}，先写上 {_mm(_fp)}"
+                              f"{_log_tag(iid)}"])
+                    return time.monotonic() - t0, True
+                time.sleep(0.3)
+        except Exception:
+            pass
     # 【当场结账，不等后台那一轮】真机 10/01：等了 3.0 秒才写回 —— 那是常驻服务看见
     # 「停止播放」→ 另起一个 heal-tick（光启动就一两秒）→ 再结账。门本来就醒着，自己结一次
     # 只要几个本机 Emby 请求，不碰网盘；后台那一轮随后再来，看到已经写好了就不动
