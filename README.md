@@ -1473,6 +1473,7 @@ WebDAV 那一屏的 `7 ＋ 添加 WebDAV`（挂几个都行，每个 WebDAV 那�
 扫码在终端里直接做；令牌续期由本机一个小服务（`media-stack-alitv`，只监听 Docker 内部网络的网关地址，公网连不上）替 OpenList 去做，
 从此不经过 api.oplist.org。还剩一个第三方：TV 投屏软件的服务器 api.extscreen.com 看得到这份令牌（夸克 TV 盘本来就在用它）。
 防火墙挡住了 Docker 连本机时，续期自动退回 api.oplist.org，盘照样能用。
+在「直链方式 → 接口通道」里来回换接口时，换下来的那份令牌留在本机（`/etc/bgpeer/ali-tokens.json`，只有 root 能读），换回去先试它，不用重新扫码或贴令牌；试不通就原样改回、再走扫码。新挂盘、重新登录时清掉。
 
 **夸克清晰度**：OpenList 的夸克 TV 盘在「转码流」方式下只拿夸克给的**第一条**地址，有的片第一条是原片整文件（被限速、拖进度慢），
 App 里明明还有 720P / 360P 转码。`media-stack quark-login` 在本机另扫码登一份夸克 TV（另一个设备号，不动 OpenList 那个盘），
