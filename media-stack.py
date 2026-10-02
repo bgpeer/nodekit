@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.290"
+SCRIPT_VERSION = "1.5.291"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -6113,9 +6113,6 @@ def do_heal_tick(hot_only=False):
     # 会提前返回，而这一步每一轮都得跑
     rescue_progress(key)
     warm_owed_kick(key)
-    if not heal_auto_on():
-        _say("自动补时长关着（7 设置 → 10）。手动补：media-stack heal <片名>")
-        return
     # 【两个信号，任一说"有人点过播放"就跑】
     #   · MediaWarp 日志里最近有没有播放请求 —— 最硬：那是请求本身，按下播放那一刻
     #     就有，不依赖 Emby 里哪个字段什么时候更新
@@ -6146,6 +6143,12 @@ def do_heal_tick(hot_only=False):
     # 90%），正常记住了进度的一个都不碰 —— 所以这里放宽到"点开过的都盯"没有风险。
     if ids:
         rescue_arm([("", i, "") for i in ids])
+    # 【盯进度不归补时长那个开关管】以前开关关着就在上面直接返回了，点开的那一集不记进
+    # 抢救表 —— 退出回到详情页那一下也就不等写回（rescue_hold 只等表里有的）。盯进度只问
+    # 本机 Emby，不碰网盘，跟补不补时长无关
+    if not heal_auto_on():
+        _say("自动补时长关着（7 设置 → 10）。手动补：media-stack heal <片名>")
+        return
     ts = last_played_ts(key)
     water = float(ms_state().get("heal_tick_seen") or 0)
     moved = ts is not None and ts > water
