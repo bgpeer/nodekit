@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.305"
+SCRIPT_VERSION = "1.5.306"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2610,8 +2610,22 @@ def do_hls_fix():
             return False
         return ALI_TC_LEVELS.index(tier) > ALI_TC_LEVELS.index(pref)
 
+    def _ali_base(vid, url):
+        """交出去的这条阿里地址，分片目录也记上 —— 阿里的 m3u8 里分片是相对路径，客户端会拼回
+        /emby/Videos/<id>/media-0.ts 来要，靠 base_of 指回阿里。【不管地址是现要的、缓存里的、
+        还是文件里接上的都要记】真机 10/02 23:59 龙虎门：1.5.303 起交出去的可以是文件里接上的旧地址，
+        目录却只在现要时记 —— 分片全 404，Hills 等了一分钟退出。"""
+        if url:
+            head = url.split("?", 1)[0]
+            with lock:
+                cache[vid] = (head[:head.rfind("/") + 1], time.time())
+        return url
+
     def ali_of(vid):
         """这一集该不该走阿里转码流 → m3u8 地址（不该 / 拿不到 → ""）。见 ALI_TC_DEADLINE_S。"""
+        return _ali_base(vid, _ali_of(vid))
+
+    def _ali_of(vid):
         tcm = ali_tc_mounts()
         if not tcm or not key:
             return ""
