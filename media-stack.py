@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.302"
+SCRIPT_VERSION = "1.5.303"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2275,6 +2275,15 @@ def hls_wanted(d):
 # 别的盘 / 没开的盘 / 这一部没有转码版本 → 原样交回 MediaWarp，行为和以前一模一样。
 ALI_TC_LEVELS = ("QHD", "FHD", "HD", "SD", "LD")          # 从高到低
 ALI_TC_TTL = 600          # 一部片的转码地址缓存多久（阿里给的地址几小时才过期，留足余量）
+# 【阿里转码流也要「重问 / 旧地址兜底 / 封顶」】真机 10/02 22:51 龙虎门：开播时阿里的令牌刚好过期，
+# 本机续期花了 18 秒，「判阿里」那一步卡满 20 秒没拿到转码地址 —— 于是退回原画直链，阿里原画
+# 被限速到 0.7 Mbps（这部要 17.4），开头慢、播着也卡。而上一次拿到的转码地址还有 4 小时才过期。
+#   · 缓存按地址自己的 x-oss-expires 判（够放完这一集就接着用），不是死的 10 分钟
+#   · 要新地址最多等 ALI_TC_DEADLINE_S 秒；手里有没过期的旧地址就先用它（新的在后台接着要）
+#   · 手里什么都没有：多等一会儿（ALI_TC_WAIT_S）—— 退回原画基本等于播不动，不如等转码
+#   · 同一集同时只要一路；上次的地址存进 HLS_LAST_FILE，服务重启也接得上
+ALI_TC_DEADLINE_S = 8
+ALI_TC_WAIT_S = 25
 ALI_DRIVERS = ("aliyundriveopen",)
 
 
@@ -2569,17 +2578,68 @@ def do_hls_fix():
 
     paths, ali = {}, {}
 
+    ali_busy = {}
+
+    def _ali_still_good(vid, u, got_at):
+        """手里这条阿里转码地址能不能接着用：够放完这一集（认不出过期时刻就按 ALI_TC_TTL）。"""
+        rem = _url_expiry_min(u)
+        if rem is None:
+            return time.time() - got_at < ALI_TC_TTL
+        rt = _runtime_min(vid)
+        return rem >= (rt + HLS_LAST_SPARE_MIN if rt else HLS_LAST_NEED_MIN)
+
     def ali_of(vid):
-        """这一集该不该走阿里转码流 → m3u8 地址（不该 / 拿不到 → ""）。"""
+        """这一集该不该走阿里转码流 → m3u8 地址（不该 / 拿不到 → ""）。见 ALI_TC_DEADLINE_S。"""
         tcm = ali_tc_mounts()
         if not tcm or not key:
             return ""
         now = time.time()
         with lock:
             hit = ali.get(vid)
-            if hit and now - hit[1] < (ALI_TC_TTL if hit[0] else HLS_BASE_FAIL_TTL):
-                return hit[0]
+        if hit is None:
+            _lg = _last(vid)              # 服务重启过：上次存下的那条
+            if _lg and "x-oss-" in _lg[0] and ".m3u8" in _lg[0].split("?", 1)[0].lower():
+                hit = (_lg[0], _lg[1])
+        if hit and hit[0] and _ali_still_good(vid, hit[0], hit[1]):
+            return hit[0]
+        if hit and not hit[0] and now - hit[1] < HLS_BASE_FAIL_TTL:
+            return ""
+        with lock:
+            ev = ali_busy.get(vid)
+            mine = ev is None
+            if mine:
+                ev = ali_busy[vid] = threading.Event()
+        if not mine:
+            ev.wait(ALI_TC_WAIT_S + 2)
+            with lock:
+                h = ali.get(vid)
+            return h[0] if h else ""
+        try:
+            old = hit[0] if (hit and hit[0] and (_url_expiry_min(hit[0]) or 0) >= HLS_LAST_DYING_MIN) else ""
+            out = {}
+            th = threading.Thread(target=_ali_fetch, args=(vid, out), daemon=True)
+            th.start()
+            th.join(ALI_TC_DEADLINE_S if old else ALI_TC_WAIT_S)
+            if out.get("url"):
+                return out["url"]
+            if old:
+                try:
+                    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：阿里转码　要新地址 "
+                              f"{ALI_TC_DEADLINE_S}s 没回，用了 {(time.time() - hit[1]) / 60:.0f} 分钟前那条"
+                              f"（还剩 {_url_expiry_min(old)} 分钟）{_log_tag(vid)}"])
+                except Exception:
+                    pass
+                return old
+            return ""
+        finally:
+            with lock:
+                ali_busy.pop(vid, None)
+            ev.set()
+
+    def _ali_fetch(vid, out):
+        """真去要一次阿里转码地址，结果写进 ali / out（晚到的也照样写进缓存，下次直接用）。"""
         url = ""
+        tcm = ali_tc_mounts()
         try:
             ip = paths.get(vid)
             if ip is None:
@@ -2597,11 +2657,16 @@ def do_hls_fix():
         except Exception:
             url = ""
         with lock:
-            ali[vid] = (url, time.time())
+            prev = ali.get(vid)
+            if url or not (prev and prev[0]):      # 要失败了别把手里还活着的那条冲掉
+                ali[vid] = (url, time.time())
             if url:
                 # 分片是相对路径时，被客户端拼回 Emby 的那些也要能指回去（见 base_of）
                 head = url.split("?", 1)[0]
                 cache[vid] = (head[:head.rfind("/") + 1], time.time())
+        if url:
+            _remember(vid, url)
+        out["url"] = url
         return url
 
     p115c, m115 = {}, [[], 0.0]
