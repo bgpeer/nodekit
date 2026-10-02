@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.289"
+SCRIPT_VERSION = "1.5.290"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -111,6 +111,9 @@ HEAL_GATE_SOCK = "/run/media-stack-healgate.sock"
 # nginx 只对有文件的那几集，把「读详情」先送去门那边等抢救写完（见 rescue_hold），别的照旧直通。
 RESCUE_HOLD_DIR = "/run/media-stack-hold"
 RESCUE_HOLD_S = 1          # 最多等几秒；写好了马上放（仓库主人：「感觉 1 秒就够了」）
+# 读详情时 Emby 还挂着「在播这一集」：多半是 Hills 退出时「停止播放」和「读详情」一起发出去，
+# Emby 还没处理完那一场。最多等这么久等它记完（仓库主人：「Hills 刷新能慢个 1-2 秒就够了」）
+RESCUE_HOLD_STOP_S = 2
 HEAL_GATE_SOCKET_UNIT = "/etc/systemd/system/media-stack-healgate.socket"
 HEAL_GATE_UNIT = "/etc/systemd/system/media-stack-healgate.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
@@ -1497,7 +1500,7 @@ def gen_nginx_site(cfg):
         proxy_set_header Content-Length "";
         proxy_set_header X-Ms-Iid $ms_iid;
         proxy_connect_timeout 3s;
-        proxy_read_timeout {RESCUE_HOLD_S + 4}s;
+        proxy_read_timeout {RESCUE_HOLD_S + RESCUE_HOLD_STOP_S + 4}s;
     }}
 """ if sub == "emby" and gate_on else "")
         out.append(f"""
@@ -5781,14 +5784,30 @@ def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
     e = (ms_state().get("heal_rescue") or {}).get(str(iid))
     if not e:
         return 0.0, True
-    if time.time() - max(int(e.get("seen") or 0), int(e.get("t0") or 0)) > RESCUE_HOLD_RECENT_S:
-        return 0.0, True
+    _fine = (ms_state().get("heal_rescue_pos") or {}).get(str(iid)) or [0, 0]
     try:
-        if any(str((se.get("NowPlayingItem") or {}).get("Id") or "") == str(iid)
-               for se in (_emby("/Sessions", key, timeout=3) or [])):
-            return time.monotonic() - t0, True
+        _ft = int(_fine[1])
+    except (TypeError, ValueError, IndexError):
+        _ft = 0
+    if time.time() - max(int(e.get("seen") or 0), int(e.get("t0") or 0), _ft) > RESCUE_HOLD_RECENT_S:
+        return 0.0, True
+    # 【Emby 还挂着在播这一集 → 先等它把这一场记完】真机 10/02 遮天 180：退出回到详情页还是
+    # 旧的续播点，再退出进来才对 —— Emby 自己记上了（流水里没有抢救那一行），只是比 Hills
+    # 读详情晚了一步。以前一看见「还在播」就当是别的设备在看、直接放行，正好放过了这一下。
+    # 等满 RESCUE_HOLD_STOP_S 还在播，那才是真有人在播，照旧放行
+    _was = False
+    try:
+        while any(str((se.get("NowPlayingItem") or {}).get("Id") or "") == str(iid)
+                  for se in (_emby("/Sessions", key, timeout=3) or [])):
+            if time.monotonic() - t0 >= RESCUE_HOLD_STOP_S:
+                return time.monotonic() - t0, True
+            _was = True
+            time.sleep(0.3)
     except Exception:
         return time.monotonic() - t0, True
+    if _was:
+        time.sleep(0.3)               # 会话刚收掉，续播点那一笔可能还差一点点才落盘
+    t1 = time.monotonic()
     # 【当场结账，不等后台那一轮】真机 10/01：等了 3.0 秒才写回 —— 那是常驻服务看见
     # 「停止播放」→ 另起一个 heal-tick（光启动就一两秒）→ 再结账。门本来就醒着，自己结一次
     # 只要几个本机 Emby 请求，不碰网盘；后台那一轮随后再来，看到已经写好了就不动
@@ -5796,7 +5815,7 @@ def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
         rescue_progress(key)
     except Exception:
         pass
-    while time.monotonic() - t0 < cap:
+    while time.monotonic() - t1 < cap:
         if str(iid) not in (ms_state().get("heal_rescue") or {}):
             return time.monotonic() - t0, True
         time.sleep(0.3)
