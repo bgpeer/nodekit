@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.308"
+SCRIPT_VERSION = "1.5.309"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19524,6 +19524,7 @@ def _add_ali_flow(d):
     mount = ask_mount(d, MOUNT_ALI)
     if not mount:
         return False
+    ali_tok_forget(mount)                 # 同一个挂载点以前留的令牌可能是别的账号的
     if _ali_how() == "scan":
         extra = _ali_tv_scan(d)
         if not extra:
@@ -19576,6 +19577,7 @@ def _ali_relogin_flow(d, mp):
         warn(f"读不到 {mp} 的存储记录。")
         return
     sid, _m, _dv, kind, _shape = row
+    ali_tok_forget(mp)                    # 重新登录可能换了账号，旧账号的令牌别再被换接口时用上
     if _ali_how() == "scan":
         if kind != "alipanTV":
             tip("扫码会把这个盘换成 TV 客户端接口")
@@ -21522,6 +21524,100 @@ def _jwt_field(tok, name):
         return ""
 
 
+# 【两条接口的令牌都留着】仓库主人：「如果再换回 TV 接口，每次都要扫码吗？」「做吧，两份令牌都留着」。
+# OpenList 一个盘只存一份刷新令牌，换接口就把另一条的覆盖掉了；换下来的那份记在这里，换回去先试它，
+# 试不通（过期 / 被别处用掉了）再扫码或贴令牌。只在本机，root-only，不上屏、不进日志。
+ALI_TOK_KEEP = BGP_DIR + "/ali-tokens.json"
+
+
+def _ali_tok_shape(tok):
+    return "" if not tok else "jwt" if (tok.count(".") == 2 and tok.startswith("ey")) else "other"
+
+
+def _ali_tok_fits(kind, tok):
+    """令牌形态配不配得上这个类型：开放平台 = JWT，TV = 不是 JWT。"""
+    return _ali_tok_shape(tok) == ("jwt" if kind == "default" else "other")
+
+
+def ali_tok_kept(mp, kind):
+    try:
+        with open(ALI_TOK_KEEP, encoding="utf-8") as f:
+            return str((json.load(f).get(mp) or {}).get(kind) or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def ali_tok_keep(mp, kind, tok):
+    """记下（tok 为空 = 删掉）这个盘这条接口的令牌。"""
+    try:
+        with open(ALI_TOK_KEEP, encoding="utf-8") as f:
+            v = json.load(f)
+        if not isinstance(v, dict):
+            v = {}
+    except (OSError, ValueError):
+        v = {}
+    if not tok and kind not in (v.get(mp) or {}):
+        return                            # 本来就没有，不去碰文件
+    e = v.setdefault(mp, {})
+    if tok:
+        e[kind] = tok
+    else:
+        e.pop(kind, None)
+    if not e:
+        v.pop(mp, None)
+    try:
+        os.makedirs(os.path.dirname(ALI_TOK_KEEP), exist_ok=True)
+        write_atomic(ALI_TOK_KEEP, json.dumps(v) + "\n", mode=0o600)
+    except OSError:
+        pass
+
+
+def ali_tok_forget(mp):
+    for k in ALIPAN_TYPES:
+        ali_tok_keep(mp, k, "")
+
+
+def _ali_addition(d, sid):
+    """这个存储现在的 addition（含令牌，只在本机用，不打印）。"""
+    db = os.path.join(d, "openlist", "config", "data.db")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        row = con.execute("select addition from x_storages where id=?", (sid,)).fetchone()
+        con.close()
+        return json.loads(row[0]) if row else {}
+    except Exception:
+        return {}
+
+
+def _ali_try_kept(d, sid, mp, cur, other, back):
+    """先试本机留着的「other」那份令牌。→ True = 换好了；False = 没有 / 不通（已原样改回）。"""
+    kept = ali_tok_kept(mp, other)
+    if not _ali_tok_fits(other, kept):
+        return False
+    print()
+    tip(f"本机留着上次「{ALIPAN_TYPES[other][0]}」的令牌，先试它，不用扫码")
+    old = _ali_addition(d, sid)
+    extra = {"alipan_type": other, "refresh_token": kept, **back}
+    if other == "alipanTV":
+        url = alitv_ensure(d)
+        extra.update(use_online_api=True, api_url_address=url or ALI_OPLIST_RENEW)
+    _write_addition(d, [(sid, mp)], extra, quiet_keys=("refresh_token",))
+    otok = _ol_token(d)
+    why = _ol_reload_storage(d, mp, otok) if otok else "登不上 OpenList"
+    if not why:
+        ok(f"{mp} 已换成「{ALIPAN_TYPES[other][0]}」")
+        ali_tok_keep(mp, other, "")       # 已经在用了，OpenList 续期会换新的，留着的作废
+        sync_alitv_service(d)
+        return True
+    # 【不通就原样改回去】别让盘停在一份死令牌上；改回的是换之前那份，盘照旧能用
+    warn(f"留着的令牌用不了了（{why[:40]}），已改回原来的设置")
+    ali_tok_keep(mp, other, "")
+    _write_addition(d, [(sid, mp)], dict({k: old.get(k) for k in extra if k in old},
+                                                 alipan_type=cur), quiet_keys=("refresh_token",))
+    sync_alitv_service(d)
+    return False
+
+
 def _alipan_channel_menu(d, mp):
     """阿里的接口通道：default（开放平台，被限速）↔ alipanTV（TV 客户端）。
 
@@ -21550,13 +21646,22 @@ def _alipan_channel_menu(d, mp):
         print(f"  · {name}{star}")
     print(f"  1. 换成「{ALIPAN_TYPES[other][0]}」")
     print("  0. 返回")
-    tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；换 TV 接口要另扫 TV 版二维码")
+    if tok_fits or _ali_tok_fits(other, ali_tok_kept(mp, other)):
+        tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；本机留着那边的令牌，换过去不用扫码")
+    else:
+        tip("两条接口原画都一样限速（没开会员约 0.7 Mbps）；换 TV 接口要另扫 TV 版二维码"
+            if other == "alipanTV" else
+            "两条接口原画都一样限速（没开会员约 0.7 Mbps）；换开放平台要另取一次令牌")
     if ask("请选择").strip() != "1":
         print("没有改动。")
         return
 
     # 【换回开放平台时续期地址也要换回去】本机那个小服务只认 TV 的令牌
     _back = {"api_url_address": ALI_OPLIST_RENEW} if other == "default" else {}
+    # 【换下来的那份先留着】下次换回来不用扫码，见 ALI_TOK_KEEP
+    _cur_tok = str(_ali_addition(d, sid).get("refresh_token") or "")
+    if _ali_tok_fits(cur, _cur_tok):
+        ali_tok_keep(mp, cur, _cur_tok)
     if tok_fits:
         print()
         print(f"  {DIM}现有的令牌就是这条路的，不用重新扫码。{RST}")
@@ -21565,6 +21670,8 @@ def _alipan_channel_menu(d, mp):
             return
         _write_addition(d, [(sid, mp)], {"alipan_type": other, **_back})
         sync_alitv_service(d)
+        return
+    if _ali_try_kept(d, sid, mp, cur, other, _back):
         return
     if other == "alipanTV":
         print()
@@ -21583,7 +21690,7 @@ def _alipan_channel_menu(d, mp):
     print(f"  取令牌：{CYAN}{BOLD}https://api.oplist.org/{RST}"
           f"（打不开换 .cn）　选「{ALIPAN_TYPES[other][2]}」　只要刷新令牌")
     tip("类型和令牌必须一起换；网站弹「获取秘钥失败」是它自己没通，过一会儿再试")
-    tok = ask("把刷新令牌粘在这里（留空取消）").strip()
+    tok = _ask_secret("把刷新令牌粘在这里（留空取消）").strip()
     if not tok:
         print("已取消，一个字都没改。")
         return
