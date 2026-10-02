@@ -19,6 +19,7 @@
 import base64
 import concurrent.futures
 import glob
+import hashlib
 import json
 import os
 import re
@@ -45,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.303"
+SCRIPT_VERSION = "1.5.304"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2329,6 +2330,11 @@ _ALI_OL_TOK = ["", 0.0]
 # 自己的 UA】去问 OpenList 要直链，302 给它。视频字节照旧手机直连 115，不过 VPS。
 # 开了本机代理的 115 不接：那种 raw_url 是 OpenList 自己的地址，原路交给 MediaWarp 就对。
 P115_TTL = 600            # 同一集、同一个 UA 的直链缓存多久（115 的链几小时才过期）
+# 【115 也照阿里的做法】仓库主人：「115 也照阿里的做法改吧」。地址带过期时刻（t=Unix 秒）就按它判，
+# 够放完这一集接着用；要新的最多等 P115_DEADLINE_S 秒，手里有旧的（先拿播放器的脸验 1 个字节）
+# 就先用；手里没有多等一会儿（P115_WAIT_S）；同一集同一个 UA 同时只要一路；存进 HLS_LAST_FILE
+P115_DEADLINE_S = 8
+P115_WAIT_S = 20
 
 
 # ── 转码流：播放列表改好再给手机，分片直连网盘（试验，默认关）──────────────────
@@ -2684,8 +2690,24 @@ def do_hls_fix():
         with open(hp, encoding="utf-8") as f:
             return strm_target_path(f.read())
 
+    p115_busy = {}
+
+    def _115_rem(u):
+        """115 直链还剩几分钟（t=Unix 秒；认不出 → 走通用的那几种）。"""
+        try:
+            t = (urllib.parse.parse_qs(urllib.parse.urlsplit(u).query).get("t") or [""])[0]
+        except ValueError:
+            t = ""
+        if t.isdigit() and len(t) >= 10:
+            return int(round((int(t) - time.time()) / 60))
+        return _url_expiry_min(u)
+
+    def _115_key(vid, ua):
+        return "115|%s|%s" % (vid, hashlib.sha1((ua or "").encode()).hexdigest()[:10])
+
     def p115_of(vid, ua):
-        """115 的盘：拿播放器自己的 UA 换一条直链（见 pan115_mounts）。不是 115 / 拿不到 → ""。"""
+        """115 的盘：拿播放器自己的 UA 换一条直链（见 pan115_mounts）。不是 115 / 拿不到 → ""。
+        缓存、封顶、旧地址兜底见 P115_DEADLINE_S。"""
         now = time.time()
         if now - m115[1] > 60:
             m115[0], m115[1] = pan115_mounts(d), now
@@ -2694,8 +2716,63 @@ def do_hls_fix():
         k = (vid, ua)
         with lock:
             hit = p115c.get(k)
-            if hit and now - hit[1] < (P115_TTL if hit[0] or hit[2] else HLS_BASE_FAIL_TTL):
+        if hit and hit[2] and now - hit[1] < P115_TTL:
+            return ""                        # 不是 115 的条目
+        if hit is None:
+            _lg = _last(_115_key(vid, ua))   # 服务重启过：上次存下的那条
+            if _lg:
+                hit = (_lg[0], _lg[1], False)
+        if hit and hit[0]:
+            rem = _115_rem(hit[0])
+            rt = _runtime_min(vid)
+            if ((rem is not None and rem >= (rt + HLS_LAST_SPARE_MIN if rt else HLS_LAST_NEED_MIN))
+                    or (rem is None and now - hit[1] < P115_TTL)):
                 return hit[0]
+        elif hit and now - hit[1] < HLS_BASE_FAIL_TTL:
+            return ""
+        with lock:
+            ev = p115_busy.get(k)
+            mine = ev is None
+            if mine:
+                ev = p115_busy[k] = threading.Event()
+        if not mine:
+            ev.wait(P115_WAIT_S + 2)
+            with lock:
+                h = p115c.get(k)
+            return h[0] if h else ""
+        try:
+            old = ""
+            if hit and hit[0]:
+                rem = _115_rem(hit[0])
+                old = hit[0] if (rem is None or rem >= HLS_LAST_DYING_MIN) else ""
+            out = {}
+            th = threading.Thread(target=_p115_fetch, args=(vid, ua, out), daemon=True)
+            th.start()
+            th.join(P115_DEADLINE_S if old else P115_WAIT_S)
+            if out.get("url"):
+                return out["url"]
+            if out.get("not115"):
+                return ""
+            if old and _alive(old, ua):
+                try:
+                    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：115　要新直链 "
+                              f"{P115_DEADLINE_S}s 没回，用了 {(time.time() - hit[1]) / 60:.0f} 分钟前那条"
+                              f"{_log_tag(vid)}"])
+                except Exception:
+                    pass
+                return old
+            if old:
+                # 旧的验不过：接着等新的，等满 P115_WAIT_S
+                th.join(max(0.0, P115_WAIT_S - P115_DEADLINE_S))
+                return out.get("url") or ""
+            return ""
+        finally:
+            with lock:
+                p115_busy.pop(k, None)
+            ev.set()
+
+    def _p115_fetch(vid, ua, out):
+        k = (vid, ua)
         url, not115 = "", False
         try:
             tp = target_of(vid)
@@ -2710,7 +2787,12 @@ def do_hls_fix():
         with lock:
             if len(p115c) > 2000:
                 p115c.clear()
-            p115c[k] = (url, time.time(), not115)
+            prev = p115c.get(k)
+            if url or not115 or not (prev and prev[0]):   # 要失败了别把手里还活着的那条冲掉
+                p115c[k] = (url, time.time(), not115)
+        if url:
+            _remember(_115_key(vid, ua), url)
+        out["url"], out["not115"] = url, not115
         return url
 
     plc, hdon = {}, [False, 0.0]
