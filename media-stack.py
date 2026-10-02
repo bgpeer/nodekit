@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.293"
+SCRIPT_VERSION = "1.5.294"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -3352,6 +3352,15 @@ def do_heal_gate():
                     if ev is None and heal_auto_on():
                         need = strm_items_need_heal(key, [iid])
                         if need:
+                            # 【开播这一刻确实没时长 → 记进抢救表并标上 nodur】真机 10/02 遮天 182：
+                            # 门补了 15 秒没补完就放行，这一场按没时长开的，停了 Emby 判「已看完」、
+                            # 续播点 0。heal-tick 那边看见门在补就不碰它，nodur 一直没标上，抢救按
+                            # 「播了不到 10 秒」悄悄放过 —— 那一下的「已看完」就是误标的
+                            try:
+                                rescue_arm(need)
+                                rescue_mark_nodur(need)
+                            except Exception:
+                                pass
                             with lock:
                                 ev = busy.get(iid)
                                 if ev is None:
@@ -5934,6 +5943,10 @@ def rescue_progress(key):
             _fp, _ft = int(_f[0]), int(_f[1])
         except (TypeError, ValueError, IndexError):
             continue
+        # 【用户也带上】点开时只记了条目 id；tick 一次都没赶上它在播的话，用户只有常驻服务
+        # 知道。没有用户就问不了 Emby，这一集会在表里一直挂着（真机 10/02 遮天 181）
+        if not e.get("uid") and len(_f) > 2 and _f[2]:
+            e["uid"] = str(_f[2])
         if _ft > int(e.get("seen") or 0) and _ft >= int(e.get("t0") or 0) and not e.get("end"):
             e["pos"], e["seen"], e["fine"] = max(0, _fp), _ft, True
     playing = {}
