@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.301"
+SCRIPT_VERSION = "1.5.302"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2372,6 +2372,11 @@ HLS_LAST_WAIT_S = 5
 HLS_LAST_SPARE_MIN = 10
 HLS_LAST_NEED_MIN = 60       # 不知道片长时，「先用」要求至少还剩这么久
 HLS_LAST_DYING_MIN = 5
+# 【拉播放列表封顶几秒（墙钟），不是 socket 超时】真机 10/02 22:08 完美世界 286：MediaWarp 18 秒给了
+# 地址，换链服务去网盘拉那份几 KB 的 m3u8 —— 拉了 89.5 秒还没拉完（网盘那个节点一点一点往外挤，
+# urllib 的 timeout 只管「一次读等多久」，挤一点就重新计时），播放器在这边干等了 108 秒。
+# 封顶之后：拉不动就换上次那条（不同节点）再试一次，还不行就交回 MediaWarp，让播放器自己去拉
+HLS_PL_DEADLINE_S = 8
 
 
 def hls_direct_on():
@@ -2746,14 +2751,24 @@ def do_hls_fix():
             pass
 
     def _pl_from(vid, loc, ua, timeout=15):
-        """真拉一次播放列表；是 #EXTM3U 就改好返回，不是 / 拉不动返回 ""。"""
-        try:
-            r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
-            with urllib.request.urlopen(r2, timeout=timeout) as r:
-                txt = r.read(2 << 20).decode("utf-8", "replace")
-                final = r.geturl() or loc
-        except Exception:
+        """真拉一次播放列表；是 #EXTM3U 就改好返回，不是 / 拉不动返回 ""。
+        总共最多 min(timeout, HLS_PL_DEADLINE_S) 秒（墙钟），见 HLS_PL_DEADLINE_S。"""
+        got = {}
+
+        def _get():
+            try:
+                r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
+                with urllib.request.urlopen(r2, timeout=timeout) as r:
+                    got["txt"] = r.read(2 << 20).decode("utf-8", "replace")
+                    got["final"] = r.geturl() or loc
+            except Exception:
+                pass
+        th = threading.Thread(target=_get, daemon=True)
+        th.start()
+        th.join(min(timeout, HLS_PL_DEADLINE_S))
+        if th.is_alive() or "txt" not in got:
             return ""
+        txt, final = got["txt"], got["final"]
         if not txt.lstrip().startswith("#EXTM3U"):
             return ""
         head = final.split("?", 1)[0]
@@ -2839,6 +2854,12 @@ def do_hls_fix():
                 body = _pl_from(vid, loc, ua)
                 if body and not _qn:
                     _remember(vid, loc)
+                elif (not body and not _qn and _lg and _lg[0] != loc and _old in ("", "-")
+                      and ".m3u8" in _lg[0].split("?", 1)[0].lower()):
+                    # 新地址那个节点拉不动：上次那条（多半是另一个节点）再试一次
+                    body = _pl_from(vid, _lg[0], ua)
+                    if body:
+                        loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
             elif (not _hls and not body and _old in ("", "-") and not _qn
                   and loc.startswith(("http://", "https://"))):
                 _remember(vid, loc)       # 整文件直链：照旧交回 MediaWarp，只是记下来备用
