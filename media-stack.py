@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.306"
+SCRIPT_VERSION = "1.5.307"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1788,6 +1788,7 @@ case "${1:-info}" in
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
   hls-direct on|off       转码流分片直连网盘（不再每段绕服务器），默认开
+  play-check      媒体库里每个盘挑一部过一遍播放：要地址几秒、哪一档、分片、速度（不碰进度）
   play-speed <片名> [--wait 秒] [--ua browser] [--at 分钟]  替你播两次（中间断开几秒），看第一次是不是比第二次慢
                   （--at 8：从第 8 分钟开始拉 —— 播到一半卡的，趁卡的时候测同一段）
   heal-trace <片名> 替你按一次播放，掐表看多久补上时长、卡在哪一节
@@ -1986,6 +1987,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" play-speed "$@" ;;
+  play-check)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" play-check "$@" ;;
   covers)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -5741,6 +5747,170 @@ def _pull_speed(url, secs=PLAY_SPEED_S, cap_mb=PLAY_SPEED_MB, ua=None, playlist=
     last = int(res["t"])
     res["per_s"] = [marks.get(i, 0) // 1024 for i in range(0, last + 1)]
     return res
+
+
+# ============================================================================ 每个盘过一遍
+# 仓库主人：「我还是希望的是每个盘都要做好对应的播放条件，不要搞得下一个盘播放的又不流畅」「做吧，每个盘都要测到」。
+# 以前都是他点了播放卡住了，我们再翻日志 —— play-check 把这一步提前：媒体库里每个盘挑一部，照播放器的
+# 路子走一遍（换链服务 → 拿地址 / 播放列表 → 分片指得回去吗 → 从网盘拉几秒），每个盘一行。
+# 【不碰进度、不触发补时长】直接打本机换链服务（不经 nginx，开播门、点播放的扳机都看不见它），不发
+# PlaybackInfo，不上报播放。每个盘最多拉 PLAY_CHECK_MB。量到的是【VPS 到网盘】这一段的速度
+PLAY_CHECK_S = 6
+PLAY_CHECK_MB = 16
+PLAY_CHECK_SAMPLE = 400       # 随机抽多少个条目来凑「每个盘一部」
+
+
+def _play_check_samples(d, key):
+    """每个盘挑一部（有时长的优先）→ {挂载点: (条目id, 名字, 网盘路径, 码率bps, 时长秒)}；外加进了 Emby 却没抽到片的盘。"""
+    mounts = sorted({str(r[1] or "") for r in _storage_rows(d) if r[1]}, key=len, reverse=True)
+    got = {}
+    try:
+        items = (_emby(f"/Items?Recursive=true&IncludeItemTypes=Movie,Episode&Fields=Path,MediaSources"
+                       f"&SortBy=Random&Limit={PLAY_CHECK_SAMPLE}", key, timeout=60).get("Items") or [])
+    except Exception:
+        items = []
+    for it in items:
+        hp = _strm_host_path(d, str(it.get("Path") or ""))
+        if not hp or not os.path.exists(hp):
+            continue
+        try:
+            with open(hp, encoding="utf-8") as f:
+                tp = strm_target_path(f.read())
+        except OSError:
+            continue
+        mp = next((m for m in mounts if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
+        if not mp:
+            continue
+        ms = (it.get("MediaSources") or [{}])[0]
+        secs = int((it.get("RunTimeTicks") or ms.get("RunTimeTicks") or 0) / 1e7)
+        br = int(ms.get("Bitrate") or 0) or (int(ms.get("Size") or 0) * 8 // secs if secs else 0)
+        name = " ".join(x for x in (it.get("SeriesName"), it.get("Name")) if x)[:30]
+        cur = got.get(mp)
+        if cur is None or (not cur[4] and secs):
+            got[mp] = (str(it.get("Id")), name, tp, br, secs)
+    return got
+
+
+def _play_check_one(d, key, iid, tp, mp):
+    """照播放器的路子走一遍。→ dict(addr 秒, kind, tier, seg, speed bps, err)"""
+    import http.client
+    out = {"addr": 0.0, "kind": "", "tier": "", "seg": "", "speed": 0.0, "err": ""}
+    self_touch(iid)
+    q = f"MediaSourceId=mediasource_{iid}&Static=true&api_key={key}"
+    loc, playlist = "", ""
+    t0 = time.monotonic()
+    try:
+        port = hls_port() if os.path.exists(HLS_UNIT) else 0
+        if port:
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=HLS_MW_BUDGET + 15)
+            c.request("GET", f"/emby/Videos/{iid}/stream?{q}", headers={"User-Agent": PLAYER_UA})
+            r = c.getresponse()
+            loc = r.getheader("Location") or ""
+            if r.status == 200 and "mpegurl" in (r.getheader("Content-Type") or "").lower():
+                playlist = r.read(2 << 20).decode("utf-8", "replace")
+            via_mw = (r.getheader("X-Accel-Redirect") or "") == "@ms_mw"
+            r.read(); c.close()
+        else:
+            via_mw = True
+        if via_mw and not loc and not playlist:
+            c = http.client.HTTPConnection("127.0.0.1", MEDIAWARP_PORT, timeout=HLS_MW_BUDGET)
+            c.request("GET", f"/Videos/{iid}/stream?{q}", headers={"User-Agent": PLAYER_UA})
+            r = c.getresponse()
+            loc = r.getheader("Location") or ""
+            if not loc:
+                out["err"] = f"MediaWarp 没给地址（HTTP {r.status}）" if r.status != 200 else ""
+                out["kind"] = "本机代理" if r.status == 200 else ""
+            c.close()                     # 本机代理回的是整部片，别读
+    except Exception as e:
+        out["err"] = f"要地址失败：{_short_err(e)}"
+    out["addr"] = time.monotonic() - t0
+    if out["err"] or out["kind"] == "本机代理" and not loc:
+        return out
+    if not loc and not playlist:
+        out["err"] = "没拿到地址"
+        return out
+    m3u8 = bool(playlist) or ".m3u8" in loc.split("?", 1)[0].lower()
+    out["kind"] = "转码" if m3u8 else "原画"
+    # 阿里转码：拿到的是哪档、阿里给了哪几档地址
+    if mp in ali_tc_mounts() and m3u8:
+        try:
+            r = _ol_api("/api/fs/other", {"path": tp, "password": "", "method": "video_preview"},
+                        _ol_token(d), timeout=30)
+            tasks = (((r.get("data") or {}).get("video_preview_play_info") or {})
+                     .get("live_transcoding_task_list") or [])
+            dirof = lambda u: (u or "").split("?")[0].rsplit("/", 1)[0]
+            cur = next((t.get("template_id") for t in tasks if t.get("url") and dirof(t["url"]) == dirof(loc)), "")
+            has = [str(t.get("template_id")) for t in tasks if t.get("url")]
+            out["tier"] = (cur or "?") + ("" if not has else f"（阿里给地址的：{'/'.join(has)}）")
+        except Exception:
+            pass
+    # 分片：相对路径的要能被换链服务指回去（1.5.306 修的那种 404）
+    if m3u8 and not playlist:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(loc, headers={"User-Agent": PLAYER_UA}),
+                                        timeout=15) as r:
+                body = r.read(2 << 20).decode("utf-8", "replace")
+            seg = next((ln.strip() for ln in body.splitlines() if ln.strip() and not ln.startswith("#")), "")
+            if seg and not seg.startswith(("http://", "https://")) and os.path.exists(HLS_UNIT):
+                c = http.client.HTTPConnection("127.0.0.1", hls_port(), timeout=20)
+                c.request("GET", f"/emby/Videos/{iid}/{seg}", headers={"User-Agent": PLAYER_UA})
+                r = c.getresponse(); r.read(); c.close()
+                out["seg"] = "分片指得回去" if r.status in (301, 302) else f"分片 {r.status}（播放器会卡住）"
+        except Exception as e:
+            out["seg"] = f"分片没验成：{_short_err(e)}"
+    sp = _pull_speed(loc, secs=PLAY_CHECK_S, cap_mb=PLAY_CHECK_MB, ua=PLAYER_UA, playlist=playlist)
+    out["speed"] = sp["bytes"] * 8 / sp["t"] if sp["t"] else 0.0
+    if sp["err"] and not sp["bytes"]:
+        out["err"] = f"拉不动：{sp['err']}"
+    return out
+
+
+def do_play_check():
+    """media-stack play-check：媒体库里每个盘挑一部，照播放器的路子过一遍，每个盘一行。见 PLAY_CHECK_S。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没安装。")
+        return
+    key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
+    if not key:
+        warn("没有 Emby API Key（「7 设置」里填），问不了 Emby。")
+        return
+    print(f"\n  {BOLD}每个盘过一遍播放{RST}")
+    samples = _play_check_samples(d, key)
+    scanned = read_yaml_all(os.path.join(d, "autofilm", "config", "config.yaml"), "source_dir") or []
+    in_emby = sorted({str(r[1]) for r in _storage_rows(d)
+                      if r[1] and any(p == str(r[1]).rstrip("/") or p.startswith(str(r[1]).rstrip("/") + "/")
+                                      for p in scanned)})
+    bad = 0
+    for mp in sorted(set(samples) | set(in_emby)):
+        if mp not in samples:
+            _trace_row("·", mp, "媒体库里没抽到这个盘的片")
+            continue
+        iid, name, tp, br, secs = samples[mp]
+        print(f"  {DIM}{mp}  {name} …{RST}", end="\r", flush=True)
+        r = _play_check_one(d, key, iid, tp, mp)
+        print("\033[K", end="")
+        if r["err"]:
+            bad += 1
+            _trace_row("✖", mp, f"{name}　要地址 {r['addr']:.1f}s　{r['err']}")
+            continue
+        if r["kind"] == "本机代理":
+            _trace_row("·", mp, f"{name}　本机代理（视频过 VPS），要地址 {r['addr']:.1f}s")
+            continue
+        need = br if r["kind"] == "原画" else 0
+        slow = (need and r["speed"] < need) or r["speed"] < 1e6
+        segbad = r["seg"].startswith("分片 ") and "指得回去" not in r["seg"]
+        mark = "✖" if segbad else "⚠" if (slow or r["addr"] > 10) else "✔"
+        bad += mark != "✔"
+        _trace_row(mark, mp, f"{name}　要地址 {r['addr']:.1f}s　{r['kind']}"
+                   + (f" {r['tier']}" if r["tier"] else "")
+                   + f"　VPS 拉 {r['speed'] / 8 / 1048576:.1f} MB/s"
+                   + (f"（这部要 {need / 8 / 1048576:.1f}）" if need else "")
+                   + (f"　{r['seg']}" if r["seg"] and r["seg"] != "分片指得回去" else ""))
+    if bad:
+        tip("⚠ / ✖ 的那几个盘，把这一屏发给仓库主人；速度量的是 VPS 到网盘，手机那段会有出入")
+    else:
+        ok("每个盘都过了")
 
 
 def do_play_speed(q, wait=5, ua="player", at_min=0.0):
@@ -25353,6 +25523,9 @@ if __name__ == "__main__":
                 except (IndexError, ValueError):
                     del _a[_i:]
             do_play_watch(" ".join(_a).strip(), minutes=_mn)
+        elif arg == "play-check":         # 每个盘挑一部过一遍播放
+            require_root()
+            do_play_check()
         elif arg == "play-speed":         # 替你播两次，看第一次是不是比第二次慢
             require_root()
             # 【等几秒要写 --wait】片名本身常带数字（完美世界 28），不能拿最后一个数猜
