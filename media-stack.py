@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.287"
+SCRIPT_VERSION = "1.5.288"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4693,7 +4693,8 @@ def strm_in_mount(d, emby_path, mp, mounts=None):
     return not any(under(m) and len(m) > len(mp) for m in (mounts or ()))
 
 
-def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False, only_paths=None):
+def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False, only_paths=None,
+                polite=None, left=None):
     """给没封面的截一帧。返回截成了几张。say 给了就把每一张的结果打出来（手动跑时）。
 
     【有人在看片就不截】截一张要去网盘拉几 MB，跟看片的人抢同一个账号的速度。
@@ -4702,7 +4703,12 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
     这个只有你点一次这个盘没有刮削的没图的全部刷新一次，不受自动的限制」。
     manual=True 时不管每小时几张、一天几张 / 几 MB、失败隔多久再试、有没有人在看；
     只留【每一张】的保险（不认跳转的源不拉、一张超过 COVER_ONE_MB 当场掐）—— 那不是
-    自动的限制，是防一张片拉掉几个 GB。手动截的流量不记进自动那本账。"""
+    自动的限制，是防一张片拉掉几个 GB。手动截的流量不记进自动那本账。
+
+    polite：截到一半有人点了播放就停（默认 = 不是手动）。生成媒体库后那条（covers-new）
+    不受张数 / 流量的限制，可照样要让路 —— 它是后台自己跑的，不是人在终端里等着。
+    left：让路时没截的那几部的 Path 放进来，调用方留着下次再截。"""
+    polite = (not manual) if polite is None else polite
     # 【自动截封面跟整队补时长同一条规矩】「点了立刻补」醒着就不去网盘拉别的片，见 heal_backlog_hold
     _why = "" if manual else heal_backlog_hold(key)
     if _why:
@@ -4763,10 +4769,12 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
     done, logs = 0, []
     manual_mb[0] = 0.0
     meter, _mlab = _heal_meter()
-    for uid, iid, name, path, secs in todo:
-        if not manual and heal_backlog_hold(key, cache_s=10):
+    for _n, (uid, iid, name, path, secs) in enumerate(todo):
+        if polite and heal_backlog_hold(key, cache_s=10):
             if say:
                 say("有人开始看片了 —— 剩下的先不截，让路。")
+            if left is not None:
+                left.extend(x[3] for x in todo[_n:])
             break
         # 【两条路，前一条截不到就换后一条】转码流的 m3u8 最省（一个分片），可截帧要把
         # 那个分片真拉下来，有的盘这一步拦；那就退回原片的 /d/。
@@ -4854,6 +4862,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
 
 
 COVER_NEW_WAIT = 1800      # 等 Emby 扫完、刮完最多等多久（秒）
+COVER_NEW_POLL = 15        # 等的时候多久看一眼（「点了立刻补」一睡，最多这么久就开截）
 COVER_NEW_GRACE = 180      # Emby 扫描停下来以后再等多久（刮削器下图要时间）
 COVER_NEW_Q = "media-stack-covers-new.json"
 
@@ -4919,21 +4928,29 @@ def do_covers_new():
     while True:
         if not _cover_new_q():
             break
-        deadline, idle = time.time() + COVER_NEW_WAIT, None
-        while time.time() < deadline:
-            if _emby_refreshing(key) or heal_backlog_hold(key):
-                idle = None
-            elif idle is None:
-                idle = time.time()
-            elif time.time() - idle >= COVER_NEW_GRACE:
+        # 【扫库停了等 COVER_NEW_GRACE；「点了立刻补」醒着就一直等，它一睡马上截】
+        # 仓库主人：「后台的那些自动补时长、截封面、预热就立刻停下，全部让给播放优先，
+        # 只有小程序完全沉睡之后这些才立刻启动」。所以让路不重新计 GRACE —— 那 180 秒
+        # 是给刮削器下图的，跟有没有人看片无关
+        deadline, quiet = time.time() + COVER_NEW_WAIT, None
+        while True:
+            if _emby_refreshing(key) and time.time() < deadline:
+                quiet = None
+            elif quiet is None:
+                quiet = time.time()
+            if (quiet is not None and time.time() - quiet >= COVER_NEW_GRACE
+                    and not heal_backlog_hold(key)):
                 break
-            time.sleep(30)
+            time.sleep(COVER_NEW_POLL)
         batch = set(_cover_new_q())
+        left = []
         try:
-            fill_covers(d, key, manual=True, only_paths=batch)
+            fill_covers(d, key, manual=True, only_paths=batch, polite=True, left=left)
         except Exception:
             pass
-        _cover_new_q(lambda cur: [p for p in cur if p not in batch])
+        # 截到一半让路了：没轮到的留在队列里，等下一次睡了接着截
+        _keep = set(left)
+        _cover_new_q(lambda cur: [p for p in cur if p not in batch or p in _keep])
     release_task_lock("covers-new")
 
 
@@ -5966,6 +5983,23 @@ def rescue_linger(key=None):
             return                    # 停了：最后记下的位置离停下的地方不到 10 秒
 
 
+def warm_owed_kick(key):
+    """有人看片时让掉的那一轮预热（warm_owed），「点了立刻补」一睡就在后台补跑。
+
+    挂在每分钟的 heal-tick 上：睡着以后最多一分钟就热上。不能挂在常驻服务退出那一下 ——
+    它一退出 systemd 就把它带起来的子进程一起收掉。"""
+    if not ms_state().get("warm_owed") or heal_backlog_hold(key):
+        return False
+    save_ms_state(warm_owed=False)   # 先摘掉：那一轮先对齐媒体库要几分钟，别每分钟再起一个
+    try:
+        subprocess.Popen([sys.executable, os.path.realpath(__file__), "warm"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+
 def do_heal_tick(hot_only=False):
     """每 HEAL_TICK_MIN 分钟一次：有人看过片才补一轮时长。安静跑。
 
@@ -5996,6 +6030,7 @@ def do_heal_tick(hot_only=False):
     # 【先盯着第一次点开的那几场播放】见 rescue_progress。放在最前面：下面好几个分支
     # 会提前返回，而这一步每一轮都得跑
     rescue_progress(key)
+    warm_owed_kick(key)
     if not heal_auto_on():
         _say("自动补时长关着（7 设置 → 10）。手动补：media-stack heal <片名>")
         return
@@ -22229,6 +22264,21 @@ def warm_links(d, key, limit=None):
     """
     if not WARM_ON:
         return 0, 0                   # 预热关了，见 WARM_ON
+    # 【有人在看片，预热让路】仓库主人：「打开播放器的时候那个小程序监控他就立刻启动，
+    # 后台的那些自动补时长、截封面、预热就立刻停下，全部让给播放优先，只有小程序完全
+    # 沉睡之后这些才立刻启动」。真机 10/01 HEYZO-0671：开播那一分钟诊断脚本看见直链预热
+    # 正在跑，同一个夸克账号两边一起拉，手机第一次 47 B/s。规矩跟整队补时长一样
+    # （heal_backlog_hold）；欠下的这一轮记 warm_owed，它一睡 heal-tick 就补跑（warm_owed_kick）。
+    # 终端里亲手敲的照跑 —— 那是人现在就要
+    _polite = not has_tty()
+    _why = heal_backlog_hold(key) if _polite else ""
+    if _why:
+        if not ms_state().get("warm_owed"):
+            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 预热让路：{_why}，等它睡了马上补热"])
+        save_ms_state(warm_owed=True)
+        return 0, 0
+    if ms_state().get("warm_owed"):
+        save_ms_state(warm_owed=False)
     try:
         users = _emby("/Users", key)
     except Exception:
@@ -22377,6 +22427,14 @@ def warm_links(d, key, limit=None):
             time.sleep(5)
         again = []
         for iid, name, pos, src in todo_q:
+            # 【热到一半有人点了播放：剩下的不热了，欠着，等它睡了再来】
+            if _polite and heal_backlog_hold(key, cache_s=10):
+                save_ms_state(warm_owed=True)
+                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 预热热到一半让路："
+                          f"有人点了播放，等它睡了马上补热"])
+                again = []
+                todo_q = []
+                break
             # 【总时长封顶】跨境慢的时候一个能耗掉半分钟。这是后台任务，跑太久没意义
             # —— 一小时后还会再来，剩下的留给那一轮
             if time.monotonic() - t_all > WARM_BUDGET:
