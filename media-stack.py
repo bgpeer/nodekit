@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.304"
+SCRIPT_VERSION = "1.5.305"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2285,6 +2285,12 @@ ALI_TC_TTL = 600          # 一部片的转码地址缓存多久（阿里给的�
 #   · 同一集同时只要一路；上次的地址存进 HLS_LAST_FILE，服务重启也接得上
 ALI_TC_DEADLINE_S = 8
 ALI_TC_WAIT_S = 25
+# 【拿到的档位比设定的低：过两分钟再问一次，有高的就换】真机 10/02 龙虎门：设的是 FHD，第一次点开时
+# 阿里只转好了 SD（FHD 是点了才开始转），拿到 SD；1.5.303 起地址按 4 小时过期时刻缓存 —— 于是之后
+# 一直播 SD（480p、109 KB/s），而那时 FHD 早就转好了。所以档位低于设定的那条，拿到超过
+# ALI_TC_UPGRADE_S 秒就再问一次（最多等 ALI_TC_UPGRADE_WAIT_S 秒，问不到照旧用手里那条）
+ALI_TC_UPGRADE_S = 120
+ALI_TC_UPGRADE_WAIT_S = 4
 ALI_DRIVERS = ("aliyundriveopen",)
 
 
@@ -2584,7 +2590,7 @@ def do_hls_fix():
 
     paths, ali = {}, {}
 
-    ali_busy = {}
+    ali_busy, ali_up = {}, {}
 
     def _ali_still_good(vid, u, got_at):
         """手里这条阿里转码地址能不能接着用：够放完这一集（认不出过期时刻就按 ALI_TC_TTL）。"""
@@ -2593,6 +2599,16 @@ def do_hls_fix():
             return time.time() - got_at < ALI_TC_TTL
         rt = _runtime_min(vid)
         return rem >= (rt + HLS_LAST_SPARE_MIN if rt else HLS_LAST_NEED_MIN)
+
+    def _ali_lower(hit):
+        """这条的档位比设定的低（或者不知道是哪档）？"""
+        tier = hit[2] if len(hit) > 2 else ""
+        pref = hit[3] if len(hit) > 3 else ""
+        if not tier or tier not in ALI_TC_LEVELS:
+            return True
+        if pref not in ALI_TC_LEVELS:
+            return False
+        return ALI_TC_LEVELS.index(tier) > ALI_TC_LEVELS.index(pref)
 
     def ali_of(vid):
         """这一集该不该走阿里转码流 → m3u8 地址（不该 / 拿不到 → ""）。见 ALI_TC_DEADLINE_S。"""
@@ -2605,9 +2621,14 @@ def do_hls_fix():
         if hit is None:
             _lg = _last(vid)              # 服务重启过：上次存下的那条
             if _lg and "x-oss-" in _lg[0] and ".m3u8" in _lg[0].split("?", 1)[0].lower():
-                hit = (_lg[0], _lg[1])
+                hit = (_lg[0], _lg[1], "", "")
+        upgrade = False
         if hit and hit[0] and _ali_still_good(vid, hit[0], hit[1]):
-            return hit[0]
+            if not (_ali_lower(hit) and now - hit[1] > ALI_TC_UPGRADE_S
+                    and now - ali_up.get(vid, 0) > ALI_TC_UPGRADE_S):
+                return hit[0]
+            upgrade = True                # 档位低：再问一次，有高的就换（见 ALI_TC_UPGRADE_S）
+            ali_up[vid] = now             # 问不到也别每次开播都问
         if hit and not hit[0] and now - hit[1] < HLS_BASE_FAIL_TTL:
             return ""
         with lock:
@@ -2625,9 +2646,11 @@ def do_hls_fix():
             out = {}
             th = threading.Thread(target=_ali_fetch, args=(vid, out), daemon=True)
             th.start()
-            th.join(ALI_TC_DEADLINE_S if old else ALI_TC_WAIT_S)
+            th.join(ALI_TC_UPGRADE_WAIT_S if upgrade else ALI_TC_DEADLINE_S if old else ALI_TC_WAIT_S)
             if out.get("url"):
                 return out["url"]
+            if upgrade:
+                return old or hit[0]      # 这次没问到高的：照旧用手里那条
             if old:
                 try:
                     heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：阿里转码　要新地址 "
@@ -2644,7 +2667,7 @@ def do_hls_fix():
 
     def _ali_fetch(vid, out):
         """真去要一次阿里转码地址，结果写进 ali / out（晚到的也照样写进缓存，下次直接用）。"""
-        url = ""
+        url, _q, _pref = "", "", ""
         tcm = ali_tc_mounts()
         try:
             ip = paths.get(vid)
@@ -2660,12 +2683,13 @@ def do_hls_fix():
                            if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
                 if mp:
                     url, _q = ali_preview_url(d, tp, tcm[mp])
+                    _pref = tcm[mp]
         except Exception:
             url = ""
         with lock:
             prev = ali.get(vid)
             if url or not (prev and prev[0]):      # 要失败了别把手里还活着的那条冲掉
-                ali[vid] = (url, time.time())
+                ali[vid] = (url, time.time(), _q, _pref)
             if url:
                 # 分片是相对路径时，被客户端拼回 Emby 的那些也要能指回去（见 base_of）
                 head = url.split("?", 1)[0]
