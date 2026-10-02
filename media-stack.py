@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.298"
+SCRIPT_VERSION = "1.5.299"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2325,6 +2325,10 @@ HLS_LAST_MAX = 300
 # 先拿播放器自己的脸拉 1 个字节验活（115 按 UA 签链、阿里原画只活 15 分钟 —— 死了的验不过就不用），
 # 活的就直接 302 过去。播放列表缓存里用这个前缀表示「这一集回 302，不回列表」
 HLS_REDIR = "\x00302 "
+# 【MediaWarp 几秒没回话就先验上次那条，不等它 30 秒失败】真机 10/02 21:08 遮天 182：MediaWarp 卡满
+# 30 秒回 404，之后拿 170 分钟前的地址兜上 —— 能播，可 0 B 干等了 31 秒。上次那条一直是活的，
+# 早几秒验它就行。MediaWarp 那一趟不掐断（掐了它那边也白干），让它接着取、取到了进它自己的缓存
+HLS_LAST_WAIT_S = 5
 
 
 def hls_direct_on():
@@ -2718,16 +2722,36 @@ def do_hls_fix():
                     f"?MediaSourceId=mediasource_{vid}&Static=true&api_key={key}",
                     headers={"User-Agent": HTTP_UA})
                 _end = _t0 + HLS_MW_BUDGET
-                while True:
-                    _tries += 1
-                    _bad = False
+
+                def _ask(out):
                     try:
                         op.open(req, timeout=max(5.0, min(HLS_MW_TRY_S, _end - time.monotonic()))).close()
+                        out["loc"], out["bad"] = "", False
                     except urllib.error.HTTPError as e:
-                        loc = e.headers.get("Location") or ""
-                        _bad = not loc and e.code >= 400
+                        out["loc"] = e.headers.get("Location") or ""
+                        out["bad"] = not out["loc"] and e.code >= 400
                     except Exception:
-                        _bad = True           # 超时 / 断开
+                        out["loc"], out["bad"] = "", True     # 超时 / 断开
+                while True:
+                    _tries += 1
+                    _out = {}
+                    if _lg and not _old:
+                        # 第一趟放后台问，HLS_LAST_WAIT_S 秒没回话就先验上次那条
+                        _th = threading.Thread(target=_ask, args=(_out,), daemon=True)
+                        _th.start()
+                        _th.join(HLS_LAST_WAIT_S)
+                        if _th.is_alive():
+                            _old = "-"
+                            body = (_pl_from(vid, _lg[0], ua, timeout=8)
+                                    if ".m3u8" in _lg[0].split("?", 1)[0].lower() else
+                                    (HLS_REDIR + _lg[0]) if _alive(_lg[0], ua) else "")
+                            if body:
+                                loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
+                                break
+                            _th.join(max(0.0, _end - time.monotonic()))
+                    else:
+                        _ask(_out)
+                    loc, _bad = _out.get("loc", ""), _out.get("bad", True)
                     # 【第一次没给地址：先拿上次那条兜底】活的就不用再等下一次（又是 30 秒）
                     if _bad and _lg and not _old:
                         _old = "-"
