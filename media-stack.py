@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.294"
+SCRIPT_VERSION = "1.5.295"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2911,8 +2911,13 @@ def rescue_watch_pos(key):
         iid = str((se.get("NowPlayingItem") or {}).get("Id") or "")
         if iid in st:
             live = True
+            old = cur.get(iid) or []
+            # 【开播那一刻这一场有没有时长】第一眼看见它在播时记下 NowPlayingItem 的时长；隔了
+            # 两分钟以上再看见 = 新的一场，重记。见 rescue_progress 里「已看完」那一段
+            _rt0 = (old[3] if len(old) > 3 and now - int(old[1] or 0) <= 120 else
+                    int((se.get("NowPlayingItem") or {}).get("RunTimeTicks") or 0))
             new[iid] = [max(0, int((se.get("PlayState") or {}).get("PositionTicks") or 0)), now,
-                        str(se.get("UserId") or "")]
+                        str(se.get("UserId") or ""), _rt0]
     if new != cur:
         save_ms_state(heal_rescue_pos=new)
     return live
@@ -5860,6 +5865,9 @@ def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
                 upos = int(ud.get("PlaybackPositionTicks") or 0)
                 if ticks and _fp >= ticks * HEAL_RESCUE_END_PCT:
                     break             # 看到结尾了：「已看完」归 Emby 自己判，走下面老路
+                if (ud.get("Played") and not e.get("nodur") and len(_fine) > 3
+                        and int(_fine[3] or 0) > 0):
+                    break             # 开播时有时长：「已看完」是播放器标的（按了下一集），不撤
                 if upos >= _fp - HEAL_RESCUE_STALE_FINE_S * 10 ** 7:
                     return time.monotonic() - t0, True        # Emby 自己记上了
                 if time.monotonic() - t1 >= cap:
@@ -5947,6 +5955,8 @@ def rescue_progress(key):
         # 知道。没有用户就问不了 Emby，这一集会在表里一直挂着（真机 10/02 遮天 181）
         if not e.get("uid") and len(_f) > 2 and _f[2]:
             e["uid"] = str(_f[2])
+        if "rt0" not in e and len(_f) > 3 and _f[3] is not None and not e.get("end"):
+            e["rt0"] = int(_f[3] or 0)
         if _ft > int(e.get("seen") or 0) and _ft >= int(e.get("t0") or 0) and not e.get("end"):
             e["pos"], e["seen"], e["fine"] = max(0, _fp), _ft, True
     playing = {}
@@ -5955,6 +5965,7 @@ def rescue_progress(key):
         if iid in st:
             playing[iid] = (se.get("UserId") or st[iid].get("uid"),
                             int((se.get("PlayState") or {}).get("PositionTicks") or 0))
+            st[iid].setdefault("rt0", int((se.get("NowPlayingItem") or {}).get("RunTimeTicks") or 0))
     for iid, e in list(st.items()):
         if iid in playing:
             # 【取最新的，不取最大的】人会往回拖；最后停在哪儿才是要续的地方
@@ -6046,6 +6057,7 @@ def rescue_progress(key):
             # 一场只补一次：补不上就照旧等满了留一句，不在这儿打转。
             if not e.get("reheal"):
                 e["reheal"] = True
+                e["nodur"] = True     # 时长在这一场里丢过：Emby 的「已看完」不可信
                 _q = dict(ms_state().get("heal_hot_queue") or {})
                 _q[str(iid)] = now
                 save_ms_state(heal_hot_queue=_q)
@@ -6062,6 +6074,13 @@ def rescue_progress(key):
             continue
         if not played and not pos:
             logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 没打勾、也没位置可写{_tail}")
+            continue
+        # 【开播时有时长 → 「已看完」是 Emby / 播放器自己判的，不撤】真机 10/02 遮天 181：播到
+        # 6 分多在 Hills 里按「下一集」，Hills 把它标成看完了。抢救只该撤「没时长开播、Emby
+        # 分母是 0 误判」的那种勾（nodur，或者这一场开播那一刻会话里的时长是 0）
+        if played and e.get("rt0") and not e.get("nodur"):
+            logs.append(f"{_ts}  ---- 进度抢救：{_saw}；{_emb} —— 开播时有时长，"
+                        f"「已看完」是播放器 / Emby 自己标的，不动{_tail}")
             continue
         try:
             _emby(f"/Users/{e.get('uid')}/Items/{iid}/UserData", key, method="POST",
