@@ -45,7 +45,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.297"
+SCRIPT_VERSION = "1.5.298"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1411,7 +1411,8 @@ def gen_nginx_site(cfg):
     # unit 文件在不在是一份可信的旧答案：它只有在真的有盘要用转码流时才会被装上。
     try:
         _w = hls_wanted(ms_install_dir())
-        hls_on = (hls_ready() if _w is None else bool(_w)) and hls_port() > 0
+        hls_on = ((True if hls_direct_on() else hls_ready() if _w is None else bool(_w))
+                  and hls_port() > 0)
     except Exception:
         hls_on = False
     try:
@@ -2320,6 +2321,10 @@ HLS_LAST_FILE = "/run/media-stack-hls-last.json"
 HLS_LAST_FIRST_S = 1800
 HLS_LAST_KEEP_S = 6 * 3600
 HLS_LAST_MAX = 300
+# 整文件直链（夸克原画、115、阿里原画、WebDAV 的 /d/ 地址）也记上次那条：MediaWarp 没给地址时，
+# 先拿播放器自己的脸拉 1 个字节验活（115 按 UA 签链、阿里原画只活 15 分钟 —— 死了的验不过就不用），
+# 活的就直接 302 过去。播放列表缓存里用这个前缀表示「这一集回 302，不回列表」
+HLS_REDIR = "\x00302 "
 
 
 def hls_direct_on():
@@ -2684,13 +2689,25 @@ def do_hls_fix():
             cache[vid] = (head[:head.rfind("/") + 1], time.time())
         return m3u8_absolutize(txt, final)
 
+    def _alive(loc, ua):
+        """整文件直链还活着没有：拿播放器的脸要 1 个字节。"""
+        try:
+            rq = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA,
+                                                      "Range": "bytes=0-0"})
+            with urllib.request.urlopen(rq, timeout=6) as r:
+                r.read(1)
+                return r.status in (200, 206)
+        except Exception:
+            return False
+
     def _playlist_fetch(vid, ua):
         body, _qn, loc, _old = "", "", "", ""
         _t0, _t1, _t2, _hls, _tries = time.monotonic(), 0.0, 0.0, False, 0
         try:
             loc, _qn = qtv_of(vid)
             _lg = None if loc else _last(vid)
-            if _lg and time.time() - _lg[1] < HLS_LAST_FIRST_S:
+            if (_lg and time.time() - _lg[1] < HLS_LAST_FIRST_S
+                    and ".m3u8" in _lg[0].split("?", 1)[0].lower()):
                 body = _pl_from(vid, _lg[0], ua, timeout=8)
                 if body:
                     loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
@@ -2714,7 +2731,9 @@ def do_hls_fix():
                     # 【第一次没给地址：先拿上次那条兜底】活的就不用再等下一次（又是 30 秒）
                     if _bad and _lg and not _old:
                         _old = "-"
-                        body = _pl_from(vid, _lg[0], ua, timeout=8)
+                        body = (_pl_from(vid, _lg[0], ua, timeout=8)
+                                if ".m3u8" in _lg[0].split("?", 1)[0].lower() else
+                                (HLS_REDIR + _lg[0]) if _alive(_lg[0], ua) else "")
                         if body:
                             loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
                             break
@@ -2729,6 +2748,9 @@ def do_hls_fix():
                 body = _pl_from(vid, loc, ua)
                 if body and not _qn:
                     _remember(vid, loc)
+            elif (not _hls and not body and _old in ("", "-") and not _qn
+                  and loc.startswith(("http://", "https://"))):
+                _remember(vid, loc)       # 整文件直链：照旧交回 MediaWarp，只是记下来备用
             _t2 = time.monotonic()
         except Exception:
             body = ""
@@ -2787,6 +2809,13 @@ def do_hls_fix():
                 # 【试验：转码流的播放列表改好再给】见 m3u8_absolutize 上面那段
                 pl = ("" if url or not direct_on()
                       else playlist_of(ms.group(1), self.headers.get("User-Agent") or ""))
+                if pl.startswith(HLS_REDIR):
+                    self.send_response(302)
+                    self.send_header("Location", pl[len(HLS_REDIR):])
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if pl:
                     data = pl.encode("utf-8")
                     self.send_response(200)
@@ -2861,6 +2890,11 @@ def sync_hls_service(d, quiet=True):
     """
     _w = hls_wanted(d)
     have = os.path.exists(HLS_UNIT)
+    # 【每个盘都要：换链重问、上次地址兜底】仓库主人：「两处都做吧」—— 以前只有盘用了转码流才装，
+    # 全是原画的机器上，MediaWarp 一时要不到地址就直接 404。播放列表直出（hls_direct）开着就装，
+    # 不管有没有盘用转码流
+    if hls_direct_on():
+        _w = _w or ["*"]
     if _w is None:
         # 【没问出来就什么都别动】装错了只是多一个进程，卸错了是当场播不了 ——
         # 两个方向的代价差着数量级，而"不动"在两个方向上都不会把事情弄坏。
@@ -2896,7 +2930,7 @@ WantedBy=multi-user.target
             sh("systemctl daemon-reload", timeout=60)
             sh(f"systemctl enable --now {os.path.basename(HLS_UNIT)}", timeout=60)
             if not quiet:
-                info("已起转码流分片重定向服务（只在有盘用转码流时存在）")
+                info("已起换链服务")
         except Exception as e:
             warn(f"装分片重定向服务失败（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
             return False
