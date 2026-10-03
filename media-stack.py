@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.326"
+SCRIPT_VERSION = "1.5.327"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2385,7 +2385,9 @@ HLS_MW_TRIES = 4           # 最多问几次（MediaWarp 回得快的失败别�
 # 以前是问一次干等满 35 秒才重问 —— 第一下卡住时轮不到第二下。并发补问不扔掉第一下：它只是慢的话照样
 # 用它的。只有「10 秒还没回」才补，平常一次就回的不多敲上游一下
 HLS_MW_HEDGE_S = 10
-HLS_MW_HEDGE_MAX = 3       # 同时最多几个在问
+# 【最多同时 2 个】真机 10/03 22:49 吞噬星空 242（新加的 4K 原画）：夸克那头整体就慢（50 多秒才给），
+# 3 个并发补问一个没赶上，倒是多敲了几下上游（流水「问了 5 次」）。卡住一下的情况补一个就够
+HLS_MW_HEDGE_MAX = 2       # 同时最多几个在问
 # 【上次拿到的播放列表地址留着】真机 10/02 17:19 遮天 181：MediaWarp 的直链缓存没了（那会儿刚更新
 # 过脚本，容器重启），现问 OpenList → 夸克接口两次都卡满 30 秒（TLS 握手超时、connection reset），
 # 问了 2 次照样 404。而 44 分钟前拿到的那条 m3u8 地址带着签名、还活着。转码流的分片地址都在
@@ -3886,6 +3888,49 @@ def play_clicks_in(txt):
     return out
 
 
+GATE_NEXT_S = 5             # 「停止播放」之后这么多秒内问别的一集的 PlaybackInfo = 播放器里点了下一集
+NEXT_PREFETCH_DELAY_S = 30  # 开播后过这么久再去取下一集的地址（别跟这一集抢开头那几秒）
+NEXT_PREFETCH_T = 60
+_NEXT_DONE = {}
+
+
+def prefetch_next_episode(key, iid, ua=""):
+    """开始看第 N 集 → 过一会儿在后台把第 N+1 集的地址先取好（经换链服务，进 MediaWarp 的缓存）。
+
+    【为什么】真机 10/03 22:49 吞噬星空 242（新加的 4K 原画）：在播放器里点下一集，夸克 50 多秒才给出地址，
+    播放器等到 41 秒放弃、再要一次才播出来。这种慢是夸克那头的，开播那一刻怎么问都快不了；但第 N 集要
+    看二十来分钟，这段时间里把下一集的地址先要好，缓存能活 LINK_TTL_H 小时，点下一集直接命中。
+    代价：一次换地址的请求，不拉视频字节；同一集半小时内只取一次。不是剧集（电影）不取。"""
+    try:
+        time.sleep(NEXT_PREFETCH_DELAY_S)
+        it = (_emby(f"/Items?Ids={iid}&Fields=SeriesId", key, timeout=15).get("Items") or [{}])[0]
+        sid = it.get("SeriesId")
+        if it.get("Type") != "Episode" or not sid:
+            return ""
+        users = _emby("/Users", key, timeout=15) or []
+        uid = (users[0] or {}).get("Id", "") if users else ""
+        eps = (_emby(f"/Shows/{sid}/Episodes?StartItemId={iid}&Limit=2&Fields=Path"
+                     + (f"&UserId={uid}" if uid else ""), key, timeout=15).get("Items") or [])
+        nxt = eps[1] if len(eps) > 1 and str(eps[0].get("Id")) == str(iid) else None
+        if not nxt or not str(nxt.get("Path") or "").endswith(".strm"):
+            return ""
+        nid = str(nxt.get("Id"))
+        now = time.time()
+        if now - _NEXT_DONE.get(nid, 0) < 1800:
+            return ""
+        _NEXT_DONE[nid] = now
+        self_touch(nid)                   # 脚本自己的请求，别被当成有人点了播放
+        t0 = time.monotonic()
+        r = gate_prefetch_stream(nid, ua, timeout=NEXT_PREFETCH_T, probe=True)
+        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 下一集先取好地址："
+                  f"{str(nxt.get('Name') or nid)[:30]}　{time.monotonic() - t0:.1f}s"
+                  f"（{ {'playlist': '转码列表', 'redirect': '直链', 'timeout': '还在取'}.get(r, '交给 MediaWarp 缓存') }）"
+                  + _log_tag(nid)])
+        return r or "mw"
+    except Exception:
+        return ""
+
+
 def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S, probe=False):
     """门那一下替播放器先要一次 /stream（打给本机换链服务）→ "playlist" / "redirect" / ""。
 
@@ -3948,6 +3993,7 @@ def do_heal_gate():
     key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     busy, lock = {}, threading.Lock()
     last = [time.monotonic()]
+    stop_at = [0.0]                    # 上一次「停止播放」进门的时刻，见 GATE_NEXT_S
     pbi_seen = {}                      # 同一部第二次问 PlaybackInfo = 按下播放，见 pbi_is_play
     _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
@@ -3983,6 +4029,7 @@ def do_heal_gate():
             last[0] = time.monotonic()
             if self.path.startswith("/stopping"):
                 # 【「停止播放」进门】放旗子、马上放行；等 Emby 收掉这一场再拿旗子 —— 另起线程
+                stop_at[0] = time.monotonic()
                 if key:
                     threading.Thread(target=stopping_begin,
                                      args=(key, self.headers.get("X-Original-URI") or "")).start()
@@ -4016,6 +4063,11 @@ def do_heal_gate():
                 # 【只是点开详情页就直接放行】不验直链、不探测 —— 见 PLAY_CLICK_RE / pbi_is_play
                 with lock:
                     _play = bool(m) and pbi_is_play(m.group(1), _uri, pbi_seen)
+                    # 【播放器里点「下一集」也是按下播放】它问下一集的 PlaybackInfo 不带 StartTimeTicks，
+                    # 以前门不当它是开播：不预取、不先补时长（真机 10/03 22:49 吞噬星空 242：上一集 22:49:02
+                    # 停、22:49:03 就问 242，门一个字没动）。刚「停止播放」几秒内又问别的一集 = 接着播
+                    if m and not _play and time.monotonic() - stop_at[0] < GATE_NEXT_S:
+                        _play = True
                 if m and key and _play:
                     iid = m.group(1)
                     t_in = time.monotonic()
@@ -4096,6 +4148,10 @@ def do_heal_gate():
                           + "、".join(_parts) + f"　门里共 {_all:.1f}s{_log_tag(_tm['iid'])}"])
                 play_ledger({"ev": "gate", "iid": _tm["iid"], "name": _nm, "s": round(_all, 1),
                              "heal": bool(_tm.get("heal"))})
+                # 【顺手把下一集的地址先取好】见 prefetch_next_episode
+                if key:
+                    threading.Thread(target=prefetch_next_episode, daemon=True,
+                                     args=(key, _tm["iid"], self.headers.get("User-Agent") or "")).start()
 
         do_GET = do_POST = do_HEAD = _go
 
