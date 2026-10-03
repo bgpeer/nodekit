@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.319"
+SCRIPT_VERSION = "1.5.320"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19214,11 +19214,14 @@ def _qr115_show(uid, at=0):
         age = (f"{m:.0f} 分钟前" if m < 60 else
                f"{m / 60:.0f} 小时前" if m < 1440 else f"{m / 1440:.0f} 天前")
         age = f"   {DIM}（{age}生成）{RST}"
+    if _QR115_AUTOMOUNT[0]:
+        # 脚本自己去 OpenList 挂 / 换，不用教人手填，令牌也不用摊开（只给扫不了时的图片地址）
+        print(f"  {BOLD}二维码{RST}     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
+        print()
+        return
     print(f"  {BOLD}当前令牌{RST}   {GREEN}{BOLD}{uid}{RST}{age}")
     print(f"  {BOLD}二维码{RST}     {CYAN}{QR115_IMAGE.format(uid)}{RST}")
     print()
-    if _QR115_AUTOMOUNT[0]:
-        return                        # 脚本自己去 OpenList 挂，不用教人手填
     print(f"  OpenList → 管理 → 存储 → 添加 → 驱动「115 网盘」：")
     print(f"     Cookie 留空 · 二维码令牌 {GREEN}上面那串{RST} · 二维码源 {GREEN}{BOLD}网页{RST}"
           f" · 根文件夹ID {GREEN}{BOLD}0{RST} · 挂载路径 {GREEN}{BOLD}/115{RST}")
@@ -19382,6 +19385,45 @@ def norm_mount(raw, default):
     if p == "/" or re.search(r"[\s?#\\]", p) or "//" in p:
         return None
     return p
+
+
+def _115_relogin_flow(d, mp):
+    """挂好的 115 盘：扫码登录（换号也用它）/ 退出登录。
+
+    仓库主人：「115 进去怎么是这样的呢……这个应该是旧的吧……显示在这里没用」。以前挂好的盘点
+    「网盘扫码登录」进的是「只拿令牌」那一屏（qr115_login）：摊开 7 天前那串一次性令牌（115 早拿它
+    换成 cookie 了，这串没用了）、教人去 OpenList 手填，「制作二维码」也不会动这个盘。现在跟阿里、
+    夸克一样：扫完由脚本把新令牌写进这个盘、清掉旧 cookie，OpenList 重启时拿它换新 cookie，当场验一遍。"""
+    print()
+    print("  1. 扫码登录")
+    print("  2. 退出登录")
+    print("  0. 返回")
+    tip("换号直接扫另一个号")
+    c = ask("请选择（回车 = 返回）").strip()
+    if c == "2":
+        drive_logout(d, mp)
+        return
+    if c != "1":
+        return
+    sid = _ol_storage_id(d, mp)
+    if sid is None:
+        warn(f"读不到 {mp} 的存储记录。")
+        return
+    _QR115_AUTOMOUNT[0] = True
+    try:
+        uid, state = _qr115_new()
+    finally:
+        _QR115_AUTOMOUNT[0] = False
+    if state != 2:
+        return
+    _write_addition(d, [(sid, mp)], {"cookie": "", "qrcode_token": uid},
+                    quiet_keys=("cookie", "qrcode_token"))
+    otok = _ol_token(d)
+    why = _ol_reload_storage(d, mp, otok) if otok else "登不上 OpenList"
+    if why:
+        warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
+    else:
+        ok(f"115 已重新登录：{mp}")
 
 
 def _add115_flow(d):
@@ -22806,7 +22848,7 @@ def _drive_menu(d, mp, drv, mounted=True):
             add("网盘扫码登录", "当前：" + (f"{YELLOW}未登录（扫码登录）{RST}" if not _haslog
                                           else f"{CYAN}已登录{RST}" if _st == "work"
                                           else f"{YELLOW}掉线了（重新扫码）{RST}"),
-                lambda: qr115_login(d, mp), False)
+                lambda: _115_relogin_flow(d, mp), False)
         elif isdav:
             # 【添加 WebDAV 也是挂盘】跟扫码挂上同一类，排第 1（仓库主人：「这个也是挂网盘的吧」）
             add("＋ 添加 WebDAV", "", lambda: _add_webdav_flow(d), False)
