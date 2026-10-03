@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.312"
+SCRIPT_VERSION = "1.5.313"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -21898,7 +21898,20 @@ def _ali_addition(d, sid):
 # 扫码登录里面做一个按钮退出登录」。换号直接扫另一个号就行（新令牌顶掉旧的）；退出登录 = 把这个盘在
 # OpenList 里的登录凭据清空 —— 盘本身留着（挂载点、扫描路径、strm 都不动），重新扫码就回来。
 # 会让整个盘打不开，所以照第四节：醒目一行说后果、默认「否」。
-DRIVE_CRED_KEYS = ("refresh_token", "access_token", "query_token", "cookie", "qrcode_token")
+# 【AccessToken 也要清】阿里驱动（OpenList drivers/aliyundrive_open）把访问令牌存在 addition 的
+# "AccessToken"（没 json 标签，大写），Init 直接拿它去问网盘、过期才用刷新令牌换。1.5.312 只清了
+# refresh_token：真机 10/03 退出后 OpenList 一重启照样连上，菜单还写「已登录 · TV 接口」，
+# 要等访问令牌过期（约 2 小时）才掉线
+DRIVE_CRED_KEYS = ("refresh_token", "access_token", "AccessToken", "query_token", "cookie", "qrcode_token")
+
+
+def drive_has_login(d, mp):
+    """这个盘在 OpenList 里还有没有登录凭据。读不到 → True（不乱说没登录）。"""
+    sid = _ol_storage_id(d, mp)
+    if sid is None:
+        return True
+    add = _ali_addition(d, sid)
+    return not add or any(add.get(k) for k in DRIVE_CRED_KEYS)
 
 
 def drive_logout(d, mp):
@@ -21918,6 +21931,11 @@ def drive_logout(d, mp):
         print("没有改动。")
         return False
     _write_addition(d, [(sid, mp)], {k: "" for k in keys}, quiet_keys=tuple(keys))
+    # 【当场验一遍】重新加载这个盘：还连得上就说明还有哪份凭据没清到，不能报「已退出」
+    otok = _ol_token(d)
+    if otok and not _ol_reload_storage(d, mp, otok):
+        warn(f"{mp} 清完还连得上网盘，没退干净 —— 把这一屏发过来")
+        return False
     ali_tok_forget(mp)                    # 本机留着的两份也删掉，不然换接口时又登回去了
     if "cookie" in keys or "qrcode_token" in keys:
         # 115：本机那份扫码记录（只拿令牌那一屏摊开的）也一起作废
@@ -22600,7 +22618,9 @@ def _drive_menu(d, mp, drv, mounted=True):
         isali = mounted and isali_drv
         isqtv = mounted and drv == DRIVER_QTV
         _olst = ol_storage_status(d, mp) if (isali or isqtv) else ""
-        _ols = (f"{CYAN}已登录{RST}" if _olst == "work" else f"{YELLOW}掉线了（重新登录）{RST}")
+        _haslog = drive_has_login(d, mp) if (isali or isqtv or (has115 and mounted)) else True
+        _ols = (f"{YELLOW}未登录（扫码登录）{RST}" if not _haslog
+                else f"{CYAN}已登录{RST}" if _olst == "work" else f"{YELLOW}掉线了（重新登录）{RST}")
 
         # 表里每一项：(名字, 当前值那一列, 点了做什么, 要不要先挂上)
         items = []
@@ -22625,13 +22645,14 @@ def _drive_menu(d, mp, drv, mounted=True):
             _at = next((t for _s, m0, _dv, t, _sh in _ali_storages(d) if m0 == mp), "")
             add("网盘扫码登录", f"当前：{_ols}"
                 + (f"{CYAN} · {'TV 接口' if _at == 'alipanTV' else '开放平台接口'}{RST}"
-                   if _olst == "work" and _at else ""),
+                   if _olst == "work" and _at and _haslog else ""),
                 lambda: _ali_relogin_flow(d, mp), False)
         elif has115 and mounted:
             # 【登没登看 OpenList 里这个盘在不在工作】115 的登录凭据在 OpenList 那边；
             # 盘状态不是 work（cookie 失效、令牌过期）就是掉线了，要重新扫
             _st = ol_storage_status(d, mp)
-            add("网盘扫码登录", "当前：" + (f"{CYAN}已登录{RST}" if _st == "work"
+            add("网盘扫码登录", "当前：" + (f"{YELLOW}未登录（扫码登录）{RST}" if not _haslog
+                                          else f"{CYAN}已登录{RST}" if _st == "work"
                                           else f"{YELLOW}掉线了（重新扫码）{RST}"),
                 lambda: qr115_login(d, mp), False)
         elif isdav:
