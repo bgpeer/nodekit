@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.325"
+SCRIPT_VERSION = "1.5.326"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2379,6 +2379,13 @@ HLS_MW_BUDGET = 50
 HLS_MW_TRY_S = 35          # 单次最多等（MediaWarp 自己 30 秒回 502）
 HLS_MW_GAP = 2
 HLS_MW_TRIES = 4           # 最多问几次（MediaWarp 回得快的失败别连着敲上游几十次）
+# 【问出去 10 秒没回：不掐它，再并发问一次，谁先回用谁】真机 10/03 22:26 FC2-4665097（夸克原画）：
+# 隔了好久点的第一部，MediaWarp 一次 35 秒没给地址，再问又被预算截断，50 秒白等；播放器 40 秒左右就
+# 自己放弃（nginx 499）、退出。紧接着点的几部同一步只要 0.7~2 秒；16:27 那次也是第一下卡住、重问一下就回。
+# 以前是问一次干等满 35 秒才重问 —— 第一下卡住时轮不到第二下。并发补问不扔掉第一下：它只是慢的话照样
+# 用它的。只有「10 秒还没回」才补，平常一次就回的不多敲上游一下
+HLS_MW_HEDGE_S = 10
+HLS_MW_HEDGE_MAX = 3       # 同时最多几个在问
 # 【上次拿到的播放列表地址留着】真机 10/02 17:19 遮天 181：MediaWarp 的直链缓存没了（那会儿刚更新
 # 过脚本，容器重启），现问 OpenList → 夸克接口两次都卡满 30 秒（TLS 握手超时、connection reset），
 # 问了 2 次照样 404。而 44 分钟前拿到的那条 m3u8 地址带着签名、还活着。转码流的分片地址都在
@@ -3114,11 +3121,40 @@ def do_hls_fix():
                         out["bad"] = not out["loc"] and e.code >= 400
                     except Exception:
                         out["loc"], out["bad"] = "", True     # 超时 / 断开
+                def _hedged(first=None):
+                    """问 MediaWarp：一个问出去 HLS_MW_HEDGE_S 秒没回就再并发补一个（最多 HLS_MW_HEDGE_MAX 个），
+                    谁先回来用谁。给地址的 / 确定答案（200）直接用；全都失败才算这一趟失败。"""
+                    nonlocal _tries
+                    runs = [first] if first else []
+                    last_go = time.monotonic() if first else 0.0
+                    while True:
+                        now = time.monotonic()
+                        if (len(runs) < HLS_MW_HEDGE_MAX and now + 5 < _end
+                                and (not runs or now - last_go >= HLS_MW_HEDGE_S)):
+                            o = {}
+                            th = threading.Thread(target=_ask, args=(o,), daemon=True)
+                            th.start()
+                            runs.append((th, o))
+                            last_go = now
+                            if first is None or len(runs) > 1:
+                                _tries += 1
+                        done_ = [o for th, o in runs if not th.is_alive()]
+                        good = next((o for o in done_ if o.get("loc") or not o.get("bad", True)), None)
+                        if good is not None:
+                            return good
+                        if len(done_) == len(runs) and (len(runs) >= HLS_MW_HEDGE_MAX or
+                                                       time.monotonic() + 5 >= _end or
+                                                       time.monotonic() - last_go < HLS_MW_HEDGE_S):
+                            return done_[-1] if done_ else {}
+                        if time.monotonic() >= _end:
+                            return {}
+                        time.sleep(0.2)
+
                 while True:
-                    _tries += 1
                     _out = {}
                     if _lg and not _old:
                         # 第一趟放后台问，HLS_LAST_WAIT_S 秒没回话就先验上次那条
+                        _tries += 1
                         _th = threading.Thread(target=_ask, args=(_out,), daemon=True)
                         _th.start()
                         _th.join(HLS_LAST_WAIT_S)
@@ -3130,9 +3166,9 @@ def do_hls_fix():
                             if body:
                                 loc, _old = _lg[0], f"{(time.time() - _lg[1]) / 60:.0f} 分钟前"
                                 break
-                            _th.join(max(0.0, _end - time.monotonic()))
+                            _out = _hedged(first=(_th, _out))
                     else:
-                        _ask(_out)
+                        _out = _hedged()
                     loc, _bad = _out.get("loc", ""), _out.get("bad", True)
                     # 【第一次没给地址：先拿上次那条兜底】活的就不用再等下一次（又是 30 秒）
                     if _bad and _lg and not _old:
