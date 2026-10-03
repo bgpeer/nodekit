@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.323"
+SCRIPT_VERSION = "1.5.324"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2441,6 +2441,29 @@ def pan115_mounts(d, rows=None):
             if mp and "115" in str(drv or "") and not _truthy((cols or {}).get("web_proxy"))]
 
 
+def short_link_mounts(d, rows=None):
+    """直链短命、又没开转码流的盘（阿里原画）的挂载点 —— 换链服务替它现换，不经 MediaWarp 的缓存。
+
+    【一个盘的直链短，别拖累别的盘】MediaWarp 的直链缓存只有一个全局时长（alist_api_ttl），以前只能
+    按最短那家定：阿里原画直链 15 分钟，进了 Emby 就把夸克的缓存从 2 小时压到 9 分钟，夸克每次开播
+    都要现换。换链服务认得出这一集在哪个盘（kind_of），这种盘由它按地址自己写的过期时刻缓存，
+    link_ttl_of 就不用再迁就它（装了换链服务的前提下）。"""
+    try:
+        rows = _storage_rows(d) if rows is None else rows
+    except Exception:
+        return []
+    tcm = ali_tc_mounts()
+    return [mp for _s, mp, drv, _a, cols in rows
+            if mp and LINK_LIFE_MIN.get(str(drv or "").lower()) and mp not in tcm
+            and not _truthy((cols or {}).get("web_proxy"))]
+
+
+def link_bypass_on(iid):
+    """开播前验出这一集缓存里的直链死了（见 link_stale_fix）→ 换链服务替它现换，别再拿缓存里那条。"""
+    t = (ms_state().get("link_bypass") or {}).get(str(iid))
+    return isinstance(t, (int, float)) and time.time() - t < LINK_TTL_H * 3600
+
+
 def ol_tok_cached(d, fresh=False):
     """OpenList 登录令牌，缓存一小时（阿里转码流和 115 换链共用）。"""
     if fresh or not _ALI_OL_TOK[0] or time.time() - _ALI_OL_TOK[1] > 3600:
@@ -2740,7 +2763,7 @@ def do_hls_fix():
         out["url"], out["tier"] = url, _q
         return url
 
-    p115c, m115 = {}, [[], 0.0]
+    p115c, m115, mraw = {}, [[], 0.0], [[]]
 
     def target_of(vid):
         """条目 id → strm 里写的网盘路径（/115/xx/片.mp4）。拿不到 → ""。"""
@@ -2763,11 +2786,13 @@ def do_hls_fix():
         now = time.time()
         if not m115[1]:
             m115[0], m115[1] = pan115_mounts(d), now
+            mraw[0] = short_link_mounts(d)
         elif now - m115[1] > HLS_KIND_TTL and not m115_busy[0]:
             m115_busy[0] = True
 
             def _bg():
                 try:
+                    mraw[0] = short_link_mounts(d)
                     m115[0], m115[1] = pan115_mounts(d), time.time()
                 finally:
                     m115_busy[0] = False
@@ -2789,19 +2814,29 @@ def do_hls_fix():
         now = time.time()
         h = kinds.get(vid)
         if h and now - h[1] < HLS_KIND_TTL:
-            return h[0]
-        try:
-            tp = target_of(vid)
-        except Exception:
-            tp = ""
-        if not tp:
-            return ""
-        k = ""
-        if _under(tp, ali_tc_mounts() or {}):
-            k = "ali"
-        elif _under(tp, m115_now()):
-            k = "115"
-        kinds[vid] = (k, now)
+            k = h[0]
+        else:
+            try:
+                tp = target_of(vid)
+            except Exception:
+                tp = ""
+            if not tp:
+                return ""
+            k = ""
+            if _under(tp, ali_tc_mounts() or {}):
+                k = "ali"
+            elif _under(tp, m115_now()):
+                k = "115"
+            elif _under(tp, mraw[0]):
+                k = "raw"
+            kinds[vid] = (k, now)
+        # 【缓存里那条死了的】开播前验出来的（link_stale_fix）：替它现换，不再为它重启 MediaWarp
+        if not k:
+            try:
+                if link_bypass_on(vid):
+                    return "raw"
+            except Exception:
+                pass
         return k
 
     p115_busy = {}
@@ -2819,16 +2854,17 @@ def do_hls_fix():
     def _115_key(vid, ua):
         return "115|%s|%s" % (vid, hashlib.sha1((ua or "").encode()).hexdigest()[:10])
 
-    def p115_of(vid, ua):
+    def p115_of(vid, ua, force=False):
         """115 的盘：拿播放器自己的 UA 换一条直链（见 pan115_mounts）。不是 115 / 拿不到 → ""。
-        缓存、封顶、旧地址兜底见 P115_DEADLINE_S。"""
+        缓存、封顶、旧地址兜底见 P115_DEADLINE_S。
+        force：认盘那边已经认定要本机现换（阿里原画、缓存里那条死了的，见 kind_of），不再查是不是 115。"""
         now = time.time()
-        if not m115_now() or not key:
+        if (not force and not m115_now()) or not key:
             return ""
         k = (vid, ua)
         with lock:
             hit = p115c.get(k)
-        if hit and hit[2] and now - hit[1] < P115_TTL:
+        if not force and hit and hit[2] and now - hit[1] < P115_TTL:
             return ""                        # 不是 115 的条目
         if hit is None:
             _lg = _last(_115_key(vid, ua))   # 服务重启过：上次存下的那条
@@ -2858,7 +2894,7 @@ def do_hls_fix():
                 rem = _115_rem(hit[0])
                 old = hit[0] if (rem is None or rem >= HLS_LAST_DYING_MIN) else ""
             out = {}
-            th = threading.Thread(target=_p115_fetch, args=(vid, ua, out), daemon=True)
+            th = threading.Thread(target=_p115_fetch, args=(vid, ua, out, force), daemon=True)
             th.start()
             th.join(P115_DEADLINE_S if old else P115_WAIT_S)
             if out.get("url"):
@@ -2872,7 +2908,7 @@ def do_hls_fix():
                               f"{_log_tag(vid)}"])
                 except Exception:
                     pass
-                _note("115 旧直链兜底")
+                _note("旧直链兜底" if force else "115 旧直链兜底")
                 return old
             if old:
                 # 旧的验不过：接着等新的，等满 P115_WAIT_S
@@ -2884,14 +2920,14 @@ def do_hls_fix():
                 p115_busy.pop(k, None)
             ev.set()
 
-    def _p115_fetch(vid, ua, out):
+    def _p115_fetch(vid, ua, out, force=False):
         k = (vid, ua)
         url, not115 = "", False
         try:
             tp = target_of(vid)
             mp = next((m for m in sorted(m115[0], key=len, reverse=True)
                        if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
-            if mp:
+            if mp or (force and tp):
                 url = pan115_url(d, tp, ua)
             else:
                 not115 = True           # 不是 115 的条目：这个答案不会变，按长的缓存
@@ -3201,11 +3237,16 @@ def do_hls_fix():
                 elif _kd == "115":
                     url = p115_of(_vid, self.headers.get("User-Agent") or "")
                     _via = "115" if url else ""
+                elif _kd == "raw":
+                    # 阿里原画 / 缓存里那条死了的：跟 115 同一套（按过期时刻缓存、旧的兜底），
+                    # 不经 MediaWarp 的全局缓存
+                    url = p115_of(_vid, self.headers.get("User-Agent") or "", force=True)
+                    _via = "原画（本机现换）" if url else ""
                 _tc = time.monotonic()
                 if _tc - _ta > 1.5:
                     try:
                         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务"
-                                  f"拿列表之前　认盘 {_tb - _ta:.1f}s（{ {'ali': '阿里转码', '115': '115'}.get(_kd, '其余') }）"
+                                  f"拿列表之前　认盘 {_tb - _ta:.1f}s（{ {'ali': '阿里转码', '115': '115', 'raw': '原画现换'}.get(_kd, '其余') }）"
                                   + (f"、换链 {_tc - _tb:.1f}s" if _kd else "")
                                   + f"{_log_tag(_vid)}"])
                     except Exception:
@@ -11173,6 +11214,14 @@ def openlist_storages(d):
     return out
 
 
+def _hls_takes_short():
+    """换链服务装着 → 直链短命的盘（阿里原画）由它现换（见 short_link_mounts），不压 MediaWarp 的缓存。"""
+    try:
+        return bool(hls_port()) and os.path.exists(HLS_UNIT)
+    except Exception:
+        return False
+
+
 def link_ttl_of(d):
     """MediaWarp 该把直链缓存多久。返回 ("10m", 10) 这样的 (写进配置的值, 分钟)。
 
@@ -11201,6 +11250,8 @@ def link_ttl_of(d):
             # 只有「这一部阿里还没转完」才退回原画直链 —— 那种少数情况由开播前验直链
             # （link_stale_fix）兜着。不然它一个盘把夸克的缓存从 2 小时压到 9 分钟。
             continue
+        if _hls_takes_short():
+            continue                  # 换链服务替它现换（short_link_mounts），不经这份缓存
         mins = min(mins, int(life * LINK_TTL_SAFE))
     if mins >= 60 and mins % 60 == 0:
         return f"{mins // 60}h", mins
@@ -11220,7 +11271,7 @@ def ttl_squeezed_by(d):
     tcm = ali_tc_mounts()
     for mp, drv, _st, _root, _mode in openlist_storages(d):
         life = LINK_LIFE_MIN.get(str(drv).lower())
-        if not life or not mp or mp in tcm:      # 开了阿里转码流的不算，见 link_ttl_of
+        if not life or not mp or mp in tcm or _hls_takes_short():   # 见 link_ttl_of
             continue
         root = mp.rstrip("/")
         if not any(p == root or p.startswith(root + "/") for p in scanned):
@@ -15555,12 +15606,45 @@ def file_layout_says(info):
 
 
 def heal_pace():
-    """这一批探几个。撞过限流就是砍过半的那个数，一直顺就是上限。"""
+    """这一批探几个。撞过限流就是砍过半的那个数，一直顺就是上限。
+    按盘记了以后（heal_pace_by）取各盘里最大的那个 —— 总名额按没被限的盘算，被限的盘自己再夹（heal_pace_of）。"""
+    st = ms_state()
     try:
-        v = int(ms_state().get("heal_pace") or HEAL_LIMIT_MAX)
+        by = [int(v) for v in (st.get("heal_pace_by") or {}).values()]
+        v = max(by) if by else int(st.get("heal_pace") or HEAL_LIMIT_MAX)
     except (TypeError, ValueError):
         v = HEAL_LIMIT_MAX
     return max(HEAL_PACE_MIN, min(HEAL_LIMIT_MAX, v))
+
+
+# 【限流按盘算】仓库主人：「其他地方还有没有这种盘和盘互相依赖的，都查一遍」。以前补时长一轮里只要
+# 撞满限流（不管是哪个盘撞的）就整轮收工、下一批全局砍半、退回单线程 —— 夸克被限流，阿里、115 排在
+# 后面的一个都补不上，下一轮也一起慢。现在：撞满的那个盘这一轮停下，别的盘接着补；下一批的配额也按盘记，
+# 撞过的盘砍半，没撞的照常往上加。
+def heal_pace_of(mp):
+    by = ms_state().get("heal_pace_by") or {}
+    try:
+        v = int(by.get(mp) or heal_pace())
+    except (TypeError, ValueError):
+        v = HEAL_LIMIT_MAX
+    return max(HEAL_PACE_MIN, min(HEAL_LIMIT_MAX, v))
+
+
+def set_heal_pace_by(throttled, seen):
+    """这一轮见过的盘：撞满限流的砍半，没撞的加一档。返回 {盘: 新配额}。"""
+    by = dict(ms_state().get("heal_pace_by") or {})
+    out = {}
+    for mp in seen:
+        cur = heal_pace_of(mp)
+        new = (max(HEAL_PACE_MIN, cur // 2) if mp in throttled
+               else min(HEAL_LIMIT_MAX, cur + HEAL_PACE_STEP))
+        by[mp] = out[mp] = new
+    save_ms_state(heal_pace_by=by)
+    return out
+
+
+def _heal_mp(it):
+    return str(it[4]) if len(it) > 4 and it[4] else ""
 
 
 def set_heal_pace(throttled):
@@ -16099,7 +16183,14 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
             save_ms_state(heal_cursor=(cur + need) % len(rest))
         elif fresh:
             head = fresh[:take]              # 全是新片，那就全探新片
-        pend = head
+        # 【每个盘按自己的配额】撞过限流的盘这一批少探，别的盘不陪着少
+        _cnt = {}
+        pend = []
+        for x in head:
+            _m = _heal_mp(x)
+            if _cnt.get(_m, 0) < heal_pace_of(_m):
+                _cnt[_m] = _cnt.get(_m, 0) + 1
+                pend.append(x)
     print()
     if len(allpend) > len(pend):
         info(f"给 {len(pend)} 个条目补媒体信息（时长、编码）"
@@ -16140,6 +16231,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     _rx0 = _meter()
     budget = HEAL_BUDGET if budget is None else budget
     _over = False                        # 轮内刹车踩没踩
+    _thr = set()                         # 这一轮撞满限流的盘
     for rnd in range(1, HEAL_ROUNDS + 1):
         if not todo_items or time.monotonic() - t_all > budget:
             break
@@ -16150,17 +16242,17 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
         again = []
         _d, _t, _over = _heal_round(d, key, todo_items, base, token, again,
                                     t_all, budget, _meter, _rx0,
-                                    None if _nolimit else _left)
+                                    None if _nolimit else _left, throttled=_thr)
         done += _d
         hit += _t
-        todo_items = again
         if _over:
             break                        # 额度用完了，重试轮更不该跑
-        if _t >= HEAL_429_STOP:
-            # 【撞满了就别再打第二轮】第二轮是给"这一下没探到"准备的，而被限量
-            # 时整轮都探不到 —— 再打一轮只是把上游按得更久。
-            print(f"  {YELLOW}上游在限量（这一轮撞了 {_t} 次），本轮到此为止{RST}")
-            break
+        # 【撞满了的那个盘别再打第二轮】第二轮是给"这一下没探到"准备的，而被限量时整轮都探不到
+        # —— 再打只是把那家按得更久。别的盘没撞，照常补（见 heal_pace_of）
+        todo_items = [x for x in again if _heal_mp(x) not in _thr]
+        if _thr:
+            print(f"  {YELLOW}{'、'.join(sorted(m or '?' for m in _thr))} 在限量，这个盘本轮到此为止"
+                  f"{'；别的盘接着补' if todo_items else ''}{RST}")
     # 【记账要在报数之前】—— 这轮花了多少，用物理网卡的接收字节差实测。
     # 播放走 302 直链、根本不经过 VPS，所以这段时间的接收量基本就是 heal 拉的。
     # 读不到计数（容器里、非 Linux）才退回按次数估。
@@ -16188,7 +16280,8 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     save_ms_state(heal_last={"ts": int(time.time()), "n": len(pend),
                              "ok": done, "mb": round(_spent, 1), "how": _how_run,
                              "via": _via_n, "meter": _how})
-    _new = set_heal_pace(hit >= HEAL_429_STOP)
+    _newby = set_heal_pace_by(_thr, {_heal_mp(x) for x in pend})
+    _new = max(_newby.values()) if _newby else heal_pace()
     _heal_summary(done, len(pend))
     _left2, _used2 = heal_budget()
     print(f"  {DIM}这轮花了约 {_spent:.0f} MB（{_how}）；今天累计 {_used2:.0f} MB / "
@@ -16206,9 +16299,10 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     if len(pend):
         print(f"  {DIM}本轮用时 {_mmss(int(_el))}，平均 {_el / len(pend):.0f} 秒一个"
               f"（预算 {_mmss(budget)}）{RST}")
-    if hit >= HEAL_429_STOP:
-        print(f"  {DIM}下一批自动减到 {_new} 个 —— 上游按请求量限，"
-              f"打得越猛补得越慢。它缓过来之后会自己加回去。{RST}")
+    if _thr:
+        print(f"  {DIM}{'、'.join(sorted(m or '?' for m in _thr))} 下一批自动减到 "
+              f"{min(_newby.get(m, _new) for m in _thr)} 个 —— 那家按请求量限，打得越猛补得越慢；"
+              f"别的盘不受影响。它缓过来之后会自己加回去。{RST}")
     elif _new > _pace:
         print(f"  {DIM}这一轮没撞限流，下一批加到 {_new} 个。{RST}")
 
@@ -16223,7 +16317,9 @@ def heal_workers():
     """
     if os.environ.get("MS_HEAL_TICK"):
         return 1
-    return 1 if heal_pace() <= HEAL_PACE_MIN else HEAL_WORKERS
+    by = ms_state().get("heal_pace_by") or {}
+    best = max([heal_pace_of(m) for m in by] or [heal_pace()])
+    return 1 if best <= HEAL_PACE_MIN else HEAL_WORKERS
 
 
 def ali_item_m3u8(iid, key):
@@ -16400,6 +16496,18 @@ def link_stale_fix(iid, key, budget=HEAL_GATE_WAIT_S):
     if not code:
         return ""
     stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    # 【不为一集重启整个 MediaWarp】仓库主人：「其他地方还有没有这种盘和盘互相依赖的，都查一遍」。
+    # 以前这里死一条就 docker restart mediawarp：所有盘缓存的直链一起清空，那几秒别人在别的盘上看片，
+    # 进度上报、拖动、下一集全失败。换链服务在（它认得出这一集、能自己去 OpenList 现换）就记一笔，
+    # 这一集往后由它现换（见 kind_of / link_bypass_on），MediaWarp 和别的盘一个都不动。
+    if hls_port() and os.path.exists(HLS_UNIT):
+        byp = {k: v for k, v in (st.get("link_bypass") or {}).items()
+               if isinstance(v, (int, float)) and now - v < LINK_TTL_H * 3600}
+        byp[str(iid)] = int(now)
+        save_ms_state(link_bypass=byp)
+        heal_log([f"{stamp}  缓存里的直链已失效（HTTP {code}），这一集改由换链服务现换"
+                  f"（不重启 MediaWarp）" + _log_tag(iid)])
+        return "bypass"
     if now - float(st.get("link_fix_at") or 0) < LINK_FIX_GAP_S:
         heal_log([f"{stamp}  缓存里的直链已失效（HTTP {code}），刚清过一次，这回不重启"
                   + _log_tag(iid)])
@@ -16865,7 +16973,7 @@ def _heal_one(d, key, _it, base, token):
 
 
 def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
-                meter=None, rx0=None, mb_left=None):
+                meter=None, rx0=None, mb_left=None, throttled=None):
     """探一轮。探不到的塞进 again 供下一轮再试。返回 (成功几个, 撞了几次限流, 是否额度用完)。
 
     【并行】一个条目里绝大部分时间是干等网络，串着跑等于把几条独立的等待排成一队。
@@ -16894,13 +17002,28 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
     stop = threading.Event()
     lock = threading.Lock()
 
+    hit_by, said_thr = {}, set()
+    throttled = set() if throttled is None else throttled
+
     def run(_it):
         if stop.is_set():
             return None               # 已经拉停了，排队没轮到的直接作废
+        _m = _heal_mp(_it)
+        with lock:
+            if _m in throttled:
+                again.append(_it)     # 这个盘撞满了限流：它排队没轮到的不发，别的盘照常
+                return None
         if _HEAL_YIELD and heal_backlog_hold(key, cache_s=10):
             stop.set()                # 补到一半有人点了播放：剩下的这一轮不补了，让路
             return None
-        return (_it,) + _heal_one(d, key, _it, base, token)
+        r = _heal_one(d, key, _it, base, token)
+        if r and r[0] == "throttle":
+            # 【在这一侧当场记】等主线程收结果再记的话，并发时同一个盘后面几个早发出去了
+            with lock:
+                hit_by[_m] = hit_by.get(_m, 0) + 1
+                if hit_by[_m] >= HEAL_429_STOP:
+                    throttled.add(_m)
+        return (_it,) + r
 
     nw = heal_workers()
     if nw > 1:
@@ -16955,11 +17078,11 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                     again.append(_it)
                     print(f"  {DIM}\u00b7{RST} {pad(str(idx) + '/' + str(total), 9)}"
                           f"{name[:26]}  {YELLOW}{note}{RST}  {DIM}{sec:.0f}s{RST}")
-                    if hit >= HEAL_429_STOP:
-                        print(f"  {YELLOW}连着撞了 {hit} 次限流，这一轮先停 —— "
-                              f"再打下去只会把上游按得更久{RST}")
-                        stop.set()
-                        break
+                    _m = _heal_mp(_it)
+                    if _m in throttled and _m not in said_thr:
+                        said_thr.add(_m)
+                        print(f"  {YELLOW}{_m or '这个盘'} 连着撞了 {hit_by[_m]} 次限流，这一轮先停这个盘 —— "
+                              f"再打只会把它按得更久；别的盘接着探{RST}")
                 else:
                     # 【这个 else 属于上面那条 res 判断链，不属于 `if over`】
                     # 上一版它挂在 `if over:` 底下，于是【每一个 over 为假的条目】
@@ -21604,6 +21727,73 @@ def _write_addition(d, targets, updates, quiet_keys=()):
     _write_storage(d, targets, addition=updates, quiet_keys=quiet_keys)
 
 
+def _write_storage_live(d, targets, addition, columns, quiet_keys=()):
+    """经 OpenList 的接口只改这几个盘：它只把这几个盘重新加载一遍，别的盘一直在线。→ 成没成。
+
+    【改一个盘，别的盘不陪着停】仓库主人：「我每个盘都要求设计是独立的」「其他地方还有没有这种盘和
+    盘互相依赖的，都查一遍」。以前改任何一个盘（登录、退出、换接口、直链方式）都是停整个 OpenList →
+    写库 → 再起 → 重启 MediaWarp：真机 10/03 115 重新登录那次「OpenList 就绪（等了 16 秒）」，这 16 秒
+    夸克、阿里、WebDAV 全都打不开，正在看的人断掉；完了还把【所有盘】的片子后台预热一遍。
+    走接口：OpenList 不停 → MediaWarp 手里的令牌照样有效、不用重启 → 别的盘缓存的直链也都还在，不用预热。
+
+    【写完要回读核对】接口回的报错不一定代表没存上（换登录时新令牌验不过，它照样先存库再报错），
+    所以成败按回读出来的对不对得上算；对不上就返回 False，交给老路（停容器直接写库）再写一遍。"""
+    try:
+        otok = _ol_token(d)
+    except Exception:
+        otok = ""
+    if not otok:
+        return False
+    olds = []
+    try:
+        for sid, mp in targets:
+            st = (_ol_api(f"/api/admin/storage/get?id={sid}", {}, otok, timeout=20,
+                          method="GET").get("data") or {})
+            if not st or "addition" not in st:
+                return False
+            olds.append((sid, mp, st))
+    except Exception:
+        return False
+    for sid, mp, st in olds:
+        try:
+            a = json.loads(st.get("addition") or "{}")
+        except ValueError:
+            return False
+        shown = []
+        for k, v in addition.items():
+            if k in quiet_keys:
+                shown.append(f"{k}: {'（原来的）' if a.get(k) else '空'} → （已更新）")
+            else:
+                shown.append(f"{k}: {a.get(k) if a.get(k) not in (None, '') else '空'} → {v}")
+            a[k] = v
+        body = dict(st, addition=json.dumps(a, ensure_ascii=False))
+        want = {}
+        for k, v in columns.items():
+            if k in st:
+                # 库里是 0/1，接口里是 true/false：照接口那边原来的类型给，不然 Go 那边解不开整条被拒
+                v = bool(v) if isinstance(st[k], bool) else v
+                body[k] = want[k] = v
+                shown.append(f"{k} → {v}")
+            else:
+                print(f"  {DIM}这个 OpenList 版本的存储没有 {k} 这一项，跳过{RST}")
+        try:
+            _ol_api("/api/admin/storage/update", body, otok, timeout=90)
+        except Exception:
+            pass                          # 成没成看回读
+        try:
+            got = (_ol_api(f"/api/admin/storage/get?id={sid}", {}, otok, timeout=20,
+                           method="GET").get("data") or {})
+            ga = json.loads(got.get("addition") or "{}")
+        except Exception:
+            return False
+        if any(ga.get(k) != v for k, v in addition.items()) or \
+                any(got.get(k) != v for k, v in want.items()):
+            return False
+        ok(f"{mp}  " + "　".join(shown))
+    print(f"  {DIM}只重新加载了改的这个盘，别的盘一直在线、正在看的不受影响。{RST}")
+    return True
+
+
 def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
     """改这些存储，然后重启 OpenList 和 MediaWarp。
 
@@ -21622,6 +21812,9 @@ def _write_storage(d, targets, addition=None, columns=None, quiet_keys=()):
     addition = dict(addition or {})
     columns = dict(columns or {})
     if not addition and not columns:
+        return
+    # 【先试只动这一个盘】见 _write_storage_live；接口不通 / 写进去对不上才走下面停整个 OpenList 那条
+    if _write_storage_live(d, targets, addition, columns, quiet_keys):
         return
     # OpenList 把存储缓存在内存里，改完必须重启才生效；写库前先停，避免锁冲突
     info("停止 OpenList...")
@@ -23911,7 +24104,7 @@ def resume_items(key, uid, limit=10):
             srcs = i.get("MediaSources") or []
             pos = (i.get("UserData") or {}).get("PlaybackPositionTicks") or 0
             out.append((i.get("Id"), str(i.get("Name") or "?"), pos,
-                        srcs[0] if srcs else {}))
+                        dict(srcs[0] if srcs else {}, _strm=str(i.get("Path") or ""))))
             if len(out) >= limit:
                 break
         if out:
@@ -24073,7 +24266,7 @@ def rest_items(key, uid, limit, cursor):
             continue
         srcs = i.get("MediaSources") or []
         out.append((i.get("Id"), str(i.get("Name") or "?"), 0,
-                    srcs[0] if srcs else {}))
+                    dict(srcs[0] if srcs else {}, _strm=str(i.get("Path") or ""))))
     return out, nxt, total
 
 
@@ -24098,7 +24291,7 @@ def latest_items(key, uid, limit=5):
             continue
         srcs = i.get("MediaSources") or []
         out.append((i.get("Id"), str(i.get("Name") or "?"), 0,
-                    srcs[0] if srcs else {}))
+                    dict(srcs[0] if srcs else {}, _strm=str(i.get("Path") or ""))))
         if len(out) >= limit:
             break
     return out
@@ -24242,8 +24435,10 @@ def warm_links(d, key, limit=None):
     # 预热每 4 秒打一个，用户点播放时就是在跟自己的后台任务抢，抢输了就是转圈。
     _noswap = proxy_only_mounts(d)
     if _noswap:
-        _drop = [n for _i, n, p, _s in cut if drive_of_strm(p or "") in _noswap]
-        cut = [x for x in cut if drive_of_strm(x[2] or "") not in _noswap]
+        # 【认盘看 strm 文件路径】以前拿第三项（续播位置，一个数字）当路径去认：位置不是 0 就报错，
+        # 是 0 就认不出 —— 代理型的盘从来没被跳过（1.5.324 查盘和盘互相依赖时发现）
+        _drop = [n for _i, n, _p, sr in cut if drive_of_strm((sr or {}).get("_strm") or "") in _noswap]
+        cut = [x for x in cut if drive_of_strm((x[3] or {}).get("_strm") or "") not in _noswap]
         if _drop:
             print(f"  {DIM}跳过 {len(_drop)} 部：它们在"
                   f"{'、'.join(sorted(_noswap))} 这类盘上 —— 没有 CDN 直链可换，"
@@ -24278,7 +24473,20 @@ def warm_links(d, key, limit=None):
     # 【多轮重试】跨境超时绝大多数是偶发的：同一部片这一秒超时、下一秒 0.3 秒就回来。
     # 一轮打完就走的话，热成率完全看运气 —— 用户实测有一轮 4 部只热上 1 部。
     # 失败的攒起来再来一遍，中间隔几秒让接口喘口气，比一次性打完靠谱得多。
-    todo_q, attempt = list(cut), 0
+    # 【按盘轮流热】以前按「继续观看 → 新加 → 老片」一溜排下去，一个盘慢（一部最多等 WARM_STEP_T 秒）
+    # 就把 WARM_BUDGET 吃光，排在后面的别的盘一部都热不上。现在各盘轮流来一部，同一个盘里照旧按原顺序
+    def _mp_of(x):
+        return drive_of_strm((x[3] or {}).get("_strm") or "")
+    _groups = {}
+    for x in cut:
+        _groups.setdefault(_mp_of(x), []).append(x)
+    _rr = []
+    while any(_groups.values()):
+        for _g in list(_groups.values()):
+            if _g:
+                _rr.append(_g.pop(0))
+    todo_q, attempt = _rr, 0
+    slow_mp, slow_n = set(), {}          # 这一轮里接线超时两次的盘：剩下的这一轮先不热它（偶发一次照常重试）
 
     def wipe():
         """把"接线中…"那行占位擦掉，再打别的。
@@ -24298,6 +24506,9 @@ def warm_links(d, key, limit=None):
             time.sleep(5)
         again = []
         for iid, name, pos, src in todo_q:
+            # 【一个盘卡住不拖别的盘】这一轮里它已经失败过：剩下的这一轮不热它，留给下一轮
+            if _mp_of((iid, name, pos, src)) in slow_mp:
+                continue
             # 【热到一半有人点了播放：剩下的不热了，欠着，等它睡了再来】
             if _polite and heal_backlog_hold(key, cache_s=10):
                 save_ms_state(warm_owed=True)
@@ -24335,6 +24546,11 @@ def warm_links(d, key, limit=None):
                     why = f"HTTP {e.code}"
             except Exception as e:
                 why = _short_err(e)
+            if not loc and ("timed out" in why or "timeout" in why.lower() or not why):
+                _sm = _mp_of((iid, name, pos, src))
+                slow_n[_sm] = slow_n.get(_sm, 0) + 1
+                if slow_n[_sm] >= 2:
+                    slow_mp.add(_sm)              # 接线超时两次：这个盘这一轮先不热了
             if not loc and attempt < WARM_RETRY:
                 again.append((iid, name, pos, src))
                 continue
