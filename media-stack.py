@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.315"
+SCRIPT_VERSION = "1.5.316"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20873,7 +20873,9 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     # 才用重编的小码（原码拉宽了竖屏放不下）
     _r = term_cell_ratio() if grid else None
     # 只往宽里拉：字格偏扁（r < 1）的终端要的是往窄里压，半个字符的精度压不匀，照原样画
-    st = [min(_r, 1.6) if _r and _r > 1.06 else (qr_stretch() if grid else 1.0)]
+    # 【别叫 st】下面等扫码的循环里 st 是扫码状态（st, code = tv.status(sid)）—— 1.5.315 就叫 st，
+    # 一轮之后被换成字符串，按 w 当场报错（真机 10/03 TypeError）
+    stretch = [min(_r, 1.6) if _r and _r > 1.06 else (qr_stretch() if grid else 1.0)]
 
     def _pick(sv):
         g = grid if sv == 1.0 or not small else small
@@ -20882,7 +20884,7 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     def _draw():
         print()
         if grid:
-            sv = st[0]
+            sv = stretch[0]
             g, need = _pick(sv)
             if need > shutil.get_terminal_size((80, 24)).columns:
                 g, sv = grid, 1.0                 # 屏放不下：画原码，不折行
@@ -20898,9 +20900,9 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     try:
         while time.time() < deadline:
             if grid:
-                nv = qr_stretch_key(poll, st[0], lambda sv: _pick(sv)[1])
+                nv = qr_stretch_key(poll, stretch[0], lambda sv: _pick(sv)[1])
                 if nv:
-                    st[0] = nv
+                    stretch[0] = nv
                     _draw()
                     continue
             try:
