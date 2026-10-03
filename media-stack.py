@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.314"
+SCRIPT_VERSION = "1.5.315"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20858,20 +20858,35 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     except Exception as e:
         warn(f"没拿到阿里的二维码：{_short_err(e)[:60]}")
         return ""
-    grid = None
+    grid = small = None
     try:
         req = urllib.request.Request(img, headers={"User-Agent": ALITV_UA})
         with tv._open(req, timeout=20) as r:
             grid = qr_grid_from_b64(base64.b64encode(r.read(1 << 20)).decode())
         if grid:
-            grid = qr_compact(grid, must=sid)     # 解出来要含这次的 sid 才重编，见 qr_encode
+            small = qr_compact(grid, must=sid)    # 解出来要含这次的 sid 才重编，见 qr_encode
     except Exception:
         pass
+    # 【按终端字格的真实比例拉】仓库主人：「变大变小应该是按到分辨率做出来的……这个 ssh 工具他每个字符的
+    # 排列密度不一样」。先问终端一个字格几像素（见 term_cell_ratio），按它拉宽成方的；终端不回就用
+    # 上次 w 挑的那档。【不拉就画原码】仓库主人：「变小也没有用还是恢复到以前的吧」—— 只有要拉宽时
+    # 才用重编的小码（原码拉宽了竖屏放不下）
+    _r = term_cell_ratio() if grid else None
+    # 只往宽里拉：字格偏扁（r < 1）的终端要的是往窄里压，半个字符的精度压不匀，照原样画
+    st = [min(_r, 1.6) if _r and _r > 1.06 else (qr_stretch() if grid else 1.0)]
+
+    def _pick(sv):
+        g = grid if sv == 1.0 or not small else small
+        return g, qr_width(g, sv)
 
     def _draw():
         print()
         if grid:
-            print("\n".join(qr_lines(grid)))
+            sv = st[0]
+            g, need = _pick(sv)
+            if need > shutil.get_terminal_size((80, 24)).columns:
+                g, sv = grid, 1.0                 # 屏放不下：画原码，不折行
+            print("\n".join(qr_lines(g, stretch=sv)))
             print()
         # 【链接照留】终端画得不好扫不了的，手机浏览器打开图片地址 → 存图 → 阿里云盘 App 从相册扫
         print(f"  {BOLD}二维码{RST}  {CYAN}{img}{RST}")
@@ -20882,9 +20897,12 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     deadline = time.time() + wait_s
     try:
         while time.time() < deadline:
-            if grid and qr_stretch_key(grid, poll):
-                _draw()
-                continue
+            if grid:
+                nv = qr_stretch_key(poll, st[0], lambda sv: _pick(sv)[1])
+                if nv:
+                    st[0] = nv
+                    _draw()
+                    continue
             try:
                 st, code = tv.status(sid)
             except Exception:
@@ -20916,9 +20934,10 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
     return ""
 
 
-def qr_stretch_key(grid, wait):
-    """等扫码时最多等 wait 秒看有没有人输 w 回车。有 → 换下一档拉宽、记住，返回 True（要重画）。
-    下一档屏放不下就不换，说一句；不是终端（管道 / 后台）就只睡 wait 秒。"""
+def qr_stretch_key(wait, cur, width_of):
+    """等扫码时最多等 wait 秒看有没有人输 w 回车。有 → 换下一档拉宽、记住，返回新的倍数；
+    否则 None。下一档屏放不下就不换，说一句；不是终端（管道 / 后台）就只睡 wait 秒。
+    width_of(倍数) → 那一档画出来占几列。"""
     import select
     try:
         if not sys.stdin.isatty():
@@ -20926,23 +20945,72 @@ def qr_stretch_key(grid, wait):
         rd, _w, _x = select.select([sys.stdin], [], [], wait)
     except (OSError, ValueError):
         time.sleep(wait)
-        return False
+        return None
     if not rd:
-        return False
+        return None
     if sys.stdin.readline().strip().lower() != "w":
-        return False
+        return None
+    nxt = next((x for x in QR_STRETCH_STEPS if x > cur + 0.01), 1.0)
     cols = shutil.get_terminal_size((80, 24)).columns
-    cur = qr_stretch() if qr_width(grid, qr_stretch()) <= cols else 1.0   # 屏上现在画的那档
-    nxt = QR_STRETCH_STEPS[(QR_STRETCH_STEPS.index(cur) + 1) % len(QR_STRETCH_STEPS)]
-    need = qr_width(grid, nxt)
+    need = width_of(nxt)
     if need > cols:
         print()
         warn(f"拉宽到 {nxt} 倍要 {need} 列，屏幕只有 {cols} 列：双指缩小字体再输 w")
-        return False
+        return None
     save_ms_state(qr_stretch=nxt)
     print()
     ok(f"二维码横向 {nxt} 倍" + ("（原样）" if nxt == 1.0 else ""))
-    return True
+    return nxt
+
+
+def term_cell_ratio(timeout=1.0):
+    """问终端一个字格多少像素 → 半个字格（一格模块）的高 / 宽；终端不回 → None。
+
+    xterm 那套查询：CSI 16 t 回「6;字格高;字格宽 t」；不认的再看 CSI 14 t 回的窗口像素
+    「4;高;宽 t」÷ 行列数。很多终端（含手机上的）认其中一个；都不认就 None，退回 w 手动挑。
+    只在本机终端里问答，不出网。问的时候关掉回显，免得回话印在屏上；等不到就算了。"""
+    import select
+    try:
+        import termios, tty
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return None
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+    except Exception:
+        return None
+    buf = ""
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[16t\x1b[14t")
+        sys.stdout.flush()
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            r, _w, _x = select.select([fd], [], [], max(0.0, end - time.monotonic()))
+            if not r:
+                break
+            buf += os.read(fd, 128).decode("latin-1")
+            if re.search(r"\x1b\[6;\d+;\d+t", buf) and re.search(r"\x1b\[4;\d+;\d+t", buf):
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+    m6 = re.search(r"\x1b\[6;(\d+);(\d+)t", buf)
+    if m6:
+        ch, cw = int(m6.group(1)), int(m6.group(2))
+    else:
+        m4 = re.search(r"\x1b\[4;(\d+);(\d+)t", buf)
+        if not m4:
+            return None
+        sz = shutil.get_terminal_size((80, 24))
+        ch, cw = int(m4.group(1)) / max(1, sz.lines), int(m4.group(2)) / max(1, sz.columns)
+    if ch <= 0 or cw <= 0:
+        return None
+    r = round(ch / (2 * cw), 2)
+    return r if 0.7 <= r <= 2.0 else None
 
 
 def alitv_gateway():
