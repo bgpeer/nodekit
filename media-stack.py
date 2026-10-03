@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.322"
+SCRIPT_VERSION = "1.5.323"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2448,6 +2448,7 @@ def ol_tok_cached(d, fresh=False):
     return _ALI_OL_TOK[0]
 
 
+HLS_KIND_TTL = 600        # 一集认过是哪种盘、115 盘的挂载点表，记这么久（挂载很少变，见 kind_of）
 P115_TRIES = 3            # 换链一共问几次（3×8 秒 + 2×1.5 秒 < nginx 那边的 30 秒）
 P115_GAP = 1.5            # 两次之间隔几秒
 P115_T = 8                # 每次最多等几秒
@@ -2754,6 +2755,55 @@ def do_hls_fix():
         with open(hp, encoding="utf-8") as f:
             return strm_target_path(f.read())
 
+    kinds, m115_busy = {}, [False]
+
+    def m115_now():
+        """115 盘的挂载点表。【开播不等它】读一遍要查 OpenList 的存储表（真机 10/03 14:09 这一步 2 秒）：
+        只有服务刚起、手里一份都没有时当场读；之后过期了放后台刷新，开播先用手里那份。"""
+        now = time.time()
+        if not m115[1]:
+            m115[0], m115[1] = pan115_mounts(d), now
+        elif now - m115[1] > HLS_KIND_TTL and not m115_busy[0]:
+            m115_busy[0] = True
+
+            def _bg():
+                try:
+                    m115[0], m115[1] = pan115_mounts(d), time.time()
+                finally:
+                    m115_busy[0] = False
+            threading.Thread(target=_bg, daemon=True).start()
+        return m115[0]
+
+    def _under(tp, mounts):
+        return any(tp == m or tp.startswith(m.rstrip("/") + "/") for m in mounts)
+
+    def kind_of(vid):
+        """这一集在哪种盘上 → "ali"（阿里转码盘）/ "115"（本机按 UA 换链的 115）/ ""（其余：夸克、
+        WebDAV、剩余网盘……走 MediaWarp / 转码列表）。
+
+        【先认盘，只走这个盘自己的路】仓库主人：「我每个盘都要求设计是独立的」。以前每一集开播都是
+        先问阿里、再问 115、最后才轮到它自己的盘 —— 夸克的片子也要白等这两步（真机 10/03 14:09：
+        「判阿里 0.0s、判 115 2.0s」），账本还被记上「阿里没给地址」。现在一集只认一次盘（strm 里的
+        网盘路径 + 挂载点前缀），之后只走那一个盘的那条路；别的盘出什么事都碰不到它。
+        认不出（Emby 一时没回）不缓存，下次再认。"""
+        now = time.time()
+        h = kinds.get(vid)
+        if h and now - h[1] < HLS_KIND_TTL:
+            return h[0]
+        try:
+            tp = target_of(vid)
+        except Exception:
+            tp = ""
+        if not tp:
+            return ""
+        k = ""
+        if _under(tp, ali_tc_mounts() or {}):
+            k = "ali"
+        elif _under(tp, m115_now()):
+            k = "115"
+        kinds[vid] = (k, now)
+        return k
+
     p115_busy = {}
 
     def _115_rem(u):
@@ -2773,9 +2823,7 @@ def do_hls_fix():
         """115 的盘：拿播放器自己的 UA 换一条直链（见 pan115_mounts）。不是 115 / 拿不到 → ""。
         缓存、封顶、旧地址兜底见 P115_DEADLINE_S。"""
         now = time.time()
-        if now - m115[1] > 60:
-            m115[0], m115[1] = pan115_mounts(d), now
-        if not m115[0] or not key:
+        if not m115_now() or not key:
             return ""
         k = (vid, ua)
         with lock:
@@ -3143,18 +3191,23 @@ def do_hls_fix():
                                  "route": route, "s": round(time.monotonic() - _ta, 1),
                                  "note": list(getattr(tl, "note", []) or []),
                                  "pre": bool(self.headers.get("X-Ms-Prefetch"))})
-                url = ali_of(ms.group(1))
+                # 【先认盘，只走这个盘的路】见 kind_of
+                _kd = kind_of(_vid)
                 _tb = time.monotonic()
-                _via = "阿里转码" if url else ""
-                if not url:
-                    url = p115_of(ms.group(1), self.headers.get("User-Agent") or "")
+                url, _via = "", ""
+                if _kd == "ali":
+                    url = ali_of(_vid)
+                    _via = "阿里转码" if url else ""
+                elif _kd == "115":
+                    url = p115_of(_vid, self.headers.get("User-Agent") or "")
                     _via = "115" if url else ""
                 _tc = time.monotonic()
                 if _tc - _ta > 1.5:
                     try:
                         heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务"
-                                  f"拿列表之前　判阿里 {_tb - _ta:.1f}s、判 115 {_tc - _tb:.1f}s"
-                                  f"{_log_tag(ms.group(1))}"])
+                                  f"拿列表之前　认盘 {_tb - _ta:.1f}s（{ {'ali': '阿里转码', '115': '115'}.get(_kd, '其余') }）"
+                                  + (f"、换链 {_tc - _tb:.1f}s" if _kd else "")
+                                  + f"{_log_tag(_vid)}"])
                     except Exception:
                         pass
                 # 【试验：转码流的播放列表改好再给】见 m3u8_absolutize 上面那段
