@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.321"
+SCRIPT_VERSION = "1.5.322"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2694,7 +2694,10 @@ def do_hls_fix():
                     pass
                 _note("阿里旧地址兜底")
                 return old
-            _note("阿里没给地址")
+            # 【不是阿里盘的不记】装了阿里转码盘以后，每一集开播都要先判一次是不是阿里盘；
+            # 夸克的片子判完不是，以前也记成「阿里没给地址」（真机 10/03 仙逆 160，开播报告里误导人）
+            if out.get("ali"):
+                _note("阿里没给地址")
             return ""
         finally:
             with lock:
@@ -2718,6 +2721,7 @@ def do_hls_fix():
                 mp = next((m for m in sorted(tcm, key=len, reverse=True)
                            if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
                 if mp:
+                    out["ali"] = True     # 真是阿里转码盘上的（账本只给这种记「阿里…」）
                     url, _q = ali_preview_url(d, tp, tcm[mp])
                     _pref = tcm[mp]
         except Exception:
@@ -6079,8 +6083,17 @@ def do_play_report(hours=24):
                 e["n"][x] = e["n"].get(x, 0) + 1
             e.setdefault("route", {})
             e["route"][r.get("route") or "?"] = e["route"].get(r.get("route") or "?", 0) + 1
-        for r in gates:
-            drives[mp_of.get(str(r.get("iid"))) or "?"]["g"] += 1
+        # 【开播次数 = 门 + 换链服务里不重样的】同一集 2 分钟内算一次。只数门那一行会漏：
+        # 播放器里点下一集 / 有的客户端开播不带 StartTimeTicks，门不当它是开播，只有换链服务记了
+        # （真机 10/03 仙逆 160：报告写「开播 0 次」）
+        _seen = set()
+        for r in sorted(gates + streams, key=lambda x: x["t"]):
+            k = (str(r.get("iid")), int(r["t"]) // 120)
+            if k in _seen:
+                continue
+            _seen.add(k)
+            drives.setdefault(r.get("mp") or mp_of.get(str(r.get("iid"))) or "?",
+                              {"s": [], "g": 0, "n": {}, "404": 0})["g"] += 1
         for r in recs:
             if r.get("ev") == "seg404":
                 drives.setdefault(mp_of.get(str(r.get("iid"))) or "?", {"s": [], "g": 0, "n": {}, "404": 0})["404"] += 1
