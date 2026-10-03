@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.313"
+SCRIPT_VERSION = "1.5.314"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19964,6 +19964,12 @@ def qr_decode(grid):
             mode = s[i:i + 4]; i += 4
             if mode == "0000":
                 break
+            if mode == "0111":
+                # 【ECI 段】只是声明后面字节按哪种字符集解（阿里的码开头带一段 UTF-8 声明）。
+                # 以前不认，整张码解不出 → 没法重编小码（真机 10/03：还是 53 格的大码）。
+                # 声明号 1/2/3 字节：首位 0 → 8 位，10 → 16 位，110 → 24 位；内容一律按 UTF-8 解
+                i += 8 if s[i] == "0" else 16 if s[i:i + 2] == "10" else 24
+                continue
             big = ver >= 10
             if mode == "0100":
                 nb = 16 if big else 8
