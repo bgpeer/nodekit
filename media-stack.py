@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.311"
+SCRIPT_VERSION = "1.5.312"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19450,15 +19450,19 @@ def _ali_tv_scan(d):
             "api_url_address": url or ALI_OPLIST_RENEW}
 
 
-def _ali_how():
-    """扫码还是贴令牌。返回 "scan" / "paste"；"" = 返回（什么都不做）。
+def _ali_how(logout=False):
+    """扫码还是贴令牌。返回 "scan" / "paste" / "logout"（logout=True 才有这项）；"" = 返回。
 
     【回车 = 返回】仓库主人：「这里的回车应该等于返回的」。以前回车 = 扫码，手一滑就进了扫码流程。"""
     print("  1. 扫码（TV 客户端接口）")
     print("  2. 贴令牌（自己去取令牌的网站）")
+    if logout:
+        print("  3. 退出登录")
     print("  0. 返回")
-    tip("扫码走 TV 客户端接口：续期在本机做，不经过 api.oplist.org")
-    return {"1": "scan", "2": "paste"}.get(ask("请选择（回车 = 返回）").strip(), "")
+    tip("换号直接扫另一个号；扫码走 TV 客户端接口，续期在本机做" if logout
+        else "扫码走 TV 客户端接口：续期在本机做，不经过 api.oplist.org")
+    return {"1": "scan", "2": "paste", "3": "logout" if logout else ""}.get(
+        ask("请选择（回车 = 返回）").strip(), "")
 MOUNT_QTV = "/quark"
 DRIVER_DAV = "WebDav"
 MOUNT_DAV = "/webdav"
@@ -19586,9 +19590,12 @@ def _ali_relogin_flow(d, mp):
         warn(f"读不到 {mp} 的存储记录。")
         return
     sid, _m, _dv, kind, _shape = row
-    how = _ali_how()
+    how = _ali_how(logout=True)
     if not how:
         print("一个字都没改。")
+        return
+    if how == "logout":
+        drive_logout(d, mp)
         return
     if how == "scan":
         if kind != "alipanTV":
@@ -19614,6 +19621,17 @@ def _qtv_relogin_flow(d, mp):
 
     跟「本机自己那份登录」（do_quark_login）是两回事：这一份是 OpenList 挂盘用的，掉了整个盘
     就打不开。【放弃要能退回去】清令牌之前先把原来的 addition 记下，按 q 原样写回。"""
+    print()
+    print("  1. 扫码登录")
+    print("  2. 退出登录")
+    print("  0. 返回")
+    tip("换号直接扫另一个号")
+    c = ask("请选择（回车 = 返回）").strip()
+    if c == "2":
+        drive_logout(d, mp)
+        return False
+    if c != "1":
+        return False
     otok = _ol_token(d)
     sid = _ol_storage_id(d, mp)
     if not otok or sid is None:
@@ -19972,6 +19990,171 @@ def qr_decode(grid):
         return txt
     except Exception:
         return ""
+
+
+# 【把码重新编得小一点】仓库主人：「怎么把字体缩小了你把二维码缩小不就行了」。阿里那张图是高纠错
+# 编的（真机 53 格宽），终端里一格至少占一个字符，手机竖屏放不下拉方的版本。码里写的只是一个地址，
+# 解出来按最低纠错（L）重新编一张，同样的内容只要 33~37 格 —— 拉宽到方的也放得下。
+# 扫码器只认内容，不管纠错档；终端里画的码本来就干净，用不上高纠错。
+def _gf_mul(x, y):
+    z = 0
+    for i in range(7, -1, -1):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        z ^= ((y >> i) & 1) * x
+    return z & 0xFF
+
+
+def _rs_ecc(data, n):
+    div = [0] * (n - 1) + [1]
+    root = 1
+    for _ in range(n):
+        for j in range(n):
+            div[j] = _gf_mul(div[j], root)
+            if j + 1 < n:
+                div[j] ^= div[j + 1]
+        root = _gf_mul(root, 2)
+    out = [0] * n
+    for b in data:
+        f = b ^ out.pop(0)
+        out.append(0)
+        for i, c in enumerate(div):
+            out[i] ^= _gf_mul(c, f)
+    return out
+
+
+def _qr_raw_cw(ver):
+    r = (16 * ver + 128) * ver + 64
+    if ver >= 2:
+        na = ver // 7 + 2
+        r -= (25 * na - 10) * na - 55
+        if ver >= 7:
+            r -= 36
+    return r // 8
+
+
+def qr_encode(text, mask=None):
+    """文字 → 模块矩阵（True = 黑），字节模式、纠错 L、版本 1~20 里最小放得下的。放不下 → None。"""
+    data = text.encode("utf-8")
+    for ver in range(1, len(QR_BLOCKS) + 1):
+        blocks = [k for cnt, k in QR_BLOCKS[ver - 1][0] for _ in range(cnt)]
+        cap = sum(blocks)
+        nb = 16 if ver >= 10 else 8
+        if 4 + nb + 8 * len(data) <= cap * 8:
+            break
+    else:
+        return None
+    bits = "0100" + format(len(data), f"0{nb}b") + "".join(f"{x:08b}" for x in data)
+    bits += "0" * min(4, cap * 8 - len(bits))
+    bits += "0" * (-len(bits) % 8)
+    cw = [int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)]
+    pad = 0xEC
+    while len(cw) < cap:
+        cw.append(pad)
+        pad ^= 0xEC ^ 0x11
+    ecn = (_qr_raw_cw(ver) - cap) // len(blocks)
+    dat, ecc, p = [], [], 0
+    for k in blocks:
+        dat.append(cw[p:p + k]); ecc.append(_rs_ecc(cw[p:p + k], ecn)); p += k
+    seq = [b[i] for i in range(max(blocks)) for b in dat if i < len(b)]
+    seq += [b[i] for i in range(ecn) for b in ecc]
+    n = 17 + 4 * ver
+    g = [[False] * n for _ in range(n)]
+    fn = [[False] * n for _ in range(n)]
+
+    def put(r, c, v):
+        g[r][c] = bool(v); fn[r][c] = True
+    for i in range(n):
+        put(6, i, i % 2 == 0); put(i, 6, i % 2 == 0)
+    for r0, c0 in ((3, 3), (3, n - 4), (n - 4, 3)):
+        for dr in range(-4, 5):
+            for dc in range(-4, 5):
+                r, c = r0 + dr, c0 + dc
+                if 0 <= r < n and 0 <= c < n:
+                    put(r, c, max(abs(dr), abs(dc)) not in (2, 4))
+    al = QR_ALIGN[ver - 1]
+    for r0 in al:
+        for c0 in al:
+            if (r0, c0) in ((6, 6), (6, al[-1]), (al[-1], 6)):
+                continue
+            for dr in range(-2, 3):
+                for dc in range(-2, 3):
+                    put(r0 + dr, c0 + dc, max(abs(dr), abs(dc)) != 1)
+
+    # 横着那一份：0~7 在右上（倒着），8 在 (8,7)，9~14 在左上 (8, 5..0)
+    def fmt2(mk):
+        f = _qr_fmt((1 << 3) | mk)                     # 纠错 L = 01
+        for i in range(15):
+            b = (f >> i) & 1
+            put(i if i < 6 else i + 1 if i < 8 else n - 15 + i, 8, b)
+            if i < 8:
+                put(8, n - 1 - i, b)
+            else:
+                put(8, 7 if i == 8 else 14 - i, b)
+        put(n - 8, 8, 1)
+    fmt2(0)
+    if ver >= 7:
+        v = ver
+        for _ in range(12):
+            v = (v << 1) ^ ((v >> 11) * 0x1F25)
+        vb = ver << 12 | v
+        for i in range(18):
+            b = (vb >> i) & 1
+            put(i // 3, n - 11 + i % 3, b); put(n - 11 + i % 3, i // 3, b)
+    i, col, row, inc = 0, n - 1, n - 1, -1
+    allbits = "".join(f"{x:08b}" for x in seq)
+    while col > 0:
+        if col == 6:
+            col -= 1
+        while 0 <= row < n:
+            for c in (col, col - 1):
+                if not fn[row][c]:
+                    g[row][c] = i < len(allbits) and allbits[i] == "1"
+                    i += 1
+            row += inc
+        row -= inc; inc = -inc; col -= 2
+    base = [r[:] for r in g]
+
+    def apply(mk):
+        out = [r[:] for r in base]
+        for r in range(n):
+            for c in range(n):
+                if not fn[r][c] and QR_MASKS[mk](r, c):
+                    out[r][c] = not out[r][c]
+        return out
+
+    def score(m):
+        sc = 0
+        for line in m + [list(x) for x in zip(*m)]:
+            run = 1
+            for a, b in zip(line, line[1:]):
+                if a == b:
+                    run += 1
+                else:
+                    sc += run - 2 if run >= 5 else 0; run = 1
+            sc += run - 2 if run >= 5 else 0
+        sc += 3 * sum(1 for r in range(n - 1) for c in range(n - 1)
+                      if m[r][c] == m[r][c + 1] == m[r + 1][c] == m[r + 1][c + 1])
+        dark = sum(map(sum, m))
+        return sc + 10 * (abs(dark * 20 - n * n * 10) // (n * n))
+    best = None
+    for mk in (range(8) if mask is None else (mask,)):
+        g = apply(mk)
+        fmt2(mk)
+        if best is None or score(g) < best[0]:
+            best = (score(g), [r[:] for r in g])
+    return best[1]
+
+
+def qr_compact(grid, must=""):
+    """能重新编得更小就编：先解出内容（要含 must 才算没解错），再按纠错 L 编。不行就原样返回。"""
+    try:
+        t = qr_decode(grid)
+        if not t or (must and must not in t):
+            return grid
+        g2 = qr_encode(t)
+        return g2 if g2 and len(g2) < len(grid) and qr_decode(g2) == t else grid
+    except Exception:
+        return grid
 
 
 def qr_link_of(b64, side=400):
@@ -20674,6 +20857,8 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
         req = urllib.request.Request(img, headers={"User-Agent": ALITV_UA})
         with tv._open(req, timeout=20) as r:
             grid = qr_grid_from_b64(base64.b64encode(r.read(1 << 20)).decode())
+        if grid:
+            grid = qr_compact(grid, must=sid)     # 解出来要含这次的 sid 才重编，见 qr_encode
     except Exception:
         pass
 
@@ -21003,8 +21188,9 @@ def qr115_status(uid, tm, sign):
                 -2: "手机上取消过了"}.get(st, f"状态 {st}")
 
 
-def qr115_login():
+def qr115_login(d=None, mp=None):
     """115 扫码登录：先摊开当前令牌，要不要重做由用户决定。
+    从挂好的 115 盘进来（给了 mp）多一项「退出登录」，见 drive_logout。
 
     进来就自动申请是错的 —— 用户可能只是想回来看一眼上次那串令牌是什么
     （比如 OpenList 那边填错了要重填），结果反而把旧的作废了。
@@ -21032,10 +21218,16 @@ def qr115_login():
         # 一个按钮按当前状态走两条路:没有就直接做,有了先问 —— 刷新会让旧令牌作废,
         # 而用户很可能只是回来看一眼那串东西,不该顺手把它废掉
         print(f"  1. 制作二维码")
+        if mp:
+            print(f"  2. 退出登录")
         print(f"  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", ""):
+            return
+        if c == "2" and mp:
+            drive_logout(d, mp)
+            ask("\n按回车继续...")
             return
         if c != "1":
             print("无效选择。")
@@ -21700,6 +21892,40 @@ def _ali_addition(d, sid):
         return json.loads(row[0]) if row else {}
     except Exception:
         return {}
+
+
+# 【退出登录】仓库主人：「我现在登入了怎么退出登录了，如果我想换一个号登入怎么办，你是不是应该在
+# 扫码登录里面做一个按钮退出登录」。换号直接扫另一个号就行（新令牌顶掉旧的）；退出登录 = 把这个盘在
+# OpenList 里的登录凭据清空 —— 盘本身留着（挂载点、扫描路径、strm 都不动），重新扫码就回来。
+# 会让整个盘打不开，所以照第四节：醒目一行说后果、默认「否」。
+DRIVE_CRED_KEYS = ("refresh_token", "access_token", "query_token", "cookie", "qrcode_token")
+
+
+def drive_logout(d, mp):
+    """清掉这个盘的登录凭据。→ 清了没有。"""
+    sid = _ol_storage_id(d, mp)
+    if sid is None:
+        warn(f"读不到 {mp} 的存储记录。")
+        return False
+    add = _ali_addition(d, sid)
+    keys = [k for k in DRIVE_CRED_KEYS if add.get(k)]
+    if not keys:
+        info(f"{mp} 本来就没登录。")
+        return False
+    print()
+    tip(f"退出后 {mp} 打不开，Emby 里这个盘的片子都放不了，重新扫码登录才恢复")
+    if not ask_yn("确定退出登录？", False):
+        print("没有改动。")
+        return False
+    _write_addition(d, [(sid, mp)], {k: "" for k in keys}, quiet_keys=tuple(keys))
+    ali_tok_forget(mp)                    # 本机留着的两份也删掉，不然换接口时又登回去了
+    if "cookie" in keys or "qrcode_token" in keys:
+        # 115：本机那份扫码记录（只拿令牌那一屏摊开的）也一起作废
+        save_ms_state(qr115_uid="", qr115_at=0, qr115_tm="", qr115_sign="")
+    if "alipan_type" in add:
+        sync_alitv_service(d)
+    ok(f"{mp} 已退出登录")
+    return True
 
 
 def _ali_try_kept(d, sid, mp, cur, other, back):
@@ -22407,7 +22633,7 @@ def _drive_menu(d, mp, drv, mounted=True):
             _st = ol_storage_status(d, mp)
             add("网盘扫码登录", "当前：" + (f"{CYAN}已登录{RST}" if _st == "work"
                                           else f"{YELLOW}掉线了（重新扫码）{RST}"),
-                qr115_login, False)
+                lambda: qr115_login(d, mp), False)
         elif isdav:
             # 【添加 WebDAV 也是挂盘】跟扫码挂上同一类，排第 1（仓库主人：「这个也是挂网盘的吧」）
             add("＋ 添加 WebDAV", "", lambda: _add_webdav_flow(d), False)
