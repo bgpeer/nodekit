@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.329"
+SCRIPT_VERSION = "1.5.330"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -9837,12 +9837,14 @@ def reidentify_items(key, ids):
     return n
 
 
-# ---- 每个盘的「刷新元数据」：只补没简介的 ----
+# ---- 每个盘的「刷新元数据」：缺什么补什么 ----
 # 【为什么要有】真机 10/03：吞噬星空 238 集以前有简介，239 起没有 —— 那几集是首播后一两天就入库的，
 # 那时 TMDb 上还没人写中文简介；Emby 只在入库那一刻刮一次，而初次导入后的自动联网刷新是脚本关掉的
 # （AutomaticRefreshIntervalDays=0，开着会把 strm 的音视频轨刷没），于是 TMDb 后来补上了也拿不回来。
-# 【只刷没简介的，不全库刷】仓库主人：「如果全部刷新是不是很消耗流量」—— 刷元数据本身只问 TMDb
-# 几 KB，但 FullRefresh 会清掉音视频轨，补回来要去网盘探一次（每集几 MB）。所以只挑没简介的。
+# 【缺什么补什么，齐全的不碰】仓库主人：「如果全部刷新是不是很消耗流量」；又：「这个刷新元数据就相当于
+# 刮削什么的都要带上，没有图片就要刮图片」。所以挑的是这个盘里【缺简介或缺图】的电影 / 剧集 / 整部剧：
+#   · 缺简介 → 「搜索缺少的元数据」，图也顺带补；代价是音视频轨被清掉，补回来要去网盘探一次（每集几 MB）
+#   · 只缺图 → 只刮图，元数据一个字段都不碰，也就不掉轨（fix_episode_images 同一个办法）
 # 【自动默认关】仓库主人：「自动刷新可以设置时间，默认关，如果开默认北京时间夜间」。
 META_CRON        = "/etc/cron.d/media-stack-meta"
 META_DEFAULT_CST = "03:30"     # 躲开 03:00 规则刷新、03:10 每月 nginx 升级、04:10 起那一串
@@ -9865,37 +9867,57 @@ def _iso_ts(s):
         return 0
 
 
-def items_missing_overview(d, key, mp):
-    """这个盘里没简介的电影 / 剧集，新入库的排前面 → [条目]；问不到 Emby → None。"""
-    out, start, page = [], 0, 500
+def items_missing_meta(d, key, mp):
+    """这个盘里缺简介或缺图的电影 / 剧集 / 整部剧，新入库的排前面 → [条目]（带 "_need"：
+    "meta" 缺简介 / "img" 只缺图）；问不到 Emby → None。
+
+    整部剧没有 strm 路径，按它底下任意一集认盘（同一部剧的集都在同一个盘上）。"""
+    allit, start, page = [], 0, 500
     while True:
         try:
-            r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode,Movie"
-                      f"&Fields=Overview,Path,DateCreated"
+            r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode,Movie,Series"
+                      f"&Fields=Overview,Path,DateCreated,SeriesId"
                       f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
         except Exception:
             return None
         items = r.get("Items") or []
-        out.extend(i for i in items if not (i.get("Overview") or "").strip()
-                   and str(i.get("Path") or "").endswith(".strm"))
+        allit.extend(items)
         start += len(items)
         if not items or start >= int(r.get("TotalRecordCount") or 0):
             break
+
+    def need(i):
+        if not (i.get("Overview") or "").strip():
+            return "meta"
+        return "" if (i.get("ImageTags") or {}).get("Primary") else "img"
+    one_ep = {}                       # 剧 id → 它底下一集的 strm 路径
+    for i in allit:
+        if i.get("Type") == "Episode" and i.get("SeriesId") and str(i.get("Path") or "").endswith(".strm"):
+            one_ep.setdefault(str(i["SeriesId"]), i["Path"])
     _mts = [str(x[1] or "") for x in _storage_rows(d)]
-    out = [i for i in out if strm_in_mount(d, i.get("Path"), mp, _mts)]
+    out = []
+    for i in allit:
+        nd = need(i)
+        if not nd:
+            continue
+        p = one_ep.get(str(i.get("Id"))) if i.get("Type") == "Series" else i.get("Path")
+        if not str(p or "").endswith(".strm") or not strm_in_mount(d, p, mp, _mts):
+            continue
+        out.append(dict(i, _need=nd))
     out.sort(key=lambda i: _iso_ts(i.get("DateCreated")), reverse=True)
     return out
 
 
 def meta_refresh(d, key, mp, auto=False):
-    """叫 Emby 给这个盘没简介的条目补一次元数据。返回 (发出去几个, 还剩几个没轮上)；问不到 → None。
+    """叫 Emby 给这个盘缺简介 / 缺图的条目补一次。返回 (发出去几个, 还剩几个没轮上)；问不到 → None。
 
-    【FullRefresh + ReplaceAllMetadata=false】= Emby 界面上的「搜索缺少的元数据」：只补空着的字段，
-    片名、季集编号（nfo 里的）都不动。Default 模式不去问 TMDb。代价是音视频轨被清掉 —— 排进
-    heal_later，几分钟后补回来（refresh_items / reidentify_items 同一个办法）。
+    缺简介：【FullRefresh + ReplaceAllMetadata=false】= Emby 界面上的「搜索缺少的元数据」：只补空着的
+    字段，片名、季集编号（nfo 里的）都不动；Default 模式不去问 TMDb。图用 FullRefresh + 不替换 = 只补缺的图。
+    代价是音视频轨被清掉 —— 排进 heal_later，几分钟后补回来（refresh_items / reidentify_items 同一个办法）。
+    只缺图：MetadataRefreshMode=None，只刮图，不掉轨，不用补。
     auto：只看入库 META_AUTO_DAYS 天内的，按 META_FRESH_DAYS 退避 —— TMDb 一直没写的那几集，
     不能每晚都刷一遍、每晚都去网盘补一遍轨。"""
-    todo = items_missing_overview(d, key, mp)
+    todo = items_missing_meta(d, key, mp)
     if todo is None:
         return None
     now = time.time()
@@ -9909,20 +9931,23 @@ def meta_refresh(d, key, mp, auto=False):
             gap = (1 if age < META_FRESH_DAYS * 86400 else 7) * 86400 - 3600
             return now - tried.get(str(i.get("Id")), 0) >= gap
         todo = [i for i in todo if due(i)]
-    go, n = todo[:META_PER_RUN], []
+    go, n, wiped = todo[:META_PER_RUN], [], []
     for i in go:
         iid = str(i.get("Id") or "")
         if not iid:
             continue
+        mode = "FullRefresh" if i.get("_need") == "meta" else "None"
         try:
-            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
-                  f"&ImageRefreshMode=Default"
+            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode={mode}"
+                  f"&ImageRefreshMode=FullRefresh"
                   f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
                   key, method="POST", timeout=30)
             n.append(iid)
+            if mode == "FullRefresh" and i.get("Type") != "Series":
+                wiped.append(iid)
         except Exception:
             continue
-    heal_later_add(n)
+    heal_later_add(wiped)
     for iid in n:
         tried[iid] = int(now)
     save_ms_state(meta_tried=tried)
@@ -23565,13 +23590,13 @@ def _drive_menu(d, mp, drv, mounted=True):
 
 
 def _meta_menu(d, mp):
-    """单个盘的「刷新元数据」：手动刷一次 / 自动每天几点（默认关）。只刷没简介的，见 meta_refresh。"""
+    """单个盘的「刷新元数据」：手动刷一次 / 自动每天几点（默认关）。缺简介、缺图的补上，见 meta_refresh。"""
     while True:
         at = meta_auto_of(mp)
         print("\n" + "-" * 60)
         print(f"  {BOLD}刷新元数据{RST}   {CYAN}{mp}{RST}")
         print("-" * 60)
-        print(f"  1. 手动刷新          {DIM}只刷没简介的{RST}")
+        print(f"  1. 手动刷新          {DIM}缺简介、缺图的补上{RST}")
         print(f"  2. 自动刷新          当前：" + (f"{CYAN}每天 {at}（北京时间）{RST}" if at else f"{DIM}关{RST}"))
         print("  0. 返回")
         print("-" * 60)
@@ -23583,15 +23608,17 @@ def _meta_menu(d, mp):
             if not key:
                 warn("没有 Emby API Key（「7 设置 → 1」），问不了 Emby。")
                 continue
-            todo = items_missing_overview(d, key, mp)
+            todo = items_missing_meta(d, key, mp)
             if todo is None:
                 warn("问不到 Emby，等它起来再试。")
                 continue
             if not todo:
-                ok("这个盘的片都有简介了。")
+                ok("这个盘的片简介、图都齐了。")
                 continue
-            tip("刷完 Emby 会清掉这几部的音视频轨，几分钟后自动补回（每部从网盘拉几 MB）")
-            if not ask_yn(f"{len(todo)} 部没简介，刷一次？", True):
+            nm = sum(1 for i in todo if i.get("_need") == "meta")
+            if nm:
+                tip("缺简介的刷完 Emby 会清掉音视频轨，几分钟后自动补回（每部从网盘拉几 MB）")
+            if not ask_yn(f"缺简介 {nm} 部、只缺图 {len(todo) - nm} 部，刷一次？", True):
                 continue
             r = meta_refresh(d, key, mp)
             if r is None:
