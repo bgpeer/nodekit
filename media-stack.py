@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.327"
+SCRIPT_VERSION = "1.5.328"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -123,6 +123,15 @@ RESCUE_HOLD_STOP_S = 2
 # 这几类读页面的请求先等它。一场「停止」只拦这一两秒
 RESCUE_STOPPING = "_stopping"
 RESCUE_STOPPING_S = 3
+# 【一直插着的「正在播」旗子】仓库主人：「这个详情页老是和进度抢刷新……有没有更稳的办法就是退出来后这个详情页
+# 永远排在进度的后面刷新」。「停止播放」的旗子要等那一下进了门才插：Hills 退出时「读页面」常常抢在
+# 「停止播放」前面到 nginx（或者门在睡、被叫醒的那一会儿），旗子还没插，读页面就直通、拿到旧进度。
+# 现在常驻服务在播的整段时间里一直插着这一面（写着哪几台设备在播，见 playing_flag_sync）；它在的时候，
+# 读详情 / 剧集页 / 继续观看 / 下一集都先到门那里问一声：是【正在播的那台设备】来读的 = 播放器刚退出，
+# 「停止播放」马上就到 —— 先等它来、等 Emby 记完再放（PLAYING_WAIT_S 秒还没来、那台还在播，就是播放中
+# 播放器自己在取东西，放行）；别的设备来读的不等
+RESCUE_PLAYING = "_playing"
+PLAYING_WAIT_S = 1.5
 HEAL_GATE_SOCKET_UNIT = "/etc/systemd/system/media-stack-healgate.socket"
 HEAL_GATE_UNIT = "/etc/systemd/system/media-stack-healgate.service"
 # 一个条目的 m3u8 目录缓存多久。直链本身有自己的有效期（这台机器上是分钟级），
@@ -1570,6 +1579,9 @@ def gen_nginx_site(cfg):
         if (-f {RESCUE_HOLD_DIR}/{RESCUE_STOPPING}) {{
             rewrite ^ /__ms_hold_item last;
         }}
+        if (-f {RESCUE_HOLD_DIR}/{RESCUE_PLAYING}) {{
+            rewrite ^ /__ms_hold_item last;
+        }}
 {_px}
     }}
     # 「停止播放」那一下：先在门那里放个旗子（马上放行，不挡它），见 stopping_begin
@@ -1593,6 +1605,9 @@ def gen_nginx_site(cfg):
         if (-f {RESCUE_HOLD_DIR}/{RESCUE_STOPPING}) {{
             rewrite ^ /__ms_hold_item last;
         }}
+        if (-f {RESCUE_HOLD_DIR}/{RESCUE_PLAYING}) {{
+            rewrite ^ /__ms_hold_item last;
+        }}
 {_px}
     }}
     location = /__ms_hold_item {{
@@ -1610,8 +1625,9 @@ def gen_nginx_site(cfg):
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
         proxy_set_header X-Ms-Iid $ms_iid;
+        proxy_set_header X-Original-URI $request_uri;
         proxy_connect_timeout 3s;
-        proxy_read_timeout {RESCUE_HOLD_S + RESCUE_HOLD_STOP_S + RESCUE_STOPPING_S + 5}s;
+        proxy_read_timeout {int(RESCUE_HOLD_S + RESCUE_HOLD_STOP_S + RESCUE_STOPPING_S + PLAYING_WAIT_S + 5)}s;
     }}
 """ if sub == "emby" and gate_on else "")
         out.append(f"""
@@ -3658,10 +3674,13 @@ def do_heal_daemon():
                     t_play = time.monotonic()     # 正在播 = 醒着
             except Exception:
                 pass
+            if playing_flag_sync(key):            # 「正在播」旗子，见 RESCUE_PLAYING
+                t_play = time.monotonic()
         # 【该睡了】半小时没人按播放（醒来一次都没按过的，2 分钟）；手上的活要先干完
         _idle = (time.monotonic() - t_play > HEAL_DAEMON_IDLE_S if t_play is not None
                  else time.monotonic() - t_wake > HEAL_DAEMON_WAKE_S)
         if _idle and not pend and not kids:
+            playing_flag_clear()          # 睡了没人刷它，别留着让读页面白跑一趟门
             return
         try:
             if os.stat(me).st_mtime != m0:
@@ -4029,7 +4048,13 @@ def do_heal_gate():
             last[0] = time.monotonic()
             if self.path.startswith("/stopping"):
                 # 【「停止播放」进门】放旗子、马上放行；等 Emby 收掉这一场再拿旗子 —— 另起线程
+                # 【旗子先插好再放行】以前在另起的线程里插，紧跟着来的读页面可能赶在它前面
                 stop_at[0] = time.monotonic()
+                try:
+                    os.makedirs(RESCUE_HOLD_DIR, mode=0o755, exist_ok=True)
+                    open(os.path.join(RESCUE_HOLD_DIR, RESCUE_STOPPING), "w").close()
+                except OSError:
+                    pass
                 if key:
                     threading.Thread(target=stopping_begin,
                                      args=(key, self.headers.get("X-Original-URI") or "")).start()
@@ -4042,7 +4067,9 @@ def do_heal_gate():
                 # 【退出播放后读详情：先等进度写回】见 rescue_hold。只等、不碰网盘
                 _iid = re.sub(r"\D", "", self.headers.get("X-Ms-Iid") or "")
                 try:
-                    _ws = stopping_wait()
+                    _wp = playing_wait(key, request_device(self.headers.get("X-Original-URI") or "",
+                                                           self.headers)) if key else 0.0
+                    _ws = stopping_wait() + _wp
                     _w, _done = rescue_hold(key, _iid) if (_iid and key) else (0.0, True)
                     _w += _ws
                     if _w >= 0.5:
@@ -6945,6 +6972,83 @@ def stopping_begin(key, uri):
             os.remove(flag)
         except OSError:
             pass
+
+
+def playing_flag_sync(key):
+    """常驻服务每几秒一次：有设备在播 → 写「正在播」旗子（哪几台设备）；没有 → 拿掉。返回有没有人在播。"""
+    flag = os.path.join(RESCUE_HOLD_DIR, RESCUE_PLAYING)
+    try:
+        devs = sorted({str(se.get("DeviceId") or "") for se in (_emby("/Sessions", key, timeout=3) or [])
+                       if (se.get("NowPlayingItem") or {}).get("Id")})
+    except Exception:
+        return False
+    try:
+        if devs:
+            os.makedirs(RESCUE_HOLD_DIR, mode=0o755, exist_ok=True)
+            write_atomic(flag, json.dumps({"devs": devs}), mode=0o644)
+        elif os.path.exists(flag):
+            os.remove(flag)
+    except OSError:
+        pass
+    return bool(devs)
+
+
+def playing_flag_clear():
+    try:
+        os.remove(os.path.join(RESCUE_HOLD_DIR, RESCUE_PLAYING))
+    except OSError:
+        pass
+
+
+def request_device(uri, headers):
+    """读页面那个请求是哪台设备发的（Emby 客户端把设备号放在地址参数或认证头里）。认不出 → ""。"""
+    try:
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(uri or "").query)
+        for k, v in q.items():
+            if k.lower() in ("x-emby-device-id", "deviceid") and v:
+                return v[0]
+    except ValueError:
+        pass
+    for h in ("X-Emby-Device-Id",):
+        if headers.get(h):
+            return headers.get(h)
+    for h in ("X-Emby-Authorization", "Authorization"):
+        mm = re.search(r'DeviceId="([^"]+)"', headers.get(h) or "")
+        if mm:
+            return mm.group(1)
+    return ""
+
+
+def playing_wait(key, dev):
+    """「正在播」旗子在、而且是正在播的那台设备来读页面 → 等「停止播放」来（旗子一插就交给 stopping_wait）
+    或者那台设备的会话收掉，最多 PLAYING_WAIT_S 秒。返回等了几秒。"""
+    flag = os.path.join(RESCUE_HOLD_DIR, RESCUE_PLAYING)
+    try:
+        if time.time() - os.stat(flag).st_mtime > 15:     # 常驻服务没在刷：当它是陈的
+            playing_flag_clear()
+            return 0.0
+        with open(flag, encoding="utf-8") as f:
+            devs = json.load(f).get("devs") or []
+    except (OSError, ValueError, AttributeError):
+        return 0.0
+    if (dev and dev not in devs) or (not dev and len(devs) != 1):
+        return 0.0                    # 别的设备来读（或者分不出是谁、又不止一台在播）：不等
+    stop = os.path.join(RESCUE_HOLD_DIR, RESCUE_STOPPING)
+    t0, t_chk = time.monotonic(), 0.0
+    while time.monotonic() - t0 < PLAYING_WAIT_S:
+        if os.path.exists(stop):
+            break                     # 「停止播放」来了：接下来 stopping_wait 等 Emby 记完
+        if time.monotonic() - t_chk >= 0.5:
+            t_chk = time.monotonic()
+            try:
+                if not any((se.get("NowPlayingItem") or {}).get("Id") and
+                           (not dev or str(se.get("DeviceId") or "") == dev)
+                           for se in (_emby("/Sessions", key, timeout=2) or [])):
+                    break             # 已经收掉了（「停止播放」早一步处理完）
+            except Exception:
+                break
+        time.sleep(0.1)
+    return time.monotonic() - t0
 
 
 def stopping_wait():
