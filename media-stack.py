@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.324"
+SCRIPT_VERSION = "1.5.325"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2822,13 +2822,17 @@ def do_hls_fix():
                 tp = ""
             if not tp:
                 return ""
-            k = ""
-            if _under(tp, ali_tc_mounts() or {}):
-                k = "ali"
-            elif _under(tp, m115_now()):
-                k = "115"
-            elif _under(tp, mraw[0]):
-                k = "raw"
+            # 【先定是哪一个挂载点（最长前缀），再看它是什么盘】挨个比前缀的话，上层是阿里、下层挂着
+            # 天翼（/网盘 与 /网盘/天翼）时，天翼的片会被认成阿里
+            _m115 = m115_now()
+            _tcm = ali_tc_mounts() or {}
+            mount_of_target(d, tp)        # 顺手刷新存储表缓存（_MP_ROWS）
+            mp = next((x for x in sorted(set(_MP_ROWS[0]) | set(_tcm) | set(_m115) | set(mraw[0]),
+                                         key=len, reverse=True)
+                       if tp == x or tp.startswith(x.rstrip("/") + "/")), "")
+            k = ("ali" if mp and mp in _tcm else
+                 "115" if mp and mp in _m115 else
+                 "raw" if mp and mp in mraw[0] else "")
             kinds[vid] = (k, now)
         # 【缓存里那条死了的】开播前验出来的（link_stale_fix）：替它现换，不再为它重启 MediaWarp
         if not k:
@@ -15610,7 +15614,7 @@ def heal_pace():
     按盘记了以后（heal_pace_by）取各盘里最大的那个 —— 总名额按没被限的盘算，被限的盘自己再夹（heal_pace_of）。"""
     st = ms_state()
     try:
-        by = [int(v) for v in (st.get("heal_pace_by") or {}).values()]
+        by = [int(v) for k, v in (st.get("heal_pace_by") or {}).items() if not str(k).endswith(".strm")]
         v = max(by) if by else int(st.get("heal_pace") or HEAL_LIMIT_MAX)
     except (TypeError, ValueError):
         v = HEAL_LIMIT_MAX
@@ -15632,7 +15636,8 @@ def heal_pace_of(mp):
 
 def set_heal_pace_by(throttled, seen):
     """这一轮见过的盘：撞满限流的砍半，没撞的加一档。返回 {盘: 新配额}。"""
-    by = dict(ms_state().get("heal_pace_by") or {})
+    # 1.5.324 那版一集记一条（键是 strm 路径），顺手清掉
+    by = {k: v for k, v in (ms_state().get("heal_pace_by") or {}).items() if not str(k).endswith(".strm")}
     out = {}
     for mp in seen:
         cur = heal_pace_of(mp)
@@ -15643,8 +15648,56 @@ def set_heal_pace_by(throttled, seen):
     return out
 
 
+_MP_ROWS = [[], 0.0]
+_MP_OF = {}
+
+
+def mount_of_target(d, tp):
+    """网盘路径 → 它属于哪个挂载点（最长前缀）。认不出 → ""。存储表缓存 60 秒。"""
+    now = time.time()
+    if now - _MP_ROWS[1] > 60:
+        try:
+            _MP_ROWS[0] = sorted((str(r[1] or "") for r in _storage_rows(d) if r[1]),
+                                 key=len, reverse=True)
+        except Exception:
+            _MP_ROWS[0] = []
+        _MP_ROWS[1] = now
+    return next((m for m in _MP_ROWS[0] if tp == m or tp.startswith(m.rstrip("/") + "/")), "")
+
+
+def strm_mount(d, emby_path):
+    """Emby 里一个 strm 条目的路径 → 它属于哪个盘（OpenList 挂载点，最长前缀）。认不出 → ""。
+
+    【按 strm 里写的网盘路径认，不按 strm 文件在哪一层】挂载点可以是两层（/网盘/天翼），strm 树第一层
+    只是 /网盘；剩余网盘一次挂好几个盘时尤其要认准。只读本机 strm 文件和存储表，不碰网盘。"""
+    if not emby_path:
+        return ""
+    hit = _MP_OF.get(emby_path)
+    if hit is not None:
+        return hit
+    try:
+        with open(_strm_host_path(d, emby_path), encoding="utf-8") as f:
+            tp = strm_target_path(f.read()) or ""
+    except (OSError, TypeError):
+        return ""
+    mp = mount_of_target(d, tp)
+    if len(_MP_OF) > 5000:
+        _MP_OF.clear()
+    _MP_OF[emby_path] = mp
+    return mp
+
+
 def _heal_mp(it):
-    return str(it[4]) if len(it) > 4 and it[4] else ""
+    """补时长队列里一项（第 5 个是 Emby 里的 strm 路径）→ 它的盘。
+    【1.5.324 那版拿 strm 路径本身当盘】每一集都成了一个盘：限流永远凑不满、只停那个盘根本不生效，
+    heal_pace_by 还一集记一条。"""
+    p = str(it[4]) if len(it) > 4 and it[4] else ""
+    if not p:
+        return ""
+    try:
+        return strm_mount(ms_install_dir(), p) or ""
+    except Exception:
+        return ""
 
 
 def set_heal_pace(throttled):
@@ -16317,7 +16370,7 @@ def heal_workers():
     """
     if os.environ.get("MS_HEAL_TICK"):
         return 1
-    by = ms_state().get("heal_pace_by") or {}
+    by = {k: v for k, v in (ms_state().get("heal_pace_by") or {}).items() if not str(k).endswith(".strm")}
     best = max([heal_pace_of(m) for m in by] or [heal_pace()])
     return 1 if best <= HEAL_PACE_MIN else HEAL_WORKERS
 
@@ -24437,8 +24490,8 @@ def warm_links(d, key, limit=None):
     if _noswap:
         # 【认盘看 strm 文件路径】以前拿第三项（续播位置，一个数字）当路径去认：位置不是 0 就报错，
         # 是 0 就认不出 —— 代理型的盘从来没被跳过（1.5.324 查盘和盘互相依赖时发现）
-        _drop = [n for _i, n, _p, sr in cut if drive_of_strm((sr or {}).get("_strm") or "") in _noswap]
-        cut = [x for x in cut if drive_of_strm((x[3] or {}).get("_strm") or "") not in _noswap]
+        _drop = [n for _i, n, _p, sr in cut if strm_mount(d, (sr or {}).get("_strm") or "") in _noswap]
+        cut = [x for x in cut if strm_mount(d, (x[3] or {}).get("_strm") or "") not in _noswap]
         if _drop:
             print(f"  {DIM}跳过 {len(_drop)} 部：它们在"
                   f"{'、'.join(sorted(_noswap))} 这类盘上 —— 没有 CDN 直链可换，"
@@ -24476,7 +24529,7 @@ def warm_links(d, key, limit=None):
     # 【按盘轮流热】以前按「继续观看 → 新加 → 老片」一溜排下去，一个盘慢（一部最多等 WARM_STEP_T 秒）
     # 就把 WARM_BUDGET 吃光，排在后面的别的盘一部都热不上。现在各盘轮流来一部，同一个盘里照旧按原顺序
     def _mp_of(x):
-        return drive_of_strm((x[3] or {}).get("_strm") or "")
+        return strm_mount(d, (x[3] or {}).get("_strm") or "")
     _groups = {}
     for x in cut:
         _groups.setdefault(_mp_of(x), []).append(x)
