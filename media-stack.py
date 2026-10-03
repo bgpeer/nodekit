@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.328"
+SCRIPT_VERSION = "1.5.329"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1800,6 +1800,7 @@ case "${1:-info}" in
   covers --retry 截失败过的也重新试一遍
   covers-mount <挂载点>  这个盘没图的全部截一次（菜单「截封面」在后台跑的就是它）
   covers-new      生成媒体库后新加的、没刮到图的截一帧（生成完自动在后台跑）
+  meta-refresh <挂载点>  这个盘没简介的补一次元数据（菜单「刷新元数据」的自动那一轮；自动关着不跑）
   play-watch <片名> [--min 分钟]  你用手机播，它盯着：视频走没走服务器、Emby 怎么播的
   ali-check <片名>        阿里转码流这一部的地址多久过期（只读）
   115-check <片名>        115 这一部卡在哪一段（只读）
@@ -2028,6 +2029,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" covers-mount "$@" ;;
+  meta-refresh)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" meta-refresh "$@" ;;
   name-fix)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -2200,6 +2206,7 @@ CRON_TIMEOUT   = {
     "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
     # 只读 /proc + 每个容器两条 docker 命令，几十毫秒的事；给 60 秒够宽了
     "traffic-sample": 60,
+    "meta-refresh": 1800,                    # 一轮最多 120 个刷新请求，Emby 后台排队
 }
 
 
@@ -9830,6 +9837,133 @@ def reidentify_items(key, ids):
     return n
 
 
+# ---- 每个盘的「刷新元数据」：只补没简介的 ----
+# 【为什么要有】真机 10/03：吞噬星空 238 集以前有简介，239 起没有 —— 那几集是首播后一两天就入库的，
+# 那时 TMDb 上还没人写中文简介；Emby 只在入库那一刻刮一次，而初次导入后的自动联网刷新是脚本关掉的
+# （AutomaticRefreshIntervalDays=0，开着会把 strm 的音视频轨刷没），于是 TMDb 后来补上了也拿不回来。
+# 【只刷没简介的，不全库刷】仓库主人：「如果全部刷新是不是很消耗流量」—— 刷元数据本身只问 TMDb
+# 几 KB，但 FullRefresh 会清掉音视频轨，补回来要去网盘探一次（每集几 MB）。所以只挑没简介的。
+# 【自动默认关】仓库主人：「自动刷新可以设置时间，默认关，如果开默认北京时间夜间」。
+META_CRON        = "/etc/cron.d/media-stack-meta"
+META_DEFAULT_CST = "03:30"     # 躲开 03:00 规则刷新、03:10 每月 nginx 升级、04:10 起那一串
+META_PER_RUN     = 120         # 一轮最多刷几部，跟 EP_REIDENT_MAX 一个道理
+META_AUTO_DAYS   = 60          # 自动只看入库 60 天内的：更老的 TMDb 多半一直不会有
+META_FRESH_DAYS  = 14          # 入库两周内的每晚试一次；之后一周试一次（每试一次要补一次轨）
+
+
+def meta_auto_of(mp):
+    """这个盘的自动刷新元数据：每天几点（北京时间 "HH:MM"）；关 → ""。"""
+    v = (ms_state().get("meta_auto") or {}).get(mp)
+    return v if isinstance(v, str) and re.match(r"^\d{2}:\d{2}$", v) else ""
+
+
+def _iso_ts(s):
+    import calendar
+    try:
+        return calendar.timegm(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, TypeError):
+        return 0
+
+
+def items_missing_overview(d, key, mp):
+    """这个盘里没简介的电影 / 剧集，新入库的排前面 → [条目]；问不到 Emby → None。"""
+    out, start, page = [], 0, 500
+    while True:
+        try:
+            r = _emby(f"/Items?Recursive=true&IncludeItemTypes=Episode,Movie"
+                      f"&Fields=Overview,Path,DateCreated"
+                      f"&StartIndex={start}&Limit={page}", key, timeout=60) or {}
+        except Exception:
+            return None
+        items = r.get("Items") or []
+        out.extend(i for i in items if not (i.get("Overview") or "").strip()
+                   and str(i.get("Path") or "").endswith(".strm"))
+        start += len(items)
+        if not items or start >= int(r.get("TotalRecordCount") or 0):
+            break
+    _mts = [str(x[1] or "") for x in _storage_rows(d)]
+    out = [i for i in out if strm_in_mount(d, i.get("Path"), mp, _mts)]
+    out.sort(key=lambda i: _iso_ts(i.get("DateCreated")), reverse=True)
+    return out
+
+
+def meta_refresh(d, key, mp, auto=False):
+    """叫 Emby 给这个盘没简介的条目补一次元数据。返回 (发出去几个, 还剩几个没轮上)；问不到 → None。
+
+    【FullRefresh + ReplaceAllMetadata=false】= Emby 界面上的「搜索缺少的元数据」：只补空着的字段，
+    片名、季集编号（nfo 里的）都不动。Default 模式不去问 TMDb。代价是音视频轨被清掉 —— 排进
+    heal_later，几分钟后补回来（refresh_items / reidentify_items 同一个办法）。
+    auto：只看入库 META_AUTO_DAYS 天内的，按 META_FRESH_DAYS 退避 —— TMDb 一直没写的那几集，
+    不能每晚都刷一遍、每晚都去网盘补一遍轨。"""
+    todo = items_missing_overview(d, key, mp)
+    if todo is None:
+        return None
+    now = time.time()
+    tried = {k: v for k, v in (ms_state().get("meta_tried") or {}).items()
+             if isinstance(v, (int, float)) and now - v < META_AUTO_DAYS * 86400}
+    if auto:
+        def due(i):
+            age = now - _iso_ts(i.get("DateCreated"))
+            if age > META_AUTO_DAYS * 86400:
+                return False
+            gap = (1 if age < META_FRESH_DAYS * 86400 else 7) * 86400 - 3600
+            return now - tried.get(str(i.get("Id")), 0) >= gap
+        todo = [i for i in todo if due(i)]
+    go, n = todo[:META_PER_RUN], []
+    for i in go:
+        iid = str(i.get("Id") or "")
+        if not iid:
+            continue
+        try:
+            _emby(f"/Items/{iid}/Refresh?MetadataRefreshMode=FullRefresh"
+                  f"&ImageRefreshMode=Default"
+                  f"&ReplaceAllMetadata=false&ReplaceAllImages=false",
+                  key, method="POST", timeout=30)
+            n.append(iid)
+        except Exception:
+            continue
+    heal_later_add(n)
+    for iid in n:
+        tried[iid] = int(now)
+    save_ms_state(meta_tried=tried)
+    return len(n), len(todo) - len(go)
+
+
+def install_meta_cron():
+    """按各盘的自动刷新元数据时刻写 cron；一个都没开就把文件删掉。"""
+    import shlex
+    on = {mp: t for mp, t in (ms_state().get("meta_auto") or {}).items() if meta_auto_of(mp)}
+    try:
+        if not on:
+            if os.path.exists(META_CRON):
+                os.remove(META_CRON)
+            return True
+        lines = ["# media-stack 各盘自动刷新元数据（只补没简介的；时刻是北京时间换算成本机的）",
+                 "SHELL=/bin/bash",
+                 "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"]
+        for mp, t in sorted(on.items()):
+            m, h = cst_to_local_cron(t)
+            lines.append(f"{m} {h} * * * root {cron_cmd('meta-refresh')} {shlex.quote(mp)} "
+                         f">/dev/null 2>&1")
+        write_atomic(META_CRON, "\n".join(lines) + "\n", mode=0o644)
+        return True
+    except OSError as e:
+        warn(f"写定时任务失败：{_short_err(e)}")
+        return False
+
+
+def do_meta_refresh(mp):
+    """media-stack meta-refresh <挂载点>：cron 调的自动那一轮。"""
+    sub = "meta-" + hashlib.md5(mp.encode("utf-8")).hexdigest()[:10]
+    if not meta_auto_of(mp) or not take_task_lock(sub):
+        return
+    d = ms_install_dir()
+    key = read_emby_api_key(d)
+    if key:
+        meta_refresh(d, key, mp, auto=True)
+    release_task_lock(sub)
+
+
 def episodes_without_image(d, rules, key, items=None):
     """自己没有缩略图的剧集。返回 {strm 宿主机路径: 条目 id}；问不到返回 None。
 
@@ -12298,7 +12432,7 @@ def do_uninstall():
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
               KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, TRAFFIC_CRON,
-              HEAL_CRON):
+              HEAL_CRON, META_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     ok("已移除密码文件和管理命令")
@@ -23406,6 +23540,9 @@ def _drive_menu(d, mp, drv, mounted=True):
             add("补时长", "当前：" + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
                                      f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"),
                 lambda: _heal_mount_toggle(mp), False)
+            _ma = meta_auto_of(mp)
+            add("刷新元数据", "自动：" + (f"{CYAN}每天 {_ma}（北京时间）{RST}" if _ma else f"{DIM}关{RST}"),
+                lambda: _meta_menu(d, mp), False)
 
         for i, (label, val, _fn, _nm) in enumerate(items, 1):
             no = str(i)
@@ -23425,6 +23562,62 @@ def _drive_menu(d, mp, drv, mounted=True):
                  + (f"先选 {mount_no} 挂上。" if mount_no else "先挂上。"))
             continue
         fn()
+
+
+def _meta_menu(d, mp):
+    """单个盘的「刷新元数据」：手动刷一次 / 自动每天几点（默认关）。只刷没简介的，见 meta_refresh。"""
+    while True:
+        at = meta_auto_of(mp)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}刷新元数据{RST}   {CYAN}{mp}{RST}")
+        print("-" * 60)
+        print(f"  1. 手动刷新          {DIM}只刷没简介的{RST}")
+        print(f"  2. 自动刷新          当前：" + (f"{CYAN}每天 {at}（北京时间）{RST}" if at else f"{DIM}关{RST}"))
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        if c == "1":
+            key = read_emby_api_key(d)
+            if not key:
+                warn("没有 Emby API Key（「7 设置 → 1」），问不了 Emby。")
+                continue
+            todo = items_missing_overview(d, key, mp)
+            if todo is None:
+                warn("问不到 Emby，等它起来再试。")
+                continue
+            if not todo:
+                ok("这个盘的片都有简介了。")
+                continue
+            tip("刷完 Emby 会清掉这几部的音视频轨，几分钟后自动补回（每部从网盘拉几 MB）")
+            if not ask_yn(f"{len(todo)} 部没简介，刷一次？", True):
+                continue
+            r = meta_refresh(d, key, mp)
+            if r is None:
+                warn("问不到 Emby，等它起来再试。")
+            else:
+                ok(f"已叫 Emby 刷 {r[0]} 部，一两分钟后看；TMDb 上也没有的照样空着"
+                   + (f"（还有 {r[1]} 部下次再刷）" if r[1] else ""))
+        elif c == "2":
+            v = ask("每天几点（北京时间，如 03:30；0 = 关）", at or META_DEFAULT_CST).strip()
+            cur = dict(ms_state().get("meta_auto") or {})
+            if v == "0":
+                cur.pop(mp, None)
+                save_ms_state(meta_auto=cur)
+                install_meta_cron()
+                ok("自动刷新元数据：关")
+                continue
+            m = re.match(r"^(\d{1,2})[:.：]?(\d{2})$", v)
+            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                print("看不懂这个时刻（像 03:30），没有改动。")
+                continue
+            cur[mp] = f"{int(m.group(1)):02d}:{m.group(2)}"
+            save_ms_state(meta_auto=cur)
+            if install_meta_cron():
+                ok(f"自动刷新元数据：每天 {cur[mp]}（北京时间）")
+        else:
+            print("无效选择。")
 
 
 def _qtv_pick_menu():
@@ -27014,6 +27207,10 @@ if __name__ == "__main__":
             require_root()
             if len(sys.argv) > 2:
                 do_covers_mount(sys.argv[2])
+        elif arg == "meta-refresh":       # 各盘自动刷新元数据（cron，只补没简介的）
+            require_root()
+            if len(sys.argv) > 2:
+                do_meta_refresh(sys.argv[2])
         elif arg == "covers":             # 没刮到封面的：截一帧当封面
             require_root()
             do_covers(retry="--retry" in sys.argv[2:])
