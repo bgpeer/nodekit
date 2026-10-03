@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.330"
+SCRIPT_VERSION = "1.5.331"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23967,12 +23967,22 @@ def _rest_menu(d):
         print(f"  6. 名称重定义        当前：{CYAN}"
               + ("清洗后的名字" if rename_policy() == "on" else "网盘原名") + RST)
         print(f"  7. 组里单个盘的设置")
+        # 【单个盘那一屏有的，这里也要有】仓库主人：「这个剩余网盘里面比那个独立盘缺少好多功能啊」。
+        # 截封面、补时长、刷新元数据都是按盘各管各的（盘和盘独立），这里先挑盘再进那个盘自己那一屏
+        _hon = sum(1 for m in rest if heal_mount_on(m))
+        _mon = sum(1 for m in rest if meta_auto_of(m))
+        print(f"  8. 截封面            {DIM}按盘截{RST}")
+        print(f"  9. 补时长            当前："
+              + (f"{DIM}关（总开关关着）{RST}" if not heal_auto_on()
+                 else f"{CYAN}开 {_hon}/{len(rest)} 个盘{RST}" if rest else f"{DIM}没有剩余的盘{RST}"))
+        print(f"  10. 刷新元数据       自动："
+              + (f"{CYAN}开 {_mon}/{len(rest)} 个盘{RST}" if _mon else f"{DIM}关{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        if c in ("5", "7"):
+        if c in ("5", "7", "8", "9", "10"):
             if not rest:
                 warn("没有剩余的盘（每个盘都单独设过路径了）。")
                 continue
@@ -23981,6 +23991,12 @@ def _rest_menu(d):
                 continue
             if c == "5":
                 _skip_dirs_menu(d, mp)
+            elif c == "8":
+                _covers_menu(d, mp)
+            elif c == "9":
+                _heal_mount_toggle(mp)
+            elif c == "10":
+                _meta_menu(d, mp)
             else:
                 drv = next((dv for m, dv, *_x in openlist_storages(d) if m == mp), "")
                 _drive_menu(d, mp, drv)
