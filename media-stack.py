@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.320"
+SCRIPT_VERSION = "1.5.321"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19279,9 +19279,13 @@ def _qr115_new():
             state, last_err = None, _short_err(e)
         if state in (2, -1, -2):
             break
-        msg = {0: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(state)
-        if msg is None:
-            msg = f"重试中（{last_err[:24]}）" if last_err else f"状态 {state}"
+        # 【没回状态 = 还没人扫】115 的状态接口是长轮询，没人扫时常常一个状态都不给；
+        # 以前照原样印「状态 None」（真机 10/03），看着像出错了
+        msg = {0: "等待扫码…", None: "等待扫码…", 1: "已扫到，请在手机上点「确认登录」…"}.get(state)
+        if last_err:
+            msg = f"重试中（{last_err[:24]}）"
+        elif msg is None:
+            msg = f"状态 {state}"
         left = int(deadline - time.time())
         print(f"\r    {DIM}{pad(msg, 40)}还剩 {left // 60}:{left % 60:02d}{RST}",
               end="", flush=True)
@@ -21379,7 +21383,8 @@ def qr115_status(uid, tm, sign):
                 1: "扫了但还没在手机上点确认",
                 0: "还没扫码",
                 -1: "已过期，要重新制作",
-                -2: "手机上取消过了"}.get(st, f"状态 {st}")
+                -2: "手机上取消过了",
+                None: "查不到状态（多半已经用过或过期）"}.get(st, f"状态 {st}")
 
 
 def qr115_login(d=None, mp=None):
