@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.318"
+SCRIPT_VERSION = "1.5.319"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19258,7 +19258,7 @@ def _qr115_new():
     if lines:
         print("\n".join(lines))
         print()
-    tip("115 App 扫一扫" + ("上面的码；扫不了就" if lines else "：")
+    tip("115 App 扫一扫" + (f"上面的码{qr_both_note()}；扫不了就" if lines else "：")
         + "手机浏览器打开二维码地址 → 存图 → 从相册选图")
     print()
     info("等你扫码确认，最多 5 分钟（Ctrl-C 可中断）")
@@ -19669,7 +19669,7 @@ def _qtv_relogin_flow(d, mp):
         print()
         if link:
             print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
-    tip("夸克 App 扫一扫，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else "")
+    tip(f"夸克 App 扫一扫{qr_both_note()}，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else "")
         if lines else "二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
     while True:
         c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
@@ -19877,9 +19877,48 @@ def qr_grid_from_b64(b64, side=400):
 
 
 def qr_from_jpeg_b64(b64, side=400):
-    """base64 的二维码图片 → 终端行。画不出来返回 []。"""
+    """base64 的二维码图片 → 终端行（见 qr_screen）。画不出来返回 []。"""
     grid = qr_grid_from_b64(b64, side)
-    return qr_lines(grid) if grid else []
+    return qr_screen(grid) if grid else []
+
+
+# 【每个盘的码都画两种】仓库主人：「几个盘最好都是做成两种，避免出现扫不上的问题」。阿里那边
+# （alitv_scan_login）先做了「上原样、下拉方」；夸克（挂盘、重新登录、本机登录）和 115 的码都走这里。
+# 终端量得出字格 / 输 w 挑过档 → 只画那一个；都没有 → 上面原样（原码）、下面拉宽 1.25 倍（重编的
+# 小码，见 qr_compact；重编不了就拿原码拉），竖屏放不下就只画原样。原样那个永远是网盘给的原码，
+# 重编哪怕出了岔子，上面那个照样能扫
+_QR_BOTH = [False]          # 上一次 qr_screen 画了两个没有（调用方的提示行要跟着说）
+_QR_RATIO = []              # 终端字格比例，一个进程只问一次（不回的终端每问一次要等 1 秒）
+
+
+def qr_cell_ratio():
+    if not _QR_RATIO:
+        _QR_RATIO.append(term_cell_ratio())
+    return _QR_RATIO[0]
+
+
+def qr_screen(grid, must=""):
+    """模块矩阵 → 屏上的行：一个或上下两个码（见上）。"""
+    cols = shutil.get_terminal_size((80, 24)).columns
+    r = qr_cell_ratio()
+    sv = (min(r, 1.6) if r > 1.06 else 1.0) if r else qr_stretch()
+    both = r is None and sv == 1.0
+    small = qr_compact(grid, must) if (both or sv != 1.0) else grid
+    _QR_BOTH[0] = False
+    if not both:
+        g = grid if sv == 1.0 else small
+        if qr_width(g, sv) > cols:
+            g, sv = grid, 1.0
+        return qr_lines(g, stretch=sv)
+    out = qr_lines(grid, stretch=1.0)
+    if qr_width(small, 1.25) <= cols:
+        out += [""] + qr_lines(small, stretch=1.25)
+        _QR_BOTH[0] = True
+    return out
+
+
+def qr_both_note():
+    return "（两个码哪个扫得上用哪个）" if _QR_BOTH[0] else ""
 
 # 【二维码 → 文字】终端扫不了码的时候（有的 SSH 客户端画出来行距对不上），把二维码里写的
 # 那串地址也打出来，手机上直接点开。只认版本 1~20（登录码一两百个字符，远用不到更大），
@@ -20158,6 +20197,8 @@ def qr_compact(grid, must=""):
         t = qr_decode(grid)
         if not t or (must and must not in t):
             return grid
+        if not must and not re.fullmatch(r"[\x20-\x7e]+", t):
+            return grid               # 没东西对照时只认全是可见字符的：解歪了多半有怪字
         g2 = qr_encode(t)
         return g2 if g2 and len(g2) < len(grid) and qr_decode(g2) == t else grid
     except Exception:
@@ -20170,7 +20211,7 @@ def qr_link_of(b64, side=400):
     if not grid:
         return [], ""
     t = qr_decode(grid)
-    return qr_lines(grid), (t if re.fullmatch(r"https?://[\x21-\x7e]+", t or "") else "")
+    return qr_screen(grid), (t if re.fullmatch(r"https?://[\x21-\x7e]+", t or "") else "")
 
 
 
@@ -20219,7 +20260,7 @@ def _add_qtv_flow(d):
         print()
         if link:
             print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
-        tip("夸克 App 扫一扫，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
+        tip(f"夸克 App 扫一扫{qr_both_note()}，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
     else:
         tip("二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
     while True:
@@ -20393,7 +20434,7 @@ def do_quark_login():
     print()
     if link:
         print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
-    tip("夸克 App 扫一扫，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
+    tip(f"夸克 App 扫一扫{qr_both_note()}，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
     while True:
         c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
         if c == "q":
