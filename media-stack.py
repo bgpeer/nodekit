@@ -46,7 +46,7 @@ HTTP_UA = "curl/8.5.0"
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.317"
+SCRIPT_VERSION = "1.5.318"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19771,7 +19771,7 @@ def _qr_sample(px, w, h, x0, y0, m, n, thr):
 # 终端不告诉我们字格多高，所以让人自己挑：等扫码时输 w 回车按这几档轮着拉宽，挑中的记住，下次直接用。
 # 拉宽要多占列数，屏不够宽就不画（折行的码更没法扫），说一句先双指缩小字体。
 QR_STRETCH_STEPS = (1.0, 1.25, 1.5)
-QR_AUTO_ROTATE_S = 20         # 一档画出来这么久还没人扫到，就自己换下一档（见 alitv_scan_login）
+QR_AUTO_ROTATE_S = 20         # 只画一个码时这么久还没人扫到，就换成两个都画（见 alitv_scan_login）
 
 
 def qr_stretch():
@@ -20882,30 +20882,44 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
         g = grid if sv == 1.0 or not small else small
         return g, qr_width(g, sv)
 
+    # 【不知道哪档方就两个都画】仓库主人：「你直接做两个出来不行吗一个方的一个扁的」。终端量不出字格、
+    # 也没挑过档（记住的是原样）时，上面画原样、下面画拉宽 1.25 倍，哪个扫得上用哪个，不用等也不用按键。
+    # 两个都用重编的小码（37 格左右），一屏摞得下；拉宽那个竖屏放不下就只画原样那个。
+    # 量出来了 / 挑过档就只画那一个；它 QR_AUTO_ROTATE_S 秒没人扫到，再换成两个都画
+    both = [stretch[0] == 1.0 and _r is None]      # 量出来了（哪怕是方的）就不猜
+    cols = shutil.get_terminal_size((80, 24)).columns
+
     def _draw():
         print()
-        if grid:
+        if grid and both[0]:
+            g = small or grid
+            print("\n".join(qr_lines(g, stretch=1.0)))
+            print()
+            if small and qr_width(small, 1.25) <= cols:
+                print("\n".join(qr_lines(small, stretch=1.25)))
+                print()
+        elif grid:
             sv = stretch[0]
             g, need = _pick(sv)
-            if need > shutil.get_terminal_size((80, 24)).columns:
+            if need > cols:
                 g, sv = grid, 1.0                 # 屏放不下：画原码，不折行
             print("\n".join(qr_lines(g, stretch=sv)))
             print()
         # 【链接照留】终端画得不好扫不了的，手机浏览器打开图片地址 → 存图 → 阿里云盘 App 从相册扫
         print(f"  {BOLD}二维码{RST}  {CYAN}{img}{RST}")
-        tip(f"阿里云盘 App 扫一扫；扫不上码会每 {QR_AUTO_ROTATE_S} 秒自己换个宽度（也可输 w 回车换）"
+        tip(("阿里云盘 App 扫一扫，两个码哪个扫得上用哪个" if both[0] and small
+             else "阿里云盘 App 扫一扫；扫不上输 w 回车换宽度，或手机浏览器打开上面的地址存图再扫")
             if grid else "手机浏览器打开上面的地址存图，阿里云盘 App 从相册扫")
         info(f"等你扫码确认，最多 {wait_s // 60} 分钟（Ctrl-C 可中断）")
     _draw()
     deadline = time.time() + wait_s
-    # 【没人扫就自己换宽度】仓库主人：「方正的扫码成功了，就没有更好的方案吗有的人他不会输入 W 的」。
-    # 不少手机 SSH 工具不回字格尺寸（term_cell_ratio 量不到），码是不是方的只有看屏的人知道。
-    # 所以一档画出来 QR_AUTO_ROTATE_S 秒还没人扫到，就自己换下一档重画（放得下的才换）；
-    # 扫到了（ScanSuccess）就停，并记住这一档，下次一出来就是它。输过 w 就交给人手，不再自己换
-    auto, shown, cols = [True], [time.monotonic()], shutil.get_terminal_size((80, 24)).columns
+    # 【只画一个时没人扫到就两个都画】仓库主人：「有的人他不会输入 W 的」。记住的那档 / 量出来的那档
+    # 画出来 QR_AUTO_ROTATE_S 秒还没人扫到（换了 SSH 工具、字体），就换成两个都画。
+    # 只画一个时扫到了才记住那一档；两个都画时不知道扫的是哪个，不记
+    auto, shown = [True], [time.monotonic()]
 
     def _remember():
-        if stretch[0] in QR_STRETCH_STEPS and stretch[0] != qr_stretch():
+        if not both[0] and stretch[0] in QR_STRETCH_STEPS and stretch[0] != qr_stretch():
             save_ms_state(qr_stretch=stretch[0])
     try:
         while time.time() < deadline:
@@ -20913,7 +20927,7 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
                 nv = qr_stretch_key(poll, stretch[0], lambda sv: _pick(sv)[1])
                 if nv:
                     stretch[0] = nv
-                    auto[0] = False
+                    auto[0] = both[0] = False
                     _draw()
                     shown[0] = time.monotonic()
                     continue
@@ -20924,15 +20938,12 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
             if st in ("ScanSuccess", "LoginSuccess"):
                 auto[0] = False
                 _remember()
-            elif grid and auto[0] and time.monotonic() - shown[0] >= QR_AUTO_ROTATE_S:
-                i = QR_STRETCH_STEPS.index(stretch[0]) if stretch[0] in QR_STRETCH_STEPS else -1
-                nxt = [x for x in QR_STRETCH_STEPS[i + 1:] + QR_STRETCH_STEPS[:i + 1]
-                       if x != stretch[0] and _pick(x)[1] <= cols]
-                if nxt:
-                    stretch[0] = nxt[0]
-                    print("\r\x1b[2K", end="")
-                    _draw()
-                shown[0] = time.monotonic()
+            elif (grid and small and auto[0] and not both[0]
+                  and time.monotonic() - shown[0] >= QR_AUTO_ROTATE_S):
+                both[0] = True
+                auto[0] = False
+                print("\r\x1b[2K", end="")
+                _draw()
             if st == "LoginSuccess" and code:
                 print("\r\x1b[2K", end="")
                 try:
