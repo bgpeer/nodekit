@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.334"
+SCRIPT_VERSION = "1.5.335"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11853,6 +11853,33 @@ def emby_users(key):
         return []
 
 
+def emby_wizard_done():
+    """Emby 的首次设置（建管理员账号）做完没有。问不到 → None。公开接口，不要 API Key。"""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8096/System/Info/Public", timeout=5) as r:
+            return bool(json.loads(r.read() or b"{}").get("StartupWizardCompleted"))
+    except Exception:
+        return None
+
+
+def first_steps(d, key=None, stores=None, n_strm=None):
+    """「第一次用」那几步 → [(做完没有, 这一步说什么)]。全做完了调用方就不印。
+
+    仓库主人：「这个使用信息有没有什么要更新的，比如第一步就叫人家要先创建 emby 帐号」。
+    顺序就是真要做的顺序：没有管理员账号建不了 API Key；没有 API Key MediaWarp 不 302；
+    没挂盘生成不出东西。"""
+    key = read_emby_api_key(d) if key is None else key
+    stores = openlist_storages(d) if stores is None else stores
+    n_strm = strm_count(d) if n_strm is None else n_strm
+    wiz = emby_wizard_done()
+    return [
+        (bool(wiz) or bool(key), "打开上面的 Emby 地址，建管理员账号"),
+        (bool(key), "Emby → 设置 → 高级 → API 密钥 → 新建，填到「7 设置 → 1」"),
+        (bool(stores), "「3 挂载路径」里挂网盘（115 / 夸克 TV / 阿里扫码，WebDAV 填地址）"),
+        (bool(n_strm), "「4 生成媒体库」，再用外部播放器登录 Emby"),
+    ]
+
+
 def show_info():
     """使用信息：把怎么进、用什么账号密码，全部从落盘的配置里读出来打印。
        不写死任何值 —— 用户改过、重跑过，这里显示的都得是当前真正生效的。"""
@@ -11889,6 +11916,14 @@ def show_info():
         if container == "emby":
             emby_url, emby_port = url, shown
 
+    # 【第一次用：按顺序做的几步】全做完了整段不印 —— 装好用着的人每次进来不用再看一遍
+    _stores, _n = openlist_storages(d), strm_count(d)
+    _steps = first_steps(d, stores=_stores, n_strm=_n)
+    if not all(ok_ for ok_, _t in _steps):
+        print(f"\n  {BOLD}▸ 第一次用：按顺序做{RST}")
+        for i, (ok_, t) in enumerate(_steps, 1):
+            print(f"      {GREEN}✔{RST} {DIM}{i}. {t}{RST}" if ok_ else f"      {YELLOW}{BOLD}➜ {i}. {t}{RST}")
+
     # 外部播放器（Hills / Infuse / Emby 官方 App…）单独列一段，因为有那个【必须填
     # MediaWarp 地址】的坑：Emby 自己的 8096 只绑 127.0.0.1，外面本来就连不到，但内网里
     # 直接连它是连得上的 —— 而那样会整个绕过 302，视频改由本机中转，又慢又烧流量，
@@ -11922,9 +11957,12 @@ def show_info():
     # 阿里的 alipan_type 要和取令牌那页的下拉框配对：default → 「阿里云盘 (OAuth2) 扫码登录」，
     # alipanTV → 「阿里云盘 (Client) TV版扫码」；不配对 → empty token returned from official API。
     # 授权时去掉「备份盘」（手机相册会变成一堆刮不出海报的条目）；只要刷新令牌。
-    print(f"\n  {BOLD}▸ 挂网盘要的令牌{RST}")
-    print(f"      {CYAN}{BOLD}https://api.oplist.org/{RST}   {DIM}打不开换 .cn{RST}")
-    tip("阿里：下拉框要和 OpenList 里的账户类型配对；只要刷新令牌；授权时去掉「备份盘」")
+    # 【挂盘先说脚本里能扫码挂的】115、夸克 TV、阿里、WebDAV 都能在「3 挂载路径」里挂，不用去 OpenList 网页、
+    # 也不用去取令牌的网站；别的盘、或者阿里选了「贴令牌」才要那个网站
+    print(f"\n  {BOLD}▸ 挂网盘{RST}")
+    print(f"      「3 挂载路径」里挂：115 / 夸克 TV / 阿里扫码，WebDAV 填地址")
+    print(f"      别的盘去 OpenList 网页挂，令牌在 {CYAN}{BOLD}https://api.oplist.org/{RST} {DIM}打不开换 .cn{RST}")
+    tip("阿里贴令牌时：下拉框要和接口配对；只要刷新令牌；授权时去掉「备份盘」")
 
     print(f"\n  {BOLD}▸ 常用命令{RST}")
     print(f"      {GREEN}{BOLD}emby{RST}                甩出面板地址")
@@ -11932,6 +11970,7 @@ def show_info():
     print(f"      {GREEN}{BOLD}media-stack 302{RST}     播一集看有没有 302，验证直链是否真生效")
     print(f"      {GREEN}{BOLD}media-stack strm{RST}    立刻跑一次 strm 生成")
     print(f"      {GREEN}{BOLD}media-stack logs{RST} <服务>   跟踪日志")
+    print(f"      {GREEN}{BOLD}media-stack help{RST}    全部命令（流量账本、开播报告、补时长流水……）")
 
     print(f"\n  {BOLD}▸ 路径{RST}")
     print(f"      安装目录   {d}")
@@ -11946,11 +11985,13 @@ def show_info():
     #   · status 字段装的是整条 Go 错误，里面带着 access_token —— 而这一屏最常被截图
     #   · 而且它是【存储初始化那一刻】写进去的，之后恢复了也不会改回 work，拿它当实时
     #     状态用会把陈年记录报成当前故障
-    stores = openlist_storages(d)
+    stores = _stores
     if stores:
         print(f"\n  {BOLD}▸ 网盘挂载{RST}")
+        # 驱动名那一列按最长的那个留宽：AliyundriveOpen 15 个字，以前留 12 跟后面那列粘在一起
+        _w = max(12, max(len(str(x[1] or "")) for x in stores) + 2)
         for mp, drv, status, root, mode in stores:
-            print(f"      {pad(mp, 14)}{pad(drv, 12)}"
+            print(f"      {pad(mp, 14)}{pad(drv, _w)}"
                   + (f"{DIM}根文件夹ID={root}{RST}" if root else "")
                   + (f"{DIM}　接口 {mode}{RST}" if mode else ""))
         if any(s != "work" for _m, _d, s, _r, _x in stores):
@@ -11958,7 +11999,7 @@ def show_info():
                   f"{DIM} —— 跑「5 链路体检」看现在通不通、怎么修{RST}")
 
     # strm 数量是判断「Emby 里为什么是空的」最直接的指标，放在容器状态前面
-    n = strm_count(d)
+    n = _n
     print(f"\n  {BOLD}▸ 媒体库内容{RST}")
     if n:
         print(f"      已生成 {GREEN}{BOLD}{n}{RST} 个 strm")
@@ -11968,7 +12009,7 @@ def show_info():
             print(f"      自动生成 {cron_human(cron)}")
     else:
         print(f"      {YELLOW}{BOLD}0 个 strm —— Emby 里现在是空的{RST}")
-        tip(f"先在 OpenList 里挂网盘（夸克根文件夹ID 填 0），再点「4 生成媒体库」")
+        tip("先在「3 挂载路径」里挂网盘，再点「4 生成媒体库」")
 
     if metatube_on(d):
         print(f"\n  {BOLD}▸ MetaTube 番号刮削{RST}")
