@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.336"
+SCRIPT_VERSION = "1.5.337"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4184,6 +4184,7 @@ def do_heal_gate():
                     open(os.path.join(RESCUE_HOLD_DIR, RESCUE_STOPPING), "w").close()
                 except OSError:
                     pass
+                note_play()
                 if key:
                     threading.Thread(target=stopping_begin,
                                      args=(key, self.headers.get("X-Original-URI") or "")).start()
@@ -4251,6 +4252,7 @@ def do_heal_gate():
                             fresh = stream_ok.get(iid, 0) > t_in
                             ev = busy.get(iid)
                         if not fresh:
+                            note_play()
                             started = False
                             if ev is None and heal_auto_on():
                                 need = strm_items_need_heal(key, [iid])
@@ -4299,6 +4301,7 @@ def do_heal_gate():
                         _play = True
                 if m and key and _play:
                     iid = m.group(1)
+                    note_play()
                     t_in = time.monotonic()
                     _tm["iid"], _tm["t0"] = iid, t_in
                     with lock:
@@ -5766,16 +5769,32 @@ _HEAL_YIELD = False
 _PLAYING_AT = [0.0, False]
 
 
+def note_play(now=None):
+    """记一笔：刚有人按了播放 / 在播 / 停止播放。整队补积压看它让路（见 heal_backlog_hold）。
+
+    【为什么不能只看「点了立刻补」那个服务醒没醒】真机 10/04 12:40：跑「8 更新」会把那个服务停掉重装，
+    它一停就「睡着了」；更新顺手在后台起一轮对齐，整队一看没人醒着就开补 —— 45 部、约 298 MB，
+    12:41 你点了播放它也没停，一直补到 12:46。开播门、每分钟那一轮看见播放都记一笔，更新重启谁都不丢。
+    30 秒内记过就不再写（播放中每两三秒一个请求）。"""
+    now = int(now or time.time())
+    try:
+        if now - int(ms_state().get("last_play_ts") or 0) >= 30:
+            save_ms_state(last_play_ts=now)
+    except Exception:
+        pass
+
+
 def someone_playing(key, cache_s=0):
-    """此刻有没有人在 Emby 里播东西（不管哪一部）。问不到当没有 —— 别因为"不知道"
-    就把后台活全停了。cache_s>0 时这么多秒内复用上一次的答案（轮内每个条目都要问）。"""
+    """此刻有没有人在 Emby 里播东西（不管哪一部）→ True / False；问不到 → None（当没有用：
+    别因为"不知道"就把后台活全停了；整队补积压那边把 None 当成要让路，见 heal_backlog_hold）。
+    cache_s>0 时这么多秒内复用上一次的答案（轮内每个条目都要问）。"""
     if cache_s and time.monotonic() - _PLAYING_AT[0] < cache_s:
         return _PLAYING_AT[1]
     try:
         on = any((se.get("NowPlayingItem") or {}).get("Id")
                  for se in (_emby("/Sessions", key, timeout=15) or []))
     except Exception:
-        on = False
+        on = None
     _PLAYING_AT[0], _PLAYING_AT[1] = time.monotonic(), on
     return on
 
@@ -5797,10 +5816,19 @@ def heal_backlog_hold(key, cache_s=0):
     if cache_s and time.monotonic() - _HELD_AT[0] < cache_s and _HELD_AT[1] is not None:
         return _HELD_AT[1]
     why = ""
+    _lp = time.time() - float(ms_state().get("last_play_ts") or 0)
     if heal_daemon_active() == "awake":
         why = "「点了立刻补」醒着（最后一次点播放后 30 分钟内）"
-    elif someone_playing(key):
-        why = "有人在看片"
+    elif 0 <= _lp < HEAL_DAEMON_IDLE_S:
+        why = f"{int(_lp // 60)} 分钟前有人播过（30 分钟内不补积压）"
+    else:
+        _sp = someone_playing(key)
+        if _sp:
+            why = "有人在看片"
+        elif _sp is None:
+            # 【问不到 Emby 就先让路】Emby 忙得连在播的会话都答不上来，多半正被整队压着 ——
+            # 这时候当成「没人」接着补，就是 12:41 那样边播边补
+            why = "问不到 Emby 有没有人在播（先让路）"
     _HELD_AT[0], _HELD_AT[1] = time.monotonic(), why
     return why
 
@@ -7737,6 +7765,8 @@ def do_heal_tick(hot_only=False):
     # 读不到（没域名、没 nginx）才退回 docker logs —— 后者每次都要从头扫一遍，
     # 每分钟一次就不便宜了。
     ids = nginx_played_ids()
+    if ids:
+        note_play()
     if ids is not None:
         try:
             os.remove(HEAL_KICK)      # 常驻服务等的那几行这一轮读走了
