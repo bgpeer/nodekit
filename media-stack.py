@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.340"
+SCRIPT_VERSION = "1.5.341"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -10785,8 +10785,9 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
             fix_episode_titles(d, rules, key, skip=up, items=all_items)
             fix_episode_images(d, rules, key, all_items)
             _names = [r["name"] for r in tv]
-            print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
-                  f"需要处理的 0 个（剧集库：{'、'.join(_names) or '一个都没有'}）{RST}")
+            if not _ONE_DRIVE[0]:
+                print(f"  {DIM}剧集编号：Emby 判定集号不对的有 {len(bad)} 个，"
+                      f"需要处理的 0 个（剧集库：{'、'.join(_names) or '一个都没有'}）{RST}")
         return 0, 0
     # 【只有"规则文件没写、开关也没答过"的库才问】规则文件里写了 true 的库照做，
     # 一句都不问 —— 用户已经在配置里明确表过态了，再拦一次是重复要答案。
@@ -11726,6 +11727,25 @@ def align_library(d, key, heal=True, migrate=True):
         sync_progress_map(d, key, just_zeroed=zeroed)
     except Exception as e:
         warn(f"同步观看进度失败：{_short_err(e)}")
+
+
+def scan_mark_shift(d, delta):
+    """只报变动、Emby 已确认收下之后，把 scan_if_grown 记的数跟着挪 delta。
+
+    不挪的话，紧接着的 align_library 一数「本地 strm 数和上次记的不一样」，又让 Emby
+    把整个库重扫一遍 —— 实测单盘新增 1 部，屏上接着就是「Emby 还在扫描媒体库（2808 个
+    条目）」干等一分钟。只挪【这一趟自己的】增减：别的盘这期间要是也变了，记的数照样
+    对不上，该扫还是扫。"""
+    mark = os.path.join(d, "strm_seen.txt")
+    try:
+        was = int(open(mark).read().strip())
+    except (OSError, ValueError):
+        return
+    try:
+        with open(mark, "w") as f:
+            f.write(str(was + delta))
+    except OSError:
+        pass
 
 
 def scan_if_grown(d, key, force=False):
@@ -14825,7 +14845,8 @@ def apply_title_policy(d, key):
         ok(f"{n_scrape} 个条目的片名解锁，交回给刮削")
         print(f"  {DIM}标题会在下一次刮削时被覆盖回去。{RST}")
     if not n and seen and not failed:
-        ok(f"{seen} 个条目的片名已经是想要的样子，没有需要改的")
+        if not _ONE_DRIVE[0]:
+            ok(f"{seen} 个条目的片名已经是想要的样子，没有需要改的")
     elif not seen:
         warn("没找到 strm 条目 —— Emby 媒体库可能还没建或还没扫。")
     return n
@@ -14958,7 +14979,59 @@ def prune_emby_ghosts(d, key, quiet=True):
     return max(n, 0)
 
 
-def emby_notify_changes(key, changes, timeout=90, quiet=False):
+def emby_refresh_parents(key, paths, cap=8):
+    """把这几条路径【最近的、Emby 已经认得的上级文件夹】直接刷一下（等于网页上对那个
+    文件夹点「扫描媒体库文件」）。返回刷了几个。
+
+    【为什么要这一下】只报变动清单（/Library/Media/Updated）的话，Emby 要先攒一阵再处理：
+    实测收进 1 条新片要 91 秒，绝大部分是它自己的攒批延迟。直接刷上级文件夹是立刻开工的，
+    而且只碰那一个文件夹，不是全库。参数照抄 Emby 网页端：Default + 不替换，已有条目
+    不会重刮。找不到上级（新建了一整层目录）就往上找，找到媒体库根为止。
+    """
+    try:
+        libs = _emby("/Library/VirtualFolders", key)
+        users = _emby("/Users", key)
+    except Exception:
+        return 0
+    uid = (users[0] or {}).get("Id", "") if users else ""
+    if not uid:
+        return 0
+    folders = {}
+    for lb in libs:
+        pid = lb.get("ItemId")
+        if not pid or not is_strm_lib(lb):
+            continue
+        for loc in lb.get("Locations") or []:
+            folders[str(loc).rstrip("/")] = pid
+        try:
+            r = _emby(f"/Users/{uid}/Items?ParentId={pid}&Recursive=true&IsFolder=true"
+                      f"&Fields=Path", key)
+        except Exception:
+            continue
+        for i in r.get("Items") or []:
+            fp = str(i.get("Path") or "").rstrip("/")
+            if fp and i.get("Id"):
+                folders[fp] = i["Id"]
+    hit = []
+    for p in paths:
+        q = os.path.dirname(str(p).rstrip("/"))
+        while q not in ("", "/") and q not in folders:
+            q = os.path.dirname(q)
+        if q in folders and folders[q] not in hit:
+            hit.append(folders[q])
+    n = 0
+    for iid in hit[:cap]:
+        try:
+            _emby(f"/Items/{iid}/Refresh?Recursive=true&MetadataRefreshMode=Default"
+                  f"&ImageRefreshMode=Default&ReplaceAllMetadata=false&ReplaceAllImages=false",
+                  key, method="POST", timeout=30)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def emby_notify_changes(key, changes, timeout=90, quiet=False, nudge=False):
     """把【具体变了哪几条路径】告诉 Emby，而不是让它重扫整个媒体库。
 
     changes 是 [(容器内路径, "Created" | "Deleted")]。
@@ -14988,6 +15061,13 @@ def emby_notify_changes(key, changes, timeout=90, quiet=False):
     gone = {p for p, k in changes if k == "Deleted"}
     if not quiet:
         info(f"只让 Emby 过一遍变动的 {len(changes)} 条，不重扫整个库...")
+    # nudge：手点「生成媒体库」那条路才用 —— 人在屏幕前等着。每小时 / 凌晨那几条不加，
+    # 那几条在白天看片时也在跑（见铁律），不往上面添新动作。
+    if nudge:
+        try:
+            emby_refresh_parents(key, [p for p, _k in changes])
+        except Exception:
+            pass
     t0 = time.time()
     while time.time() - t0 < timeout:
         time.sleep(3)
@@ -17983,6 +18063,12 @@ def autofilm_clock():
 
     它日志时间戳末尾那个偏移量才是调度器真正用的那套时钟。
     """
+    s = autofilm_clock_s()
+    return None if s is None else (s // 3600, s // 60 % 60)
+
+
+def autofilm_clock_s():
+    """AutoFilm 调度器当前是一天里的第几秒。取不到返回 None。时钟的来历见 autofilm_clock。"""
     out = sh("docker logs --tail 80 autofilm", timeout=30)
     text = (out.stdout or "") + (out.stderr or "")
     off = None
@@ -17994,8 +18080,7 @@ def autofilm_clock():
         mins = 0
     else:
         mins = (int(off[1:3]) * 60 + int(off[4:6])) * (1 if off[0] == "+" else -1)
-    t = time.gmtime(time.time() + mins * 60)
-    return t.tm_hour, t.tm_min
+    return int(time.time() + mins * 60) % 86400
 
 
 AF_TASK_RE = re.compile(r"添加 Alist2Strm 定时任务 task_id=(\S+) cron=(.+?)\s*$")
@@ -18134,13 +18219,13 @@ def print_strm_counts(d, only=None):
     if len(_ms) == 1:
         row = next((r for r in openlist_storages(d) if r[0] == _ms[0]), None)
         who = f"{driver_cn(row[1])} {_ms[0]}" if row else _ms[0]
-        print(f"  当前媒体库 {BOLD}{who}{RST} 已有 "
+        print(f"  {CYAN}{BOLD}单盘{RST} {BOLD}{who}{RST} 已有 "
               f"{BOLD}{strm_count(d, only)}{RST} 个 strm 文件")
         return
     if _ms:
         # 剩余网盘那一组：列出组里每个盘，再给个合计 —— 组里可能有盘一个都没有，
         # 那一行的 0 正是"我加的路径到底生效没有"的答案
-        print(f"  {BOLD}当前媒体库{RST}{DIM}（♻ 剩余网盘这一组）{RST}")
+        print(f"  {CYAN}{BOLD}剩余网盘{RST}{DIM}（这一组 {len(_ms)} 个盘）{RST}")
         for mp in _ms:
             row = next((r for r in openlist_storages(d) if r[0] == mp), None)
             who = f"{driver_cn(row[1])} {mp}" if row else mp
@@ -18149,7 +18234,7 @@ def print_strm_counts(d, only=None):
         print(f"    {pad('合计', 30)}     {BOLD}{strm_count(d, only):>5}{RST} 个")
         return
 
-    print(f"  {BOLD}当前媒体库{RST}")
+    print(f"  {CYAN}{BOLD}全部网盘{RST}")
     seen, total = set(), 0
     for mp, drv, _st, _r, _m in openlist_storages(d):
         if not mp or mp == "/":
@@ -18195,6 +18280,11 @@ def print_strm_counts(d, only=None):
                  if _rest else ""))
     print(f"    {pad('合计', 30)}     {BOLD}{total:>5}{RST} 个 strm 文件"
           f"  {DIM}（剩余网盘那行是上面几行里的一部分，没重复计）{RST}")
+
+
+_ONE_DRIVE = [False]       # do_strm 只扫一个盘时置上：全库那几句「没事」不上屏
+AF_FIRE_LEAD = 45          # 手动扫描：排在多少秒后触发（AutoFilm 重启 + 登记任务通常十几秒）
+AF_FIRE_LEAD_RETRY = 120   # 没赶上时重排一次，退回原来的两分钟
 
 
 def do_strm(only=None):
@@ -18270,13 +18360,19 @@ def do_strm(only=None):
         warn(f"清目录缓存失败（不影响扫描，但刚加的片子可能看不见）：{_short_err(e)}")
 
     original = open(cfg_path, encoding="utf-8").read()
-    hm = autofilm_clock()
-    if hm is None:
-        g = time.gmtime()
-        hm = (g.tm_hour, g.tm_min)
+    # 【触发时刻精确到秒】原来是"两分钟后的整分"，实际要干等 60–120 秒才开扫，
+    # 而 AutoFilm 重启 + 登记任务通常十几秒就完了。cron 第一位就是秒，直接排在
+    # AF_FIRE_LEAD 秒后。没赶上（登记晚于触发时刻，调度器会顺延到明天）见下面的重排。
+    sod = autofilm_clock_s()
+    if sod is None:
+        sod = int(time.time()) % 86400
         warn("读不到 AutoFilm 的时区，按 UTC 估算触发时刻。")
-    t = (hm[0] * 60 + hm[1] + 2) % 1440
-    fire = f"0 {t % 60:02d} {t // 60:02d} * * *"
+    _t_sod = time.monotonic()
+
+    def fire_at(lead):
+        s = (sod + int(time.monotonic() - _t_sod) + lead) % 86400
+        return s, f"{s % 60} {s // 60 % 60:02d} {s // 3600:02d} * * *"
+    fire_s, fire = fire_at(AF_FIRE_LEAD)
 
     # 【每个任务都要改，不能只改第一个】原来这里写死 count=1。单网盘时只有一条
     # cron，看不出问题；一个网盘一个任务之后，只有排在最前面那个任务被改成
@@ -18311,25 +18407,36 @@ def do_strm(only=None):
 
     done = ""
     try:
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(patched)
-        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        if subprocess.run(["docker", "restart", "autofilm"],
-                          capture_output=True).returncode != 0:
-            err("重启 AutoFilm 失败，它可能没在跑。")
-            return
+        for _try, _lead in enumerate((AF_FIRE_LEAD, AF_FIRE_LEAD_RETRY)):
+            if _try:
+                fire_s, fire = fire_at(_lead)
+                patched, _n = _patch_cron(original, fire, ids)
+            t_fire = _t_sod + (fire_s - sod) % 86400 - 1   # 秒数是截断取整的，往早里算一秒
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(patched)
+            since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            if subprocess.run(["docker", "restart", "autofilm"],
+                              capture_output=True).returncode != 0:
+                err("重启 AutoFilm 失败，它可能没在跑。")
+                return
 
-        # 等它把配置读进内存（启动会打印 scheduled_count），然后【立刻】还原磁盘。
-        # 见函数开头的说明：还原之后这一轮照跑，而脚本从此可以随时被打断。
-        for _ in range(20):
-            if "scheduled_count" in autofilm_log(since):
+            # 等它把配置读进内存（启动会打印 scheduled_count），然后【立刻】还原磁盘。
+            # 见函数开头的说明：还原之后这一轮照跑，而脚本从此可以随时被打断。
+            for _ in range(20):
+                if "scheduled_count" in autofilm_log(since):
+                    break
+                time.sleep(1)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(original)
+            # 登记早于触发时刻（留 3 秒余量）才算赶上；没赶上就按老办法两分钟后再排一次
+            if time.monotonic() < t_fire - 3:
                 break
-            time.sleep(1)
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(original)
+            if not _try:
+                print(f"  {DIM}AutoFilm 起得慢，没赶上，改成 {AF_FIRE_LEAD_RETRY} 秒后再排一次{RST}")
         base_lines = len(autofilm_log(since).splitlines())
 
-        info(f"已安排在 {fire.split()[2]}:{fire.split()[1]}（容器时间）触发，最多等 2 分钟开始。")
+        info(f"已安排在 {fire_s // 3600:02d}:{fire_s // 60 % 60:02d}:{fire_s % 60:02d}"
+             f"（容器时间）触发，约 {max(0, int(t_fire - time.monotonic()))} 秒后开始。")
         tip("不用守着：Ctrl-C 随时走人，扫描在容器里继续跑，收尾每小时那轮会做")
         # 【这句话以前是错的】原来写"走人的话这三步要下次再点"。那是 align_library
         # 还没有的时候。现在补时长、清失效、通知扫描、调库选项、预热全都挂在每小时
@@ -18573,7 +18680,9 @@ def do_strm(only=None):
         # 变动少就只报这几条（几秒）。多了、没变动、或者这条路没走通，都退回全库扫描 ——
         # 【"没变动"也要退回去扫】本地没变不等于 Emby 里就是对的：媒体库可能是刚建的，
         # 里头一个条目都没有。emby_scan_wait 自己有去重，刚扫过就不会真扫。
-        if not emby_notify_changes(key, diff):
+        if emby_notify_changes(key, diff, nudge=True):
+            scan_mark_shift(d, len(snap1 - snap0) - len(snap0 - snap1))
+        else:
             if emby_scan_wait(key, timeout=900, label="扫描媒体库"):
                 ok("Emby 已扫完")
             else:
@@ -18581,13 +18690,22 @@ def do_strm(only=None):
         # 【补时长不在这儿跑】它是整条流程里最慢的一步，而且跟"生成成没成功"
         # 无关。扔后台之后用户扫完就能走人，缺多少时长看体检那行「条目时长」。
         # migrate=False：上面刚挪过，再挪一遍是白挪 2600 个文件、白等一轮重扫
-        align_library(d, key, heal=False, migrate=False)
-        auto_libraries_apply(d, key)  # 按关键词规则把该建的库建上
+        # 【单盘只说单盘的事】下面这几步是全库的整理（片名、集号、按规则建库），只读 Emby
+        # 不碰网盘；单盘时"2808 个条目已经是想要的样子"这类全库的「没事」不上屏，
+        # 看着像在扫全部。真改了、真出错照样说。
+        _ONE_DRIVE[0] = bool(only)
+        try:
+            align_library(d, key, heal=False, migrate=False)
+            auto_libraries_apply(d, key, quiet=bool(only))  # 按关键词规则把该建的库建上
+        finally:
+            _ONE_DRIVE[0] = False
         report_not_in_emby(d, key, only)
         # 【后台跑】跟「8 更新」那边同一个理由：预热要跨境换直链，慢的时候一部
         # 几十秒，而生成媒体库本身早就做完了。热不热得上跟这次生成成没成功毫无
         # 关系，没道理让用户对着它干等。
-        _nodur = len(items_without_duration(key))
+        # 单盘只数这个盘的（仓库主人：76 个看着像在扫全部）
+        _nodur = len([x for x in items_without_duration(key)
+                      if not only or any(strm_in_mount(d, x[4], m) for m in only_mounts(only))])
         _ncov = queue_new_covers(sorted(snap1 - snap0))
         try:
             for _sub in ("warm",) + (("heal",) if heal_auto_on() else ()):
@@ -18617,16 +18735,20 @@ def do_strm(only=None):
     # 用的是 snap0 / snap1：开工前和全部收尾之后的两份清单，减出来才是真的净变化。
     print()
     _add, _del = len(snap1 - snap0), len(snap0 - snap1)
-    _scope = f"{DIM}（只算 {only} 这个盘）{RST}" if only else ""
+    # 【结论要一眼看到】仓库主人：「最后显示的是新增加了一个吗，这个地方应该用高亮」。
+    # 单盘 / 剩余网盘这一组 / 全部网盘 打在最前面，扫的是哪一摊一眼就知道。
+    _ms = only_mounts(only)
+    _who = (f"单盘 {_ms[0]}" if len(_ms) == 1 else
+            f"剩余网盘 {len(_ms)} 个盘" if _ms else "全部网盘")
     if _add or _del:
-        _bits = ([f"{BOLD}新增 {_add} 个{RST}"] if _add else []) + \
-                ([f"{BOLD}清掉 {_del} 个{RST}"] if _del else [])
-        ok(f"这一轮：{'、'.join(_bits)}{DIM}（按文件数，剧集一集一个；"
-           f"本地共 {len(snap1)} 个）{RST}" + _scope)
+        _bits = ([f"新增 {_add} 个"] if _add else []) + ([f"清掉 {_del} 个"] if _del else [])
         # 【别让人把"个"当成"部"】剧集是一集一个文件；清掉的是网盘里删了或改名的
+        print(f"  {GREEN}{BOLD}✔ 【{_who}】这一轮：{'、'.join(_bits)}{RST}"
+              f"  {DIM}（剧集一集算一个；本地共 {len(snap1)} 个）{RST}")
     else:
         # 【"没有变化"也要说】他这次就是 0，而屏上什么都不打，反而让人以为哪里没跑到。
-        ok(f"这一轮没有新增，也没有清掉{DIM}（本地 {len(snap1)} 个 strm）{RST}" + _scope)
+        print(f"  {YELLOW}{BOLD}✔ 【{_who}】这一轮没有新增，也没有清掉{RST}"
+              f"  {DIM}（本地 {len(snap1)} 个）{RST}")
 
 
 def write_secret(path, key, value):
