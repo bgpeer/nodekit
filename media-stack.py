@@ -44,9 +44,20 @@ import zipfile
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
+# 【屏上、流水、账本里的时刻一律北京时间】仓库主人：「统一改成北京时间」。VPS 摆在哪（东京 UTC+9、
+# 也见过 UTC 的）跟人看表无关：定时都是按北京时间设的，账本却按本机时区分小时、分天，对着看总差一两个小时。
+# 只管【给人看的】；cron 要的本机时刻照旧走 cst_to_local_cron（那个必须按本机时区换算）。
+# 不改进程的 TZ：nginx / docker 日志、Emby 时间那几处解析还是按它们各自的口径来。
+BJ_OFFSET = 8 * 3600
+
+
+def bj_fmt(fmt, ts=None):
+    """北京时间的 strftime。ts 不给 = 现在。"""
+    return time.strftime(fmt, time.gmtime((time.time() if ts is None else ts) + BJ_OFFSET))
+
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.332"
+SCRIPT_VERSION = "1.5.333"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2743,7 +2754,7 @@ def do_hls_fix():
                 return old or hit[0]      # 这次没问到高的：照旧用手里那条
             if old:
                 try:
-                    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：阿里转码　要新地址 "
+                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：阿里转码　要新地址 "
                               f"{ALI_TC_DEADLINE_S}s 没回，用了 {(time.time() - hit[1]) / 60:.0f} 分钟前那条"
                               f"（还剩 {_url_expiry_min(old)} 分钟）{_log_tag(vid)}"])
                 except Exception:
@@ -2939,7 +2950,7 @@ def do_hls_fix():
                 return ""
             if old and _alive(old, ua):
                 try:
-                    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：115　要新直链 "
+                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：115　要新直链 "
                               f"{P115_DEADLINE_S}s 没回，用了 {(time.time() - hit[1]) / 60:.0f} 分钟前那条"
                               f"{_log_tag(vid)}"])
                 except Exception:
@@ -3232,7 +3243,7 @@ def do_hls_fix():
         _all = time.monotonic() - _t0
         if _all > 1.5 or (_hls and not body) or _qn or _tries > 1 or (_old and _old != "-"):     # 自己挑了档的每次都记，好对得上
             try:
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
                           + (f"自己问夸克（转码 {_qn}）" if _qn else
                              f"用了 {_old}拿到的地址（还活着）" if _old and _old != "-" and not _tries else
                              "MediaWarp 给地址")
@@ -3310,7 +3321,7 @@ def do_hls_fix():
                 _tc = time.monotonic()
                 if _tc - _ta > 1.5:
                     try:
-                        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务"
+                        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务"
                                   f"拿列表之前　认盘 {_tb - _ta:.1f}s（{ {'ali': '阿里转码', '115': '115', 'raw': '原画现换'}.get(_kd, '其余') }）"
                                   + (f"、换链 {_tc - _tb:.1f}s" if _kd else "")
                                   + f"{_log_tag(_vid)}"])
@@ -3948,7 +3959,7 @@ def prefetch_next_episode(key, iid, ua=""):
         self_touch(nid)                   # 脚本自己的请求，别被当成有人点了播放
         t0 = time.monotonic()
         r = gate_prefetch_stream(nid, ua, timeout=NEXT_PREFETCH_T, probe=True)
-        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 下一集先取好地址："
+        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 下一集先取好地址："
                   f"{str(nxt.get('Name') or nid)[:30]}　{time.monotonic() - t0:.1f}s"
                   f"（{ {'playlist': '转码列表', 'redirect': '直链', 'timeout': '还在取'}.get(r, '交给 MediaWarp 缓存') }）"
                   + _log_tag(nid)])
@@ -4080,7 +4091,7 @@ def do_heal_gate():
                     _w, _done = rescue_hold(key, _iid) if (_iid and key) else (0.0, True)
                     _w += _ws
                     if _w >= 0.5:
-                        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情"
+                        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情"
                                   f"等了 {_w:.1f}s（{'跟上了' if _done else '等满了，交给后台结账'}）"
                                   f"{_log_tag(_iid)}"])
                 except Exception:
@@ -4178,7 +4189,7 @@ def do_heal_gate():
                 if "fix_s" in _tm:
                     _parts.append(f"验直链 {_tm['fix_s']:.1f}s（{_tm['fix']}）")
                 _all = time.monotonic() - _tm["t0"]
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  开播计时：{_nm or _tm['iid']}　"
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：{_nm or _tm['iid']}　"
                           + "、".join(_parts) + f"　门里共 {_all:.1f}s{_log_tag(_tm['iid'])}"])
                 play_ledger({"ev": "gate", "iid": _tm["iid"], "name": _nm, "s": round(_all, 1),
                              "heal": bool(_tm.get("heal"))})
@@ -4976,7 +4987,7 @@ def do_traffic_sample():
         if drx or dtx:
             parts.append(f"{c}:{drx}:{dtx}")
     row = "\t".join([str(cur["ts"]), str(d_rx), str(d_tx)] + parts) + "\n"
-    day = time.strftime("%Y-%m-%d", time.localtime(cur["ts"]))
+    day = bj_fmt("%Y-%m-%d", cur["ts"])
     try:
         with open(f"{TRAFFIC_DIR}/traffic-{day}.tsv", "a") as f:
             f.write(row)
@@ -4995,7 +5006,7 @@ def traffic_mark(task, t0, note=""):
        例外是 heal：它本来就拿网卡差实测过自己那一轮，那个数比格子准，走 note 带出来。"""
     try:
         os.makedirs(TRAFFIC_DIR, exist_ok=True)
-        day = time.strftime("%Y-%m-%d", time.localtime(t0))
+        day = bj_fmt("%Y-%m-%d", t0)
         f = f"{TRAFFIC_DIR}/tasks-{day}.tsv"
         with open(f, "a") as fh:
             fh.write(f"{int(t0)}\t{int(time.time())}\t{task}\t{note}\n")
@@ -5017,7 +5028,7 @@ def play_ledger(rec):
     try:
         os.makedirs(TRAFFIC_DIR, exist_ok=True)
         rec.setdefault("t", int(time.time()))
-        f = f"{TRAFFIC_DIR}/plays-{time.strftime('%Y-%m-%d', time.localtime(rec['t']))}.jsonl"
+        f = f"{TRAFFIC_DIR}/plays-{bj_fmt('%Y-%m-%d', rec['t'])}.jsonl"
         with open(f, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         os.chmod(f, 0o600)
@@ -5040,11 +5051,39 @@ def _timed(name, fn, note=None):
         except Exception:
             pass
 
+def _traffic_day_lines(prefix, day):
+    """某个【北京时间】日子的账本行。返回 [行]；一个文件都没有 → None。
+
+    【前后各多读一个文件】1.5.333 以前文件按 VPS 本机时区分天（东京那台的「10-04」是北京 10-03 23:00
+    到 10-04 23:00），改成北京时间以后，旧文件里同一个北京日子的行分在两个文件里。三个都读、按每行开头的
+    时间戳挑北京日子对得上的 —— 新文件本来就对得上，旧文件也不会少一小时、多一小时。"""
+    import datetime
+    try:
+        d0 = datetime.date.fromisoformat(day)
+    except ValueError:
+        return None
+    out, seen = [], False
+    for k in (-1, 0, 1):
+        try:
+            fh = open(f"{TRAFFIC_DIR}/{prefix}-{d0 + datetime.timedelta(days=k)}.tsv")
+        except OSError:
+            continue
+        seen = True
+        with fh:
+            for line in fh:
+                try:
+                    if bj_fmt("%Y-%m-%d", int(line.split("\t", 1)[0])) == day:
+                        out.append(line)
+                except ValueError:
+                    continue
+    return out if seen else None
+
+
 def _traffic_tasks(day):
     """读某天的任务记录 → [(起, 止, 任务名, 备注)]，按开始时刻排序。"""
     out = []
     try:
-        for line in open(f"{TRAFFIC_DIR}/tasks-{day}.tsv"):
+        for line in _traffic_day_lines("tasks", day) or ():
             f = line.rstrip("\n").split("\t")
             if len(f) < 3:
                 continue
@@ -5060,7 +5099,7 @@ def _traffic_rows(day):
     """某天的原始格子 [(ts, 收, 发)]，给任务归因用。"""
     rows = []
     try:
-        for line in open(f"{TRAFFIC_DIR}/traffic-{day}.tsv"):
+        for line in _traffic_day_lines("traffic", day) or ():
             f = line.rstrip("\n").split("\t")
             if len(f) < 3:
                 continue
@@ -5079,17 +5118,16 @@ def _traffic_hour_src(day):
        两张表交叉不起来 —— 于是「每小时稳定 110 MB、一直在跑」这种问题，
        账本能看见却答不出"是谁"。现场就卡在这儿。数据本来每格都记着，缺的只是这一步。"""
     out = {}
-    try:
-        fh = open(f"{TRAFFIC_DIR}/traffic-{day}.tsv")
-    except OSError:
+    fh = _traffic_day_lines("traffic", day)
+    if fh is None:
         return out
-    with fh:
+    if True:
         for line in fh:
             f = line.rstrip("\n").split("\t")
             if len(f) < 3:
                 continue
             try:
-                h = time.strftime("%H", time.localtime(int(f[0])))
+                h = bj_fmt("%H", int(f[0]))
             except ValueError:
                 continue
             bucket = out.setdefault(h, {})
@@ -5106,8 +5144,8 @@ def _traffic_hour_src(day):
 def _traffic_prune():
     """只留最近 TRAFFIC_KEEP_DAYS 天。一天几十 KB，留半个月也就几百 KB。"""
     try:
-        keep = {time.strftime("%Y-%m-%d", time.localtime(time.time() - i * 86400))
-                for i in range(TRAFFIC_KEEP_DAYS)}
+        keep = {bj_fmt("%Y-%m-%d", time.time() - i * 86400)
+                for i in range(TRAFFIC_KEEP_DAYS + 1)}   # 多留一天：读一个日子要连带前后一个文件
         for n in os.listdir(TRAFFIC_DIR):
             if n.startswith("traffic-") and n.endswith(".tsv") and n[8:-4] not in keep:
                 os.remove(os.path.join(TRAFFIC_DIR, n))
@@ -5140,11 +5178,10 @@ def _traffic_read(day):
     per = {}
     hours = {}
     rows = 0
-    try:
-        fh = open(f"{TRAFFIC_DIR}/traffic-{day}.tsv")
-    except OSError:
+    fh = _traffic_day_lines("traffic", day)
+    if fh is None:
         return 0, 0, {}, {}, 0
-    with fh:
+    if True:
         for line in fh:
             f = line.rstrip("\n").split("\t")
             if len(f) < 3:
@@ -5155,7 +5192,7 @@ def _traffic_read(day):
                 continue
             rows += 1
             rx += a; tx += b
-            h = time.strftime("%H", time.localtime(ts))
+            h = bj_fmt("%H", ts)
             hh = hours.setdefault(h, [0, 0])
             hh[0] += a; hh[1] += b
             for part in f[3:]:
@@ -5209,7 +5246,7 @@ def traffic_report(day=None):
       · openlist 是唯一真正出境拉网盘数据的一环：它占网卡下行的比例高 → Emby 这边在吃；低 → 节点在吃
       · 按任务的「窗口内网卡」含同一时段别的活动，只能当上限看；heal 自测的数比它准
     """
-    day = day or time.strftime("%Y-%m-%d")
+    day = day or bj_fmt("%Y-%m-%d")
     rx, tx, per, hours, rows = _traffic_read(day)
     print("\n" + "=" * 60)
     print(f"  {BOLD}流量账本  {day}{RST}")
@@ -5251,7 +5288,7 @@ def traffic_report(day=None):
         for t0, t1, name, note in long_:
             win = [r for r in trows if t0 <= r[0] <= t1 + TRAFFIC_EVERY_MIN * 60]
             dur = max(0, t1 - t0)
-            print(f"    {time.strftime('%H:%M', time.localtime(t0))}  {_padw(name, 13)}"
+            print(f"    {bj_fmt('%H:%M', t0)}  {_padw(name, 13)}"
                   f"跑了 {dur // 60} 分  ↓{_gb(sum(r[1] for r in win))}"
                   + (f"   {DIM}{note}{RST}" if note else ""))
         if short:
@@ -5288,7 +5325,7 @@ def traffic_report(day=None):
         ol = per.get("openlist", [0, 0])[0]
         print(f"  网盘拉取（openlist）↓{_gb(ol)}，占 {ol * 100 / rx:.0f}%"
               f"{DIM}　高 = Emby 这边在吃，低 = 代理节点在吃{RST}")
-    if day == time.strftime("%Y-%m-%d"):
+    if day == bj_fmt("%Y-%m-%d"):
         _hd = ms_state().get("heal_day") or {}
         if _hd.get("date") == day and float(_hd.get("mb") or 0) > 0:
             _used = float(_hd["mb"])
@@ -5512,7 +5549,7 @@ def _cover_meter_mb(rx0, meter=None):
 
 
 def _cover_day():
-    today = time.strftime("%Y-%m-%d")
+    today = bj_fmt("%Y-%m-%d")
     st = ms_state().get("cover_day") or {}
     return st if st.get("date") == today else {"date": today, "n": 0}
 
@@ -5742,7 +5779,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
                           "t": int(time.time())}
             if _heavy and not no_range:
                 why = f"拉了 {_mb:.0f} MB 还没截到，这个源跳不到中间，已掐断"
-        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面："
+        logs.append(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 封面："
                     + (f"截了第 {int(at) // 60} 分 {int(at) % 60:02d} 秒那一帧"
                        if ok_ else "没截成（" + ("拿不到地址" if not url else
                                                  "Emby 没收下" if jpg else why or "截不到画面")
@@ -5886,7 +5923,7 @@ def cover_prefer_scrape(key, limit=COVER_PER_RUN):
         made.pop(iid, None)
         seen.pop(iid, None)
         n += 1
-        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 封面：刮削找到了正式封面，"
+        logs.append(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 封面：刮削找到了正式封面，"
                     f"换掉了截帧的那张{_log_tag(iid)}")
     save_ms_state(cover_made=made, cover_checked=seen)
     heal_log(logs)
@@ -6254,7 +6291,7 @@ def _play_ledger_read(t_from, t_to):
     t = t_from - 86400
     days = []
     while t <= t_to + 86400:
-        dd = time.strftime("%Y-%m-%d", time.localtime(t))
+        dd = bj_fmt("%Y-%m-%d", t)
         if dd not in days:
             days.append(dd)
         t += 3600
@@ -6368,13 +6405,13 @@ def do_play_report(hours=24):
             print("-" * 60)
             print(f"  {BOLD}最慢的 {len(top)} 次{RST}")
             for w in top:
-                print(f"    {time.strftime('%m-%d %H:%M', time.localtime(w['t']))}  "
+                print(f"    {bj_fmt('%m-%d %H:%M', w['t'])}  "
                       f"{_padw(mp_of.get(w['iid']) or '?', 10)}{_padw((w['name'] or w['iid'])[:20], 22)}"
                       f"门 {w['gate']:.1f}s　要地址 {w['addr']:.1f}s"
                       + (f"　{DIM}{'、'.join(w['note'])}{RST}" if w["note"] else ""))
     # ---- 夜里 / 后台定时任务：不经过开播门，单独列
-    days = sorted({time.strftime("%Y-%m-%d", time.localtime(t)) for t in range(t_from, now + 1, 3600)}
-                  | {time.strftime("%Y-%m-%d", time.localtime(now))})
+    days = sorted({bj_fmt("%Y-%m-%d", t) for t in range(t_from, now + 1, 3600)}
+                  | {bj_fmt("%Y-%m-%d", now)})
     tasks, trows = [], []
     for dd in days:
         tasks += [x for x in _traffic_tasks(dd) if x[1] >= t_from and x[0] <= now]
@@ -6389,7 +6426,7 @@ def do_play_report(hours=24):
             short[name] = short.get(name, 0) + 1
             continue
         win = [r for r in trows if t0 <= r[0] <= t1 + TRAFFIC_EVERY_MIN * 60]
-        print(f"    {time.strftime('%m-%d %H:%M', time.localtime(t0))}  {_padw(name, 13)}"
+        print(f"    {bj_fmt('%m-%d %H:%M', t0)}  {_padw(name, 13)}"
               f"跑了 {(t1 - t0) // 60} 分  ↓{_gb(sum(r[1] for r in win))}"
               + (f"   {DIM}{note}{RST}" if note else ""))
     if short:
@@ -7155,7 +7192,7 @@ def rescue_hold(key, iid, cap=RESCUE_HOLD_S):
                                 "PlayCount": int(ud.get("PlayCount") or 0),
                                 "IsFavorite": bool(ud.get("IsFavorite"))}, timeout=3)
                     _mm = lambda t: f"{t // 600000000} 分 {t // 10 ** 7 % 60:02d} 秒"
-                    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情，"
+                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情，"
                               f"Emby 还是 {_mm(upos) if upos else '0'}，先写上 {_mm(_fp)}"
                               f"{_log_tag(iid)}"])
                     return time.monotonic() - t0, True
@@ -7270,7 +7307,7 @@ def rescue_progress(key):
                                     "PlayCount": int(ud.get("PlayCount") or 0),
                                     "IsFavorite": bool(ud.get("IsFavorite"))}, timeout=30)
                         fixed += 1
-                        logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
+                        logs.append(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
                                     f"只播了一小会儿，Emby 判成看完了（那时还没时长），"
                                     f"已撤掉「已看完」  {e.get('name') or it.get('Name') or iid}"
                                     f"{_log_tag(iid)}")
@@ -7310,7 +7347,7 @@ def rescue_progress(key):
         _emb = (f"Emby：已看完 {'是' if played else '否'}、续播点 "
                 f"{_mmss(upos) if upos else '0'}、时长 {ticks / 6e8:.0f} 分")
         _tail = f"  {e.get('name') or iid}{_log_tag(iid)}"
-        _ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        _ts = bj_fmt('%Y-%m-%d %H:%M:%S')
         # 【Emby 的续播点比看到的旧一大截 = 这一场它没记上】真机遮天 178：播到 3 分 26 秒
         # 退出（盯梢从 Emby 自己的会话里看到的），详情页还是「继续播放 00:33」—— 上一场的。
         # 原来只要续播点不是 0 就当"它自己记住了"，这种旧值一律放过。比看到的位置早
@@ -7340,7 +7377,7 @@ def rescue_progress(key):
                 _q = dict(ms_state().get("heal_hot_queue") or {})
                 _q[str(iid)] = now
                 save_ms_state(heal_hot_queue=_q)
-                logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
+                logs.append(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救："
                             f"这一场停了，时长却又没了（补上之后被盖掉）—— 马上再补一次"
                             f"  {e.get('name') or iid}{_log_tag(iid)}")
             continue                  # 还没补上时长：写了也白写，等一等
@@ -7565,7 +7602,7 @@ def do_heal_tick(hot_only=False):
     _cool = {k: v for k, v in _all_hot.items() if _now - v < _gap}
     _fresh = set(clicks or ()) | set(_q)      # 按下播放的 + 上一轮排上队没轮到的
     # 次数照记（heal-trace 报给人看），不拿来拦
-    _today = time.strftime("%Y-%m-%d")
+    _today = bj_fmt("%Y-%m-%d")
     _tries = ms_state().get("heal_hot_n") or {}
     if _tries.get("date") != _today:
         _tries = {"date": _today, "n": {}}
@@ -7961,7 +7998,7 @@ def do_heal_trace(q, play=True):
                    f"点开播放照常补。常见原因：某次播放失败（撞上连不上的 CDN 节点），"
                    f"Emby 拿失败时读到的半截信息盖掉了补好的")
     _tn = ms_state().get("heal_hot_n") or {}
-    if _tn.get("date") == time.strftime("%Y-%m-%d"):
+    if _tn.get("date") == bj_fmt("%Y-%m-%d"):
         _k = int((_tn.get("n") or {}).get(iid) or 0)
         if _k:
             _trace_row("·", "今天因点开探过", f"{_k} 次（点一次探一次，不设上限）")
@@ -8088,7 +8125,7 @@ def do_heal_trace(q, play=True):
     print(f"  {BOLD}三、替你按一次播放{RST}  {DIM}（和手机上点一下一样换一次直链，"
           f"302 回来就停，不拉视频）{RST}")
     off0 = _st.st_size if (_st and _site) else None
-    t_play = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 1))
+    t_play = bj_fmt("%Y-%m-%d %H:%M:%S", time.time() - 1)
     via, code, secs = _trace_play(iid, st0["msid"], key)
     if not isinstance(code, int):
         _trace_row("✖", "请求", f"走 {via}，没发出去：{code}")
@@ -11485,7 +11522,7 @@ def build_summary(cfg, colored=True):
     def c(code, s):
         return f"{code}{s}{RST}" if colored else s
 
-    lines = [f"服务地址一览（生成时间：{time.strftime('%F %T')}）",
+    lines = [f"服务地址一览（生成时间：{bj_fmt('%F %T')}）",
              "  " + "-" * 58]
     if cfg["basic_auth"]:
         lines += [
@@ -13496,7 +13533,7 @@ def fix_movie_names(d, key, quiet=True):
         iid = str(it.get("Id"))
         if iid in done or n >= NAME_FIX_MAX:
             continue
-        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        stamp = bj_fmt('%Y-%m-%d %H:%M:%S')
         # 【英文文件名要用英文搜一遍来核对】识别接口回来的结果只有库语言的名字（奇异博士），
         # 不带原名 —— 拿「Doctor Strange」跟「奇异博士」比永远对不上（真机 9/28 就这么没动）。
         # 片名是英文时再按英文搜一次：英文名对得上的那几个 TMDb 编号，就是认可的答案。
@@ -16159,7 +16196,7 @@ def heal_on_term(how):
     import signal as _sig
 
     def _h(signum, frame):
-        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{how}）"
+        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{how}）"
                   f"被 timeout 砍掉了 —— 正在探的那一集没探完，下次点开会再探"])
         raise SystemExit(143)
     try:
@@ -16262,7 +16299,7 @@ def heal_mb_each():
        夹在 [4, 60]：太小会让配额虚高（上限形同虚设），太大会让配额缩到探不动。
        今天还没探过（每天第一轮）就用常量兜底。"""
     st = ms_state().get("heal_day") or {}
-    if st.get("date") == time.strftime("%Y-%m-%d"):
+    if st.get("date") == bj_fmt("%Y-%m-%d"):
         probes = int(st.get("probes") or 0)
         mb = float(st.get("mb") or 0)
         if probes >= 5 and mb > 0:
@@ -16292,7 +16329,7 @@ def heal_budget(how=None):
     how 留着是给调用方写清"问的是哪一档"，数是同一个。
     """
     st = ms_state().get("heal_day") or {}
-    used = float(st.get("mb") or 0) if st.get("date") == time.strftime("%Y-%m-%d") else 0.0
+    used = float(st.get("mb") or 0) if st.get("date") == bj_fmt("%Y-%m-%d") else 0.0
     return max(0.0, heal_day_mb() - used), used
 
 
@@ -16349,7 +16386,7 @@ def heal_unstuck(iid, now=None):
 
 def heal_budget_spend(mb, probes=0):
     """记一笔账。跨天先清零再记。"""
-    today = time.strftime("%Y-%m-%d")
+    today = bj_fmt("%Y-%m-%d")
     st = ms_state().get("heal_day") or {}
     if st.get("date") != today:
         st = {"date": today, "mb": 0.0, "probes": 0}
@@ -16365,7 +16402,7 @@ def heal_daily_diff(pending, gave_up):
 
        两个数都是现成的，不再多问 Emby 一次：pending 是这一轮算出来的待探数，
        gave_up 是放弃名单的大小。每天记一次（同一天内反复跑不会覆盖掉基准）。"""
-    today = time.strftime("%Y-%m-%d")
+    today = bj_fmt("%Y-%m-%d")
     old = ms_state().get("heal_seen") or {}
     if old.get("date") != today:
         save_ms_state(heal_seen={"date": today, "pending": pending, "gave_up": gave_up})
@@ -16527,7 +16564,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
         # 【同一个原因只记一次】醒着那半小时每分钟一轮，一轮一行会把流水淹掉
         if ms_state().get("heal_hold_sig") != _why:
             save_ms_state(heal_hold_sig=_why)
-            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（整队）让路："
+            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（整队）让路："
                       f"{_why}，等它睡了再补；只补你点开的那一集"])
         return
     if _HEAL_YIELD:
@@ -16542,7 +16579,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
             _sig = ",".join(sorted(str(x[1]) for x in _loose))
             if ms_state().get("heal_loose_sig") != _sig:
                 save_ms_state(heal_loose_sig=_sig)
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
                           f"跳过 {len(_loose)} 个补上又掉了的（{HEAL_STICK_H} 小时内不再探）："
                           + "、".join(str(x[2])[:20] for x in _loose[:6])
                           + ("…" if len(_loose) > 6 else "")])
@@ -16552,7 +16589,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     # 没探"，翻流水的人看到的就是一片空白 —— 和"根本没触发"长得一模一样。
     if _left <= 0 and not _nolimit:
         _cap_mb = heal_day_mb()
-        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
                   f"没探：今天的额度用完了（约 {_used:.0f}/{_cap_mb} MB），"
                   f"{len(allpend)} 个没轮上"])
         print()
@@ -16626,7 +16663,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     except Exception:
         pass
     if not token:
-        heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
+        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_try}）"
                   f"没探：OpenList 登不上，{len(pend)} 个没轮上"])
         # 【没探就不算探过】看片后那条在探之前先记了冷却和次数（防被 timeout 砍掉后
         # 下一分钟从头再来）。这里一个都没探，把那两笔退回去 —— 不然下次点开会被
@@ -16687,7 +16724,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
                 _via_n[_k] = _via_n.get(_k, 0) + 1
                 break
     _how_run = _how_try
-    heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_run}）："
+    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 这一轮（{_how_run}）："
               f"{done}/{len(pend)} 个补上，约 {_spent:.0f} MB（{_how}）"
               + (f"，路线 " + "、".join(f"{k} {v}" for k, v in _via_n.items())
                  if _via_n else "")])
@@ -16909,7 +16946,7 @@ def link_stale_fix(iid, key, budget=HEAL_GATE_WAIT_S):
     code = link_dead(loc)
     if not code:
         return ""
-    stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    stamp = bj_fmt('%Y-%m-%d %H:%M:%S')
     # 【不为一集重启整个 MediaWarp】仓库主人：「其他地方还有没有这种盘和盘互相依赖的，都查一遍」。
     # 以前这里死一条就 docker restart mediawarp：所有盘缓存的直链一起清空，那几秒别人在别的盘上看片，
     # 进度上报、拖动、下一集全失败。换链服务在（它认得出这一集、能自己去 OpenList 现换）就记一笔，
@@ -17309,7 +17346,7 @@ def _heal_one(d, key, _it, base, token):
             _lay = file_layout(raw)
             if file_layout_says(_lay)[0]:
                 _alt = True
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 探测回包（{_kind}）："
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 探测回包（{_kind}）："
                           + _probe_brief(iid) + _log_tag(iid)])
                 _routes.append(("不开直播流", url,
                                 "IsPlayback=false&AutoOpenLiveStream=false"))
@@ -17336,7 +17373,7 @@ def _heal_one(d, key, _it, base, token):
         # 没读到；文件头里本来就没写。不看文件就只能猜（FC2-4954902 猜错过两次）。
         # 只在这一种结局才看，几十 KB。
         if _alt:
-            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 探测回包（不开直播流）："
+            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 探测回包（不开直播流）："
                       + _probe_brief(iid) + _log_tag(iid)])
         _has, _say_f = (file_layout_says(_lay if _lay is not None else file_layout(raw))
                         if "整文件" in _tried else (None, ""))
@@ -17459,7 +17496,7 @@ def _heal_round(d, key, pend, base, token, again, t_all=None, budget=None,
                     # 四元组在重试名单、并行回收好几处都按位置用着。
                     _via = ("m3u8" if "（m3u8）" in (note or "")
                             else "整文件" if "（整文件）" in (note or "") else "-")
-                    logs.append(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  "
+                    logs.append(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  "
                                 f"{pad(res, 8)}{pad(_via, 7)}{sec:>4.0f}s  "
                                 f"{(note or '').replace(chr(10), ' ')[:60]}  "
                                 f"{str(name)[:40]}{_log_tag(_it[1])}")
@@ -21817,11 +21854,11 @@ def do_alitv_renewd():
                     d = tv.token(refresh=q["refresh_ui"])
                 self._send(200, {"refresh_token": d.get("refresh_token", ""),
                                  "access_token": d.get("access_token", "")})
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 阿里 TV：本机续期成功"])
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 阿里 TV：本机续期成功"])
             except Exception as e:
                 # OpenList 拿到空令牌会把 text 当原因报出来
                 self._send(200, {"text": f"本机续期失败：{_short_err(e)[:60]}"})
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 阿里 TV：本机续期失败"
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 阿里 TV：本机续期失败"
                           f"（{_short_err(e)[:60]}）"])
 
     srv = http.server.ThreadingHTTPServer((gw, ALITV_PORT), H)
@@ -23736,7 +23773,7 @@ def _covers_menu(d, mp):
     # 【上一次花了多少摆在最前面】仓库主人：「每次点进去能看到上一次截图所消耗的流量」
     last = cover_manual_last(mp)
     if last:
-        print(f"  上一次　{time.strftime('%m-%d %H:%M', time.localtime(last['t']))}　"
+        print(f"  上一次　{bj_fmt('%m-%d %H:%M', last['t'])}　"
               f"截成 {last['n']}/{last['of']} 张　用了约 {CYAN}{last['mb']:.0f} MB{RST}"
               + ("　（中途停了）" if last.get("cut") else ""))
     _mts = [str(r[1] or "") for r in _storage_rows(d)]
@@ -24829,7 +24866,7 @@ def warm_links(d, key, limit=None):
     _why = heal_backlog_hold(key) if _polite else ""
     if _why:
         if not ms_state().get("warm_owed"):
-            heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 预热让路：{_why}，等它睡了马上补热"])
+            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 预热让路：{_why}，等它睡了马上补热"])
         save_ms_state(warm_owed=True)
         return 0, 0
     if ms_state().get("warm_owed"):
@@ -25003,7 +25040,7 @@ def warm_links(d, key, limit=None):
             # 【热到一半有人点了播放：剩下的不热了，欠着，等它睡了再来】
             if _polite and heal_backlog_hold(key, cache_s=10):
                 save_ms_state(warm_owed=True)
-                heal_log([f"{time.strftime('%Y-%m-%d %H:%M:%S')}  ---- 预热热到一半让路："
+                heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 预热热到一半让路："
                           f"有人点了播放，等它睡了马上补热"])
                 again = []
                 todo_q = []
@@ -26828,7 +26865,7 @@ def do_healthcheck():
                 f"{mins} 分钟前失败：{ka.get('error', '')[:40]}")
 
     if os.path.exists(TRAFFIC_CRON):
-        _rx, _tx, _per, _hh, _rows = _traffic_read(time.strftime("%Y-%m-%d"))
+        _rx, _tx, _per, _hh, _rows = _traffic_read(bj_fmt("%Y-%m-%d"))
         if _rows:
             _ol = _per.get("openlist", [0, 0])[0]
             _hint = (f"，openlist 占 {_ol * 100 / _rx:.0f}%" if _rx else "")
