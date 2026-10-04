@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.335"
+SCRIPT_VERSION = "1.5.336"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1627,7 +1627,19 @@ def gen_nginx_site(cfg):
         if (-f {RESCUE_HOLD_DIR}/{RESCUE_PLAYING}) {{
             rewrite ^ /__ms_hold_item last;
         }}
+        # 打开详情页：抄一份给门，在后台先把待会儿要点的那一集的地址取好（不等它，见 prefetch_on_open）
+        mirror /__ms_peek;
+        mirror_request_body off;
 {_px}
+    }}
+    location = /__ms_peek {{
+        internal;
+        proxy_pass http://unix:{HEAL_GATE_SOCK}:/peek;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 3s;
     }}
     # 「停止播放」那一下：先在门那里放个旗子（马上放行，不挡它），见 stopping_begin
     location ~* ^/(?:emby/)?sessions/playing/stopped$ {{
@@ -4004,6 +4016,67 @@ def prefetch_next_episode(key, iid, ua=""):
         return ""
 
 
+# 打开详情页就先取地址：取多久算等满（后台跑，人不等）；同一集多久内不重取跟「下一集先取好」共用 _NEXT_DONE
+PEEK_T = 60
+
+
+def prefetch_on_open(key, iid, uid="", ua=""):
+    """打开一部剧 / 一集 / 一部电影的详情页 → 在后台把待会儿多半要点的那一集的地址先取好（只换地址、不拉视频）。
+
+    【为什么】真机 10/04 12:16 仙逆 160：13:16:33 打开剧集页，13:16:56 才按播放（中间 23 秒在看简介、挑集），
+    按下去以后 MediaWarp 给地址又花了 24 秒（夸克接口慢，问了 2 次），门等满 15 秒放行、开播 18 秒。
+    这种慢是网盘那头的，按下播放那一刻怎么问都快不了；但打开详情页到按播放之间往往有十几二十秒，
+    这段时间里先把地址要好，按播放直接命中缓存。仓库主人：「查一下开播慢的问题」。
+    挑哪一集：剧 → 这部剧里看了一半的那集，没有就「下一集」；单集 / 电影 → 就是它。
+    【只取 302 直链的盘】走本机代理的盘（WebDAV 这类）要一次 /stream 就是从网盘拉视频经 VPS 转手 —— 不取。
+    代价：一次换地址的请求；同一集半小时内只取一次（跟「下一集先取好」共用账）；同一时刻只取一个。"""
+    try:
+        it = (_emby(f"/Items?Ids={iid}&Fields=Path", key, timeout=15).get("Items") or [{}])[0]
+        typ = it.get("Type")
+        if typ == "Series":
+            if not uid:
+                users = _emby("/Users", key, timeout=15) or []
+                uid = (users[0] or {}).get("Id", "") if users else ""
+            if not uid:
+                return ""
+            tgt = ((_emby(f"/Users/{uid}/Items/Resume?ParentId={iid}&Recursive=true&IncludeItemTypes=Episode"
+                          f"&Limit=1&Fields=Path", key, timeout=15) or {}).get("Items") or [None])[0]
+            if not tgt:
+                tgt = ((_emby(f"/Shows/NextUp?SeriesId={iid}&UserId={uid}&Limit=1&Fields=Path",
+                              key, timeout=15) or {}).get("Items") or [None])[0]
+        elif typ in ("Episode", "Movie"):
+            tgt = it
+        else:
+            return ""
+        if not tgt or not str(tgt.get("Path") or "").endswith(".strm"):
+            return ""
+        nid = str(tgt.get("Id"))
+        d = ms_install_dir()
+        try:
+            with open(_strm_host_path(d, tgt["Path"]), encoding="utf-8") as f:
+                tp = strm_target_path(f.read()) or ""
+        except (OSError, TypeError):
+            return ""
+        _mp, proxied = mount_of_path(d, tp)
+        if not _mp or proxied is not False:
+            return ""
+        now = time.time()
+        if now - _NEXT_DONE.get(nid, 0) < 1800:
+            return ""
+        _NEXT_DONE[nid] = now
+        self_touch(nid)                   # 脚本自己的请求，别被当成有人点了播放
+        t0 = time.monotonic()
+        r = gate_prefetch_stream(nid, ua, timeout=PEEK_T, probe=True)
+        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 打开详情页先取好地址："
+                  f"{' '.join(x for x in (tgt.get('SeriesName'), tgt.get('Name')) if x)[:30] or nid}"
+                  f"　{time.monotonic() - t0:.1f}s"
+                  f"（{ {'playlist': '转码列表', 'redirect': '直链', 'timeout': '还在取'}.get(r, '交给 MediaWarp 缓存') }）"
+                  + _log_tag(nid)])
+        return r or "mw"
+    except Exception:
+        return ""
+
+
 def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S, probe=False):
     """门那一下替播放器先要一次 /stream（打给本机换链服务）→ "playlist" / "redirect" / ""。
 
@@ -4069,6 +4142,7 @@ def do_heal_gate():
     stop_at = [0.0]                    # 上一次「停止播放」进门的时刻，见 GATE_NEXT_S
     pbi_seen = {}                      # 同一部第二次问 PlaybackInfo = 按下播放，见 pbi_is_play
     stream_ok = {}                     # 第一次拉视频那一下查过 / 补过的条目 → 到这个时刻之前不再查，见 /streamgate
+    peek_busy = [False]                # 打开详情页先取地址：同一时刻只取一个，见 /peek
     _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
     def _mark(iid, on):
@@ -4133,6 +4207,29 @@ def do_heal_gate():
                                   f"{_log_tag(_iid)}"])
                 except Exception:
                     pass
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                last[0] = time.monotonic()
+                return
+            if self.path.startswith("/peek"):
+                # 【打开详情页：先在后台取地址】nginx 用 mirror 把读详情抄一份过来，不等这边回话；
+                # 这里马上回 204，取地址另起线程（见 prefetch_on_open）。同一时刻只取一个
+                _uri = self.headers.get("X-Original-URI") or ""
+                m = re.search(r"/(?:users/([0-9a-f]+)/)?items/(\d+)(?:\?|$)", _uri, re.I)
+                if m and key and not self.headers.get(PLAY_PROBE_HDR):
+                    with lock:
+                        go = not peek_busy[0]
+                        peek_busy[0] = peek_busy[0] or go
+                    if go:
+                        def _peek(uid, iid, ua):
+                            try:
+                                prefetch_on_open(key, iid, uid, ua)
+                            finally:
+                                peek_busy[0] = False
+                        threading.Thread(target=_peek, args=(m.group(1) or "", m.group(2),
+                                                             self.headers.get("User-Agent") or ""),
+                                         daemon=True).start()
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
