@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.339"
+SCRIPT_VERSION = "1.5.340"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1413,6 +1413,13 @@ def gen_nginx_site(cfg):
 
     out = ["# 由 media-stack.py 自动生成，重跑会覆盖，别手改。",
            "# 本文件只新增站点，不改动节点(bgpeer)的任何 nginx 配置。",
+           # 【每行末尾多记两项：这个请求一共花了多久 / 后面（Emby、MediaWarp、门）回话花了多久】
+           # 仓库主人：「加吧，单独上，我测过再合」。退出后进度不刷新那几次，光看日志分不出是 Hills 没来读，
+           # 还是读了、卡在 Emby 那边；有了这两项，下次一眼看出「停止播放」和读页面各等了几秒。
+           # 前面跟 nginx 默认的 combined 一字不差，只在 UA 后面追加 —— 脚本里按 combined 读日志的地方
+           # （_NGX_LINE、$4 / $7 / $9、按 " 切的 UA）都不受影响。只记秒数，不多记任何身份信息
+           "log_format ms_timed '$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent '",
+           "                    '\"$http_referer\" \"$http_user_agent\" rt=$request_time urt=$upstream_response_time';",
            # 【探测类 UA 换成浏览器 UA 再送进 OpenList】上游网盘按 UA 挡人：实测
            # ffprobe 的 Lavf/59.27.100 一律 429、Python-urllib 一律 403，而浏览器 UA
            # 撞几次限流之后能拿到 206/200。OpenList 是透明代理（ProcessHeader 把客户端
@@ -1699,7 +1706,7 @@ server {{
     # 「5 链路体检」靠它统计有多少陌生外网 IP 访问过 —— 这几个服务是公网可达的,
     # 拿到域名就能敲门,总得有个地方能看见。logrotate 的默认规则匹配
     # /var/log/nginx/*.log,不用额外配置轮转。
-    access_log {NGX_ACCESS_LOG};
+    access_log {NGX_ACCESS_LOG} ms_timed;
 
     client_max_body_size 0;
 {a}{hls}{gate}
