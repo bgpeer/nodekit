@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.333"
+SCRIPT_VERSION = "1.5.334"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1520,6 +1520,11 @@ def gen_nginx_site(cfg):
         proxy_redirect  off;
         proxy_buffering off;
         proxy_read_timeout 3600s;"""
+        # 【拉视频的请求也先问一声门】见 do_heal_gate 的 /streamgate：第一次拉视频时这一部还没时长就先补好。
+        # 门出错 / 超时（auth_request 回 500）→ 照原样往后交，这一段只会让开播晚几秒，绝不挡播放
+        _sg = ("        auth_request /__ms_stream_gate;\n"
+               "        error_page 500 = @ms_hls_s;\n") if (sub == "emby" and gate_on) else ""
+        _stream_in_hls = False
         hls = (f"""
     # 转码流的分片（见 media-stack.py 的 do_hls_fix）：只回 302，不过视频字节
     location ~* ^/(?:emby/)?videos/[0-9]+/[^/]+\\.(?:ts|m4s)$ {{
@@ -1535,7 +1540,7 @@ def gen_nginx_site(cfg):
             hls += f"""
     # 阿里转码流 / 115 按播放器 UA 换链（见 media-stack.py 的 ALI_TC_LEVELS、pan115_mounts）
     location ~* ^/(?:emby/)?videos/[0-9]+/(?:stream|original)(?:\\.[a-z0-9]+)?$ {{
-        proxy_pass http://127.0.0.1:{hls_port()};
+{_sg}        proxy_pass http://127.0.0.1:{hls_port()};
         proxy_set_header Host $host;
         proxy_redirect off;
         proxy_connect_timeout 3s;
@@ -1545,7 +1550,17 @@ def gen_nginx_site(cfg):
     location @ms_mw {{
 {_px_mw}
     }}
-"""
+""" + (f"""    location @ms_hls_s {{
+        recursive_error_pages on;
+        proxy_pass http://127.0.0.1:{hls_port()}$request_uri;
+        proxy_set_header Host $host;
+        proxy_redirect off;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout {HLS_MW_BUDGET + 15}s;
+        error_page 502 503 504 = @ms_mw;
+    }}
+""" if _sg else "")
+            _stream_in_hls = True
         # 【先补时长再开播】按下播放的第一个请求（PlaybackInfo）先问一声 do_heal_gate：
         # 这一集缺时长就当场补好再放行，Emby 从这一场一开始就有时长、自己记得住进度。
         # 问不到 / 超时（5xx）→ error_page 原样放行：这一段只会让开播晚几秒，绝不挡播放。
@@ -1571,7 +1586,26 @@ def gen_nginx_site(cfg):
     location @ms_pbi {{
 {_px}
     }}
-    location = /__ms_heal_gate {{
+    location = /__ms_stream_gate {{
+        internal;
+        proxy_pass http://unix:{HEAL_GATE_SOCK}:/streamgate;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-URI $request_uri;
+        proxy_set_header X-Ms-Probe $http_x_ms_probe;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout {HEAL_GATE_WAIT_S + 10}s;
+    }}
+""" + ("" if _stream_in_hls else f"""    # 第一次拉视频（没走换链服务的那种）：先问一声门，再交给 MediaWarp
+    location ~* ^/(?:emby/)?videos/[0-9]+/(?:stream|original)(?:\\.[a-z0-9]+)?$ {{
+        auth_request /__ms_stream_gate;
+        error_page 500 = @ms_vid;
+{_px_mw}
+    }}
+    location @ms_vid {{
+{_px_mw}
+    }}
+""") + f"""    location = /__ms_heal_gate {{
         internal;
         proxy_pass http://unix:{HEAL_GATE_SOCK}:/gate;
         proxy_pass_request_body off;
@@ -3925,6 +3959,8 @@ def play_clicks_in(txt):
     return out
 
 
+# 第一次拉视频那一下查过（或补过）的条目，这么久之内再拉视频直接放行 —— 播放中每两三秒一个请求
+STREAM_GATE_OK_S = 600
 GATE_NEXT_S = 5             # 「停止播放」之后这么多秒内问别的一集的 PlaybackInfo = 播放器里点了下一集
 NEXT_PREFETCH_DELAY_S = 30  # 开播后过这么久再去取下一集的地址（别跟这一集抢开头那几秒）
 NEXT_PREFETCH_T = 60
@@ -4032,6 +4068,7 @@ def do_heal_gate():
     last = [time.monotonic()]
     stop_at = [0.0]                    # 上一次「停止播放」进门的时刻，见 GATE_NEXT_S
     pbi_seen = {}                      # 同一部第二次问 PlaybackInfo = 按下播放，见 pbi_is_play
+    stream_ok = {}                     # 第一次拉视频那一下查过 / 补过的条目 → 到这个时刻之前不再查，见 /streamgate
     _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
     def _mark(iid, on):
@@ -4094,6 +4131,56 @@ def do_heal_gate():
                         heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 进度抢救：退出后读详情"
                                   f"等了 {_w:.1f}s（{'跟上了' if _done else '等满了，交给后台结账'}）"
                                   f"{_log_tag(_iid)}"])
+                except Exception:
+                    pass
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                last[0] = time.monotonic()
+                return
+            if self.path.startswith("/streamgate"):
+                # 【开播门也守在第一次拉视频那一下】真机 10/04 07:31 FC2-102722：从「继续观看」直接点播放，
+                # Hills 只问了一次 PlaybackInfo（跟点开详情页那一次一模一样），门当成翻详情放行了，没先补；
+                # 紧接着就开始拉视频，补时长那一轮只能边播边探（321 秒，跟正在播的抢带宽），第二次点才走正路。
+                # 翻详情页不拉视频，所以守在这里不会误探。同一集查过就 STREAM_GATE_OK_S 内直接放行 ——
+                # 播放中每两三秒一个拉视频的请求，不能每个都去问 Emby。
+                _uri = self.headers.get("X-Original-URI") or ""
+                m = re.search(r"/videos/(\d+)/", _uri, re.I)
+                try:
+                    if m and key and not self.headers.get(PLAY_PROBE_HDR):
+                        iid = m.group(1)
+                        t_in = time.monotonic()
+                        with lock:
+                            fresh = stream_ok.get(iid, 0) > t_in
+                            ev = busy.get(iid)
+                        if not fresh:
+                            started = False
+                            if ev is None and heal_auto_on():
+                                need = strm_items_need_heal(key, [iid])
+                                if need:
+                                    try:
+                                        rescue_arm(need)
+                                        rescue_mark_nodur(need)
+                                    except Exception:
+                                        pass
+                                    with lock:
+                                        ev = busy.get(iid)
+                                        if ev is None:
+                                            ev = threading.Event()
+                                            busy[iid] = ev
+                                            started = True
+                                            threading.Thread(target=_bg, args=(need[0], ev)).start()
+                            if ev is not None:
+                                ev.wait(HEAL_GATE_WAIT_S)
+                                if started:
+                                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：第一次拉视频时还没时长，"
+                                              f"门先补了 {time.monotonic() - t_in:.1f}s 再放行{_log_tag(iid)}"])
+                            else:
+                                # 别人正在探这一集（strm 临时切成了 URL）：等它切回来，不然这一下经服务器转手
+                                while _probe_busy_now(iid) and time.monotonic() - t_in < HEAL_GATE_WAIT_S:
+                                    time.sleep(1)
+                            with lock:
+                                stream_ok[iid] = time.monotonic() + STREAM_GATE_OK_S
                 except Exception:
                     pass
                 self.send_response(204)
@@ -4749,6 +4836,30 @@ def install_selfupdate_cron(install_dir):
         return True
     except OSError as e:
         warn(f"装自动更新任务失败（不影响使用）：{e}")
+        return False
+
+
+def cron_tz_resync():
+    """本机相对 UTC 的偏移变了 → 把按北京时间排的那几条定时（自动更新、每日对齐、刷新元数据）重写一遍。
+
+    【为什么要有】仓库主人：「有的服务器是美国的、新加坡的，那时区不一样怎么办」。时区不一样本身没事：
+    cst_to_local_cron 按本机此刻的偏移换算。可美国、欧洲那些地方有夏令时，一年偏移变两次 —— cron 是装的时候
+    换算好写死的，变了以后每天 04:50 的对齐就成了 03:50 / 05:50，直到下一次「8 更新」才改回来。
+    heal-tick 每分钟调一次：没变就是一次 localtime + 读状态文件。返回这次有没有重写。"""
+    try:
+        off = int(time.localtime().tm_gmtoff or 0)
+        old = ms_state().get("cron_gmtoff")
+        if old == off:
+            return False
+        d = ms_install_dir()
+        if os.path.exists(SYNC_CRON):
+            install_sync_cron(d)
+        if os.path.exists(SELFUP_CRON):
+            install_selfupdate_cron(d)
+        install_meta_cron()
+        save_ms_state(cron_gmtoff=off)
+        return old is not None
+    except Exception:
         return False
 
 
@@ -27372,6 +27483,7 @@ if __name__ == "__main__":
         elif arg == "heal-tick":          # cron 每分钟调的：有人看过片才补一轮
             require_root()
             refresh_heal_cron()           # 自动更新只换脚本，cron 的节奏靠这一句跟上
+            cron_tz_resync()              # 本机时区偏移变了（夏令时）→ 北京时间的那几条定时跟着改
             # 【两把锁，分开管两件事】
             #   · heal-tick 自己那把：同一时刻只许一个 tick —— 间隔 1 分钟而一轮能跑
             #     两分多钟，不拦就会一轮叠一轮
