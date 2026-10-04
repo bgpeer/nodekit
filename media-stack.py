@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.337"
+SCRIPT_VERSION = "1.5.338"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -3316,6 +3316,7 @@ def do_hls_fix():
             plc[vid] = (body, time.time())
         return body
 
+    _hls_last = [time.monotonic()]     # 最后一次来请求的时刻：脚本换了要等它空了才重起，见下面 _swap
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nginx"        # 不自报家门，跟别处口径一致
@@ -3325,6 +3326,7 @@ def do_hls_fix():
             pass                        # 日志走 nginx 那份，这里不另堆
 
         def _go(self):
+            _hls_last[0] = time.monotonic()
             ms = re.match(r"^/(?:[Ee]mby/)?[Vv]ideos/(\d+)/(?:stream|original)(?:\.\w+)?(?:\?|$)",
                           self.path, re.I)
             if ms:
@@ -3439,6 +3441,29 @@ def do_hls_fix():
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", hls_port()), H)
     srv.daemon_threads = True
+
+    # 【脚本换了：手上空了自己用新代码重起】「8 更新」不再硬重启它（硬重启会掐掉正在取的播放列表、清掉记着的
+    # 上次地址）。systemd 是 Restart=always，退出就用新代码拉起来；只在 HLS_SWAP_IDLE_S 秒没来请求时退
+    _me = os.path.realpath(__file__)
+    try:
+        _m0 = os.stat(_me).st_mtime
+    except OSError:
+        _m0 = 0
+
+    try:
+        open(HLS_SWAP_MARK, "w").close()
+    except OSError:
+        pass
+
+    def _swap():
+        while True:
+            time.sleep(15)
+            try:
+                if os.stat(_me).st_mtime != _m0 and time.monotonic() - _hls_last[0] > HLS_SWAP_IDLE_S:
+                    os._exit(0)
+            except OSError:
+                pass
+    threading.Thread(target=_swap, daemon=True).start()
     srv.serve_forever()
 
 
@@ -3459,7 +3484,7 @@ def remove_hls_service():
         pass
 
 
-def sync_hls_service(d, quiet=True):
+def sync_hls_service(d, quiet=True, restart=True):
     """按"有没有盘用转码流"装上或停掉这个服务。返回它现在开着没有。
 
     【按需装卸】不用转码流的人不该多一个常驻进程 —— 多一个进程就多一个故障点、
@@ -3514,7 +3539,7 @@ WantedBy=multi-user.target
     elif not want and have:
         remove_hls_service()
         return False
-    elif want and have:
+    elif want and have and restart:
         sh(f"systemctl restart {os.path.basename(HLS_UNIT)}", timeout=60)
     return want
 
@@ -3614,8 +3639,11 @@ WantedBy=multi-user.target
             # 1.5.170 装的是"开机自启、一直开着"的那种 —— 把那个自启撤掉
             sh(f"systemctl disable {svc}", timeout=60)
         sh(f"systemctl enable --now {pth}", timeout=60)
-        # 【醒着的那个换成新代码】停掉就行：下一次有人访问，闹钟用新代码把它叫起来
-        sh(f"systemctl stop {svc}", timeout=60)
+        # 【只有 unit 变了才停】以前每次「8 更新」都停：它一停就「睡着了」，整队以为没人在用开补、
+        # 「正在播」旗子也没人刷（真机 10/04 12:40）。脚本换了不用停 —— 它看见脚本变了、手上没活时自己退出，
+        # 下一次有人访问闹钟用新代码把它叫起来
+        if changed:
+            sh(f"systemctl stop {svc}", timeout=60)
         if not quiet:
             info("已装「点了立刻补」（按下播放几秒内就补；半小时没人看片自己睡，不占进程）")
         return True
@@ -3912,8 +3940,10 @@ KillMode=process
         if changed:
             sh("systemctl daemon-reload", timeout=60)
         sh(f"systemctl enable --now {os.path.basename(HEAL_GATE_SOCKET_UNIT)}", timeout=60)
-        # 醒着的那个换成新代码：停掉就行，下一次开播 socket 用新代码把它叫起来
-        sh(f"systemctl stop {os.path.basename(HEAL_GATE_UNIT)}", timeout=60)
+        # 【只有 unit 变了才停】脚本换了不用停：门看见脚本变了、手上没在补的就自己退出，下一次开播 socket
+        # 用新代码把它叫起来 —— 硬停会把正在等的开播 / 读页面一起掐掉
+        if changed:
+            sh(f"systemctl stop {os.path.basename(HEAL_GATE_UNIT)}", timeout=60)
         if apply_site and changed and os.path.exists(NGX_SITE):
             cfg2 = rebuild_cfg_from_disk(ms_install_dir())
             if cfg2.get("has_domain") and os.path.exists(cfg2.get("crt") or ""):
@@ -4877,6 +4907,8 @@ def do_selfupdate():
     if not is_installed(d):
         return
     me = os.path.realpath(__file__)
+    # 【有人在播就推迟】换掉脚本，门、常驻服务会在手上没活时用新代码重起 —— 不碰正在播的那一场也别凑这个热闹
+    play_quiet_wait(read_emby_api_key(d), "自动更新脚本", max_s=240, step=30)   # cron 只给 300 秒；没等到明天再换
     rec = {"ts": int(time.time()), "ok": False, "changed": False,
            "from": SCRIPT_VERSION, "to": "", "error": ""}
     try:
@@ -5011,6 +5043,10 @@ def do_precache():
     """
     d = ms_install_dir()
     if not is_installed(d):
+        return
+    # 【有人在用就不重载】停用再启用存储的那几秒，正在播的那一集换不到直链（见 play_quiet）
+    _k = read_emby_api_key(d)
+    if not play_quiet_wait(_k, "刷目录缓存", max_s=240, step=30):
         return
     mounts = {"/" + m for m in
               (strm_mount_dir(p) for p in effective_scan_paths(d)) if m}
@@ -5579,6 +5615,13 @@ def do_warm():
                            "auth")
     if not key:
         return
+    # 【有人在播 / 刚播过：这一小时不对齐】刷新条目、补积压会跟正在播的抢 Emby 和网盘；下一小时再来
+    _why = play_quiet(key)
+    if _why:
+        if ms_state().get("warm_quiet_sig") != _why[-6:]:
+            save_ms_state(warm_quiet_sig=_why[-6:])
+            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 小时对齐让路：{_why}，下一小时再做"])
+        return
     align_library(d, key)
     warm_links(d, key)
     try:
@@ -5782,6 +5825,57 @@ def note_play(now=None):
             save_ms_state(last_play_ts=now)
     except Exception:
         pass
+
+
+# 【铁律：任何更新、任何定时任务都不许影响开播连接和退出后的进度刷新】
+# 仓库主人：「再检查一下每次的更新还有凌晨的更新有没有什么误伤播放的，顺便写个注释每次更新不可以影响开播
+# 连接和进度刷新」。真机 10/04 12:40：一次「8 更新」停掉了「点了立刻补」、顺手在后台起了一轮整队，45 部、
+# 298 MB 跟正在播的抢 Emby 和网盘，开播 15~18 秒、退出读到旧进度。所以：
+#   · 会重启容器 / 服务、刷新 Emby 条目、重载网盘存储、拉网盘字节的活，有人在播或刚播过（PLAY_QUIET_S 内）
+#     一律让路：定时的推迟到没人播再做（play_quiet_wait），推不了的这一轮跳过
+#   · 「8 更新」是人按的：有人在播先问一声（默认否）；配置没变的容器不重启、代码换了的服务等它自己空闲时重启
+#     （门、常驻服务、换链服务都会在脚本换掉后、手上没活时自己用新代码重起），不硬停
+#   · 加新的定时任务 / 更新步骤之前先想：它会不会让 MediaWarp 的直链缓存清空、让 Emby 忙到答不上读页面、
+#     让「正在播」那面旗子断掉 —— 会的就套上 play_quiet / play_quiet_wait
+HLS_SWAP_IDLE_S = 120        # 换链服务：脚本换了之后，这么久没来请求才自己用新代码重起
+HLS_SWAP_MARK = "/run/media-stack-hls.swap"   # 在跑的换链服务会自己重起（1.5.338 起的代码）—— 有它「8 更新」就不硬重启
+PLAY_QUIET_S = 600            # 刚播过的这么多秒内也算「有人在用」
+PLAY_QUIET_WAIT_MAX = 5400    # 定时任务最多推迟这么久（cron 的超时比它长）
+
+
+def play_quiet(key, recent_s=PLAY_QUIET_S):
+    """现在能不能做会打扰播放的活 → "" 能做；否则返回原因（有人在播 / 刚播过 / 问不到 Emby）。"""
+    try:
+        _lp = time.time() - float(ms_state().get("last_play_ts") or 0)
+    except (TypeError, ValueError):
+        _lp = 1e9
+    if 0 <= _lp < recent_s:
+        return f"{int(_lp // 60)} 分钟前有人播过"
+    if not key:
+        return ""
+    sp = someone_playing(key)
+    if sp:
+        return "有人在看片"
+    if sp is None:
+        return "问不到 Emby 有没有人在播"
+    return ""
+
+
+def play_quiet_wait(key, what, max_s=PLAY_QUIET_WAIT_MAX, step=120):
+    """定时任务开跑前：有人在播 / 刚播过就等，最多 max_s 秒。返回 True = 可以做了，False = 等满了还有人在用（这一轮不做）。"""
+    t0 = time.time()
+    said = False
+    while True:
+        why = play_quiet(key)
+        if not why:
+            return True
+        if not said:
+            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- {what}让路：{why}，等没人播再做（最多 {max_s // 60} 分钟）"])
+            said = True
+        if time.time() - t0 >= max_s:
+            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- {what}这一轮不做了：等了 {max_s // 60} 分钟还有人在用"])
+            return False
+        time.sleep(step)
 
 
 def someone_playing(key, cache_s=0):
@@ -10265,7 +10359,8 @@ def do_meta_refresh(mp):
         return
     d = ms_install_dir()
     key = read_emby_api_key(d)
-    if key:
+    # 【有人在播就推迟】缺简介的刷完会掉轨、要去网盘补回来（见 play_quiet）
+    if key and play_quiet_wait(key, f"刷新元数据（{mp}）", max_s=1200):   # cron 给 1800 秒
         meta_refresh(d, key, mp, auto=True)
     release_task_lock(sub)
 
@@ -11694,6 +11789,10 @@ def do_sync():
     try:
         key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
                                "auth")
+        # 【有人在播就推迟】扫库、对齐、刷新条目会把 Emby 压住，读页面拿到旧进度（见 play_quiet）
+        if not play_quiet_wait(key, "每日对齐"):
+            rec["error"] = "一直有人在播，这一轮推迟到明天"
+            raise RuntimeError(rec["error"])
         normalize_strm_files(d)
         # 【规则拦不住 AutoFilm】它每一轮都会把排除掉的目录重新生成出来，所以这里也要清
         # 一遍 —— 不然用户在菜单里清干净了，第二天早上那批条目又回到库里。
@@ -12565,6 +12664,14 @@ def do_update(from_menu=False):
     compose = os.path.join(d, "docker-compose.yml")
     env_file = os.path.join(d, ".env")
 
+    # 【有人在看片先问一声】换镜像会重启容器、正在播的那一场会断（见 play_quiet 那段铁律）
+    _k0 = read_emby_api_key(d)
+    if _k0 and someone_playing(_k0):
+        tip("有人在看片：更新会重启容器，正在播的会断")
+        if not ask_yn("还是现在就更新？", False):
+            print("没有更新。")
+            return
+
     # 镜像拉不动就跳过，不再 return —— 跨境网络本来就时好时坏，
     # 而下面重刷配置才是修 bug 的那一步，不该被一次拉取失败连坐掉。
     # 【拉之前先记一份版本】拉完再问就没有对照物了 —— 而"这次到底更了什么"
@@ -12608,6 +12715,14 @@ def do_update(from_menu=False):
             err(f"生成 {svc} 配置失败：{e}")
             warn(f"{path} 保持原样没动，更新继续往下走。")
             continue
+        # 【没变就不重启】重启 MediaWarp 会清掉它手里所有直链缓存（预取好的、下一集先取好的全没了），
+        # 更新完第一次开播就得重新跨境去要地址 —— 以前每次「8 更新」都无条件重启这两个
+        try:
+            with open(path, encoding="utf-8") as f:
+                if f.read() == text:
+                    continue
+        except OSError:
+            pass
         write_atomic(path, text)
         subprocess.run(["docker", "restart", svc], capture_output=True)
     # 【老版本 OpenList（alist v3）还有「网站 URL」这个设置，有就顺手填上】
@@ -12649,7 +12764,7 @@ def do_update(from_menu=False):
     # 了两次？」）。而且这一处不看 NGX_SITE 在不在 —— 装的时候选了"不让脚本配 nginx"
     # 的机器，更新一次就被凭空写出一份站点配置来。
     try:
-        sync_hls_service(d)
+        sync_hls_service(d, restart=not os.path.exists(HLS_SWAP_MARK))   # 会自己重起的就不硬重启（见 do_hls_fix 的 _swap）
     except Exception as e:
         warn(f"分片重定向没对上（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
     try:
