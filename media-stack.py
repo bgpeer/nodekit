@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.338"
+SCRIPT_VERSION = "1.5.339"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -3316,7 +3316,6 @@ def do_hls_fix():
             plc[vid] = (body, time.time())
         return body
 
-    _hls_last = [time.monotonic()]     # 最后一次来请求的时刻：脚本换了要等它空了才重起，见下面 _swap
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "nginx"        # 不自报家门，跟别处口径一致
@@ -3326,7 +3325,6 @@ def do_hls_fix():
             pass                        # 日志走 nginx 那份，这里不另堆
 
         def _go(self):
-            _hls_last[0] = time.monotonic()
             ms = re.match(r"^/(?:[Ee]mby/)?[Vv]ideos/(\d+)/(?:stream|original)(?:\.\w+)?(?:\?|$)",
                           self.path, re.I)
             if ms:
@@ -3442,28 +3440,12 @@ def do_hls_fix():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", hls_port()), H)
     srv.daemon_threads = True
 
-    # 【脚本换了：手上空了自己用新代码重起】「8 更新」不再硬重启它（硬重启会掐掉正在取的播放列表、清掉记着的
-    # 上次地址）。systemd 是 Restart=always，退出就用新代码拉起来；只在 HLS_SWAP_IDLE_S 秒没来请求时退
-    _me = os.path.realpath(__file__)
+    # 【1.5.339 退回：不再在后台盯着脚本换没换、空闲了自己重起】1.5.338 加的，跟「退出后进度不刷新」一起出现，
+    # 原因没查明之前先退回 337 的样子：「8 更新」照旧重启它一次
     try:
-        _m0 = os.stat(_me).st_mtime
-    except OSError:
-        _m0 = 0
-
-    try:
-        open(HLS_SWAP_MARK, "w").close()
+        os.remove(HLS_SWAP_MARK)
     except OSError:
         pass
-
-    def _swap():
-        while True:
-            time.sleep(15)
-            try:
-                if os.stat(_me).st_mtime != _m0 and time.monotonic() - _hls_last[0] > HLS_SWAP_IDLE_S:
-                    os._exit(0)
-            except OSError:
-                pass
-    threading.Thread(target=_swap, daemon=True).start()
     srv.serve_forever()
 
 
@@ -5615,13 +5597,9 @@ def do_warm():
                            "auth")
     if not key:
         return
-    # 【有人在播 / 刚播过：这一小时不对齐】刷新条目、补积压会跟正在播的抢 Emby 和网盘；下一小时再来
-    _why = play_quiet(key)
-    if _why:
-        if ms_state().get("warm_quiet_sig") != _why[-6:]:
-            save_ms_state(warm_quiet_sig=_why[-6:])
-            heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  ---- 小时对齐让路：{_why}，下一小时再做"])
-        return
+    # 【1.5.339 退回：小时对齐不再因为有人播过而整轮跳过】1.5.338 加了这一条之后，仓库主人实测退出后进度
+    # 不刷新，退回 1.5.337 就正常（真机 10/04 14:13 / 15:2x）。原因没查明之前先退回 337 的样子；补积压那一段
+    # 自己会让路（heal_backlog_hold），不靠这里
     align_library(d, key)
     warm_links(d, key)
     try:
@@ -5833,12 +5811,14 @@ def note_play(now=None):
 # 298 MB 跟正在播的抢 Emby 和网盘，开播 15~18 秒、退出读到旧进度。所以：
 #   · 会重启容器 / 服务、刷新 Emby 条目、重载网盘存储、拉网盘字节的活，有人在播或刚播过（PLAY_QUIET_S 内）
 #     一律让路：定时的推迟到没人播再做（play_quiet_wait），推不了的这一轮跳过
-#   · 「8 更新」是人按的：有人在播先问一声（默认否）；配置没变的容器不重启、代码换了的服务等它自己空闲时重启
-#     （门、常驻服务、换链服务都会在脚本换掉后、手上没活时自己用新代码重起），不硬停
+#   · 「8 更新」是人按的：有人在播先问一声（默认否）；配置没变的容器不重启；门、常驻服务 unit 没变不硬停
+#     （它们会在脚本换掉后、手上没活时自己用新代码重起）；换链服务更新时照旧重启一次
+#   · 【1.5.339 退回了 338 里两处平时一直在跑的改动】每小时对齐「有人播过就整轮跳过」、换链服务「后台盯脚本自己重起」。
+#     仓库主人实测：338 退出后进度不刷新，退回 337 就正常。原因没查明 —— 再往平时会跑的路径上加东西，先单独上、
+#     让仓库主人实测退出刷新，再合别的
 #   · 加新的定时任务 / 更新步骤之前先想：它会不会让 MediaWarp 的直链缓存清空、让 Emby 忙到答不上读页面、
 #     让「正在播」那面旗子断掉 —— 会的就套上 play_quiet / play_quiet_wait
-HLS_SWAP_IDLE_S = 120        # 换链服务：脚本换了之后，这么久没来请求才自己用新代码重起
-HLS_SWAP_MARK = "/run/media-stack-hls.swap"   # 在跑的换链服务会自己重起（1.5.338 起的代码）—— 有它「8 更新」就不硬重启
+HLS_SWAP_MARK = "/run/media-stack-hls.swap"   # 1.5.338 的换链服务留下的记号；1.5.339 起不再用，起来就删掉
 PLAY_QUIET_S = 600            # 刚播过的这么多秒内也算「有人在用」
 PLAY_QUIET_WAIT_MAX = 5400    # 定时任务最多推迟这么久（cron 的超时比它长）
 
@@ -12764,7 +12744,7 @@ def do_update(from_menu=False):
     # 了两次？」）。而且这一处不看 NGX_SITE 在不在 —— 装的时候选了"不让脚本配 nginx"
     # 的机器，更新一次就被凭空写出一份站点配置来。
     try:
-        sync_hls_service(d, restart=not os.path.exists(HLS_SWAP_MARK))   # 会自己重起的就不硬重启（见 do_hls_fix 的 _swap）
+        sync_hls_service(d)       # 1.5.339 退回 337：更新时照旧重启换链服务一次
     except Exception as e:
         warn(f"分片重定向没对上（转码流在 Emby 里仍会转圈）：{_short_err(e)}")
     try:
