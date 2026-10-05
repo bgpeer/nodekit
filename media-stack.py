@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.348"
+SCRIPT_VERSION = "1.5.349"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11910,6 +11910,7 @@ def align_library(d, key, heal=True, migrate=True):
         warn(f"同步观看进度失败：{_short_err(e)}")
 
 
+EMBY_SYNC_WAIT_S = 240                   # 只报变动之后等 Emby 收下最多多久，见 emby_sync_changes
 EMBY_SEEN_FILE = "emby_strm_seen.json"   # 上一次跟 Emby 对齐时本地有哪些 strm（容器内路径）
 
 
@@ -11919,8 +11920,7 @@ def emby_sync_changes(d, key, label="扫描媒体库", force=False):
     【为什么不直接扫整个库】真机 10/05：每扫一次整个库，刚补上的音视频轨就被清掉一批（09:52 那次
     掉 15 个，凌晨 04:50、05:00 连扫两次后全库只剩 30 / 2808 有轨道）。strm 里是网盘路径，
     Emby 重读时读不出来，轨道清空、只留时长 —— 开播门下次又得现补 10 秒。
-    【报哪些】新增 = 本地有、上次对齐时还没有、Emby 里也没有的；删除 = Emby 里有、本地文件
-    确实已经不在的（文件还在的一律不报删除 —— 报错了 Emby 会把条目删掉）。上次报过却没进库的
+    【报哪些】只报新增 = 本地有、上次对齐时还没有、Emby 里也没有的（1.5.349 起不报删除，见下面）。上次报过却没进库的
     （坏文件）不再反复报，不然每次都退回扫整个库。
     force（改了库选项，必须整个重扫）→ 直接扫整个库。
     """
@@ -11938,11 +11938,13 @@ def emby_sync_changes(d, key, label="扫描媒体库", force=False):
     if have is not None:
         if prev is None:
             prev = set(have)          # 头一回：Emby 里已有的当成上次对齐过的
-        diff = ([(p, "Created") for p in sorted(cur - prev - have)]
-                + [(p, "Deleted") for p in sorted(have - cur)
-                   if p.startswith(STRM_PATH + "/")
-                   and not os.path.exists(_strm_host_path(d, p))])
-        ok = (not diff) or emby_notify_changes(key, diff, quiet=not has_tty())
+        # 【只报新增，不报删除】真机 10/06 04:50：报了一批「删除」—— 七米蓝 合集/周星驰 底下那些 Emby 里还挂着、
+        # 本地早没了的空壳。Emby 收到后是把整个「周星驰」文件夹刷新一遍（日志一串 will be refreshed），空壳照样
+        # 删不掉，刷新还把那里的轨道清了；这边等不到确认，90 秒后退回扫整个库，又清掉一大批。每晚重来一遍。
+        # 空壳归 align_library 里的 prune_emby_ghosts 管：它直接按条目删，不碰文件夹、不触发刷新。
+        diff = [(p, "Created") for p in sorted(cur - prev - have)]
+        # 【等 4 分钟】Emby 自己先攒 60 秒才处理（04:50:06 报、04:51:36 才动），90 秒正卡在边上
+        ok = (not diff) or emby_notify_changes(key, diff, timeout=EMBY_SYNC_WAIT_S, quiet=not has_tty())
     if not ok:
         ok = emby_scan_wait(key, timeout=900, label=label, force=force)
     if ok:
