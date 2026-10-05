@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.346"
+SCRIPT_VERSION = "1.5.347"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2465,6 +2465,11 @@ P115_WAIT_S = 20
 # 【只为"门先取好、播放器紧接着来拿"那几秒】真机 9/28 play-speed：同一份播放列表隔 5 秒
 # 再用一遍，分片一段都拉不下来。缓存久了反而把用过的旧列表发给下一场，所以压短
 HLS_DIRECT_TTL = 60        # 同一集改好的播放列表缓存多久（秒）
+# 【同一集 10 分钟内夸克没给过列表 → 直接交回 MediaWarp，不再白等】真机 10/05 完美世界 286：19:34 两次
+# 「网盘回列表 8.0s 没取到」交回 MediaWarp，播得很流畅；19:36 再点开又从头问夸克（又是 8 秒没取到）、
+# 门再验 3.7 秒旧地址，开头白等 12 秒，结果照样是 MediaWarp 在播。仓库主人：「第二次点进去的时候他应该
+# 直接用第一次播放的信息啊」。夸克那几分钟被问密了在限速，接着问只会更慢。
+HLS_LIST_FAIL_REUSE_S = 600
 # 【MediaWarp 没给地址：换链服务替播放器再问，别把 404 交出去】真机 10/02 16:07 遮天 181：
 # 一两个小时没人看，OpenList 的目录缓存过期，现去问夸克列表时卡了 30 秒（context canceled）。
 # MediaWarp 回 502，排队等同一个地址的 Hills 拿到 404 就再也不要了 —— 一直 0 B/s。
@@ -3059,6 +3064,7 @@ def do_hls_fix():
         return hdon[0]
 
     pl_busy = {}                       # 条目 id → 正在取的那一路的 Event（见 playlist_of）
+    pl_listfail = {}                   # 条目 id → 上次「MediaWarp 给了 m3u8、网盘没回列表」的时刻（见 HLS_LIST_FAIL_REUSE_S）
     qtvm, qfid = [[], 0.0], {}
 
     def qtv_of(vid):
@@ -3091,6 +3097,8 @@ def do_hls_fix():
             hit = plc.get(vid)
             if hit and now - hit[1] < (HLS_DIRECT_TTL if hit[0] else HLS_BASE_FAIL_TTL):
                 return hit[0]
+            if now - pl_listfail.get(vid, 0) < HLS_LIST_FAIL_REUSE_S:
+                return ""                # 刚才网盘没回列表、是 MediaWarp 播的：这次直接交回它
             ev = pl_busy.get(vid)
             mine = ev is None
             if mine:
@@ -3328,6 +3336,10 @@ def do_hls_fix():
             _note("列表没拉到")
         with lock:
             plc[vid] = (body, time.time())
+            if _hls and not body:
+                pl_listfail[vid] = time.time()
+            elif body:
+                pl_listfail.pop(vid, None)
         return body
 
     class H(http.server.BaseHTTPRequestHandler):
@@ -3832,6 +3844,7 @@ HEAL_EMPTY_AGAIN_S = 3     # 探完是空的，隔几秒当场再探一次（见
 # 53 MB 全经东京服务器转手（play-watch 抓到的），这就是「第一次播放卡」
 HEAL_GATE_RESTORE_S = 8
 # 多久没人开播就退出（由 systemd 的 socket 再叫醒）
+GATE_FALLBACK_REUSE_S = 600   # 按下播放：10 分钟内预取没取到、旧地址验过是活的 → 不再取不再验，见 HLS_LIST_FAIL_REUSE_S
 HEAL_GATE_IDLE_S = 1800
 
 
@@ -4257,6 +4270,7 @@ def do_heal_gate():
     pbi_seen = {}                      # 同一部第二次问 PlaybackInfo = 按下播放，见 pbi_is_play
     stream_ok = {}                     # 第一次拉视频那一下查过 / 补过的条目 → 到这个时刻之前不再查，见 /streamgate
     peek_busy = [False]                # 打开详情页先取地址：同一时刻只取一个，见 /peek
+    pre_skip = {}                      # 条目 id → 上次「预取没取到、旧地址验过是活的」的时刻，见 GATE_FALLBACK_REUSE_S
     _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
     def _mark(iid, on):
@@ -4404,7 +4418,7 @@ def do_heal_gate():
                             if ev is not None:
                                 ev.wait(HEAL_GATE_WAIT_S)
                                 if started:
-                                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：第一次拉视频时还没时长，"
+                                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：第一次拉视频时缺时长或音视频轨，"
                                               f"门先补了 {time.monotonic() - t_in:.1f}s 再放行{_log_tag(iid)}"])
                             else:
                                 # 别人正在探这一集（strm 临时切成了 URL）：等它切回来，不然这一下经服务器转手
@@ -4438,7 +4452,12 @@ def do_heal_gate():
                     _tm["iid"], _tm["t0"] = iid, t_in
                     with lock:
                         ev = busy.get(iid)
-                    if ev is None and not _probe_busy_now(iid):
+                    if (ev is None and not _probe_busy_now(iid)
+                            and time.monotonic() - pre_skip.get(iid, -1e9) < GATE_FALLBACK_REUSE_S):
+                        # 【10 分钟内刚试过：预取没取到、旧地址是活的】这次不再取、不再验，直接放行，
+                        # 换链服务那边同样直接交回 MediaWarp（见 HLS_LIST_FAIL_REUSE_S）
+                        _tm["pre"], _tm["pre_k"] = 0.0, "刚试过没取到，直接用上次那条"
+                    elif ev is None and not _probe_busy_now(iid):
                         # 【先替播放器把 /stream 要好】取到了就说明直链是活的，不用再验，
                         # 播放器紧接着来要时直接命中 —— 见 gate_prefetch_stream
                         # 【没取到才验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
@@ -4453,6 +4472,10 @@ def do_heal_gate():
                                 _a = time.monotonic()
                                 _tm["fix"] = link_stale_fix(iid, key) or "活的"
                                 _tm["fix_s"] = time.monotonic() - _a
+                                if _tm["fix"] == "活的":
+                                    pre_skip[iid] = time.monotonic()
+                            else:
+                                pre_skip.pop(iid, None)
                         except Exception:
                             pass
                     if ev is None and heal_auto_on():
