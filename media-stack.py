@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.342"
+SCRIPT_VERSION = "1.5.343"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11369,6 +11369,42 @@ def migrate_strm_layout(d, key, wait=True):
     # `[片名].超清中英双字.mp4` 和 `[片名].1080p.mkv` 会清出同一个名字，
     # shutil.move 到已存在的路径是【静默覆盖】—— 库里就这么少一部，还查不出来。
     # 撞了就这几条全都不挪，把原名留着比悄悄合掉强。
+    # 【AutoFilm 按网盘原名重建的那一份：删掉它，别拿它盖整理好的那份】真机 10/05：七米蓝每晚
+    # strm_created_count=2643 —— 整理过名字的，AutoFilm 按原名找不到就重建一遍；原来这里把重建
+    # 的挪过去【覆盖】整理好的那份，等于每晚两千多个 strm 换成新文件，Emby 扫到就把补好的
+    # 音视频轨清空。内容一字不差 = 同一部片，留住原来那份（文件不动），删掉重建的。
+    # 附属文件：目标那边已经有的删掉重建的，没有的才挪过去。
+    _srcs0 = {os.path.abspath(x) for x, _ in moves}
+    _drop = []
+    for _src, dst in moves:
+        if os.path.abspath(dst) in _srcs0 or not os.path.exists(dst):
+            continue
+        try:
+            if (open(dst, encoding="utf-8").read().strip()
+                    == open(_src, encoding="utf-8").read().strip()):
+                _drop.append((_src, dst))
+        except OSError:
+            pass
+    if _drop:
+        _ds = {x for x, _ in _drop}
+        moves = [x for x in moves if x[0] not in _ds]
+        for _src, dst in _drop:
+            old_stem = os.path.basename(_src)[:-len(".strm")]
+            new_stem = os.path.basename(dst)[:-len(".strm")]
+            for sc in _strm_sidecars(_src):
+                tgt = os.path.join(os.path.dirname(dst),
+                                   new_stem + os.path.basename(sc)[len(old_stem):])
+                try:
+                    if os.path.exists(tgt):
+                        os.remove(sc)
+                    else:
+                        shutil.move(sc, tgt)
+                except OSError:
+                    pass
+            try:
+                os.remove(_src)
+            except OSError:
+                pass
     seen = {}
     for _src, dst in moves:
         seen[dst] = seen.get(dst, 0) + 1
@@ -11729,6 +11765,51 @@ def align_library(d, key, heal=True, migrate=True):
         warn(f"同步观看进度失败：{_short_err(e)}")
 
 
+EMBY_SEEN_FILE = "emby_strm_seen.json"   # 上一次跟 Emby 对齐时本地有哪些 strm（容器内路径）
+
+
+def emby_sync_changes(d, key, label="扫描媒体库", force=False):
+    """让 Emby 跟上本地 strm 的增删：能只报变动就只报变动，报不了才扫整个库（只扫一次）。返回有没有对上。
+
+    【为什么不直接扫整个库】真机 10/05：每扫一次整个库，刚补上的音视频轨就被清掉一批（09:52 那次
+    掉 15 个，凌晨 04:50、05:00 连扫两次后全库只剩 30 / 2808 有轨道）。strm 里是网盘路径，
+    Emby 重读时读不出来，轨道清空、只留时长 —— 开播门下次又得现补 10 秒。
+    【报哪些】新增 = 本地有、上次对齐时还没有、Emby 里也没有的；删除 = Emby 里有、本地文件
+    确实已经不在的（文件还在的一律不报删除 —— 报错了 Emby 会把条目删掉）。上次报过却没进库的
+    （坏文件）不再反复报，不然每次都退回扫整个库。
+    force（改了库选项，必须整个重扫）→ 直接扫整个库。
+    """
+    if not key:
+        return False
+    cur = {p for p in (_strm_container_path(d, hp) for hp, _t in strm_inventory(d)) if p}
+    mf = os.path.join(d, EMBY_SEEN_FILE)
+    try:
+        with open(mf, encoding="utf-8") as f:
+            prev = set(json.load(f))
+    except Exception:
+        prev = None
+    ok = False
+    have = None if force else emby_strm_paths(key)
+    if have is not None:
+        if prev is None:
+            prev = set(have)          # 头一回：Emby 里已有的当成上次对齐过的
+        diff = ([(p, "Created") for p in sorted(cur - prev - have)]
+                + [(p, "Deleted") for p in sorted(have - cur)
+                   if p.startswith(STRM_PATH + "/")
+                   and not os.path.exists(_strm_host_path(d, p))])
+        ok = (not diff) or emby_notify_changes(key, diff, quiet=not has_tty())
+    if not ok:
+        ok = emby_scan_wait(key, timeout=900, label=label, force=force)
+    if ok:
+        write_atomic(mf, json.dumps(sorted(cur), ensure_ascii=False), 0o600)
+        try:
+            with open(os.path.join(d, "strm_seen.txt"), "w") as f:
+                f.write(str(strm_count(d)))
+        except OSError:
+            pass
+    return ok
+
+
 def scan_mark_shift(d, delta):
     """只报变动、Emby 已确认收下之后，把 scan_if_grown 记的数跟着挪 delta。
 
@@ -11762,7 +11843,8 @@ def scan_if_grown(d, key, force=False):
         was = -1
     if not key or (now == was and not force):
         return False
-    emby_scan_wait(key, timeout=600, label="扫描媒体库")
+    # 【能只报变动就只报变动】见 emby_sync_changes：扫整个库会清掉补好的轨道
+    emby_sync_changes(d, key, force=force)
     try:
         with open(mark, "w") as f:
             f.write(str(now))
@@ -11812,9 +11894,14 @@ def do_sync():
             rec["error"] = "没有 Emby API Key"    # 本地那一层已经做完了
         else:
             rec["nodur_before"] = len(items_without_duration(key, "all"))
+            # 【先把 AutoFilm 按原名重建的那批收掉，再告诉 Emby】不然 Emby 先看见两千多个"新文件"，
+            # 只能扫整个库（见 migrate_strm_layout 里删重建的那段）
+            migrate_strm_layout(d, key, wait=False)
             tune_strm_libraries(key)   # 扫描前先调好，新条目一进来就是对的
             emby_auto_scan_off(key)    # 新装的、被人加回去的，凌晨这一轮兜住
-            emby_scan_wait(key, timeout=900, label="每日对齐的扫描")
+            # 【只报变动，报不了才扫整个库，只扫一次】下面 align_library 的 scan_if_grown 看到
+            # 数对上了就不会再扫第二次（原来 04:50、05:00 连扫两次）
+            emby_sync_changes(d, key, label="每日对齐的扫描")
             align_library(d, key)      # 和小时级那轮同一份，不会飘
             rec["nodur_after"] = len(items_without_duration(key, "all"))
             rec["missing"] = len(strm_not_in_emby(d, key))
