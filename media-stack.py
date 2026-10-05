@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.347"
+SCRIPT_VERSION = "1.5.348"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -26130,7 +26130,13 @@ def _is_internal_host(host):
 
 
 def mask_host(u):
-    """把地址里的域名打码：https://list.jp.example.net → https://list.<你的域名>。
+    """体检里显示的地址。1.5.348 起【原样显示真实域名】，不再打码（见下面仓库主人那句）。
+
+    【1.5.348 改回原样】仓库主人 10/05：「这个地方可以显示自己的真实完整域名，不用打码，检测本来就是
+    检测自己的线路播放信息的，密码都显示在使用信息里面这里显示个域名有什么了，而且 VPS 一般是自己观看
+    不是暴露在公网的，该怎么显示就怎么显示」。这是 CLAUDE.md「不泄漏」那一节说的「拿来跟仓库主人商量、
+    他点头了」的情形，记在 CLAUDE.md 里，别再改回打码。函数留着，调用的地方不用动。
+    下面是原来打码时的说法，留作来历：
 
     【体检的输出是会被截图发出去的】这个文件里好几处注释都写着这句（
     openlist_storages、tune_strm_libraries 都为它删过东西），可「换直链」和
@@ -26144,20 +26150,7 @@ def mask_host(u):
     【内网名和 IP 照原样留着】它们不是安装人信息，而且一打码就看不出"它落在内网"
     这个关键结论 —— 那正是这两行要判的东西。
     """
-    if not u:
-        return u
-    try:
-        sp = urllib.parse.urlsplit(u if "//" in u else "//" + u)
-        host = sp.hostname or ""
-        port = f":{sp.port}" if sp.port else ""
-    except ValueError:
-        return "<地址>"
-    if not host or _is_internal_host(host):
-        return u
-    scheme = f"{sp.scheme}://" if sp.scheme else ""
-    parts = host.split(".")
-    head = f"{parts[0]}." if len(parts) > 2 else ""
-    return f"{scheme}{head}<你的域名>{port}"
+    return u
 
 
 def public_visitors(limit=20000):
