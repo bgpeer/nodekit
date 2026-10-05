@@ -5770,7 +5770,7 @@ def cdn_quantum():
     if on:
         print(f"  {Y}提示：关了后 Cloudflare 又能看到 VLESS CDN 节点的 UUID 和访问目标{N}")
     else:
-        print(f"  {Y}提示：开了后只有 mihomo 系客户端（1.19.13+）能连 VLESS CDN 节点，"
+        print(f"  {Y}提示：服务端仅支持 Xray（VLESS CDN 节点会改用 xray）；只有 mihomo 系客户端（1.19.13+）能连，"
               f"sing-box / 小火箭订阅里不再有它们（含优选）{N}")
     if (_ask(f"  {'关闭' if on else '开启'}CDN量子加密? y 确认 / 回车放弃: ") or "n").lower() not in ("y", "yes"):
         print("  已放弃。"); return
