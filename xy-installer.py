@@ -143,6 +143,19 @@ CDN_CONF  = CDN_DIR + "/config.json"
 CDN_SVC   = "xy-cdn"
 CDN_PORTS = [2053, 2083, 2087, 2096, 8443]       # Cloudflare 免费版可代理的 HTTPS 端口
 
+# CDN量子加密：给 VLESS 类 CDN 节点开 xray 的 VLESS Encryption（mlkem768x25519plus）。
+# 为什么只给 CDN：CF 橙云在它那头把 TLS 解开，能看到 VLESS 里的 UUID 和每次要连的目标；
+# 这层加密是客户端 ↔ VPS 端到端的，CF 只看到密文。直连节点外面已经是 REALITY/TLS，再套一层纯属浪费。
+# 代价（屏上会提示）：
+#   · 服务端只有 xray 支持 → 开了以后 VLESS CDN 节点一律改用 xray 内核（关掉时还原原内核）；
+#   · 客户端只有 mihomo 系（≥1.19.13）支持；sing-box 到 1.15 都不支持、小火箭未知 →
+#     这两种订阅里自动不写这些节点（含优选候选），单条链接照样能导入别的客户端。
+# 认证用 X25519 而不是 ML-KEM-768：每次连接的临时密钥交换两种都是 ML-KEM-768+X25519（抗量子），
+# 差别只在「认证」——认证得在握手当时破解才有用，没有「先存后解」的问题；ML-KEM 公钥 1184 字节，
+# 塞进分享链接会长到二维码都扫不了。所以取 X25519 认证：保密性同样抗量子，链接短。
+# 开关存在 CDN_PREF_FILE 的 "quantum" 键：清空重装后新节点照样按开关来。
+CDN_QE_MIN_XRAY = (25, 9, 5)                     # VLESS Encryption 是 xray v25.9.5 起才有的
+
 # 优选：客户端不直连域名解析出的那个 CF 任播 IP，改连一个实测更快的 CF 边缘地址。
 # 分享链接里【地址位】填优选地址、【sni/host 仍填真域名】——CF 回源认的是 Host 头，
 # 所以换地址不用动服务端任何配置。自动测速在本机(VPS)跑，测的是 VPS→CF 边缘这一段。
@@ -1855,6 +1868,8 @@ def link_to_proxy(u):
         net = qs.get("type", "tcp"); sec = qs.get("security", "none")
         d = {"name": nm("vless"), "type": "vless", "server": host, "port": port, "uuid": P.username, "udp": "true"}
         if qs.get("flow"): d["flow"] = qs["flow"]
+        # VLESS Encryption（CDN量子加密）：mihomo 1.19.13+ 认 encryption 字段；"none" 等于没开，不写
+        if qs.get("encryption", "none") not in ("", "none"): d["encryption"] = qs["encryption"]
         d["tls"] = "true"; d["client-fingerprint"] = qs.get("fp", "chrome")
         if qs.get("sni"): d["servername"] = qs["sni"]
         if sec == "reality":
@@ -2200,6 +2215,8 @@ def mihomo_to_sb_outbound(key, d):
        不支持的类型(如 xhttp)返回 None，由调用方跳过。"""
     if key not in PROTO_TO_SBTAG:
         return None                                      # xhttp 等 → 不写进 sing-box
+    if d.get("encryption"):
+        return None                                      # VLESS Encryption：sing-box 不支持，写进去只会连不上
     tag = d.get("name", "") or key                       # 统一用节点池名称（含服务器端前缀）
     srv = d["server"]; sni = d.get("servername") or d.get("sni") or srv
     insec = bool(d.get("skip-cert-verify"))
@@ -2529,6 +2546,8 @@ def shadowrocket_line(name, d):
     scv = "1" if d.get("skip-cert-verify") else "0"
     if d.get("network") == "xhttp":
         return None                                   # 小火箭不支持 xhttp → 跳过（不写进小火箭订阅，单链接仍在）
+    if d.get("encryption"):
+        return None                                   # VLESS Encryption：小火箭支不支持查不到（闭源），宁可不写也别写个连不上的
     if t == "vless":
         p = [f"{name} = vless", srv, str(port), f"username={d['uuid']}", "tls=1", f"sni={sni}",
              f"skip-cert-verify={scv}", "tfo=1"]
@@ -5609,8 +5628,9 @@ def _cdn_link(st):
     cred = st.get("cred") or st.get("uuid", "")
     dom, port, path, tag = st["domain"], st["cf_port"], st["path"], st["tag"]
     addr = _cdn_addr(st)
+    enc = st.get("enc") or "none"                         # CDN量子加密：客户端那半把钥匙
     if proto == "vless-xhttp":
-        return (f"vless://{cred}@{addr}:{port}?encryption=none&security=tls&sni={dom}"
+        return (f"vless://{cred}@{addr}:{port}?encryption={enc}&security=tls&sni={dom}"
                 f"&host={dom}&type=xhttp&path={path}&fp=chrome#{tag}")
     if proto == "vmess-ws":
         return vmess_link({"v": "2", "ps": tag, "add": addr, "port": str(port), "id": cred,
@@ -5619,7 +5639,7 @@ def _cdn_link(st):
     if proto == "trojan-ws":
         return (f"trojan://{cred}@{addr}:{port}?security=tls&sni={dom}"
                 f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
-    return (f"vless://{cred}@{addr}:{port}?encryption=none&security=tls&sni={dom}"
+    return (f"vless://{cred}@{addr}:{port}?encryption={enc}&security=tls&sni={dom}"
             f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
 
 def _cdn_intro():
@@ -5635,8 +5655,9 @@ def _state_prefix():
     try: return json.load(open(STATE_FILE)).get("prefix", "")
     except Exception: return ""
 
-def _cdn_config(proto, core, cred, path, port, domain, crt, key):
-    """按协议+核心生成 CDN 节点的 (config_dict, binpath)。cred=uuid(vless/vmess)或password(trojan)。"""
+def _cdn_config(proto, core, cred, path, port, domain, crt, key, dec="none"):
+    """按协议+核心生成 CDN 节点的 (config_dict, binpath)。cred=uuid(vless/vmess)或password(trojan)。
+       dec=VLESS 的 decryption（CDN量子加密开着时是 mlkem768x25519plus...，只有 xray 认）。"""
     if core == "xray":
         xr_tls = {"certificates": [{"certificateFile": crt, "keyFile": key}]}
         if proto == "vless-xhttp":
@@ -5647,7 +5668,7 @@ def _cdn_config(proto, core, cred, path, port, domain, crt, key):
                       "wsSettings": {"path": path}, "tlsSettings": xr_tls}
         if proto.startswith("vless"):
             ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": "cdn-in",
-                  "settings": {"clients": [{"id": cred}], "decryption": "none"},
+                  "settings": {"clients": [{"id": cred}], "decryption": dec or "none"},
                   "streamSettings": stream}
         elif proto == "vmess-ws":
             ib = {"listen": "0.0.0.0", "port": port, "protocol": "vmess", "tag": "cdn-in",
@@ -5673,6 +5694,117 @@ def _cdn_config(proto, core, cred, path, port, domain, crt, key):
     return ({"log": {"level": "info"}, "inbounds": [ib],
              "outbounds": [{"type": "direct"}]}, SB_BIN)
 
+def _cdn_qe_on():
+    """CDN量子加密开关当前是否开着。"""
+    return bool(_pref_load().get("quantum"))
+
+def _cdn_qe_xray_ok():
+    """xray 已装且够新（VLESS Encryption 要 25.9.5+）。读不出版本按不够新算。"""
+    if not os.path.exists(XRAY_BIN):
+        return False
+    v = _core_ver(XRAY_BIN)
+    return v is not None and v >= CDN_QE_MIN_XRAY
+
+def _cdn_qe_keys():
+    """生成一对 (服务端 decryption, 客户端 encryption)。
+       `xray x25519` 的私钥 / Password 就是 `xray vlessenc` 里 X25519 认证那对钥匙（同一个函数生成），
+       借它拿钥匙，免得去解析 vlessenc 那几行说明文字。
+       native=不做外观伪装（外面已经是 CF 的 TLS，伪装没意义，native 最快）；
+       600s=服务端 0-RTT 票据有效期，0rtt=客户端优先复用票据——都是 vlessenc 的默认值。"""
+    priv, pub = reality_keys(XRAY_BIN, "x25519")
+    return (f"mlkem768x25519plus.native.600s.{priv}",
+            f"mlkem768x25519plus.native.0rtt.{pub}")
+
+def _cdn_is_vless(n):
+    return str(n.get("proto", "vless-ws")).startswith("vless")
+
+def _cdn_qe_switch(node, on):
+    """给一条 VLESS CDN 节点开/关量子加密：换钥匙、必要时换内核、重写配置、重启它自己的服务。
+       端口 / uuid / 路径 / 证书一律不动，客户端那边只是链接里 encryption 那一段变了。
+       开：sing-box 内核的改 xray，原内核记进 core_orig；关：有 core_orig 就还原。
+       任何一步失败都把配置和服务原样还原，返回 False；成功返回 True。node 原地改。"""
+    old = dict(node)
+    try:
+        old_conf = open(node["conf"]).read()
+    except OSError:
+        old_conf = None
+    if on:
+        node["dec"], node["enc"] = _cdn_qe_keys()
+        if node.get("core", "sing-box") != "xray":
+            node["core_orig"] = node.get("core", "sing-box"); node["core"] = "xray"
+    else:
+        node.pop("dec", None); node.pop("enc", None)
+        if node.get("core_orig"):
+            node["core"] = node.pop("core_orig")
+    cred = node.get("cred") or node.get("uuid", "")
+    try:
+        cfg_dict, binpath = _cdn_config(node.get("proto", "vless-ws"), node["core"], cred,
+                                        node["path"], node["cf_port"], node["domain"],
+                                        node["crt"], node["key"], node.get("dec") or "none")
+        json.dump(cfg_dict, open(node["conf"], "w"), indent=2)
+        if node["core"] != old.get("core", "sing-box"):
+            # 换内核：旧 unit 指向另一个程序，write_service 为防误伤别人的服务不肯覆盖，先删掉
+            sh(f"rm -f /etc/systemd/system/{node['svc']}.service", check=False)
+        write_service(node["svc"], binpath, node["conf"])
+        return True
+    except Exception as e:
+        node.clear(); node.update(old)
+        if old_conf is not None:
+            open(node["conf"], "w").write(old_conf)
+        old_bin = XRAY_BIN if old.get("core", "sing-box") == "xray" else SB_BIN
+        sh(f"rm -f /etc/systemd/system/{node['svc']}.service", check=False)
+        try: write_service(node["svc"], old_bin, node["conf"])
+        except Exception: pass
+        first = (str(e).strip().splitlines() or [""])[0]
+        print(f"  ⚠ {node['domain']}:{node['cf_port']} 没改成，已还原：{first}")
+        return False
+
+def cdn_quantum():
+    """CDN量子加密开关（只作用于 VLESS 类 CDN 节点）。"""
+    Y, N = "\033[1;33m", "\033[0m"
+    cfg = _pref_load()
+    on = bool(cfg.get("quantum"))
+    nodes = _cdn_load()
+    vl = [n for n in nodes if _cdn_is_vless(n)]
+    print(f"\n  CDN量子加密　当前：{'开' if on else '关'}")
+    if on:
+        print(f"  {Y}提示：关了后 Cloudflare 又能看到 VLESS CDN 节点的 UUID 和访问目标{N}")
+    else:
+        print(f"  {Y}提示：开了后只有 mihomo 系客户端（1.19.13+）能连 VLESS CDN 节点，"
+              f"sing-box / 小火箭订阅里不再有它们（含优选）{N}")
+    if (_ask(f"  {'关闭' if on else '开启'}CDN量子加密? y 确认 / 回车放弃: ") or "n").lower() not in ("y", "yes"):
+        print("  已放弃。"); return
+    if not on and vl and not _cdn_qe_xray_ok():
+        if os.path.exists(XRAY_BIN):
+            print("  ⚠ xray 内核太旧（要 25.9.5+），先回主菜单 19 更新内核。"); return
+        print("  正在下载 xray 内核（量子加密只有 xray 支持）...")
+        try: install_xray()
+        except Exception as e:
+            print("  ✗ xray 下载失败：", e); return
+    was_in_sub = any(n.get("in_sub") for n in nodes)
+    old_links = _cdn_state_links(nodes, cfg)             # 必须先算：改完就还原不出旧链接了
+    done = bad = 0
+    for n in vl:
+        if bool(n.get("enc")) != on:                     # 已经是目标状态（比如上次开时没改成的）
+            continue
+        if _cdn_qe_switch(n, not on): done += 1
+        else: bad += 1
+    sh("systemctl daemon-reload", check=False)
+    if nodes:
+        _cdn_save(nodes)
+    if not on and bad and done == 0:
+        print("  ✗ 一条都没改成，开关保持关闭。"); return
+    cfg["quantum"] = not on
+    _pref_save(cfg)
+    _cdn_resync(old_links, was_in_sub)
+    if not vl:
+        print(f"  ✓ 已{'关闭' if on else '开启'}（现在没有 VLESS CDN 节点，以后新装的按这个来）。")
+    else:
+        print(f"  ✓ 已{'关闭' if on else '开启'}，{done} 条 VLESS CDN 节点已改好"
+              f"{'' if not was_in_sub else '、订阅已刷新'}，客户端要重拉订阅 / 重新导入链接。")
+    if bad:
+        print(f"  ⚠ {bad} 条没改成（仍{'加密' if on else '是明文'}），排查后到这里关了再开一次可重试。")
+
 def _parse_cdn_protos(raw):
     """协议多选解析：回车=vless-ws；0/all=全部 4 种；否则按逗号分隔编号取，去重保序。"""
     raw = raw.strip().replace("，", ",")
@@ -5687,9 +5819,10 @@ def _parse_cdn_protos(raw):
             out.append(CDN_PROTOS[tok])
     return out
 
-def _cdn_build_one(nodes, proto, core, domain, prefix, pref=""):
+def _cdn_build_one(nodes, proto, core, domain, prefix, pref="", qe=False):
     """建一条 CDN 节点（独立证书/配置/服务/端口），成功返回 node、失败返回 None。
-       pref=优选地址，只影响分享链接的地址位，服务端配置与它无关。"""
+       pref=优选地址，只影响分享链接的地址位，服务端配置与它无关。
+       qe=CDN量子加密：只对 VLESS 生效，强制 xray 内核，用户选的内核记进 core_orig（关掉时还原）。"""
     port = _cdn_pick_port({n["cf_port"] for n in nodes})
     if not port:
         return None
@@ -5698,7 +5831,12 @@ def _cdn_build_one(nodes, proto, core, domain, prefix, pref=""):
     _cdn_selfsigned(domain, crt, key)
     cred = new_pw() if proto == "trojan-ws" else new_uuid()
     path = "/" + secrets.token_hex(4)
-    cfg_dict, binpath = _cdn_config(proto, core, cred, path, port, domain, crt, key)
+    dec = enc = core_orig = ""
+    if qe and proto.startswith("vless"):
+        dec, enc = _cdn_qe_keys()
+        if core != "xray":
+            core_orig, core = core, "xray"
+    cfg_dict, binpath = _cdn_config(proto, core, cred, path, port, domain, crt, key, dec or "none")
     os.makedirs(CDN_DIR, exist_ok=True)
     json.dump(cfg_dict, open(conf, "w"), indent=2)
     sh(f"systemctl disable --now {svc}", check=False)
@@ -5715,6 +5853,10 @@ def _cdn_build_one(nodes, proto, core, domain, prefix, pref=""):
     node = {"id": nid, "proto": proto, "core": core, "domain": domain, "cred": cred,
             "path": path, "cf_port": port, "tag": _tag(prefix, f"CDN·{proto}"), "svc": svc,
             "crt": crt, "key": key, "conf": conf, "in_sub": False, "pref": pref}
+    if enc:
+        node["dec"], node["enc"] = dec, enc
+    if core_orig:
+        node["core_orig"] = core_orig
     nodes.append(node)                                    # 立即并入，供下一条挑端口/id 避重
     return node
 
@@ -5766,12 +5908,21 @@ def cdn_add():
         print(f"  当前只剩 {free} 个可用端口，只装前 {free} 个：{protos[:free]}")
         protos = protos[:free]
 
-    # 核心：只对非 xhttp 的协议问一次（xhttp 强制 xray）；多选里混了 xhttp 会自动分别用对的核心
+    # CDN量子加密开着：VLESS 的一律 xray + 加密。xray 太旧就这次先不加密，别让整条装不上。
+    qe = _cdn_qe_on() and any(p.startswith("vless") for p in protos)
+    if qe and os.path.exists(XRAY_BIN) and not _cdn_qe_xray_ok():
+        print("  ⚠ xray 内核太旧（要 25.9.5+），这次 VLESS 节点先不加密；更新内核后到菜单 6 关了再开即可补上。")
+        qe = False
+    forced_xray = lambda p: p == "vless-xhttp" or (qe and p.startswith("vless"))
+
+    # 核心：只对不强制 xray 的协议问一次（xhttp / 量子加密的 VLESS 强制 xray）
     core_choice = "sing-box"
-    if any(p != "vless-xhttp" for p in protos):
+    if any(not forced_xray(p) for p in protos):
         core_choice = "xray" if _ask("  非 XHTTP 的用哪个核心? 1 sing-box(默认) / 2 xray: ").strip() == "2" else "sing-box"
     if "vless-xhttp" in protos:
         print("  （XHTTP 入站仅 xray 支持，那条自动用 xray）")
+    if qe:
+        print("  （CDN量子加密已开：VLESS 节点用 xray 并加密，只有 mihomo 系客户端能连）")
 
     ipfx = _state_prefix()
     if ipfx:
@@ -5783,7 +5934,7 @@ def cdn_add():
     pref = next((n.get("pref") for n in nodes if n.get("pref")), "")
 
     # 需要的核心先各下载一次（避免循环里重复打印下载）
-    for cr in {("xray" if p == "vless-xhttp" else core_choice) for p in protos}:
+    for cr in {("xray" if forced_xray(p) else core_choice) for p in protos}:
         binp = XRAY_BIN if cr == "xray" else SB_BIN
         if not os.path.exists(binp):
             print(f"  正在下载 {cr} 内核（CDN 备用节点用）...")
@@ -5794,7 +5945,7 @@ def cdn_add():
     created = []
     for proto in protos:
         core = "xray" if proto == "vless-xhttp" else core_choice
-        node = _cdn_build_one(nodes, proto, core, domain, prefix, pref)
+        node = _cdn_build_one(nodes, proto, core, domain, prefix, pref, qe=qe)
         if node:
             created.append(node)
     if not created:
@@ -5865,7 +6016,9 @@ def cdn_write_sub():
                     any(l for l in read_saved_links() if not any(l == _cdn_link(n) for n in nodes)))
     print(f"\n  全部 CDN 节点写入订阅（当前 {already}/{total} 条已写入）")
     for n in nodes:
-        print(f"    · {n['domain']}:{n['cf_port']} [{n['proto']}] → {CDN_PROTO_SUB[n['proto']]}")
+        sub = ("仅 mihomo（CDN量子加密，sing-box/小火箭写入时自动跳过）" if n.get("enc")
+               else CDN_PROTO_SUB[n['proto']])
+        print(f"    · {n['domain']}:{n['cf_port']} [{n['proto']}] → {sub}")
     print("  写入后客户端拉一次订阅即见（不支持某协议的格式自动跳过）；单条备用链接不受影响。")
     if writing and not has_main:
         print("  注意：本机还没装主节点，订阅将只含这些 CDN 节点；且订阅地址走本机 IP，")
@@ -6373,6 +6526,7 @@ def cdn_menu():
         print("  3 查看全部备用链接")
         print("  4 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
         print("  5 卸载 CDN 节点（可选某条 / 全部）")
+        print(f"  6 CDN量子加密  当前：{'开' if _cdn_qe_on() else '关'}")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
@@ -6390,7 +6544,7 @@ def cdn_menu():
                 pf = (n.get("pref") or "").strip()
                 print(f"   {i}. {n['domain']}:{n['cf_port']}（{n.get('proto','vless-ws')}/"
                       f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}"
-                      f"{'  优选→' + pf if pf else ''}")
+                      f"{'  量子加密' if n.get('enc') else ''}{'  优选→' + pf if pf else ''}")
             print("\n  ▼ 全部 CDN 备用节点链接（导入客户端用；平时留着不用即可）:")
             for i, n in enumerate(nodes, 1):
                 print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
@@ -6399,6 +6553,8 @@ def cdn_menu():
             cdn_write_sub()
         elif c == "5":
             cdn_remove()
+        elif c == "6":
+            cdn_quantum()
         elif c in ("0", ""):
             return
 
