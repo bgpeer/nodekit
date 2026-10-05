@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.345"
+SCRIPT_VERSION = "1.5.346"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1877,6 +1877,8 @@ case "${1:-info}" in
                   (--no-play 只看不按)
   heal-watch <片名> [分钟] 补上（已齐就不补）后盯着：音视频轨什么时候、被谁弄掉的
                   (默认盯 20 分钟；要跨过整点那一轮就写 90)
+  gate-bypass [类|off] 开播门按类单独放行（gate/streamgate/peek/stopping/hold，逗号隔开），off 全部恢复；
+                  (不带参数看现在关了哪几类、开播门最近的记账 /var/log/media-stack/gate.log)
   heal-reset      清空「探不出来」的放弃名单，让它们下一轮重新排队
                   (只在确实修好过源头之后才有意义，见屏上提示)
   check           链路体检(等同菜单里的「5 链路体检」)
@@ -2098,6 +2100,11 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" meta-refresh "$@" ;;
+  gate-bypass)
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    shift || true
+    exec python3 "$S" gate-bypass "$@" ;;
   name-fix)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -4158,6 +4165,75 @@ def gate_prefetch_stream(iid, ua, timeout=HEAL_GATE_WAIT_S, probe=False):
     return ""
 
 
+GATE_ROUTES = ("gate", "streamgate", "peek", "stopping", "hold")
+GATE_ROUTE_CN = {"gate": "按下播放", "streamgate": "第一次拉视频", "peek": "点开详情页先取地址",
+                 "stopping": "退出播放插旗子", "hold": "退出后读详情等进度"}
+GATE_LOG_MAX = 2 * 1024 * 1024
+
+
+def gate_log_path():
+    return os.path.join(TRAFFIC_DIR, "gate.log")
+
+
+def gate_log_line(route, secs, uri="", note=""):
+    """开播门记一笔：几点、哪一类、花了多久、哪一条（只留路径，参数 / token 一律不记）。root-only。
+
+    【为什么要记】真机：开播门开着时，闲一阵再回来，退出播放后 Hills 不回来读详情、进度不刷新；
+    把门整个关掉就正常（10/05 仓库主人实测）。门管五类事，是哪一类惹的看不出来 —— 记下来，
+    再配合 gate-bypass 一类一类关，就能对上。"""
+    try:
+        os.makedirs(TRAFFIC_DIR, mode=0o700, exist_ok=True)
+        p = gate_log_path()
+        try:
+            if os.path.getsize(p) > GATE_LOG_MAX:
+                os.replace(p, p + ".1")
+        except OSError:
+            pass
+        uri = re.sub(r"\?.*", "", uri or "")
+        uri = re.sub(r"/users/[0-9a-f]{16,}/", "/users/<id>/", uri, flags=re.I)
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  {route:<10} {secs:6.2f}s  {uri}"
+                    + (f"  {note}" if note else "") + "\n")
+    except OSError:
+        pass
+
+
+def gate_bypass_set():
+    """开播门这会儿放行（不做事、直接 204）的那几类。"""
+    return {str(x) for x in (ms_state().get("gate_bypass") or []) if str(x) in GATE_ROUTES}
+
+
+def do_gate_bypass(arg=""):
+    """media-stack gate-bypass [类,类|off]：开播门按类单独放行，用来一类一类排查。"""
+    arg = (arg or "").strip()
+    if arg:
+        if arg.lower() in ("off", "none", "0"):
+            want = []
+        else:
+            want = [x.strip() for x in arg.replace("，", ",").split(",") if x.strip()]
+            bad = [x for x in want if x not in GATE_ROUTES]
+            if bad:
+                warn(f"不认识：{'、'.join(bad)}（只认 {', '.join(GATE_ROUTES)}）")
+                return
+        save_ms_state(gate_bypass=want)
+    cur = gate_bypass_set()
+    for r in GATE_ROUTES:
+        st = f"{YELLOW}放行（关着）{RST}" if r in cur else f"{GREEN}照常{RST}"
+        print(f"  {pad(r, 11)}{pad(GATE_ROUTE_CN[r], 20)}{st}")
+    if cur:
+        tip("排查完记得 media-stack gate-bypass off")
+    try:
+        with open(gate_log_path(), encoding="utf-8") as f:
+            tail = f.readlines()[-8:]
+    except OSError:
+        tail = []
+    if tail:
+        print(f"  {DIM}最近的记账（{gate_log_path()}）：{RST}")
+        for ln in tail:
+            print(f"  {DIM}{ln.rstrip()}{RST}")
+
+
 def do_heal_gate():
     """systemd socket 拉起来的：nginx 放行 PlaybackInfo 之前来问一声。
 
@@ -4212,6 +4288,24 @@ def do_heal_gate():
 
     class H(http.server.BaseHTTPRequestHandler):
         def _go(self):
+            # 【每个请求记一笔；被 gate-bypass 关掉的那一类直接放行】见 gate_log_line / do_gate_bypass
+            t0 = time.monotonic()
+            route = self.path.split("?")[0].strip("/") or "?"
+            note = ""
+            try:
+                if route in gate_bypass_set():
+                    note = "关着，直接放行"
+                    self.send_response(204)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    last[0] = time.monotonic()
+                else:
+                    self._go_real()
+            finally:
+                gate_log_line(route, time.monotonic() - t0,
+                              self.headers.get("X-Original-URI") or "", note)
+
+        def _go_real(self):
             last[0] = time.monotonic()
             if self.path.startswith("/stopping"):
                 # 【「停止播放」进门】放旗子、马上放行；等 Emby 收掉这一场再拿旗子 —— 另起线程
@@ -28017,6 +28111,9 @@ if __name__ == "__main__":
                 warn("已经有一轮补时长在跑了（扫完媒体库会自动扔一轮到后台）。")
                 print(f"  {DIM}等它跑完再来，或者 pkill -f 'media-stack.py heal' "
                       f"把那一轮停掉。{RST}")
+        elif arg == "gate-bypass":        # 开播门按类单独放行（排查用）
+            require_root()
+            do_gate_bypass(sys.argv[2] if len(sys.argv) > 2 else "")
         elif arg == "heal-gate":          # systemd socket 拉起的：开播前先补时长
             require_root()
             do_heal_gate()
