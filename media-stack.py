@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.341"
+SCRIPT_VERSION = "1.5.342"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11813,6 +11813,7 @@ def do_sync():
         else:
             rec["nodur_before"] = len(items_without_duration(key, "all"))
             tune_strm_libraries(key)   # 扫描前先调好，新条目一进来就是对的
+            emby_auto_scan_off(key)    # 新装的、被人加回去的，凌晨这一轮兜住
             emby_scan_wait(key, timeout=900, label="每日对齐的扫描")
             align_library(d, key)      # 和小时级那轮同一份，不会飘
             rec["nodur_after"] = len(items_without_duration(key, "all"))
@@ -12836,6 +12837,8 @@ def do_update(from_menu=False):
     _k2 = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth")
     if _k2:
         tune_strm_libraries(_k2)
+        if emby_auto_scan_off(_k2):
+            ok("已关掉 Emby 自带的 12 小时自动扫库（有变动脚本自己通知）")
         # 【刮削器/语言也要在这儿对一次】库选项的对齐一直分在两处：续播门槛和多版本合并
         # （tune_strm_libraries）就在上面这行，更新时会跑；刮削器和语言
         # （sync_library_options）只挂在「4 生成媒体库」和定时任务上，更新这条路一次都不
@@ -14623,6 +14626,37 @@ def _pick_opt_key(opts, names):
             return n
     return ""
 
+
+
+def emby_auto_scan_off(key):
+    """关掉 Emby 自带的「每 12 小时扫描媒体库」。关了返回 True，本来就没开 False，问不到 None。
+
+    【为什么要关】真机 10/05 09:52：Emby 自己按 12 小时间隔扫了一次库，刚补上的音视频轨
+    一下掉了 15 个（星球大战外传1、仙逆 159–161、FC2 那几部……）。补过轨道的条目再被扫到，
+    Emby 会重读 strm；strm 里是网盘路径、读不出来，轨道就清空、只留时长 —— 开播门下次又得
+    现补 10 秒，补时长那几轮天天重复补同一批。
+    【关了不会漏新片】strm 一有变化脚本自己会叫 Emby：生成媒体库、凌晨 AutoFilm 之后的每日
+    对齐、每小时数到 strm 数变了（scan_if_grown）。只关间隔触发器，别的触发器不碰。
+    要留着 Emby 自己的定时扫库：ms_state 里设 emby_auto_scan_keep=true，再到 Emby 后台计划任务里加回去。
+    """
+    if ms_state().get("emby_auto_scan_keep"):
+        return False
+    try:
+        tasks = _emby("/ScheduledTasks", key, timeout=15) or []
+    except Exception:
+        return None
+    t = next((x for x in tasks if x.get("Key") == "RefreshLibrary"), None)
+    if not t or not t.get("Id"):
+        return None
+    trig = t.get("Triggers") or []
+    keep = [x for x in trig if x.get("Type") != "IntervalTrigger"]
+    if len(keep) == len(trig):
+        return False
+    try:
+        _emby(f"/ScheduledTasks/{t['Id']}/Triggers", key, method="POST", timeout=15, body=keep)
+    except Exception:
+        return None
+    return True
 
 
 def tune_strm_libraries(key):
