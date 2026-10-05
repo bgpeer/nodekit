@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.343"
+SCRIPT_VERSION = "1.5.344"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -3871,6 +3871,25 @@ def remove_heal_gate():
         pass
 
 
+def gate_fresh_restart(key):
+    """脚本换了新版：没人在播，就把开播门停掉，下一次开播 socket 用新代码干净地拉起来。返回停没停。
+
+    【为什么不等它自己退】门看见脚本变了、手上空了会自己退出（do_heal_gate 末尾那段），可真机
+    一再撞上：338、341、343 每次「8 更新」换了版本，退出播放后 Hills 就不回来读详情、进度不刷新，
+    要回主页再进去才看得到；同一份代码手动 `systemctl stop media-stack-healgate` 之后马上好了
+    （10/05 13:5x 仓库主人实测）。版本没变的「8 更新」不换脚本、门不重起，一直没出过事。
+    门坏在哪一步还没抓到，先用验证过的办法：换了脚本就干净地停一次。
+    【不误伤播放】有人正在播（或问不到）就不停，照旧等它自己退。socket 在 systemd 手里，
+    停了之后下一个请求进来再拉起来，开播多等一下脚本加载，不会被拒。
+    """
+    if not os.path.exists(HEAL_GATE_UNIT):
+        return False
+    if key and someone_playing(key) is not False:
+        return False
+    sh(f"systemctl stop {os.path.basename(HEAL_GATE_UNIT)}", timeout=60)
+    return True
+
+
 def sync_heal_gate(apply_site=False, quiet=True):
     """装上「先补再播」：一个 systemd socket（nginx 连它）+ 按需拉起的服务。
 
@@ -4931,6 +4950,7 @@ def do_selfupdate():
             os.replace(tmp, me)               # 原子替换，中途断电不会留半截脚本
             rec["ok"] = rec["changed"] = True
             rec["to"] = m.group(1) if m else "?"
+            gate_fresh_restart(read_emby_api_key(d))   # 见它的说明：等它自己退会坏
     except Exception as e:
         rec["error"] = _short_err(e)
     try:
@@ -5820,6 +5840,8 @@ def note_play(now=None):
 #     一律让路：定时的推迟到没人播再做（play_quiet_wait），推不了的这一轮跳过
 #   · 「8 更新」是人按的：有人在播先问一声（默认否）；配置没变的容器不重启；门、常驻服务 unit 没变不硬停
 #     （它们会在脚本换掉后、手上没活时自己用新代码重起）；换链服务更新时照旧重启一次
+#   · 【开播门例外，1.5.344】脚本换了版本、没人在播：直接停掉门（gate_fresh_restart）。等它自己退，
+#     338/341/343 换完版本后退出播放进度都不刷新，仓库主人手动 stop 一次就好 —— 338 起「unit 没变不硬停」正是那时加的
 #   · 【1.5.339 退回了 338 里两处平时一直在跑的改动】每小时对齐「有人播过就整轮跳过」、换链服务「后台盯脚本自己重起」。
 #     仓库主人实测：338 退出后进度不刷新，退回 337 就正常。原因没查明 —— 再往平时会跑的路径上加东西，先单独上、
 #     让仓库主人实测退出刷新，再合别的
@@ -12872,6 +12894,8 @@ def do_update(from_menu=False):
     install_heal_cron(d)      # 「有人看过片就补时长」的轻量轮，见 do_heal_tick
     sync_heal_daemon()        # 按下播放几秒内就补，见 do_heal_daemon
     sync_heal_gate()          # 先补时长再开播；nginx 那一段由下面重新生成站点时写上
+    if os.environ.get("MS_SELF_UPDATED"):
+        gate_fresh_restart(_k0)   # 换了脚本：没人在播就让门用新代码干净地起来，见它的说明
     traffic_install_cron()    # 流量账本：常驻记账，事后能回查任意时刻
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
