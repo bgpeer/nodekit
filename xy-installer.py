@@ -20,6 +20,23 @@
 # ============================================================================
 import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicodedata, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
 
+# 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
+# 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
+# 空格」的，数字那段换成 bgpeer 同色（粗体绿 1;32）。只在直接印到终端时上色 —— 进日志 / 管道 / 测试的照旧是纯文本。
+import builtins as _builtins
+import sys as _sys
+_MENU_NUM_RE = re.compile(r"(^[ \t]*|(?<=  ))(\d{1,2}\.)(?=\s)", re.M)   # 行首的，或并排的（前面两个空格）
+
+
+def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置 print，见上
+    try:
+        f = kw.get("file") or _sys.stdout
+        if args and isinstance(args[0], str) and f is _sys.stdout and f.isatty():
+            args = (_MENU_NUM_RE.sub("\\1\033[1;32m\\2\033[0m", args[0]),) + args[1:]
+    except Exception:
+        pass
+    return _builtins.print(*args, **kw)
+
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
 SCRIPT_VERSION = "1.1.42"
@@ -2399,7 +2416,7 @@ def cn_exact_re(names):
     """把一批节点名拼成精确匹配的正则 ^(?:a|b)$，给 mihomo 的 exclude-filter 用。
        为什么不直接用 CN_PAT：Go 正则没有环视，写不出「是 CN 但不带其它国家标记」，
        直接排 CN_PAT 会把「🇨🇳台湾」这类其实不是大陆的节点也踢出去。服务器知道哪些是
-       中国节点，列名字最准。只转义正则元字符——Go 不认 `\ ` 这类对非标点的转义。"""
+       中国节点，列名字最准。只转义正则元字符——Go 不认 `\\ `（反斜杠加空格）这类对非标点的转义。"""
     esc = lambda n: re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", n)
     return "^(?:" + "|".join(esc(n) for n in names) + ")$"
 
