@@ -45,11 +45,37 @@ import sys as _sys
 _MENU_NUM_RE = re.compile(r"(^[ \t]*|(?<=  ))(\d{1,2}\.)(?=\s)", re.M)   # 行首的，或并排的（前面两个空格）
 
 
+_MENU_SEEN = set()                        # 这一屏印出来的编号；问「请选择」时打的是这里面的，才回头染绿（见 _ask_paint）
+
+
+def _menu_num_paint(m):
+    _MENU_SEEN.add(m.group(2)[:-1])
+    return f"{m.group(1)}\033[1;32m{m.group(2)}\033[0m"
+
+
+def _ask_paint(prompt_shown, v, seen):
+    """打完回车之后：打的是菜单上有的编号 → 把这一行重印一遍、数字染成同色；菜单上没有的照旧普通颜色。
+
+    仓库主人：「这个输入只有上面预设好了的才变成高亮，如果你输入的上面是没有的应该就是普通的颜色」。
+    打字那一刻是终端自己回显的，还不知道最后打什么，所以只能回车后回头重印。整行放不下一行（会折行）
+    就不重印，免得把上一行盖花。"""
+    try:
+        if not v or v not in seen or not _sys.stdout.isatty():
+            return
+        cols = shutil.get_terminal_size((60, 20)).columns
+        wide = sum(2 if ord(ch) > 0x2E80 else 1 for ch in prompt_shown + v)
+        if wide >= cols:
+            return
+        _builtins.print(f"\033[1A\r\033[2K{prompt_shown}\033[1;32m{v}\033[0m", flush=True)
+    except Exception:
+        pass
+
+
 def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置 print，见上
     try:
         f = kw.get("file") or _sys.stdout
         if args and isinstance(args[0], str) and f is _sys.stdout and f.isatty():
-            args = (_MENU_NUM_RE.sub("\\1\033[1;32m\\2\033[0m", args[0]),) + args[1:]
+            args = (_MENU_NUM_RE.sub(_menu_num_paint, args[0]),) + args[1:]
     except Exception:
         pass
     return _builtins.print(*args, **kw)
@@ -74,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.352"
+SCRIPT_VERSION = "1.5.353"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -229,18 +255,15 @@ def ask(prompt, default=""):
     hint = f" [{default}]" if default else ""
     try:
         with open("/dev/tty", "r") as t:
-            # 【打进去的字也跟菜单编号同色】仓库主人：「被选择的那个 16 没有变成高亮的……这个可不可以变」。
-            # 终端回显用的是当前颜色：问之前切成粗体绿，回车之后切回来（Ctrl-C 也切回来）
-            _c = sys.stdout.isatty()
-            print(f"{prompt}{hint}: " + ("\033[1;32m" if _c else ""), end="", flush=True)
-            try:
-                line = t.readline()
-            finally:
-                if _c:
-                    print("\033[0m", end="", flush=True)
+            # 【打的是菜单上有的编号才染绿】见 _ask_paint
+            _seen = set(_MENU_SEEN)
+            _MENU_SEEN.clear()
+            print(f"{prompt}{hint}: ", end="", flush=True)
+            line = t.readline()
             if line == "":
                 raise EOFError
             v = line.rstrip("\n").strip()
+            _ask_paint(f"{prompt}{hint}: ", v, _seen)
     except (OSError, EOFError):
         try:
             v = input(f"{prompt}{hint}: ").strip()
