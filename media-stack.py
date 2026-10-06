@@ -37,6 +37,23 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+# 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
+# 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
+# 空格」的，数字那段换成 bgpeer 同色（粗体绿 1;32）。只在直接印到终端时上色 —— 进日志 / 管道 / 测试的照旧是纯文本。
+import builtins as _builtins
+import sys as _sys
+_MENU_NUM_RE = re.compile(r"(^[ \t]*|(?<=  ))(\d{1,2}\.)(?=\s)", re.M)   # 行首的，或并排的（前面两个空格）
+
+
+def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置 print，见上
+    try:
+        f = kw.get("file") or _sys.stdout
+        if args and isinstance(args[0], str) and f is _sys.stdout and f.isatty():
+            args = (_MENU_NUM_RE.sub("\\1\033[1;32m\\2\033[0m", args[0]),) + args[1:]
+    except Exception:
+        pass
+    return _builtins.print(*args, **kw)
+
 # 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
 # vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
 # GitHub、jsDelivr、公共反代、ip-api 都看得到。换成最常见的 curl 串：不自报家门，
@@ -57,7 +74,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.350"
+SCRIPT_VERSION = "1.5.351"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
