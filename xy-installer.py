@@ -8493,8 +8493,15 @@ def _ask(prompt=""):
        也该当场走默认值继续，而不是抛 EOFError 把整件事炸在半路。"""
     try:
         with open("/dev/tty", "r") as t:
-            print(prompt, end="", flush=True)
-            line = t.readline()
+            # 【打进去的字也跟菜单编号同色】仓库主人：「被选择的那个 16 没有变成高亮的……这个可不可以变」。
+            # 终端回显用的是当前颜色：问之前切成粗体绿，回车之后切回来（Ctrl-C 也切回来）
+            _c = _sys.stdout.isatty()
+            print(prompt + ("\033[1;32m" if _c else ""), end="", flush=True)
+            try:
+                line = t.readline()
+            finally:
+                if _c:
+                    print("\033[0m", end="", flush=True)
             if line == "":
                 raise EOFError
             return line.rstrip("\n").strip()

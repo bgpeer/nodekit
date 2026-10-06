@@ -74,7 +74,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.351"
+SCRIPT_VERSION = "1.5.352"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -229,8 +229,15 @@ def ask(prompt, default=""):
     hint = f" [{default}]" if default else ""
     try:
         with open("/dev/tty", "r") as t:
-            print(f"{prompt}{hint}: ", end="", flush=True)
-            line = t.readline()
+            # 【打进去的字也跟菜单编号同色】仓库主人：「被选择的那个 16 没有变成高亮的……这个可不可以变」。
+            # 终端回显用的是当前颜色：问之前切成粗体绿，回车之后切回来（Ctrl-C 也切回来）
+            _c = sys.stdout.isatty()
+            print(f"{prompt}{hint}: " + ("\033[1;32m" if _c else ""), end="", flush=True)
+            try:
+                line = t.readline()
+            finally:
+                if _c:
+                    print("\033[0m", end="", flush=True)
             if line == "":
                 raise EOFError
             v = line.rstrip("\n").strip()
