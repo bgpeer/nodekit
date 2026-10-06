@@ -57,7 +57,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.349"
+SCRIPT_VERSION = "1.5.350"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13109,7 +13109,7 @@ def do_uninstall():
         install_dir = ask("安装目录", install_dir)
     compose = os.path.join(install_dir, "docker-compose.yml")
     print()
-    warn("将要删除：媒体栈的容器、nginx 站点配置、media-stack/emby 命令。")
+    warn("将要删除：媒体栈的容器（在这里装的小雅连它一起）、nginx 站点配置、media-stack/emby 命令。")
     warn("节点(bgpeer)的任何文件都不会被碰。")
     print(f"  {DIM}输入 {RST}{RED}{BOLD}yes{RST}{DIM} 确认；回车 / n / 其它任何输入都是取消。{RST}")
     # 卸载是不可逆操作，故意不接受 y —— 必须完整打出 yes，避免手滑
@@ -13122,6 +13122,11 @@ def do_uninstall():
     else:
         for c in ("emby", "openlist", "autofilm", "mediawarp", "homepage"):
             sh(f"docker rm -f {c}")
+    # 小雅不在 compose 里（单独起的，见 xiaoya_install），这里一并带走：容器 + 令牌目录。
+    # 【只带走脚本自己装的那份】机器上要是本来就有一份别处装的小雅，卸载媒体栈不该把它和它的令牌删了
+    if ms_state().get("xiaoya_ours"):
+        sh(f"docker rm -f {XIAOYA_NAME}", timeout=120)
+        shutil.rmtree(XIAOYA_DIR, ignore_errors=True)
     ok("容器已删除")
     remove_heal_daemon()      # 常驻进程：卸完不该还有一个 media-stack 的进程在跑
     remove_alitv_service()    # 阿里 TV 本机续期服务同理
@@ -22778,6 +22783,201 @@ def _add_webdav_flow(d):
     return True
 
 
+# ============================================================================ 小雅（自建 WebDAV）
+# 仓库主人：「要接上小雅的，难道要改变我的架构吗……我就是怕弄坏了我的架构」。
+# 【不动现有架构】小雅单独一个容器，接在 mediastack 内部网络上，不对外开端口；docker-compose 不改，
+# 别的容器一个都不重启。OpenList 里多挂一个 WebDAV 存储（跟七米蓝一样），后面扫描、生成、Emby 全照旧。
+# 【撤得干净】「移除小雅」一次做完：去掉扫描路径（AutoFilm 重启、问清不清 strm）→ 删 OpenList 存储 →
+# 删容器 → 删令牌目录 → 删镜像。删完跟没装过一样。
+# 【阿里令牌要另取一份】OpenList 的 /aliyun 用的令牌每续一次就换新的，两边共用会互相踢下线。
+# 【会出网】小雅自己会去它的更新服务器下目录数据、去阿里云盘转存 —— 等于告诉它们「这台机器在跑小雅」。
+# 这是装小雅本身带来的，装的那一屏一行说清，仓库主人点头才装（见 CLAUDE.md「实在躲不掉的时候」）。
+XIAOYA_NAME = "xiaoya"
+XIAOYA_IMAGE = "xiaoyaliu/alist:latest"
+XIAOYA_DIR = "/etc/xiaoya"
+XIAOYA_MOUNT = "/xiaoya"
+XIAOYA_DAV = "http://xiaoya/dav"          # 同一个 mediastack 网络里按容器名找，端口是容器里的 80
+XIAOYA_GUEST = ("guest", "guest_Api789")  # 小雅 WebDAV 的默认访客账号；它的 guestpass.txt 改过就用改过的
+XIAOYA_MIN_FREE_GB = 10
+XIAOYA_FILES = (("mytoken.txt", "阿里云盘 token"),
+                ("myopentoken.txt", "阿里云盘 open token"),
+                ("temp_transfer_folder_id.txt", "转存文件夹 ID"))
+
+
+def xiaoya_state():
+    """小雅容器：「未装」/「在跑」/「停了」。"""
+    try:
+        r = sh(f"docker inspect -f '{{{{.State.Running}}}}' {XIAOYA_NAME}", timeout=20)
+    except Exception:
+        return "问不到"
+    out = (r.stdout or "").strip()
+    if r.returncode != 0 or not out:
+        return "未装"
+    return "在跑" if out == "true" else "停了"
+
+
+def xiaoya_tokens_ok():
+    """三个令牌文件都填了没有。"""
+    try:
+        return all(open(os.path.join(XIAOYA_DIR, f), encoding="utf-8").read().strip()
+                   for f, _n in XIAOYA_FILES)
+    except OSError:
+        return False
+
+
+def xiaoya_set_tokens():
+    """贴小雅要的三样（不回显、不进日志），写进 /etc/xiaoya，root-only。返回改没改。"""
+    tip("阿里令牌要另取一份，跟 OpenList 的 /aliyun 共用会互相踢下线")
+    got = {}
+    for f, name in XIAOYA_FILES:
+        v = _ask_secret(f"{name}（回车跳过、不改）").strip()
+        if v:
+            got[f] = v
+    if not got:
+        print("没有改动。")
+        return False
+    os.makedirs(XIAOYA_DIR, mode=0o700, exist_ok=True)
+    os.chmod(XIAOYA_DIR, 0o700)
+    for f, v in got.items():
+        write_atomic(os.path.join(XIAOYA_DIR, f), v + "\n", 0o600)
+    ok(f"已存 {len(got)} 项（{XIAOYA_DIR}，只有 root 能读）")
+    if xiaoya_state() == "在跑":
+        sh(f"docker restart {XIAOYA_NAME}", timeout=120)
+        ok("小雅已重启，用新令牌")
+    return True
+
+
+def xiaoya_install(d):
+    """装 / 启动小雅容器。接 mediastack 网络、不开端口、不碰别的容器。返回成没成。"""
+    st = xiaoya_state()
+    if st == "在跑":
+        ok("小雅已经在跑")
+        return True
+    if st == "停了":
+        sh(f"docker start {XIAOYA_NAME}", timeout=120)
+        ok("小雅已启动")
+        return True
+    if not xiaoya_tokens_ok():
+        warn("先在「2 阿里令牌」里填好三样，小雅没有它们起不来")
+        return False
+    free = shutil.disk_usage("/").free / 2 ** 30
+    if free < XIAOYA_MIN_FREE_GB:
+        warn(f"磁盘只剩 {free:.0f} GB（小雅要几 GB，建议留 {XIAOYA_MIN_FREE_GB} GB 以上）")
+        if not ask_yn("仍然要装？", False):
+            return False
+    if sh("docker network inspect mediastack", timeout=20).returncode != 0:
+        err("找不到 mediastack 网络（媒体栈装好了吗？）")
+        return False
+    tip("小雅会去它自己的更新服务器下目录、去阿里云盘转存 —— 它们会知道这台机器在跑小雅")
+    if not ask_yn("装小雅？", False):
+        print("没有装。")
+        return False
+    info("正在拉小雅镜像、起容器（第一次要几分钟）...")
+    try:
+        r = sh(f"docker run -d --name {XIAOYA_NAME} --restart unless-stopped --network mediastack "
+               f"-v {XIAOYA_DIR}:/data {XIAOYA_IMAGE}", timeout=900)
+    except Exception as e:
+        err(f"没起来：{_short_err(e)}")
+        return False
+    if r.returncode != 0:
+        err(f"没起来：{_short_err((r.stderr or r.stdout or '').strip())}")
+        return False
+    save_ms_state(xiaoya_ours=True)       # 卸载媒体栈时只带走自己装的这份，见 do_uninstall
+    ok("小雅已启动　第一次要下几百 MB 目录数据，过 5–10 分钟再「3 挂进 OpenList」")
+    return True
+
+
+def xiaoya_mounted(d):
+    return any(mp == XIAOYA_MOUNT for mp, *_x in openlist_storages(d))
+
+
+def xiaoya_mount(d):
+    """在 OpenList 里挂 /xiaoya（WebDAV，本机代理，跟七米蓝一样）。返回成没成。"""
+    if xiaoya_mounted(d):
+        ok(f"已经挂着：{XIAOYA_MOUNT}")
+        return True
+    if xiaoya_state() != "在跑":
+        warn("小雅没在跑，先「1 安装 / 启动」")
+        return False
+    tok = _ol_token(d)
+    if not tok:
+        err("登不上 OpenList（它在跑吗？）")
+        return False
+    user, pw = XIAOYA_GUEST
+    try:
+        pw = open(os.path.join(XIAOYA_DIR, "guestpass.txt"), encoding="utf-8").read().strip() or pw
+    except OSError:
+        pass
+    add = {"vendor": "other", "address": XIAOYA_DAV, "username": user, "password": pw,
+           "root_folder_path": "/", "tls_insecure_skip_verify": False}
+    info(f"正在 OpenList 里挂上 {XIAOYA_MOUNT} ...")
+    try:
+        r = _ol_api("/api/admin/storage/create",
+                    _ol_storage_body(XIAOYA_MOUNT, DRIVER_DAV, add, proxy=True), tok, timeout=60)
+    except Exception as e:
+        err(f"没挂上：{_short_err(e)}")
+        return False
+    if r.get("code") != 200:
+        _ol_drop_storage(d, XIAOYA_MOUNT, tok)
+        err(f"没挂上：{_short_err(str(r.get('message') or ''))[:60]}")
+        tip("小雅刚装的话还在下数据，过几分钟再挂")
+        return False
+    ok(f"小雅已挂上：{XIAOYA_MOUNT}　{YELLOW}⚠ 走 VPS 流量{RST}")
+    tip("别扫整个小雅：在「3 挂载路径」里点它 → 2 修改扫描路径，只加要看的几个目录")
+    return True
+
+
+def xiaoya_remove(d):
+    """一次撤干净：扫描路径 → OpenList 存储 → 容器 → 令牌目录 → 镜像。返回做没做。"""
+    print(f"  {RED}{BOLD}会删掉：小雅的扫描路径、OpenList 里的 {XIAOYA_MOUNT}、小雅容器、{XIAOYA_DIR} 里的令牌{RST}")
+    tip("Emby 里从小雅来的片子会跟着清掉；别的盘一个不动")
+    if not ask_yn("移除小雅？", False):
+        print("没有改动。")
+        return False
+    exp = explicit_scan_paths()
+    mine = _paths_under(exp, XIAOYA_MOUNT)
+    if mine:
+        save_ms_state(scan_spec=[p for p in exp if p not in mine])
+        _apply_scan_paths(d, f"去掉 {'、'.join(mine)}，")
+    tok = _ol_token(d)
+    if tok and xiaoya_mounted(d):
+        _ol_drop_storage(d, XIAOYA_MOUNT, tok)
+    sh(f"docker rm -f {XIAOYA_NAME}", timeout=120)
+    shutil.rmtree(XIAOYA_DIR, ignore_errors=True)
+    sh(f"docker image rm {XIAOYA_IMAGE}", timeout=120)
+    save_ms_state(xiaoya_ours=False)
+    ok("小雅已移除，现有的盘都没动")
+    return True
+
+
+def _xiaoya_menu(d):
+    """「3 挂载路径 → 小雅（自建）」那一屏。"""
+    while True:
+        st = xiaoya_state()
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}小雅（自建 WebDAV）{RST}")
+        print("-" * 60)
+        col = GREEN if st == "在跑" else (YELLOW if st == "停了" else DIM)
+        print(f"  1. {pad('安装 / 启动', 20)}当前：{col}{st}{RST}")
+        print(f"  2. {pad('阿里令牌', 20)}当前："
+              + (f"{GREEN}已填{RST}" if xiaoya_tokens_ok() else f"{DIM}未填{RST}"))
+        print(f"  3. {pad('挂进 OpenList', 20)}当前："
+              + (f"{GREEN}已挂 {XIAOYA_MOUNT}{RST}" if xiaoya_mounted(d) else f"{DIM}未挂{RST}"))
+        print(f"  4. 移除小雅")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        fn = {"1": lambda: xiaoya_install(d), "2": xiaoya_set_tokens,
+              "3": lambda: xiaoya_mount(d), "4": lambda: xiaoya_remove(d)}.get(c)
+        if fn is None:
+            print("无效选择。")
+            continue
+        fn()
+        ask("\n按回车继续...")
+
+
 def qr115_status(uid, tm, sign):
     """回查一个令牌现在还有没有效。返回 (状态码, 人话)。
 
@@ -24958,6 +25158,12 @@ def mount_paths_menu():
                       lambda: _rest_menu(d)))
         extra.append((f"{pad('调整顺序', 19)}{DIM}补时长、截封面按上面的先后来{RST}",
                       lambda: stores and _mount_order_menu(stores)))
+        # 【小雅：常驻一栏，排在最后】没装也在（第四节：入口不准依附在会消失的东西上），见 _xiaoya_menu。
+        # 放最后是为了不挪动上面那些栏的编号 —— 按惯了的数字不能变
+        _xy = xiaoya_state()
+        extra.append((f"{pad('小雅（自建）', 19)}"
+                      + (f"{GREEN}{_xy}{RST}" if _xy == "在跑" else f"{YELLOW if _xy == '停了' else DIM}{_xy}{RST}"),
+                      lambda: _xiaoya_menu(d)))
         for j, (txt, _fn) in enumerate(extra, n + 1):
             print(f"  {j:>2}. {txt}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
