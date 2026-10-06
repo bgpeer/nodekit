@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.353"
+SCRIPT_VERSION = "1.5.354"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11690,9 +11690,17 @@ def migrate_strm_layout(d, key, wait=True):
     if key:
         # 【挪完必须让 Emby 知道】不然旧条目留着、新条目不出现，一部片两个入口。
         # 先走快车道：挪了哪几条我们【一清二楚】，没必要为十几条让它重扫两千多个。
-        moved = [(_strm_container_path(d, src), "Deleted") for src, _dst in moves]
+        # 【没人看着（凌晨 / 每小时）：只报新增、等足 4 分钟、等不到也不扫整个库】真机 10/07：
+        # 04:50:15 报了一批挪位置的（含删除），Emby 照例攒 90 秒、04:51:45 才把周星驰 BLURAY 那几个
+        # 文件夹整个刷一遍；这边也正好只等 90 秒，04:51:46 退回扫整个库 —— 04:52–04:56 掉轨道
+        # 就是它。和 1.5.349 同一个坑：删除留给 prune_emby_ghosts 按条目删，新增后面
+        # emby_sync_changes 会再报一次、那条路等得到。手点（有终端）的照旧：人在等，扫就扫。
+        _tty = has_tty()
+        moved = ([(_strm_container_path(d, src), "Deleted") for src, _dst in moves]
+                 if _tty else [])
         moved += [(_strm_container_path(d, dst), "Created") for _src, dst in moves]
-        if not emby_notify_changes(key, moved):
+        if not emby_notify_changes(key, moved, timeout=90 if _tty else EMBY_SYNC_WAIT_S,
+                                   quiet=not _tty) and _tty:
             if not wait:
                 # 【调用方马上就要全库扫一次，这儿白等】等的是同一件事：两次各 15 分钟，
                 # 用户对着屏幕干等半小时，而中间那次的结果下一次会重新算一遍。
