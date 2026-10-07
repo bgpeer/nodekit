@@ -3082,9 +3082,35 @@ def _ghrelay_rewrite(text):
     return text.replace("https://gh-proxy.com/", p)
 
 
+# 自定义模板常被贴成「网页」链接——GitHub 文件页 / gist 页面，拉下来是一整页 HTML，
+# 不是模板本身。这里把它们换成对应的原始文件链接（前面带了镜像前缀的也认，前缀保留）：
+#   https://github.com/<o>/<r>/blob/<ref>/<path>[?plain=1][#L10] → https://raw.githubusercontent.com/<o>/<r>/<ref>/<path>
+#   https://gist.github.com/<user>/<id>                         → https://gist.githubusercontent.com/<user>/<id>/raw
+#   （gist 的 /raw 不带文件名时给的是第一个文件；多文件 gist 请直接贴那个文件的 Raw 链接）
+# github.com/<o>/<r>/raw/... 本来就会跳到原始文件，不用改。
+_GH_BLOB_RE   = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/blob/([^?#\s]+)")
+_GIST_PAGE_RE = re.compile(r"https://gist\.github\.com/([^/\s]+)/([0-9A-Fa-f]+)/?(?:[?#]\S*)?$")
+
+def tpl_raw_url(url):
+    """模板链接若是 GitHub 文件页 / gist 页面，换成原始文件链接；其它原样返回。"""
+    u = (url or "").strip()
+    m = _GH_BLOB_RE.search(u)
+    if m:
+        o, r, rest = m.groups()
+        return u[:m.start()] + f"https://raw.githubusercontent.com/{o}/{r}/{rest}"
+    m = _GIST_PAGE_RE.search(u)
+    if m:
+        return u[:m.start()] + f"https://gist.githubusercontent.com/{m.group(1)}/{m.group(2)}/raw"
+    return u
+
 def fetch_tpl(url):
-    """拉模板：GitHub 链接中转改写 + 老锚点名归一。三个格式的生成器都走这里。"""
-    t = _ghrelay_rewrite(fetch_url(url))
+    """拉模板：GitHub 链接中转改写 + 老锚点名归一。三个格式的生成器都走这里。
+       页面链接先换成原始文件链接（老版本存下的自定义链接也照样能用）；
+       拉到的若还是网页，直接报错——调用方会回滚、保留原配置，不会把一页 HTML 当模板写进订阅。"""
+    raw = fetch_url(tpl_raw_url(url))
+    if raw.lstrip()[:64].lower().startswith(("<!doctype html", "<html")):
+        raise RuntimeError("模板链接打开是网页、不是模板文件，请改用 Raw（原始文件）链接")
+    t = _ghrelay_rewrite(raw)
     for old, new in _ANCHOR_OLD.items():
         t = t.replace(old, new)
     return t
@@ -4144,9 +4170,14 @@ def config_menu(ext):
                     continue
                 if s != "1":
                     continue                            # 0/其它 → 返回，不动原链接
-            url = _ask("  自定义模板链接(gist/GitHub raw，占位符须与作者模板一致): ").strip()
+            url = _ask("  自定义模板链接(GitHub / gist，页面链接或 raw 都行；占位符须与作者模板一致): ").strip()
             if url:
-                set_custpl(ext, url); print("  ✓ 已保存。之后『3→2 自定义模板』即用它。")
+                raw = tpl_raw_url(url)
+                set_custpl(ext, raw)
+                if raw != url:
+                    print(f"  ✓ 已保存（网页链接已换成原始文件链接）：{raw}")
+                else:
+                    print("  ✓ 已保存。之后『3→2 自定义模板』即用它。")
         elif c == "0" or c == "":
             return
 
