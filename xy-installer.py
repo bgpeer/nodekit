@@ -2098,7 +2098,7 @@ def rotate_links_token():
     t = load_tokens(); t["links"] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
 
 # 订阅托管小服务：有 cert/key 参数就起 HTTPS，否则明文 HTTP（用法：port dir [cert key]）
-# 订阅托管小服务：静态发订阅文件；另带一个 /gh/ GitHub 中转（规则/图标走本机、不依赖 gh-proxy）。
+# 订阅托管小服务：静态发订阅文件；另带一个 /gh/ GitHub 中转（规则/图标走本机、不依赖外部 CDN / 反代）。
 # 中转和订阅共用同一端口（客户端本就从这端口拉订阅，无需额外放行）。多线程，中转不卡订阅。
 # 安全：中转只白名单 GitHub 几个主机——绝不做成"谁都能拿它转发任意网址"的开放代理。
 _SUB_SERVER_PY = r'''import http.server, ssl, sys, urllib.request, urllib.parse
@@ -3046,8 +3046,8 @@ def _ghrelay_token():
 
 def _ghrelay_prefix():
     """本机 GitHub 中转前缀 https://域名:订阅端口/<token>/gh/ ——默认开（有域名+真证书且没被手动关时）。
-       带 token 防别人蹭；返回 '' 则用模板里原本的 gh-proxy.com。中转与订阅同端口、只白名单 GitHub、非开放代理。
-       没域名/自签时返回 ''：中转走 HTTPS 需要真证书，否则客户端拒连，只能退回 gh-proxy。"""
+       带 token 防别人蹭；返回 '' 则用模板里原本的链接（作者模板是 jsDelivr）。中转与订阅同端口、只白名单 GitHub、非开放代理。
+       没域名/自签时返回 ''：中转走 HTTPS 需要真证书，否则客户端拒连，只能退回模板原链接。"""
     if os.path.exists(GHRELAY_OFF):
         return ""
     dom = _host()
@@ -3055,11 +3055,12 @@ def _ghrelay_prefix():
         return ""
     return f"https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/"
 
-# 能被【自动识别】直接改走中转的 GitHub「原始文件」主机——规则集(.mrs/.yaml)和图标都在这几个上。
-# 只认原始文件主机：github.com 的项目页、codeload 的 zip 不自动改（那些多半是说明链接/面板包，
-# 误改没意义甚至变慢）；真要转它们，在模板里显式写代理前缀即可，下面第二步会处理。
+# 能被【自动识别】直接改走中转的 GitHub 主机——规则集(.mrs/.yaml)、图标、面板包都在这几个上。
+# github.com 的项目页不自动改（多半是说明链接，误改没意义）；真要转，在模板里显式写代理前缀。
+# codeload 原来也不认，靠模板里写 gh-proxy 前缀才进中转；作者模板改用 jsDelivr 后面板 zip
+# （jsDelivr 发不了 zip）只能写裸 codeload 链接，所以现在按主机认它。
 _GH_RAW_HOSTS = ("raw.githubusercontent.com", "gist.githubusercontent.com",
-                 "objects.githubusercontent.com")
+                 "objects.githubusercontent.com", "codeload.github.com")
 _URL_TAIL = r'[^\s"\'<>,}\]\)]+'                     # URL 结尾：碰到引号/空白/YAML·JSON 分隔符就停
 # 匹配「可有可无的代理前缀 + GitHub 原始文件链接」。前缀那段会把 https://gh-proxy.com/、
 # https://ghproxy.net/ 这类镜像整段吃掉一起替换，避免出现「别人的镜像/自己的中转/…」套娃。
@@ -3067,18 +3068,38 @@ _GH_URL_RE = re.compile(
     r'(?:https?://' + _URL_TAIL + r'?/)?'
     r'(https://(?:' + "|".join(h.replace(".", r"\.") for h in _GH_RAW_HOSTS) + r')/' + _URL_TAIL + r')')
 
+# 作者模板的远程链接用 jsDelivr（https://cdn.jsdelivr.net/gh/<o>/<r>@<ref>/<path>）——
+# 官方 CDN，比第三方反代 gh-proxy 稳，不会说跑路就跑路。中转开着时要把它们也收进本机中转：
+# 先还原成 raw.githubusercontent 链接，再交给下面同一套改写。还原成 raw 而不是让中转去拉 jsDelivr：
+# VPS 到 GitHub 本来就通，raw 是第一手、没有 jsDelivr 分支缓存那几个小时的滞后，中转的白名单也不用加。
+# 四个 jsDelivr 主机都认；版本号是数字范围（@1、@1.2）或 @latest 的不还原——那是 jsDelivr 的
+# 版本解析语义，raw 没有对应的东西，原样留着让客户端直接走 jsDelivr。
+_JSD_GH_RE = re.compile(
+    r'https://(?:cdn|fastly|gcore|testingcf)\.jsdelivr\.net/gh/'
+    r'([^/\s"\'<>,}\]\)@]+)/([^/\s"\'<>,}\]\)@]+)@([^/\s"\'<>,}\]\)]+)/(' + _URL_TAIL + r')')
+
+def _jsd_to_raw(text):
+    """jsDelivr 的 GitHub 文件链接 → raw.githubusercontent 链接（版本范围 / latest 不动）。"""
+    def sub(m):
+        o, r, ref, path = m.groups()
+        if ref == "latest" or re.fullmatch(r"\d+(\.\d+)?", ref):
+            return m.group(0)
+        return f"https://raw.githubusercontent.com/{o}/{r}/{ref}/{path}"
+    return _JSD_GH_RE.sub(sub, text)
+
 def _ghrelay_rewrite(text):
     """开启时把模板里的 GitHub 链接改走本机中转；关闭/无域名则原样返回。
-       三种写法都认——因为很多人写模板不会加 gh-proxy 前缀，靠 raw 主机名识别才最可靠：
+       四种写法都认——因为很多人写模板不会加 gh-proxy 前缀，靠 raw 主机名识别才最可靠：
          ① https://raw.githubusercontent.com/…            裸链接，自动识别
          ② https://gh-proxy.com/https://raw.github…       老写法，前缀可有可无
          ③ https://随便哪个镜像/https://raw.github…       别人的镜像也整段换掉
-       第二步再兜底处理非原始文件主机（github.com/codeload/gist.github.com）上显式写了前缀的。
+         ④ https://cdn.jsdelivr.net/gh/<o>/<r>@<ref>/…     作者模板现在的写法，先还原成 raw
+       第二步再兜底处理非原始文件主机（github.com/gist.github.com）上显式写了前缀的。
        对已经是中转链接的文本重复执行不会套娃（前缀段会把旧的中转前缀一并吃掉再补上）。"""
     p = _ghrelay_prefix()
     if not p:
         return text
-    text = _GH_URL_RE.sub(lambda m: p + m.group(1), text)
+    text = _GH_URL_RE.sub(lambda m: p + m.group(1), _jsd_to_raw(text))
     return text.replace("https://gh-proxy.com/", p)
 
 
@@ -4623,20 +4644,20 @@ def ghdl_relay_menu():
             print("  无效选择。")
 
 def ghrelay_menu():
-    """GitHub 中转：规则/图标走【本机中转】还是 gh-proxy.com（别人的）。默认本机中转。
+    """GitHub 中转：规则/图标走【本机中转】还是模板原链接（作者模板为 jsDelivr）。默认本机中转。
        支持开/关 + 刷新中转 token（防别人蹭，旧地址立即失效，配置随之刷新）。需域名+真证书。"""
     dom = _host()
     if not (re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or "") and _sub_https()):
-        print("\n  需要域名 + acme 真证书才能自建中转（走 HTTPS）；当前无域名/自签，只能用 gh-proxy。"); return
+        print("\n  需要域名 + acme 真证书才能自建中转（走 HTTPS）；当前无域名/自签，只能用模板原链接（jsDelivr）。"); return
     while True:
         on = not os.path.exists(GHRELAY_OFF)
-        print("\n" + "=" * 60 + "\nGitHub 中转（规则/图标走本机·摆脱 gh-proxy 依赖）\n" + "=" * 60)
-        print("  当前：" + ("\033[1;32m本机中转\033[0m" if on else "gh-proxy.com（别人的）"))
+        print("\n" + "=" * 60 + "\nGitHub 中转（规则/图标走本机·不依赖外部 CDN）\n" + "=" * 60)
+        print("  当前：" + ("\033[1;32m本机中转\033[0m" if on else "模板原链接（jsDelivr）"))
         if on:
             print(f"  中转地址前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
             print("  （只转发 GitHub、与订阅同端口、带 token 防蹭）")
         print("-" * 60)
-        print(f"  1 本机中转 写入配置（开/关）   [当前：{'开' if on else '关（用 gh-proxy）'}]")
+        print(f"  1 本机中转 写入配置（开/关）   [当前：{'开' if on else '关（用 jsDelivr）'}]")
         print("  2 刷新中转 token（防别人蹭：旧地址立即失效 + 刷新订阅；订阅端口不变、客户端自动更新即可）")
         print("  3 刷新 token + 换端口（更狠：连订阅端口一起换随机·自动避开节点端口）")
         print(f"  4 备用取件中转（本机拉不到 GitHub 时，借别的机器转）  "
@@ -4657,7 +4678,7 @@ def ghrelay_menu():
             print("  ✓ 已切换并刷新订阅，客户端重拉即生效。" if _ghrelay_regen() else "  刷新失败（没有可用节点？）。")
         elif c == "2":
             if not on:
-                print("  当前用的是 gh-proxy，先『1』开启本机中转再刷 token。"); continue
+                print("  当前没开本机中转，先『1』开启再刷 token。"); continue
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))   # 换新 token，旧的立即失效
             harden_perms()                # 刚落地是 0644，当场收紧，别留窗口
             print("  正在换 token 并刷新订阅…")
@@ -4668,7 +4689,7 @@ def ghrelay_menu():
                 print("  刷新失败（没有可用节点？）。")
         elif c == "3":
             if not on:
-                print("  当前用的是 gh-proxy，先『1』开启本机中转再操作。"); continue
+                print("  当前没开本机中转，先『1』开启再操作。"); continue
             R, N = "\033[1;31m", "\033[0m"
             cur = sub_port()
             print(f"\n  当前订阅端口：{cur}")
