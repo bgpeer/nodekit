@@ -3853,9 +3853,9 @@ def run(sb_names, xr_names):
             write_nginx_conf()                          # 收集完 ws 家族，写 443 伪装站+反代
         # reality 绑 443 时 nginx 只留 :80 acme stub（续期用），不写 443 块，443 归 reality
         cfg = f"{SB_DIR}/config.json"
-        json.dump({"log": {"level": "info"}, "inbounds": ins,
-                   "outbounds": [{"type": "direct"}]},
-                  open(cfg, "w"), indent=2)
+        sb_cfg = {"log": {"level": "info"}, "inbounds": ins, "outbounds": [{"type": "direct"}]}
+        sb_fix_dns(sb_cfg)                              # 1.13+ 本机 DNS 不走 resolved（见 sb_fix_dns）
+        json.dump(sb_cfg, open(cfg, "w"), indent=2)
         write_service("sing-box", SB_BIN, cfg)
 
     if xr_names:
@@ -4283,6 +4283,63 @@ def _xray_heal_minclientver(restart=True):
         sh("systemctl restart xray", check=False)
     return True
 
+# ── sing-box 服务端的本机 DNS ──────────────────────────────────────────────────
+# 服务端配置原来不写 dns 段，用 sing-box 默认的本机解析。sing-box 1.13 起，Linux 上的本机解析
+# 会改走 systemd-resolved 的 DBus 接口——它判断「这台机归 resolved 管」只看 /etc/resolv.conf
+# 开头的注释里有没有 systemd-resolved 字样，【不管服务还在不在】。resolved 被停 / 被卸、
+# resolv.conf 却还留着那行注释的机器（不少云镜像都这样），每个连接都卡在：
+#   lookup www.gstatic.com: (exchange4: The name org.freedesktop.resolve1 was not provided by any .service files)
+# 客户端看就是 sing-box 的节点全部超时，xray 的照常（xray 自己读 resolv.conf 里的 nameserver）。
+# 内核每月自动更新，1.12 → 1.13 的那天就突然全挂（2026-10 真机）。
+# 解法：本机 DNS 写成 {"type":"local","prefer_go":true}——直接拿 resolv.conf 里的 nameserver 自己查，
+# 跟 xray 一样，不碰 DBus（源码：local.go 只有 !preferGo 时才走 resolved）。
+# prefer_go 是 1.13 才有的字段，1.12 见了会 "unknown field" 整份配置起不来，所以按内核版本加。
+SB_PREFER_GO_MIN = (1, 13, 0)
+
+def sb_fix_dns(cfg):
+    """给 sing-box 服务端配置补上 prefer_go 的本机 DNS（内核 ≥1.13 才补，1.12 原样不动）。
+       没有 dns 段就加一个；已有 local 类型的服务器只补 prefer_go。改了返回 True。"""
+    v = _core_ver(SB_BIN) if os.path.exists(SB_BIN) else None
+    if v is None or v < SB_PREFER_GO_MIN or not isinstance(cfg, dict):
+        return False
+    dns = cfg.get("dns")
+    if not isinstance(dns, dict) or not dns.get("servers"):
+        cfg["dns"] = dict(dns if isinstance(dns, dict) else {},
+                          servers=[{"type": "local", "tag": "local", "prefer_go": True}])
+        return True
+    changed = False
+    for srv in dns["servers"]:
+        if isinstance(srv, dict) and srv.get("type") == "local" and not srv.get("prefer_go"):
+            srv["prefer_go"] = True
+            changed = True
+    return changed
+
+def _sb_heal_dns(restart=True):
+    """现有的 sing-box 配置（主节点 + sing-box 内核的 CDN 节点）缺 prefer_go 就补上；
+       校验不过原样回滚，绝不留坏配置；补了的才重启那一个服务。返回补了几份。"""
+    targets = [(f"{SB_DIR}/config.json", "sing-box")]
+    for n in _cdn_load():
+        if n.get("core", "sing-box") != "xray" and n.get("conf") and n.get("svc"):
+            targets.append((n["conf"], n["svc"]))
+    fixed = 0
+    for path, svc in targets:
+        try:
+            old = open(path).read()
+            data = json.loads(old)
+        except Exception:
+            continue
+        if not sb_fix_dns(data):
+            continue
+        json.dump(data, open(path, "w"), indent=2)
+        ok, _ = core_check(SB_BIN, path)
+        if not ok:
+            open(path, "w").write(old)
+            continue
+        if restart:
+            sh(f"systemctl restart {svc}", check=False)
+        fixed += 1
+    return fixed
+
 CORE_DONE_MARK = "本次更新结束"     # 前台跟随日志时用它判断后台已跑完
 CERT_DONE_MARK = "本次证书修复结束"  # 同上，证书修复用
 NODE_OP_MARK   = "本次节点操作结束"  # 同上，装/加/删协议用
@@ -4309,6 +4366,8 @@ def update_cores_auto(only=None):
             print(f"{ts} {name} 更新失败:", e)
     if _xray_heal_minclientver():                            # 升级到 xray 26.7.11+ 后补 minClientVer，兼容旧客户端
         print(f"{ts} xray reality 已补 minClientVer=1.0.0（兼容 mihomo/旧客户端）")
+    if _sb_heal_dns():                                       # 升到 sing-box 1.13+ 后补 prefer_go，防 DNS 走 resolved 全挂
+        print(f"{ts} sing-box 已补本机 DNS prefer_go（不再依赖 systemd-resolved）")
     setup_core_update_cron()                                 # 顺手确保每月自动更新的 cron 在
     print(f"{time.strftime('%F %T')} {CORE_DONE_MARK}")      # 后台跑时用 python3 -u，逐行落盘不缓冲
 
@@ -5786,8 +5845,9 @@ def _cdn_config(proto, core, cred, path, port, domain, crt, key, dec="none"):
     else:  # trojan-ws
         ib = {"type": "trojan", "tag": "cdn-in", "listen": "::", "listen_port": port,
               "users": [{"password": cred}], "tls": sb_tls, "transport": tr}
-    return ({"log": {"level": "info"}, "inbounds": [ib],
-             "outbounds": [{"type": "direct"}]}, SB_BIN)
+    sb = {"log": {"level": "info"}, "inbounds": [ib], "outbounds": [{"type": "direct"}]}
+    sb_fix_dns(sb)                                       # 1.13+ 本机 DNS 不走 resolved（见 sb_fix_dns）
+    return (sb, SB_BIN)
 
 def _cdn_qe_on():
     """CDN量子加密开关当前是否开着。"""
@@ -8497,6 +8557,8 @@ def main_menu():
     if _xray_heal_minclientver():
         print("  ⓘ 已给 xray reality 补 minClientVer=1.0.0：新版 xray(26.7.11+)默认会静默拒掉\n"
               "     mihomo/Clash 等上报旧版本的客户端，补上后它们又能连了（xray 已后台重启一次）。")
+    if _sb_heal_dns():
+        print("  ✓ 已修好 sing-box 的本机 DNS（sing-box 已重启）")
     while True:
         print("\n" + "=" * 60)
         print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
@@ -8921,6 +8983,8 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
                     "outbounds": [{"protocol": "freedom", "tag": "direct"},
                                   {"protocol": "blackhole", "tag": "block"}]})
             ibs = cfg["inbounds"]
+        if core == "sb":
+            sb_fix_dns(cfg)                     # 新建的、老的都顺手补上（见 sb_fix_dns）
         ins, lks = build(table, picks, dup=dup, mark=mark)
         exist_tags = {ib.get("tag") for ib in ibs}
         add_ins, add_lks = [], []
