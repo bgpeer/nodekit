@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.354"
+SCRIPT_VERSION = "1.5.355"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -9337,6 +9337,29 @@ def set_rules_source(src):
     save_ms_state(rules_src="custom" if src == "custom" else "author")
 
 
+# 自定义链接常被贴成「网页」地址——GitHub 文件页 / gist 页面，拉下来是一整页 HTML，
+# 解析不出规则就会被「先验再存」挡掉，看着像链接坏了。这里换成对应的原始文件链接
+# （前面带了镜像前缀的也认，前缀保留）。和 xy-installer 的 tpl_raw_url 同一套规则：
+#   github.com/<o>/<r>/blob/<ref>/<path>[?plain=1][#L10] → raw.githubusercontent.com/<o>/<r>/<ref>/<path>
+#   gist.github.com/<user>/<id>                         → gist.githubusercontent.com/<user>/<id>/raw
+#   （多文件 gist 的 /raw 给的是第一个文件，那种请直接贴那个文件的 Raw 链接）
+_GH_BLOB_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/blob/([^?#\s]+)")
+_GIST_PAGE_RE = re.compile(r"https://gist\.github\.com/([^/\s]+)/([0-9A-Fa-f]+)/?(?:[?#]\S*)?$")
+
+
+def raw_link(url):
+    """GitHub 文件页 / gist 页面链接换成原始文件链接；其它原样返回。"""
+    u = (url or "").strip()
+    m = _GH_BLOB_RE.search(u)
+    if m:
+        o, r, rest = m.groups()
+        return u[:m.start()] + f"https://raw.githubusercontent.com/{o}/{r}/{rest}"
+    m = _GIST_PAGE_RE.search(u)
+    if m:
+        return u[:m.start()] + f"https://gist.githubusercontent.com/{m.group(1)}/{m.group(2)}/raw"
+    return u
+
+
 def set_rules_url(url):
     """存自定义链接。传空串 = 删掉，并且【同步切回作者的】。
 
@@ -9361,7 +9384,7 @@ def fetch_lib_rules(d, src=None, url=None):
     拉到一页 404 或者限流提示照写进去的话，下一轮所有媒体库会当场消失。
     """
     src = src or rules_source()
-    u = url if url is not None else rules_url_of(src)
+    u = raw_link(url if url is not None else rules_url_of(src))
     if not u:
         return False
     try:
@@ -11372,11 +11395,14 @@ def auto_libraries():
                     continue
                 if t != "1":
                     continue
-            print(f"  {DIM}填 raw 链接（GitHub raw / gist raw 都行），"
+            print(f"  {DIM}填链接（GitHub 文件页 / raw / gist 都行），"
                   f"格式和作者那份一样。回车放弃。{RST}")
-            u = ask("自定义链接").strip()
-            if not u:
+            u0 = ask("自定义链接").strip()
+            if not u0:
                 continue
+            u = raw_link(u0)
+            if u != u0:
+                print(f"  {DIM}网页链接已换成原始文件链接：{u}{RST}")
             if not u.lower().startswith(("http://", "https://")):
                 warn("要 http:// 或 https:// 开头的链接")
                 continue
