@@ -296,9 +296,29 @@ def _parse_remote_list(txt):
                 tags.append(ln.split()[0])
     return tags, doms, ips
 
+# 自定义链接常被贴成「网页」地址——GitHub 文件页 / gist 页面，拉下来是一整页 HTML。
+# 换成对应的原始文件链接（前面带了镜像前缀的也认，前缀保留）；和 xy-installer 的 tpl_raw_url 同一套：
+#   github.com/<o>/<r>/blob/<ref>/<path>[?plain=1][#L10] → raw.githubusercontent.com/<o>/<r>/<ref>/<path>
+#   gist.github.com/<user>/<id>                         → gist.githubusercontent.com/<user>/<id>/raw
+_GH_BLOB_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/blob/([^?#\s]+)")
+_GIST_PAGE_RE = re.compile(r"https://gist\.github\.com/([^/\s]+)/([0-9A-Fa-f]+)/?(?:[?#]\S*)?$")
+
+def raw_link(url):
+    """GitHub 文件页 / gist 页面链接换成原始文件链接；其它原样返回。"""
+    u = (url or "").strip()
+    m = _GH_BLOB_RE.search(u)
+    if m:
+        o, r, rest = m.groups()
+        return u[:m.start()] + f"https://raw.githubusercontent.com/{o}/{r}/{rest}"
+    m = _GIST_PAGE_RE.search(u)
+    if m:
+        return u[:m.start()] + f"https://gist.githubusercontent.com/{m.group(1)}/{m.group(2)}/raw"
+    return u
+
 def _link_data(cfg):
-    """拉取并解析自定义链接，返回校验后的 (tags, domains, ips)。失败返回 None。"""
-    url = (cfg.get("wl_url") or "").strip()
+    """拉取并解析自定义链接，返回校验后的 (tags, domains, ips)。失败返回 None。
+       页面链接先换成原始文件链接（老版本存下的也照样能用）。"""
+    url = raw_link(cfg.get("wl_url"))
     if not url:
         return None
     if url in _LINK_CACHE:
@@ -699,9 +719,12 @@ def menu():
                     continue                             # n 返回菜单，不动原链接
             print("  样板可直接抄走改：https://github.com/bgpeer/nodekit/blob/main/whitelist-template.py")
             print("  支持 WHITELIST_TAGS / ALLOW_DOMAINS / ALLOW_IPS 三个列表；也兼容纯文本 tag 列表、whitelist-inject.sh")
-            url = _ask("  自定义放行名单链接(必须是 raw 链接): ").strip()
+            url0 = _ask("  自定义放行名单链接(GitHub 文件页 / raw / gist 都行): ").strip()
+            url = raw_link(url0)
             if url:
                 cfg["wl_url"] = url; cfg["wl_mode"] = "custom"; cnblock_save(cfg)
+                if url != url0:
+                    print(f"  网页链接已换成原始文件链接：{url}")
                 print("  已保存，并切到自定义名单。")
                 if cfg.get("enabled"): apply_cn_block(cfg)
         elif c == "4":
