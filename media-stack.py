@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.355"
+SCRIPT_VERSION = "1.5.356"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11295,7 +11295,8 @@ def auto_libraries_apply(d, key, quiet=False):
         # 可这里变的是 Emby 那边（库多了一条路径），本地一个文件没动 —— 实测：115 新挂的
         # AV影片 目录，生成完先扫了一遍（那时还没有库指向它），补上路径后这一遍被去重跳过，
         # 屏上写着「补了 1 条路径」，库里却一部都没有。
-        emby_scan_wait(key, timeout=900, label="扫描新建的媒体库", force=True)
+        emby_scan_wait(key, timeout=900, label="扫描新建的媒体库", force=True,
+                       unattended_ok=True)
     if not quiet:
         print(f"  {DIM}规则文件：{lib_rules_path(d)}"
               f"（改仓库里那份，「8 更新」会拉下来）{RST}")
@@ -12069,6 +12070,9 @@ def scan_if_grown(d, key, force=False):
         was = int(open(mark).read().strip())
     except (OSError, ValueError):
         was = -1
+    # 夜里拦下的整库重扫（改了库选项 / 补了季集编号），等有人手点时补上，见 emby_scan_wait
+    if has_tty() and ms_state().get("scan_pending"):
+        force = True
     if not key or (now == was and not force):
         return False
     # 【能只报变动就只报变动】见 emby_sync_changes：扫整个库会清掉补好的轨道
@@ -13845,7 +13849,36 @@ def strm_mtime_guard(d):
     return fixed
 
 
-def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
+SCAN_LOG_MAX = 1024 * 1024
+
+
+def scan_log_line(what, note=""):
+    """跟 Emby 说「扫整个库」「只报这几条」的每一次都记一笔：几点、谁叫的、为什么。root-only。
+
+    【为什么要记】10/06、10/07、10/08 连着三晚 04:5x 掉轨道，每次都要翻 Emby 日志倒推是脚本哪一步
+    发的扫描，一晚只能查出一处。记下来以后一眼就知道是谁。"""
+    try:
+        os.makedirs(TRAFFIC_DIR, mode=0o700, exist_ok=True)
+        p = os.path.join(TRAFFIC_DIR, "scan.log")
+        try:
+            if os.path.getsize(p) > SCAN_LOG_MAX:
+                os.replace(p, p + ".1")
+        except OSError:
+            pass
+        who, f = [], sys._getframe(1)
+        while f is not None and len(who) < 5:
+            if f.f_code.co_name not in ("<module>", "main", "_timed"):
+                who.append(f.f_code.co_name)
+            f = f.f_back
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  {what}  {'←'.join(who)}"
+                     + (f"  {note}" if note else "") + "\n")
+    except Exception:
+        pass
+
+
+def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False, unattended_ok=False):
     """让 Emby 扫一次媒体库并【等它扫完】。返回是否确认扫完。
 
     必须等：迁移时要靠"先扫一次看到文件没了"来让 Emby 真正删掉旧条目。没等完就去重新生成
@@ -13862,6 +13895,16 @@ def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
     一个字都没有 —— 用户看到的就是"卡在「14 个 strm 已挪好」不动了"。
     """
     if not key:
+        return False
+    # 【没人在终端前，一律不扫整个库】真机 10/06–10/08 连着三晚 04:5x：每晚都是脚本某一步等不到 Emby
+    # 确认、退回扫整个库，扫一次就清掉几十个补好的音视频轨（全库只剩 30 多 / 2813 有轨道）。一处一处堵
+    # 堵不完 —— 堵在这一个出口。凌晨 / 每小时那几条要的只是「让 Emby 跟上增删」，只报变动那条路
+    # 等不到这一轮就算了，下一轮再报。真要整个重扫的（改了库选项、补了季集编号）记下来，
+    # 等下次手点「4 生成媒体库」时扫（见 scan_if_grown）。新建的媒体库是空的、没有轨道可掉，放行。
+    if not has_tty() and not unattended_ok:
+        scan_log_line("扫整个库：拦下", f"{label}{' force' if force else ''}")
+        if force:
+            save_ms_state(scan_pending=label)
         return False
     # 【扫库前先把"只是被重写过"的 strm 的修改时间放回去】见 strm_mtime_guard
     try:
@@ -13899,6 +13942,9 @@ def emby_scan_wait(key, timeout=600, label="扫描媒体库", force=False):
             timeout=30).close()
     except Exception:
         return False
+    scan_log_line("扫整个库", label)
+    if ms_state().get("scan_pending"):
+        save_ms_state(scan_pending="")
 
     t0 = time.time()
     deadline = t0 + timeout
@@ -15409,6 +15455,9 @@ def emby_notify_changes(key, changes, timeout=90, quiet=False, nudge=False):
     try:
         _emby("/Library/Media/Updated", key, method="POST", timeout=60,
               body={"Updates": [{"Path": p, "UpdateType": k} for p, k in changes]})
+        _nc = sum(k == "Created" for _p, k in changes)
+        scan_log_line("只报变动", f"新增 {_nc} / 删除 {len(changes) - _nc}："
+                      + "、".join(os.path.basename(p)[:40] for p, _k in changes[:3]))
     except Exception as e:
         if not quiet:
             print(f"  {DIM}没法只更新变动的那几条（{_short_err(e)}），改成全库扫描{RST}")
