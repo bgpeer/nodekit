@@ -1226,6 +1226,98 @@ def setup_port_hopping(target_port, rng):
     if not have("netfilter-persistent"):
         sh("DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent", check=False)
     sh("netfilter-persistent save", check=False)
+    _hy2_hop_persist(target_port, rng)
+
+# 端口跳跃规则的兜底：sing-box 每次启动（含开机）都跑一遍，缺了就补、指错了就换。
+# 只靠 netfilter-persistent 不够——实测有机器 save 静默没写进 rules.v4，一重启 DNAT 没了，
+# hy2 整段跳跃端口全超时（单端口还通，所以很难看出来）。
+HY2_HOP_SH     = "/usr/local/sbin/xy-hy2-hop"
+HY2_HOP_DROPIN = "/etc/systemd/system/sing-box.service.d/xy-hy2-hop.conf"
+
+def _hy2_hop_script(port, rng):
+    lo, hi = rng.split("-")
+    return f"""#!/bin/sh
+# sing-box 启动时补回 hy2 端口跳跃 DNAT（UDP {lo}-{hi} -> :{port}）。由安装脚本生成，勿手改。
+# hy2 已经不在 sing-box 配置里了（重装没选 hy2 等）就什么都不做，免得把整段 UDP 转给死端口
+grep -Eq '"listen_port": *{port}([^0-9]|$)' {SB_DIR}/config.json 2>/dev/null || exit 0
+for t in iptables ip6tables; do
+  command -v $t >/dev/null 2>&1 || continue
+  ok=0
+  $t -w -t nat -S PREROUTING 2>/dev/null | grep -- xy_hy2_portHopping | while read -r l; do
+    case "$l" in
+      *"--dport {lo}:{hi} "*"--to-destination :{port}") ;;
+      *) $t -w -t nat $(echo "$l" | sed 's/^-A /-D /') ;;
+    esac
+  done
+  $t -w -t nat -C PREROUTING -p udp --dport {lo}:{hi} -m comment --comment xy_hy2_portHopping -j DNAT --to-destination :{port} 2>/dev/null || {{
+    $t -w -t nat -A PREROUTING -p udp --dport {lo}:{hi} -m comment --comment xy_hy2_portHopping -j DNAT --to-destination :{port} && echo "added $t"
+  }}
+done
+exit 0
+"""
+
+def _hy2_hop_persist(port, rng):
+    """写兜底脚本 + sing-box 的 drop-in（ExecStartPost）。内容没变不动；变了才 daemon-reload。"""
+    body = _hy2_hop_script(port, rng)
+    unit = f"[Service]\nExecStartPost=-{HY2_HOP_SH}\n"
+    changed = False
+    try:
+        for path, text, mode in ((HY2_HOP_SH, body, 0o700), (HY2_HOP_DROPIN, unit, 0o644)):
+            try:
+                same = open(path).read() == text
+            except Exception:
+                same = False
+            if not same:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                open(path, "w").write(text)
+                changed = True
+            os.chmod(path, mode)
+    except Exception:
+        return False
+    if changed:
+        sh("systemctl daemon-reload", check=False)
+    return changed
+
+def _hy2_hop_unpersist():
+    """删 hy2 / 卸载时撤掉兜底，免得 sing-box 一启动又把 DNAT 加回来。"""
+    gone = False
+    for path in (HY2_HOP_DROPIN, HY2_HOP_SH):
+        if os.path.exists(path):
+            os.remove(path)
+            gone = True
+    try:
+        os.rmdir(os.path.dirname(HY2_HOP_DROPIN))         # 空了才删得掉，别人的 drop-in 不动
+    except Exception:
+        pass
+    if gone:
+        sh("systemctl daemon-reload", check=False)
+
+def _hy2_hop_heal():
+    """老装机自愈：sing-box 里有 hy2、跳跃没关，就补上兜底并当场跑一次。
+       补回了缺的 DNAT 返回 True。没有 hy2 或跳跃关了什么都不做。"""
+    try:
+        cfg = json.load(open(f"{SB_DIR}/config.json"))
+        port = next(ib["listen_port"] for ib in cfg.get("inbounds", [])
+                    if ib.get("type") == "hysteria2" and ib.get("listen_port"))
+    except StopIteration:
+        _hy2_hop_unpersist()                              # 没有 hy2 了，兜底也撤掉
+        return False
+    except Exception:
+        return False
+    try:
+        raw = json.load(open(STATE_FILE)).get("hy2_ports", "")
+    except Exception:
+        raw = ""
+    if (raw or "").strip().lower() in ("off", "n", "no", "none"):
+        _hy2_hop_unpersist()
+        return False
+    rng = raw.strip() if re.match(r"^\d+-\d+$", (raw or "").strip()) else HY2_PORTS
+    _hy2_hop_persist(int(port), rng)
+    out = sh(HY2_HOP_SH, check=False) if os.path.exists(HY2_HOP_SH) else ""
+    if "added" in (out or ""):
+        sh("netfilter-persistent save", check=False)
+        return True
+    return False
 
 def sb_hysteria2(port, tag):
     pw = new_pw(); crt, key, insec = ensure_acme()
@@ -4368,6 +4460,8 @@ def update_cores_auto(only=None):
         print(f"{ts} xray reality 已补 minClientVer=1.0.0（兼容 mihomo/旧客户端）")
     if _sb_heal_dns():                                       # 升到 sing-box 1.13+ 后补 prefer_go，防 DNS 走 resolved 全挂
         print(f"{ts} sing-box 已补本机 DNS prefer_go（不再依赖 systemd-resolved）")
+    if _hy2_hop_heal():                                      # 端口跳跃 DNAT 丢了（持久化没生效）就补回
+        print(f"{ts} hy2 端口跳跃规则已补回")
     setup_core_update_cron()                                 # 顺手确保每月自动更新的 cron 在
     print(f"{time.strftime('%F %T')} {CORE_DONE_MARK}")      # 后台跑时用 python3 -u，逐行落盘不缓冲
 
@@ -4469,6 +4563,7 @@ def _uninstall_core():
         for line in sh(f"{ipt} -t nat -S PREROUTING", check=False).splitlines():
             if line.startswith("-A") and "xy_hy2_portHopping" in line:
                 sh(f"{ipt} -t nat " + line.replace("-A", "-D", 1), check=False)
+    _hy2_hop_unpersist()
     sh("netfilter-persistent save", check=False)
     if os.path.exists(NGINX_CONF):                      # 移除本脚本的 nginx 前置块（不动用户其它站点）
         sh(f"rm -f {NGINX_CONF}", check=False)
@@ -8559,6 +8654,8 @@ def main_menu():
               "     mihomo/Clash 等上报旧版本的客户端，补上后它们又能连了（xray 已后台重启一次）。")
     if _sb_heal_dns():
         print("  ✓ 已修好 sing-box 的本机 DNS（sing-box 已重启）")
+    if _hy2_hop_heal():
+        print("  ✓ 已补回 hy2 端口跳跃规则（以后 sing-box 每次启动都会自动检查）")
     while True:
         print("\n" + "=" * 60)
         print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
@@ -9123,6 +9220,7 @@ def _drop_hy2_dnat():
             if line.startswith("-A") and "portHopping" in line:
                 sh(f"{ipt} -t nat " + line.replace("-A", "-D", 1), check=False)
                 n += 1
+    _hy2_hop_unpersist()
     if n:
         sh("netfilter-persistent save", check=False)
     return n
