@@ -4311,37 +4311,18 @@ def _cfg_auto_state(ext):
         return "关"
     return "开（手改过，暂停中）" if cfg_auto_paused(ext) else "开（每天 03:20）"
 
-def _cfg_auto_local_times(year=None):
-    """北京 03:20 落在本机时区的哪几个钟点：取今年 1 月和 7 月各算一次。
-
-       为什么不只算一次：美国、欧洲、澳洲这些地方有夏令时，同一个北京时刻在本机冬天和夏天
-       差一个小时（洛杉矶冬天 11:20、夏天 12:20）。只按装的那天算，换季后就整整偏一小时。
-       两个都写进 cron，到点由 cfg_auto_run 再看一眼北京时间，不是 03:20 前后的那次直接退出。
-       没有夏令时的地方（UTC、新加坡、日本、香港……）两次算出来一样，只写一行。"""
-    import datetime
-    bj = datetime.timezone(datetime.timedelta(hours=8))
-    y = year or datetime.date.today().year
-    out = []
-    for mon in (1, 7):
-        t = datetime.datetime(y, mon, 15, *CFG_AUTO_AT, tzinfo=bj).astimezone()
-        if (t.hour, t.minute) not in out:
-            out.append((t.hour, t.minute))
-    return out
-
 def setup_cfg_auto_cron():
-    """装每天北京 03:20 自动更新三大配置的 cron（按本机时区换算，夏令时两季都覆盖）。幂等。"""
+    """装每天北京 03:20 自动更新三大配置的 cron（时区 / 夏令时换算见 bj_cron_lines，进排队器）。幂等。"""
     try:
         if os.path.abspath(__file__) != SELF_LOCAL and not os.path.exists(SELF_LOCAL):
             os.makedirs(BGP_DIR, exist_ok=True)
             shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
-        times = _cfg_auto_local_times()
+        lines, times = bj_job_lines(*CFG_AUTO_AT, "cfgauto", f"python3 {SELF_LOCAL} cfg-auto >> {CFG_AUTO_LOG} 2>&1")
         txt = (f"# bgpeer 三大配置每日自动更新（北京时间 {CFG_AUTO_AT[0]:02d}:{CFG_AUTO_AT[1]:02d}"
-               f" = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}"
-               f"{'（冬/夏令时各一行，到点只有对的那次真跑）' if len(times) > 1 else ''}）\n"
+               f" = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点，进排队器）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               + "".join(f"{m} {h} * * * root python3 {SELF_LOCAL} cfg-auto >> {CFG_AUTO_LOG} 2>&1\n"
-                         for h, m in times))
+               + "".join(l + "\n" for l in lines))
         try:
             if open(CFG_AUTO_CRON).read() == txt:
                 return True
@@ -4353,16 +4334,15 @@ def setup_cfg_auto_cron():
         return False
 
 def _cfg_auto_due(now=None):
-    """cron 叫醒时核对：现在是不是北京 03:20 前后（±15 分钟），而且今天还没跑过。
-       返回今天的北京日期（该跑）或 None（不是这次）。夏令时那两行里，不对的那行在这里被挡掉。"""
+    """今天（北京日期）还没跑过就返回今天的日期，跑过了返回 None。
+
+       钟点不在这里核对了：cron 那行到点已经用北京时间核对过（见 bj_cron_lines），之后进排队器，
+       可能排在别的任务后面晚几分钟，也可能被重启打断、开机后才接着跑——这些都该照跑，只防同一天跑两遍。"""
     import datetime
     bj = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(
         datetime.timezone(datetime.timedelta(hours=8)))
-    mins = bj.hour * 60 + bj.minute - (CFG_AUTO_AT[0] * 60 + CFG_AUTO_AT[1])
     day = bj.strftime("%F")
-    if abs(mins) > 15 or _cfg_auto_load().get("last") == day:
-        return None
-    return day
+    return None if _cfg_auto_load().get("last") == day else day
 
 def cfg_auto_run():
     """cron 每天 03:20 调：开着自动更新的格式，按【当前选的模板】（作者 / 自定义）重生成一遍。
@@ -4376,8 +4356,7 @@ def cfg_auto_run():
     _heal_other_crons()
     day = _cfg_auto_due()
     if not day:
-        return                                  # 夏令时另一季那行、或今天已跑过：安静退出
-    d = _cfg_auto_load(); d["last"] = day; _cfg_auto_save(d)
+        return                                  # 今天已跑过：安静退出
     ts = time.strftime("%F %T")
     todo = [e for e in FMT if os.path.exists(FMT[e]["file"]) and cfg_auto_on(e)]
     for e in [e for e in todo if cfg_auto_paused(e)]:
@@ -4403,6 +4382,7 @@ def cfg_auto_run():
             print(f"{ts} {meta['label']} 更新失败，已保留原配置（{which}模板）：{str(err).splitlines()[0] if str(err) else err}")
             continue
         print(f"{ts} {meta['label']} " + ("无变化" if open(target).read() == old else "已更新") + f"（{which}模板）")
+    d = _cfg_auto_load(); d["last"] = day; _cfg_auto_save(d)    # 跑完才记：中途被重启打断，开机会接着跑
     harden_perms()
 
 def cfg_auto_menu(ext):
@@ -4520,15 +4500,163 @@ def bj_cron_lines(hh, mm, cmd, day=None):
     guard = f'[ "$(TZ=CST-8 date +{fmt})" = "{want}" ] && '
     return [f"{m} {h} * * * root {guard}{cmd}" for h, m in times], times
 
+
+# ── 凌晨任务排队（bgpeer-jobq）────────────────────────────────────────────────
+# 仓库主人：「如果有影响就在后面排队，如果要等服务器重启了排队的就自动跟上进行继续做」。
+# 凌晨这几条（cn-block 刷新会重启 sing-box、nginx 升级会重启 nginx、内核更新会重启 sing-box/xray、
+# 三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
+# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize
+# 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对三份一致）。
+JOBQ_BIN  = "/usr/local/sbin/bgpeer-jobq"
+JOBQ_UNIT = "/etc/systemd/system/bgpeer-jobq.service"
+JOBQ_SH = r"""#!/bin/bash
+# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，三个脚本各带一份同样的，勿手改）
+#   bgpeer-jobq run <任务名> '<命令>'   登记 → 排队 → 前面的跑完再跑（同名任务已在排/在跑就不重复登记）
+#   bgpeer-jobq resume                  开机时调：上次重启打断的、还没轮到的，按原先顺序接着跑
+#   bgpeer-jobq list                    看队列
+# 记录落在硬盘（不是 /run），断电重启也丢不了；登记超过 12 小时还没跑上的丢掉，免得白天冒出凌晨的活。
+Q=${BGPEER_JOBQ_DIR:-/var/lib/bgpeer-jobq}
+LOCK=${BGPEER_JOBQ_LOCK:-/run/bgpeer-jobq.lock}
+LOG=${BGPEER_JOBQ_LOG:-/var/log/bgpeer-jobq.log}
+MAX_AGE=${BGPEER_JOBQ_MAX_AGE:-43200}
+JOB_TIMEOUT=${BGPEER_JOBQ_TIMEOUT:-7200}
+BOOT_WAIT=${BGPEER_JOBQ_BOOT_WAIT:-60}
+mkdir -p "$Q" && chmod 700 "$Q"
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+queued() {   # 同名任务是否已在排 / 在跑
+  local f
+  for f in "$Q"/*.job "$Q"/*.run; do
+    [ -e "$f" ] && [ "$(head -n1 "$f")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+drain() {    # 拿到锁的那个把整条队按登记顺序跑完；没拿到的等着（= 排队）
+  exec 9>"$LOCK"
+  flock 9
+  local f id cmd t0 rc
+  while :; do
+    f=$(ls -1 "$Q"/*.job 2>/dev/null | sort | head -n1)
+    [ -n "$f" ] || break
+    id=$(sed -n 1p "$f"); cmd=$(sed -n 2p "$f")
+    if [ $(( $(date +%s) - $(stat -c %Y "$f") )) -gt "$MAX_AGE" ]; then
+      log "$id 登记超过 $((MAX_AGE / 3600)) 小时没跑上，丢弃"; rm -f "$f"; continue
+    fi
+    mv "$f" "${f%.job}.run"                 # 正在跑：这时重启，开机会接着跑它
+    t0=$(date +%s); log "$id 开始"
+    timeout "$JOB_TIMEOUT" bash -c "$cmd" 9>&-   # 9>&-：锁别漏给任务起的进程，不然锁永远放不掉
+    rc=$?
+    rm -f "${f%.job}.run"; log "$id 结束 rc=$rc 用时 $(( $(date +%s) - t0 ))s"
+  done
+  exec 9>&-
+}
+
+case "$1" in
+  run)
+    [ -n "$2" ] && [ -n "$3" ] || { echo "用法: $0 run <任务名> '<命令>'" >&2; exit 2; }
+    if queued "$2"; then log "$2 已在队列里，不重复登记"; exit 0; fi
+    tmp=$(mktemp "$Q/.new.XXXXXX")
+    printf '%s\n%s\n' "$2" "$3" > "$tmp"
+    mv "$tmp" "$Q/$(date +%s%N)-$2.job"
+    if ! flock -n "$LOCK" true 2>/dev/null; then log "$2 排队：前面还有任务在跑"; fi
+    drain
+    ;;
+  resume)
+    n=0
+    for f in "$Q"/*.run; do [ -e "$f" ] && mv "$f" "${f%.run}.job" && n=$((n + 1)); done
+    m=$(ls -1 "$Q"/*.job 2>/dev/null | wc -l)
+    [ "$m" -gt 0 ] || exit 0
+    log "开机续跑：被重启打断 $n 个，共 $m 个待跑；等 ${BOOT_WAIT}s 让网络和服务先起来"
+    sleep "$BOOT_WAIT"
+    drain
+    ;;
+  list)
+    for f in "$Q"/*.job "$Q"/*.run; do
+      [ -e "$f" ] && echo "$(basename "$f")  $(sed -n 2p "$f")"
+    done
+    ;;
+  *) echo "用法: $0 run <任务名> '<命令>' | resume | list" >&2; exit 2 ;;
+esac
+"""
+JOBQ_UNIT_TXT = ("[Unit]\nDescription=bgpeer 凌晨任务排队：开机接着跑被重启打断 / 还没轮到的\n"
+                 "Wants=network-online.target\nAfter=network-online.target sing-box.service xray.service nginx.service\n"
+                 "[Service]\nType=simple\nExecStart=" + JOBQ_BIN + " resume\n"
+                 "[Install]\nWantedBy=multi-user.target\n")
+
+
+def ensure_jobq():
+    """装 / 更新排队器和开机续跑服务。内容没变什么都不做。装不上返回 False（调用方退回直接跑）。"""
+    try:
+        changed = False
+        for path, txt, mode in ((JOBQ_BIN, JOBQ_SH, 0o755), (JOBQ_UNIT, JOBQ_UNIT_TXT, 0o644)):
+            try:
+                same = open(path).read() == txt
+            except OSError:
+                same = False
+            if not same:
+                # 写临时文件再换名：排队器可能正在跑（bash 是边跑边读脚本的），原地改写会把它读花
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".new", "w") as f:
+                    f.write(txt)
+                os.chmod(path + ".new", mode)
+                os.replace(path + ".new", path)
+                changed = True
+            os.chmod(path, mode)
+        if changed:
+            subprocess.run("systemctl daemon-reload; systemctl enable bgpeer-jobq.service",
+                           shell=True, capture_output=True)
+        return True
+    except OSError:
+        return False
+
+
+def bj_job_lines(hh, mm, job, cmd, day=None):
+    """北京时间定时任务的 cron 行：时间换算 + 到点核对（见 bj_cron_lines）+ 交给排队器。
+       排队器不在（被别的卸载删了）就直接跑，至少不丢任务。cmd 里不能有单引号。"""
+    assert "'" not in cmd
+    ensure_jobq()
+    wrapped = (f"if [ -x {JOBQ_BIN} ]; then {JOBQ_BIN} run {job} '{cmd}'; "
+               f"else {cmd}; fi")
+    return bj_cron_lines(hh, mm, wrapped, day=day)
+
+
+def jobq_cleanup_if_unused():
+    """卸载时调：/etc/cron.d 里已经没有任务用排队器了，才把它和开机服务、队列一起撤掉。
+       （网络优化是独立模块，卸代理主体时它的 nginx 月度升级还在用排队器，那就留着。）"""
+    try:
+        for n in os.listdir("/etc/cron.d"):
+            try:
+                if JOBQ_BIN in open(os.path.join("/etc/cron.d", n)).read():
+                    return False
+            except OSError:
+                pass
+    except OSError:
+        pass
+    subprocess.run("systemctl disable bgpeer-jobq.service", shell=True, capture_output=True)
+    for p in (JOBQ_BIN, JOBQ_UNIT):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    shutil.rmtree("/var/lib/bgpeer-jobq", ignore_errors=True)
+    try:
+        os.remove("/var/log/bgpeer-jobq.log")
+    except OSError:
+        pass
+    subprocess.run("systemctl daemon-reload", shell=True, capture_output=True)
+    return True
+
+
 def setup_core_update_cron():
     """装每月定点更新内核的 cron：北京时间每月 2 号 04:00（时区 / 夏令时换算见 bj_cron_lines）。幂等。"""
     try:
         if os.path.abspath(__file__) != SELF_LOCAL:      # 确保 cron 调的本地副本存在
             os.makedirs(BGP_DIR, exist_ok=True)
             shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
-        lines, times = bj_cron_lines(4, 0, f"python3 {SELF_LOCAL} update-cores >> {CORE_CRON_LOG} 2>&1", day=2)
+        lines, times = bj_job_lines(4, 0, "coreupdate", f"python3 {SELF_LOCAL} update-cores >> {CORE_CRON_LOG} 2>&1", day=2)
         txt = (f"# bgpeer 内核每月自动更新（北京时间每月 2 号 04:00 = 本机 "
-               f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京日期和钟点）\n"
+               f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京日期和钟点，进排队器）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
                + "".join(l + "\n" for l in lines))
@@ -4545,10 +4673,10 @@ def setup_core_update_cron():
 NETOPT_NGINX_CRON = "/etc/cron.d/net-optimize-nginx-update"
 CNBLOCK_CRON      = "/etc/cron.d/bgpeer-cnblock"
 
-def _heal_bj_cron(path, hh, mm, title, day=None):
+def _heal_bj_cron(path, hh, mm, title, job, day=None):
     """别的模块装的北京时间定时任务，老写法按本机时区只换算了一次（或写了 Debian 不认的
-       CRON_TZ），夏令时换季 / 改时区后会偏。这里就地换成 bj_cron_lines 的写法，命令原样保留。
-       已经是新写法（带 CST-8 核对）就不动。改了返回 True。
+       CRON_TZ），夏令时换季 / 改时区后会偏，也没进排队器。这里就地换成 bj_job_lines 的写法，
+       命令原样保留。已经进了排队器的就不动。改了返回 True。
 
        · cn-block 每天 03:00 刷新：新版自己每次刷新也会对齐，但老副本要等它更新
        · net-optimize 每月 1 号 03:10 升级 nginx：老写法 CRON_TZ=Asia/Shanghai，UTC 机器上实际是北京 11:10"""
@@ -4556,15 +4684,20 @@ def _heal_bj_cron(path, hh, mm, title, day=None):
         txt = open(path).read()
     except OSError:
         return False
-    if "CST-8" in txt:
+    if JOBQ_BIN in txt:
         return False
     m = re.search(r"^\s*\d+\s+\d+\s+\S+\s+\*\s+\*\s+root\s+(.+)$", txt, re.M)
     if not m:
         return False
-    lines, times = bj_cron_lines(hh, mm, m.group(1).strip(), day=day)
+    cmd = m.group(1).strip()
+    if cmd.startswith("[ ") and " ] && " in cmd:          # 上一版带了北京时间核对：剥掉，下面重新加
+        cmd = cmd.split(" ] && ", 1)[1]
+    if "'" in cmd:
+        return False
+    lines, times = bj_job_lines(hh, mm, job, cmd, day=day)
     when = f"每月 {day} 号 " if day else "每天 "
     new = (f"# {title}（北京时间{when}{hh:02d}:{mm:02d} = 本机 "
-           f"{' / '.join(f'{h:02d}:{mi:02d}' for h, mi in times)}，到点核对北京时间）\n"
+           f"{' / '.join(f'{h:02d}:{mi:02d}' for h, mi in times)}，到点核对北京时间，进排队器）\n"
            "SHELL=/bin/bash\n"
            "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
            + "".join(l + "\n" for l in lines))
@@ -4575,8 +4708,8 @@ def _heal_bj_cron(path, hh, mm, title, day=None):
         return False
 
 def _heal_other_crons():
-    _heal_bj_cron(CNBLOCK_CRON, 3, 0, "bgpeer 屏蔽规则集每日刷新")
-    _heal_bj_cron(NETOPT_NGINX_CRON, 3, 10, "Net-Optimize: monthly nginx upgrade", day=1)
+    _heal_bj_cron(CNBLOCK_CRON, 3, 0, "bgpeer 屏蔽规则集每日刷新", "cnblock")
+    _heal_bj_cron(NETOPT_NGINX_CRON, 3, 10, "Net-Optimize: monthly nginx upgrade", "nginx-upgrade", day=1)
 
 def _core_update_schedule_str():
     """可读描述：北京每月 2 号 04:00，附本机实际触发时刻。"""
@@ -4830,6 +4963,7 @@ def _uninstall_core():
         paths.append("/etc/bgpeer")          # 没人共用，整个目录一起收
     for p in paths:
         sh(f"rm -rf {p}", check=False)
+    jobq_cleanup_if_unused()             # 凌晨任务排队器：没有别的定时任务在用了才撤（网络优化可能还在用）
     if _ms:
         # 【目录留着，但节点自己的文件要清干净】留下的只有别人的东西。
         for p in ("/etc/bgpeer/state.json", CFG_AUTO_FILE):
