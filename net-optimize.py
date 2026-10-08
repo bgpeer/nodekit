@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.1"
+VERSION = "4.5.2"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -1977,6 +1977,28 @@ def cmd_daemon():
         sys.exit(1)
 
 
+def bj_cron_lines(hh, mm, cmd, day=None):
+    """北京时间 hh:mm（day 给了 = 每月那一号）→ /etc/cron.d 里的行。
+
+    为什么不能只换算一次：Debian/Ubuntu 的 cron 不认 CRON_TZ，只能按本机时区写；而美国、欧洲、
+    澳洲这些地方有夏令时，同一个北京时刻在本机冬天和夏天差一小时（洛杉矶冬 11:00 / 夏 12:00），
+    只按装的那天算，换季后就整整偏一小时，还可能撞上别的凌晨任务。
+    所以按今年 1 月和 7 月各算一次，两个本机时刻都写；每行前面用北京时间再核对一次
+    （TZ=CST-8 是 POSIX 写法，不依赖 tzdata），只有对的那行真跑。没有夏令时的时区只有一行。
+    每月任务：本机日期可能跟北京差一天，所以日期字段写 *、改由核对里的「几号」把关。"""
+    import datetime
+    bj = datetime.timezone(datetime.timedelta(hours=8))
+    y = datetime.date.today().year
+    times = []
+    for mon in (1, 7):
+        t = datetime.datetime(y, mon, 15, hh, mm, tzinfo=bj).astimezone()
+        if (t.hour, t.minute) not in times:
+            times.append((t.hour, t.minute))
+    fmt, want = ("\\%d\\%H", f"{day:02d}{hh:02d}") if day else ("\\%H", f"{hh:02d}")
+    guard = f'[ "$(TZ=CST-8 date +{fmt})" = "{want}" ] && '
+    return [f"{m} {h} * * * root {guard}{cmd}" for h, m in times], times
+
+
 # === Nginx 官方源 / 双源共存 / 安装升级 / 自动更新（--nginx-upgrade 由 cron 调）===
 NGINX_KEYRING = "/usr/share/keyrings/nginx-archive-keyring.gpg"
 NGINX_OFFICIAL_LIST = "/etc/apt/sources.list.d/nginx-official.list"
@@ -2231,12 +2253,7 @@ def fix_nginx_repo(install_if_missing=False):
     # 5) 不执行主脚本时，每月 1 号北京时间 03:10 自动更新。
     #    【只在 nginx 确实装上了之后才写】装失败还挂 cron 的话，等于每月重试安装。
     if have_cmd("nginx"):
-        write_text(NGINX_CRON,
-                   "SHELL=/bin/bash\n"
-                   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
-                   "CRON_TZ=Asia/Shanghai\n"
-                   "# Net-Optimize: monthly nginx upgrade, nginx.org Pin=1001\n"
-                   f"10 3 1 * * root {PYTHON_BIN} {SCRIPT_PATH} --nginx-upgrade\n")
+        write_nginx_cron()
         echo("✅ 已配置 Nginx 自动更新 cron：北京时间每月 1 号 03:10")
         ver = run(["nginx", "-v"], timeout=5).stderr.strip().split("/")[-1]
         echo(f"✅ 当前 Nginx 版本：{ver}")
@@ -2300,6 +2317,21 @@ WantedBy=multi-user.target
     echo("✅ 开机自启服务配置完成")
 
 
+def write_nginx_cron():
+    """每月 1 号北京 03:10 升级 nginx 的 cron。内容没变不重写。
+
+    原来写的是 CRON_TZ=Asia/Shanghai —— Debian/Ubuntu 的 cron 不认这一行，实际按本机时区跑
+    （UTC 机器上变成北京 11:10）。改成本机时刻 + 北京时间核对，见 bj_cron_lines。"""
+    lines, times = bj_cron_lines(3, 10, f"{PYTHON_BIN} {SCRIPT_PATH} --nginx-upgrade", day=1)
+    txt = ("SHELL=/bin/bash\n"
+           "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+           "# Net-Optimize: monthly nginx upgrade, nginx.org Pin=1001"
+           f"（北京时间每月 1 号 03:10 = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）\n"
+           + "".join(l + "\n" for l in lines))
+    if read_text(NGINX_CRON) != txt:
+        write_text(NGINX_CRON, txt)
+
+
 def cmd_boot_apply():
     """开机恢复（原 net-optimize-apply）：不因单步失败中断。"""
     lock = open("/var/run/net-optimize-apply.lock", "w")
@@ -2310,6 +2342,13 @@ def cmd_boot_apply():
         return
 
     cfg = config_read()
+
+    # 老装机那条 nginx 月度 cron 是 CRON_TZ 写法（Debian 不认）；开机顺手换成能用的，改过时区也一起对齐
+    if os.path.isfile(NGINX_CRON):
+        try:
+            write_nginx_cron()
+        except Exception:
+            pass
 
     # 模块 + sysctl
     for module in read_text(MODULES_FILE).split():

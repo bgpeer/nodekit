@@ -3,7 +3,7 @@
 # 独立文件，方便单独维护；nodekit 主脚本(xy-installer.py)通过子进程调用：
 #   python3 cn-block.py            交互菜单
 #   python3 cn-block.py apply      按已存状态重新注入（未开启则直接跳过）——重装后自动调用
-#   python3 cn-block.py refresh    刷新规则集缓存并重启（cron 每天北京 03:00 调用）
+#   python3 cn-block.py refresh    刷新规则集缓存并重启（cron 每天北京 03:00 调用，任何时区 / 夏令时都对）
 #   python3 cn-block.py remove     卸载屏蔽规则
 #
 # 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
@@ -582,21 +582,44 @@ def _cache_path():
     except Exception:
         return f"{SB_DIR}/cache.db"
 
+def bj_cron_lines(hh, mm, cmd, day=None):
+    """北京时间 hh:mm（day 给了 = 每月那一号）→ /etc/cron.d 里的行。
+
+    为什么不能只换算一次：Debian/Ubuntu 的 cron 不认 CRON_TZ，只能按本机时区写；而美国、欧洲、
+    澳洲这些地方有夏令时，同一个北京时刻在本机冬天和夏天差一小时（洛杉矶冬 11:00 / 夏 12:00），
+    只按装的那天算，换季后就整整偏一小时，还可能撞上别的凌晨任务。
+    所以按今年 1 月和 7 月各算一次，两个本机时刻都写；每行前面用北京时间再核对一次
+    （TZ=CST-8 是 POSIX 写法，不依赖 tzdata），只有对的那行真跑。没有夏令时的时区只有一行。
+    每月任务：本机日期可能跟北京差一天，所以日期字段写 *、改由核对里的「几号」把关。"""
+    import datetime
+    bj = datetime.timezone(datetime.timedelta(hours=8))
+    y = datetime.date.today().year
+    times = []
+    for mon in (1, 7):
+        t = datetime.datetime(y, mon, 15, hh, mm, tzinfo=bj).astimezone()
+        if (t.hour, t.minute) not in times:
+            times.append((t.hour, t.minute))
+    fmt, want = ("\\%d\\%H", f"{day:02d}{hh:02d}") if day else ("\\%H", f"{hh:02d}")
+    guard = f'[ "$(TZ=CST-8 date +{fmt})" = "{want}" ] && '
+    return [f"{m} {h} * * * root {guard}{cmd}" for h, m in times], times
+
 def setup_cron():
-    """装每日定点刷新的 cron：北京时间 03:00 = UTC 19:00。
-       Debian/Ubuntu 默认 cron 不支持 CRON_TZ（那是 cronie 的特性），
-       所以按服务器当前时区把 UTC 19:00 换算成本地时刻写入。"""
+    """装每日定点刷新的 cron：北京时间 03:00（时区 / 夏令时换算见 bj_cron_lines）。幂等。"""
     try:
         if os.path.abspath(__file__) != SELF_PATH:      # 确保 cron 调的本地副本存在
             os.makedirs(BGP_DIR, exist_ok=True)
             import shutil; shutil.copy(os.path.abspath(__file__), SELF_PATH)
-        import datetime
-        local = (datetime.datetime.now(datetime.timezone.utc)
-                 .replace(hour=19, minute=0, second=0, microsecond=0).astimezone())
-        txt = (f"# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = UTC 19:00 = 本机 {local:%H:%M}）\n"
+        lines, times = bj_cron_lines(3, 0, f"python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1")
+        txt = (f"# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = 本机 "
+               f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               f"{local.minute} {local.hour} * * * root python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1\n")
+               + "".join(l + "\n" for l in lines))
+        try:
+            if open(CRON_FILE).read() == txt:
+                return
+        except OSError:
+            pass
         open(CRON_FILE, "w").write(txt); os.chmod(CRON_FILE, 0o644)
     except OSError as e:
         print("  安装定时任务失败（不影响屏蔽，仅少了每日刷新）:", e)
@@ -610,6 +633,7 @@ def refresh():
        起不来就回滚缓存，绝不因刷新把节点搞挂。cron 调用。"""
     if not cnblock_load().get("enabled"):
         return
+    setup_cron()                                        # 顺手对齐 cron（老装机按装的那天换算、改过时区）
     cache = _cache_path(); bak = cache + ".bak"
     if os.path.exists(cache):
         try: os.replace(cache, bak)
