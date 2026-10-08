@@ -3,7 +3,7 @@
 # 独立文件，方便单独维护；nodekit 主脚本(xy-installer.py)通过子进程调用：
 #   python3 cn-block.py            交互菜单
 #   python3 cn-block.py apply      按已存状态重新注入（未开启则直接跳过）——重装后自动调用
-#   python3 cn-block.py refresh    刷新规则集缓存并重启（cron 每天北京 03:00 调用，任何时区 / 夏令时都对）
+#   python3 cn-block.py refresh    规则集有变化才刷新缓存并重启（cron 每天北京 03:00 调用，任何时区 / 夏令时都对）
 #   python3 cn-block.py remove     卸载屏蔽规则
 #
 # 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
@@ -778,12 +778,52 @@ def remove_cron():
     try: os.remove(CRON_FILE)
     except OSError: pass
 
+def _cnblk_remote_sets():
+    """配置里本脚本注入的远程规则集 {tag: url}（sing-box 拉的就是这几个地址）。"""
+    try:
+        conf = json.load(open(f"{SB_DIR}/config.json"))
+    except Exception:
+        return {}
+    return {r["tag"]: r["url"] for r in (conf.get("route") or {}).get("rule_set", [])
+            if str(r.get("tag", "")).startswith("cnblk-") and r.get("type") == "remote" and r.get("url")}
+
+def _rs_hashes(sets):
+    """把这几个规则集按 sing-box 用的同一个地址拉一遍，算 sha256。任何一个拉不下来返回 None。"""
+    import hashlib
+    out = {}
+    for tag, url in sorted(sets.items()):
+        data = None
+        for rd in range(2):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+                data = urllib.request.urlopen(req, timeout=30).read()
+                break
+            except Exception:
+                time.sleep(2 * (rd + 1))
+        if not data:
+            return None
+        out[tag] = hashlib.sha256(data).hexdigest()
+    return out
+
 def refresh():
-    """定点刷新：清 sing-box 规则集缓存后重启，强制重新拉取远程 srs；
-       起不来就回滚缓存，绝不因刷新把节点搞挂。cron 调用。"""
+    """定点刷新：规则集【有变化】才清 sing-box 规则集缓存并重启，强制重新拉取远程 srs；
+       起不来就回滚缓存，绝不因刷新把节点搞挂。cron 调用。
+
+       【没变化不重启】仓库主人：「03:00 那个改成规则有变化才重启吧」。以前每晚都重启一次 sing-box，
+       凌晨挂着的连接都断几秒；而 geoip/cn 一个月只变十来天、域名那份更少。先按 sing-box 用的同一批地址
+       拉一遍算指纹，跟上次成功刷新时记的比：一样就什么都不做；拉不下来也不重启（sing-box 自己每 24 小时
+       也会更新这几个规则集，不会因为这一晚没刷就过期）。第一次（还没记过指纹）照旧刷一次。"""
     if not cnblock_load().get("enabled"):
         return
     setup_cron()                                        # 顺手对齐 cron（老装机按装的那天换算、改过时区）
+    sets = _cnblk_remote_sets()
+    new = _rs_hashes(sets) if sets else None
+    if new is None:
+        print(time.strftime("%F %T"), "规则集拉不下来，这次不重启（sing-box 自己每 24 小时也会更新）")
+        return
+    if cnblock_load().get("rs_hash") == new:
+        print(time.strftime("%F %T"), "规则集没有变化，不重启 sing-box")
+        return
     cache = _cache_path(); bak = cache + ".bak"
     if os.path.exists(cache):
         try: os.replace(cache, bak)
@@ -807,7 +847,8 @@ def refresh():
     if bak and os.path.exists(bak):
         try: os.remove(bak)
         except OSError: pass
-    print(time.strftime("%F %T"), "规则集已刷新")
+    cfg = cnblock_load(); cfg["rs_hash"] = new; cnblock_save(cfg)   # 起来了才记，没起来下次还会再试
+    print(time.strftime("%F %T"), "规则集有变化，已刷新（sing-box 重启一次）")
 
 def update_now():
     """立即更新：重新拉取最新放行名单 + 规则集并即时生效，不必等每天 03:00 的定时刷新。
