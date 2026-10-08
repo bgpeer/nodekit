@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.360"
+SCRIPT_VERSION = "1.5.361"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2565,6 +2565,64 @@ HLS_LAST_DYING_MIN = 5
 # urllib 的 timeout 只管「一次读等多久」，挤一点就重新计时），播放器在这边干等了 108 秒。
 # 封顶之后：拉不动就换上次那条（不同节点）再试一次，还不行就交回 MediaWarp，让播放器自己去拉
 HLS_PL_DEADLINE_S = 8
+# 【一条连接 3 秒没回就再开一条一起拉，谁先回用谁】真机 10/08 晚高峰（22:17–22:30）：东京到夸克一路丢包，
+# OpenList 的日志里全是「dial tcp … i/o timeout」「TLS handshake timeout」「connection reset by peer」，
+# curl 三次有两次要 1.1 秒才连上（第一个包丢了、等 1 秒重发）。丢包时往往是【某一条连接】卡死，换一条
+# 常常就通了。列表拉不到（「网盘回列表 8.0s 没取到」）就只能交回 MediaWarp —— 之后手机每一段都先绕回东京
+# 再跳去夸克，晚高峰只剩几百 KB/s（仙逆 159：209 KB/s）；拉到了每一段手机直连夸克（实测 4.6 MB/s）。
+# 仓库主人：「改第1条」。正常时一条 0.2~2 秒就回，不会多开；总时长照旧封顶 HLS_PL_DEADLINE_S。
+# 第一条要是很快就断了（被断开、5xx），马上开第二条，不等满 3 秒；网盘明确回了 4xx（地址本身不行）不再开
+HLS_PL_HEDGE_S = 3
+HLS_PL_HEDGE_MAX = 2          # 一次拉列表最多几条连接
+
+
+def hls_pl_get(loc, ua, deadline, info=None):
+    """从网盘拉那份几 KB 的 m3u8 → (内容, 跳转之后的地址)；拉不到 → None。墙钟最多 deadline 秒。
+
+    见 HLS_PL_HEDGE_S：一条连接 HLS_PL_HEDGE_S 秒没回、或者很快就断了，就再开一条一起拉，谁先回用谁。
+    info（dict）记下开了几条（conns）、第几条先回（win，0 = 都没回）。"""
+    end = time.monotonic() + deadline
+    runs = []
+
+    def _get(o):
+        try:
+            rq = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
+            with urllib.request.urlopen(rq, timeout=max(1.0, end - time.monotonic())) as r:
+                o["txt"] = r.read(2 << 20).decode("utf-8", "replace")
+                o["final"] = r.geturl() or loc
+        except urllib.error.HTTPError as e:
+            o["no"] = e.code < 500       # 网盘明确回了 4xx：地址本身不行，再开一条也一样
+        except Exception:
+            pass                         # 连不上 / 握手超时 / 被断开：换一条连接常常就通了
+        finally:
+            o["done"] = True
+
+    def _go():
+        o = {"t": time.monotonic()}
+        runs.append(o)
+        threading.Thread(target=_get, args=(o,), daemon=True).start()
+
+    _go()
+    won = None
+    while True:
+        won = next((o for o in runs if o.get("done") and "txt" in o), None)
+        if won is not None or any(o.get("no") for o in runs):
+            break
+        now = time.monotonic()
+        if now >= end:
+            break
+        alive = [o for o in runs if not o.get("done")]
+        if (len(runs) < HLS_PL_HEDGE_MAX and end - now > 1.0
+                and (not alive or now - runs[-1]["t"] >= HLS_PL_HEDGE_S)):
+            _go()
+            continue
+        if not alive:
+            break
+        time.sleep(0.05)
+    if info is not None:
+        info["conns"] = len(runs)
+        info["win"] = runs.index(won) + 1 if won is not None else 0
+    return (won["txt"], won["final"]) if won is not None else None
 
 
 def hls_direct_on():
@@ -3208,25 +3266,14 @@ def do_hls_fix():
         except Exception:
             pass
 
-    def _pl_from(vid, loc, ua, timeout=15):
+    def _pl_from(vid, loc, ua, timeout=15, info=None):
         """真拉一次播放列表；是 #EXTM3U 就改好返回，不是 / 拉不动返回 ""。
-        总共最多 min(timeout, HLS_PL_DEADLINE_S) 秒（墙钟），见 HLS_PL_DEADLINE_S。"""
-        got = {}
-
-        def _get():
-            try:
-                r2 = urllib.request.Request(loc, headers={"User-Agent": ua or PLAYER_UA})
-                with urllib.request.urlopen(r2, timeout=timeout) as r:
-                    got["txt"] = r.read(2 << 20).decode("utf-8", "replace")
-                    got["final"] = r.geturl() or loc
-            except Exception:
-                pass
-        th = threading.Thread(target=_get, daemon=True)
-        th.start()
-        th.join(min(timeout, HLS_PL_DEADLINE_S))
-        if th.is_alive() or "txt" not in got:
+        总共最多 min(timeout, HLS_PL_DEADLINE_S) 秒（墙钟），见 HLS_PL_DEADLINE_S；
+        一条连接卡住就再开一条，见 hls_pl_get。"""
+        got = hls_pl_get(loc, ua, min(timeout, HLS_PL_DEADLINE_S), info)
+        if not got:
             return ""
-        txt, final = got["txt"], got["final"]
+        txt, final = got
         if not txt.lstrip().startswith("#EXTM3U"):
             return ""
         head = final.split("?", 1)[0]
@@ -3247,6 +3294,7 @@ def do_hls_fix():
 
     def _playlist_fetch(vid, ua):
         body, _qn, loc, _old = "", "", "", ""
+        _pli = {}                        # 拉列表开了几条连接、第几条先回，见 hls_pl_get
         _t0, _t1, _t2, _hls, _tries = time.monotonic(), 0.0, 0.0, False, 0
         try:
             loc, _qn = qtv_of(vid)
@@ -3338,7 +3386,7 @@ def do_hls_fix():
             _t1 = time.monotonic()
             _hls = ".m3u8" in loc.split("?", 1)[0].lower()
             if _hls and not body:
-                body = _pl_from(vid, loc, ua)
+                body = _pl_from(vid, loc, ua, info=_pli)
                 if body and not _qn:
                     _remember(vid, loc)
                 elif (not body and not _qn and _lg and _lg[0] != loc and _old in ("", "-")
@@ -3356,7 +3404,8 @@ def do_hls_fix():
         # 【开播计时的后半截】慢在 MediaWarp 换地址（它要问 OpenList、OpenList 要问网盘接口），
         # 还是慢在网盘回播放列表 —— 两截分开记。快的（1.5 秒以内）不记，免得流水被刷满。
         _all = time.monotonic() - _t0
-        if _all > 1.5 or (_hls and not body) or _qn or _tries > 1 or (_old and _old != "-"):     # 自己挑了档的每次都记，好对得上
+        if (_all > 1.5 or (_hls and not body) or _qn or _tries > 1 or (_old and _old != "-")     # 自己挑了档的每次都记，好对得上
+                or _pli.get("conns", 1) > 1):     # 补开过连接的也记：晚高峰管不管用要看它
             try:
                 heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：换链服务取播放列表　"
                           + (f"自己问夸克（转码 {_qn}）" if _qn else
@@ -3367,12 +3416,16 @@ def do_hls_fix():
                           + ("　没给地址" if _tries and not loc else "")
                           + (f"　拿 {_old}的地址兜上了" if _old and _old != "-" and _tries else "")
                           + (f"、网盘回列表 {_t2 - _t1:.1f}s" if _t1 and _t2 else "")
+                          + ((f"（第一条卡住，开了第二条，第 {_pli['win']} 条先回）" if _pli.get("win")
+                              else "（开了两条连接都没回）") if _pli.get("conns", 1) > 1 else "")
                           + ("" if body or not _hls else "　没取到（交回 MediaWarp）")
                           + f"{_log_tag(vid)}"])
             except Exception:
                 pass
         if _tries > 1:
             _note(f"重问 {_tries} 次")
+        if _pli.get("conns", 1) > 1:
+            _note("拉列表补开连接" + ("" if _pli.get("win") else "也没拉到"))
         if _old and _old != "-":
             _note("旧地址兜底" if _tries else "旧地址直接用")
         if _tries and not loc:
