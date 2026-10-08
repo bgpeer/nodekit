@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.357"
+SCRIPT_VERSION = "1.5.358"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4887,6 +4887,153 @@ def hist_verdict(s):
     return "ok", None
 
 
+# Emby 这边凌晨那几条（04:10 自动更新脚本、04:50 每日对齐、各盘刷新元数据）也进同一个
+# 排队器，跟节点那边的 03:00 / 03:10 / 03:20 / 04:00 一条队。【只排每天一次的】保活、预热、heal-tick、
+# 流量采样一小时 / 一分钟就一次，排进去只会互相堵；04:15 刷目录缓存要赶 AutoFilm 04:20，也不排（见 install_sync_cron）。
+# 「有人在播就让路」（play_quiet_wait）还在各任务自己里面，不动。
+# ── 凌晨任务排队（bgpeer-jobq）────────────────────────────────────────────────
+# 仓库主人：「如果有影响就在后面排队，如果要等服务器重启了排队的就自动跟上进行继续做」。
+# 凌晨这几条（cn-block 刷新会重启 sing-box、nginx 升级会重启 nginx、内核更新会重启 sing-box/xray、
+# 三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
+# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize /
+# media-stack 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对四份一致）。
+JOBQ_BIN  = "/usr/local/sbin/bgpeer-jobq"
+JOBQ_UNIT = "/etc/systemd/system/bgpeer-jobq.service"
+JOBQ_SH = r"""#!/bin/bash
+# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，四个脚本各带一份同样的，勿手改）
+#   bgpeer-jobq run <任务名> '<命令>'   登记 → 排队 → 前面的跑完再跑（同名任务已在排/在跑就不重复登记）
+#   bgpeer-jobq resume                  开机时调：上次重启打断的、还没轮到的，按原先顺序接着跑
+#   bgpeer-jobq list                    看队列
+# 记录落在硬盘（不是 /run），断电重启也丢不了；登记超过 12 小时还没跑上的丢掉，免得白天冒出凌晨的活。
+Q=${BGPEER_JOBQ_DIR:-/var/lib/bgpeer-jobq}
+LOCK=${BGPEER_JOBQ_LOCK:-/run/bgpeer-jobq.lock}
+LOG=${BGPEER_JOBQ_LOG:-/var/log/bgpeer-jobq.log}
+MAX_AGE=${BGPEER_JOBQ_MAX_AGE:-43200}
+JOB_TIMEOUT=${BGPEER_JOBQ_TIMEOUT:-14400}   # 4 小时：Emby 每日对齐自己就给了 3 小时
+BOOT_WAIT=${BGPEER_JOBQ_BOOT_WAIT:-60}
+mkdir -p "$Q" && chmod 700 "$Q"
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+queued() {   # 同名任务是否已在排 / 在跑
+  local f
+  for f in "$Q"/*.job "$Q"/*.run; do
+    [ -e "$f" ] && [ "$(head -n1 "$f")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+drain() {    # 拿到锁的那个把整条队按登记顺序跑完；没拿到的等着（= 排队）
+  exec 9>"$LOCK"
+  flock 9
+  local f id cmd t0 rc
+  while :; do
+    f=$(ls -1 "$Q"/*.job 2>/dev/null | sort | head -n1)
+    [ -n "$f" ] || break
+    id=$(sed -n 1p "$f"); cmd=$(sed -n 2p "$f")
+    if [ $(( $(date +%s) - $(stat -c %Y "$f") )) -gt "$MAX_AGE" ]; then
+      log "$id 登记超过 $((MAX_AGE / 3600)) 小时没跑上，丢弃"; rm -f "$f"; continue
+    fi
+    mv "$f" "${f%.job}.run"                 # 正在跑：这时重启，开机会接着跑它
+    t0=$(date +%s); log "$id 开始"
+    timeout "$JOB_TIMEOUT" bash -c "$cmd" 9>&-   # 9>&-：锁别漏给任务起的进程，不然锁永远放不掉
+    rc=$?
+    rm -f "${f%.job}.run"; log "$id 结束 rc=$rc 用时 $(( $(date +%s) - t0 ))s"
+  done
+  exec 9>&-
+}
+
+case "$1" in
+  run)
+    [ -n "$2" ] && [ -n "$3" ] || { echo "用法: $0 run <任务名> '<命令>'" >&2; exit 2; }
+    if queued "$2"; then log "$2 已在队列里，不重复登记"; exit 0; fi
+    tmp=$(mktemp "$Q/.new.XXXXXX")
+    printf '%s\n%s\n' "$2" "$3" > "$tmp"
+    mv "$tmp" "$Q/$(date +%s%N)-$2.job"
+    if ! flock -n "$LOCK" true 2>/dev/null; then log "$2 排队：前面还有任务在跑"; fi
+    drain
+    ;;
+  resume)
+    n=0
+    for f in "$Q"/*.run; do [ -e "$f" ] && mv "$f" "${f%.run}.job" && n=$((n + 1)); done
+    m=$(ls -1 "$Q"/*.job 2>/dev/null | wc -l)
+    [ "$m" -gt 0 ] || exit 0
+    log "开机续跑：被重启打断 $n 个，共 $m 个待跑；等 ${BOOT_WAIT}s 让网络和服务先起来"
+    sleep "$BOOT_WAIT"
+    drain
+    ;;
+  list)
+    for f in "$Q"/*.job "$Q"/*.run; do
+      [ -e "$f" ] && echo "$(basename "$f")  $(sed -n 2p "$f")"
+    done
+    ;;
+  *) echo "用法: $0 run <任务名> '<命令>' | resume | list" >&2; exit 2 ;;
+esac
+"""
+JOBQ_UNIT_TXT = ("[Unit]\nDescription=bgpeer 凌晨任务排队：开机接着跑被重启打断 / 还没轮到的\n"
+                 "Wants=network-online.target\nAfter=network-online.target sing-box.service xray.service nginx.service\n"
+                 "[Service]\nType=simple\nExecStart=" + JOBQ_BIN + " resume\n"
+                 "[Install]\nWantedBy=multi-user.target\n")
+
+
+def ensure_jobq():
+    """装 / 更新排队器和开机续跑服务。内容没变什么都不做。装不上返回 False（调用方退回直接跑）。"""
+    try:
+        changed = False
+        for path, txt, mode in ((JOBQ_BIN, JOBQ_SH, 0o755), (JOBQ_UNIT, JOBQ_UNIT_TXT, 0o644)):
+            try:
+                same = open(path).read() == txt
+            except OSError:
+                same = False
+            if not same:
+                # 写临时文件再换名：排队器可能正在跑（bash 是边跑边读脚本的），原地改写会把它读花
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".new", "w") as f:
+                    f.write(txt)
+                os.chmod(path + ".new", mode)
+                os.replace(path + ".new", path)
+                changed = True
+            os.chmod(path, mode)
+        if changed:
+            subprocess.run("systemctl daemon-reload; systemctl enable bgpeer-jobq.service",
+                           shell=True, capture_output=True)
+        return True
+    except OSError:
+        return False
+
+
+def jobq_wrap(job, cmd):
+    """把一条命令包成「交给排队器」：排队器不在（被别的卸载删了）就直接跑，至少不丢任务。"""
+    import shlex
+    return f"if [ -x {JOBQ_BIN} ]; then {JOBQ_BIN} run {job} {shlex.quote(cmd)}; else {cmd}; fi"
+
+
+def jobq_cleanup_if_unused():
+    """卸载时调：/etc/cron.d 里已经没有任务用排队器了，才把它和开机服务、队列一起撤掉。
+       （网络优化是独立模块，卸代理主体时它的 nginx 月度升级还在用排队器，那就留着。）"""
+    try:
+        for n in os.listdir("/etc/cron.d"):
+            try:
+                if JOBQ_BIN in open(os.path.join("/etc/cron.d", n)).read():
+                    return False
+            except OSError:
+                pass
+    except OSError:
+        pass
+    subprocess.run("systemctl disable bgpeer-jobq.service", shell=True, capture_output=True)
+    for p in (JOBQ_BIN, JOBQ_UNIT):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    shutil.rmtree("/var/lib/bgpeer-jobq", ignore_errors=True)
+    try:
+        os.remove("/var/log/bgpeer-jobq.log")
+    except OSError:
+        pass
+    subprocess.run("systemctl daemon-reload", shell=True, capture_output=True)
+    return True
+
+
 def cron_cmd(sub):
     """拼一条 cron 用的命令：超时 + 调本脚本的某个子命令。
 
@@ -5061,6 +5208,20 @@ def cst_to_local_cron(hhmm):
     return total % 60, total // 60
 
 
+def jobq_migrate_crons():
+    """老装机的凌晨那几条 cron 还没进排队器 → 重写一遍（只写 cron 文件，不动容器、不碰播放）。
+       进 Emby 菜单时、每天 04:10 自动更新那一轮里各调一次；已经是新写法就什么都不做。"""
+    d = ms_install_dir()
+    for path, fix in ((SYNC_CRON, lambda: install_sync_cron(d)),
+                      (SELFUP_CRON, lambda: install_selfupdate_cron(d)),
+                      (META_CRON, install_meta_cron)):
+        try:
+            if os.path.exists(path) and JOBQ_BIN not in open(path).read():
+                fix()
+        except Exception:
+            pass
+
+
 def do_selfupdate():
     """定时任务调的自动更新：【只把脚本换成仓库里的最新版】。结果写 json 给体检读。
 
@@ -5078,6 +5239,7 @@ def do_selfupdate():
     d = ms_install_dir()
     if not is_installed(d):
         return
+    jobq_migrate_crons()            # 老装机：凌晨那几条接进排队器（只写 cron 文件）
     me = os.path.realpath(__file__)
     # 【有人在播就推迟】换掉脚本，门、常驻服务会在手上没活时用新代码重起 —— 不碰正在播的那一场也别凑这个热闹
     play_quiet_wait(read_emby_api_key(d), "自动更新脚本", max_s=240, step=30)   # cron 只给 300 秒；没等到明天再换
@@ -5126,6 +5288,7 @@ def do_selfupdate():
 
 def install_selfupdate_cron(install_dir):
     """装每天一次的脚本自动更新。见 do_selfupdate。"""
+    ensure_jobq()
     m, h = cst_to_local_cron(SELFUP_HOUR_CST)
     try:
         txt = (f"# media-stack 每天自动把脚本换成仓库最新版（只换脚本，\n"
@@ -5134,7 +5297,7 @@ def install_selfupdate_cron(install_dir):
                f"排在每日对齐之前，换完那一轮就是新版在跑。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               f"{m} {h} * * * root {cron_cmd('selfupdate')} >/dev/null 2>&1\n")
+               f"{m} {h} * * * root {jobq_wrap('ms-selfupdate', cron_cmd('selfupdate') + ' >/dev/null 2>&1')}\n")
         with open(SELFUP_CRON, "w") as f:
             f.write(txt)
         os.chmod(SELFUP_CRON, 0o644)
@@ -5178,6 +5341,7 @@ def install_sync_cron(install_dir):
       · 新建的媒体库续播门槛是默认的 120 秒 —— 短片子永远没有记忆。门槛是每个库
         各自一份的，而加库的动作在 Emby 里做，脚本这边毫无感知
     """
+    ensure_jobq()
     m, h = cst_to_local_cron(SYNC_HOUR_CST)
     pm, ph = cst_to_local_cron(PRECACHE_HOUR_CST)
     try:
@@ -5189,8 +5353,11 @@ def install_sync_cron(install_dir):
                f"# 给新媒体库调续播门槛、补时长、通知 Emby 扫描 —— 排在生成【之后】。\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               # 刷目录缓存【不进排队器】：它必须赶在 AutoFilm 04:20 生成 strm 之前（AutoFilm 在容器里按
+               # 自己的钟跑，等不了人），而排队器里前面若有几个盘的刷新元数据在等人看完片，能一路拖过 04:20。
+               # 它只是每个盘两个 HTTP 请求、不重启任何东西，跟谁一起跑都不碍事。
                f"{pm} {ph} * * * root {cron_cmd('precache')} >/dev/null 2>&1\n"
-               f"{m} {h} * * * root {cron_cmd('sync')} >/dev/null 2>&1\n")
+               f"{m} {h} * * * root {jobq_wrap('ms-sync', cron_cmd('sync') + ' >/dev/null 2>&1')}\n")
         with open(SYNC_CRON, "w") as f:
             f.write(txt)
         os.chmod(SYNC_CRON, 0o644)
@@ -10540,13 +10707,15 @@ def install_meta_cron():
             if os.path.exists(META_CRON):
                 os.remove(META_CRON)
             return True
+        ensure_jobq()
         lines = ["# media-stack 各盘自动刷新元数据（只补没简介的；时刻是北京时间换算成本机的）",
                  "SHELL=/bin/bash",
                  "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin"]
         for mp, t in sorted(on.items()):
             m, h = cst_to_local_cron(t)
-            lines.append(f"{m} {h} * * * root {cron_cmd('meta-refresh')} {shlex.quote(mp)} "
-                         f">/dev/null 2>&1")
+            job = "ms-meta-" + hashlib.md5(mp.encode("utf-8")).hexdigest()[:10]
+            lines.append(f"{m} {h} * * * root "
+                         + jobq_wrap(job, f"{cron_cmd('meta-refresh')} {shlex.quote(mp)} >/dev/null 2>&1"))
         write_atomic(META_CRON, "\n".join(lines) + "\n", mode=0o644)
         return True
     except OSError as e:
@@ -13233,6 +13402,7 @@ def do_uninstall():
               HEAL_CRON, META_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
+    jobq_cleanup_if_unused()        # 凌晨任务排队器：节点那边还在用就留着
     ok("已移除密码文件和管理命令")
 
     if ask_yn(f"删除 {install_dir}（配置和 strm 全部丢失，不可逆）？", False):
@@ -28233,6 +28403,8 @@ def do_healthcheck():
 
 def main_menu():
     require_root()
+    if is_installed():
+        jobq_migrate_crons()        # 老装机：凌晨那几条接进排队器（只写 cron 文件）
     while True:
         installed = is_installed()
         print("\n" + "=" * 60)
