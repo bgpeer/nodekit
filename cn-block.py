@@ -608,12 +608,12 @@ def bj_cron_lines(hh, mm, cmd, day=None):
 # 仓库主人：「如果有影响就在后面排队，如果要等服务器重启了排队的就自动跟上进行继续做」。
 # 凌晨这几条（cn-block 刷新会重启 sing-box、nginx 升级会重启 nginx、内核更新会重启 sing-box/xray、
 # 三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
-# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize
-# 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对三份一致）。
+# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize /
+# media-stack 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对四份一致）。
 JOBQ_BIN  = "/usr/local/sbin/bgpeer-jobq"
 JOBQ_UNIT = "/etc/systemd/system/bgpeer-jobq.service"
 JOBQ_SH = r"""#!/bin/bash
-# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，三个脚本各带一份同样的，勿手改）
+# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，四个脚本各带一份同样的，勿手改）
 #   bgpeer-jobq run <任务名> '<命令>'   登记 → 排队 → 前面的跑完再跑（同名任务已在排/在跑就不重复登记）
 #   bgpeer-jobq resume                  开机时调：上次重启打断的、还没轮到的，按原先顺序接着跑
 #   bgpeer-jobq list                    看队列
@@ -622,7 +622,7 @@ Q=${BGPEER_JOBQ_DIR:-/var/lib/bgpeer-jobq}
 LOCK=${BGPEER_JOBQ_LOCK:-/run/bgpeer-jobq.lock}
 LOG=${BGPEER_JOBQ_LOG:-/var/log/bgpeer-jobq.log}
 MAX_AGE=${BGPEER_JOBQ_MAX_AGE:-43200}
-JOB_TIMEOUT=${BGPEER_JOBQ_TIMEOUT:-7200}
+JOB_TIMEOUT=${BGPEER_JOBQ_TIMEOUT:-14400}   # 4 小时：Emby 每日对齐自己就给了 3 小时
 BOOT_WAIT=${BGPEER_JOBQ_BOOT_WAIT:-60}
 mkdir -p "$Q" && chmod 700 "$Q"
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
@@ -714,14 +714,16 @@ def ensure_jobq():
         return False
 
 
+def jobq_wrap(job, cmd):
+    """把一条命令包成「交给排队器」：排队器不在（被别的卸载删了）就直接跑，至少不丢任务。"""
+    import shlex
+    return f"if [ -x {JOBQ_BIN} ]; then {JOBQ_BIN} run {job} {shlex.quote(cmd)}; else {cmd}; fi"
+
+
 def bj_job_lines(hh, mm, job, cmd, day=None):
-    """北京时间定时任务的 cron 行：时间换算 + 到点核对（见 bj_cron_lines）+ 交给排队器。
-       排队器不在（被别的卸载删了）就直接跑，至少不丢任务。cmd 里不能有单引号。"""
-    assert "'" not in cmd
+    """北京时间定时任务的 cron 行：时间换算 + 到点核对（见 bj_cron_lines）+ 交给排队器。"""
     ensure_jobq()
-    wrapped = (f"if [ -x {JOBQ_BIN} ]; then {JOBQ_BIN} run {job} '{cmd}'; "
-               f"else {cmd}; fi")
-    return bj_cron_lines(hh, mm, wrapped, day=day)
+    return bj_cron_lines(hh, mm, jobq_wrap(job, cmd), day=day)
 
 
 def jobq_cleanup_if_unused():
