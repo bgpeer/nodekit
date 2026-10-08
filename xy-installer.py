@@ -4273,7 +4273,7 @@ def update_one_config(ext):
 
 def _cfg_auto_load():
     d = _load_json(CFG_AUTO_FILE)
-    return {"off": list(d.get("off") or []), "hand": dict(d.get("hand") or {})}
+    return {"off": list(d.get("off") or []), "hand": dict(d.get("hand") or {}), "last": d.get("last", "")}
 
 def _cfg_auto_save(d):
     os.makedirs(BGP_DIR, exist_ok=True)
@@ -4311,20 +4311,37 @@ def _cfg_auto_state(ext):
         return "关"
     return "开（手改过，暂停中）" if cfg_auto_paused(ext) else "开（每天 03:20）"
 
+def _cfg_auto_local_times(year=None):
+    """北京 03:20 落在本机时区的哪几个钟点：取今年 1 月和 7 月各算一次。
+
+       为什么不只算一次：美国、欧洲、澳洲这些地方有夏令时，同一个北京时刻在本机冬天和夏天
+       差一个小时（洛杉矶冬天 11:20、夏天 12:20）。只按装的那天算，换季后就整整偏一小时。
+       两个都写进 cron，到点由 cfg_auto_run 再看一眼北京时间，不是 03:20 前后的那次直接退出。
+       没有夏令时的地方（UTC、新加坡、日本、香港……）两次算出来一样，只写一行。"""
+    import datetime
+    bj = datetime.timezone(datetime.timedelta(hours=8))
+    y = year or datetime.date.today().year
+    out = []
+    for mon in (1, 7):
+        t = datetime.datetime(y, mon, 15, *CFG_AUTO_AT, tzinfo=bj).astimezone()
+        if (t.hour, t.minute) not in out:
+            out.append((t.hour, t.minute))
+    return out
+
 def setup_cfg_auto_cron():
-    """装每天北京 03:20 自动更新三大配置的 cron（本机时区换算，同 setup_core_update_cron）。幂等。"""
+    """装每天北京 03:20 自动更新三大配置的 cron（按本机时区换算，夏令时两季都覆盖）。幂等。"""
     try:
-        import datetime
         if os.path.abspath(__file__) != SELF_LOCAL and not os.path.exists(SELF_LOCAL):
             os.makedirs(BGP_DIR, exist_ok=True)
             shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
-        bj = datetime.timezone(datetime.timedelta(hours=8))
-        local = datetime.datetime(2001, 6, 2, *CFG_AUTO_AT, tzinfo=bj).astimezone()
+        times = _cfg_auto_local_times()
         txt = (f"# bgpeer 三大配置每日自动更新（北京时间 {CFG_AUTO_AT[0]:02d}:{CFG_AUTO_AT[1]:02d}"
-               f" = 本机 {local:%H:%M}）\n"
+               f" = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}"
+               f"{'（冬/夏令时各一行，到点只有对的那次真跑）' if len(times) > 1 else ''}）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               f"{local.minute} {local.hour} * * * root python3 {SELF_LOCAL} cfg-auto >> {CFG_AUTO_LOG} 2>&1\n")
+               + "".join(f"{m} {h} * * * root python3 {SELF_LOCAL} cfg-auto >> {CFG_AUTO_LOG} 2>&1\n"
+                         for h, m in times))
         try:
             if open(CFG_AUTO_CRON).read() == txt:
                 return True
@@ -4335,12 +4352,29 @@ def setup_cfg_auto_cron():
     except OSError:
         return False
 
+def _cfg_auto_due(now=None):
+    """cron 叫醒时核对：现在是不是北京 03:20 前后（±15 分钟），而且今天还没跑过。
+       返回今天的北京日期（该跑）或 None（不是这次）。夏令时那两行里，不对的那行在这里被挡掉。"""
+    import datetime
+    bj = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(
+        datetime.timezone(datetime.timedelta(hours=8)))
+    mins = bj.hour * 60 + bj.minute - (CFG_AUTO_AT[0] * 60 + CFG_AUTO_AT[1])
+    day = bj.strftime("%F")
+    if abs(mins) > 15 or _cfg_auto_load().get("last") == day:
+        return None
+    return day
+
 def cfg_auto_run():
     """cron 每天 03:20 调：开着自动更新的格式，按【当前选的模板】（作者 / 自定义）重生成一遍。
 
        不动节点、不换 token、不重启任何服务——订阅目录里是指向配置文件的软链，文件换了客户端
        下次拉就是新的，xy-sub 不用重启（重启那一下正好有客户端在拉就会失败一次）。
        生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。"""
+    setup_cfg_auto_cron()                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
+    day = _cfg_auto_due()
+    if not day:
+        return                                  # 夏令时另一季那行、或今天已跑过：安静退出
+    d = _cfg_auto_load(); d["last"] = day; _cfg_auto_save(d)
     ts = time.strftime("%F %T")
     todo = [e for e in FMT if os.path.exists(FMT[e]["file"]) and cfg_auto_on(e)]
     for e in [e for e in todo if cfg_auto_paused(e)]:
