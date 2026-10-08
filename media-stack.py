@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.358"
+SCRIPT_VERSION = "1.5.359"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4318,6 +4318,7 @@ def do_heal_gate():
     stream_ok = {}                     # 第一次拉视频那一下查过 / 补过的条目 → 到这个时刻之前不再查，见 /streamgate
     peek_busy = [False]                # 打开详情页先取地址：同一时刻只取一个，见 /peek
     pre_skip = {}                      # 条目 id → 上次「预取没取到、旧地址验过是活的」的时刻，见 GATE_FALLBACK_REUSE_S
+    heal_t0 = {}                       # 条目 id → 门开始替它补的时刻：按下播放和第一次拉视频共用一份 15 秒，见 _left
     _boot = [time.monotonic() - _T_LOAD if _T_LOAD else None]   # 第一次开播时报一次
 
     def _mark(iid, on):
@@ -4335,6 +4336,12 @@ def do_heal_gate():
         except Exception:
             pass
 
+    def _left(iid, t_in):
+        # 【门里总共最多 HEAL_GATE_WAIT_S 秒】真机 10/08 112675：按下播放那一下取地址、验直链、等补时长
+        # 三段各算各的，一次 31 秒、一次 35 秒。按下播放和紧跟着的第一次拉视频也合用一份
+        t0 = min(t_in, heal_t0.get(str(iid), t_in))
+        return max(0.0, HEAL_GATE_WAIT_S - (time.monotonic() - t0))
+
     def _bg(item, ev):
         _mark(item[1], True)
         try:
@@ -4346,6 +4353,7 @@ def do_heal_gate():
             ev.set()
             with lock:
                 busy.pop(str(item[1]), None)
+                heal_t0.pop(str(item[1]), None)
 
     class H(http.server.BaseHTTPRequestHandler):
         def _go(self):
@@ -4448,7 +4456,16 @@ def do_heal_gate():
                             note_play()
                             started = False
                             if ev is None and heal_auto_on():
-                                need = strm_items_need_heal(key, [iid])
+                                _nd = set()
+                                need = strm_items_need_heal(key, [iid], nodur=_nd)
+                                if need and iid not in _nd:
+                                    # 只缺音视频轨、时长有 → 不补不等，开播后再补，见 heal_defer_add
+                                    heal_defer_add([iid])
+                                    try:
+                                        rescue_arm(need)
+                                    except Exception:
+                                        pass
+                                    need = []
                                 if need:
                                     try:
                                         rescue_arm(need)
@@ -4460,16 +4477,17 @@ def do_heal_gate():
                                         if ev is None:
                                             ev = threading.Event()
                                             busy[iid] = ev
+                                            heal_t0[iid] = t_in
                                             started = True
                                             threading.Thread(target=_bg, args=(need[0], ev)).start()
                             if ev is not None:
-                                ev.wait(HEAL_GATE_WAIT_S)
+                                ev.wait(_left(iid, t_in))
                                 if started:
                                     heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：第一次拉视频时缺时长或音视频轨，"
                                               f"门先补了 {time.monotonic() - t_in:.1f}s 再放行{_log_tag(iid)}"])
                             else:
                                 # 别人正在探这一集（strm 临时切成了 URL）：等它切回来，不然这一下经服务器转手
-                                while _probe_busy_now(iid) and time.monotonic() - t_in < HEAL_GATE_WAIT_S:
+                                while _probe_busy_now(iid) and _left(iid, t_in) > 0:
                                     time.sleep(1)
                             with lock:
                                 stream_ok[iid] = time.monotonic() + STREAM_GATE_OK_S
@@ -4515,7 +4533,9 @@ def do_heal_gate():
                                                       probe=bool(self.headers.get(PLAY_PROBE_HDR)))
                             _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, {
                                 "timeout": "等满了，换链服务还在取", "": "没取到"}.get(_k, _k)
-                            if not _k:
+                            if not _k and _left(iid, t_in) <= 0:
+                                _tm["fix"] = "15 秒用完了，不验"      # 换链服务那边照样会换
+                            elif not _k:
                                 _a = time.monotonic()
                                 _tm["fix"] = link_stale_fix(iid, key) or "活的"
                                 _tm["fix_s"] = time.monotonic() - _a
@@ -4526,7 +4546,17 @@ def do_heal_gate():
                         except Exception:
                             pass
                     if ev is None and heal_auto_on():
-                        need = strm_items_need_heal(key, [iid])
+                        _nd = set()
+                        need = strm_items_need_heal(key, [iid], nodur=_nd)
+                        if need and iid not in _nd:
+                            # 只缺音视频轨、时长有 → 不补不等，开播后再补，见 heal_defer_add
+                            heal_defer_add([iid])
+                            try:
+                                rescue_arm(need)
+                            except Exception:
+                                pass
+                            _tm["tracks"] = True
+                            need = []
                         if need:
                             # 【开播这一刻确实没时长 → 记进抢救表并标上 nodur】真机 10/02 遮天 182：
                             # 门补了 15 秒没补完就放行，这一场按没时长开的，停了 Emby 判「已看完」、
@@ -4542,15 +4572,15 @@ def do_heal_gate():
                                 if ev is None:
                                     ev = threading.Event()
                                     busy[iid] = ev
+                                    heal_t0[iid] = t_in
                                     threading.Thread(target=_bg, args=(need[0], ev)).start()
                     if ev is not None:
                         _tm["heal"] = True
-                        ev.wait(max(3, HEAL_GATE_WAIT_S - (time.monotonic() - t_in)))
+                        ev.wait(_left(iid, t_in))
                     else:
                         # 【别人正在探这一集】看片后 / 整队那一轮正把它的 strm 切成 URL 在探 ——
                         # 等它切回来再放行，不然开播就是经服务器转手（见 _probe_busy）
-                        t_w = time.monotonic()
-                        while _probe_busy_now(iid) and time.monotonic() - t_w < HEAL_GATE_WAIT_S:
+                        while _probe_busy_now(iid) and _left(iid, t_in) > 0:
                             time.sleep(1)
             except Exception:
                 pass
@@ -4577,6 +4607,10 @@ def do_heal_gate():
                     _parts.append(f"预取播放列表 {_tm['pre']:.1f}s（{_tm['pre_k']}）")
                 if "fix_s" in _tm:
                     _parts.append(f"验直链 {_tm['fix_s']:.1f}s（{_tm['fix']}）")
+                elif "fix" in _tm:
+                    _parts.append(_tm["fix"])
+                if _tm.get("tracks"):
+                    _parts.append("只缺音视频轨，不等，开播后再补")
                 _all = time.monotonic() - _tm["t0"]
                 heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：{_nm or _tm['iid']}　"
                           + "、".join(_parts) + f"　门里共 {_all:.1f}s{_log_tag(_tm['iid'])}"])
@@ -8290,6 +8324,10 @@ def do_heal_tick(hot_only=False):
     _gb = {k for k, v in (ms_state().get("heal_gate_busy") or {}).items()
            if isinstance(v, (int, float)) and time.time() - v < 600}
     hot = [x for x in hot if str(x[1]) not in _gb]
+    # 【门放过去的「只缺轨道」，开播头两分钟不碰】过了再补，见 heal_defer_add；先排进队列，不丢
+    _df = heal_defer_active()
+    _held = [x for x in hot if str(x[1]) in _df]
+    hot = [x for x in hot if str(x[1]) not in _df]
     _waiting = [x for x in hot if str(x[1]) in _cool and str(x[1]) not in _fresh]
     hot = [x for x in hot if str(x[1]) not in _cool or str(x[1]) in _fresh]
     _cool = _all_hot
@@ -8300,7 +8338,7 @@ def do_heal_tick(hot_only=False):
     hot = hot[:HEAL_BY_NAME_MAX]
     _now_q = int(time.time())
     save_ms_state(heal_hot_queue={str(x[1]): int(_q.get(str(x[1])) or _now_q)
-                                  for x in _later})
+                                  for x in _later + _held})
     if hot:
         _say(f"刚点开过、而且还缺媒体信息的有 {len(hot)} 个，先补这几个。")
         # 【先记再探】探到一半被 timeout 砍掉也算探过 —— 不然下一分钟又从头来一遍
@@ -10536,6 +10574,37 @@ def heal_later_add(ids, delay=HEAL_LATER_DELAY_S):
         save_ms_state(heal_later=cur)
     except Exception:
         pass
+
+
+GATE_TRACKS_DEFER_S = 120
+
+
+def heal_defer_add(ids, secs=GATE_TRACKS_DEFER_S):
+    """开播这一下【只缺音视频轨、时长是有的】→ 门不补、不等，secs 秒内 heal-tick 也别碰，过后再补。
+
+    【为什么不等】真机 10/08 gate.log：239616、208076、225505 第一次拉视频都是「streamgate 15.00s」——
+    门替它补轨道，网盘探 15 秒探不完，屏上 0B 干等满 15 秒，然后照样放行。时长有，进度就记得住；
+    缺的只是轨道，这一场没它照样播。仓库主人 10/08：「两条一起改吧」。
+    【为什么要躲开开播那一下】探的时候 strm 临时切成 URL，赶上 Emby 正回 PlaybackInfo / 第一次拉视频，
+    这一场就经服务器转手。过 secs 秒播放已经拿到地址了，再探不影响它。"""
+    ids = [str(i) for i in ids or () if i]
+    if not ids:
+        return
+    try:
+        now = int(time.time())
+        cur = {k: v for k, v in (ms_state().get("heal_defer") or {}).items()
+               if isinstance(v, (int, float)) and v > now}
+        for i in ids:
+            cur[i] = now + secs
+        save_ms_state(heal_defer=cur)
+    except Exception:
+        pass
+
+
+def heal_defer_active():
+    now = time.time()
+    return {k for k, v in (ms_state().get("heal_defer") or {}).items()
+            if isinstance(v, (int, float)) and v > now}
 
 
 def heal_later_due():
@@ -14852,7 +14921,7 @@ def mediawarp_played_ids(minutes):
     return set(re.findall(r"/videos/(\d+)/", txt, re.I))
 
 
-def strm_items_need_heal(key, ids):
+def strm_items_need_heal(key, ids, nodur=None):
     """这些条目 id 里，还缺媒体信息的那几个 → [(uid, id, 名字, 是不是新片), ...]。
 
     【非得再筛一道不可】每一次点播放都会被 MediaWarp 记进日志，而库里绝大多数条目
@@ -14897,6 +14966,8 @@ def strm_items_need_heal(key, ids):
         if no_dur or no_streams:
             out.append((uid, i.get("Id"), i.get("Name") or "?",
                         _is_fresh_item(i)))
+            if no_dur and nodur is not None:      # 开播门要分「缺时长」和「只缺轨道」，见 heal_defer_add
+                nodur.add(str(i.get("Id")))
     return out
 
 
