@@ -603,15 +603,163 @@ def bj_cron_lines(hh, mm, cmd, day=None):
     guard = f'[ "$(TZ=CST-8 date +{fmt})" = "{want}" ] && '
     return [f"{m} {h} * * * root {guard}{cmd}" for h, m in times], times
 
+
+# ── 凌晨任务排队（bgpeer-jobq）────────────────────────────────────────────────
+# 仓库主人：「如果有影响就在后面排队，如果要等服务器重启了排队的就自动跟上进行继续做」。
+# 凌晨这几条（cn-block 刷新会重启 sing-box、nginx 升级会重启 nginx、内核更新会重启 sing-box/xray、
+# 三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
+# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize
+# 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对三份一致）。
+JOBQ_BIN  = "/usr/local/sbin/bgpeer-jobq"
+JOBQ_UNIT = "/etc/systemd/system/bgpeer-jobq.service"
+JOBQ_SH = r"""#!/bin/bash
+# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，三个脚本各带一份同样的，勿手改）
+#   bgpeer-jobq run <任务名> '<命令>'   登记 → 排队 → 前面的跑完再跑（同名任务已在排/在跑就不重复登记）
+#   bgpeer-jobq resume                  开机时调：上次重启打断的、还没轮到的，按原先顺序接着跑
+#   bgpeer-jobq list                    看队列
+# 记录落在硬盘（不是 /run），断电重启也丢不了；登记超过 12 小时还没跑上的丢掉，免得白天冒出凌晨的活。
+Q=${BGPEER_JOBQ_DIR:-/var/lib/bgpeer-jobq}
+LOCK=${BGPEER_JOBQ_LOCK:-/run/bgpeer-jobq.lock}
+LOG=${BGPEER_JOBQ_LOG:-/var/log/bgpeer-jobq.log}
+MAX_AGE=${BGPEER_JOBQ_MAX_AGE:-43200}
+JOB_TIMEOUT=${BGPEER_JOBQ_TIMEOUT:-7200}
+BOOT_WAIT=${BGPEER_JOBQ_BOOT_WAIT:-60}
+mkdir -p "$Q" && chmod 700 "$Q"
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+queued() {   # 同名任务是否已在排 / 在跑
+  local f
+  for f in "$Q"/*.job "$Q"/*.run; do
+    [ -e "$f" ] && [ "$(head -n1 "$f")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+drain() {    # 拿到锁的那个把整条队按登记顺序跑完；没拿到的等着（= 排队）
+  exec 9>"$LOCK"
+  flock 9
+  local f id cmd t0 rc
+  while :; do
+    f=$(ls -1 "$Q"/*.job 2>/dev/null | sort | head -n1)
+    [ -n "$f" ] || break
+    id=$(sed -n 1p "$f"); cmd=$(sed -n 2p "$f")
+    if [ $(( $(date +%s) - $(stat -c %Y "$f") )) -gt "$MAX_AGE" ]; then
+      log "$id 登记超过 $((MAX_AGE / 3600)) 小时没跑上，丢弃"; rm -f "$f"; continue
+    fi
+    mv "$f" "${f%.job}.run"                 # 正在跑：这时重启，开机会接着跑它
+    t0=$(date +%s); log "$id 开始"
+    timeout "$JOB_TIMEOUT" bash -c "$cmd" 9>&-   # 9>&-：锁别漏给任务起的进程，不然锁永远放不掉
+    rc=$?
+    rm -f "${f%.job}.run"; log "$id 结束 rc=$rc 用时 $(( $(date +%s) - t0 ))s"
+  done
+  exec 9>&-
+}
+
+case "$1" in
+  run)
+    [ -n "$2" ] && [ -n "$3" ] || { echo "用法: $0 run <任务名> '<命令>'" >&2; exit 2; }
+    if queued "$2"; then log "$2 已在队列里，不重复登记"; exit 0; fi
+    tmp=$(mktemp "$Q/.new.XXXXXX")
+    printf '%s\n%s\n' "$2" "$3" > "$tmp"
+    mv "$tmp" "$Q/$(date +%s%N)-$2.job"
+    if ! flock -n "$LOCK" true 2>/dev/null; then log "$2 排队：前面还有任务在跑"; fi
+    drain
+    ;;
+  resume)
+    n=0
+    for f in "$Q"/*.run; do [ -e "$f" ] && mv "$f" "${f%.run}.job" && n=$((n + 1)); done
+    m=$(ls -1 "$Q"/*.job 2>/dev/null | wc -l)
+    [ "$m" -gt 0 ] || exit 0
+    log "开机续跑：被重启打断 $n 个，共 $m 个待跑；等 ${BOOT_WAIT}s 让网络和服务先起来"
+    sleep "$BOOT_WAIT"
+    drain
+    ;;
+  list)
+    for f in "$Q"/*.job "$Q"/*.run; do
+      [ -e "$f" ] && echo "$(basename "$f")  $(sed -n 2p "$f")"
+    done
+    ;;
+  *) echo "用法: $0 run <任务名> '<命令>' | resume | list" >&2; exit 2 ;;
+esac
+"""
+JOBQ_UNIT_TXT = ("[Unit]\nDescription=bgpeer 凌晨任务排队：开机接着跑被重启打断 / 还没轮到的\n"
+                 "Wants=network-online.target\nAfter=network-online.target sing-box.service xray.service nginx.service\n"
+                 "[Service]\nType=simple\nExecStart=" + JOBQ_BIN + " resume\n"
+                 "[Install]\nWantedBy=multi-user.target\n")
+
+
+def ensure_jobq():
+    """装 / 更新排队器和开机续跑服务。内容没变什么都不做。装不上返回 False（调用方退回直接跑）。"""
+    try:
+        changed = False
+        for path, txt, mode in ((JOBQ_BIN, JOBQ_SH, 0o755), (JOBQ_UNIT, JOBQ_UNIT_TXT, 0o644)):
+            try:
+                same = open(path).read() == txt
+            except OSError:
+                same = False
+            if not same:
+                # 写临时文件再换名：排队器可能正在跑（bash 是边跑边读脚本的），原地改写会把它读花
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".new", "w") as f:
+                    f.write(txt)
+                os.chmod(path + ".new", mode)
+                os.replace(path + ".new", path)
+                changed = True
+            os.chmod(path, mode)
+        if changed:
+            subprocess.run("systemctl daemon-reload; systemctl enable bgpeer-jobq.service",
+                           shell=True, capture_output=True)
+        return True
+    except OSError:
+        return False
+
+
+def bj_job_lines(hh, mm, job, cmd, day=None):
+    """北京时间定时任务的 cron 行：时间换算 + 到点核对（见 bj_cron_lines）+ 交给排队器。
+       排队器不在（被别的卸载删了）就直接跑，至少不丢任务。cmd 里不能有单引号。"""
+    assert "'" not in cmd
+    ensure_jobq()
+    wrapped = (f"if [ -x {JOBQ_BIN} ]; then {JOBQ_BIN} run {job} '{cmd}'; "
+               f"else {cmd}; fi")
+    return bj_cron_lines(hh, mm, wrapped, day=day)
+
+
+def jobq_cleanup_if_unused():
+    """卸载时调：/etc/cron.d 里已经没有任务用排队器了，才把它和开机服务、队列一起撤掉。
+       （网络优化是独立模块，卸代理主体时它的 nginx 月度升级还在用排队器，那就留着。）"""
+    try:
+        for n in os.listdir("/etc/cron.d"):
+            try:
+                if JOBQ_BIN in open(os.path.join("/etc/cron.d", n)).read():
+                    return False
+            except OSError:
+                pass
+    except OSError:
+        pass
+    subprocess.run("systemctl disable bgpeer-jobq.service", shell=True, capture_output=True)
+    for p in (JOBQ_BIN, JOBQ_UNIT):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    shutil.rmtree("/var/lib/bgpeer-jobq", ignore_errors=True)
+    try:
+        os.remove("/var/log/bgpeer-jobq.log")
+    except OSError:
+        pass
+    subprocess.run("systemctl daemon-reload", shell=True, capture_output=True)
+    return True
+
+
 def setup_cron():
     """装每日定点刷新的 cron：北京时间 03:00（时区 / 夏令时换算见 bj_cron_lines）。幂等。"""
     try:
         if os.path.abspath(__file__) != SELF_PATH:      # 确保 cron 调的本地副本存在
             os.makedirs(BGP_DIR, exist_ok=True)
             import shutil; shutil.copy(os.path.abspath(__file__), SELF_PATH)
-        lines, times = bj_cron_lines(3, 0, f"python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1")
+        lines, times = bj_job_lines(3, 0, "cnblock", f"python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1")
         txt = (f"# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = 本机 "
-               f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点）\n"
+               f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点，进排队器）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
                + "".join(l + "\n" for l in lines))
