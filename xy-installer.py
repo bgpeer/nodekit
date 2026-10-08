@@ -4371,6 +4371,9 @@ def cfg_auto_run():
        下次拉就是新的，xy-sub 不用重启（重启那一下正好有客户端在拉就会失败一次）。
        生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。"""
     setup_cfg_auto_cron()                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
+    if os.path.exists(CORE_CRON_FILE):
+        setup_core_update_cron()                # 内核每月那条也一起对齐（老装机是按 6 月写死的）
+    _heal_other_crons()
     day = _cfg_auto_due()
     if not day:
         return                                  # 夏令时另一季那行、或今天已跑过：安静退出
@@ -4496,33 +4499,89 @@ def update_script():
     import sys
     os.execv(sys.executable, [sys.executable, SELF_LOCAL])
 
+def bj_cron_lines(hh, mm, cmd, day=None):
+    """北京时间 hh:mm（day 给了 = 每月那一号）→ /etc/cron.d 里的行。
+
+    为什么不能只换算一次：Debian/Ubuntu 的 cron 不认 CRON_TZ，只能按本机时区写；而美国、欧洲、
+    澳洲这些地方有夏令时，同一个北京时刻在本机冬天和夏天差一小时（洛杉矶冬 11:00 / 夏 12:00），
+    只按装的那天算，换季后就整整偏一小时，还可能撞上别的凌晨任务。
+    所以按今年 1 月和 7 月各算一次，两个本机时刻都写；每行前面用北京时间再核对一次
+    （TZ=CST-8 是 POSIX 写法，不依赖 tzdata），只有对的那行真跑。没有夏令时的时区只有一行。
+    每月任务：本机日期可能跟北京差一天，所以日期字段写 *、改由核对里的「几号」把关。"""
+    import datetime
+    bj = datetime.timezone(datetime.timedelta(hours=8))
+    y = datetime.date.today().year
+    times = []
+    for mon in (1, 7):
+        t = datetime.datetime(y, mon, 15, hh, mm, tzinfo=bj).astimezone()
+        if (t.hour, t.minute) not in times:
+            times.append((t.hour, t.minute))
+    fmt, want = ("\\%d\\%H", f"{day:02d}{hh:02d}") if day else ("\\%H", f"{hh:02d}")
+    guard = f'[ "$(TZ=CST-8 date +{fmt})" = "{want}" ] && '
+    return [f"{m} {h} * * * root {guard}{cmd}" for h, m in times], times
+
 def setup_core_update_cron():
-    """装每月定点更新内核的 cron：北京时间每月 2 号 04:00。
-       Debian/Ubuntu 的 cron 不支持 CRON_TZ，按服务器本地时区把北京时刻换算成本地。
-       北京(UTC+8) 2 号 04:00 视本机时区落在本地 1 号或 2 号，天/时/分一并算出。"""
+    """装每月定点更新内核的 cron：北京时间每月 2 号 04:00（时区 / 夏令时换算见 bj_cron_lines）。幂等。"""
     try:
-        import datetime
         if os.path.abspath(__file__) != SELF_LOCAL:      # 确保 cron 调的本地副本存在
             os.makedirs(BGP_DIR, exist_ok=True)
             shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
-        bj = datetime.timezone(datetime.timedelta(hours=8))
-        local = datetime.datetime(2001, 6, 2, 4, 0, tzinfo=bj).astimezone()  # 每月2号04:00北京→本地
-        txt = (f"# bgpeer 内核每月自动更新（北京时间每月2号04:00 = 本机每月{local.day}号 {local:%H:%M}）\n"
+        lines, times = bj_cron_lines(4, 0, f"python3 {SELF_LOCAL} update-cores >> {CORE_CRON_LOG} 2>&1", day=2)
+        txt = (f"# bgpeer 内核每月自动更新（北京时间每月 2 号 04:00 = 本机 "
+               f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京日期和钟点）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
-               f"{local.minute} {local.hour} {local.day} * * root python3 {SELF_LOCAL} "
-               f"update-cores >> {CORE_CRON_LOG} 2>&1\n")
+               + "".join(l + "\n" for l in lines))
+        try:
+            if open(CORE_CRON_FILE).read() == txt:
+                return times
+        except OSError:
+            pass
         open(CORE_CRON_FILE, "w").write(txt); os.chmod(CORE_CRON_FILE, 0o644)
-        return local
+        return times
     except OSError as e:
         print("  安装内核自动更新 cron 失败（不影响使用）:", e); return None
 
+NETOPT_NGINX_CRON = "/etc/cron.d/net-optimize-nginx-update"
+CNBLOCK_CRON      = "/etc/cron.d/bgpeer-cnblock"
+
+def _heal_bj_cron(path, hh, mm, title, day=None):
+    """别的模块装的北京时间定时任务，老写法按本机时区只换算了一次（或写了 Debian 不认的
+       CRON_TZ），夏令时换季 / 改时区后会偏。这里就地换成 bj_cron_lines 的写法，命令原样保留。
+       已经是新写法（带 CST-8 核对）就不动。改了返回 True。
+
+       · cn-block 每天 03:00 刷新：新版自己每次刷新也会对齐，但老副本要等它更新
+       · net-optimize 每月 1 号 03:10 升级 nginx：老写法 CRON_TZ=Asia/Shanghai，UTC 机器上实际是北京 11:10"""
+    try:
+        txt = open(path).read()
+    except OSError:
+        return False
+    if "CST-8" in txt:
+        return False
+    m = re.search(r"^\s*\d+\s+\d+\s+\S+\s+\*\s+\*\s+root\s+(.+)$", txt, re.M)
+    if not m:
+        return False
+    lines, times = bj_cron_lines(hh, mm, m.group(1).strip(), day=day)
+    when = f"每月 {day} 号 " if day else "每天 "
+    new = (f"# {title}（北京时间{when}{hh:02d}:{mm:02d} = 本机 "
+           f"{' / '.join(f'{h:02d}:{mi:02d}' for h, mi in times)}，到点核对北京时间）\n"
+           "SHELL=/bin/bash\n"
+           "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+           + "".join(l + "\n" for l in lines))
+    try:
+        open(path, "w").write(new); os.chmod(path, 0o644)
+        return True
+    except OSError:
+        return False
+
+def _heal_other_crons():
+    _heal_bj_cron(CNBLOCK_CRON, 3, 0, "bgpeer 屏蔽规则集每日刷新")
+    _heal_bj_cron(NETOPT_NGINX_CRON, 3, 10, "Net-Optimize: monthly nginx upgrade", day=1)
+
 def _core_update_schedule_str():
-    """返回本机 cron 实际触发时刻的可读描述（北京每月2号04:00 换算后）。"""
-    import datetime
-    bj = datetime.timezone(datetime.timedelta(hours=8))
-    local = datetime.datetime(2001, 6, 2, 4, 0, tzinfo=bj).astimezone()
-    return f"每月 {local.day} 号 {local:%H:%M}（本机时区，= 北京每月 2 号 04:00）"
+    """可读描述：北京每月 2 号 04:00，附本机实际触发时刻。"""
+    _, times = bj_cron_lines(4, 0, "", day=2)
+    return f"北京时间每月 2 号 04:00（本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）"
 
 def _xray_heal_minclientver(restart=True):
     """给现有 xray reality 入站补 minClientVer（缺才补）。
@@ -8839,6 +8898,9 @@ def main_menu():
         print("  ✓ 已补回 hy2 端口跳跃规则（以后 sing-box 每次启动都会自动检查）")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
+    if os.path.exists(CORE_CRON_FILE):
+        setup_core_update_cron()                 # 老装机那条是按 6 月写死的，换成冬夏两季都对的写法
+    _heal_other_crons()                          # cn-block 03:00 / 网络优化 nginx 月度：换成冬夏两季都对的写法
     while True:
         print("\n" + "=" * 60)
         print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
