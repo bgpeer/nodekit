@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.359"
+SCRIPT_VERSION = "1.5.360"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4361,6 +4361,7 @@ def do_heal_gate():
             t0 = time.monotonic()
             route = self.path.split("?")[0].strip("/") or "?"
             note = ""
+            self._t_sent, self._cut = None, False
             try:
                 if route in gate_bypass_set():
                     note = "关着，直接放行"
@@ -4371,7 +4372,11 @@ def do_heal_gate():
                 else:
                     self._go_real()
             finally:
-                gate_log_line(route, time.monotonic() - t0,
+                # 【记的是放行用了几秒】回完话后面还有记账（问片名、写流水），以前一起算进去，
+                # 10/08 那条「gate 32.10s」分不出是挡了 32 秒还是回完话又忙了一阵
+                if self._cut:
+                    note = f"{HEAL_GATE_WAIT_S} 秒到了先放行"
+                gate_log_line(route, (self._t_sent or time.monotonic()) - t0,
                               self.headers.get("X-Original-URI") or "", note)
 
         def _go_real(self):
@@ -4443,147 +4448,164 @@ def do_heal_gate():
                 # 紧接着就开始拉视频，补时长那一轮只能边播边探（321 秒，跟正在播的抢带宽），第二次点才走正路。
                 # 翻详情页不拉视频，所以守在这里不会误探。同一集查过就 STREAM_GATE_OK_S 内直接放行 ——
                 # 播放中每两三秒一个拉视频的请求，不能每个都去问 Emby。
-                _uri = self.headers.get("X-Original-URI") or ""
-                m = re.search(r"/videos/(\d+)/", _uri, re.I)
-                try:
-                    if m and key and not self.headers.get(PLAY_PROBE_HDR):
-                        iid = m.group(1)
-                        t_in = time.monotonic()
-                        with lock:
-                            fresh = stream_ok.get(iid, 0) > t_in
-                            ev = busy.get(iid)
-                        if not fresh:
-                            note_play()
-                            started = False
-                            if ev is None and heal_auto_on():
-                                _nd = set()
-                                need = strm_items_need_heal(key, [iid], nodur=_nd)
-                                if need and iid not in _nd:
-                                    # 只缺音视频轨、时长有 → 不补不等，开播后再补，见 heal_defer_add
-                                    heal_defer_add([iid])
-                                    try:
-                                        rescue_arm(need)
-                                    except Exception:
-                                        pass
-                                    need = []
-                                if need:
-                                    try:
-                                        rescue_arm(need)
-                                        rescue_mark_nodur(need)
-                                    except Exception:
-                                        pass
-                                    with lock:
-                                        ev = busy.get(iid)
-                                        if ev is None:
-                                            ev = threading.Event()
-                                            busy[iid] = ev
-                                            heal_t0[iid] = t_in
-                                            started = True
-                                            threading.Thread(target=_bg, args=(need[0], ev)).start()
-                            if ev is not None:
-                                ev.wait(_left(iid, t_in))
-                                if started:
-                                    heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：第一次拉视频时缺时长或音视频轨，"
-                                              f"门先补了 {time.monotonic() - t_in:.1f}s 再放行{_log_tag(iid)}"])
-                            else:
-                                # 别人正在探这一集（strm 临时切成了 URL）：等它切回来，不然这一下经服务器转手
-                                while _probe_busy_now(iid) and _left(iid, t_in) > 0:
-                                    time.sleep(1)
+                def _work():
+                    _uri = self.headers.get("X-Original-URI") or ""
+                    m = re.search(r"/videos/(\d+)/", _uri, re.I)
+                    try:
+                        if m and key and not self.headers.get(PLAY_PROBE_HDR):
+                            iid = m.group(1)
+                            t_in = time.monotonic()
                             with lock:
-                                stream_ok[iid] = time.monotonic() + STREAM_GATE_OK_S
-                except Exception:
-                    pass
+                                fresh = stream_ok.get(iid, 0) > t_in
+                                ev = busy.get(iid)
+                            if not fresh:
+                                note_play()
+                                started = False
+                                if ev is None and heal_auto_on():
+                                    _nd = set()
+                                    need = strm_items_need_heal(key, [iid], nodur=_nd)
+                                    if need and iid not in _nd:
+                                        # 只缺音视频轨、时长有 → 不补不等，开播后再补，见 heal_defer_add
+                                        heal_defer_add([iid])
+                                        try:
+                                            rescue_arm(need)
+                                        except Exception:
+                                            pass
+                                        need = []
+                                    if need:
+                                        try:
+                                            rescue_arm(need)
+                                            rescue_mark_nodur(need)
+                                        except Exception:
+                                            pass
+                                        with lock:
+                                            ev = busy.get(iid)
+                                            if ev is None:
+                                                ev = threading.Event()
+                                                busy[iid] = ev
+                                                heal_t0[iid] = t_in
+                                                started = True
+                                                threading.Thread(target=_bg, args=(need[0], ev)).start()
+                                if ev is not None:
+                                    ev.wait(_left(iid, t_in))
+                                    if started:
+                                        heal_log([f"{bj_fmt('%Y-%m-%d %H:%M:%S')}  开播计时：第一次拉视频时缺时长或音视频轨，"
+                                                  f"门先补了 {time.monotonic() - t_in:.1f}s 再放行{_log_tag(iid)}"])
+                                else:
+                                    # 别人正在探这一集（strm 临时切成了 URL）：等它切回来，不然这一下经服务器转手
+                                    while _probe_busy_now(iid) and _left(iid, t_in) > 0:
+                                        time.sleep(1)
+                                with lock:
+                                    stream_ok[iid] = time.monotonic() + STREAM_GATE_OK_S
+                    except Exception:
+                        pass
+                # 【硬上限】门里哪一步卡住（问 Emby、读换链服务回的列表……）都不许拖过 HEAL_GATE_WAIT_S：
+                # 到点先放行，没做完的留在后台接着做。真机 10/08 21:55:52 遮天 184：门里卡了 32 秒，nginx 等满
+                # 25 秒放弃才放行（开播计时都没来得及记）
+                _th = threading.Thread(target=_work, daemon=True)
+                _th.start()
+                _th.join(HEAL_GATE_WAIT_S + 0.5)
+                self._cut = _th.is_alive()
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 last[0] = time.monotonic()
                 return
             _tm = {}                           # 开播计时，见下面 finally 那段
-            try:
-                _uri = self.headers.get("X-Original-URI") or ""
-                m = re.search(r"/items/(\d+)/playbackinfo", _uri, re.I)
-                # 【只是点开详情页就直接放行】不验直链、不探测 —— 见 PLAY_CLICK_RE / pbi_is_play
-                with lock:
-                    _play = bool(m) and pbi_is_play(m.group(1), _uri, pbi_seen)
-                    # 【播放器里点「下一集」也是按下播放】它问下一集的 PlaybackInfo 不带 StartTimeTicks，
-                    # 以前门不当它是开播：不预取、不先补时长（真机 10/03 22:49 吞噬星空 242：上一集 22:49:02
-                    # 停、22:49:03 就问 242，门一个字没动）。刚「停止播放」几秒内又问别的一集 = 接着播
-                    if m and not _play and time.monotonic() - stop_at[0] < GATE_NEXT_S:
-                        _play = True
-                if m and key and _play:
-                    iid = m.group(1)
-                    note_play()
-                    t_in = time.monotonic()
-                    _tm["iid"], _tm["t0"] = iid, t_in
+            def _work():
+                try:
+                    _uri = self.headers.get("X-Original-URI") or ""
+                    m = re.search(r"/items/(\d+)/playbackinfo", _uri, re.I)
+                    # 【只是点开详情页就直接放行】不验直链、不探测 —— 见 PLAY_CLICK_RE / pbi_is_play
                     with lock:
-                        ev = busy.get(iid)
-                    if (ev is None and not _probe_busy_now(iid)
-                            and time.monotonic() - pre_skip.get(iid, -1e9) < GATE_FALLBACK_REUSE_S):
-                        # 【10 分钟内刚试过：预取没取到、旧地址是活的】这次不再取、不再验，直接放行，
-                        # 换链服务那边同样直接交回 MediaWarp（见 HLS_LIST_FAIL_REUSE_S）
-                        _tm["pre"], _tm["pre_k"] = 0.0, "刚试过没取到，直接用上次那条"
-                    elif ev is None and not _probe_busy_now(iid):
-                        # 【先替播放器把 /stream 要好】取到了就说明直链是活的，不用再验，
-                        # 播放器紧接着来要时直接命中 —— 见 gate_prefetch_stream
-                        # 【没取到才验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
-                        # 之后一帧不出（遮天 181）。命中缓存又活着的，多花不到两秒
-                        try:
-                            _a = time.monotonic()
-                            _k = gate_prefetch_stream(iid, self.headers.get("User-Agent") or "",
-                                                      probe=bool(self.headers.get(PLAY_PROBE_HDR)))
-                            _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, {
-                                "timeout": "等满了，换链服务还在取", "": "没取到"}.get(_k, _k)
-                            if not _k and _left(iid, t_in) <= 0:
-                                _tm["fix"] = "15 秒用完了，不验"      # 换链服务那边照样会换
-                            elif not _k:
+                        _play = bool(m) and pbi_is_play(m.group(1), _uri, pbi_seen)
+                        # 【播放器里点「下一集」也是按下播放】它问下一集的 PlaybackInfo 不带 StartTimeTicks，
+                        # 以前门不当它是开播：不预取、不先补时长（真机 10/03 22:49 吞噬星空 242：上一集 22:49:02
+                        # 停、22:49:03 就问 242，门一个字没动）。刚「停止播放」几秒内又问别的一集 = 接着播
+                        if m and not _play and time.monotonic() - stop_at[0] < GATE_NEXT_S:
+                            _play = True
+                    if m and key and _play:
+                        iid = m.group(1)
+                        note_play()
+                        t_in = time.monotonic()
+                        _tm["iid"], _tm["t0"] = iid, t_in
+                        with lock:
+                            ev = busy.get(iid)
+                        if (ev is None and not _probe_busy_now(iid)
+                                and time.monotonic() - pre_skip.get(iid, -1e9) < GATE_FALLBACK_REUSE_S):
+                            # 【10 分钟内刚试过：预取没取到、旧地址是活的】这次不再取、不再验，直接放行，
+                            # 换链服务那边同样直接交回 MediaWarp（见 HLS_LIST_FAIL_REUSE_S）
+                            _tm["pre"], _tm["pre_k"] = 0.0, "刚试过没取到，直接用上次那条"
+                        elif ev is None and not _probe_busy_now(iid):
+                            # 【先替播放器把 /stream 要好】取到了就说明直链是活的，不用再验，
+                            # 播放器紧接着来要时直接命中 —— 见 gate_prefetch_stream
+                            # 【没取到才验缓存里的直链】死了就当场换新 —— 不然播放器拿到一个 302
+                            # 之后一帧不出（遮天 181）。命中缓存又活着的，多花不到两秒
+                            try:
                                 _a = time.monotonic()
-                                _tm["fix"] = link_stale_fix(iid, key) or "活的"
-                                _tm["fix_s"] = time.monotonic() - _a
-                                if _tm["fix"] == "活的":
-                                    pre_skip[iid] = time.monotonic()
-                            else:
-                                pre_skip.pop(iid, None)
-                        except Exception:
-                            pass
-                    if ev is None and heal_auto_on():
-                        _nd = set()
-                        need = strm_items_need_heal(key, [iid], nodur=_nd)
-                        if need and iid not in _nd:
-                            # 只缺音视频轨、时长有 → 不补不等，开播后再补，见 heal_defer_add
-                            heal_defer_add([iid])
-                            try:
-                                rescue_arm(need)
+                                _k = gate_prefetch_stream(iid, self.headers.get("User-Agent") or "",
+                                                          probe=bool(self.headers.get(PLAY_PROBE_HDR)))
+                                _tm["pre"], _tm["pre_k"] = time.monotonic() - _a, {
+                                    "timeout": "等满了，换链服务还在取", "": "没取到"}.get(_k, _k)
+                                if not _k and _left(iid, t_in) <= 0:
+                                    _tm["fix"] = "15 秒用完了，不验"      # 换链服务那边照样会换
+                                elif not _k:
+                                    _a = time.monotonic()
+                                    _tm["fix"] = link_stale_fix(iid, key) or "活的"
+                                    _tm["fix_s"] = time.monotonic() - _a
+                                    if _tm["fix"] == "活的":
+                                        pre_skip[iid] = time.monotonic()
+                                else:
+                                    pre_skip.pop(iid, None)
                             except Exception:
                                 pass
-                            _tm["tracks"] = True
-                            need = []
-                        if need:
-                            # 【开播这一刻确实没时长 → 记进抢救表并标上 nodur】真机 10/02 遮天 182：
-                            # 门补了 15 秒没补完就放行，这一场按没时长开的，停了 Emby 判「已看完」、
-                            # 续播点 0。heal-tick 那边看见门在补就不碰它，nodur 一直没标上，抢救按
-                            # 「播了不到 10 秒」悄悄放过 —— 那一下的「已看完」就是误标的
-                            try:
-                                rescue_arm(need)
-                                rescue_mark_nodur(need)
-                            except Exception:
-                                pass
-                            with lock:
-                                ev = busy.get(iid)
-                                if ev is None:
-                                    ev = threading.Event()
-                                    busy[iid] = ev
-                                    heal_t0[iid] = t_in
-                                    threading.Thread(target=_bg, args=(need[0], ev)).start()
-                    if ev is not None:
-                        _tm["heal"] = True
-                        ev.wait(_left(iid, t_in))
-                    else:
-                        # 【别人正在探这一集】看片后 / 整队那一轮正把它的 strm 切成 URL 在探 ——
-                        # 等它切回来再放行，不然开播就是经服务器转手（见 _probe_busy）
-                        while _probe_busy_now(iid) and _left(iid, t_in) > 0:
-                            time.sleep(1)
-            except Exception:
-                pass
+                        if ev is None and heal_auto_on():
+                            _nd = set()
+                            need = strm_items_need_heal(key, [iid], nodur=_nd)
+                            if need and iid not in _nd:
+                                # 只缺音视频轨、时长有 → 不补不等，开播后再补，见 heal_defer_add
+                                heal_defer_add([iid])
+                                try:
+                                    rescue_arm(need)
+                                except Exception:
+                                    pass
+                                _tm["tracks"] = True
+                                need = []
+                            if need:
+                                # 【开播这一刻确实没时长 → 记进抢救表并标上 nodur】真机 10/02 遮天 182：
+                                # 门补了 15 秒没补完就放行，这一场按没时长开的，停了 Emby 判「已看完」、
+                                # 续播点 0。heal-tick 那边看见门在补就不碰它，nodur 一直没标上，抢救按
+                                # 「播了不到 10 秒」悄悄放过 —— 那一下的「已看完」就是误标的
+                                try:
+                                    rescue_arm(need)
+                                    rescue_mark_nodur(need)
+                                except Exception:
+                                    pass
+                                with lock:
+                                    ev = busy.get(iid)
+                                    if ev is None:
+                                        ev = threading.Event()
+                                        busy[iid] = ev
+                                        heal_t0[iid] = t_in
+                                        threading.Thread(target=_bg, args=(need[0], ev)).start()
+                        if ev is not None:
+                            _tm["heal"] = True
+                            ev.wait(_left(iid, t_in))
+                        else:
+                            # 【别人正在探这一集】看片后 / 整队那一轮正把它的 strm 切成 URL 在探 ——
+                            # 等它切回来再放行，不然开播就是经服务器转手（见 _probe_busy）
+                            while _probe_busy_now(iid) and _left(iid, t_in) > 0:
+                                time.sleep(1)
+                except Exception:
+                    pass
+            # 【硬上限】门里哪一步卡住（问 Emby、读换链服务回的列表……）都不许拖过 HEAL_GATE_WAIT_S：
+            # 到点先放行，没做完的留在后台接着做。真机 10/08 21:55:52 遮天 184：门里卡了 32 秒，nginx 等满
+            # 25 秒放弃才放行（开播计时都没来得及记）
+            _th = threading.Thread(target=_work, daemon=True)
+            _th.start()
+            _th.join(HEAL_GATE_WAIT_S + 0.5)
+            if _th.is_alive():
+                _tm["cut"] = True
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -4605,6 +4627,8 @@ def do_heal_gate():
                     _boot[0] = None
                 if "pre" in _tm:
                     _parts.append(f"预取播放列表 {_tm['pre']:.1f}s（{_tm['pre_k']}）")
+                if _tm.get("cut"):
+                    _parts.append(f"{HEAL_GATE_WAIT_S} 秒到了先放行（门里还没做完，后台接着做）")
                 if "fix_s" in _tm:
                     _parts.append(f"验直链 {_tm['fix_s']:.1f}s（{_tm['fix']}）")
                 elif "fix" in _tm:
@@ -4620,6 +4644,10 @@ def do_heal_gate():
                 if key:
                     threading.Thread(target=prefetch_next_episode, daemon=True,
                                      args=(key, _tm["iid"], self.headers.get("User-Agent") or "")).start()
+
+        def end_headers(self):
+            super().end_headers()
+            self._t_sent = time.monotonic()
 
         do_GET = do_POST = do_HEAD = _go
 
