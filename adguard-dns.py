@@ -28,6 +28,75 @@ RESOLVED_DROPIN = RESOLVED_DIR + "/adguard.conf"  # 腾 53 时写的 drop-in（�
 AGH_INSTALL = "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh"
 WEB_PORT = 3000
 
+# 跟 xy-installer.py 同一套（菜单 13 是子进程跑本文件，主脚本那份管不到这里）
+# 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
+# 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
+# 空格」的，数字那段换成 bgpeer 同色（粗体绿 1;32）。只在直接印到终端时上色 —— 进日志 / 管道 / 测试的照旧是纯文本。
+import builtins as _builtins
+import sys as _sys
+_MENU_NUM_RE = re.compile(r"(^[ \t]*|(?<=  ))(\d{1,2}\.)(?=\s)", re.M)   # 行首的，或并排的（前面两个空格）
+
+
+_MENU_SEEN = set()                        # 这一屏印出来的编号；问「请选择」时打的是这里面的，才回头染绿（见 _ask_paint）
+
+
+def _menu_num_paint(m):
+    _MENU_SEEN.add(m.group(2)[:-1])
+    return f"{m.group(1)}\033[1;32m{m.group(2)}\033[0m"
+
+
+def _ask_paint(prompt_shown, v, seen):
+    """打完回车之后：打的是菜单上有的编号 → 把这一行重印一遍、数字染成同色；菜单上没有的照旧普通颜色。
+
+    仓库主人：「这个输入只有上面预设好了的才变成高亮，如果你输入的上面是没有的应该就是普通的颜色」。
+    打字那一刻是终端自己回显的，还不知道最后打什么，所以只能回车后回头重印。整行放不下一行（会折行）
+    就不重印，免得把上一行盖花。"""
+    try:
+        if not v or v not in seen or not _sys.stdout.isatty():
+            return
+        cols = shutil.get_terminal_size((60, 20)).columns
+        wide = sum(2 if ord(ch) > 0x2E80 else 1 for ch in prompt_shown + v)
+        if wide >= cols:
+            return
+        _builtins.print(f"\033[1A\r\033[2K{prompt_shown}\033[1;32m{v}\033[0m", flush=True)
+    except Exception:
+        pass
+
+
+# 【不带点的编号也算】子菜单大多写成「  1 修改配置」「1 作者模板   2 自定义模板   0 返回」，上面那条只认
+# 「1.」，于是只有主菜单亮、里面几层全是白的。仓库主人：「我当时是想把所有的需要输入按钮的都要做成高亮」。
+# 不带点的数字太容易撞上普通文字（「  80 端口被占」「  5 条候选」），所以收得紧：
+#   · 只认 0~29；后面空格隔开紧跟中文（量词「条个台次秒分……」不算），
+#     独占一行的单个数字后面跟英文也算（「  1 smux 开关」「  4 Emby 证书」）；
+#   · 并排的要前面至少三个空格（菜单项之间都是三四个空格），或紧跟中文冒号（「计费方式：1 双向相加」）。
+_MENU_BARE_RE = re.compile(r"(^[ \t]+|(?<=   )|(?<=：))([12]?\d)( +)(?=(\S))", re.M)
+_MENU_UNIT = "条个台次秒分小天行项端倍位张份组路周月年号字块元"
+
+
+def _menu_bare_paint(m):
+    head, num, gap, nxt = m.groups()
+    cjk = "\u4e00" <= nxt <= "\u9fff" and nxt not in _MENU_UNIT
+    word = bool(head) and len(num) == 1 and nxt.isascii() and nxt.isalpha()
+    if not (cjk or word):
+        return m.group(0)
+    _MENU_SEEN.add(num)
+    return f"{head}\033[1;32m{num}\033[0m{gap}"
+
+
+def _menu_paint(s):
+    return _MENU_BARE_RE.sub(_menu_bare_paint, _MENU_NUM_RE.sub(_menu_num_paint, s))
+
+
+def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置 print，见上
+    try:
+        f = kw.get("file") or _sys.stdout
+        if args and isinstance(args[0], str) and f is _sys.stdout and f.isatty():
+            args = (_menu_paint(args[0]),) + args[1:]
+    except Exception:
+        pass
+    return _builtins.print(*args, **kw)
+
+
 def sh(cmd, check=False):
     r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     if check and r.returncode:
@@ -38,11 +107,15 @@ def _ask(prompt=""):
     """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。"""
     try:
         with open("/dev/tty", "r") as t:
+            _seen = set(_MENU_SEEN)
+            _MENU_SEEN.clear()
             print(prompt, end="", flush=True)
             line = t.readline()
             if line == "":
                 raise EOFError
-            return line.rstrip("\n").strip()
+            v = line.rstrip("\n").strip()
+            _ask_paint(prompt, v, _seen)
+            return v
     except (OSError, EOFError):
         return input(prompt).strip()
 
