@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.356"
+SCRIPT_VERSION = "1.5.357"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -5762,7 +5762,7 @@ def traffic_menu():
                           if n.startswith("traffic-") and n.endswith(".tsv"))
         except OSError:
             days = []
-        print(f"\n  1 看别的日期（现有 {len(days)} 天）    0 返回")
+        print(f"\n  1. 看别的日期（现有 {len(days)} 天）    0. 返回")
         c = ask("请选择").strip()
         if c != "1":
             return
@@ -11354,8 +11354,8 @@ def auto_libraries():
                 for x in sorted(set(paths)):
                     print(f"        {DIM}{x}{RST}")
         print()
-        print(f"  {DIM}1 用作者的　2 用自定义　3 自定义链接（填/换/删）　"
-              f"4 重新拉一次　{RST}{BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
+        print(f"  1. 用作者的   2. 用自定义   3. 自定义链接（填/换/删）   "
+              f"4. 重新拉一次   {BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
         c = ask("请选择").strip().lower()
         if c in ("", "0", "q"):
             return
@@ -11388,7 +11388,7 @@ def auto_libraries():
             if cust:
                 print()
                 print(f"  当前自定义链接：{CYAN}{cust}{RST}")
-                print(f"  {DIM}1 更换　2 删除（并切回作者的）　0 返回{RST}")
+                print("  1. 更换   2. 删除（并切回作者的）   0. 返回")
                 t = ask("请选择").strip()
                 if t == "2":
                     set_rules_url("")

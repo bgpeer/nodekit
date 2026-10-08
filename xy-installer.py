@@ -54,11 +54,35 @@ def _ask_paint(prompt_shown, v, seen):
         pass
 
 
+# 【不带点的编号也算】子菜单大多写成「  1 修改配置」「1 作者模板   2 自定义模板   0 返回」，上面那条只认
+# 「1.」，于是只有主菜单亮、里面几层全是白的。仓库主人：「我当时是想把所有的需要输入按钮的都要做成高亮」。
+# 不带点的数字太容易撞上普通文字（「  80 端口被占」「  5 条候选」），所以收得紧：
+#   · 只认 0~29；后面空格隔开紧跟中文（量词「条个台次秒分……」不算），
+#     独占一行的单个数字后面跟英文也算（「  1 smux 开关」「  4 Emby 证书」）；
+#   · 并排的要前面至少三个空格（菜单项之间都是三四个空格），或紧跟中文冒号（「计费方式：1 双向相加」）。
+_MENU_BARE_RE = re.compile(r"(^[ \t]+|(?<=   )|(?<=：))([12]?\d)( +)(?=(\S))", re.M)
+_MENU_UNIT = "条个台次秒分小天行项端倍位张份组路周月年号字块元"
+
+
+def _menu_bare_paint(m):
+    head, num, gap, nxt = m.groups()
+    cjk = "\u4e00" <= nxt <= "\u9fff" and nxt not in _MENU_UNIT
+    word = bool(head) and len(num) == 1 and nxt.isascii() and nxt.isalpha()
+    if not (cjk or word):
+        return m.group(0)
+    _MENU_SEEN.add(num)
+    return f"{head}\033[1;32m{num}\033[0m{gap}"
+
+
+def _menu_paint(s):
+    return _MENU_BARE_RE.sub(_menu_bare_paint, _MENU_NUM_RE.sub(_menu_num_paint, s))
+
+
 def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置 print，见上
     try:
         f = kw.get("file") or _sys.stdout
         if args and isinstance(args[0], str) and f is _sys.stdout and f.isatty():
-            args = (_MENU_NUM_RE.sub(_menu_num_paint, args[0]),) + args[1:]
+            args = (_menu_paint(args[0]),) + args[1:]
     except Exception:
         pass
     return _builtins.print(*args, **kw)
@@ -233,6 +257,12 @@ NODE_FILE = "/root/xy-nodes.txt"                 # 本机节点分享链接（�
 SELF_LOCAL     = BGP_DIR + "/xy-installer.py"    # 本地脚本副本（cron 调它，不受网络影响）
 CORE_CRON_FILE = "/etc/cron.d/bgpeer-coreupdate" # 每月定点更新内核的 cron
 CORE_CRON_LOG  = "/var/log/bgpeer-coreupdate.log"
+# 三大配置（mihomo / sing-box / 小火箭）每天自动按【当前选的模板】重生成：北京时间 03:20 调 `cfg-auto`。
+# 排在 cn-block 03:00 刷新（会重启 sing-box）之后、媒体那套 04:10 起的活之前；rules 仓库 02:10 已同步完。
+CFG_AUTO_FILE = BGP_DIR + "/cfg_auto.json"      # {"off": [关掉的格式], "hand": {格式: 手改后的 sha256}}
+CFG_AUTO_CRON = "/etc/cron.d/bgpeer-cfgupdate"
+CFG_AUTO_LOG  = "/var/log/bgpeer-cfgupdate.log"
+CFG_AUTO_AT   = (3, 20)                          # 北京时间
 CERT_FIX_LOG   = "/var/log/bgpeer-certfix.log"   # 证书修复日志（转后台跑，SSH 断了也查得到）
 NODE_OP_LOG    = "/var/log/bgpeer-nodeop.log"    # 装/加/删协议日志（同上，转后台跑）
 NODE_OP_PLAN   = BGP_DIR + "/nodeop.json"        # 交互里选好的方案，交给后台那半程去执行
@@ -4019,6 +4049,7 @@ def run(sb_names, xr_names):
 
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
+    setup_cfg_auto_cron()                                # 三大配置每天北京 03:20 按当前模板自动更新
     if sched:
         print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 19 手动立即更新。')
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
@@ -4240,6 +4271,114 @@ def update_one_config(ext):
             print("  还没添加自定义模板链接（先选『4 自定义模板链接』）。"); return
         _regen_config(ext, url, "自定义")
 
+def _cfg_auto_load():
+    d = _load_json(CFG_AUTO_FILE)
+    return {"off": list(d.get("off") or []), "hand": dict(d.get("hand") or {})}
+
+def _cfg_auto_save(d):
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump(d, open(CFG_AUTO_FILE, "w"), ensure_ascii=False, indent=2)
+
+def _file_sha(path):
+    import hashlib
+    try:
+        return hashlib.sha256(open(path, "rb").read()).hexdigest()
+    except OSError:
+        return ""
+
+def cfg_auto_on(ext):
+    """默认开：没被显式关掉就算开。"""
+    return ext not in _cfg_auto_load()["off"]
+
+def cfg_auto_paused(ext):
+    """手改过、而且手改的那份还原样在 → 暂停自动更新，免得 03:20 一刷把手改的覆盖掉。
+       之后不管哪条路重生成过（3 更新配置 / 多路复用 / 中转 / 自建 DNS），文件一变就自动恢复。"""
+    h = _cfg_auto_load()["hand"].get(ext)
+    return bool(h) and h == _file_sha(FMT[ext]["file"])
+
+def cfg_auto_set(ext, on):
+    d = _cfg_auto_load()
+    d["off"] = [e for e in d["off"] if e != ext] + ([] if on else [ext])
+    if on:
+        d["hand"].pop(ext, None)
+    _cfg_auto_save(d)
+
+def _cfg_auto_mark_hand(ext):
+    d = _cfg_auto_load(); d["hand"][ext] = _file_sha(FMT[ext]["file"]); _cfg_auto_save(d)
+
+def _cfg_auto_state(ext):
+    if not cfg_auto_on(ext):
+        return "关"
+    return "开（手改过，暂停中）" if cfg_auto_paused(ext) else "开（每天 03:20）"
+
+def setup_cfg_auto_cron():
+    """装每天北京 03:20 自动更新三大配置的 cron（本机时区换算，同 setup_core_update_cron）。幂等。"""
+    try:
+        import datetime
+        if os.path.abspath(__file__) != SELF_LOCAL and not os.path.exists(SELF_LOCAL):
+            os.makedirs(BGP_DIR, exist_ok=True)
+            shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
+        bj = datetime.timezone(datetime.timedelta(hours=8))
+        local = datetime.datetime(2001, 6, 2, *CFG_AUTO_AT, tzinfo=bj).astimezone()
+        txt = (f"# bgpeer 三大配置每日自动更新（北京时间 {CFG_AUTO_AT[0]:02d}:{CFG_AUTO_AT[1]:02d}"
+               f" = 本机 {local:%H:%M}）\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"{local.minute} {local.hour} * * * root python3 {SELF_LOCAL} cfg-auto >> {CFG_AUTO_LOG} 2>&1\n")
+        try:
+            if open(CFG_AUTO_CRON).read() == txt:
+                return True
+        except OSError:
+            pass
+        open(CFG_AUTO_CRON, "w").write(txt); os.chmod(CFG_AUTO_CRON, 0o644)
+        return True
+    except OSError:
+        return False
+
+def cfg_auto_run():
+    """cron 每天 03:20 调：开着自动更新的格式，按【当前选的模板】（作者 / 自定义）重生成一遍。
+
+       不动节点、不换 token、不重启任何服务——订阅目录里是指向配置文件的软链，文件换了客户端
+       下次拉就是新的，xy-sub 不用重启（重启那一下正好有客户端在拉就会失败一次）。
+       生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。"""
+    ts = time.strftime("%F %T")
+    todo = [e for e in FMT if os.path.exists(FMT[e]["file"]) and cfg_auto_on(e)]
+    for e in [e for e in todo if cfg_auto_paused(e)]:
+        print(f"{ts} {FMT[e]['label']} 手改过，跳过（进菜单「自动更新」可恢复）")
+    todo = [e for e in todo if not cfg_auto_paused(e)]
+    if not todo or not read_saved_links():
+        return
+    G["host"] = _host()
+    ylines, nodes = parse_nodes(aggregated_links())
+    if not ylines:
+        print(f"{ts} 没有可用节点，跳过"); return
+    for e in todo:
+        meta, target = FMT[e], FMT[e]["file"]
+        which = "自定义" if tpl_src_of(e) == "custom" else "作者"
+        old = open(target).read()
+        try:
+            meta["gen"](ylines, nodes, tpl_url_current(e))
+            ok, err = _validate_generated(e, target)
+        except Exception as ex:
+            ok, err = False, ex
+        if not ok:
+            open(target, "w").write(old)
+            print(f"{ts} {meta['label']} 更新失败，已保留原配置（{which}模板）：{str(err).splitlines()[0] if str(err) else err}")
+            continue
+        print(f"{ts} {meta['label']} " + ("无变化" if open(target).read() == old else "已更新") + f"（{which}模板）")
+    harden_perms()
+
+def cfg_auto_menu(ext):
+    """菜单里的自动更新开关：开 ⇄ 关；手改暂停中的，问一句再恢复（恢复后 03:20 会覆盖手改）。"""
+    if cfg_auto_on(ext) and cfg_auto_paused(ext):
+        print("  \033[1;33m提示：恢复后每天 03:20 会按模板重生成，手改的内容会被覆盖\033[0m")
+        if _ask("  恢复自动更新? [y/N]: ").lower() in ("y", "yes"):
+            cfg_auto_set(ext, True); print("  ✔ 已恢复")
+        return
+    cfg_auto_set(ext, not cfg_auto_on(ext))
+    setup_cfg_auto_cron()
+    print(f"  ✔ 自动更新已{'开' if cfg_auto_on(ext) else '关'}")
+
 def config_menu(ext):
     """单个格式的配置子菜单：改配置 / 改订阅(换token) / 更新配置(作者·自定义) / 加自定义模板链接。"""
     meta = FMT[ext]
@@ -4259,10 +4398,17 @@ def config_menu(ext):
         print("  2 修改订阅（显示当前 / 换 token）")
         print("  3 更新配置（作者模板 / 自定义模板）")
         print("  4 自定义模板链接（添加 / 更换 / 删除）")
+        print(f"  5 自动更新　当前：{_cfg_auto_state(ext)}")
         print("  0 返回")
         c = _ask("选择: ").strip()
         if c == "1":
+            before = _file_sha(meta["file"])
             edit_file(meta["file"])
+            if _file_sha(meta["file"]) != before and cfg_auto_on(ext):
+                _cfg_auto_mark_hand(ext)                # 手改了：自动更新先停，免得 03:20 覆盖
+                print("  \033[1;33m提示：手改过，自动更新已暂停（重新生成配置后自动恢复）\033[0m")
+        elif c == "5":
+            cfg_auto_menu(ext)
         elif c == "2":
             print("  当前订阅:", sub_url(ext))
             if _ask("  换新 token? [y/N]: ").lower() in ("y", "yes"):
@@ -4463,6 +4609,7 @@ def update_cores_auto(only=None):
     if _hy2_hop_heal():                                      # 端口跳跃 DNAT 丢了（持久化没生效）就补回
         print(f"{ts} hy2 端口跳跃规则已补回")
     setup_core_update_cron()                                 # 顺手确保每月自动更新的 cron 在
+    setup_cfg_auto_cron()                                    # 同理：三大配置每日自动更新的 cron
     print(f"{time.strftime('%F %T')} {CORE_DONE_MARK}")      # 后台跑时用 python3 -u，逐行落盘不缓冲
 
 def update_cores():
@@ -4582,7 +4729,7 @@ def _uninstall_core():
              "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", WEBROOT,
              # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
              "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
-             CORE_CRON_FILE, CORE_CRON_LOG]
+             CORE_CRON_FILE, CORE_CRON_LOG, CFG_AUTO_CRON, CFG_AUTO_LOG]
     if not _keep_cert:
         # 证书是节点签的，没人用就跟着走
         paths.append("/etc/ssl/sb")
@@ -4592,7 +4739,7 @@ def _uninstall_core():
         sh(f"rm -rf {p}", check=False)
     if _ms:
         # 【目录留着，但节点自己的文件要清干净】留下的只有别人的东西。
-        for p in ("/etc/bgpeer/state.json",):
+        for p in ("/etc/bgpeer/state.json", CFG_AUTO_FILE):
             sh(f"rm -f {p}", check=False)
         print("  ↷ /etc/bgpeer 保留：Emby 那套（media-stack）的状态也存在这里。")
         print("    里面记着它的安装目录、分片重定向端口、每个盘的探测 UA 开关 ——")
@@ -8656,6 +8803,8 @@ def main_menu():
         print("  ✓ 已修好 sing-box 的本机 DNS（sing-box 已重启）")
     if _hy2_hop_heal():
         print("  ✓ 已补回 hy2 端口跳跃规则（以后 sing-box 每次启动都会自动检查）")
+    if any(os.path.exists(m["file"]) for m in FMT.values()):
+        setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     while True:
         print("\n" + "=" * 60)
         print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
@@ -9570,6 +9719,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单19 转后台都调这个
         update_cores_auto(sys.argv[2] if len(sys.argv) > 2 else None)   # 可选 sing-box/xray/both
+        sys.exit(0)
+    if sys.argv[1] == "cfg-auto":        # cron 每天北京 03:20：三大配置按当前模板自动更新
+        cfg_auto_run()
         sys.exit(0)
     if sys.argv[1] == "cert-fix":        # 菜单 15 转后台调这个（脱离 SSH，重启核心也断不掉）
         cert_fix_run()
