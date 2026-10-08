@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.361"
+SCRIPT_VERSION = "1.5.362"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -9431,6 +9431,21 @@ def planned_stem(stem, mount, clean=None):
     return stem
 
 
+def collapsed_disc_strm(host, target):
+    """collapse_bluray_folders 压出来的那个 strm：在原盘目录里、跟目录同名、指向 BDMV 里的正片。
+
+    【它就该待在原盘目录里，别按网盘目录树挪】按网盘那棵树算，它「应该」在 BDMV/STREAM/00003.strm；
+    migrate_strm_layout 照这个挪回去，原盘目录里又长出 BDMV —— 下一轮 collapse 再压、再删、再写，
+    migrate 再挪，每晚转一圈。真机 10/09：04:50 scan.log「新增 14：00003.strm」（周星驰那 14 套原盘
+    又被挪回 BDMV），05:00 又当空壳删掉 14 个 —— Emby 里这几部每晚删了重建，轨道跟着掉，报删除还让
+    Emby 把整个文件夹刷一遍。
+    restore_strm_names（按网盘文件名还原）同理：会把它改回 00003.strm，下一轮 migrate 又挪进 BDMV。
+    这三处（migrate / 还原文件名 / 改名预览）都认它、都不碰。"""
+    stem = os.path.basename(host)[:-len(".strm")] if host.endswith(".strm") else ""
+    return bool(stem) and "/bdmv/" in str(target).replace("\\", "/").lower() \
+        and stem == os.path.basename(os.path.dirname(host))
+
+
 def planned_strm_path(d, netdisk_path, scan_paths, clean=None):
     """按当前扫描配置，这个网盘文件的 strm 【应该】落在宿主机的哪儿。
 
@@ -9465,6 +9480,8 @@ def rename_preview(d, only=None, clean=True):
         return []
     out = []
     for host, target in strm_inventory(d, only):
+        if collapsed_disc_strm(host, target):
+            continue                      # 不会挪它，也就不会改它的名，见 collapsed_disc_strm
         want = planned_strm_path(d, target, sps, clean=clean)
         if not want:
             continue
@@ -11241,8 +11258,8 @@ def restore_strm_names(d):
                     tgt = strm_target_path(fh.read())
             except OSError:
                 continue
-            if not tgt:
-                continue
+            if not tgt or collapsed_disc_strm(src, tgt):
+                continue                  # 压好的原盘 strm 就该跟原盘目录同名，改成 00003.strm 又会被挪回 BDMV
             want = planned_stem(os.path.splitext(os.path.basename(tgt))[0],
                                 drive_of_strm(src)) + ".strm"
             if want == f or not want.strip():
@@ -11900,6 +11917,8 @@ def migrate_strm_layout(d, key, wait=True):
         return 0
     moves = []
     for host, target in strm_inventory(d):
+        if collapsed_disc_strm(host, target):
+            continue                      # 压好的原盘就待在原盘目录里，见 collapsed_disc_strm
         want = planned_strm_path(d, target, sps)
         if want and os.path.abspath(want) != os.path.abspath(host):
             moves.append((host, want))
