@@ -126,6 +126,31 @@ ALLOW_IPS = [
     # "2001:db8::/32",      # IPv6 也行
 ]
 
+# ── 屏上排版小工具（同 xy-installer.py，CLAUDE.md 第五节「排版要整齐干净」）──────────
+def _hl(code, text):
+    return f"\033[{code}m{text}\033[0m" if _sys.stdout.isatty() else text
+
+def ui_title(text):
+    print("\n" + "=" * 60 + f"\n  {text}\n" + "=" * 60)
+
+def ui_line():
+    print("-" * 60)
+
+def ui_items(items):
+    for num, name, cur in items:
+        print(f"  {num}. {name}" + (f"　当前：{cur}" if cur not in (None, "") else ""))
+
+def ui_tip(text):
+    print("  " + _hl("1;33", f"提示：{text}"))
+
+def ui_kv(label, value):
+    print(f"  {_hl('36', label + '：')}{value}")
+
+def ui_url(label, url, code="1;32"):
+    print(_hl("1;33", f"▸ {label}"))
+    print(_hl(code, url) if url else _hl("2", "（还没有）"))
+
+
 def sh(cmd, check=True):
     r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     if check and r.returncode:
@@ -887,23 +912,22 @@ def custom_allow_menu():
         doms = list(cfg.get("wl_domains") or [])         # 本机加的：可增删
         ips = list(cfg.get("wl_ips") or [])
         items = [("域名", d) for d in doms] + [("IP", i) for i in ips]
-        print("\n" + "-" * 60)
-        print("  单条放行（域名 / IP）—— 命中即直连，不被 CN 屏蔽拦下")
-        print("-" * 60)
+        # 命中即直连，不被 CN 屏蔽拦下。脚本内置的要改仓库里的 cn-block.py 才能动，这里删不掉。
+        ui_title("单条放行（域名 / IP）")
         if sd or si:
-            print("  脚本内置（改仓库里的 cn-block.py 才能动，这里删不掉）:")
-            for v in sd: print(f"      [域名] {v}")
-            for v in si: print(f"      [IP]   {v}")
+            print(_hl("1;33", "▸ 脚本内置（这里删不掉）"))
+            for v in sd: print(f"  [域名] {v}")
+            for v in si: print(f"  [IP]   {v}")
             print()
-        print("  本机添加:")
-        if items:
-            for n, (kind, v) in enumerate(items, 1):
-                print(f"    {n:>2}. [{kind}] {v}")
-        else:
-            print("    (还没添加)")
-        print(f"\n  {Y}域名按后缀匹配{N}：填 example.com，它和它的所有子域都放行")
-        print("  1 添加（可一次多个，逗号分隔）   2 删除   0 返回")
-        c = _ask("  选择: ").strip()
+        print(_hl("1;33", f"▸ 本机添加（{len(items)} 条）"))
+        for n, (kind, v) in enumerate(items, 1):
+            print(_hl("1;36", f"[{n}] ") + f"[{kind}] " + _hl("94", v))
+        if not items:
+            print(_hl("2", "（还没添加）"))
+        ui_line()
+        ui_items([(1, "添加（可一次多个，逗号分隔）", None), (2, "删除", None), (0, "返回", None)])
+        ui_tip("域名按后缀匹配：填 example.com，它和所有子域都放行")
+        c = _ask("选择: ").strip()
         # 直接在这里贴域名/IP 也认。上面写着「1 添加（可一次多个，逗号分隔）」，
         # 紧接着就是「选择」，很容易让人以为在这儿直接输 —— 实际使用中就是这么
         # 填了一次、看到「还没添加」以为功能坏了。与其让他白填，不如认下来。
@@ -970,19 +994,18 @@ def menu():
         cfg = cnblock_load()
         on = cfg.get("enabled")
         wl = {"author": "作者名单", "custom": "自定义名单", "none": "不放行"}.get(cfg.get("wl_mode", "author"), "作者名单")
-        print("\n" + "=" * 60 + "\n屏蔽中国域名和IP\n" + "=" * 60)
-        print(f"  当前状态: {'已开启 ✓' if on else '未开启'}    放行白名单: {wl}")
-        print(f"  自定义放行名单链接: {cfg.get('wl_url') or '(未设置)'}")
         _d, _i = _wl_custom(cfg)
-        print(f"  单条放行: {len(_d)} 个域名 + {len(_i)} 个 IP" if (_d or _i) else "  单条放行: (未添加)")
-        print("-" * 60)
-        print("  1 屏蔽中国域名和IP" + ("（已开，再选可关闭）" if on else ""))
-        print("  2 放行白名单（作者名单 / 自定义名单）")
-        print("  3 自定义放行名单脚本链接（规则集 + 单条域名/IP，可抄样板改）")
-        print("  4 单条放行域名/IP（自己加，按后缀匹配含子域）")
-        print("  5 立即更新（拉取最新放行名单/规则集并生效，不用等每天定时刷新）")
-        print("  6 卸载（不想屏蔽了，直接清掉规则）")
-        print("  0 退出")
+        # 3 自定义放行名单脚本链接：规则集 + 单条域名/IP，可抄样板改；5 立即更新：不用等每天 03:00 定时刷新
+        ui_title("屏蔽中国域名和 IP")
+        ui_url("自定义放行名单链接", cfg.get("wl_url") or "", "94")
+        ui_line()
+        ui_items([(1, "屏蔽中国域名和 IP", _hl("1;32", "已开（再选可关闭）") if on else "未开"),
+                  (2, "放行白名单", wl),
+                  (3, "自定义放行名单链接", None),
+                  (4, "单条放行域名 / IP", f"{len(_d)} 个域名 + {len(_i)} 个 IP" if (_d or _i) else None),
+                  (5, "立即更新（拉最新名单 / 规则集）", None),
+                  (6, "卸载（清掉屏蔽规则）", None),
+                  (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             if on:
@@ -991,8 +1014,9 @@ def menu():
             else:
                 apply_cn_block(cfg)
         elif c == "2":
-            print("    1 作者名单   2 自定义名单   0 返回")
-            s = _ask("    选择: ").strip()
+            print()
+            ui_items([(1, "作者名单", None), (2, "自定义名单", None), (0, "返回", None)])
+            s = _ask("选择: ").strip()
             if s == "1":   cfg["wl_mode"] = "author"
             elif s == "2": cfg["wl_mode"] = "custom"
             else:          continue

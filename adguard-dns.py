@@ -97,6 +97,31 @@ def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置
     return _builtins.print(*args, **kw)
 
 
+# ── 屏上排版小工具（同 xy-installer.py，CLAUDE.md 第五节「排版要整齐干净」）──────────
+def _hl(code, text):
+    return f"\033[{code}m{text}\033[0m" if _sys.stdout.isatty() else text
+
+def ui_title(text):
+    print("\n" + "=" * 60 + f"\n  {text}\n" + "=" * 60)
+
+def ui_line():
+    print("-" * 60)
+
+def ui_items(items):
+    for num, name, cur in items:
+        print(f"  {num}. {name}" + (f"　当前：{cur}" if cur not in (None, "") else ""))
+
+def ui_tip(text):
+    print("  " + _hl("1;33", f"提示：{text}"))
+
+def ui_kv(label, value):
+    print(f"  {_hl('36', label + '：')}{value}")
+
+def ui_url(label, url, code="1;32"):
+    print(_hl("1;33", f"▸ {label}"))
+    print(_hl(code, url) if url else _hl("2", "（还没有）"))
+
+
 def sh(cmd, check=False):
     r = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     if check and r.returncode:
@@ -635,12 +660,12 @@ def dot_clientid():
             print(f"    去 Cloudflare 加一条：类型 {G}A{N}  名称 {G}*.{dom.split('.',1)[0] if dom.count('.')>1 else '*'}{N}"
                   f"  内容 {G}{_public_ip()}{N}  代理状态 {Y}仅DNS(灰云){N}")
         print(f"  Token 存在 {G}~/.acme.sh/account.conf{N}，约 90 天后自动续期还要用它。")
-        print("  " + "-" * 56)
-        print(f"  1 更换 Cloudflare API 令牌（旧的泄露了/被吊销了）")
-        print(f"  2 删除 DoT ClientID 支持（证书改回单域名；{C}只撤这一项，AdGuard 照常跑{N}）")
-        print(f"    —— 想把整套自建 DNS 都卸掉，回上级菜单选 2")
-        print(f"  0 返回")
-        c = _ask("  选择: ").strip()
+        ui_line()
+        ui_items([(1, "更换 Cloudflare API 令牌（泄露了 / 被吊销了）", None),
+                  (2, "删除 DoT ClientID 支持（证书改回单域名，AdGuard 照常跑）", None),
+                  (0, "返回", None)])
+        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 2")
+        c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
         elif c == "2":
@@ -786,9 +811,10 @@ def change_web_port():
     if len(hits) != 1:                                   # 没能唯一定位就别乱改
         print(f"  配置里没能唯一定位后台端口行（找到 {len(hits)} 处），保险起见不自动改。"); return
     cur = int(hits[0][1])
-    print(f"\n  当前后台端口: {cur}")
-    print("  1 随机(2000-5000)   2 自定义   0 取消")
-    c = _ask("  选择: ").strip()
+    print()
+    ui_kv("当前后台端口", cur)
+    ui_items([(1, "随机（2000-5000）", None), (2, "自定义", None), (0, "取消", None)])
+    c = _ask("选择: ").strip()
     if c == "1":
         new = _pick_web_port(cur)
         if not new:
@@ -1421,20 +1447,25 @@ def _selfdns_toggle():
 
 def menu():
     while True:
-        print("\n" + "=" * 60 + "\n自建DNS · AdGuard Home（自己的解析服务器 · 兼带广告过滤）\n"
-              + "=" * 60)
-        st = "已安装 " + ("运行中 ✓" if _running() else "未运行 ✗") if _installed() else "未安装"
-        print("  当前状态:", st)
-        print("-" * 60)
-        print("  1 安装（装 AdGuard Home + 起服务，之后网页后台点几下完成设置）")
-        print("  2 卸载（整套撤干净：服务+数据、订阅里的自建DNS、泛域名证书、腾53的改动；不动节点）")
-        print("  3 使用方法（当前配置信息 + 设备怎么设置，照着填即可）")
-        print("  4 腾出 53 端口（被 systemd-resolved 占用时用）")
-        print("  5 改后台端口（随机 2000-5000 / 自定义，防扫描；带回滚）")
-        print("  6 把自建DNS写入订阅配置（开/关：第一次写入·再点移除，自动刷新）")
-        print("  7 自检（服务/端口/证书/解析/访问控制 一次查清，只读不改）")
-        print("  8 让 DoT 也能带 ClientID（签泛域名证书；设了白名单后安卓专用DNS仍可用）")
-        print("  0 退出")
+        # 2 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
+        # 5 改后台端口：随机 2000-5000 / 自定义，防扫描，带回滚。7 自检：只读不改。
+        # 8 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。
+        ui_title("自建 DNS · AdGuard Home（兼带广告过滤）")
+        if _installed():
+            st = "已安装 · " + (_hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
+        else:
+            st = _hl("2", "未安装")
+        ui_kv("当前状态", st)
+        ui_line()
+        ui_items([(1, "安装", None),
+                  (2, "卸载（整套撤干净，不动节点）", None),
+                  (3, "使用方法（设备怎么填）", None),
+                  (4, "腾出 53 端口（被 systemd-resolved 占用时）", None),
+                  (5, "改后台端口", None),
+                  (6, "自建 DNS 写入订阅", "已写入" if os.path.exists(SELFDNS_FLAG) else "未写入"),
+                  (7, "自检（只读）", None),
+                  (8, "DoT 带 ClientID（签泛域名证书）", None),
+                  (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
         elif c == "2": uninstall()
