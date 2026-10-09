@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.364"
+SCRIPT_VERSION = "1.5.365"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -5600,6 +5600,89 @@ def _nic_counters():
         return None, None
     return rx, tx
 
+# 【商家网段的广播单独记一列】真机 10/10 抓 2 分钟：64062 个广播包（每秒 530 多个、每个 60 来字节的 ARP ——
+# 同一个网段里别的机器在问 IP），一小时约 120 MB。账本里「宿主机」夜里每小时 120~150 MB 的那层底子就是它，
+# 不是这台机器上哪个程序在用。仓库主人：「应该做一个商家广播显示流量，表示这是商家的不被误解」。
+# 做法：nftables 的 netdev ingress 上挂两条【只数不拦】的 counter（policy accept），跟网卡一起每 5 分钟记一笔增量。
+BCAST_TABLE = "ms_bcast"
+BCAST_KEY = "@商家广播"      # 账本里这一列的名字；@ 开头，不会跟容器名撞
+ETH_HDR = 14               # nft 在 ingress 数的长度不含以太网头，网卡计数器含（实测差的正好是 14 × 包数）
+
+
+def _bcast_ifaces():
+    """要数广播的网口：真网卡里的以太网口（type == 1、有 device 链接）。
+
+    【只挂真网卡】ifb（流量整形镜像口）、dummy、网桥这些虚拟口没有 device 链接 —— ifb 收的是从真网卡
+    转过来的同一批包，挂上去会数两遍。一个都没有（个别虚拟化）就退回默认路由那一口。"""
+    def _eth(n):
+        try:
+            with open(f"/sys/class/net/{n}/type") as f:
+                return f.read().strip() == "1"
+        except OSError:
+            return False
+    out = []
+    try:
+        for line in open("/proc/net/dev"):
+            if ":" not in line:
+                continue
+            name = line.partition(":")[0].strip()
+            if name == "lo" or name.startswith(("docker", "br-", "veth", "tun", "sing")):
+                continue
+            if _eth(name) and os.path.exists(f"/sys/class/net/{name}/device"):
+                out.append(name)
+    except OSError:
+        pass
+    if not out:
+        try:
+            for ln in open("/proc/net/route").read().splitlines()[1:]:
+                f = ln.split()
+                if len(f) > 1 and f[1] == "00000000" and _eth(f[0]):
+                    out = [f[0]]
+                    break
+        except OSError:
+            pass
+    return out
+
+
+def bcast_bytes():
+    """商家网段的广播 + 组播一共进来多少字节（按网卡口径，开机 / 建表以来累计）。数不了 → None。
+
+    数不了 = 没装 nftables、内核不支持 netdev 表 —— 那就跟以前一样，账本里不单列这一项。
+    表没了或者网口变了就重建（计数从 0 开始，增量那边按「重启」处理，见 _traffic_delta）。"""
+    if not shutil.which("nft"):
+        return None
+    want = {"in_" + re.sub(r"\W", "_", i): i for i in _bcast_ifaces()}
+    if not want:
+        return None
+    r = sh(f"nft list table netdev {BCAST_TABLE}", timeout=20)
+    txt = r.stdout if r.returncode == 0 else ""
+    if set(re.findall(r"chain (\S+) \{", txt)) != set(want):
+        sh(f"nft delete table netdev {BCAST_TABLE}", timeout=20)
+        body = "".join(f'  chain {c} {{\n'
+                       f'    type filter hook ingress device "{i}" priority -500; policy accept;\n'
+                       f"    meta pkttype broadcast counter\n"
+                       f"    meta pkttype multicast counter\n  }}\n" for c, i in want.items())
+        try:
+            subprocess.run(["nft", "-f", "-"], input=f"table netdev {BCAST_TABLE} {{\n{body}}}\n",
+                           text=True, capture_output=True, timeout=20)
+        except Exception:
+            return None
+        r = sh(f"nft list table netdev {BCAST_TABLE}", timeout=20)
+        if r.returncode != 0:
+            return None
+        txt = r.stdout
+    got = re.findall(r"meta pkttype (?:broadcast|multicast) counter packets (\d+) bytes (\d+)", txt)
+    if not got:
+        return None
+    return sum(int(b) + ETH_HDR * int(p) for p, b in got)
+
+
+def bcast_remove():
+    """卸载时把那张只数不拦的表拿掉。"""
+    if shutil.which("nft"):
+        sh(f"nft delete table netdev {BCAST_TABLE}", timeout=20)
+
+
 def _netdev_first(path):
     """从一份 /proc/net/dev 里取第一个非 lo 网口的 (收字节, 发字节)。取不到返回 None。
 
@@ -5659,11 +5742,15 @@ def do_traffic_sample():
         return
     cons = _container_counters()
     try:
+        bc = bcast_bytes()
+    except Exception:
+        bc = None
+    try:
         prev = json.load(open(TRAFFIC_PREV))
     except Exception:
         prev = {}
     cur = {"ts": int(time.time()), "nic": [nic_rx, nic_tx],
-           "con": {k: list(v) for k, v in cons.items()}}
+           "con": {k: list(v) for k, v in cons.items()}, "bc": bc}
     os.makedirs(TRAFFIC_DIR, exist_ok=True)
     try:
         os.chmod(TRAFFIC_DIR, 0o700)          # 里面是这台机器的用网画像，不给别人看
@@ -5688,6 +5775,10 @@ def do_traffic_sample():
         dtx = _traffic_delta(tx, p[1]) if p else tx
         if drx or dtx:
             parts.append(f"{c}:{drx}:{dtx}")
+    if bc is not None and prev.get("bc") is not None:
+        dbc = _traffic_delta(bc, int(prev["bc"]))
+        if dbc:
+            parts.append(f"{BCAST_KEY}:{dbc}:0")
     row = "\t".join([str(cur["ts"]), str(d_rx), str(d_tx)] + parts) + "\n"
     day = bj_fmt("%Y-%m-%d", cur["ts"])
     try:
@@ -5970,7 +6061,7 @@ def traffic_report(day=None):
         src = hsrc.get(h, {})
         top = sorted(src.items(), key=lambda kv: -kv[1])[:2]
         host = max(0, a - sum(src.values()))
-        who = "  ".join(f"{n} {_gb(v)}" for n, v in top if v > 0)
+        who = "  ".join(f"{'商家广播' if n == BCAST_KEY else n} {_gb(v)}" for n, v in top if v > 0)
         if host > 0:
             who = (who + "  " if who else "") + f"宿主机 {_gb(host)}"
         print(f"    {h} 时 ↓{_gb(a):>9}  {bar:<12} {DIM}{who}{RST}")
@@ -6000,7 +6091,10 @@ def traffic_report(day=None):
     # ---- 按来源
     print("-" * 60)
     print(f"  {BOLD}按来源{RST}{DIM}（容器自己的网口，占网卡下行）{RST}")
+    bc = per.get(BCAST_KEY, [0, 0])[0]
     for c, (a, b) in sorted(per.items(), key=lambda kv: -kv[1][0]):
+        if c == BCAST_KEY:
+            continue
         pct = f"{a * 100 / rx:.0f}%" if rx else "-"
         print(f"    {c:<14} ↓{_gb(a):>9}  ↑{_gb(b):>9}   {DIM}{pct}{RST}")
     # 【按小时算完再加】直接拿全天的「网卡 − 各容器」会被容器之间的流量压成 0：真机那天
@@ -6016,13 +6110,19 @@ def traffic_report(day=None):
     # （近 3 万个包，同网段别的机器在问 IP）—— 夜里没人用也每小时一百多 MB，不是哪个程序在拉
     print(f"    {_padw('宿主机·非容器', 15)}↓{_gb(h_rx):>9}  ↑"
           + (f"{_gb(h_tx):>9}" if h_tx > 0 else f"{DIM}{'算不出':>6}{RST}")
-          + f"   {DIM}至少这么多（代理节点、商家网段广播在这里）{RST}")
+          + (f"   {DIM}至少这么多（代理节点、系统更新这些）{RST}" if bc else
+             f"   {DIM}至少这么多（代理节点、商家网段广播在这里）{RST}"))
+    if bc:
+        print(f"    {YELLOW}{_padw('商家网段广播', 15)}↓{_gb(bc):>9}{RST}" + " " * 12
+              + f"   {DIM}{bc * 100 / rx:.0f}%　同网段别的机器发的，不是你用的{RST}")
 
     # ---- 合计（最后，停下来就能看到）
     print("-" * 60)
     cover = rows * TRAFFIC_EVERY_MIN
     print(f"  {BOLD}全天合计  ↓{_gb(rx)}  ↑{_gb(tx)}{RST}"
           f"   {DIM}物理网卡 · 覆盖 {cover // 60} 小时 {cover % 60} 分{RST}")
+    if bc:
+        print(f"  {YELLOW}其中商家网段广播 ↓{_gb(bc)}{RST}　除去它 ↓{_gb(max(0, rx - bc))}")
     if rx:
         ol = per.get("openlist", [0, 0])[0]
         print(f"  网盘拉取（openlist）↓{_gb(ol)}，占 {ol * 100 / rx:.0f}%"
@@ -13595,6 +13695,7 @@ def do_uninstall():
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
     jobq_cleanup_if_unused()        # 凌晨任务排队器：节点那边还在用就留着
+    bcast_remove()                  # 账本数商家广播的那张表（只数不拦）
     ok("已移除密码文件和管理命令")
 
     if ask_yn(f"删除 {install_dir}（配置和 strm 全部丢失，不可逆）？", False):
@@ -28335,8 +28436,10 @@ def do_healthcheck():
         if _rows:
             _ol = _per.get("openlist", [0, 0])[0]
             _hint = (f"，openlist 占 {_ol * 100 / _rx:.0f}%" if _rx else "")
+            _bcd = _per.get(BCAST_KEY, [0, 0])[0]
             _hc("流量账本", "ok",
-                f"今天已记 {_rows} 格，网卡 ↓{_gb(_rx)}{_hint}"
+                f"今天已记 {_rows} 格，网卡 ↓{_gb(_rx)}"
+                + (f"（其中商家广播 {_gb(_bcd)}）" if _bcd else "") + f"{_hint}"
                 f"{DIM}　详细看「6 流量账本」{RST}")
         else:
             _hc("流量账本", "skip",
