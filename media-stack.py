@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.363"
+SCRIPT_VERSION = "1.5.364"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -11269,7 +11269,15 @@ def restore_strm_names(d):
             dst = os.path.join(dp, want)
             try:
                 if os.path.exists(dst):
-                    os.remove(src)      # 原名那个已经在了（AutoFilm 重新生成的）
+                    # 【只删同一部的】原名那个已经在了（AutoFilm 重新生成的）才删 —— 两边指向网盘上同一个文件。
+                    # 指向的不是同一个，是同一部片的另一个版本（清洗后撞了名）：migrate 那边按「撞名的怎么办」
+                    # 留着它的原名，这里就不能删。真机 10/09–10/10：七米蓝那 25 个（三傻大闹宝莱坞
+                    # 3.Idiots.2009.mkv 和 …1080p.BluRay.x264 DTS-WiKi 两版、良知堡垒两版……）每晚 AutoFilm
+                    # 重建 → 报给 Emby 收进去 → 这里删掉 → 当空壳从 Emby 删（还刷一遍整个文件夹）→ 第二晚再来。
+                    with open(dst, encoding="utf-8") as fh:
+                        if strm_target_path(fh.read()) != tgt:
+                            continue
+                    os.remove(src)
                 else:
                     os.replace(src, dst)
                 n += 1
