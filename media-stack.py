@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.362"
+SCRIPT_VERSION = "1.5.363"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -6044,14 +6044,16 @@ def traffic_menu():
                           if n.startswith("traffic-") and n.endswith(".tsv"))
         except OSError:
             days = []
-        print(f"\n  1. 看别的日期（现有 {len(days)} 天）    0. 返回")
+        print()
+        print(f"  1. 看别的日期        当前：{CYAN}{len(days)} 天的账本{RST}")
+        print("  0. 返回")
         c = ask("请选择").strip()
         if c != "1":
             return
         if not days:
             warn("还没有任何一天的账本。"); continue
         for i, d in enumerate(days, 1):
-            print(f"    {i}) {d}")
+            print(f"  {i}. {d}")
         n = ask("看第几个").strip()
         if n.isdigit() and 1 <= int(n) <= len(days):
             traffic_report(days[int(n) - 1])
@@ -11690,8 +11692,12 @@ def auto_libraries():
                 for x in sorted(set(paths)):
                     print(f"        {DIM}{x}{RST}")
         print()
-        print(f"  1. 用作者的   2. 用自定义   3. 自定义链接（填/换/删）   "
-              f"4. 重新拉一次   {BOLD}y 按上面建库{RST}{DIM}　回车退出{RST}")
+        print("  1. 用作者的" + (f"          {GREEN}← 当前{RST}" if src == "author" else ""))
+        print("  2. 用自定义" + (f"          {GREEN}← 当前{RST}" if src == "custom" else ""))
+        print("  3. 自定义链接（填 / 换 / 删）")
+        print("  4. 重新拉一次")
+        print(f"  {BOLD}y. 按上面建库{RST}")
+        print("  0. 返回")
         c = ask("请选择").strip().lower()
         if c in ("", "0", "q"):
             return
@@ -11723,8 +11729,11 @@ def auto_libraries():
         elif c == "3":
             if cust:
                 print()
-                print(f"  当前自定义链接：{CYAN}{cust}{RST}")
-                print("  1. 更换   2. 删除（并切回作者的）   0. 返回")
+                print(f"{YELLOW}{BOLD}▸ 当前自定义链接{RST}")
+                print(f"{CYAN}{cust}{RST}")
+                print("  1. 更换")
+                print("  2. 删除（并切回作者的）")
+                print("  0. 返回")
                 t = ask("请选择").strip()
                 if t == "2":
                     set_rules_url("")
@@ -12792,9 +12801,11 @@ def show_info():
     print(f"  {BOLD}媒体栈使用信息{RST}")
     print("=" * 60)
 
-    print(f"\n  {BOLD}▸ 访问地址{RST}")
+    # 排版（CLAUDE.md 第五节）：每个地址一行标题（名称 + 端口）+ 地址顶格单独一行，条间空一行，长按复制干净
+    print(f"\n{YELLOW}{BOLD}▸ 访问地址{RST}")
     ip = "" if domain else public_ip()
     emby_url = emby_port = ""
+    _first = True
     for sub, port, container, label in SUBDOMAINS:
         if container == "homepage" and not os.path.isdir(os.path.join(d, "homepage")):
             continue
@@ -12802,8 +12813,11 @@ def show_info():
         # 所以这里要报【外面真正能连的那个端口】，不是 compose 里写的那个
         url, shown = ((f"https://{sub}.{domain}", "443") if domain
                       else (f"http://{ip}:{port}", str(port)))
-        print(f"      {pad(label, 11)}{CYAN}{BOLD}{pad(url, 34)}{RST}"
-              f"{DIM}端口 {shown}{RST}")
+        if not _first:
+            print()
+        _first = False
+        print(f"{CYAN}{BOLD}[{label.strip()}]{RST}  {DIM}端口 {shown}{RST}")
+        print(f"{GREEN}{BOLD}{url}{RST}")
         if container == "emby":
             emby_url, emby_port = url, shown
 
@@ -12811,7 +12825,7 @@ def show_info():
     _stores, _n = openlist_storages(d), strm_count(d)
     _steps = first_steps(d, stores=_stores, n_strm=_n)
     if not all(ok_ for ok_, _t in _steps):
-        print(f"\n  {BOLD}▸ 第一次用：按顺序做{RST}")
+        print(f"\n{YELLOW}{BOLD}▸ 第一次用：按顺序做{RST}")
         for i, (ok_, t) in enumerate(_steps, 1):
             print(f"      {GREEN}✔{RST} {DIM}{i}. {t}{RST}" if ok_ else f"      {YELLOW}{BOLD}➜ {i}. {t}{RST}")
 
@@ -12820,8 +12834,8 @@ def show_info():
     # 直接连它是连得上的 —— 而那样会整个绕过 302，视频改由本机中转，又慢又烧流量，
     # 表面上还"能播放"，属于最典型的「看起来正常、实际是废的」。
     if emby_url:
-        print(f"\n  {BOLD}▸ 外部播放器{RST}")
-        print(f"      服务器地址 {CYAN}{BOLD}{emby_url}{RST}")
+        print(f"\n{YELLOW}{BOLD}▸ 外部播放器（Hills / Infuse / Emby App）服务器地址{RST}")
+        print(f"{GREEN}{BOLD}{emby_url}{RST}")
         print(f"      端  口     {CYAN}{BOLD}{emby_port}{RST}")
         us = emby_users(read_emby_api_key(d) or "")
         if us:
@@ -12834,11 +12848,11 @@ def show_info():
         tip("客户端必须填这个地址；直连 8096 会绕开 302，视频全走 VPS")
 
     if ba_pass:
-        print(f"\n  {BOLD}▸ 浏览器弹框{RST}{DIM}（打开首页入口时）{RST}")
+        print(f"\n{YELLOW}{BOLD}▸ 浏览器弹框{RST}{DIM}（打开首页入口时）{RST}")
         print(f"      用户名   {CYAN}{BOLD}{ba_user}{RST}")
         print(f"      密  码   {CYAN}{BOLD}{ba_pass}{RST}")
 
-    print(f"\n  {BOLD}▸ 各服务自己的账号{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 各服务自己的账号{RST}")
     print(f"      Emby       {DIM}首次打开自己设{RST}")
     print(f"      OpenList   {CYAN}{BOLD}admin{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
 
@@ -12850,12 +12864,13 @@ def show_info():
     # 授权时去掉「备份盘」（手机相册会变成一堆刮不出海报的条目）；只要刷新令牌。
     # 【挂盘先说脚本里能扫码挂的】115、夸克 TV、阿里、WebDAV 都能在「3 挂载路径」里挂，不用去 OpenList 网页、
     # 也不用去取令牌的网站；别的盘、或者阿里选了「贴令牌」才要那个网站
-    print(f"\n  {BOLD}▸ 挂网盘{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 挂网盘{RST}")
     print(f"      「3 挂载路径」里挂：115 / 夸克 TV / 阿里扫码，WebDAV 填地址")
-    print(f"      别的盘去 OpenList 网页挂，令牌在 {CYAN}{BOLD}https://api.oplist.org/{RST} {DIM}打不开换 .cn{RST}")
+    print(f"      别的盘去 OpenList 网页挂，令牌在这里取 {DIM}（打不开换 .cn）{RST}")
+    print(f"{CYAN}https://api.oplist.org/{RST}")
     tip("阿里贴令牌时：下拉框要和接口配对；只要刷新令牌；授权时去掉「备份盘」")
 
-    print(f"\n  {BOLD}▸ 常用命令{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 常用命令{RST}")
     print(f"      {GREEN}{BOLD}emby{RST}                甩出面板地址")
     print(f"      {GREEN}{BOLD}media-stack{RST}         全部地址 + 密码 + 容器状态")
     print(f"      {GREEN}{BOLD}media-stack 302{RST}     播一集看有没有 302，验证直链是否真生效")
@@ -12863,7 +12878,7 @@ def show_info():
     print(f"      {GREEN}{BOLD}media-stack logs{RST} <服务>   跟踪日志")
     print(f"      {GREEN}{BOLD}media-stack help{RST}    全部命令（流量账本、开播报告、补时长流水……）")
 
-    print(f"\n  {BOLD}▸ 路径{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 路径{RST}")
     print(f"      安装目录   {d}")
     print(f"      媒体目录   {data_root}")
     print(f"      strm 目录  {os.path.join(data_root, 'strm', STRM_SUBDIR)}"
@@ -12878,7 +12893,7 @@ def show_info():
     #     状态用会把陈年记录报成当前故障
     stores = _stores
     if stores:
-        print(f"\n  {BOLD}▸ 网盘挂载{RST}")
+        print(f"\n{YELLOW}{BOLD}▸ 网盘挂载{RST}")
         # 驱动名那一列按最长的那个留宽：AliyundriveOpen 15 个字，以前留 12 跟后面那列粘在一起
         _w = max(12, max(len(str(x[1] or "")) for x in stores) + 2)
         for mp, drv, status, root, mode in stores:
@@ -12891,7 +12906,7 @@ def show_info():
 
     # strm 数量是判断「Emby 里为什么是空的」最直接的指标，放在容器状态前面
     n = _n
-    print(f"\n  {BOLD}▸ 媒体库内容{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 媒体库内容{RST}")
     if n:
         print(f"      已生成 {GREEN}{BOLD}{n}{RST} 个 strm")
         print(f"      Emby 媒体库指向 {CYAN}{BOLD}{STRM_PATH}{RST}")
@@ -12903,14 +12918,14 @@ def show_info():
         tip("先在「3 挂载路径」里挂网盘，再点「4 生成媒体库」")
 
     if metatube_on(d):
-        print(f"\n  {BOLD}▸ MetaTube 番号刮削{RST}")
-        print(f"      服务端地址 {CYAN}{BOLD}http://metatube:{METATUBE_PORT}{RST}")
+        print(f"\n{YELLOW}{BOLD}▸ MetaTube 番号刮削{RST}")
+        print(f"{GREEN}{BOLD}http://metatube:{METATUBE_PORT}{RST}")
         tip("Emby → 插件 → MetaTube 填这个地址；只对番号（ABC-123）有效")
 
     # 容器只报「几个在跑」。以前这里直接贴 docker compose ps 的原始输出,在手机上
     # 每行都折成三四行,IMAGE/COMMAND/PORTS 糊成一片,而真正要看的只有"跑没跑"。
     # 详细状态在「5 链路体检」里。
-    print(f"\n  {BOLD}▸ 容器{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 容器{RST}")
     want = ["emby", "openlist", "autofilm", "mediawarp"]
     if os.path.isdir(os.path.join(d, "homepage")):
         want.append("homepage")
