@@ -4069,12 +4069,9 @@ def run(sb_names, xr_names):
     except OSError:
         out_file = None
 
-    print("\n" + "=" * 60)
-    print("分享链接（直接喂给 Mihomo-fx 的 LINKS 解析）")
-    print("=" * 60)
+    # 装完的屏和「2 查看链接」一个样：标题框 → 一条一行标题 + 链接顶格、条间空行 → 三大订阅高亮
+    ui_title("分享链接")
     print_node_links(all_links)
-    if out_file:
-        print(f"（已保存到 {out_file}）")
 
     # 生成三格式订阅（mihomo / sing-box / Shadowrocket），各自一条链接
     ok = False
@@ -4086,13 +4083,13 @@ def run(sb_names, xr_names):
         urls = sub_urls_text()
         if out_file:
             open(out_file, "a").write("\n# 订阅链接:\n" + urls + "\n")
-        print("\n" + "=" * 60)
-        print("一键订阅链接（按客户端选一条，含全部节点 + 分流规则）")
-        print("=" * 60)
+        ui_title("订阅链接（按客户端选一条）")
         print_sub_urls()
-        print("=" * 60)
-        proto = "HTTPS(真证书) + 随机 token" if _sub_https() else "明文 HTTP + 随机 token（无域名/自签，客户端拒绝自签 TLS）"
-        print(f"※ {proto}，请勿外传；改端口/关闭见 xy-sub.service（端口 {sub_port()}）")
+        ui_line()
+        # HTTPS 用真证书；无域名 / 自签时是明文 HTTP（客户端拒绝自签 TLS）。改端口 / 关闭见 xy-sub.service
+        ui_tip("订阅含随机 token，请勿外传" + ("" if _sub_https() else "（明文 HTTP）"))
+    if out_file:
+        print(f"  链接已存到 {out_file}")
 
     # 记住这次安装（节点不再随重装丢失：下次进安装默认「保持节点、只更新配置」）
     try:
@@ -9553,16 +9550,17 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     except OSError:
         pass
 
-    print("\n" + "=" * 60)
-    print(f"  已添加 {len(new_links)} 个节点（现有节点未做任何改动）")
-    if failed:
-        print(f"\033[1;31m  ⚠ {'、'.join(failed)} 那边失败了、已回滚，它下面选的协议一个没加。"
-              f"上面这些已经装好并写进订阅了，修好后再单独加那几个即可。\033[0m")
-    print("=" * 60)
+    # 和「2 查看链接」一个样：新节点一条一行、条间空行，三大订阅高亮
+    ui_title(f"已添加 {len(new_links)} 个节点（现有节点未改动）")
     print_node_links(new_links)
-    print("\n订阅地址没变，客户端重拉一次订阅即可看到新节点"
-          "（有聚合节点的话，先到主机点一次『更新配置』）：")
-    print_sub_urls()
+    if _sub_items():
+        ui_title("订阅链接（地址没变，客户端重拉即可）")
+        print_sub_urls()
+    ui_line()
+    if failed:
+        # 失败那边已回滚、它下面选的协议一个没加；上面的已装好并写进订阅，修好后单独加那几个
+        ui_warn(f"{'、'.join(failed)} 失败已回滚，那几个协议没加上")
+    ui_tip("有聚合节点的话，先到主机点一次「更新配置」")
 
 # ============================================================================ 删除协议
 # 删比加难：加只是往配置里塞一条，删要把【散落各处的副作用】一起收回来——
