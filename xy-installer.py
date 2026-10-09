@@ -2199,10 +2199,38 @@ def sub_url(ext):
     scheme = "https" if _sub_https() else "http"
     return f"{scheme}://{_host()}:{sub_port()}/{t}.{ext}"
 
-def sub_urls_text():
+SUB_TITLES = {"yaml": "mihomo / Clash", "json": "sing-box", "conf": "小火箭 Shadowrocket"}
+
+def _sub_items():
     ff = {"yaml": CFG_FILE, "json": SBOX_FILE, "conf": SR_FILE}; toks = load_tokens()
-    return "\n".join(f"  {SUB_EXTS[e]:<12} {sub_url(e)}"
-                     for e in ("yaml", "json", "conf") if os.path.exists(ff[e]) and toks.get(e))
+    return [(e, sub_url(e)) for e in ("yaml", "json", "conf") if os.path.exists(ff[e]) and toks.get(e)]
+
+def sub_urls_text():
+    """写进文件 / 日志用的纯文本：标题一行、链接一行、空一行。"""
+    return "\n\n".join(f"  {SUB_TITLES[e]}\n{u}" for e, u in _sub_items())
+
+def _hl(code, text):
+    """只在直接印到终端时上色；进文件 / 管道的照旧纯文本（不然复制出去带一串乱码）。"""
+    return f"\033[{code}m{text}\033[0m" if _sys.stdout.isatty() else text
+
+def print_sub_urls():
+    """屏上的三大订阅：客户端名黄色粗体一行，链接绿色单独一行（顶格，长按复制不带空格），每条之间空一行。
+       仓库主人：「下面的三大订阅也是的应该写得清晰明了而且用高亮，写成一坨别人怎么看得清」。"""
+    items = _sub_items()
+    for i, (e, u) in enumerate(items):
+        print(_hl("1;33", f"▸ {SUB_TITLES[e]}"))
+        print(_hl("1;32", u))
+        if i < len(items) - 1:
+            print()
+
+def print_node_links(links):
+    """屏上的分享链接：节点名青色粗体一行，链接单独一行（顶格、不上色，复制最干净），每条之间空一行。
+       仓库主人：「每个单条链接应该用什么隔开让别人好看一点或者每条单链接空一行也可以」。"""
+    for i, u in enumerate(links, 1):
+        print(_hl("1;36", f"[{i}] {_link_name(u) or '节点'}"))
+        print(u)
+        if i < len(links):
+            print()
 
 def links_url():
     """本机节点链接（.links）地址：粘到别的机器「聚合节点链接」里做多机汇总。"""
@@ -4012,9 +4040,9 @@ def run(sb_names, xr_names):
         out_file = None
 
     print("\n" + "=" * 60)
-    print("分享链接（直接喂给 Mihomo-fx 的 LINKS 解析）:")
+    print("分享链接（直接喂给 Mihomo-fx 的 LINKS 解析）")
     print("=" * 60)
-    print("\n".join(all_links))
+    print_node_links(all_links)
     if out_file:
         print(f"（已保存到 {out_file}）")
 
@@ -4029,9 +4057,9 @@ def run(sb_names, xr_names):
         if out_file:
             open(out_file, "a").write("\n# 订阅链接:\n" + urls + "\n")
         print("\n" + "=" * 60)
-        print("一键订阅链接（按你的客户端选对应一条，含全部节点+分流规则）:")
+        print("一键订阅链接（按客户端选一条，含全部节点 + 分流规则）")
         print("=" * 60)
-        print(urls)
+        print_sub_urls()
         print("=" * 60)
         proto = "HTTPS(真证书) + 随机 token" if _sub_https() else "明文 HTTP + 随机 token（无域名/自签，客户端拒绝自签 TLS）"
         print(f"※ {proto}，请勿外传；改端口/关闭见 xy-sub.service（端口 {sub_port()}）")
@@ -4107,12 +4135,12 @@ def show_links():
             print("（已把订阅托管服务同步到 " + ("HTTPS" if _sub_https() else "HTTP") + "，URL 不变）")
         except Exception as e:
             print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
-    print("\n" + "=" * 60 + "\n分享链接:\n" + "=" * 60)
+    print("\n" + "=" * 60 + "\n分享链接\n" + "=" * 60)
     # 和订阅里保持一致：同样补上「前缀·协议」的分隔点（只影响显示，NODE_FILE 不动）
-    print("\n".join(_link_rename(u, _sep_name(_link_name(u))) for u in links))
-    urls = sub_urls_text()
-    if urls:
-        print("=" * 60 + "\n订阅链接（按客户端选一条）:\n" + urls)
+    print_node_links([_link_rename(u, _sep_name(_link_name(u))) for u in links])
+    if _sub_items():
+        print("=" * 60 + "\n订阅链接（按客户端选一条）\n" + "=" * 60)
+        print_sub_urls()
     print("-" * 60)
     print("  1 更换节点名称前缀（只改显示名、不用重装，改完自动刷新三格式订阅）")
     if _ask("  选择(回车返回): ").strip() == "1":
@@ -7173,8 +7201,10 @@ def cdn_menu():
                       f"{'  量子加密' if n.get('enc') else ''}{'  优选→' + pf if pf else ''}")
             print("\n  ▼ 全部 CDN 备用节点链接（导入客户端用；平时留着不用即可）:")
             for i, n in enumerate(nodes, 1):
-                print(f"  {i}. [{n['proto']}/{n['core']}] {n['domain']}:{n['cf_port']}")
-                print(f"     {_cdn_link(n)}")
+                if i > 1:
+                    print()                     # 每条之间空一行，别糊成一坨
+                print(_hl("1;36", f"[{i}] {n['proto']}/{n['core']}  {n['domain']}:{n['cf_port']}"))
+                print(_cdn_link(n))
         elif c == "4":
             cdn_write_sub()
         elif c == "5":
@@ -9544,10 +9574,10 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
         print(f"\033[1;31m  ⚠ {'、'.join(failed)} 那边失败了、已回滚，它下面选的协议一个没加。"
               f"上面这些已经装好并写进订阅了，修好后再单独加那几个即可。\033[0m")
     print("=" * 60)
-    print("\n".join(new_links))
+    print_node_links(new_links)
     print("\n订阅地址没变，客户端重拉一次订阅即可看到新节点"
           "（有聚合节点的话，先到主机点一次『更新配置』）：")
-    print(sub_urls_text())
+    print_sub_urls()
 
 # ============================================================================ 删除协议
 # 删比加难：加只是往配置里塞一条，删要把【散落各处的副作用】一起收回来——
