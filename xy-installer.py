@@ -2213,6 +2213,36 @@ def _hl(code, text):
     """只在直接印到终端时上色；进文件 / 管道的照旧纯文本（不然复制出去带一串乱码）。"""
     return f"\033[{code}m{text}\033[0m" if _sys.stdout.isatty() else text
 
+# ── 屏上排版小工具（CLAUDE.md 第五节「排版要整齐干净」）────────────────────────
+# 菜单统一长这样：标题框 → 状态 / 链接区 → 分隔线 → 「  N. 名称　当前：值」一项一行 → 一行提示。
+# 编号自动染绿（见文件头 print）；颜色只在终端上（_hl）；要复制的链接顶格单独一行。
+def ui_title(text):
+    print("\n" + "=" * 60 + f"\n  {text}\n" + "=" * 60)
+
+def ui_line():
+    print("-" * 60)
+
+def ui_items(items):
+    """[(编号, 名称, 当前值或 None), …] → 每项一行「  N. 名称　当前：值」。"""
+    for num, name, cur in items:
+        print(f"  {num}. {name}" + (f"　当前：{cur}" if cur not in (None, "") else ""))
+
+def ui_tip(text):
+    print("  " + _hl("1;33", f"提示：{text}"))
+
+def ui_warn(text):
+    """会让东西没掉的操作：红色粗体单独一行说清后果（CLAUDE.md 第四节）。"""
+    print("  " + _hl("1;31", f"⚠ {text}"))
+
+def ui_kv(label, value):
+    """状态行：「  标签：值」，标签青色。"""
+    print(f"  {_hl('36', label + '：')}{value}")
+
+def ui_url(label, url, code="1;32"):
+    """一条要复制的链接：黄色标题一行 + 链接顶格单独一行（默认绿色）。"""
+    print(_hl("1;33", f"▸ {label}"))
+    print(_hl(code, url) if url else _hl("2", "（还没有）"))
+
 def print_sub_urls():
     """屏上的三大订阅：客户端名黄色粗体一行，链接绿色单独一行（顶格，长按复制不带空格），每条之间空一行。
        仓库主人：「下面的三大订阅也是的应该写得清晰明了而且用高亮，写成一坨别人怎么看得清」。"""
@@ -4135,15 +4165,16 @@ def show_links():
             print("（已把订阅托管服务同步到 " + ("HTTPS" if _sub_https() else "HTTP") + "，URL 不变）")
         except Exception as e:
             print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
-    print("\n" + "=" * 60 + "\n分享链接\n" + "=" * 60)
+    ui_title("分享链接")
     # 和订阅里保持一致：同样补上「前缀·协议」的分隔点（只影响显示，NODE_FILE 不动）
     print_node_links([_link_rename(u, _sep_name(_link_name(u))) for u in links])
     if _sub_items():
-        print("=" * 60 + "\n订阅链接（按客户端选一条）\n" + "=" * 60)
+        ui_title("订阅链接（按客户端选一条）")
         print_sub_urls()
-    print("-" * 60)
-    print("  1 更换节点名称前缀（只改显示名、不用重装，改完自动刷新三格式订阅）")
-    if _ask("  选择(回车返回): ").strip() == "1":
+    ui_line()
+    # 只改显示名、不用重装，改完自动刷新三格式订阅
+    ui_items([(1, "更换节点名称前缀", None), (0, "返回", None)])
+    if _ask("选择: ").strip() == "1":
         rename_prefix()
 
 def peers_menu():
@@ -4155,24 +4186,23 @@ def peers_menu():
         except Exception: pass
     while True:
         peers = load_peers()
-        print("\n" + "=" * 60)
-        print("  聚合节点链接（多机汇总）")
-        print("=" * 60)
-        lu = links_url()
-        print("  ▸ 本机 links 链接地址（要被别的主机聚合时，复制这条给它）:")
-        print("    " + (lu if lu else "（本机还没节点，先『1.安装』）"))
-        print("-" * 60)
-        if peers:
-            print("  已添加的成员链接（生成时不通的自动忽略）：")
-            for i, u in enumerate(peers, 1):
-                ok, why = peer_status(u)
-                print(f"    {i}. {u}   " +
-                      ("\033[1;32m✓\033[0m" if ok else f"\033[1;31m✗ {why}\033[0m"))
-        else:
-            print("  还没添加成员链接。到别的机器进本菜单，复制它顶部那条 links 链接，粘进来即可。")
-        print("-" * 60)
-        print("  1 添加链接    2 删除链接    3 刷新本机 links 链接（换 token）    0 返回")
-        print("  （加/删后回主菜单进配置菜单点『更新配置』重新汇总生成）")
+        ui_title("聚合节点链接（多机汇总）")
+        # 本机这条绿色、成员机那几条淡蓝 —— 仓库主人：「本机的链接应该做成绿色的，然后被添加的换成淡一点的其他的颜色」
+        ui_url("本机 links 链接（给别的主机聚合用）", links_url())
+        print()
+        print(_hl("1;33", f"▸ 已添加的成员链接（{len(peers)} 条，不通的生成时自动跳过）"))
+        for i, u in enumerate(peers, 1):
+            ok, why = peer_status(u)
+            if i > 1:
+                print()
+            print(_hl("1;36", f"[{i}] ") + (_hl("1;32", "✓ 连通") if ok else _hl("1;31", f"✗ {why}")))
+            print(_hl("94", u))
+        if not peers:
+            print(_hl("2", "（还没有：到别的机器进本菜单，复制它的本机 links 链接粘进来）"))
+        ui_line()
+        ui_items([(1, "添加链接", None), (2, "删除链接", None),
+                  (3, "刷新本机 links 链接（换 token）", None), (0, "返回", None)])
+        ui_tip("加 / 删后到配置菜单点「更新配置」重新汇总")
         c = _ask("选择: ").strip()
         if c == "3":
             if not links_url():
@@ -4289,8 +4319,9 @@ def _regen_config(ext, url, which):
 
 def update_one_config(ext):
     """更新单个格式的配置：可选作者模板 / 自定义模板；不动节点、不换 token。"""
-    print("\n  1 作者模板   2 自定义模板   0 返回")
-    c = _ask("  选择: ").strip()
+    print()
+    ui_items([(1, "作者模板", None), (2, "自定义模板", None), (0, "返回", None)])
+    c = _ask("选择: ").strip()
     if c == "1":
         _regen_config(ext, FMT[ext]["author"], "作者")
     elif c == "2":
@@ -4431,41 +4462,45 @@ def config_menu(ext):
         print(f"\n还没有 {meta['label']} 配置，请先『1.安装』。"); return
     while True:
         cust = load_custpl().get(ext)
-        print("\n" + "=" * 60 + f"\n{meta['label']} 配置\n" + "=" * 60)
         src = tpl_src_of(ext)
-        print(f"  配置文件: {meta['file']}")
-        print(f"  当前订阅: {sub_url(ext)}")
-        print(f"  自定义模板: {cust or '(未设置)'}")
-        print(f"  ▸ 当前生效: 【{'自定义模板' if src == 'custom' else '作者模板'}】"
-              f"  ← 多路复用/GitHub中转/自建DNS 重生成订阅时也用它")
-        print("-" * 60)
-        print("  1 修改配置（编辑器打开）")
-        print("  2 修改订阅（显示当前 / 换 token）")
-        print("  3 更新配置（作者模板 / 自定义模板）")
-        print("  4 自定义模板链接（添加 / 更换 / 删除）")
-        print(f"  5 自动更新　当前：{_cfg_auto_state(ext)}")
-        print("  0 返回")
+        ui_title(f"{meta['label']} 配置")
+        # 当前生效的模板，多路复用 / GitHub 中转 / 自建 DNS 重生成订阅时也用它
+        ui_kv("配置文件", meta["file"])
+        ui_kv("当前生效", _hl("1;32", "自定义模板" if src == "custom" else "作者模板"))
+        print()
+        ui_url("订阅链接", sub_url(ext))
+        print()
+        ui_url("自定义模板链接", cust, "94")
+        ui_line()
+        ui_items([(1, "修改配置（编辑器打开）", None),
+                  (2, "修改订阅（换 token）", None),
+                  (3, "更新配置（作者 / 自定义模板）", None),
+                  (4, "自定义模板链接（添加 / 更换 / 删除）", None),
+                  (5, "自动更新", _cfg_auto_state(ext)),
+                  (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             before = _file_sha(meta["file"])
             edit_file(meta["file"])
             if _file_sha(meta["file"]) != before and cfg_auto_on(ext):
                 _cfg_auto_mark_hand(ext)                # 手改了：自动更新先停，免得 03:20 覆盖
-                print("  \033[1;33m提示：手改过，自动更新已暂停（重新生成配置后自动恢复）\033[0m")
+                ui_tip("手改过，自动更新已暂停（重新生成配置后自动恢复）")
         elif c == "5":
             cfg_auto_menu(ext)
         elif c == "2":
-            print("  当前订阅:", sub_url(ext))
+            ui_tip("换 token 后旧订阅链接立即失效，客户端要重新导入")
             if _ask("  换新 token? [y/N]: ").lower() in ("y", "yes"):
-                rotate_token_ext(ext); print("  新订阅:", sub_url(ext))
+                rotate_token_ext(ext); print("  ✔ 已换")
+                ui_url("新订阅链接", sub_url(ext))
         elif c == "3":
             update_one_config(ext)
         elif c == "4":
             cur = load_custpl().get(ext)
             if cur:                                     # 已有链接：给 更换 / 删除 / 返回
-                print(f"\n  当前自定义模板链接：{cur}")
-                print("  1 更换   2 删除（改回作者模板）   0 返回")
-                s = _ask("  选择: ").strip()
+                print()
+                ui_url("当前自定义模板链接", cur, "94")
+                ui_items([(1, "更换", None), (2, "删除（改回作者模板）", None), (0, "返回", None)])
+                s = _ask("选择: ").strip()
                 if s == "2":
                     del_custpl(ext); set_tplsrc(ext, "author")   # 链接没了，当前选择同步切回作者
                     print("  ✓ 已删除自定义模板链接，之后一律用作者模板。")
@@ -4869,15 +4904,16 @@ def update_cores_auto(only=None):
     print(f"{time.strftime('%F %T')} {CORE_DONE_MARK}")      # 后台跑时用 python3 -u，逐行落盘不缓冲
 
 def update_cores():
-    print("\n当前版本:")
+    ui_title("更新核心")
     for name, binpath in (("sing-box", SB_BIN), ("xray", XRAY_BIN)):
         if os.path.exists(binpath):
             v = sh(f"{binpath} version", check=False)
-            print(f"  {name}: {v.splitlines()[0] if v else '版本读取失败'}")
+            ui_kv(name, v.splitlines()[0] if v else "版本读取失败")
         else:
-            print(f"  {name}: 未安装")
-    print("更新核心:  1. sing-box   2. xray   3. 两个   0. 返回")
-    print(f"  （每月自动更新已开启：{_core_update_schedule_str()}）")
+            ui_kv(name, _hl("2", "未安装"))
+    ui_kv("自动更新", _core_update_schedule_str())
+    ui_line()
+    ui_items([(1, "sing-box", None), (2, "xray", None), (3, "两个都更新", None), (0, "返回", None)])
     c = _ask("选择: ")
     if c == "0" or not c:
         return
@@ -5011,14 +5047,16 @@ def uninstall_all():
        AdGuard 自建DNS 本就随代理主体一起卸(它的 DoT 依赖 acme 证书，证书会被删)；
        唯一独立、需单独带上的是网络优化(BBR/QoS，写在 /etc/net-optimize)。"""
     nopt = os.path.exists(NETOPT_CONFIG)
-    print("\n" + "=" * 60 + "\n卸载\n" + "=" * 60)
-    print("  代理主体：sing-box/xray、订阅服务、证书、AdGuard自建DNS、CDN 节点、bgpeer 命令、定时任务")
-    print(f"  网络优化(BBR/QoS)：{'已启用（独立模块）' if nopt else '未启用'}")
-    print("-" * 60)
-    print("  1 卸载代理主体（网络优化保留）")
-    print("  2 全部卸载（代理主体 + 网络优化，一次清干净、恢复系统默认）")
-    print("  0 返回")
+    ui_title("卸载")
+    ui_kv("代理主体", "sing-box / xray、订阅服务、证书、AdGuard 自建 DNS、CDN 节点、bgpeer 命令、定时任务")
+    ui_kv("网络优化", "已启用（独立模块）" if nopt else _hl("2", "未启用"))
+    ui_line()
+    ui_items([(1, "卸载代理主体（网络优化保留）", None),
+              (2, "全部卸载（代理主体 + 网络优化，恢复系统默认）", None),
+              (0, "返回", None)])
     c = _ask("选择: ").strip()
+    if c in ("1", "2"):
+        ui_warn("卸载后节点、订阅、证书全部删除，客户端立即连不上，不可恢复")
     if c == "1":
         if _ask("\n  确认卸载代理主体（AdGuard 一并卸；网络优化保留）? [y/N]: ").lower() in ("y", "yes"):
             _uninstall_core()
@@ -5141,18 +5179,19 @@ def ghdl_relay_menu():
        GitHub，它也连不上，多绕一跳没有任何意义。所以这里填的必须是别的机器。"""
     while True:
         lst = own_relays()
-        print("\n" + "=" * 60 + "\n备用取件中转（自己人的，优先于公共反代）\n" + "=" * 60)
-        print("  用途：这台机器拉不到 GitHub（内核二进制 / 模板 / 版本号）时，")
-        print("        借你另一台能通的机器把东西转过来，不用把包交给第三方反代。")
-        print("  怎么拿：去那台能通 GitHub 的机器，菜单 14 顶上就印着它的中转地址前缀，整条复制过来。")
-        print("-" * 60)
-        if lst:
-            for i, u in enumerate(lst, 1):
-                print(f"  {i}) {u}")
-        else:
-            print("  （还没配。没配也不影响——直连不通时会退到公共反代，只是那是第三方。）")
-        print("-" * 60)
-        print("  1 添加一条    2 删除一条    3 逐条测试连通    0 返回")
+        # 用途：这台机器拉不到 GitHub（内核二进制 / 模板 / 版本号）时，借另一台能通的机器转过来，
+        # 不用把包交给第三方反代。地址去那台机器菜单 14 顶上整条复制。没配也不影响（退到公共反代）。
+        ui_title("备用取件中转（自己人的，优先于公共反代）")
+        print(_hl("1;33", f"▸ 已配置（{len(lst)} 条）"))
+        for i, u in enumerate(lst, 1):
+            if i > 1:
+                print()
+            print(_hl("1;36", f"[{i}]"))
+            print(_hl("94", u))
+        if not lst:
+            print(_hl("2", "（还没有：去能通 GitHub 的机器，菜单 14 顶上复制它的中转地址前缀）"))
+        ui_line()
+        ui_items([(1, "添加一条", None), (2, "删除一条", None), (3, "逐条测试连通", None), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c in ("0", ""):
             return
@@ -5195,9 +5234,9 @@ def ghdl_relay_menu():
         elif c == "3":
             if not lst:
                 print("  列表是空的。"); continue
-            for u in lst:
+            for i, u in enumerate(lst, 1):
                 ok, why = _relay_probe(u)
-                print(("  \033[1;32m✓ " if ok else "  \033[1;31m✗ ") + f"{u}  —— {why}" + "\033[0m")
+                print(_hl("1;36", f"[{i}] ") + (_hl("1;32", f"✓ {why}") if ok else _hl("1;31", f"✗ {why}")))
         else:
             print("  无效选择。")
 
@@ -5209,18 +5248,19 @@ def ghrelay_menu():
         print("\n  需要域名 + acme 真证书才能自建中转（走 HTTPS）；当前无域名/自签，只能用模板原链接（jsDelivr）。"); return
     while True:
         on = not os.path.exists(GHRELAY_OFF)
-        print("\n" + "=" * 60 + "\nGitHub 中转（规则/图标走本机·不依赖外部 CDN）\n" + "=" * 60)
-        print("  当前：" + ("\033[1;32m本机中转\033[0m" if on else "模板原链接（jsDelivr）"))
+        # 中转只转发 GitHub、与订阅同端口、带 token 防蹭。刷新 token：旧地址立即失效 + 刷新订阅，
+        # 订阅端口不变、客户端自动更新即可；「换端口」连订阅端口一起换随机（自动避开节点端口）。
+        ui_title("GitHub 中转（规则 / 图标走本机）")
+        ui_kv("当前", _hl("1;32", "本机中转") if on else "模板原链接（jsDelivr）")
         if on:
-            print(f"  中转地址前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
-            print("  （只转发 GitHub、与订阅同端口、带 token 防蹭）")
-        print("-" * 60)
-        print(f"  1 本机中转 写入配置（开/关）   [当前：{'开' if on else '关（用 jsDelivr）'}]")
-        print("  2 刷新中转 token（防别人蹭：旧地址立即失效 + 刷新订阅；订阅端口不变、客户端自动更新即可）")
-        print("  3 刷新 token + 换端口（更狠：连订阅端口一起换随机·自动避开节点端口）")
-        print(f"  4 备用取件中转（本机拉不到 GitHub 时，借别的机器转）  "
-              f"[已配 {len(own_relays())} 条]")
-        print("  0 返回")
+            print()
+            ui_url("中转地址前缀（给别的机器当备用取件中转）", f"https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
+        ui_line()
+        ui_items([(1, "本机中转写入配置", "开" if on else "关（用 jsDelivr）"),
+                  (2, "刷新中转 token（旧地址失效）", None),
+                  (3, "刷新 token + 换订阅端口", None),
+                  (4, "备用取件中转", f"{len(own_relays())} 条"),
+                  (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "4":
             ghdl_relay_menu(); continue
@@ -5303,11 +5343,12 @@ def selfdns_toggle():
         print("  还没有节点，先『1.安装』。"); return
     on = os.path.exists(SELFDNS_FLAG)
     if on:
-        print(f"\n  自建 DNS 已写入订阅。当前 ClientID: {selfdns_clientid()}")
-        print("  1 从订阅移除")
-        print("  2 更换 ClientID（泄露了就换——截图/贴日志很容易带出去）")
-        print("  0 返回")
-        c = _ask("  选择: ").strip()
+        print()
+        ui_kv("自建 DNS", _hl("1;32", "已写入订阅"))
+        ui_kv("ClientID", selfdns_clientid())
+        ui_line()
+        ui_items([(1, "从订阅移除", None), (2, "更换 ClientID（泄露了就换）", None), (0, "返回", None)])
+        c = _ask("选择: ").strip()
         if c == "2":
             rotate_selfdns_clientid(); return
         if c != "1":
@@ -5324,19 +5365,16 @@ def selfdns_toggle():
         act = "已写入"
     G["host"] = dom; ensure_deps()
     if build_subscription(read_saved_links()):               # 重新生成三格式并托管（不换 token）
-        print(f"\n  ✓ {act}自建 DNS，订阅已刷新（mihomo / sing-box / 小火箭 三个都写）。")
+        # mihomo / 小火箭：放列表最前当主用，没通自动回落原 DNS，只是慢一下。
+        # sing-box：换的是 dns.final，它【没有 DNS 回落】——这台 DNS 挂了默认解析就断（多机聚合尤其要注意）。
+        # ClientID 与 IP 无关，手机流量换网也不影响；填进「允许的客户端」就关掉了开放解析器。
+        print(f"\n  ✔ {act}自建 DNS，三个订阅已刷新，客户端重拉一次生效")
         if act == "已写入":
-            print(f"  写入的 DoH：{_selfdns_doh()}")
-            print("  ⚠ 确保 AdGuard 已开加密、防火墙放行 DoH 端口。")
-            print("    mihomo / 小火箭：放在列表最前当主用，没通会自动回落到原 DNS，只是慢一下。")
-            print("    sing-box：换的是 dns.final，且 sing-box【没有 DNS 回落机制】——"
-                  "这台 DNS 挂了\n              它的默认解析就断（多机聚合时尤其要注意："
-                  "别的节点还活着，解析却没了）。")
-            print(f"\n  ▸ 建议顺手关掉「开放解析器」：DoH 挂在公网上，不设白名单谁扫到都能用。")
-            print(f"    AdGuard 后台 → 设置 → DNS设置 → 访问设置 → 允许的客户端，填入这一行：")
-            print(f"        {selfdns_clientid()}")
-            print(f"    手机流量 IP 会变、没法按 IP 白名单，这个 ClientID 与 IP 无关，换网络也不影响。")
-        print("  客户端重新拉一次订阅即生效。")
+            print()
+            ui_url("写入的 DoH", _selfdns_doh())
+            print()
+            ui_url("AdGuard 后台 → DNS 设置 → 访问设置 → 允许的客户端，填这一行", selfdns_clientid())
+            ui_tip("sing-box 没有 DNS 回落：这台 AdGuard 挂了 sing-box 就解析不了")
     else:
         print("  刷新配置失败（没有可用节点？）。")
 
@@ -5459,14 +5497,11 @@ def _vpschk_last():
 def vps_check_menu():
     """VPS 线路检测：三网回程走哪条骨干 + IP 纯净度。脚本在本仓库 vps-check.py。
        纯 stdlib、无第三方依赖；traceroute 缺了它自己 apt/yum/apk 装。"""
-    print("\n" + "=" * 60)
-    print("  VPS 线路检测（三网回程 + IP 纯净度）")
-    print("=" * 60)
+    ui_title("VPS 线路检测（三网回程 + IP 纯净度）")
     _vpschk_last()
-    print("-" * 60)
-    print("  1 本机IP检测（约 2 分钟）")
-    print("  2 外部IP检测（输入任意 IP，查画像 + 本机到它的链路 + 黑名单）")
-    print("  0 返回")
+    ui_line()
+    # 外部 IP 检测：输入任意 IP，查画像 + 本机到它的链路 + 黑名单
+    ui_items([(1, "本机 IP 检测（约 2 分钟）", None), (2, "外部 IP 检测", None), (0, "返回", None)])
     c = _ask("选择: ").strip()
     if c not in ("1", "2"):
         return
@@ -5528,7 +5563,7 @@ def _netopt_version():
 
 def net_optimize_menu():
     """网络优化（本仓库 net-optimize.py：BBR/QoS/缓冲区等内核调优，依赖工具自动安装）。"""
-    G, N, MARK = "\033[1;32m", "\033[0m", "  \033[1;32m← 当前\033[0m"
+    MARK = "  " + _hl("1;32", "← 当前")
     while True:
         mode, mb = _netopt_state()
         is_10 = mode == "adaptive" and mb is not None and abs(mb - 10) < 0.05
@@ -5547,18 +5582,16 @@ def net_optimize_menu():
             or mode == "fixed_burst" else ""
         m3 = MARK if mode == "fixed_cake" else ""
         _v = _netopt_version()
-        print("\n" + "=" * 60)
-        print("  网络优化（BBR / QoS 内核调优，依赖工具自动安装）"
-              + (f"  {G}v{_v}{N}" if _v else "  （未安装）"))
-        print("=" * 60)
-        print(f"  当前档位: {G}{cur}{N}")
-        print("-" * 60)
-        print(f"  1 自适应智能算法+抢占带宽（流量 10MB/s 激活，适合内存 <1G 机器）{m1}")
-        print(f"  2 自适应智能算法+抢占带宽（默认 20MB/s 激活、阈值可调；输入 0=纯暴力发包无智能算法，适合内存 2G 左右机器）{m2}")
-        print(f"  3 固定 cake 纯智能算法（不切换，适合高性能机器）{m3}")
-        print("  4 网络优化状况（一键检测当前优化状态）")
-        print("  5 卸载网络优化（清除全部优化配置，恢复系统默认）")
-        print("  0 返回")
+        # 档位说明：1 适合内存 <1G；2 默认 20MB/s 激活、阈值可调，输入 0 = 纯暴力发包无智能算法，适合 2G 左右；
+        # 3 不切换，适合高性能机器。5 清除全部优化配置、恢复系统默认。
+        ui_title("网络优化（BBR / QoS 内核调优）")
+        ui_kv("版本", _hl("1;32", f"v{_v}") if _v else _hl("2", "未安装"))
+        ui_kv("当前档位", _hl("1;32", cur))
+        ui_line()
+        print(f"  1. 自适应 + 抢带宽（10MB/s 激活，内存 <1G）{m1}")
+        print(f"  2. 自适应 + 抢带宽（阈值可调，内存 2G 左右）{m2}")
+        print(f"  3. 固定 cake 纯智能算法（高性能机器）{m3}")
+        ui_items([(4, "网络优化状况", None), (5, "卸载网络优化（恢复系统默认）", None), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             _run_net_optimize()
@@ -5734,17 +5767,12 @@ def smux_apply(on):
 def smux_menu():
     while True:
         st = smux_current_state()
-        print("\n" + "=" * 60)
-        print("  多路复用开关 smux（只对 ws / httpupgrade 类协议有效）")
-        print("=" * 60)
+        ui_title("多路复用 smux（只对 ws / httpupgrade 类协议有效）")
         if st is None:
-            print("  本机没有 ws / httpupgrade 类 sing-box 节点，smux 不适用。")
+            print("  ⚠ 本机没有 ws / httpupgrade 类 sing-box 节点，smux 不适用")
             return
-        print(f"  当前状态: {'已开启 ✓' if st else '已关闭'}")
-        print("  提示: 开启后网页/小请求更顺，大文件下载/丢包线路可能变慢。")
-        print("-" * 60)
-        print(f"  1 smux 开关（循环检测，当前{'开' if st else '关'}，选此项切换）")
-        print("  0 返回")
+        ui_items([(1, "smux 开关", _hl("1;32", "开") if st else "关"), (0, "返回", None)])
+        ui_tip("开启后网页 / 小请求更顺，大文件下载 / 丢包线路可能变慢")
         c = _ask("选择: ").strip()
         if c == "1":
             ans = _ask(f"  确认{'关闭' if st else '开启'} smux? y 确认 / n 返回: ").strip().lower()
@@ -5892,8 +5920,8 @@ def change_sni_apply(new):
     return True
 
 def _choose_new_sni(cur):
-    print("  1 随机挑一个（内置大站池，自动避开当前）   2 手动输入   0 取消")
-    c = _ask("  选择: ").strip()
+    ui_items([(1, "随机挑一个（内置大站池，避开当前）", None), (2, "手动输入", None), (0, "取消", None)])
+    c = _ask("选择: ").strip()
     if c == "1":
         pool = [s for s in REALITY_SNI_POOL if s != cur]
         return secrets.choice(pool) if pool else None
@@ -5908,22 +5936,17 @@ def change_sni_menu():
     G_, Y_, R_, N_ = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
     while True:
         cur = _current_sni()
-        print("\n" + "=" * 60)
-        print("  更换伪装域名（reality 借用的 SNI 目标站）")
-        print("=" * 60)
+        ui_title("更换伪装域名（reality 借用的 SNI 目标站）")
         if not cur:
-            print("  本机没有 reality 类节点（reality-*），没有伪装域名可换。")
+            print("  ⚠ 本机没有 reality 类节点，没有伪装域名可换")
             return
-        print(f"  当前伪装域名: {G_}{cur}{N_}")
+        ui_kv("当前伪装域名", _hl("1;32", cur))
         ok, detail = _reality_sni_ok(cur)                 # 从本机实连一下：连通 + TLS1.3 + h2
-        if ok:
-            print(f"  连通性检测: {G_}通 · {detail}{N_}")
-        else:
-            print(f"  连通性检测: {R_}不通 · {detail}{N_}")
-            print(f"  {Y_}↑ 你 VPS 连不上/这个站不合格，reality 伪装会打折，建议更换。{N_}")
-        print("-" * 60)
-        print("  1 更换（随机挑 / 手动输入）")
-        print("  0 返回")
+        ui_kv("连通性检测", _hl("1;32", f"通 · {detail}") if ok else _hl("1;31", f"不通 · {detail}"))
+        ui_line()
+        ui_items([(1, "更换（随机挑 / 手动输入）", None), (0, "返回", None)])
+        if not ok:
+            ui_tip("这个站从本机连不上或不合格，reality 伪装会打折，建议更换")
         c = _ask("选择: ").strip()
         if c == "1":
             new = _choose_new_sni(cur)
@@ -6046,14 +6069,9 @@ def bt_menu():
         on = bt_enabled()
         if not (os.path.exists(f"{SB_DIR}/config.json") or os.path.exists(f"{XRAY_DIR}/config.json")):
             print("\n还没有节点，请先『1.安装』。"); return
-        print("\n" + "=" * 60)
-        print("  BT/PT 下载屏蔽（防 VPS 因 BT 流量被投诉封机）")
-        print("=" * 60)
-        print(f"  当前状态: {'已开启 ✓' if on else '已关闭'}")
-        print("  说明: 服务端识别到 BT/PT 流量即拒绝；best-effort，vision 流可能漏一小部分。")
-        print("-" * 60)
-        print(f"  1 BT/PT 屏蔽开关（循环检测，当前{'开' if on else '关'}，选此项切换）")
-        print("  0 返回")
+        # 服务端识别到 BT/PT 流量即拒绝；best-effort，vision 流可能漏一小部分。
+        ui_title("BT/PT 下载屏蔽（防 VPS 被投诉封机）")
+        ui_items([(1, "BT/PT 屏蔽开关", _hl("1;32", "开") if on else "关"), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             ans = _ask(f"  确认{'关闭' if on else '开启'} BT 屏蔽? y 确认 / n 返回: ").strip().lower()
@@ -6158,10 +6176,11 @@ def traffic_setup():
     except ValueError: quota = cfg.get("quota_gb")
     _MODES = {"1": "sum", "2": "max", "3": "out", "4": "in"}
     _cur = {v: k for k, v in _MODES.items()}.get(cfg.get("mode", "sum"), "1")
-    print("  计费方式：1 双向相加   2 单向取大   3 只计出站(上传)   4 只计入站(下载)")
-    print("            只按上传计费的机房选 3——那种机器上选 2 会取到下载那一边，")
-    print("            面板数字会比真实账单大很多倍。")
-    m = _ask(f"  选择 1-4（回车={_cur}）: ").strip()
+    print(_hl("1;33", "▸ 计费方式"))
+    ui_items([(1, "双向相加", None), (2, "单向取大", None),
+              (3, "只计出站（上传）", None), (4, "只计入站（下载）", None)])
+    ui_tip("只按上传计费的机房选 3（选 2 会取到下载那边，比账单大很多倍）")
+    m = _ask(f"选择（回车 = {_cur}）: ").strip()
     mode = _MODES.get(m or _cur, "sum")
     cfg.update({"reset_day": reset_day, "quota_gb": quota, "mode": mode})
 
@@ -6297,11 +6316,11 @@ def _cdn_link(st):
 
 def _cdn_intro():
     """进 CDN 菜单顶部的简短说明（原理 + 执行前三步）。"""
-    print("  防 IP 被墙：域名套 Cloudflare 中转，客户端连的是 CF 的 IP，本机真 IP 被墙也能用。")
-    print("  嫌慢就用【优选地址】（菜单 2）：换更快的 CF 边缘，或筛一批候选交给客户端自己选。")
-    print("  执行前：① 域名解析绑到本机 IP、开【橙色云】代理（必须橙云）；"
-          "② VPS 放行端口 2053/2083/2087/2096/8443（商用 VPS 一般全开放）；"
-          "③ CF 的 SSL/TLS 模式选【Full 完全】。")
+    # 原理：域名套 Cloudflare，客户端连 CF 的 IP，本机真 IP 被墙也能用；嫌慢用「2 优选地址」换更快的 CF 边缘。
+    print(_hl("1;33", "▸ 装之前在 Cloudflare 做好三件事"))
+    print("  ① 域名解析到本机 IP，开" + _hl("1;33", "橙色云"))
+    print("  ② VPS 放行 2053 / 2083 / 2087 / 2096 / 8443")
+    print("  ③ SSL/TLS 模式选 " + _hl("1;33", "Full（完全）"))
 
 def _state_prefix():
     """读安装时用的名称前缀（state.json），CDN 节点默认沿用它。"""
@@ -7061,39 +7080,29 @@ def cdn_pref_menu():
     while True:
         nodes = _cdn_load()
         cfg = _pref_load()
-        print("\n" + "=" * 60)
-        print("  优选地址（换客户端连的 CF 边缘，服务端一行都不用改）")
-        print("=" * 60)
-        print("  原理：分享链接里【地址位】换成更快的 CF 地址，【SNI/Host 仍是你的真域名】；")
-        print("        CF 靠 Host 头回源，所以换任意 CF 边缘都能连回同一台 VPS。")
+        # 原理：分享链接里【地址位】换成更快的 CF 地址，SNI / Host 仍是你的真域名；CF 靠 Host 回源，
+        # 换任意 CF 边缘都能连回同一台 VPS，服务端一行都不用改。候选节点交给客户端 URLTest 自己挑最快的。
+        ui_title("优选地址（换客户端连的 CF 边缘）")
         if not nodes:
-            print("-" * 60)
-            print("  还没配置 CDN 节点，先回上级菜单选 1 装一条。")
+            print("  ⚠ 还没配置 CDN 节点，先回上级菜单选 1 装一条")
             return
         cur = sorted({(n.get("pref") or "").strip() for n in nodes})
         cands = [c for c in (cfg.get("cands") or []) if c]
-        print("-" * 60)
-        if cur == [""]:
-            print("  基础节点：未优选（客户端直连域名解析到的 CF IP）")
-        else:
-            print("  基础节点优选地址：" + "、".join(c or "(未优选·用域名)" for c in cur))
-        if cands:
-            print(f"  候选节点：{len(cands)} 条 —— " + "、".join(cands))
-            print("            （客户端 URLTest 从这几条里自己挑最快的）")
-        else:
-            print("  候选节点：无")
+        ui_kv("基础节点", _hl("2", "未优选（用域名）") if cur == [""]
+              else _hl("1;32", "、".join(c or "(用域名)" for c in cur)))
+        ui_kv("候选节点", f"{len(cands)} 条：" + "、".join(cands) if cands else _hl("2", "无"))
         last = cfg.get("last") or {}
         if last.get("ok"):
-            print(f"  上次测速：{last.get('time','')}  选出 {last.get('n','?')} 个"
-                  f"，最快 {last.get('best','')} / {last.get('mbps','?')} Mbps")
+            ui_kv("上次测速", f"{last.get('time','')}  选出 {last.get('n','?')} 个，"
+                              f"最快 {last.get('best','')} / {last.get('mbps','?')} Mbps")
         elif last:
-            print(f"  上次测速：{last.get('time','')}  没选出可用地址（已保持原样）")
-        print("-" * 60)
-        print(f"  1 测速筛候选（写 {cfg.get('n_cand_out', 5)} 条进订阅，让客户端自己选最快的）")
-        print("  2 手动填优选域名/IP（直接留空回车=取消优选、回到用域名）")
-        print("  3 清空候选节点")
-        print("  4 测速参数")
-        print("  0 返回")
+            ui_kv("上次测速", f"{last.get('time','')}  没选出可用地址（已保持原样）")
+        ui_line()
+        ui_items([(1, f"测速筛候选（写 {cfg.get('n_cand_out', 5)} 条进订阅）", None),
+                  (2, "手动填优选域名 / IP（留空 = 取消优选）", None),
+                  (3, "清空候选节点", None),
+                  (4, "测速参数", None),
+                  (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             cdn_pref_scan()
@@ -7168,20 +7177,18 @@ def cdn_remove():
 def cdn_menu():
     while True:
         nodes = _cdn_load()
-        print("\n" + "=" * 60)
-        print("  CDN 套用（防 IP 被墙：靠 Cloudflare 中转续命）")
-        print("=" * 60)
+        ui_title("CDN 套用（IP 被墙时靠 Cloudflare 中转）")
         _cdn_intro()
-        print("-" * 60)
-        print(f"  1 CDN节点安装{('（已配置 %d 条）' % len(nodes)) if nodes else ''}")
+        ui_line()
         pcur = sorted({(n.get("pref") or "").strip() for n in nodes}) if nodes else [""]
-        print(f"  2 优选地址（手动填 / 测速筛候选给客户端选）"
-              f"{'  当前：' + '、'.join(c for c in pcur if c) if pcur != [''] else ''}")
-        print("  3 查看全部备用链接")
-        print("  4 全部节点写入/移出订阅（循环开关，执行后订阅自动刷新）")
-        print("  5 卸载 CDN 节点（可选某条 / 全部）")
-        print(f"  6 CDN量子加密  当前：{'开' if _cdn_qe_on() else '关'}")
-        print("  0 返回")
+        insub = any(n.get("in_sub") for n in nodes)
+        ui_items([(1, "CDN 节点安装", f"{len(nodes)} 条" if nodes else None),
+                  (2, "优选地址", "、".join(c for c in pcur if c) if pcur != [""] else None),
+                  (3, "查看全部备用链接", None),
+                  (4, "全部节点写入 / 移出订阅", ("已写入" if insub else "未写入") if nodes else None),
+                  (5, "卸载 CDN 节点（某条 / 全部）", None),
+                  (6, "CDN 量子加密", "开" if _cdn_qe_on() else "关"),
+                  (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             cdn_add()
@@ -7190,20 +7197,18 @@ def cdn_menu():
         elif c == "3":
             if not nodes:
                 print("  还没配置，先选 1 CDN节点安装。"); continue
-            # 上方：已配置节点列表；下方：全部备用链接
-            print("\n  已配置 %d 条：" % len(nodes))
+            # 每条：标题一行（协议 / 核心 / 地址 + 运行状态 + 是否进订阅），链接顶格一行，条间空一行
+            ui_title(f"CDN 备用节点链接（{len(nodes)} 条）")
             for i, n in enumerate(nodes, 1):
                 act = sh(f"systemctl is-active {n['svc']}", check=False) == "active"
-                insub = "已写入订阅" if n.get("in_sub") else "仅备用链接"
                 pf = (n.get("pref") or "").strip()
-                print(f"   {i}. {n['domain']}:{n['cf_port']}（{n.get('proto','vless-ws')}/"
-                      f"{n.get('core','sing-box')}） {'运行中 ✓' if act else '未运行 ✗'}  {insub}"
-                      f"{'  量子加密' if n.get('enc') else ''}{'  优选→' + pf if pf else ''}")
-            print("\n  ▼ 全部 CDN 备用节点链接（导入客户端用；平时留着不用即可）:")
-            for i, n in enumerate(nodes, 1):
                 if i > 1:
-                    print()                     # 每条之间空一行，别糊成一坨
-                print(_hl("1;36", f"[{i}] {n['proto']}/{n['core']}  {n['domain']}:{n['cf_port']}"))
+                    print()
+                print(_hl("1;36", f"[{i}] {n.get('proto', 'vless-ws')}/{n.get('core', 'sing-box')}  "
+                                  f"{n['domain']}:{n['cf_port']}")
+                      + "  " + (_hl("1;32", "运行中") if act else _hl("1;31", "未运行"))
+                      + "  " + ("已写入订阅" if n.get("in_sub") else _hl("2", "仅备用"))
+                      + ("  量子加密" if n.get("enc") else "") + (f"  优选→{pf}" if pf else ""))
                 print(_cdn_link(n))
         elif c == "4":
             cdn_write_sub()
@@ -7649,11 +7654,13 @@ def cert_install_flow(info):
     if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
         print("  域名格式不对，已取消。")
         return
-    print("\n  验证方式：")
-    print("   1 HTTP-01（默认）  用 80 端口验证，只签这一个域名，不用任何密钥")
-    print("   2 DNS-01 泛域名    用 Cloudflare API 验证，签 *." + dom + "，不占端口，")
-    print("                      Emby / 子域名都能共用同一张")
-    w = (_ask("  选择 [1/2]（回车=1）: ") or "1").strip()
+    # HTTP-01：用 80 端口验证，只签这一个域名，不用任何密钥。
+    # DNS-01：用 Cloudflare API 验证，签 *.域名，不占端口，Emby / 子域名都能共用同一张。
+    print()
+    print(_hl("1;33", "▸ 验证方式"))
+    ui_items([(1, "HTTP-01（默认，80 端口，只签这一个域名）", None),
+              (2, f"DNS-01 泛域名（Cloudflare API，签 *.{dom}）", None)])
+    w = (_ask("选择（回车 = 1）: ") or "1").strip()
     cf_token = ""
     wildcard = (w == "2")
     if wildcard:
@@ -7710,24 +7717,23 @@ def cert_upgrade_flow(i):
     emby = i["emby_domain"]
     want = cert_want_names(dom, True, emby)
     missing = [n for n in want if not _name_covers(i["names"], n)]
-    print(f"\n  已经装着 {dom} 的证书（{cert_issuer()}，{_cert_left_text(i['secs'])}）")
-    print(f"  覆盖：{', '.join(i['names']) or '(读不出)'}")
+    # 升级要用 DNS-01（Cloudflare API）——泛域名只能这么签，HTTP-01 签不出来。
+    # 升级后 Emby（emby 域的各个子域）就能跟节点共用这一张，两条续期链并成一条。
+    ui_title("证书：升级成泛域名")
+    ui_kv("当前证书", f"{dom}（{cert_issuer()}，{_cert_left_text(i['secs'])}）")
+    ui_kv("覆盖", ", ".join(i["names"]) or "(读不出)")
     if not missing:
-        print(f"\n  {GRN}已经是泛域名了，该盖的都盖住了。{N}")
-        print("  想重新签一张：选『3 强制重签』。")
-        if emby and not i["emby_shared"]:
-            print(f"  {C}想让 Emby 共用这一张：选『4 Emby 证书』。{N}")
+        print()
+        print("  ✔ " + _hl("1;32", "已经是泛域名了，该盖的都盖住了"))
+        ui_tip("想重新签：「3 强制重签」" + ("；想让 Emby 共用：「4 Emby 证书」"
+                                          if emby and not i["emby_shared"] else ""))
         _ask("  按回车返回...")
         return
-    print(f"\n  可以升级成泛域名，升完会覆盖：{', '.join(want)}")
-    print(f"  现在还缺：{Y}{', '.join(missing)}{N}")
-    if emby:
-        print(f"  升级后 Emby（{emby} 的各个子域）就能跟节点共用这一张，两条续期链并成一条。")
-    print("\n  升级要用 DNS-01（Cloudflare API）验证——泛域名只能这么签，HTTP-01 签不出来。")
-    print("-" * 60)
-    print("  1 升级成泛域名（DNS-01 · Cloudflare）")
-    print("  0 返回")
-    if (_ask("选择 [1/0]（回车=0 返回）: ") or "0").strip() != "1":
+    ui_kv("升级后覆盖", ", ".join(want))
+    ui_kv("现在还缺", _hl("1;33", ", ".join(missing)))
+    ui_line()
+    ui_items([(1, "升级成泛域名（DNS-01 · Cloudflare）", None), (0, "返回", None)])
+    if (_ask("选择: ") or "0").strip() != "1":
         return
     cf_token = ""
     if _acme_has_cf():
@@ -7927,52 +7933,35 @@ def emby_cert_menu(i):
             _ask("  按回车返回...")
             return
         shared = i.get("emby_shared")
-        print("\n" + "=" * 60)
-        print("  Emby 证书")
-        print("=" * 60)
+        # 共用：Emby 的证书路径是指向节点证书的软链，节点这张续期时本来就会 reload nginx，Emby 自动吃到新证书。
+        # 各用各的：两条续期链 = 把「证书过期全挂」的风险配了两份，Emby 那条断了平时没人发现。
+        # 合并不了：Emby 对外是 emby. / mw. 等好几个子域，要泛域名 *.域名 才盖得住。
+        ui_title("Emby 证书")
         if shared:
-            print(f"  当前:      {GRN}共用一张{N}"
-                  f"（Emby 的证书路径是指向节点证书的软链）")
-            print(f"  两边都用:  {ACME_CRT}   {_cert_left_text(i['secs'])}")
-            print(f"             覆盖 {', '.join(i['names']) or '(读不出)'}")
-            print(f"  {GRN}续期一条链{N}：节点这张续期时本来就会 reload nginx，"
-                  f"Emby 自动吃到新证书。")
+            ui_kv("当前", _hl("1;32", "共用一张") + "（一条续期链）")
+            ui_kv("证书", f"{ACME_CRT}  {_cert_left_text(i['secs'])}")
+            ui_kv("覆盖", ", ".join(i["names"]) or "(读不出)")
         else:
-            print(f"  当前:      {Y}各用各的{N}（两张证书、两条续期链）")
-            print(f"  节点这张:  {i['domain'] or '(读不出)'}   "
-                  f"{_cert_left_text(i['secs'])}")
-            print(f"             {ACME_CRT}")
-            print(f"  Emby 这张: *.{dom}   {_cert_left_text(i['emby_secs'])}")
-            print(f"             {_emby_crt(dom)}")
-            print(f"  {Y}⚠ 两条续期链 = 把「证书过期全挂」的风险配了两份，而且 Emby"
-                  f"那条断了不会有人发现{N}")
-            print(f"    （平时不看，真挂了才知道）。")
-        print("-" * 60)
-        # ① 共用
+            ui_kv("当前", _hl("1;33", "各用各的") + "（两张证书、两条续期链）")
+            ui_kv("节点这张", f"{i['domain'] or '(读不出)'}  {_cert_left_text(i['secs'])}")
+            ui_kv("Emby 这张", f"*.{dom}  {_cert_left_text(i['emby_secs'])}")
+        ui_line()
         if shared:
-            print(f"  1 共用节点这张证书    {GRN}当前就是{N}")
+            one = _hl("1;32", "当前就是")
         elif i.get("emby_covered"):
-            print(f"  1 共用节点这张证书    {C}可以合并{N}"
-                  f"（两张变一张，少一条会悄悄断掉的续期链）")
+            one = _hl("1;36", "可以合并（少一条会悄悄断的续期链）")
         else:
-            print(f"  1 共用节点这张证书    {R}✗ 不行{N}：节点这张盖不住 "
-                  f"<子域>.{dom}")
-            print(f"                        Emby 对外是 emby./mw. 等好几个子域，"
-                  f"要泛域名 *.{dom} 才顶得住；")
-            print(f"                        节点这张覆盖的是 "
-                  f"{', '.join(i['names']) or '(读不出)'}")
-            print(f"                        {Y}先去『1 安装证书』用 DNS-01 重签一张"
-                  f"泛域名的，再回来合并{N}")
-        # ② 各用各的
-        if shared:
-            print(f"  2 各用各的            Emby 用回它自己那张"
-                  f"（备份还在就放回去）")
-            print(f"                        {Y}⚠ 它在 acme.sh 的续期记录合并时已经撤了，"
-                  f"还原后要去『16 自建 Emby』重签{N}")
-        else:
-            print(f"  2 各用各的            {GRN}当前就是{N}")
-        print("  0 返回")
-        c = (_ask("选择（回车=0 返回）: ") or "0").strip()
+            one = _hl("1;31", f"不行：节点这张盖不住 <子域>.{dom}")
+        ui_items([(1, "共用节点这张证书", one),
+                  (2, "各用各的", "Emby 用回自己那张" if shared else _hl("1;32", "当前就是")),
+                  (0, "返回", None)])
+        if not shared and not i.get("emby_covered"):
+            ui_tip(f"先去「1 安装证书」用 DNS-01 重签泛域名 *.{dom}，再回来合并")
+        elif shared:
+            ui_tip("选 2 还原后要去「16 自建 Emby」重签它那张（合并时续期记录已撤）")
+        elif not shared:
+            ui_tip("各用各的：Emby 那条续期断了平时没人发现，能合并建议合并")
+        c = (_ask("选择: ") or "0").strip()
         if c in ("0", ""):
             return
         if c == "1":
@@ -8754,22 +8743,18 @@ def cert_menu():
     """菜单 15：证书管理。"""
     while True:
         i = cert_panel()
-        print(f"  1 安装证书      当前：{'已安装' if i['exists'] else '未安装'}")
         _nd = node_domain()
-        print("  2 更换域名      " +
-              (f"当前：{_nd}（连证书、节点链接、订阅一起换）" if _nd
-               else "本机没有域名（自签 + IP）"))
-        print("  3 强制重签      重新签一张并让所有服务重读（到期前后、或怀疑证书坏了时用）")
-        if i["emby_domain"]:
-            print("  4 Emby 证书        " +
-                  ("当前：共用一张" if i["emby_shared"] else
-                   "当前：各用各的（两张证书、两条续期链）")
-                  + "　进去可两边切换")
         _can = [r for r in acme_records() if r["removable"]]
-        print("  5 清理旧证书    " +
-              (f"\033[1;33m有 {len(_can)} 个没用/抢占的记录\033[0m" if _can else "都是有主的"))
-        print("  0 返回")
-        c = (_ask("选择（回车=0 返回）: ") or "0").strip()
+        # 2 更换域名：连证书、节点链接、订阅一起换；3 强制重签：到期前后、或怀疑证书坏了时用
+        items = [(1, "安装证书", _hl("1;32", "已安装") if i["exists"] else "未安装"),
+                 (2, "更换域名", _nd or _hl("2", "本机没有域名（自签 + IP）")),
+                 (3, "强制重签（所有服务重读）", None)]
+        if i["emby_domain"]:
+            items.append((4, "Emby 证书", "共用一张" if i["emby_shared"] else "各用各的"))
+        items += [(5, "清理旧证书", _hl("1;33", f"{len(_can)} 个没用 / 抢占的记录") if _can else "都是有主的"),
+                  (0, "返回", None)]
+        ui_items(items)
+        c = (_ask("选择: ") or "0").strip()
         if c == "0" or c == "":
             return
         if c == "1":
@@ -9643,24 +9628,19 @@ def del_protocols_flow(st, have_sb, have_xr):
         print("\n  还没装任何协议。")
         return
     _restore_state_to_G(st)
-    print("\n" + "=" * 60)
-    print("  删除协议")
-    print("=" * 60)
+    ui_title("删除协议")
     stale_sb, stale_xr = _stale_protos(have_sb, have_xr)
-    _mark = lambda lst, stale: ", ".join(n + ("（残留）" if n in stale else "") for n in lst)
+    _mark = lambda lst, stale: ", ".join(n + (_hl("1;33", "（残留）") if n in stale else "") for n in lst)
     if have_sb:
-        print("  已装 sing-box:", _mark(have_sb, stale_sb))
+        ui_kv("已装 sing-box", _mark(have_sb, stale_sb))
     if have_xr:
-        print("  已装 xray:    ", _mark(have_xr, stale_xr))
+        ui_kv("已装 xray", _mark(have_xr, stale_xr))
+    ui_line()
+    ui_items([(1, "选择删除", None), (2, "全部删除", None), (0, "返回", None)])
     if stale_sb or stale_xr:
-        print("  ⓘ 标『残留』的：安装记录里有，核心配置里却没有它的入站。\n"
-              "     删它会把订阅和记录里剩下的部分清掉；也可以直接从『1 只添加新协议』"
-              "把它装回来。")
-    print("-" * 60)
-    print("  1. 选择删除")
-    print("  2. 全部删除")
-    print("  0. 返回")
-    c = (_ask("选择 [1/2/0]（回车=0 返回）: ") or "0").strip()
+        # 残留：安装记录里有、核心配置里却没有它的入站。删它会把订阅和记录里剩下的部分清掉
+        ui_tip("「残留」= 记录里有、配置里没有；删掉会清干净，也可从「1 只添加新协议」装回来")
+    c = (_ask("选择: ") or "0").strip()
     if c == "0":
         return
     if c == "2":
@@ -9862,21 +9842,21 @@ def install_flow():
     st, have_sb, have_xr = _installed_state()
     if (have_sb or have_xr) and read_saved_links():
         n_sb, n_xr = len(SB) - len(have_sb), len(XRAY) - len(have_xr)
-        print("\n" + "=" * 60)
-        print("  检测到本机已安装 bgpeer 节点")
-        print("=" * 60)
+        # 1 只加新协议：老节点端口 / UUID / 密码 / 订阅地址全不变；2 全部重装：订阅地址也换，客户端要重新导入；
+        # 3 删除协议：只删选中的，其余不动（含清理 DNAT / nginx 反代）
+        ui_title("检测到本机已安装 bgpeer 节点")
         if have_sb:
-            print("  已装 sing-box:", ", ".join(have_sb))
+            ui_kv("已装 sing-box", ", ".join(have_sb))
         if have_xr:
-            print("  已装 xray:    ", ", ".join(have_xr))
-        print(f"  还没装的:      sing-box {n_sb} 个 / xray {n_xr} 个")
-        print("-" * 60)
-        print("  1. 只添加新协议   老节点的端口/UUID/密码/订阅地址全部不变，推荐")
-        print("  2. 全部重新安装   所有节点重新生成，订阅地址也会换，客户端要重新导入")
-        print("  3. 删除协议       只删选中的，其余节点不动（含清理 DNAT / nginx 反代）")
-        print("  0. 返回")
+            ui_kv("已装 xray", ", ".join(have_xr))
+        ui_kv("还没装的", f"sing-box {n_sb} 个 / xray {n_xr} 个")
+        ui_line()
+        ui_items([(1, "只添加新协议（老节点不动，推荐）", None),
+                  (2, "全部重新安装（订阅地址会换）", None),
+                  (3, "删除协议（只删选中的）", None),
+                  (0, "返回", None)])
         # 回车默认 0：这几条都会动正在跑的节点，不该靠误按回车触发
-        ans = (_ask("选择 [1/2/3/0] (回车=0 返回): ") or "0").strip()
+        ans = (_ask("选择: ") or "0").strip()
         if ans == "0":
             print("已取消，返回主菜单。"); return
         if ans == "3":
