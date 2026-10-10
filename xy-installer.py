@@ -2419,7 +2419,9 @@ def print_sub_urls():
        仓库主人：「下面的三大订阅也是的应该写得清晰明了而且用高亮，写成一坨别人怎么看得清」。"""
     items = _sub_items()
     for i, (e, u) in enumerate(items):
-        print(_hl("1;33", f"▸ {SUB_TITLES[e]}"))
+        # 标上这一格式当前用的模板（刷新、每天 03:20 自动更新都按它）；自定义的换个颜色，一眼看得出不是作者模板
+        cust = tpl_src_of(e) == "custom"
+        print(_hl("1;33", f"▸ {SUB_TITLES[e]}") + _hl("1;35" if cust else "36", "（自定义模板）" if cust else "（作者模板）"))
         print(_hl("1;32", u))
         if i < len(items) - 1:
             print()
@@ -4511,10 +4513,13 @@ def show_links():
         ui_title("订阅链接（按客户端选一条）")
         print_sub_urls()
     ui_line()
-    # 只改显示名、不用重装，改完自动刷新三格式订阅
-    ui_items([(1, "更换节点名称前缀", None), (0, "返回", None)])
-    if _ask("选择: ").strip() == "1":
+    # 1 只改显示名、不用重装，改完自动刷新三格式订阅；2 三格式各按上面标的模板重生成（见 cfg_refresh_all）
+    ui_items([(1, "更换节点名称前缀", None), (2, "刷新三大配置", None), (0, "返回", None)])
+    c = _ask("选择: ").strip()
+    if c == "1":
         rename_prefix()
+    elif c == "2":
+        cfg_refresh_all()
 
 def peers_menu():
     """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
@@ -4742,6 +4747,23 @@ def _cfg_auto_due(now=None):
     day = bj.strftime("%F")
     return None if _cfg_auto_load().get("last") == day else day
 
+def _regen_fmt(e, ylines, nodes):
+    """按该格式【当前选的模板】（作者 / 自定义，见 tpl_url_current）重生成一份；生成或校验失败回滚原文件。
+       不动节点、不换 token、不重启服务。返回 (状态, 模板名, 错误)：状态 = "updated" / "same" / "failed"。
+       每天 03:20 自动更新、「2 节点链接 / 订阅」里的刷新三大配置都走这里，两边结果一致。"""
+    target = FMT[e]["file"]
+    which = "自定义" if tpl_src_of(e) == "custom" else "作者"
+    old = open(target).read()
+    try:
+        FMT[e]["gen"](ylines, nodes, tpl_url_current(e))
+        ok, err = _validate_generated(e, target)
+    except Exception as ex:
+        ok, err = False, ex
+    if not ok:
+        open(target, "w").write(old)
+        return "failed", which, err
+    return ("same" if open(target).read() == old else "updated"), which, ""
+
 def cfg_auto_run():
     """cron 每天 03:20 调：开着自动更新的格式，按【当前选的模板】（作者 / 自定义）重生成一遍。
 
@@ -4771,21 +4793,41 @@ def cfg_auto_run():
     if not ylines:
         print(f"{ts} 没有可用节点，跳过"); return
     for e in todo:
-        meta, target = FMT[e], FMT[e]["file"]
-        which = "自定义" if tpl_src_of(e) == "custom" else "作者"
-        old = open(target).read()
-        try:
-            meta["gen"](ylines, nodes, tpl_url_current(e))
-            ok, err = _validate_generated(e, target)
-        except Exception as ex:
-            ok, err = False, ex
-        if not ok:
-            open(target, "w").write(old)
-            print(f"{ts} {meta['label']} 更新失败，已保留原配置（{which}模板）：{str(err).splitlines()[0] if str(err) else err}")
+        st, which, err = _regen_fmt(e, ylines, nodes)
+        if st == "failed":
+            print(f"{ts} {FMT[e]['label']} 更新失败，已保留原配置（{which}模板）：{str(err).splitlines()[0] if str(err) else err}")
             continue
-        print(f"{ts} {meta['label']} " + ("无变化" if open(target).read() == old else "已更新") + f"（{which}模板）")
+        print(f"{ts} {FMT[e]['label']} " + ("无变化" if st == "same" else "已更新") + f"（{which}模板）")
     d = _cfg_auto_load(); d["last"] = day; _cfg_auto_save(d)    # 跑完才记：中途被重启打断，开机会接着跑
     harden_perms()
+
+def cfg_refresh_all():
+    """「2 节点链接 / 订阅」→ 刷新三大配置：三个格式各按自己当前选的模板（作者 / 自定义）重生成一遍。
+       跟每天 03:20 同一套（_regen_fmt）：不动节点、不换 token、不重启服务，订阅地址不变，失败回滚原配置。
+       跟 03:20 不同的两处：自动更新关了的格式也刷（人点的就是要刷）；手改过的格式先红字说清会覆盖，默认不刷。"""
+    todo = [e for e in FMT if os.path.exists(FMT[e]["file"])]
+    if not todo or not read_saved_links():
+        print("  还没有配置可刷新，先『1.安装』。"); return
+    for e in [e for e in todo if cfg_auto_paused(e)]:
+        ui_warn(f"{FMT[e]['label']} 手改过，刷新会把手改的内容覆盖掉")
+        if _ask(f"  刷新 {FMT[e]['label']}? [y/N]: ").strip().lower() not in ("y", "yes"):
+            todo.remove(e)
+            print(f"  ⚠ {FMT[e]['label']} 没刷新（手改的那份留着）")
+    if not todo:
+        return
+    G["host"] = _host()
+    ylines, nodes = parse_nodes(aggregated_links())            # 本机 + 成员机节点（多机聚合），跟「更新配置」一样
+    if not ylines:
+        print("  ⚠ 没有可用节点，没刷新。"); return
+    for e in todo:
+        st, which, err = _regen_fmt(e, ylines, nodes)
+        if st == "failed":
+            print(f"  ⚠ {FMT[e]['label']} 刷新失败，已保留原配置（{which}模板）："
+                  f"{str(err).splitlines()[0] if str(err) else err}")
+        else:
+            print(f"  ✔ {FMT[e]['label']} " + ("已刷新" if st == "updated" else "无变化") + f"（{which}模板）")
+    harden_perms()
+    ui_tip("订阅地址没变，客户端刷新一次订阅就是新的")
 
 def cfg_auto_menu(ext):
     """菜单里的自动更新开关：开 ⇄ 关；手改暂停中的，问一句再恢复（恢复后 03:20 会覆盖手改）。"""
