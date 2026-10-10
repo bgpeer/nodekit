@@ -661,11 +661,26 @@ def nginx_reload():
 
 def write_nginx_acme_stub():
     """先放一个 80 server 块，供 acme webroot 验证用（此时还没证书，不写 443）。"""
-    conf = (f"server {{\n  listen 80;\n  listen [::]:80;\n  server_name {G['domain']};\n"
+    conf = (f"server {{\n  listen 80;\n{_V6_80()}  server_name {G['domain']};\n"
             f"  location /.well-known/acme-challenge/ {{ root {WEBROOT}; }}\n"
             f"  location / {{ return 404; }}\n}}\n")
     open(NGINX_CONF, "w").write(conf)
     nginx_reload()
+
+def _ipv6_ok():
+    """本机内核支不支持 IPv6 套接字。有的 VPS（部分 OpenVZ/LXC、开机参数 ipv6.disable=1）整个没有 IPv6，
+       nginx 写了 `listen [::]:80` 就 `Address family not supported`，nginx -t 不过、整个安装失败。"""
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.close(); return True
+    except OSError:
+        return False
+
+def _v6(line):
+    """nginx 的 IPv6 监听行：本机没有 IPv6 就不写。"""
+    return line if _ipv6_ok() else ""
+
+def _V6_80():
+    return _v6("  listen [::]:80;\n")       # 单独拎出来：f-string 里不能写反斜杠（老 Python）
 
 def _nginx_ws_locations():
     """ws 家族的 location 反代块（供 443 或本地 https server 复用）。"""
@@ -682,7 +697,7 @@ def _nginx_ws_locations():
 
 def _nginx_80_server():
     """:80——acme webroot 验证 + 跳转到 https。"""
-    return (f"server {{\n  listen 80;\n  listen [::]:80;\n  server_name {G['domain']};\n"
+    return (f"server {{\n  listen 80;\n{_V6_80()}  server_name {G['domain']};\n"
             f"  server_tokens off;\n"                 # 别报 nginx/1.24.0，只回 nginx
             f"  location /.well-known/acme-challenge/ {{ root {WEBROOT}; }}\n"
             f"  location / {{ return 301 https://$host$request_uri; }}\n}}\n")
@@ -729,7 +744,7 @@ def nginx_http2_on():
 def write_nginx_conf():
     """签好证书、收集完 ws 家族后，写完整 conf：80 跳转 + 443 伪装站 + ws 按 path 反代。"""
     listen = (nginx_http2_listen("443 ssl")
-              + nginx_http2_listen("[::]:443 ssl")
+              + _v6(nginx_http2_listen("[::]:443 ssl"))
               + nginx_http2_on())
     open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
     nginx_reload()
@@ -785,7 +800,7 @@ def _stream_conf_text():
         m += f"    {b['sni']}  127.0.0.1:{b['port']};\n"
     m += f"    {G['domain']}  127.0.0.1:{SNI_HTTPS_PORT};\n"
     m += f"    default  127.0.0.1:{SNI_HTTPS_PORT};\n}}\n"
-    srv = ("server {\n  listen 443 reuseport;\n  listen [::]:443 reuseport;\n"
+    srv = ("server {\n  listen 443 reuseport;\n" + _v6("  listen [::]:443 reuseport;\n") +
            "  ssl_preread on;\n  proxy_pass $bgpeer_upstream;\n}\n")
     return m + srv
 
@@ -2578,6 +2593,15 @@ PROTO_TO_SBTAG = {
     "tuic": "🇺🇲 singbox_tuic", "anytls": "🇺🇲 AnyTLS", "vmess-httpupgrade": "🇺🇲 VMess_HTTPUpgrade_TLS",
 }
 
+def _sb_vmess_security(d):
+    """sing-box 出站的 vmess 加密：写具体算法，别写 auto / none / zero。
+       xray 的 vmess 服务端只认具体算法——sing-box 把 auto、zero、none 原样报上去，xray 直接拒
+       （unknown security type），sing-box 客户端连 xray 内核的 vmess 全挂（新装模拟逐个组合实测：
+       aes-128-gcm / chacha20-poly1305 通，auto / zero / none 不通）。sing-box 内核的 vmess 哪种都收。
+       链接里写明了具体算法就照用，否则 aes-128-gcm（手机基本都有 AES 硬件加速）。"""
+    c = str(d.get("cipher") or "").lower()
+    return c if c in ("aes-128-gcm", "chacha20-poly1305", "aes-128-cfb") else "aes-128-gcm"
+
 def mihomo_to_sb_outbound(key, d):
     """mihomo 节点 dict → 完整的 sing-box 出站对象（服务器端现生成，不依赖模板里的固定参数）。
        不支持的类型(如 xhttp)返回 None，由调用方跳过。"""
@@ -2609,7 +2633,7 @@ def mihomo_to_sb_outbound(key, d):
     if t == "vmess":
         net = "httpupgrade" if key == "vmess-httpupgrade" else "ws"
         ob = {"tag": tag, "type": "vmess", "server": srv, "server_port": int(d["port"]),
-              "uuid": d["uuid"], "security": "none", "alter_id": 0,
+              "uuid": d["uuid"], "security": _sb_vmess_security(d), "alter_id": 0,
               "tls": {"enabled": True, "server_name": sni, "insecure": insec, "utls": utls},
               "transport": {"type": net, "path": d["ws-opts"].get("path", "/"),
                             "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}}
@@ -2820,17 +2844,55 @@ def _cn_into_direct(members, cn):
         out.insert(i, CN_GROUP)
     return out + [n for n in cn if n not in out]
 
+def _local_xray_reality():
+    """本机 xray 内核开的 reality 入站 → {(对外地址, 端口)}。
+
+       sing-box 订阅要跳过它们：xray 新版的 REALITY 只收 ClientHello 里带 X25519MLKEM768 的客户端
+       （XTLS/REALITY tls.go：reject outdated/strange Client Hello that doesn't have X25519MLKEM768），
+       服务端没有开关能放宽；sing-box 的 reality 客户端不带这一项（新装模拟用 sing-box 1.12 / 1.14 对
+       xray 26.9 实测，换哪种 utls 指纹都一样被拒；Hiddify / NekoBox 用的也是 sing-box 内核），
+       握手直接被当成探测转去借用站，表现就是证书错 / 超时。
+       mihomo 带了，所以 mihomo / 小火箭订阅照常保留这些节点。sing-box 内核开的 reality 不受影响。
+       只认本机（地址 = 本机域名 / IP）：多机聚合进来的别人节点看不到人家的内核，不动。"""
+    try:
+        cfg = json.load(open(f"{XRAY_DIR}/config.json"))
+    except Exception:
+        return set()
+    ports = set()
+    for ib in cfg.get("inbounds", []):
+        st = ib.get("streamSettings") or {}
+        if st.get("security") == "reality" and ib.get("port"):
+            try:
+                ports.add(int(ib["port"]))
+            except (TypeError, ValueError):
+                pass
+    if not ports:
+        return set()
+    hosts = {h for h in (G.get("host"), G.get("domain"), _host()) if h}
+    try:
+        st = json.load(open(STATE_FILE))
+        hosts |= {h for h in (st.get("host"), st.get("domain")) if h}
+    except Exception:
+        pass
+    return {(h, p) for h in hosts for p in ports}
+
 def build_singbox_sub(nodes, tpl_url):
     """对象级替换锚点：_NOD_ 换节点对象、_GRP_ 换国家组、
        _NAM_ / <正则> / _NAM_:<正则> 展开策略组成员，再按手写风格序列化。"""
     cfg = json.loads(fetch_tpl(tpl_url))                      # 中转改写 + 老锚点名归一
-    objs = []
+    objs, xr_skip = [], 0
+    xr_reality = _local_xray_reality()
     for key, d in nodes:
+        if d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0)) in xr_reality:
+            xr_skip += 1                                     # 见 _local_xray_reality：sing-box 客户端连不上
+            continue
         try:
             ob = mihomo_to_sb_outbound(key, d)
             if ob: objs.append(ob)
         except Exception:
             pass
+    if xr_skip:
+        print(f"  sing-box 订阅跳过 {xr_skip} 条 xray 内核的 reality（sing-box 系客户端连不上，mihomo / 小火箭照常有）")
     if not objs:
         return
     # 国家检测/成员池 = 注入的订阅节点 + 用户手写进模板的静态节点（同为出站节点，按类型识别）
@@ -4031,6 +4093,11 @@ def build_subscription(all_links, new_token=False):
     if not ylines:
         return False
     os.makedirs(BGP_DIR, exist_ok=True)
+    # host 也得在【生成配置之前】记下：中转前缀 / 订阅走不走 https / 本机直连规则，生成器都按 sub.host 判断。
+    # 以前是生成完才写——重装时换了域名（或 IP ↔ 域名），配置是照着【上一次】的 host 生成的：
+    # 中转一条没有、直连规则还是旧地址（重装模拟实测）。
+    if G.get("host"):
+        open(HOST_FILE, "w").write(G["host"])
     # 重装换端口必须在【生成配置之前】：配置里规则集 / 图标走本机中转的地址带着订阅端口
     # （_ghrelay_prefix 用 sub_port()）。以前是先按旧端口生成、serve_sub 里才换新端口——
     # 订阅地址是新端口，里面的中转地址全是旧端口，规则集一个都拉不下来（仓库主人实测撞上）。
@@ -4041,7 +4108,6 @@ def build_subscription(all_links, new_token=False):
             meta["gen"](ylines, nodes, tpl_url_current(ext))   # 跟随该格式当前选的模板
         except Exception as e:
             print(f"{meta['label']} 配置生成跳过:", e)
-    open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先）
     serve_sub(reset=new_token, renew_port=False)          # 端口上面已经换过
     return True
 
@@ -4212,7 +4278,7 @@ def run(sb_names, xr_names):
         print("BT 屏蔽重注入跳过（不影响节点）:", e)
 
     # 落盘保存，避免终端刷屏后找不到；同时打印到屏幕
-    out_file = "/root/xy-nodes.txt"
+    out_file = NODE_FILE
     try:
         with open(out_file, "w") as f:
             f.write("\n".join(all_links) + "\n")
@@ -10050,8 +10116,8 @@ def install_flow():
     print("=" * 60)
     print("  sing-box + xray 交互安装")
     print("=" * 60)
-    print("选择核心:  1. sing-box   2. xray   3. 两个都装")
-    core = _ask("输入 [1/2/3] (回车=1): ") or "1"
+    ui_items([(1, "sing-box（默认）", None), (2, "xray", None), (3, "两个都装", None)])
+    core = _ask("选择核心（回车 = 1）: ") or "1"
 
     sb_names, xr_names = [], []
     if core in ("1", "3"):
@@ -10063,6 +10129,10 @@ def install_flow():
         xr_names = _pick("【xray 协议】", list(XRAY), default=xr_default)
     if not sb_names and not xr_names:
         print("没选任何协议，退出。"); return
+    if {"reality-vision", "reality-grpc"} & set(xr_names):
+        # xray 新版 reality 只收带 X25519MLKEM768 的客户端，sing-box 系客户端握手被拒（见 _local_xray_reality），
+        # sing-box 订阅会自动跳过这几条；sing-box 内核开的 reality 所有客户端都能连
+        ui_tip("xray 的 reality-vision / grpc：sing-box App / Hiddify / NekoBox 连不上，给它们用请装在 sing-box 内核")
 
     # 证书可能是先在『15 证书管理』里装好的（那边不需要先有节点）。这里认出来，
     # 把域名直接摆上、回车即用，免得手打错一个字符就变成重新申请一张。
