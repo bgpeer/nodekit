@@ -25,7 +25,7 @@
     "timeout": "10s"
   },
   "experimental": {
-    "cache_file": {"enabled": true, "path": "cache.db", "store_fakeip": true, "store_dns": true, "buffer_size": "1mb", "flush_interval": "30s"},
+    "cache_file": {"enabled": true, "path": "cache.db", "store_fakeip": true, "store_dns": true},
     "clash_api": {"external_controller": "127.0.0.1:9091", "secret": "88888888", "default_mode": "规则", "access_control_allow_origin": ["*"], "access_control_allow_private_network": true}
   },
   "inbounds": [
