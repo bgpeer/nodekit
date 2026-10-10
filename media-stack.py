@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.371"
+SCRIPT_VERSION = "1.5.372"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -19491,6 +19491,12 @@ def do_strm(only=None):
             f"{read_yaml_scalar(cfg_path, 'source_dir', '/')} 在 OpenList 里点得开吗")
         return
 
+    strm_finish(d, only, snap0)
+
+
+def strm_finish(d, only, snap0):
+    """生成之后的收尾：按规则清、压原盘、清失效、挪布局、让 Emby 跟上、建库、后台补时长 / 截封面、报这一轮的净变化。
+    snap0 = 开工前的 strm 清单（容器内路径）。「4 生成媒体库」和小雅的「快速生成」共用这一段。"""
     # 【排除放在压原盘之前】不然会先花一堆列目录的时间去压那些马上就要清掉的原盘。
     apply_skip_dirs(d, only=only)
 
@@ -24051,6 +24057,140 @@ def xiaoya_paths(d):
     return True
 
 
+# ---- 快速生成：读小雅自带的清单，不爬网盘 -----------------------------------------------------
+# 仓库主人：「小雅的盘那么大就没有其他的办法快速把文件全部扫过来做出 strm 吗」「把快速生成 strm 也做了吧」。
+# 小雅的 /data/strm.txt（即 /etc/xiaoya/strm.txt）是它自己的全量清单，七十多万行，每行「整理过的名字#地址」：
+#   115/IMAX/信条 - IMAX (2020)/{tmdb-577922}/信条.2020.strm#http://xiaoya.host:5678/d/<小雅里的真实路径>?sign=SIGN_STR
+# 【只用 # 后面那半】/d/ 后面就是小雅里的真实路径 = OpenList 里 /xiaoya 下的路径。按它在 strm 树里落点、内容写
+# 路径形式（/xiaoya/…），跟 AutoFilm 扫出来的【一模一样】—— 前半那套整理过的名字不用：落点要跟网盘树一一对应
+# （见 strm_subpath），不然清失效、挪布局、补时长全都对不上；片名刮削本来就交给 Emby。
+# 【只加不删、已有的不动】跟 AutoFilm 的 overwrite: false 一样；清失效照旧交给收尾（strm_finish）。
+# 【只生成「修改路径」里选的、跳过「不扫的目录」】跟 AutoFilm 扫的范围一样，选几类就只出几类。
+XIAOYA_STRM_LIST = "strm.txt"
+XIAOYA_FAST_BIG = 50000          # 一次要生成这么多以上，先提醒 Emby 入库会很久
+
+
+def xiaoya_strm_lines():
+    """一行一行吐小雅的清单。宿主机上有（/etc/xiaoya/strm.txt）就直接读，没有就进容器读。读不到 → None。"""
+    p = os.path.join(XIAOYA_DIR, XIAOYA_STRM_LIST)
+    if os.path.exists(p):
+        return open(p, encoding="utf-8", errors="replace")
+    try:
+        pr = subprocess.Popen(["docker", "exec", XIAOYA_NAME, "cat", "/data/" + XIAOYA_STRM_LIST],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return pr.stdout
+
+
+def xiaoya_list_path(line):
+    """清单里的一行 → 它在 OpenList 里的路径（/xiaoya/…）；不像样的行 → ""。"""
+    i = line.rfind("#http")
+    if i < 0:
+        return ""
+    try:
+        p = urllib.parse.unquote(urllib.parse.urlsplit(line[i + 1:].strip()).path)
+    except Exception:
+        return ""
+    if not p.startswith("/d/"):
+        return ""
+    segs = [x for x in p[3:].split("/") if x]
+    # 【挡掉 . / ..】下游要按这几段拼本地路径写文件
+    if not segs or any(x in (".", "..") for x in segs) or not os.path.splitext(segs[-1])[1]:
+        return ""
+    return XIAOYA_MOUNT + "/" + "/".join(segs)
+
+
+def xiaoya_fast_plan(d, lines, scope, pats):
+    """→ (要写的 [(本地 strm, 内容)], 已有几个, 范围外几个)。scope = 「修改路径」里小雅那几条。"""
+    base = os.path.join(strm_root(d), STRM_SUBDIR)
+    roots = [x.rstrip("/") for x in scope]
+    todo, have, out, seen = [], 0, 0, set()
+    for ln in lines:
+        op = xiaoya_list_path(ln)
+        if not op:
+            continue
+        if not any(op == r or op.startswith(r + "/") for r in roots):
+            out += 1
+            continue
+        parts = op.strip("/").split("/")
+        if pats and _skip_hit(parts[1:-1], pats):
+            out += 1
+            continue
+        sp = os.path.splitext(os.path.join(base, *parts))[0] + ".strm"
+        if sp in seen:
+            continue                  # 同名不同后缀（x.mkv / x.mp4）：跟 AutoFilm 一样留第一个
+        seen.add(sp)
+        if os.path.exists(sp):
+            have += 1
+            continue
+        todo.append((sp, op))
+    return todo, have, out
+
+
+def xiaoya_fast_write(todo):
+    """写 strm。→ (写了几个, 失败几个)。每两万个报一次进度。"""
+    n = bad = 0
+    for i, (sp, op) in enumerate(todo, 1):
+        try:
+            os.makedirs(os.path.dirname(sp), exist_ok=True)
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write(op)
+            n += 1
+        except OSError:
+            bad += 1                  # 文件名太长之类：跳过这一个，不拖垮整轮
+        if i % 20000 == 0:
+            print(f"  {DIM}...已写 {i}/{len(todo)}{RST}")
+    return n, bad
+
+
+def xiaoya_fast_strm(d):
+    """「生成媒体库 → 3 快速生成」：读小雅清单直接写 strm，几分钟出几十万个，不爬网盘。返回做没做。"""
+    scope = xiaoya_scan_paths()
+    if not scope:
+        warn("小雅还没加路径，先「2 修改路径」选全盘或几类")
+        return False
+    lines = xiaoya_strm_lines()
+    if lines is None:
+        warn("读不到小雅的清单（小雅在跑吗？）")
+        return False
+    info("正在读小雅的清单...")
+    try:
+        todo, have, _out = xiaoya_fast_plan(d, lines, scope, skip_dirs_of(XIAOYA_MOUNT))
+    finally:
+        try:
+            lines.close()
+        except Exception:
+            pass
+    if not todo and not have:
+        warn("清单里一条都没对上（小雅刚装的话还在下数据，过几分钟再试）")
+        return False
+    print(f"  要生成 {BOLD}{len(todo)}{RST} 个　已有 {have} 个跳过")
+    if not todo:
+        ok("都已经生成过了")
+        return False
+    if len(todo) >= XIAOYA_FAST_BIG:
+        tip(f"一次 {len(todo) // 10000} 万多个，Emby 入库要很久、很吃机器；嫌多就先「2 修改路径」只挑几类")
+    if not ask_yn("生成？", True):
+        print("没有生成。")
+        return False
+    snap0 = {_strm_container_path(d, hp) for hp, _t in strm_inventory(d, XIAOYA_MOUNT)}
+    t0 = time.monotonic()
+    n, bad = xiaoya_fast_write(todo)
+    ok(f"已生成 {n} 个 strm（{_mmss(int(time.monotonic() - t0))}）" + (f"，{bad} 个写不进去跳过" if bad else ""))
+    # 【AutoFilm 再去爬一遍就白快了】七十万个文件一层层列目录，凌晨那轮能跑一整天。问一句关掉小雅的定时扫描，
+    # 以后新片再点一次快速生成（小雅每天自己更新清单）；想要回来在「2 定时扫描」里改
+    if (ms_state().get("strm_cron_by_mount") or {}).get(XIAOYA_MOUNT) != NEVER_CRON:
+        if ask_yn("小雅的定时扫描改成关？（以后新片再点快速生成）", True):
+            cur = dict(ms_state().get("strm_cron_by_mount") or {})
+            cur[XIAOYA_MOUNT] = NEVER_CRON
+            save_ms_state(strm_cron_by_mount=cur)
+            _apply_autofilm_cron(d)
+    strm_finish(d, XIAOYA_MOUNT, snap0)
+    return True
+
+
 def xiaoya_remove(d):
     """一次撤干净：扫描路径 → OpenList 存储 → 容器 → 令牌目录 → 镜像。返回做没做。"""
     print(f"  {RED}{BOLD}会删掉：小雅的扫描路径、OpenList 里的 {XIAOYA_MOUNT}、小雅容器、{XIAOYA_DIR} 里的令牌{RST}")
@@ -26078,6 +26218,8 @@ def _scan_menu(d, mount=None, label=""):
         print("-" * 60)
         print("  1. 立即扫描")
         print(f"  2. 定时扫描          当前：{CYAN}{cur}{RST}")
+        if mount == XIAOYA_MOUNT:
+            print(f"  3. 快速生成          {DIM}读小雅清单，不爬网盘{RST}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -26085,6 +26227,9 @@ def _scan_menu(d, mount=None, label=""):
             return
         if c == "1":
             do_strm(only=mount)
+            ask("\n按回车返回...")
+        elif c == "3" and mount == XIAOYA_MOUNT:
+            xiaoya_fast_strm(d)
             ask("\n按回车返回...")
         elif c == "2" and not mount:
             _global_cron_menu(d)
