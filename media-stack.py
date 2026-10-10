@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.369"
+SCRIPT_VERSION = "1.5.370"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23559,7 +23559,7 @@ def _xiaoya_scan():
             got["temp_transfer_folder_id.txt"] = fid
             ok(f"转存文件夹已建好：{XIAOYA_TEMP_NAME}")
         else:
-            warn("转存文件夹没建成，回这一屏选「手动粘贴」补上")
+            warn("转存文件夹没建成，回这一屏选「3 手动填令牌」补上")
     print()
     info("第 2 次扫码：开放平台授权（小雅播放用）")
     ot = alitv_scan_login()
@@ -23569,15 +23569,24 @@ def _xiaoya_scan():
 
 
 def xiaoya_set_tokens(d=None):
-    """小雅要的三样：扫码拿（推荐）或者手动粘贴（不回显、不进日志），写进 /etc/xiaoya，root-only。返回改没改。"""
-    print(f"  1. 扫码（推荐）")
-    print(f"  2. 手动粘贴")
+    """「1 扫码登录」：1 扫码登录 / 2 退出登录 / 3 手动填令牌。三样写进 /etc/xiaoya（root-only，不回显、不进日志）。
+    返回改没改。
+
+    仓库主人：「这两个（安装 / 启动、阿里令牌）我觉得可以设计在一起……扫完码可以直接带着安装了，退出登录
+    也不用卸载安装，但是在外面删除小雅可以删除全部安装」。所以扫完：没装就接着装、停着就起、在跑就换新令牌重启。
+    【手动填令牌留着】扫码拿不全（转存文件夹没建成）时靠它补，第四节：入口不许悄悄没了。"""
+    print(f"  1. 扫码登录")
+    print(f"  2. 退出登录")
+    print(f"  3. 手动填令牌")
     print("  0. 返回")
-    c = ask("请选择").strip()
+    tip("请用阿里网盘扫码登录，换号直接扫另一个号")
+    c = ask("请选择（回车 = 返回）").strip()
     got = {}
     if c == "1":
         got = _xiaoya_scan()
     elif c == "2":
+        return xiaoya_logout()
+    elif c == "3":
         tip("阿里令牌要另取一份，跟 OpenList 的 /aliyun 共用会互相踢下线")
         for f, name in XIAOYA_FILES:
             v = _ask_secret(f"{name}（回车跳过、不改）").strip()
@@ -23596,10 +23605,33 @@ def xiaoya_set_tokens(d=None):
     if xiaoya_state() == "在跑":
         sh(f"docker restart {XIAOYA_NAME}", timeout=120)
         ok("小雅已重启，用新令牌")
-    elif d and xiaoya_state() == "未装" and xiaoya_tokens_ok():
-        # 【填好就接着装、装好就挂】仓库主人：「应该在扫码成功的时候就挂上全盘」。装之前那句确认照旧要
+    elif d and xiaoya_tokens_ok():
+        # 【填好就接着装、装好就挂】仓库主人：「应该在扫码成功的时候就挂上全盘」。装之前那句确认照旧要；
+        # 退出登录停下的那份，重新扫上就起回来
         print()
         xiaoya_install(d)
+    return True
+
+
+def xiaoya_logout():
+    """退出登录：删掉三样令牌、把小雅停下。容器、OpenList 里的 /xiaoya、扫描路径都留着，重新扫码就回来。
+    → 退了没有。【停下】令牌删了它也还攥着旧的那份在用，不停就等于没退。"""
+    if not any(os.path.exists(os.path.join(XIAOYA_DIR, f)) for f, _n in XIAOYA_FILES):
+        info("本来就没登录。")
+        return False
+    print()
+    tip(f"退出后 {XIAOYA_MOUNT} 打不开，Emby 里小雅的片子都放不了，重新扫码登录才恢复")
+    if not ask_yn("确定退出登录？", False):
+        print("没有改动。")
+        return False
+    for f, _n in XIAOYA_FILES:
+        try:
+            os.remove(os.path.join(XIAOYA_DIR, f))
+        except OSError:
+            pass
+    if xiaoya_state() == "在跑":
+        sh(f"docker stop {XIAOYA_NAME}", timeout=120)
+    ok("小雅已退出登录（装好的小雅留着）")
     return True
 
 
@@ -23614,7 +23646,7 @@ def xiaoya_install(d):
         ok("小雅已启动")
         return True
     if not xiaoya_tokens_ok():
-        warn("先在「2 阿里令牌」里填好三样，小雅没有它们起不来")
+        warn("先「1 扫码登录」，小雅没有阿里令牌起不来")
         return False
     free = shutil.disk_usage("/").free / 2 ** 30
     if free < XIAOYA_MIN_FREE_GB:
@@ -23649,7 +23681,7 @@ XIAOYA_RETRY_S = 20
 
 
 def xiaoya_wait_mount(d, wait_s=None):
-    """等小雅准备好就挂进 OpenList（整个盘）。等不到 / Ctrl-C 也不要紧：之后选「3 扫描路径」会先挂上。"""
+    """等小雅准备好就挂进 OpenList（整个盘）。等不到 / Ctrl-C 也不要紧：之后选「2 修改路径」会先挂上。"""
     wait_s = XIAOYA_READY_S if wait_s is None else wait_s
     info(f"等小雅下完目录数据就自动挂上 {XIAOYA_MOUNT}（一般 5–10 分钟，Ctrl-C 可跳过）")
     end = time.time() + wait_s
@@ -23669,7 +23701,7 @@ def xiaoya_wait_mount(d, wait_s=None):
     except KeyboardInterrupt:
         print()
     print("\r\x1b[2K", end="")
-    warn("小雅还没准备好，过几分钟选「3 扫描路径」，会先自动挂上")
+    warn("小雅还没准备好，过几分钟选「2 修改路径」，会先自动挂上")
     return False
 
 
@@ -23685,7 +23717,7 @@ def xiaoya_mount(d, quiet=False):
         return True
     if xiaoya_state() != "在跑":
         if not quiet:
-            warn("小雅没在跑，先「1 安装 / 启动」")
+            warn("小雅没在跑，先「1 扫码登录」")
         return False
     tok = _ol_token(d)
     if not tok:
@@ -23741,7 +23773,7 @@ def xiaoya_default_whole(d):
         return False
     save_ms_state(scan_spec=merge_scan_paths(explicit_scan_paths() + [XIAOYA_MOUNT]))
     _apply_scan_paths(d, f"加了 {XIAOYA_MOUNT}（全盘），")
-    tip("小雅全盘几十万部，第一次扫要很久；嫌大就进「3 扫描路径 → 1 添加修改路径」只挑几类")
+    tip("小雅全盘几十万部，第一次扫要很久；嫌大就进「2 修改路径 → 1 添加修改路径」只挑几类")
     return True
 
 
@@ -23803,7 +23835,7 @@ def _xiaoya_paths_menu(d):
 
 
 def xiaoya_paths(d):
-    """「3 扫描路径」：没挂就先挂上整个盘，再进这个盘的扫描路径（加 / 删要进 Emby 的目录）。
+    """「2 修改路径」：没挂就先挂上整个盘，再进这个盘的扫描路径（加 / 删要进 Emby 的目录）。
 
     仓库主人：「把那个挂进 OpenList 做成修改路径的可以细分」。挂盘这一步没删，并进来了：没挂时先挂。"""
     if not xiaoya_mounted(d) and not xiaoya_mount(d):
@@ -23836,34 +23868,56 @@ def xiaoya_remove(d):
 
 
 def _xiaoya_menu(d):
-    """「3 挂载路径 → 小雅（自建）」那一屏。"""
+    """「3 挂载路径 → 小雅（自建）」那一屏，跟夸克那几个盘一个排法：1 扫码登录、2 修改路径，
+    中间是每个盘都有的那几项（生成媒体库、直链方式……刷新元数据，见 _drive_std_items），最后「移除小雅」。
+
+    【扫码登录 = 登录 + 安装 / 启动】仓库主人：「这两个我觉得可以设计在一起」。安装 / 启动没删，并进来了：
+    令牌齐了还没装 / 停着，点「1」先问装不装 / 起不起，扫完码也会接着装。"""
     while True:
         st = xiaoya_state()
-        print("\n" + "-" * 60)
-        print(f"  {BOLD}小雅（自建 WebDAV）{RST}")
-        print("-" * 60)
-        col = GREEN if st == "在跑" else (YELLOW if st == "停了" else DIM)
-        print(f"  1. {pad('安装 / 启动', 20)}当前：{col}{st}{RST}")
-        print(f"  2. {pad('阿里令牌', 20)}当前："
-              + (f"{GREEN}已填{RST}" if xiaoya_tokens_ok() else f"{DIM}未填{RST}"))
-        _mt = xiaoya_mounted(d)
-        _xw = xiaoya_scan_label() if _mt else "未挂"
-        print(f"  3. {pad('扫描路径', 20)}当前："
-              + (f"{GREEN}{_xw}{RST}" if _mt and _xw != "未加路径" else f"{DIM}{_xw}{RST}"))
-        print(f"  4. 移除小雅")
+        tok = xiaoya_tokens_ok()
+        mounted = xiaoya_mounted(d)
+        print("\n" + "=" * 60)
+        _xw = xiaoya_scan_label() if mounted else "未挂"
+        print(f"  {BOLD}小雅（自建）{RST}   {BOLD}{XIAOYA_MOUNT}{RST}   {CYAN}{_xw}{RST}")
+        print("=" * 60)
+        items = []
+        add = lambda *x: items.append(x)
+        _lg = (f"{YELLOW}未登录（扫码登录）{RST}" if not tok
+               else f"{CYAN}已登录{RST}" if st == "在跑"
+               else f"{YELLOW}已登录 · {'没装' if st == '未装' else st}{RST}")
+
+        def _login():
+            # 令牌齐了只是没装 / 停着：先装 / 起，不用再扫一遍；不装（选了否）再进登录那一屏
+            if not (tok and st in ("未装", "停了") and xiaoya_install(d)):
+                xiaoya_set_tokens(d)
+            ask("\n按回车继续...")
+
+        add("扫码登录", f"当前：{_lg}", _login, False)
+        _paths = ("修改路径", "当前：" + (f"{CYAN}{_xw}{RST}" if mounted and _xw != "未加路径" else f"{DIM}{_xw}{RST}"),
+                  lambda: xiaoya_paths(d))
+        # 【没挂也照样列着】跟没挂的夸克一样，要挂上才能做的几项点了先让去挂；截封面那三项挂着才有
+        ch, switchable = drive_channel(d, XIAOYA_MOUNT, DRIVER_DAV) if mounted else ("原画直链", False)
+        _drive_std_items(d, XIAOYA_MOUNT, DRIVER_DAV, add, mounted, ch, switchable, paths=_paths, cn="小雅")
+        if mounted:
+            _drive_tail_items(d, XIAOYA_MOUNT, add)
+        add("移除小雅", "", lambda: (xiaoya_remove(d), ask("\n按回车继续...")), False)
+        for i, (label, val, _fn, _nm) in enumerate(items, 1):
+            no = str(i)
+            print(f"  {no}. {pad(label, 19 - len(no))}{val}" if val else f"  {no}. {label}")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        fn = {"1": lambda: xiaoya_install(d), "2": lambda: xiaoya_set_tokens(d),
-              "3": lambda: xiaoya_paths(d), "4": lambda: xiaoya_remove(d)}.get(c)
-        if fn is None:
+        if not (c.isdigit() and 1 <= int(c) <= len(items)):
             print("无效选择。")
             continue
+        _label, _val, fn, need_mount = items[int(c) - 1]
+        if need_mount and not mounted:
+            warn("小雅还没挂上，这一项要挂上之后才能用 —— 先选「2 修改路径」挂上（没登录先「1 扫码登录」）。")
+            continue
         fn()
-        if c != "3":                  # 扫描路径那一屏自己有「0 返回」，回来不用再按一次回车
-            ask("\n按回车继续...")
 
 
 def qr115_status(uid, tm, sign):
@@ -25355,6 +25409,45 @@ def _skip_dirs_menu(d, mp):
             apply_skip_dirs(d, only=mp)
 
 
+def _drive_std_items(d, mp, drv, add, mounted, ch, switchable, paths=None, cn=None):
+    """每个盘都有的六项：修改扫描路径、生成媒体库、直链方式、片名用哪个、不扫的目录、名称重定义。
+    小雅那一屏也用这一套（paths 换成它自己的「修改路径」），两边排法、写法一致。"""
+    names = {"scrape": "刮削结果", "filename": "网盘文件名"}
+    _rn = {"on": "清洗后的名字", "off": "网盘原名"}
+    tp = title_policy_of(mp)
+    _sc = _scan_of(mp)
+    has_sw = mounted and switchable and drive_links(d, mp, drv)
+    _sk = skip_dirs_of(mp)
+    if paths:                             # 小雅的「修改路径」：没挂会自己先挂，不用拦
+        add(*paths, False)
+    else:
+        add("修改扫描路径", f"{CYAN}{_sc}{RST}", lambda: _drive_paths_menu(d, mp), True)
+    add("生成媒体库", f"{DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}",
+        lambda: _scan_menu(d, mp, f"{cn or driver_cn(drv)} {mp}"), True)
+    add("直链方式", f"当前：{CYAN}{ch}{RST}" + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"),
+        lambda: _link_method_menu(d, [mp], cn or driver_cn(drv)), True)
+    add("片名用哪个", f"当前：{CYAN}{names.get(tp, tp)}{RST}", lambda: _title_menu(d, mp), False)
+    add("不扫的目录", "当前：" + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"),
+        lambda: _skip_dirs_menu(d, mp), True)
+    add("名称重定义", f"当前：{CYAN}{_rn.get(rename_policy_of(mp))}{RST}"
+        + ("" if (ms_state().get("rename_by_drive") or {}).get(mp) else f"  {DIM}（跟默认）{RST}"),
+        lambda: _rename_menu(d, mp), False)
+
+
+def _drive_tail_items(d, mp, add):
+    """挂着的盘才有、排在最后的三项：截封面、补时长、刷新元数据。"""
+    _cl, _cr = cover_manual_last(mp), cover_running(mp)
+    add("截封面", (f"{YELLOW}后台截着 {_cr.get('done', 0)}/{_cr.get('of', '?')}{RST}" if _cr is not None
+                 else f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"),
+        lambda: _covers_menu(d, mp), False)
+    add("补时长", "当前：" + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
+                             f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"),
+        lambda: _heal_mount_toggle(mp), False)
+    _ma = meta_auto_of(mp)
+    add("刷新元数据", "自动：" + (f"{CYAN}每天 {_ma}（北京时间）{RST}" if _ma else f"{DIM}关{RST}"),
+        lambda: _meta_menu(d, mp), False)
+
+
 def _drive_menu(d, mp, drv, mounted=True):
     """单个网盘的设置。mounted=False：OpenList 里还没挂上（115 / 夸克 TV / 阿里 / WebDAV 常驻）——
     同一屏、同样的几项，要挂上才能做的那几项点了会先让去挂。
@@ -25364,13 +25457,10 @@ def _drive_menu(d, mp, drv, mounted=True):
     别的盘照旧从「1 修改扫描路径」开始。
     【编号按列表现排】以前每一项的编号写死在两处（打印一处、分发一处），挪一项要改一串、
     还对不上过。现在先排一张表，编号跟着表走，打印和分发都看这张表。"""
-    names = {"scrape": "刮削结果", "filename": "网盘文件名"}
-    _rn = {"on": "清洗后的名字", "off": "网盘原名"}
     while True:
         if not mounted and has_driver_storage(d, drv):
             return                    # 刚扫码挂上了：回外层，那边会按真实的盘重新列
         ch, switchable = drive_channel(d, mp, drv) if mounted else ("原画直链", False)
-        tp = title_policy_of(mp)
         print("\n" + "=" * 60)
         # 没挂的 115 不印挂载点：/115 是脚本扫码挂时才用的名字，用户手动挂可能叫别的
         # 【挂载点不印两遍】扫描路径本来就以挂载点开头（/quark/夸克挂载），前面再印一个 /quark
@@ -25435,19 +25525,7 @@ def _drive_menu(d, mp, drv, mounted=True):
         mount_no = str(len(items)) if (items and not mounted) else ""
 
         # ---- 每个盘都有的六项
-        has_sw = mounted and switchable and drive_links(d, mp, drv)
-        _sk = skip_dirs_of(mp)
-        add("修改扫描路径", f"{CYAN}{_sc}{RST}", lambda: _drive_paths_menu(d, mp), True)
-        add("生成媒体库", f"{DIM}定时：{RST}{CYAN}{strm_cron_desc(mp)}{RST}",
-            lambda: _scan_menu(d, mp, f"{driver_cn(drv)} {mp}"), True)
-        add("直链方式", f"当前：{CYAN}{ch}{RST}" + ("" if has_sw else f"  {DIM}（只有这一种）{RST}"),
-            lambda: _link_method_menu(d, [mp], driver_cn(drv)), True)
-        add("片名用哪个", f"当前：{CYAN}{names.get(tp, tp)}{RST}", lambda: _title_menu(d, mp), False)
-        add("不扫的目录", "当前：" + (f"{CYAN}{len(_sk)} 条{RST}" if _sk else f"{DIM}无{RST}"),
-            lambda: _skip_dirs_menu(d, mp), True)
-        add("名称重定义", f"当前：{CYAN}{_rn.get(rename_policy_of(mp))}{RST}"
-            + ("" if (ms_state().get("rename_by_drive") or {}).get(mp) else f"  {DIM}（跟默认）{RST}"),
-            lambda: _rename_menu(d, mp), False)
+        _drive_std_items(d, mp, drv, add, mounted, ch, switchable)
 
         # ---- 各盘自己的
         if isqtv:
@@ -25462,16 +25540,7 @@ def _drive_menu(d, mp, drv, mounted=True):
             add("只拿令牌（自己去 OpenList 填）", "", qr115_login, False)
         # 【截封面、补时长】挂着的盘才有，排在最后
         if mounted:
-            _cl, _cr = cover_manual_last(mp), cover_running(mp)
-            add("截封面", (f"{YELLOW}后台截着 {_cr.get('done', 0)}/{_cr.get('of', '?')}{RST}" if _cr is not None
-                         else f"上次：{CYAN}{_cl['mb']:.0f} MB{RST}" if _cl else f"{DIM}没图的全部截一次{RST}"),
-                lambda: _covers_menu(d, mp), False)
-            add("补时长", "当前：" + (f"{CYAN}开{RST}" if heal_mount_on(mp) else
-                                     f"{DIM}关（总开关关着）{RST}" if not heal_auto_on() else f"{YELLOW}关{RST}"),
-                lambda: _heal_mount_toggle(mp), False)
-            _ma = meta_auto_of(mp)
-            add("刷新元数据", "自动：" + (f"{CYAN}每天 {_ma}（北京时间）{RST}" if _ma else f"{DIM}关{RST}"),
-                lambda: _meta_menu(d, mp), False)
+            _drive_tail_items(d, mp, add)
 
         for i, (label, val, _fn, _nm) in enumerate(items, 1):
             no = str(i)
