@@ -125,6 +125,7 @@
   image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
   keywords: 纪录片, 纪录, documentary
+
 - name: 综艺
   type: tvshows
   language: zh-CN
