@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.372"
+SCRIPT_VERSION = "1.5.373"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23848,6 +23848,12 @@ def xiaoya_logout():
     return True
 
 
+def xiaoya_run_cmd():
+    """起小雅容器的那一句。安装和「更新小雅」重建都用它，两边参数不会走样。"""
+    return (f"docker run -d --name {XIAOYA_NAME} --restart unless-stopped --network mediastack "
+            f"-v {XIAOYA_DIR}:/data {XIAOYA_IMAGE}")
+
+
 def xiaoya_install(d):
     """装 / 启动小雅容器。接 mediastack 网络、不开端口、不碰别的容器。返回成没成。"""
     st = xiaoya_state()
@@ -23875,8 +23881,7 @@ def xiaoya_install(d):
         return False
     info("正在拉小雅镜像、起容器（第一次要几分钟）...")
     try:
-        r = sh(f"docker run -d --name {XIAOYA_NAME} --restart unless-stopped --network mediastack "
-               f"-v {XIAOYA_DIR}:/data {XIAOYA_IMAGE}", timeout=900)
+        r = sh(xiaoya_run_cmd(), timeout=900)
     except Exception as e:
         err(f"没起来：{_short_err(e)}")
         return False
@@ -23980,13 +23985,21 @@ def xiaoya_scan_label():
 
 
 def xiaoya_default_whole(d):
-    """刚挂上、还没加过路径 → 默认扫全盘。仓库主人：「安装成功了默认就是添加的全盘，如果觉得服务器优秀
-    扫全盘也是可以，如果觉得盘太大就添加修改路径扫部分也可以」。加过路径的不动。"""
-    if xiaoya_scan_paths():
+    """挂着、还没加过路径 → 默认扫全盘。仓库主人：「安装成功了默认就是添加的全盘，如果觉得服务器优秀
+    扫全盘也是可以，如果觉得盘太大就添加修改路径扫部分也可以」。加过路径的不动。
+    【早先挂上的也补上】仓库主人：「他为什么没有显示全盘，一定要让我挂路径吗」—— 1.5.368 之前挂上的机器
+    没走过这一步，进小雅那一屏时补。自己「2 删除所有路径」删掉的（xiaoya_no_default）不再补回去。
+    【顺手关掉小雅的定时扫描】全盘七十多万个文件，AutoFilm 凌晨一层层去爬能跑一整天；strm 交给
+    「生成媒体库 → 快速生成」（读小雅清单，几分钟）。自己设过小雅定时的不动。"""
+    if xiaoya_scan_paths() or ms_state().get("xiaoya_no_default"):
         return False
+    crons = dict(ms_state().get("strm_cron_by_mount") or {})
+    if XIAOYA_MOUNT not in crons:
+        crons[XIAOYA_MOUNT] = NEVER_CRON
+        save_ms_state(strm_cron_by_mount=crons)
     save_ms_state(scan_spec=merge_scan_paths(explicit_scan_paths() + [XIAOYA_MOUNT]))
     _apply_scan_paths(d, f"加了 {XIAOYA_MOUNT}（全盘），")
-    tip("小雅全盘几十万部，第一次扫要很久；嫌大就进「2 修改路径 → 1 添加修改路径」只挑几类")
+    tip("全盘七十多万部：用「生成媒体库 → 快速生成」出 strm；嫌大就「2 修改路径」只挑几类")
     return True
 
 
@@ -24022,7 +24035,7 @@ def _xiaoya_paths_menu(d):
             if not ask_yn("删除所有路径？", False):
                 print("没有改动。")
                 continue
-            save_ms_state(scan_spec=[p for p in exp if p not in mine])
+            save_ms_state(scan_spec=[p for p in exp if p not in mine], xiaoya_no_default=True)
             _apply_scan_paths(d, "删掉小雅的扫描路径，")
             continue
         if c != "1":
@@ -24031,6 +24044,7 @@ def _xiaoya_paths_menu(d):
         got = [p for p in _pick_dirs(d, XIAOYA_MOUNT) if p]
         if not got:
             continue
+        save_ms_state(xiaoya_no_default=False)
         if any(p.rstrip("/") == XIAOYA_MOUNT for p in got):
             # 在最上面那层按「.」= 要全盘：小雅自己那几条换成整个盘
             save_ms_state(scan_spec=merge_scan_paths([p for p in exp if p not in mine] + [XIAOYA_MOUNT]))
@@ -24191,6 +24205,38 @@ def xiaoya_fast_strm(d):
     return True
 
 
+def xiaoya_update(d):
+    """「更新小雅」：拉新镜像，换了才重建容器（同一句 xiaoya_run_cmd，令牌、挂载、扫描路径都不动）。返回更没更。
+    【重建会断小雅的播放】有人在播 / 刚播过先问一句，默认否（CLAUDE.md 第六节）。"""
+    if xiaoya_state() == "未装":
+        warn("小雅还没装，先「1 扫码登录」")
+        return False
+    why = play_quiet(read_emby_api_key(d))
+    if why:
+        tip(f"{why}：更新要重启小雅，正在播的小雅片子会断")
+        if not ask_yn("还是现在更新？", False):
+            print("没有更新。")
+            return False
+    info("正在拉小雅的新镜像...")
+    old = (sh(f"docker inspect -f '{{{{.Image}}}}' {XIAOYA_NAME}", timeout=20).stdout or "").strip()
+    r = sh(f"docker pull {XIAOYA_IMAGE}", timeout=900)
+    if r.returncode != 0:
+        err(f"没拉下来：{_short_err((r.stderr or r.stdout or '').strip())}")
+        return False
+    new = (sh(f"docker image inspect -f '{{{{.Id}}}}' {XIAOYA_IMAGE}", timeout=20).stdout or "").strip()
+    if new and new == old:
+        ok("小雅已是最新")
+        return False
+    sh(f"docker rm -f {XIAOYA_NAME}", timeout=120)
+    r = sh(xiaoya_run_cmd(), timeout=900)
+    if r.returncode != 0:
+        err(f"没起来：{_short_err((r.stderr or r.stdout or '').strip())}")
+        tip("「1 扫码登录」会再装一次（令牌都还在）")
+        return False
+    ok("小雅已更新，等它下完目录数据（几分钟）就恢复")
+    return True
+
+
 def xiaoya_remove(d):
     """一次撤干净：扫描路径 → OpenList 存储 → 容器 → 令牌目录 → 镜像。返回做没做。"""
     print(f"  {RED}{BOLD}会删掉：小雅的扫描路径、OpenList 里的 {XIAOYA_MOUNT}、小雅容器、{XIAOYA_DIR} 里的令牌{RST}")
@@ -24209,7 +24255,7 @@ def xiaoya_remove(d):
     sh(f"docker rm -f {XIAOYA_NAME}", timeout=120)
     shutil.rmtree(XIAOYA_DIR, ignore_errors=True)
     sh(f"docker image rm {XIAOYA_IMAGE}", timeout=120)
-    save_ms_state(xiaoya_ours=False)
+    save_ms_state(xiaoya_ours=False, xiaoya_no_default=False)
     ok("小雅已移除，现有的盘都没动")
     return True
 
@@ -24220,6 +24266,8 @@ def _xiaoya_menu(d):
 
     【扫码登录 = 登录 + 安装 / 启动】仓库主人：「这两个我觉得可以设计在一起」。安装 / 启动没删，并进来了：
     令牌齐了还没装 / 停着，点「1」先问装不装 / 起不起，扫完码也会接着装。"""
+    if xiaoya_mounted(d):
+        xiaoya_default_whole(d)       # 早先挂上、没加过路径的补上全盘，见 xiaoya_default_whole
     while True:
         st = xiaoya_state()
         tok = xiaoya_tokens_ok()
@@ -24248,6 +24296,7 @@ def _xiaoya_menu(d):
         _drive_std_items(d, XIAOYA_MOUNT, DRIVER_DAV, add, mounted, ch, switchable, paths=_paths, cn="小雅")
         if mounted:
             _drive_tail_items(d, XIAOYA_MOUNT, add)
+        add("更新小雅", "", lambda: (xiaoya_update(d), ask("\n按回车继续...")), False)
         add("移除小雅", "", lambda: (xiaoya_remove(d), ask("\n按回车继续...")), False)
         for i, (label, val, _fn, _nm) in enumerate(items, 1):
             no = str(i)
