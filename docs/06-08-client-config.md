@@ -45,13 +45,14 @@
 | sing-box | [`subbox-template.json`](https://github.com/bgpeer/nodekit/blob/main/subbox-template.json) |
 | Shadowrocket（小火箭）| [`shadowrocket-template.conf`](https://github.com/bgpeer/nodekit/blob/main/shadowrocket-template.conf) |
 
-> **sing-box 模板要 1.15+，1.14 装不上**（这是**有意的**，不是待修的 bug）。
-> 卡住的只有 `experimental.cache_file` 的 `buffer_size` / `flush_interval` 两个字段——
-> sing-box 的配置解码开了 `DisallowUnknownFields`，**未知字段不是忽略而是直接启动失败**，
-> 1.14.1 上报 `json: unknown field "buffer_size"`，整份配置加载不了。实测去掉这两个
-> 1.14.1 就能过，也就是说整份模板只卡在这两处。
+> **sing-box 模板要 1.14+**：正式版 1.14、测试版 1.15 都能直接用。1.12 / 1.13 装不上——
+> `dns.optimistic`、`cache_file.store_dns` 是 1.14 才有的字段，sing-box 的配置解码开了
+> `DisallowUnknownFields`，**未知字段不是忽略而是直接启动失败**（报 `json: unknown field "…"`）。
 >
-> 换句话说：**看到 1.14 报这个错，别去删那两个字段**——要么升到 1.15，要么自己 fork 一份模板。
+> 以前模板里还有 `cache_file` 的 `buffer_size` / `flush_interval`（1.15 才有），1.14 一加载就报
+> `unknown field "buffer_size"`，整份模板只卡在这两处；10/10 仓库主人定了改到 1.14，已去掉。
+> 代价很小：`buffer_size` 写的 1MB 本来就是默认值；`flush_interval` 是让缓存每 30 秒落一次盘，
+> 去掉后 1.15 上缓存写盘没那么勤，节点和分流不受影响。**以后往模板里加字段，先确认 1.14 认得。**
 >
 > 另外 TUN 段**故意不写 `mtu`**。sing-box 的默认值是分平台的（Network Extension 4064、
 > Android 9000、桌面 65535），一份订阅喂三个平台，写死任何一个数都会坑到另外两个；
