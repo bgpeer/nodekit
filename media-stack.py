@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.365"
+SCRIPT_VERSION = "1.5.366"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23420,14 +23420,170 @@ def xiaoya_tokens_ok():
         return False
 
 
-def xiaoya_set_tokens():
-    """贴小雅要的三样（不回显、不进日志），写进 /etc/xiaoya，root-only。返回改没改。"""
-    tip("阿里令牌要另取一份，跟 OpenList 的 /aliyun 共用会互相踢下线")
+# ---- 小雅要的三样，扫码拿 ----------------------------------------------------------------
+# 仓库主人：「做成扫码的多好，不然谁知道在哪里去找 token」。
+#   · 阿里云盘 token：阿里网页版自己的扫码登录（passport 那两个接口），确认后回包里就有 refreshToken
+#   · 开放平台 token：复用 /aliyun 那套本机扫码（AliTV，走 TV 接口），见 alitv_scan_login
+#   · 转存文件夹：拿第一步的 accessToken 在你自己的网盘里建「小雅转存」（已经有就用它）
+# 【不泄漏】令牌只写进 /etc/xiaoya（0600），屏上、日志里都不打；请求只发阿里自己的服务器。
+# 浏览器那张脸是故意的（BROWSER_UA）：这几个是网页版的接口。
+ALIWEB_PASSPORT = "https://passport.aliyundrive.com/newlogin/qrcode/"
+ALIWEB_QS = {"appName": "aliyun_drive", "fromSite": "52", "appEntrance": "web", "isMobile": "false",
+             "lang": "zh_CN", "returnUrl": "", "bizParams": "", "_bx-v": "2.2.3"}
+ALIWEB_API = "https://api.aliyundrive.com"
+ALIWEB_USER = "https://user.aliyundrive.com/v2/user/get"
+XIAOYA_TEMP_NAME = "小雅转存"
+
+
+def _aliweb(url, form=None, js=None, token="", opener=None):
+    hd = {"User-Agent": BROWSER_UA, "Referer": "https://www.alipan.com/"}
+    data = None
+    if form is not None:
+        data = urllib.parse.urlencode(form).encode()
+        hd["Content-Type"] = "application/x-www-form-urlencoded"
+    elif js is not None:
+        data = json.dumps(js).encode()
+        hd["Content-Type"] = "application/json"
+    if token:
+        hd["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, headers=hd, method="POST" if data is not None else "GET")
+    with (opener or urllib.request.urlopen)(req, timeout=20) as r:
+        return json.load(r)
+
+
+def aliweb_qrcode(opener=None):
+    """→ (二维码里写的那串, t, ck)"""
+    d = ((_aliweb(ALIWEB_PASSPORT + "generate.do?" + urllib.parse.urlencode(ALIWEB_QS), opener=opener)
+          .get("content") or {}).get("data") or {})
+    if not d.get("codeContent") or not d.get("ck"):
+        raise RuntimeError("没给二维码")
+    return str(d["codeContent"]), str(d.get("t") or ""), str(d["ck"])
+
+
+def aliweb_status(t, ck, opener=None):
+    """→ (状态, 登录结果)。状态：NEW / SCANED / CONFIRMED / EXPIRED / CANCELED"""
+    d = ((_aliweb(ALIWEB_PASSPORT + "query.do?" + urllib.parse.urlencode(
+            {k: ALIWEB_QS[k] for k in ("appName", "fromSite", "_bx-v")}),
+            form={"t": t, "ck": ck, **ALIWEB_QS, "navlanguage": "zh-CN", "navPlatform": "MacIntel"},
+            opener=opener).get("content") or {}).get("data") or {})
+    st, res = str(d.get("qrCodeStatus") or ""), {}
+    if st == "CONFIRMED" and d.get("bizExt"):
+        try:
+            res = json.loads(base64.b64decode(d["bizExt"]).decode("utf-8", "replace")).get("pds_login_result") or {}
+        except Exception:
+            res = {}
+    return st, res
+
+
+def aliweb_scan_login(opener=None, poll=2, wait_s=300):
+    """终端里扫阿里云盘网页版的登录码 → 登录结果（含 refreshToken / accessToken）。失败 / 放弃 → {}。"""
+    try:
+        code, t, ck = aliweb_qrcode(opener)
+    except Exception as e:
+        warn(f"没拿到阿里的二维码：{_short_err(e)[:60]}")
+        return {}
+    grid = qr_encode(code)
+    if not grid:
+        warn("二维码画不出来")
+        return {}
+    print()
+    print("\n".join(qr_screen(grid)))
+    print()
+    tip("阿里云盘 App 扫一扫，再在手机上点确认" + qr_both_note())
+    deadline = time.time() + wait_s
+    try:
+        while time.time() < deadline:
+            try:
+                st, res = aliweb_status(t, ck, opener)
+            except Exception:
+                st, res = "", {}
+            if st == "CONFIRMED":
+                print("\r\x1b[2K", end="")
+                if res.get("refreshToken"):
+                    ok("阿里云盘扫码确认成功")
+                    return res
+                warn("扫上了，但没拿到令牌")
+                return {}
+            if st in ("EXPIRED", "CANCELED"):
+                print("\r\x1b[2K", end="")
+                warn("二维码过期 / 取消了，再来一次。")
+                return {}
+            msg = "已扫到，请在手机上点确认…" if st == "SCANED" else "等待扫码…"
+            left = int(deadline - time.time())
+            print(f"\r    {DIM}{pad(msg, 30)}还剩 {left // 60}:{left % 60:02d}{RST}", end="", flush=True)
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print()
+        warn("已中断。")
+        return {}
+    print("\r\x1b[2K", end="")
+    warn("没等到确认。")
+    return {}
+
+
+def aliweb_temp_folder(login, opener=None):
+    """在这个阿里云盘账号里建「小雅转存」（已经有就用它）→ 文件夹 ID；建不成 → ""。
+
+    放在资源库（resource_drive_id）里，账号没分资源库就放默认盘 —— 小雅转存用的是资源库那个盘。"""
+    tok = str(login.get("accessToken") or "")
+    if not tok:
+        return ""
+    drv = ""
+    try:
+        u = _aliweb(ALIWEB_USER, js={}, token=tok, opener=opener)
+        drv = str(u.get("resource_drive_id") or u.get("default_drive_id") or "")
+    except Exception:
+        pass
+    drv = drv or str(login.get("defaultDriveId") or "")
+    if not drv:
+        return ""
+    try:
+        r = _aliweb(ALIWEB_API + "/adrive/v2/file/createWithFolders", token=tok, opener=opener,
+                    js={"drive_id": drv, "parent_file_id": "root", "name": XIAOYA_TEMP_NAME,
+                        "type": "folder", "check_name_mode": "refuse"})
+    except Exception:
+        return ""
+    return str(r.get("file_id") or "")
+
+
+def _xiaoya_scan():
+    """扫两次码 → {文件名: 值}。拿到几样算几样。"""
     got = {}
-    for f, name in XIAOYA_FILES:
-        v = _ask_secret(f"{name}（回车跳过、不改）").strip()
-        if v:
-            got[f] = v
+    info("第 1 次扫码：阿里云盘登录")
+    login = aliweb_scan_login()
+    if login.get("refreshToken"):
+        got["mytoken.txt"] = str(login["refreshToken"])
+        fid = aliweb_temp_folder(login)
+        if fid:
+            got["temp_transfer_folder_id.txt"] = fid
+            ok(f"转存文件夹已建好：{XIAOYA_TEMP_NAME}")
+        else:
+            warn("转存文件夹没建成，回这一屏选「手动粘贴」补上")
+    print()
+    info("第 2 次扫码：开放平台授权（小雅播放用）")
+    ot = alitv_scan_login()
+    if ot:
+        got["myopentoken.txt"] = ot
+    return got
+
+
+def xiaoya_set_tokens():
+    """小雅要的三样：扫码拿（推荐）或者手动粘贴（不回显、不进日志），写进 /etc/xiaoya，root-only。返回改没改。"""
+    print(f"  1. 扫码（推荐）")
+    print(f"  2. 手动粘贴")
+    print("  0. 返回")
+    c = ask("请选择").strip()
+    got = {}
+    if c == "1":
+        got = _xiaoya_scan()
+    elif c == "2":
+        tip("阿里令牌要另取一份，跟 OpenList 的 /aliyun 共用会互相踢下线")
+        for f, name in XIAOYA_FILES:
+            v = _ask_secret(f"{name}（回车跳过、不改）").strip()
+            if v:
+                got[f] = v
+    else:
+        return False
     if not got:
         print("没有改动。")
         return False
