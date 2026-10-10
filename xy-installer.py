@@ -1499,7 +1499,7 @@ def make_sb_vmess(transport):
             lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": "443",
                              "id": uid, "aid": "0", "net": _VMESS_NET[transport],
                              "type": "none", "host": tls_host(), "path": path,
-                             "tls": "tls", "sni": tls_host(), **smk})
+                             "tls": "tls", "sni": tls_host(), "fp": "chrome", **smk})
             return ib, lk
         crt, key, insec = ensure_acme()
         ib = {"type": "vmess", "tag": tag, "listen": "::", "listen_port": port,
@@ -1512,7 +1512,7 @@ def make_sb_vmess(transport):
         lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": str(port),
                          "id": uid, "aid": "0", "net": _VMESS_NET[transport],
                          "type": "none", "host": tls_host(), "path": path,
-                         "tls": "tls", "sni": tls_host(), **smk, **_vmess_insec(insec)})
+                         "tls": "tls", "sni": tls_host(), "fp": "chrome", **smk, **_vmess_insec(insec)})
         return ib, lk
     return b
 
@@ -1846,7 +1846,7 @@ def xr_vmess_ws(port, tag):
     lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": str(port),
                      "id": uid, "aid": "0", "net": "ws", "type": "none",
                      "host": tls_host(), "path": path, "tls": "tls", "sni": tls_host(),
-                     **_vmess_insec(insec)})
+                     "fp": "chrome", **_vmess_insec(insec)})
     return ib, lk
 
 def xr_vless_xhttp_tls(port, tag):
@@ -2137,6 +2137,10 @@ def link_to_proxy(u):
         d = {"name": name, "type": "vmess", "server": j["add"], "port": int(j["port"]), "uuid": j["id"],
              "alterId": int(j.get("aid", 0)), "cipher": j.get("scy", "auto"), "udp": "true"}
         if j.get("tls") == "tls": d["tls"] = "true"; d["servername"] = j.get("sni") or j.get("host")
+        # TLS 指纹：跟 vless 一样默认 chrome。以前 vmess 没带，mihomo 就用 Go 自带的 ClientHello——
+        # 这个指纹墙认得，同样走 nginx 443，vless-ws 通、vmess-ws / httpupgrade 被掐成超时。
+        # 老链接没有 fp 字段也按 chrome 补，订阅下次生成就带上，不用重装。
+        if j.get("tls") == "tls": d["client-fingerprint"] = j.get("fp") or "chrome"
         if j.get("tls") == "tls" and any(str(j.get(k, "")).lower() in ("1", "true")
                                          for k in ("allowInsecure", "insecure", "skip-cert-verify")):
             d["skip-cert-verify"] = "true"
@@ -6416,7 +6420,7 @@ def _cdn_link(st):
     if proto == "vmess-ws":
         return vmess_link({"v": "2", "ps": tag, "add": addr, "port": str(port), "id": cred,
                            "aid": "0", "net": "ws", "type": "none", "host": dom,
-                           "path": path, "tls": "tls", "sni": dom})
+                           "path": path, "tls": "tls", "sni": dom, "fp": "chrome"})
     if proto == "trojan-ws":
         return (f"trojan://{cred}@{addr}:{port}?security=tls&sni={dom}"
                 f"&type=ws&host={dom}&path={path}&fp=chrome#{tag}")
