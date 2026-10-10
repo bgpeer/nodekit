@@ -6616,7 +6616,7 @@ def cdn_add():
         print("  域名格式不对，已取消。"); return
 
     ui_line()
-    ui_items([(1, "VLESS + WS", "默认·最稳"), (2, "VLESS + XHTTP", "最快"),
+    ui_items([(1, "VLESS + WS（默认·最稳）", None), (2, "VLESS + XHTTP（最快）", None),
               (3, "VMess + WS", None), (4, "Trojan + WS", None)])
     protos = _parse_cdn_protos(_ask("选协议（回车 = 1；多选用逗号如 1,3,4；a = 全部）: "))
     if not protos:
@@ -6632,15 +6632,18 @@ def cdn_add():
         qe = False
     forced_xray = lambda p: p == "vless-xhttp" or (qe and p.startswith("vless"))
 
-    # 核心：只对不强制 xray 的协议问一次（xhttp / 量子加密的 VLESS 强制 xray）
+    # 核心：只对不强制 xray 的协议问一次（xhttp / 量子加密的 VLESS 强制 xray）。
+    # 仓库主人看不懂原来那句「非 XHTTP 的用哪个核心」——先列出哪些固定 xray、这一问管哪几个，再问。
+    _pn = {"vless-ws": "VLESS+WS", "vless-xhttp": "VLESS+XHTTP", "vmess-ws": "VMess+WS", "trojan-ws": "Trojan+WS"}
+    fixed = [_pn.get(p, p) for p in protos if forced_xray(p)]
+    free_ps = [_pn.get(p, p) for p in protos if not forced_xray(p)]
+    if fixed:
+        # XHTTP 入站只有 xray 支持；CDN量子加密开着时 VLESS 也只能 xray（且只有 mihomo 系客户端能连）
+        print(f"  {'、'.join(fixed)}：固定用 xray" + ("（量子加密）" if qe else ""))
     core_choice = "sing-box"
-    if any(not forced_xray(p) for p in protos):
-        ui_items([(1, "sing-box", "默认"), (2, "xray", None)])
-        core_choice = "xray" if _ask("非 XHTTP 的用哪个核心（回车 = 1）: ").strip() == "2" else "sing-box"
-    if "vless-xhttp" in protos:
-        print("  （XHTTP 入站仅 xray 支持，那条自动用 xray）")
-    if qe:
-        print("  （CDN量子加密已开：VLESS 节点用 xray 并加密，只有 mihomo 系客户端能连）")
+    if free_ps:
+        ui_items([(1, "sing-box（默认）", None), (2, "xray", None)])
+        core_choice = "xray" if _ask(f"{'、'.join(free_ps)} 用哪个核心（回车 = 1）: ").strip() == "2" else "sing-box"
 
     ipfx = _state_prefix()
     if ipfx:
