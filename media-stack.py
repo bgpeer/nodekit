@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.374"
+SCRIPT_VERSION = "1.5.375"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23385,7 +23385,7 @@ def _add_webdav_flow(d):
     return True
 
 
-# ============================================================================ 小雅（自建 WebDAV）
+# ============================================================================ 小雅（WebDAV）
 # 仓库主人：「要接上小雅的，难道要改变我的架构吗……我就是怕弄坏了我的架构」。
 # 【不动现有架构】小雅单独一个容器，接在 mediastack 内部网络上，不对外开端口；docker-compose 不改，
 # 别的容器一个都不重启。OpenList 里多挂一个 WebDAV 存储（跟七米蓝一样），后面扫描、生成、Emby 全照旧。
@@ -24359,7 +24359,7 @@ def xiaoya_remove(d):
 
 
 def _xiaoya_menu(d):
-    """「3 挂载路径 → 小雅（自建）」那一屏，跟夸克那几个盘一个排法：1 扫码登录、2 修改路径，
+    """「3 挂载路径 → 小雅（WebDAV）」那一屏，跟夸克那几个盘一个排法：1 扫码登录、2 修改路径，
     中间是每个盘都有的那几项（生成媒体库、直链方式……刷新元数据，见 _drive_std_items），最后「移除小雅」。
 
     【扫码登录 = 登录 + 安装 / 启动】仓库主人：「这两个我觉得可以设计在一起」。安装 / 启动没删，并进来了：
@@ -24372,7 +24372,7 @@ def _xiaoya_menu(d):
         mounted = xiaoya_mounted(d)
         print("\n" + "=" * 60)
         _xw = xiaoya_scan_label() if mounted else "未挂"
-        print(f"  {BOLD}小雅（自建）{RST}   {BOLD}{XIAOYA_MOUNT}{RST}   {CYAN}{_xw}{RST}")
+        print(f"  {BOLD}小雅（WebDAV）{RST}   {BOLD}{XIAOYA_MOUNT}{RST}   {CYAN}{_xw}{RST}")
         print("=" * 60)
         items = []
         add = lambda *x: items.append(x)
@@ -26558,7 +26558,7 @@ def mount_paths_menu():
     mark_drive_defaults_empty(d)          # 头一回来挂盘的新机器：之后挂的都算新盘
     while True:
         # 【小雅不单列一行 WebDAV】仓库主人：「这个怎么跑到外面来了……这个要放在小雅里面」。
-        # 它的扫描路径、状态都在下面「小雅（自建）」那一栏里管，见 _xiaoya_menu
+        # 它的扫描路径、状态都在下面「小雅（WebDAV）」那一栏里管，见 _xiaoya_menu
         stores = [(mp, drv, st) for mp, drv, st, _r, _m in openlist_storages(d)
                   if mp and mp != "/" and mp != XIAOYA_MOUNT]
         # 【按用户排的先后显示】补时长、截封面也按这个先后（见 mount_rank）
@@ -26610,7 +26610,7 @@ def mount_paths_menu():
         else:
             _xtxt = (f"{GREEN}{_xy}{RST}" if _xy == "在跑"
                      else f"{YELLOW if _xy == '停了' else DIM}{_xy}{RST}")
-        extra.append((f"{pad('小雅（自建）', 19)}" + _xtxt, lambda: _xiaoya_menu(d)))
+        extra.append((f"{pad('小雅（WebDAV）', 19)}" + _xtxt, lambda: _xiaoya_menu(d)))
         if no115:
             extra.append((f"{pad('115 网盘', 19)}{YELLOW}未挂载{RST}",
                           lambda: _drive_menu(d, MOUNT_115, DRIVER_115, mounted=False)))
