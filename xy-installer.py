@@ -1358,6 +1358,37 @@ def _vmess_insec_heal():
         pass
     return True
 
+def _relay_port_heal():
+    """老装机自愈：配置里本机中转的地址跟现在的订阅端口 / 中转 token 对不上（重装时先生成、后换端口
+       那个老 bug 留下的），就按当前模板重生成三格式（订阅 token、端口不变）。修了返回 True。"""
+    try:
+        pre = _ghrelay_prefix()
+    except Exception:
+        return False
+    if not pre:
+        return False
+    host = pre.split("//", 1)[1].split(":", 1)[0]
+    stale = False
+    for meta in FMT.values():
+        try:
+            txt = open(meta["file"]).read()
+        except OSError:
+            continue
+        # 配置里出现指向本机域名的中转地址、却不是当前这个前缀 → 端口或 token 是旧的
+        for m in re.finditer(r"https://" + re.escape(host) + r":\d+/[^/\s\"']+/gh/", txt):
+            if m.group(0) != pre:
+                stale = True; break
+        if stale:
+            break
+    if not stale or not read_saved_links():
+        return False
+    try:
+        G["host"] = _host()
+        build_subscription(read_saved_links(), new_token=False)
+    except Exception:
+        return False
+    return True
+
 def _hy2_hop_heal():
     """老装机自愈：sing-box 里有 hy2、跳跃没关，就补上兜底并当场跑一次。
        补回了缺的 DNAT 返回 True。没有 hy2 或跳跃关了什么都不做。"""
@@ -2480,13 +2511,14 @@ if cert and key:
 httpd.serve_forever()
 '''
 
-def serve_sub(reset=False):
+def serve_sub(reset=False, renew_port=True):
     """SUB_DIR 放 <token>.<ext> 软链指向各格式配置文件；每格式独立 token（存 TOKENS_FILE）。
-       reset=True 换全部 token + 换新随机端口；否则复用已有、只给新格式补 token、端口不动。"""
+       reset=True 换全部 token + 换新随机端口；否则复用已有、只给新格式补 token、端口不动。
+       renew_port=False：端口调用方已经换过了（见 build_subscription），这里别再换第二次。"""
     os.makedirs(SUB_DIR, exist_ok=True)
     # 这个目录里【文件名就是 token】，列一次目录就全曝光；空 index.html 挡住列目录，
     # harden_perms 再把目录本身收成 0700。两道都要，少一道都漏。
-    if reset:
+    if reset and renew_port:
         renew_sub_port()                        # 重装换节点：端口随 token 一起换新
     toks = {} if reset else load_tokens()
     for f in os.listdir(SUB_DIR):                       # 清旧软链（含 .links）
@@ -3999,13 +4031,18 @@ def build_subscription(all_links, new_token=False):
     if not ylines:
         return False
     os.makedirs(BGP_DIR, exist_ok=True)
+    # 重装换端口必须在【生成配置之前】：配置里规则集 / 图标走本机中转的地址带着订阅端口
+    # （_ghrelay_prefix 用 sub_port()）。以前是先按旧端口生成、serve_sub 里才换新端口——
+    # 订阅地址是新端口，里面的中转地址全是旧端口，规则集一个都拉不下来（仓库主人实测撞上）。
+    if new_token:
+        renew_sub_port()
     for ext, meta in FMT.items():
         try:
             meta["gen"](ylines, nodes, tpl_url_current(ext))   # 跟随该格式当前选的模板
         except Exception as e:
             print(f"{meta['label']} 配置生成跳过:", e)
     open(HOST_FILE, "w").write(G["host"])              # 记住 host（域名优先）
-    serve_sub(reset=new_token)
+    serve_sub(reset=new_token, renew_port=False)          # 端口上面已经换过
     return True
 
 def detect_existing():
@@ -4524,6 +4561,8 @@ def cfg_auto_run():
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                # 内核每月那条也一起对齐（老装机是按 6 月写死的）
     _heal_other_crons()
+    if _relay_port_heal():                      # 中转地址带着旧端口：重生成（cfg-auto 下面本来也会重生成，先修好兜底）
+        print(f"{time.strftime('%F %T')} 已修好配置里的中转地址")
     if _vmess_insec_heal():                     # 自签 vmess 缺跳过证书校验：补上（不进菜单的机器也能修好）
         print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
     day = _cfg_auto_due()
@@ -9183,6 +9222,8 @@ def main_menu():
         print("  ✓ 已补回 hy2 端口跳跃规则（以后 sing-box 每次启动都会自动检查）")
     if _vmess_insec_heal():
         print("  ✓ 已修好自签 vmess 节点（订阅地址不变，客户端刷新一次订阅即可）")
+    if _relay_port_heal():
+        print("  ✓ 已修好配置里的中转地址（订阅地址不变，客户端刷新一次订阅即可）")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     if os.path.exists(CORE_CRON_FILE):
