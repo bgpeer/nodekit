@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.367"
+SCRIPT_VERSION = "1.5.368"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23657,8 +23657,8 @@ def xiaoya_wait_mount(d, wait_s=None):
         while True:
             if xiaoya_mount(d, quiet=True):
                 print("\r\x1b[2K", end="")
-                ok(f"小雅已挂上：{XIAOYA_MOUNT}（整个盘）　{YELLOW}⚠ 走 VPS 流量{RST}")
-                tip("在「3 扫描路径」里只加要看的几个目录，别扫整个小雅")
+                ok(f"小雅已挂上：{XIAOYA_MOUNT}　{YELLOW}⚠ 走 VPS 流量{RST}")
+                xiaoya_default_whole(d)
                 return True
             left = int(end - time.time())
             if left <= 0:
@@ -23716,7 +23716,85 @@ def xiaoya_mount(d, quiet=False):
         return False
     if not quiet:
         ok(f"小雅已挂上：{XIAOYA_MOUNT}　{YELLOW}⚠ 走 VPS 流量{RST}")
+        xiaoya_default_whole(d)
     return True
+
+
+def xiaoya_scan_paths():
+    return _paths_under(explicit_scan_paths(), XIAOYA_MOUNT)
+
+
+def xiaoya_scan_label():
+    """「扫描全盘」/「N 个目录」/「未加路径」"""
+    mine = xiaoya_scan_paths()
+    if not mine:
+        return "未加路径"
+    if any(p.rstrip("/") == XIAOYA_MOUNT for p in mine):
+        return "扫描全盘"
+    return f"{len(mine)} 个目录"
+
+
+def xiaoya_default_whole(d):
+    """刚挂上、还没加过路径 → 默认扫全盘。仓库主人：「安装成功了默认就是添加的全盘，如果觉得服务器优秀
+    扫全盘也是可以，如果觉得盘太大就添加修改路径扫部分也可以」。加过路径的不动。"""
+    if xiaoya_scan_paths():
+        return False
+    save_ms_state(scan_spec=merge_scan_paths(explicit_scan_paths() + [XIAOYA_MOUNT]))
+    _apply_scan_paths(d, f"加了 {XIAOYA_MOUNT}（全盘），")
+    tip("小雅全盘几十万部，第一次扫要很久；嫌大就进「3 扫描路径 → 1 添加修改路径」只挑几类")
+    return True
+
+
+def _xiaoya_paths_menu(d):
+    """小雅的扫描路径：当前扫全盘 / 哪几个目录；1 添加修改路径（挑了几类就只扫这几类）/ 2 删除所有路径。"""
+    while True:
+        mine = xiaoya_scan_paths()
+        whole = any(p.rstrip("/") == XIAOYA_MOUNT for p in mine)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{XIAOYA_MOUNT} 的扫描路径{RST}")
+        print("-" * 60)
+        if whole:
+            print(f"  当前：{CYAN}扫描全盘{RST}")
+        elif mine:
+            for i, p in enumerate(mine, 1):
+                print(f"  {DIM}{i:>2}.{RST} {p}")
+        else:
+            print(f"  当前：{DIM}未加路径{RST}")
+        print("-" * 60)
+        print("  1. 添加修改路径")
+        print("  2. 删除所有路径")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", "", "q"):
+            return
+        exp = explicit_scan_paths()
+        if c == "2":
+            if not mine:
+                print("没有可删的。")
+                continue
+            print(f"  {RED}{BOLD}小雅的扫描路径全部删掉：Emby 里从小雅来的片子会跟着清掉{RST}")
+            if not ask_yn("删除所有路径？", False):
+                print("没有改动。")
+                continue
+            save_ms_state(scan_spec=[p for p in exp if p not in mine])
+            _apply_scan_paths(d, "删掉小雅的扫描路径，")
+            continue
+        if c != "1":
+            print("无效选择。")
+            continue
+        got = [p for p in _pick_dirs(d, XIAOYA_MOUNT) if p and p.rstrip("/") != XIAOYA_MOUNT]
+        if not got:
+            continue
+        # 【挑了几类就只扫这几类】原来是扫全盘的，换成挑的这几个，不是在全盘上再叠
+        base = [p for p in exp if not (whole and p in mine)]
+        merged = merge_scan_paths(base + got)
+        added = [p for p in merged if p not in exp]
+        if not added and not whole:
+            print(f"  {DIM}{'、'.join(got)} 已经在扫了，没有加{RST}")
+            continue
+        save_ms_state(scan_spec=merged)
+        _apply_scan_paths(d, ("全盘换成 " if whole else "加了 ") + "、".join(added or got) + "，")
 
 
 def xiaoya_paths(d):
@@ -23725,8 +23803,7 @@ def xiaoya_paths(d):
     仓库主人：「把那个挂进 OpenList 做成修改路径的可以细分」。挂盘这一步没删，并进来了：没挂时先挂。"""
     if not xiaoya_mounted(d) and not xiaoya_mount(d):
         return False
-    tip("只加要看的几类（电影 / 电视剧 / 动漫 / 纪录片 / 综艺），别加整个小雅")
-    _drive_paths_menu(d, XIAOYA_MOUNT)
+    _xiaoya_paths_menu(d)
     return True
 
 
@@ -23765,10 +23842,9 @@ def _xiaoya_menu(d):
         print(f"  2. {pad('阿里令牌', 20)}当前："
               + (f"{GREEN}已填{RST}" if xiaoya_tokens_ok() else f"{DIM}未填{RST}"))
         _mt = xiaoya_mounted(d)
-        _np = len(_paths_under(explicit_scan_paths(), XIAOYA_MOUNT)) if _mt else 0
+        _xw = xiaoya_scan_label() if _mt else "未挂"
         print(f"  3. {pad('扫描路径', 20)}当前："
-              + ((f"{GREEN}已挂 · {_np} 个目录{RST}" if _np else f"{YELLOW}已挂 · 未加目录{RST}")
-                 if _mt else f"{DIM}未挂{RST}"))
+              + (f"{GREEN}{_xw}{RST}" if _mt and _xw != "未加路径" else f"{DIM}{_xw}{RST}"))
         print(f"  4. 移除小雅")
         print("  0. 返回")
         print("-" * 60)
@@ -25907,8 +25983,10 @@ def mount_paths_menu():
         return
     mark_drive_defaults_empty(d)          # 头一回来挂盘的新机器：之后挂的都算新盘
     while True:
+        # 【小雅不单列一行 WebDAV】仓库主人：「这个怎么跑到外面来了……这个要放在小雅里面」。
+        # 它的扫描路径、状态都在下面「小雅（自建）」那一栏里管，见 _xiaoya_menu
         stores = [(mp, drv, st) for mp, drv, st, _r, _m in openlist_storages(d)
-                  if mp and mp != "/"]
+                  if mp and mp != "/" and mp != XIAOYA_MOUNT]
         # 【按用户排的先后显示】补时长、截封面也按这个先后（见 mount_rank）
         _pos = {mp: i for i, mp in enumerate(order_mounts([x[0] for x in stores]))}
         stores.sort(key=lambda x: _pos.get(x[0], 0))
@@ -25948,6 +26026,17 @@ def mount_paths_menu():
         # 应该是放在 7 ＋ 添加 WebDAV」。一个 WebDAV 都没有时，这一栏就是「WebDAV 未挂载」，
         # 入口照样在（第四节：入口不准依附在会消失的东西上）。
         extra = []
+        # 【小雅紧跟在挂好的盘后面】挂上了就跟别的盘一样显示扫描路径和走不走 VPS 流量；没挂显示状态。
+        # 没装也在（第四节：入口不准依附在会消失的东西上），见 _xiaoya_menu
+        _xy = xiaoya_state()
+        if xiaoya_mounted(d):
+            _xw = xiaoya_scan_label()
+            _xtxt = (f"{CYAN if _xw != '未加路径' else DIM}{pad(_xw, 20)}{RST}"
+                     + opt_tag("__source__", "proxy"))
+        else:
+            _xtxt = (f"{GREEN}{_xy}{RST}" if _xy == "在跑"
+                     else f"{YELLOW if _xy == '停了' else DIM}{_xy}{RST}")
+        extra.append((f"{pad('小雅（自建）', 19)}" + _xtxt, lambda: _xiaoya_menu(d)))
         if no115:
             extra.append((f"{pad('115 网盘', 19)}{YELLOW}未挂载{RST}",
                           lambda: _drive_menu(d, MOUNT_115, DRIVER_115, mounted=False)))
@@ -25965,12 +26054,6 @@ def mount_paths_menu():
                       lambda: _rest_menu(d)))
         extra.append((f"{pad('调整顺序', 19)}{DIM}补时长、截封面按上面的先后来{RST}",
                       lambda: stores and _mount_order_menu(stores)))
-        # 【小雅：常驻一栏，排在最后】没装也在（第四节：入口不准依附在会消失的东西上），见 _xiaoya_menu。
-        # 放最后是为了不挪动上面那些栏的编号 —— 按惯了的数字不能变
-        _xy = xiaoya_state()
-        extra.append((f"{pad('小雅（自建）', 19)}"
-                      + (f"{GREEN}{_xy}{RST}" if _xy == "在跑" else f"{YELLOW if _xy == '停了' else DIM}{_xy}{RST}"),
-                      lambda: _xiaoya_menu(d)))
         for j, (txt, _fn) in enumerate(extra, n + 1):
             print(f"  {j:>2}. {txt}")
         # 【"扫全部"不放这一屏】这一屏管的是设置（哪些盘、扫哪些目录、各自的定时），
