@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.370"
+SCRIPT_VERSION = "1.5.371"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23398,6 +23398,12 @@ XIAOYA_MIN_FREE_GB = 10
 XIAOYA_FILES = (("mytoken.txt", "阿里云盘 token"),
                 ("myopentoken.txt", "阿里云盘 open token"),
                 ("temp_transfer_folder_id.txt", "转存文件夹 ID"))
+# 115 / 夸克是加在阿里上面的（阿里那三样还是必需的：小雅的片库底子是阿里分享）。
+#   · 115：115_cookie.txt + ali2115.txt —— 播阿里的片先秒传进你的 115 再走 115 播，不吃阿里没会员的限速；
+#     小雅里 115 分享的那部分也靠它
+#   · 夸克：quark_cookie.txt —— 小雅里夸克分享的那部分靠它
+XIAOYA_115 = ("115_cookie.txt", "ali2115.txt")
+XIAOYA_QUARK = ("quark_cookie.txt",)
 
 
 def xiaoya_state():
@@ -23559,7 +23565,7 @@ def _xiaoya_scan():
             got["temp_transfer_folder_id.txt"] = fid
             ok(f"转存文件夹已建好：{XIAOYA_TEMP_NAME}")
         else:
-            warn("转存文件夹没建成，回这一屏选「3 手动填令牌」补上")
+            warn("转存文件夹没建成，回这一屏选「5 手动填令牌」补上")
     print()
     info("第 2 次扫码：开放平台授权（小雅播放用）")
     ot = alitv_scan_login()
@@ -23568,25 +23574,207 @@ def _xiaoya_scan():
     return got
 
 
+# ---- 115 扫码 → cookie ----------------------------------------------------------------------
+# 二维码、等确认跟「挂上 115」那一套是同一个（_qr115_new）；确认后不交给 OpenList，自己拿去换 cookie。
+# 【换 cookie 用另一种客户端】115 同一种客户端只许登一处：OpenList 的 /115 用的是「网页」，这里也用网页
+# 两边就互相踢下线（跟阿里「另取一份」一个道理）。支付宝小程序那一种不跟它抢；换不成再试微信小程序。
+PAN115_LOGIN = "https://passportapi.115.com/app/1.0/{0}/1.0/login/qrcode/"
+PAN115_APPS = ("alipaymini", "wechatmini")
+PAN115_MKDIR = "https://webapi.115.com/files/add"
+
+
+def pan115_cookie(uid, opener=None):
+    """扫码确认过的令牌 → (cookie 串, 用的哪种客户端)；换不成 → ("", "")。"""
+    for app in PAN115_APPS:
+        req = urllib.request.Request(PAN115_LOGIN.format(app),
+                                     data=urllib.parse.urlencode({"account": uid, "app": app}).encode(),
+                                     headers={"User-Agent": HTTP_UA,
+                                              "Content-Type": "application/x-www-form-urlencoded"})
+        try:
+            with (opener or urllib.request.urlopen)(req, timeout=20) as r:
+                ck = ((json.load(r).get("data") or {}).get("cookie") or {})
+        except Exception:
+            continue
+        if ck.get("UID") and ck.get("SEID"):
+            return "; ".join(f"{k}={ck[k]}" for k in ("UID", "CID", "SEID", "KID") if ck.get(k)), app
+    return "", ""
+
+
+def pan115_temp_dir(cookie, opener=None):
+    """在 115 根目录建「小雅转存」（已经有就算建不成）→ 文件夹 ID；建不成 → ""。"""
+    req = urllib.request.Request(PAN115_MKDIR, data=urllib.parse.urlencode(
+        {"pid": "0", "cname": XIAOYA_TEMP_NAME}).encode(),
+        headers={"User-Agent": HTTP_UA, "Cookie": cookie,
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with (opener or urllib.request.urlopen)(req, timeout=20) as r:
+            j = json.load(r)
+    except Exception:
+        return ""
+    return str(j.get("cid") or j.get("file_id") or "") if j.get("state") else ""
+
+
+def ali2115_text(cookie, dir_id):
+    """小雅的 ali2115.txt。【没建成转存文件夹就不自动清】dir_id=0 是 115 根目录，清临时文件别清到根上去。"""
+    return (f"purge_ali_temp=true\n"
+            f'cookie="{cookie}"\n'
+            f"purge_pan115_temp={'true' if dir_id else 'false'}\n"
+            f"dir_id={dir_id or '0'}\n")
+
+
+def _xiaoya_scan_115():
+    """扫 115 → {文件名: 内容}；没成 → {}。「只拿令牌」那一屏记着的那串不动（这一串换完 cookie 就没用了）。"""
+    keep = {k: ms_state().get(k) for k in ("qr115_uid", "qr115_tm", "qr115_sign", "qr115_at")}
+    _QR115_AUTOMOUNT[0] = True
+    try:
+        uid, state = _qr115_new()
+    finally:
+        _QR115_AUTOMOUNT[0] = False
+        save_ms_state(**keep)
+    if state != 2:
+        return {}
+    cookie, _app = pan115_cookie(uid)
+    if not cookie:
+        warn("扫上了，但没换到 115 的 cookie，再扫一次试试")
+        return {}
+    fid = pan115_temp_dir(cookie)
+    if fid:
+        ok(f"115 转存文件夹已建好：{XIAOYA_TEMP_NAME}")
+    else:
+        warn("115 转存文件夹没建成：转存放 115 根目录，不自动清")
+    return {"115_cookie.txt": cookie, "ali2115.txt": ali2115_text(cookie, fid)}
+
+
+# ---- 夸克扫码 → cookie ------------------------------------------------------------------------
+# 夸克网页版的扫码登录（uop.quark.cn 那两个接口），确认后拿 service_ticket 去 pan.quark.cn 换 cookie。
+# 跟「Quark TV」那份登录不相干（那份是 TV 接口的令牌，小雅要的是网页 cookie）。浏览器那张脸是故意的。
+QUARK_UOP = "https://uop.quark.cn/cas/ajax/"
+QUARK_CLIENT = "532"
+QUARK_QR = ("https://su.quark.cn/4_eMHBJ?token={}&client_id=" + QUARK_CLIENT + "&ssb=weblogin&uc_param_str="
+            "&uc_biz_str=S%3Acustom%7COPT%3ASAREA%400%7COPT%3AIMMERSIVE%401%7COPT%3ABACK_BTN_STYLE%400")
+QUARK_ACCOUNT = "https://pan.quark.cn/account/info?st={}&lw=scan"
+
+
+def _quark_rid():
+    h = secrets.token_hex(16)
+    return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+
+
+def _quark_get(url, opener=None):
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Referer": "https://pan.quark.cn/"})
+    with (opener or urllib.request.urlopen)(req, timeout=20) as r:
+        return json.load(r)
+
+
+def quark_cookie_from_ticket(st):
+    """service_ticket → 夸克网页 cookie 串（__pus / __puus 那几个）；换不成 → ""。"""
+    import http.cookiejar
+    jar = http.cookiejar.CookieJar()
+    try:
+        _quark_get(QUARK_ACCOUNT.format(urllib.parse.quote(st)),
+                   urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar)).open)
+    except Exception:
+        pass
+    return "; ".join(f"{c.name}={c.value}" for c in jar if c.value)
+
+
+def quark_web_scan_login(opener=None, poll=2, wait_s=300):
+    """终端里扫夸克网页版的登录码 → cookie 串；失败 / 放弃 → ""。"""
+    try:
+        rid = _quark_rid()
+        tok = str(((_quark_get(f"{QUARK_UOP}getTokenForQrcodeLogin?client_id={QUARK_CLIENT}&v=1.2"
+                               f"&request_id={rid}", opener).get("data") or {}).get("members") or {})
+                  .get("token") or "")
+    except Exception as e:
+        warn(f"没拿到夸克的二维码：{_short_err(e)[:60]}")
+        return ""
+    if not tok:
+        warn("夸克没给二维码")
+        return ""
+    grid = qr_encode(QUARK_QR.format(tok))
+    if not grid:
+        warn("二维码画不出来")
+        return ""
+    print()
+    print("\n".join(qr_screen(grid)))
+    print()
+    tip("夸克 App 扫一扫，再在手机上点确认" + qr_both_note())
+    deadline = time.time() + wait_s
+    st = ""
+    try:
+        while time.time() < deadline:
+            try:
+                j = _quark_get(f"{QUARK_UOP}getServiceTicketByQrcodeToken?client_id={QUARK_CLIENT}&v=1.2"
+                               f"&token={tok}&request_id={_quark_rid()}", opener)
+            except Exception:
+                j = {}
+            code = j.get("status")
+            if code == 2000000:
+                st = str(((j.get("data") or {}).get("members") or {}).get("service_ticket") or "")
+                break
+            if code == 50004002:
+                print("\r\x1b[2K", end="")
+                warn("二维码过期了，再来一次。")
+                return ""
+            left = int(deadline - time.time())
+            print(f"\r    {DIM}{pad('等待扫码…', 30)}还剩 {left // 60}:{left % 60:02d}{RST}", end="", flush=True)
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        print()
+        warn("已中断。")
+        return ""
+    print("\r\x1b[2K", end="")
+    if not st:
+        warn("没等到确认。")
+        return ""
+    cookie = quark_cookie_from_ticket(st)
+    if "__pus" not in cookie:
+        warn("扫上了，但没换到夸克的 cookie，再扫一次试试")
+        return ""
+    ok("夸克扫码确认成功")
+    return cookie
+
+
+def _xiaoya_has(files):
+    try:
+        return all(open(os.path.join(XIAOYA_DIR, f), encoding="utf-8").read().strip() for f in files)
+    except OSError:
+        return False
+
+
+def xiaoya_login_label():
+    """「已登录 · 115 · 夸克」这种：阿里那份之外，115 / 夸克登了哪个就带上哪个。"""
+    return "".join([" · 115" if _xiaoya_has(XIAOYA_115) else "", " · 夸克" if _xiaoya_has(XIAOYA_QUARK) else ""])
+
+
 def xiaoya_set_tokens(d=None):
-    """「1 扫码登录」：1 扫码登录 / 2 退出登录 / 3 手动填令牌。三样写进 /etc/xiaoya（root-only，不回显、不进日志）。
+    """「1 扫码登录」：1 阿里扫码 / 2 115 扫码 / 3 夸克扫码 / 4 退出登录 / 5 手动填令牌。
+    写进 /etc/xiaoya（root-only，不回显、不进日志）。仓库主人：「做吧，115 和夸克都做成扫码」。
     返回改没改。
 
     仓库主人：「这两个（安装 / 启动、阿里令牌）我觉得可以设计在一起……扫完码可以直接带着安装了，退出登录
     也不用卸载安装，但是在外面删除小雅可以删除全部安装」。所以扫完：没装就接着装、停着就起、在跑就换新令牌重启。
     【手动填令牌留着】扫码拿不全（转存文件夹没建成）时靠它补，第四节：入口不许悄悄没了。"""
-    print(f"  1. 扫码登录")
-    print(f"  2. 退出登录")
-    print(f"  3. 手动填令牌")
+    _on = lambda files: f"{CYAN}已登录{RST}" if _xiaoya_has(files) else f"{DIM}未登录{RST}"
+    print(f"  1. {pad('阿里扫码（必需）', 19)}当前：{_on([f for f, _n in XIAOYA_FILES])}")
+    print(f"  2. {pad('115 扫码（不限速）', 19)}当前：{_on(XIAOYA_115)}")
+    print(f"  3. {pad('夸克扫码', 19)}当前：{_on(XIAOYA_QUARK)}")
+    print(f"  4. 退出登录")
+    print(f"  5. 手动填令牌")
     print("  0. 返回")
-    tip("请用阿里网盘扫码登录，换号直接扫另一个号")
+    tip("先扫阿里（必需），115、夸克可选；换号直接扫另一个号")
     c = ask("请选择（回车 = 返回）").strip()
     got = {}
     if c == "1":
         got = _xiaoya_scan()
     elif c == "2":
-        return xiaoya_logout()
+        got = _xiaoya_scan_115()
     elif c == "3":
+        ck = quark_web_scan_login()
+        got = {"quark_cookie.txt": ck} if ck else {}
+    elif c == "4":
+        return xiaoya_logout()
+    elif c == "5":
         tip("阿里令牌要另取一份，跟 OpenList 的 /aliyun 共用会互相踢下线")
         for f, name in XIAOYA_FILES:
             v = _ask_secret(f"{name}（回车跳过、不改）").strip()
@@ -23600,7 +23788,7 @@ def xiaoya_set_tokens(d=None):
     os.makedirs(XIAOYA_DIR, mode=0o700, exist_ok=True)
     os.chmod(XIAOYA_DIR, 0o700)
     for f, v in got.items():
-        write_atomic(os.path.join(XIAOYA_DIR, f), v + "\n", 0o600)
+        write_atomic(os.path.join(XIAOYA_DIR, f), v.rstrip("\n") + "\n", 0o600)
     ok(f"已存 {len(got)} 项（{XIAOYA_DIR}，只有 root 能读）")
     if xiaoya_state() == "在跑":
         sh(f"docker restart {XIAOYA_NAME}", timeout=120)
@@ -23614,24 +23802,43 @@ def xiaoya_set_tokens(d=None):
 
 
 def xiaoya_logout():
-    """退出登录：删掉三样令牌、把小雅停下。容器、OpenList 里的 /xiaoya、扫描路径都留着，重新扫码就回来。
-    → 退了没有。【停下】令牌删了它也还攥着旧的那份在用，不停就等于没退。"""
-    if not any(os.path.exists(os.path.join(XIAOYA_DIR, f)) for f, _n in XIAOYA_FILES):
+    """退出登录。只登了阿里：直接退；还登了 115 / 夸克：先问退哪个。
+    退阿里 = 全部退：删掉所有令牌 / cookie、把小雅停下（令牌删了它也还攥着旧的那份在用，不停就等于没退）。
+    只退 115 / 夸克：删那几个文件、小雅重启一下换掉。容器、OpenList 里的 /xiaoya、扫描路径都留着。→ 退了没有。"""
+    ali = [f for f, _n in XIAOYA_FILES]
+    have = lambda fs: any(os.path.exists(os.path.join(XIAOYA_DIR, f)) for f in fs)
+    extra = [(n, fs) for n, fs in (("115", XIAOYA_115), ("夸克", XIAOYA_QUARK)) if have(fs)]
+    if not have(ali) and not extra:
         info("本来就没登录。")
         return False
+    drop, whole = ali + list(XIAOYA_115) + list(XIAOYA_QUARK), True
+    if extra:
+        print()
+        print("  1. 全部退出")
+        for i, (n, _fs) in enumerate(extra, 2):
+            print(f"  {i}. 只退 {n}")
+        print("  0. 返回")
+        c = ask("请选择（回车 = 返回）").strip()
+        if c.isdigit() and 2 <= int(c) < 2 + len(extra):
+            drop, whole = list(extra[int(c) - 2][1]), False
+        elif c != "1":
+            return False
     print()
-    tip(f"退出后 {XIAOYA_MOUNT} 打不开，Emby 里小雅的片子都放不了，重新扫码登录才恢复")
+    if whole:
+        tip(f"退出后 {XIAOYA_MOUNT} 打不开，Emby 里小雅的片子都放不了，重新扫码登录才恢复")
+    else:
+        tip("退出后小雅里这个盘的资源放不了，小雅会重启一下")
     if not ask_yn("确定退出登录？", False):
         print("没有改动。")
         return False
-    for f, _n in XIAOYA_FILES:
+    for f in drop:
         try:
             os.remove(os.path.join(XIAOYA_DIR, f))
         except OSError:
             pass
     if xiaoya_state() == "在跑":
-        sh(f"docker stop {XIAOYA_NAME}", timeout=120)
-    ok("小雅已退出登录（装好的小雅留着）")
+        sh(f"docker {'stop' if whole else 'restart'} {XIAOYA_NAME}", timeout=120)
+    ok("小雅已退出登录（装好的小雅留着）" if whole else "已退出")
     return True
 
 
@@ -23884,7 +24091,7 @@ def _xiaoya_menu(d):
         items = []
         add = lambda *x: items.append(x)
         _lg = (f"{YELLOW}未登录（扫码登录）{RST}" if not tok
-               else f"{CYAN}已登录{RST}" if st == "在跑"
+               else f"{CYAN}已登录{xiaoya_login_label()}{RST}" if st == "在跑"
                else f"{YELLOW}已登录 · {'没装' if st == '未装' else st}{RST}")
 
         def _login():
