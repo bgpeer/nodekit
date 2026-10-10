@@ -1322,6 +1322,40 @@ def _hy2_hop_unpersist():
     if gone:
         sh("systemctl daemon-reload", check=False)
 
+def _vmess_insec_heal():
+    """老装机自愈：自签（没有域名）装出来的 vmess 链接缺「跳过证书校验」，补上并刷新订阅（token 不变）。
+       只改本机自己的 vmess + TLS 链接（地址 = 本机 host），别的机器聚合过来的、CDN 的不碰。
+       补了返回 True；有域名（真证书）或没有要补的，什么都不做。"""
+    try:
+        if json.load(open(STATE_FILE)).get("domain"):
+            return False
+        host = open(HOST_FILE).read().strip()
+        lines = open(NODE_FILE).read().split("\n")
+    except Exception:
+        return False
+    hit = False
+    for i, l in enumerate(lines):
+        if l.startswith("#"):
+            break                                         # 「# 订阅链接:」往下不是节点
+        if not l.startswith("vmess://"):
+            continue
+        try:
+            b = l[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        except Exception:
+            continue
+        if j.get("tls") != "tls" or j.get("add") != host or j.get("allowInsecure"):
+            continue
+        j.update(_vmess_insec(True)); lines[i] = vmess_link(j); hit = True
+    if not hit:
+        return False
+    open(NODE_FILE, "w").write("\n".join(lines))
+    try:
+        G["host"] = host
+        build_subscription(read_saved_links(), new_token=False)
+    except Exception:
+        pass
+    return True
+
 def _hy2_hop_heal():
     """老装机自愈：sing-box 里有 hy2、跳跃没关，就补上兜底并当场跑一次。
        补回了缺的 DNAT 返回 True。没有 hy2 或跳跃关了什么都不做。"""
@@ -1441,6 +1475,13 @@ def make_sb_vless(transport):
         return ib, lk
     return b
 
+# vmess 的分享链接是 base64 JSON，没有 ?insecure= 那种查询参数，自签时「跳过证书校验」要写进 JSON 里。
+# 以前漏了这一项：其它协议自签都带 insecure=1，唯独 vmess 没带，客户端拿自签证书去校验 →
+# 「certificate relies on legacy Common Name field」握手失败，三个 vmess 节点在自签机上全部超时。
+# 字段名用 v2rayN 系通行的 allowInsecure；link_to_proxy 读它，订阅三格式都跟着走。
+def _vmess_insec(insec):
+    return {"allowInsecure": "1"} if insec else {}
+
 def make_sb_vmess(transport):
     def b(port, tag):
         uid = new_uuid(); path = "/" + secrets.token_hex(3)
@@ -1469,7 +1510,7 @@ def make_sb_vmess(transport):
         lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": str(port),
                          "id": uid, "aid": "0", "net": _VMESS_NET[transport],
                          "type": "none", "host": tls_host(), "path": path,
-                         "tls": "tls", "sni": tls_host(), **smk})
+                         "tls": "tls", "sni": tls_host(), **smk, **_vmess_insec(insec)})
         return ib, lk
     return b
 
@@ -1802,7 +1843,8 @@ def xr_vmess_ws(port, tag):
                              "tlsSettings": _xr_tls(crt, key)}}
     lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": str(port),
                      "id": uid, "aid": "0", "net": "ws", "type": "none",
-                     "host": tls_host(), "path": path, "tls": "tls", "sni": tls_host()})
+                     "host": tls_host(), "path": path, "tls": "tls", "sni": tls_host(),
+                     **_vmess_insec(insec)})
     return ib, lk
 
 def xr_vless_xhttp_tls(port, tag):
@@ -2093,6 +2135,9 @@ def link_to_proxy(u):
         d = {"name": name, "type": "vmess", "server": j["add"], "port": int(j["port"]), "uuid": j["id"],
              "alterId": int(j.get("aid", 0)), "cipher": j.get("scy", "auto"), "udp": "true"}
         if j.get("tls") == "tls": d["tls"] = "true"; d["servername"] = j.get("sni") or j.get("host")
+        if j.get("tls") == "tls" and any(str(j.get(k, "")).lower() in ("1", "true")
+                                         for k in ("allowInsecure", "insecure", "skip-cert-verify")):
+            d["skip-cert-verify"] = "true"
         net = j.get("net", "tcp")
         if net == "ws": d["network"] = "ws"; d["ws-opts"] = {"path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}}
         elif net == "httpupgrade": d["network"] = "ws"; d["ws-opts"] = {"path": j.get("path", "/"), "headers": {"Host": j.get("host", "")}, "v2ray-http-upgrade": "true"}
@@ -4410,6 +4455,8 @@ def cfg_auto_run():
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                # 内核每月那条也一起对齐（老装机是按 6 月写死的）
     _heal_other_crons()
+    if _vmess_insec_heal():                     # 自签 vmess 缺跳过证书校验：补上（不进菜单的机器也能修好）
+        print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
     day = _cfg_auto_due()
     if not day:
         return                                  # 今天已跑过：安静退出
@@ -9044,6 +9091,8 @@ def main_menu():
         print("  ✓ 已修好 sing-box 的本机 DNS（sing-box 已重启）")
     if _hy2_hop_heal():
         print("  ✓ 已补回 hy2 端口跳跃规则（以后 sing-box 每次启动都会自动检查）")
+    if _vmess_insec_heal():
+        print("  ✓ 已修好自签 vmess 节点（订阅地址不变，客户端刷新一次订阅即可）")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     if os.path.exists(CORE_CRON_FILE):
