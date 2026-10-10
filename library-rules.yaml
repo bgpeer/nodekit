@@ -125,3 +125,12 @@
   image_scrapers: TheMovieDb, TheTVDB, FanArt
   metatube: false
   keywords: 纪录片, 纪录, documentary
+- name: 综艺
+  type: tvshows
+  language: zh-CN
+  country: CN
+  scrapers: TheTVDB, TheMovieDb
+  image_scrapers: TheTVDB, FanArt, TheMovieDb
+  metatube: false
+  episode_number: true
+  keywords: 综艺, 真人秀, variety

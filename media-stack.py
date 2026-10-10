@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.366"
+SCRIPT_VERSION = "1.5.367"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -9694,6 +9694,7 @@ LIB_RULES_DEFAULT = [
     {"name": "动漫",   "kw": ["动漫", "动画", "番剧", "anime"],      "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
     {"name": "动漫电影", "kw": ["动漫电影", "剧场版"],               "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
     {"name": "纪录片", "kw": ["纪录片", "纪录", "documentary"],      "type": "movies",  "mt": False, "lang": "zh", "country": "CN"},
+    {"name": "综艺",   "kw": ["综艺", "真人秀", "variety"],          "type": "tvshows", "mt": False, "lang": "zh", "country": "CN"},
     # 【兜底往安全的方向倒】private 默认开着。这份内置名单是拉不到仓库那份规则文件
     # 时才用的。那种时候如果成人库对所有账号可见，用户多半还不知道有这回事 ——
     # 而这个疏忽是当场、当着人暴露的。想让所有账号都能看，规则里显式写 private: false。
@@ -23567,7 +23568,7 @@ def _xiaoya_scan():
     return got
 
 
-def xiaoya_set_tokens():
+def xiaoya_set_tokens(d=None):
     """小雅要的三样：扫码拿（推荐）或者手动粘贴（不回显、不进日志），写进 /etc/xiaoya，root-only。返回改没改。"""
     print(f"  1. 扫码（推荐）")
     print(f"  2. 手动粘贴")
@@ -23595,6 +23596,10 @@ def xiaoya_set_tokens():
     if xiaoya_state() == "在跑":
         sh(f"docker restart {XIAOYA_NAME}", timeout=120)
         ok("小雅已重启，用新令牌")
+    elif d and xiaoya_state() == "未装" and xiaoya_tokens_ok():
+        # 【填好就接着装、装好就挂】仓库主人：「应该在扫码成功的时候就挂上全盘」。装之前那句确认照旧要
+        print()
+        xiaoya_install(d)
     return True
 
 
@@ -23634,25 +23639,58 @@ def xiaoya_install(d):
         err(f"没起来：{_short_err((r.stderr or r.stdout or '').strip())}")
         return False
     save_ms_state(xiaoya_ours=True)       # 卸载媒体栈时只带走自己装的这份，见 do_uninstall
-    ok("小雅已启动　第一次要下几百 MB 目录数据，过 5–10 分钟再「3 挂进 OpenList」")
+    ok("小雅已启动")
+    xiaoya_wait_mount(d)
     return True
+
+
+XIAOYA_READY_S = 900          # 第一次起要下几百 MB 目录数据，真机 08:37 起、09:02 挂上；最多等这么久
+XIAOYA_RETRY_S = 20
+
+
+def xiaoya_wait_mount(d, wait_s=None):
+    """等小雅准备好就挂进 OpenList（整个盘）。等不到 / Ctrl-C 也不要紧：之后选「3 扫描路径」会先挂上。"""
+    wait_s = XIAOYA_READY_S if wait_s is None else wait_s
+    info(f"等小雅下完目录数据就自动挂上 {XIAOYA_MOUNT}（一般 5–10 分钟，Ctrl-C 可跳过）")
+    end = time.time() + wait_s
+    try:
+        while True:
+            if xiaoya_mount(d, quiet=True):
+                print("\r\x1b[2K", end="")
+                ok(f"小雅已挂上：{XIAOYA_MOUNT}（整个盘）　{YELLOW}⚠ 走 VPS 流量{RST}")
+                tip("在「3 扫描路径」里只加要看的几个目录，别扫整个小雅")
+                return True
+            left = int(end - time.time())
+            if left <= 0:
+                break
+            print(f"\r    {DIM}{pad('小雅还在准备…', 24)}最多再等 {left // 60}:{left % 60:02d}{RST}",
+                  end="", flush=True)
+            time.sleep(min(XIAOYA_RETRY_S, left))
+    except KeyboardInterrupt:
+        print()
+    print("\r\x1b[2K", end="")
+    warn("小雅还没准备好，过几分钟选「3 扫描路径」，会先自动挂上")
+    return False
 
 
 def xiaoya_mounted(d):
     return any(mp == XIAOYA_MOUNT for mp, *_x in openlist_storages(d))
 
 
-def xiaoya_mount(d):
-    """在 OpenList 里挂 /xiaoya（WebDAV，本机代理，跟七米蓝一样）。返回成没成。"""
+def xiaoya_mount(d, quiet=False):
+    """在 OpenList 里挂 /xiaoya（WebDAV，本机代理，跟七米蓝一样）。返回成没成。quiet：等着重试那条路不上屏。"""
     if xiaoya_mounted(d):
-        ok(f"已经挂着：{XIAOYA_MOUNT}")
+        if not quiet:
+            ok(f"已经挂着：{XIAOYA_MOUNT}")
         return True
     if xiaoya_state() != "在跑":
-        warn("小雅没在跑，先「1 安装 / 启动」")
+        if not quiet:
+            warn("小雅没在跑，先「1 安装 / 启动」")
         return False
     tok = _ol_token(d)
     if not tok:
-        err("登不上 OpenList（它在跑吗？）")
+        if not quiet:
+            err("登不上 OpenList（它在跑吗？）")
         return False
     user, pw = XIAOYA_GUEST
     try:
@@ -23661,20 +23699,34 @@ def xiaoya_mount(d):
         pass
     add = {"vendor": "other", "address": XIAOYA_DAV, "username": user, "password": pw,
            "root_folder_path": "/", "tls_insecure_skip_verify": False}
-    info(f"正在 OpenList 里挂上 {XIAOYA_MOUNT} ...")
+    if not quiet:
+        info(f"正在 OpenList 里挂上 {XIAOYA_MOUNT} ...")
     try:
         r = _ol_api("/api/admin/storage/create",
                     _ol_storage_body(XIAOYA_MOUNT, DRIVER_DAV, add, proxy=True), tok, timeout=60)
     except Exception as e:
-        err(f"没挂上：{_short_err(e)}")
+        if not quiet:
+            err(f"没挂上：{_short_err(e)}")
         return False
     if r.get("code") != 200:
         _ol_drop_storage(d, XIAOYA_MOUNT, tok)
-        err(f"没挂上：{_short_err(str(r.get('message') or ''))[:60]}")
-        tip("小雅刚装的话还在下数据，过几分钟再挂")
+        if not quiet:
+            err(f"没挂上：{_short_err(str(r.get('message') or ''))[:60]}")
+            tip("小雅刚装的话还在下数据，过几分钟再试")
         return False
-    ok(f"小雅已挂上：{XIAOYA_MOUNT}　{YELLOW}⚠ 走 VPS 流量{RST}")
-    tip("别扫整个小雅：在「3 挂载路径」里点它 → 2 修改扫描路径，只加要看的几个目录")
+    if not quiet:
+        ok(f"小雅已挂上：{XIAOYA_MOUNT}　{YELLOW}⚠ 走 VPS 流量{RST}")
+    return True
+
+
+def xiaoya_paths(d):
+    """「3 扫描路径」：没挂就先挂上整个盘，再进这个盘的扫描路径（加 / 删要进 Emby 的目录）。
+
+    仓库主人：「把那个挂进 OpenList 做成修改路径的可以细分」。挂盘这一步没删，并进来了：没挂时先挂。"""
+    if not xiaoya_mounted(d) and not xiaoya_mount(d):
+        return False
+    tip("只加要看的几类（电影 / 电视剧 / 动漫 / 纪录片 / 综艺），别加整个小雅")
+    _drive_paths_menu(d, XIAOYA_MOUNT)
     return True
 
 
@@ -23712,21 +23764,25 @@ def _xiaoya_menu(d):
         print(f"  1. {pad('安装 / 启动', 20)}当前：{col}{st}{RST}")
         print(f"  2. {pad('阿里令牌', 20)}当前："
               + (f"{GREEN}已填{RST}" if xiaoya_tokens_ok() else f"{DIM}未填{RST}"))
-        print(f"  3. {pad('挂进 OpenList', 20)}当前："
-              + (f"{GREEN}已挂 {XIAOYA_MOUNT}{RST}" if xiaoya_mounted(d) else f"{DIM}未挂{RST}"))
+        _mt = xiaoya_mounted(d)
+        _np = len(_paths_under(explicit_scan_paths(), XIAOYA_MOUNT)) if _mt else 0
+        print(f"  3. {pad('扫描路径', 20)}当前："
+              + ((f"{GREEN}已挂 · {_np} 个目录{RST}" if _np else f"{YELLOW}已挂 · 未加目录{RST}")
+                 if _mt else f"{DIM}未挂{RST}"))
         print(f"  4. 移除小雅")
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
         if c in ("0", "", "q"):
             return
-        fn = {"1": lambda: xiaoya_install(d), "2": xiaoya_set_tokens,
-              "3": lambda: xiaoya_mount(d), "4": lambda: xiaoya_remove(d)}.get(c)
+        fn = {"1": lambda: xiaoya_install(d), "2": lambda: xiaoya_set_tokens(d),
+              "3": lambda: xiaoya_paths(d), "4": lambda: xiaoya_remove(d)}.get(c)
         if fn is None:
             print("无效选择。")
             continue
         fn()
-        ask("\n按回车继续...")
+        if c != "3":                  # 扫描路径那一屏自己有「0 返回」，回来不用再按一次回车
+            ask("\n按回车继续...")
 
 
 def qr115_status(uid, tm, sign):
