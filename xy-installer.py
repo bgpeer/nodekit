@@ -6590,13 +6590,11 @@ def _cdn_wipe_all(nodes):
     except OSError: pass
 
 def cdn_add():
-    """CDN 节点安装：协议可多选、一次装多条；已装则问清空重装 / 追加 / 返回。"""
-    print("\n" + "=" * 60)
-    print("  CDN 节点安装（域名 + Cloudflare 中转，防 IP 被墙时续命）")
-    print("=" * 60)
-    print("  原理：客户端连 Cloudflare 的 IP、不是你 VPS 的 IP；VPS 真 IP 被墙也能用。")
-    print("  前提：一个域名，且能挂到 Cloudflare（免费版就行）。")
-    print("-" * 60)
+    """CDN 节点安装：协议可多选、一次装多条；已装则问清空重装 / 追加 / 返回。
+       原理：客户端连 Cloudflare 的 IP、不是 VPS 的 IP，VPS 真 IP 被墙也能用；前提是一个能挂到
+       Cloudflare 的域名（免费版就行）。装完默认写进订阅——IP 被墙时它就是主力，不该再让人去点菜单 4。"""
+    ui_title("CDN 节点安装")
+    ui_tip("要一个挂在 Cloudflare 的域名；客户端连 CF，VPS 的 IP 被墙也能用")
     nodes = _cdn_load()
     if nodes:                                             # 已安装 → 问怎么处理
         print(f"  检测到已安装 {len(nodes)} 条 CDN 节点。")
@@ -6617,8 +6615,10 @@ def cdn_add():
     if "." not in domain or "/" in domain or " " in domain:
         print("  域名格式不对，已取消。"); return
 
-    print("  选协议: 1 VLESS+WS(默认·最稳) / 2 VLESS+XHTTP(最快) / 3 VMess+WS / 4 Trojan+WS")
-    protos = _parse_cdn_protos(_ask("  选择(回车=1；可多选，逗号分隔如 1,3,4；a=全部): "))
+    ui_line()
+    ui_items([(1, "VLESS + WS", "默认·最稳"), (2, "VLESS + XHTTP", "最快"),
+              (3, "VMess + WS", None), (4, "Trojan + WS", None)])
+    protos = _parse_cdn_protos(_ask("选协议（回车 = 1；多选用逗号如 1,3,4；a = 全部）: "))
     if not protos:
         print("  没选到有效协议，已取消。"); return
     if len(protos) > free:
@@ -6635,7 +6635,8 @@ def cdn_add():
     # 核心：只对不强制 xray 的协议问一次（xhttp / 量子加密的 VLESS 强制 xray）
     core_choice = "sing-box"
     if any(not forced_xray(p) for p in protos):
-        core_choice = "xray" if _ask("  非 XHTTP 的用哪个核心? 1 sing-box(默认) / 2 xray: ").strip() == "2" else "sing-box"
+        ui_items([(1, "sing-box", "默认"), (2, "xray", None)])
+        core_choice = "xray" if _ask("非 XHTTP 的用哪个核心（回车 = 1）: ").strip() == "2" else "sing-box"
     if "vless-xhttp" in protos:
         print("  （XHTTP 入站仅 xray 支持，那条自动用 xray）")
     if qe:
@@ -6669,25 +6670,36 @@ def cdn_add():
         print("  ✗ 没有成功新增的节点。"); return
     _cdn_save(nodes)
     ports = "、".join(str(n["cf_port"]) for n in created)
-    print(f"\n  ✓ 新增成功 {len(created)} 条（共 {len(nodes)} 条，各自独立服务、与主节点互不影响）。")
-    print(f"  记得在 CF 把域名 {created[0]['domain']} 绑到本机 IP、开橙云，VPS 放行端口：{ports}")
-    print("  （详细步骤见本菜单顶部说明）。")
+    # 每条各自独立服务、与主节点互不影响；有优选地址时链接地址位已换成它，SNI/Host 仍是域名
+    ui_title(f"已新增 {len(created)} 条 CDN 节点（共 {len(nodes)} 条）")
+    print_node_links([_cdn_link(n) for n in created])
+    ui_line()
+    ui_tip(f"CF 里 {created[0]['domain']} 解析到本机、开橙云、SSL 选 Full；VPS 放行 {ports}")
     if pref:
-        print(f"  优选地址：沿用 {pref}（链接地址位已换成它，SNI/Host 仍是 {created[0]['domain']}）")
-    print("\n  ▼ 本次新增的备用链接（导入客户端用；平时留着不用即可）:")
-    for i, n in enumerate(created, 1):
-        print(f"  {i}. {_cdn_link(n)}")
+        ui_kv("优选地址", f"沿用 {pref}")
 
-    # 装完顺手筛一批优选候选：CDN 走 CF 任播，默认解析到哪个边缘全看运气，往往又慢又挤。
-    # 先筛一批写进来，让客户端 URLTest 自己挑最快的；以后想换就进菜单 2「优选地址」。
+    # 装完默认写进订阅（仓库主人：「改成装完直接问，默认写入」）。IP 被墙时 CDN 就是主力，
+    # 以前装完只留备用链接、要再进菜单 4 写入，容易漏。写入时连同优选候选一起进（见 _cdn_sub_links）。
+    if (_ask("写进三大订阅？（回车 = 写入 / n = 只留备用链接）: ").strip().lower() or "y") not in ("n", "no"):
+        cfg = _pref_load()
+        was = any(n.get("in_sub") for n in nodes)
+        old = _cdn_state_links(nodes, cfg)              # 先算快照：改完就还原不出旧链接了
+        for n in nodes:
+            n["in_sub"] = True                          # 和菜单 4 一致：全部一起写，不留半进半出
+        _cdn_save(nodes)
+        _cdn_resync(old, was)
+        print("  ✔ 已写进三大订阅（订阅地址不变）")
+    else:
+        print("  已只留备用链接，想写随时进菜单 4")
+
+    # 装完顺手筛一批优选候选：CDN 走 CF 任播，默认解析到哪个边缘全看运气，实测常比优选后慢好几倍。
+    # 筛出来的多条候选一起写进订阅，由客户端 URLTest 自己挑最快的（只有客户端测得到你那边到 CF 的延迟）；
+    # 以后想换就进菜单 2「优选地址」。
     cfg = _pref_load()
-    print("\n" + "-" * 60)
-    print("  ▼ 优选候选：现在筛一批更快的 CF 边缘吗？")
-    print("    默认解析到的边缘全看运气，实测常比优选后慢好几倍。筛出来的多条候选一起写进")
-    print("    订阅，最终由客户端自己挑最快的那条——只有客户端测得到你这边到 CF 的真实延迟。")
-    print(f"    代价：下载测速最多耗 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量，约一两分钟。")
-    if (_ask("  回车=筛（推荐） / n=跳过: ").strip().lower() or "y") in ("n", "no"):
-        print("  已跳过。想筛随时进菜单 2「优选地址」→ 1。")
+    ui_line()
+    ui_tip(f"筛一批更快的 CF 边缘，客户端自动挑最快的（约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量、一两分钟）")
+    if (_ask("现在筛？（回车 = 筛 / n = 跳过）: ").strip().lower() or "y") in ("n", "no"):
+        print("  已跳过，想筛随时进菜单 2「优选地址」")
         return
     cdn_pref_scan(ask=False)
 
@@ -7008,10 +7020,11 @@ def cdn_pref_scan(ask=True):
     cfg = _pref_load()
     n_out = max(1, int(cfg.get("n_cand_out", 5)))
     base = _cdn_cand_base(nodes)
-    print(f"\n  测速筛候选：粗筛出最多 {n_out} 个 CF 边缘，各写一条 "
-          f"[{base.get('proto')}] 节点进订阅。")
-    print(f"  它们共用同一个服务端入站，不新建任何服务；最终由客户端 URLTest 挑最快的那条。")
-    print(f"  下载测速最多消耗约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量。")
+    # 粗筛出最多 n_out 个 CF 边缘，各写一条节点进订阅；它们共用同一个服务端入站、不新建服务，
+    # 最终由客户端 URLTest 挑最快的那条。
+    ui_title(f"测速筛候选（最多 {n_out} 条 [{base.get('proto')}]）")
+    if ask:
+        ui_tip(f"下载测速最多耗约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量")
     if ask and (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
         return
     res = cdn_speedtest(cfg)
@@ -7029,16 +7042,17 @@ def cdn_pref_scan(ask=True):
                    "best": res[0]["ip"], "mbps": res[0]["mbps"]}
     _pref_save(cfg)
     _cdn_resync(old, was)
-    print(f"\n  ✓ 选出 {len(picked)} 个候选，已写成 {len(picked)} 条节点：")
+    ui_title(f"选出 {len(picked)} 条优选节点")
     for i, r in enumerate(res[:n_out], 1):
-        print(f"    {_cdn_tag_prefix(base)}CDN·优选{i}   {r['ip']:<16}"
-              f"（本机测 {r['ms']}ms / {r['mbps']} Mbps）")
+        print(f"  {_hl('1;36', f'{_cdn_tag_prefix(base)}CDN·优选{i}')}  {r['ip']:<16}"
+              f"本机测 {r['ms']}ms / {r['mbps']} Mbps")
+    ui_line()
+    # 本机测的是 VPS→CF 这一段，只作粗筛；哪条对你的网络最快，只有客户端的 URLTest 说了算
     if was:
-        print("  订阅已刷新。")
+        print("  ✔ 订阅已刷新")
+        ui_tip("客户端重拉订阅，随机组（URLTest）自动挑最快的、不通的自动跳过")
     else:
-        print("  ⚠ 当前 CDN 节点还没写进订阅，候选也不会出现在订阅里——先用上级菜单 4 写入。")
-    print("\n  接下来：客户端重拉订阅，让它的 URLTest 从这几条里挑最快的。")
-    print("  本机测的是 VPS→CF 这一段，只作粗筛；哪条对你的网络最快，只有客户端说了算。")
+        ui_warn("CDN 节点还没写进订阅，优选也不会进——到菜单 4 写入")
 
 def cdn_cand_clear():
     """清空候选（基础节点和手动优选地址不动）。"""
