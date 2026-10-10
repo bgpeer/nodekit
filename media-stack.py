@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.368"
+SCRIPT_VERSION = "1.5.369"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23783,8 +23783,13 @@ def _xiaoya_paths_menu(d):
         if c != "1":
             print("无效选择。")
             continue
-        got = [p for p in _pick_dirs(d, XIAOYA_MOUNT) if p and p.rstrip("/") != XIAOYA_MOUNT]
+        got = [p for p in _pick_dirs(d, XIAOYA_MOUNT) if p]
         if not got:
+            continue
+        if any(p.rstrip("/") == XIAOYA_MOUNT for p in got):
+            # 在最上面那层按「.」= 要全盘：小雅自己那几条换成整个盘
+            save_ms_state(scan_spec=merge_scan_paths([p for p in exp if p not in mine] + [XIAOYA_MOUNT]))
+            _apply_scan_paths(d, f"换成 {XIAOYA_MOUNT}（全盘），")
             continue
         # 【挑了几类就只扫这几类】原来是扫全盘的，换成挑的这几个，不是在全盘上再叠
         base = [p for p in exp if not (whole and p in mine)]
