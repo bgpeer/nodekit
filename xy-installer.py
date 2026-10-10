@@ -1327,9 +1327,11 @@ def _vmess_insec_heal():
        只改本机自己的 vmess + TLS 链接（地址 = 本机 host），别的机器聚合过来的、CDN 的不碰。
        补了返回 True；有域名（真证书）或没有要补的，什么都不做。"""
     try:
-        if json.load(open(STATE_FILE)).get("domain"):
+        st = json.load(open(STATE_FILE))
+        if st.get("domain"):
             return False
-        host = open(HOST_FILE).read().strip()
+        # 节点地址看安装时记下的 host：订阅地址可能已换成证书域名（sub.host），节点链接仍是 IP
+        host = st.get("host") or open(HOST_FILE).read().strip()
         lines = open(NODE_FILE).read().split("\n")
     except Exception:
         return False
@@ -1350,7 +1352,7 @@ def _vmess_insec_heal():
         return False
     open(NODE_FILE, "w").write("\n".join(lines))
     try:
-        G["host"] = host
+        G["host"] = _host()               # 订阅地址保持原样（build_subscription 会把它写回 sub.host）
         build_subscription(read_saved_links(), new_token=False)
     except Exception:
         pass
@@ -2245,6 +2247,68 @@ def sub_url(ext):
     return f"{scheme}://{_host()}:{sub_port()}/{t}.{ext}"
 
 SUB_TITLES = {"yaml": "mihomo / Clash", "json": "sing-box", "conf": "小火箭 Shadowrocket"}
+
+def _sub_cert_domain():
+    """证书管理里装的证书，有没有一个能给订阅用的域名 → (域名, 说明)。
+       要求：证书盖得住它、而且【解析到本机】（灰色云直连）。橙色云解析到 CF，订阅端口过不了 CF，不能用。
+       泛域名证书挑不出具体子域名，就让人填一个（被泛域名盖住、解析到本机才收）。"""
+    try:
+        i = cert_info()
+    except Exception:
+        return "", ""
+    if not i.get("exists"):
+        return "", ""
+    names = [n for n in dict.fromkeys([i.get("domain", "")] + i.get("names", [])) if n and not n.startswith("*.")]
+    bad = []
+    for n in names:
+        ok, why = _domain_resolves_here(n)
+        if ok:
+            return n, why
+        bad.append(f"{n}：{why}")
+    if i.get("wildcard") and _sys.stdin.isatty():
+        base = next((x[2:] for x in i.get("names", []) if x.startswith("*.")), "")
+        d = _ask(f"证书是泛域名 *.{base}，订阅用哪个子域名（要灰色云解析到本机，回车跳过）: ").strip().lower().rstrip(".")
+        if d and _name_covers(i.get("names", []), d):
+            ok, why = _domain_resolves_here(d)
+            if ok:
+                return d, why
+            bad.append(f"{d}：{why}")
+    return "", "；".join(bad)
+
+def sub_offer_cert_domain():
+    """订阅还在用 IP、证书管理里又装了证书 → 问要不要把订阅地址换成证书域名（回车 = 换）。
+       仓库主人：「检测到证书域名，询问是否用证书域名来替换订阅，已经是证书域名的就忽略」。
+
+       换的只是订阅地址（sub.host），节点链接不动；换完订阅走 HTTPS + 真证书——明文 HTTP 订阅
+       在线路上谁都看得到 token 和全部节点参数，换成 HTTPS 这一条就堵上了；本机 GitHub 中转也跟着能开。
+       代价：订阅地址从 http://IP 变成 https://域名，旧地址失效，客户端要重新导入一次。
+       换了返回 True。已经是域名、没证书、证书域名没解析到本机，都不问。"""
+    if not _sub_items() or not _is_ip(_host()):
+        return False
+    d, why = _sub_cert_domain()
+    if not d:
+        if why:
+            ui_tip(f"证书域名没解析到本机，订阅暂不能换（要灰色云 A 记录）：{why}")
+        return False
+    ui_tip(f"检测到证书域名 {d}：订阅可换成 https 域名地址，换完客户端要重新导入")
+    if (_ask(f"订阅地址换成 {d}？（回车 = 换 / n = 不换）: ").strip().lower() or "y") in ("n", "no"):
+        return False
+    old = open(HOST_FILE).read() if os.path.exists(HOST_FILE) else None
+    try:
+        open(HOST_FILE, "w").write(d)
+        G["host"] = d
+        build_subscription(read_saved_links(), new_token=False)   # token 不变，xy-sub 换成 HTTPS
+    except Exception as e:
+        if old is not None:
+            open(HOST_FILE, "w").write(old)
+        G["host"] = _host()
+        try: serve_sub()
+        except Exception: pass
+        print("  ⚠ 换订阅域名失败，已换回原来的地址：", e)
+        return False
+    print("  ✔ 订阅地址已换成证书域名（token 不变），客户端重新导入：")
+    print_sub_urls()
+    return True
 
 def _sub_items():
     ff = {"yaml": CFG_FILE, "json": SBOX_FILE, "conf": SR_FILE}; toks = load_tokens()
@@ -4207,6 +4271,7 @@ def show_links():
             print("（已把订阅托管服务同步到 " + ("HTTPS" if _sub_https() else "HTTP") + "，URL 不变）")
         except Exception as e:
             print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
+    sub_offer_cert_domain()               # 订阅还是 IP、证书管理里装了证书 → 问要不要换成证书域名
     ui_title("分享链接")
     # 和订阅里保持一致：同样补上「前缀·协议」的分隔点（只影响显示，NODE_FILE 不动）
     print_node_links([_link_rename(u, _sep_name(_link_name(u))) for u in links])
@@ -6692,6 +6757,7 @@ def cdn_add():
         _cdn_save(nodes)
         _cdn_resync(old, was)
         print("  ✔ 已写进三大订阅（订阅地址不变）")
+        sub_offer_cert_domain()           # 订阅还是 IP、证书管理里装了证书 → 问要不要换成证书域名
     else:
         print("  已只留备用链接，想写随时进菜单 4")
 
@@ -6767,6 +6833,8 @@ def cdn_write_sub():
         n["in_sub"] = writing
     _cdn_save(nodes)
     print(f"  ✓ 已{'写入' if writing else '移出'}全部 CDN 节点并刷新三格式订阅。客户端重新拉订阅即可生效。")
+    if writing:
+        sub_offer_cert_domain()           # 订阅还是 IP、证书管理里装了证书 → 问要不要换成证书域名
     if not writing and not read_saved_links():
         # 移出后订阅里一个节点都不剩：build_subscription 对空列表不再刷新，托管的旧订阅内容不会自动清空
         print("  ℹ️ 订阅里已无任何节点，之前托管的订阅内容不会再更新；如需彻底清空可到菜单 2「节点/订阅」重置。")
@@ -7766,6 +7834,7 @@ def cert_install_flow(info):
     plan = {"op": "cert-install", "domain": dom, "wildcard": wildcard,
             "cf_token": cf_token, "names": want, "G": dict(G)}
     _node_op_dispatch(plan, lambda: cert_install_apply(dom, wildcard, cf_token, want))
+    sub_offer_cert_domain()               # 证书装好了、订阅还是 IP → 问要不要换成证书域名
 
 def cert_upgrade_flow(i):
     """已经有证书时进『1 安装证书』：能升级成泛域名就给这条路，否则说清楚该走哪儿。
