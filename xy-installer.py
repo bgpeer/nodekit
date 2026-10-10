@@ -125,6 +125,8 @@ BGP_DIR      = "/etc/bgpeer"
 CFG_FILE     = BGP_DIR + "/mihomo.yaml"      # mihomo 可编辑成品配置
 SBOX_FILE    = BGP_DIR + "/singbox.json"     # sing-box 客户端可编辑成品配置
 SR_FILE      = BGP_DIR + "/shadowrocket.conf" # Shadowrocket 可编辑成品配置
+SR_NODES_FILE = BGP_DIR + "/shadowrocket-nodes.txt"  # 小火箭节点订阅（base64 分享链接；跟小火箭配置同一个 token、扩展名 .txt）
+SR_MODE_FILE  = BGP_DIR + "/sr_mode"                 # "sub" = 小火箭节点走节点订阅、配置里不带节点；没有 = 老写法
 SUB_DIR      = BGP_DIR + "/sub"              # 托管目录（<token>.yaml/.json/.conf 软链）
 SUB_SERVER   = BGP_DIR + "/xy-sub-server.py" # 订阅托管小服务（支持可选 TLS）
 HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
@@ -621,38 +623,348 @@ def nginx_install_shared():
     return have("nginx")
 
 
+# ---------------------------------------------------------------------------- 伪装站
+# 以前全网一张「We'll be back soon」维护页（7/09 之前是「It works!」）：扫描的人一看就知道这些机器是同一个
+# 脚本装的，一个维护页挂几个月也不像真站。mack-a 是从他仓库 9 套博客模板里随机下一套，用他脚本的人共用这 9 张。
+# 这里每台机器在本机现生成一个小站：站点类型、站名、配色、字体、版式、文章标题 / 日期 / 正文全随机，机器之间
+# 各不一样（仓库主人 10/11 点头）。全部本地生成：不下载、不引外部字体 / CDN / 统计，页面里没有任何跟仓库或
+# 作者沾边的字样。生成一次就不再动（真站不会隔三差五整站换样）；用户自己放的站点一律不碰（只认那两张老默认页）。
+_FS_ADJ = ["Quiet", "Slow", "Little", "Northern", "Paper", "Small", "Bright", "Late", "Open", "Gentle", "Hidden",
+           "Silver", "Blue", "Green", "Golden", "Distant", "Simple", "Morning", "Evening", "Winter", "Autumn", "Amber"]
+_FS_NOUN = ["Harbor", "Lantern", "Garden", "Field", "River", "Window", "Compass", "Orchard", "Meadow", "Valley",
+            "Shore", "Path", "Notebook", "Kettle", "Atlas", "Lighthouse", "Workshop", "Canvas", "Hearth", "Pine",
+            "Stone", "Cloud", "Island", "Bridge", "Willow", "Harvest"]
+_FS_PLACE = ["the coast", "the old town", "the market", "the hills", "the harbor", "the station", "the park",
+             "the river", "the bridge", "the lake", "a small village", "the north shore", "the valley"]
+_FS_SEASON = ["spring", "summer", "autumn", "winter"]
+_FS_MONTH = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
+             "October", "November", "December"]
+_FS_FIRST = ["Anna", "Lena", "Mira", "Clara", "Nora", "Elena", "Iris", "Maya", "Jonas", "Felix", "Tom", "Leo",
+             "Daniel", "Martin", "Owen", "Hugo", "Emil", "Theo", "Sara", "Julia"]
+_FS_CITY = ["Lisbon", "Porto", "Lyon", "Utrecht", "Bergen", "Leeds", "Ghent", "Malmo", "Graz", "Turku", "Bristol",
+            "Aarhus", "Valencia", "Bologna"]
+_FS_KINDS = {
+    "blog": {
+        "names": ["{A} {N}", "The {N} Journal", "{N} & {N2}", "Notes from the {N}", "{A} {N} Diary"],
+        "tag": ["Small notes on everyday things", "Thoughts, walks and the occasional recipe",
+                "Writing about books, food and slow weekends", "A personal journal, updated now and then"],
+        "nav": ["Home", "About"],
+        "titles": ["A walk along {place}", "What I read this {season}", "Notes on {topic}", "Learning to {verb}",
+                   "A weekend at {place}", "Small things I liked in {month}", "On {topic} and patience",
+                   "Cooking {food} again", "Three lessons from {topic}", "Coffee, rain and {topic}",
+                   "Starting over with {topic}", "A slow {season} morning"],
+        "topic": ["gardening", "bread baking", "long walks", "journaling", "slow travel", "old maps",
+                  "home cooking", "learning a language", "second-hand books", "keeping a sketchbook"],
+        "verb": ["bake bread", "draw again", "run in the morning", "keep a notebook", "grow tomatoes",
+                 "fix my bicycle", "write by hand"],
+        "food": ["soup", "dumplings", "pasta", "curry", "pancakes", "risotto", "lentil stew"],
+        "body": ["I did not plan much this time, and it turned out to be the best part.",
+                 "The weather changed three times before noon, which is normal around here.",
+                 "Most of the afternoon went by without me noticing.",
+                 "I wrote a few lines in my notebook and then simply watched people pass by.",
+                 "It is funny how the smallest routines end up holding the whole week together.",
+                 "There is a bakery on the corner that opens before sunrise, and I have become a regular.",
+                 "I keep a short list of things that made the day better, and this one made it.",
+                 "A friend recommended it years ago and I finally got around to it.",
+                 "Nothing dramatic happened, but I came home in a much better mood.",
+                 "I am trying to write here more often, even if the posts are short.",
+                 "The first attempt was a small disaster, the second one was surprisingly good.",
+                 "Sometimes the best plan is to leave the phone at home and walk.",
+                 "I took the long way back, past the old houses near the water.",
+                 "It reminded me how much I enjoy doing one thing at a time.",
+                 "The recipe is simple, the trick is to be patient with it.",
+                 "By the evening the light was soft and everything looked a little kinder.",
+                 "I still have a few pages left to read, so maybe more on this later.",
+                 "If you have a favourite version of this, I would love to hear about it someday."],
+        "about": ["This is a small personal site where I write about ordinary days.",
+                  "Posts are irregular and mostly short.",
+                  "I like walking, cooking for friends and reading on slow afternoons.",
+                  "Nothing here is sponsored; it is just a notebook that happens to be public."],
+    },
+    "photo": {
+        "names": ["{A} Light", "{N} Frames", "{A} {N} Photography", "Frames from {N}", "{N} & Light"],
+        "tag": ["Photographs and short notes", "Light, places and quiet moments",
+                "A small gallery of everyday scenes", "Photos from walks near and far"],
+        "nav": ["Gallery", "About"],
+        "titles": ["{Season} light at {place}", "A morning at {place}", "Shadows in {month}",
+                   "Walking with a {lens} lens", "Colors of {place}", "Rain over {place}",
+                   "Notes from a {season} roll", "Late afternoon at {place}", "Small details in {month}"],
+        "lens": ["35mm", "50mm", "28mm", "85mm"],
+        "body": ["Most of these were taken within an hour, before the light went flat.",
+                 "I only had one lens with me, which made things easier, not harder.",
+                 "The fog cleared just enough to see the outline of the hills.",
+                 "I like how ordinary places change completely with a bit of low sun.",
+                 "A few frames were slightly out of focus, but I kept them anyway.",
+                 "Walking slowly is still the best way I know to find pictures.",
+                 "The colors were muted, almost like an old postcard.",
+                 "I went back the next day for the same view and it was gone.",
+                 "There were more people than usual, so I waited for the quiet moments.",
+                 "These are straight from the camera, with only small adjustments.",
+                 "Some days you get one picture you like, and that is enough.",
+                 "The reflections on the water did most of the work here.",
+                 "I am trying to print a few of these for the wall.",
+                 "Every season this place looks like a different town."],
+        "about": ["I take photographs mostly on walks, close to home or while travelling.",
+                  "This site is a small archive of the pictures I want to keep.",
+                  "I shoot with a simple setup and try not to edit too much.",
+                  "Thanks for stopping by and taking a look."],
+    },
+    "studio": {
+        "names": ["{N} Studio", "{A} {N} Studio", "{N} Works", "Studio {N}", "{N} & {N2} Design"],
+        "tag": ["Design and small web projects", "Brand, print and web for small teams",
+                "A small independent design studio", "Simple design for local businesses"],
+        "nav": ["Journal", "About"],
+        "titles": ["Rebuilding a {thing} for a local {client}", "Notes on {topic}", "Why we keep things simple",
+                   "A new identity for a {client}", "What we learned from {topic}", "Designing for {audience}",
+                   "A small {thing} for a {client}", "Sketches from a {season} project"],
+        "thing": ["website", "menu", "booklet", "logo", "shop page", "poster series"],
+        "client": ["bakery", "bookshop", "cafe", "florist", "bike shop", "small library", "music school"],
+        "audience": ["slow readers", "small screens", "busy people", "local shops"],
+        "topic": ["typography", "color", "small budgets", "accessibility", "print", "white space"],
+        "body": ["The brief was short and clear, which is always a good start.",
+                 "We started with paper sketches before opening any software.",
+                 "Most of the work was removing things rather than adding them.",
+                 "The client knew their customers very well, so we listened a lot.",
+                 "We tested a few versions on real phones before choosing one.",
+                 "Good typography solved more problems here than any illustration could.",
+                 "The budget was small, so every decision had to earn its place.",
+                 "We kept the color palette to two colors and one neutral.",
+                 "Printing a draft and pinning it to the wall helped us see the problems.",
+                 "Small details like spacing and line length made the biggest difference.",
+                 "The final version feels calm, which is exactly what we wanted.",
+                 "We are always happy to work with neighbours and small teams.",
+                 "Afterwards we wrote down what we would do differently next time.",
+                 "It took three rounds of feedback, which felt just right."],
+        "about": ["We are a small design studio based in {city}.",
+                  "We work with local shops, cafes and cultural projects on identity, print and simple websites.",
+                  "Our process is calm and practical: listen first, sketch a lot, ship something useful.",
+                  "We take on only a few projects at a time."],
+    },
+    "notes": {
+        "names": ["{N} Notes", "{A} Bytes", "{N} Log", "Notes on {N}", "The {A} Terminal"],
+        "tag": ["Things I learned and do not want to forget", "Small notes on code and tools",
+                "A notebook for everyday programming", "Short write-ups of small problems"],
+        "nav": ["Notes", "About"],
+        "titles": ["Notes on {tech}", "A small trick with {tool}", "Cleaning up my {thing}", "Why I like {tool}",
+                   "Reading about {tech}", "Debugging a slow {thing}", "Things I got wrong about {tech}",
+                   "Keeping a tidy {thing}"],
+        "tech": ["text encodings", "time zones", "regular expressions", "SQL indexes", "unit tests",
+                 "shell scripts", "image compression", "CSS grid", "date parsing", "plain text files"],
+        "tool": ["make", "sqlite", "awk", "git", "vim", "a plain text editor", "spreadsheets"],
+        "thing": ["dotfiles", "build script", "backup routine", "photo library", "static site", "notes folder"],
+        "body": ["I ran into this again last week, so here is a short note for future me.",
+                 "The fix turned out to be one line, after an hour of looking in the wrong place.",
+                 "Writing a tiny test first made the problem obvious.",
+                 "Most of the time the simplest tool is good enough.",
+                 "I keep relearning this, which is exactly why it goes here.",
+                 "The documentation was correct, I just did not read it carefully.",
+                 "Measuring before changing anything saved me from a pointless rewrite.",
+                 "Plain text keeps winning for small personal projects.",
+                 "It is worth writing down the commands you only need twice a year.",
+                 "After cleaning things up, the whole thing runs noticeably faster.",
+                 "I wish someone had told me this when I started.",
+                 "There is probably a better way, but this one is easy to remember.",
+                 "Naming things clearly helped more than any clever trick.",
+                 "Next time I will start with the boring solution and see if it is enough."],
+        "about": ["I write software for a living and keep these notes mostly for myself.",
+                  "Posts are short and practical: small problems, small fixes.",
+                  "If something here helps you too, that makes me happy.",
+                  "Opinions are my own and change over time."],
+    },
+}
+_FS_FONTS = ["Georgia, 'Times New Roman', serif",
+             "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+             "'Palatino Linotype', Palatino, 'Book Antiqua', serif",
+             "'Trebuchet MS', 'Segoe UI', Tahoma, sans-serif",
+             "'Gill Sans', 'Gill Sans MT', Calibri, sans-serif"]
+_FS_MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+
+def fake_site_write(root, rnd=None):
+    """在 root 现生成一个小静态站（首页 / 文章 / 关于 / 404 / robots.txt），返回站名。各项都随机，见上。"""
+    import html as _html, datetime, colorsys
+    R = rnd or random.SystemRandom()
+    kind = R.choice(list(_FS_KINDS)); K = _FS_KINDS[kind]
+    n1, n2 = R.sample(_FS_NOUN, 2)
+    name = R.choice(K["names"]).format(A=R.choice(_FS_ADJ), N=n1, N2=n2)
+    tag, first, city = R.choice(K["tag"]), R.choice(_FS_FIRST), R.choice(_FS_CITY)
+    # 配色 / 字体 / 版式
+    hue, dark = R.random(), R.random() < 0.3
+    def hexc(h, l, s):
+        r, g, b = colorsys.hls_to_rgb(h % 1, l, s)
+        return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
+    accent = hexc(hue, R.uniform(0.62, 0.72) if dark else R.uniform(0.32, 0.42), R.uniform(0.35, 0.65))
+    bg = hexc(hue, R.uniform(0.08, 0.12), 0.12) if dark else hexc(hue, R.uniform(0.96, 0.985), R.uniform(0.15, 0.4))
+    fg = "#e8e6e1" if dark else hexc(hue, 0.16, 0.15)
+    muted = "#a7a29a" if dark else hexc(hue, 0.42, 0.08)
+    card = hexc(hue, 0.15, 0.12) if dark else "#ffffff"
+    font = _FS_MONO if kind == "notes" and R.random() < 0.5 else R.choice(_FS_FONTS)
+    layout = R.choice(["column", "side", "cards"])
+    width = R.choice([640, 680, 720, 760, 820])
+    radius = R.choice([0, 4, 8, 12])
+    datefmt = R.choice(["{d:%Y-%m-%d}", "{d:%B} {d.day}, {d.year}", "{d.day} {d:%b} {d.year}"])
+    # 文章：5~10 篇，日期往前随机撒，新的在前
+    today = datetime.date.today()
+    # 标题里的空位按「洗一遍牌、依次发」取，同一个站里尽量不撞词（别三篇都是「…for a bookshop」）
+    src = {"place": _FS_PLACE, "season": _FS_SEASON, "month": _FS_MONTH}
+    src.update({k: K[k] for k in ("titles", "topic", "verb", "food", "lens", "thing", "client", "audience", "tech", "tool")
+                if k in K})                                     # 标题句式本身也按牌发，不连着几篇都是「Notes on …」
+    decks = {k: [] for k in src}
+    def deal(k):
+        if not decks[k]:
+            decks[k] = R.sample(src[k], len(src[k]))
+        return decks[k].pop()
+    fill = {k: (lambda k=k: deal(k)) for k in src if k != "titles"}
+    fill["Season"] = lambda: deal("season").capitalize()
+    posts, seen, firsts = [], set(), set()
+    for _ in range(R.randint(5, 10)):
+        for _try in range(20):
+            t = re.sub(r"\{(\w+)\}", lambda m: fill[m.group(1)](), deal("titles"))
+            if t not in seen:
+                break
+        seen.add(t)
+        slug = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:60] or "post"
+        while any(p["slug"] == slug for p in posts):
+            slug += "-" + str(R.randint(2, 9))
+        body = R.sample(K["body"], len(K["body"]))
+        fresh = [x for x in body if x not in firsts] or body     # 每篇开头一句不重样（首页摘要就是它）
+        body.remove(fresh[0]); body.insert(0, fresh[0]); firsts.add(fresh[0])
+        paras, i = [], 0
+        for _p in range(R.randint(3, 5)):
+            k = R.randint(2, 4)
+            paras.append(" ".join(body[i:i + k]) or R.choice(K["body"])); i += k
+        posts.append({"title": t, "slug": slug, "date": today - datetime.timedelta(days=R.randint(4, 900)),
+                      "paras": paras})
+    posts.sort(key=lambda p: p["date"], reverse=True)
+    since = min(p["date"] for p in posts).year - R.randint(0, 3)
+    years = f"{since}&ndash;{today.year}" if since < today.year else str(today.year)
+    E = _html.escape
+    initial = E(name[0])
+    icon = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E"
+            f"%3Crect width='64' height='64' rx='{R.choice([0, 12, 32])}' fill='%23{accent[1:]}'/%3E"
+            f"%3Ctext x='32' y='44' font-size='34' text-anchor='middle' fill='white' font-family='sans-serif'%3E{initial}%3C/text%3E%3C/svg%3E")
+    css = (f"*{{box-sizing:border-box}}html{{-webkit-text-size-adjust:100%}}"
+           f"body{{margin:0;background:{bg};color:{fg};font-family:{font};line-height:1.65;font-size:17px}}"
+           f"a{{color:{accent};text-decoration:none}}a:hover{{text-decoration:underline}}"
+           f".wrap{{max-width:{width}px;margin:0 auto;padding:28px 20px 48px}}"
+           f"header .name{{font-size:1.5rem;font-weight:700;color:{fg}}}header .tag{{color:{muted};margin:.2rem 0 0}}"
+           f"nav a{{margin-right:1.1rem}}nav{{margin:.9rem 0 2rem}}"
+           f".meta{{color:{muted};font-size:.88rem}}h1{{font-size:1.7rem;line-height:1.3;margin:.2rem 0 .4rem}}"
+           f"h2{{font-size:1.15rem;margin:0 0 .2rem}}.post{{margin:0 0 1.6rem}}"
+           f"footer{{margin-top:3rem;color:{muted};font-size:.85rem}}")
+    if layout == "side":
+        css += (f"@media(min-width:900px){{.wrap{{max-width:{width + 260}px;display:grid;"
+                f"grid-template-columns:220px 1fr;gap:40px}}header{{position:sticky;top:28px;align-self:start}}"
+                f"nav a{{display:block;margin:.3rem 0}}}}")
+    if layout == "cards":
+        css += (f".list{{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}}"
+                f".post{{background:{card};padding:18px;border-radius:{radius}px;margin:0;"
+                f"box-shadow:0 1px 3px rgba(0,0,0,.08)}}")
+    if kind == "photo":
+        css += (f".ph{{height:{R.choice([150, 170, 190])}px;border-radius:{radius}px;margin:0 0 .6rem}}")
+    links = [("/", K["nav"][0])] + [("/about/", n) if n == "About" else ("/", n) for n in K["nav"][1:]]
+    def page(title, main):
+        nav = "".join(f'<a href="{h}">{E(t)}</a>' for h, t in links)
+        return ("<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+                f"<title>{E(title)}</title>\n<meta name=\"description\" content=\"{E(tag)}\">\n"
+                f"<link rel=\"icon\" href=\"{icon}\">\n<style>{css}</style>\n</head>\n<body>\n<div class=\"wrap\">\n"
+                f"<header><a class=\"name\" href=\"/\">{E(name)}</a><p class=\"tag\">{E(tag)}</p>"
+                f"<nav>{nav}</nav></header>\n<main>\n{main}\n</main>\n</div>\n"
+                f"<div class=\"wrap\" style=\"padding-top:0\"><footer>&copy; {years} {E(name)}</footer></div>\n"
+                "</body>\n</html>\n")
+    def grad():
+        h2 = (hue + R.uniform(.05, .3)) % 1
+        return (f'<div class="ph" style="background:linear-gradient({R.randint(0, 359)}deg,'
+                f'{hexc(hue, R.uniform(.35, .7), .4)},{hexc(h2, R.uniform(.3, .75), .45)})"></div>')
+    items = "\n".join(
+        f'<article class="post">{grad() if kind == "photo" else ""}'
+        f'<h2><a href="/posts/{p["slug"]}.html">{E(p["title"])}</a></h2>'
+        f'<div class="meta">{datefmt.format(d=p["date"])}</div>'
+        + (f'<p>{E(p["paras"][0].split(". ")[0].rstrip("."))}.</p>' if layout != "cards" else "")
+        + "</article>" for p in posts)
+    files = {"index.html": page(name, f'<div class="list">\n{items}\n</div>')}
+    for j, p in enumerate(posts):
+        nxt = posts[j + 1] if j + 1 < len(posts) else None
+        main = (f'<article><h1>{E(p["title"])}</h1><div class="meta">{datefmt.format(d=p["date"])}</div>\n'
+                + (grad() if kind == "photo" else "")
+                + "".join(f"<p>{E(x)}</p>\n" for x in p["paras"])
+                + "</article>\n<p class=\"meta\"><a href=\"/\">&larr; All posts</a>"
+                + (f' &middot; Older: <a href="/posts/{nxt["slug"]}.html">{E(nxt["title"])}</a>' if nxt else "")
+                + "</p>")
+        files[f"posts/{p['slug']}.html"] = page(f"{p['title']} – {name}", main)
+    about = [s.format(city=city) for s in K["about"]]
+    hello = "" if kind == "studio" else f"<p>Hi, I&rsquo;m {E(first)}.</p>\n"
+    files["about/index.html"] = page(f"About – {name}", "<h1>About</h1>\n" + hello
+                                     + "".join(f"<p>{E(s)}</p>\n" for s in about))
+    files["404.html"] = page(f"Page not found – {name}", "<h1>Page not found</h1>\n"
+                             "<p>The page you are looking for does not exist or has moved.</p>\n"
+                             "<p><a href=\"/\">Back to the homepage</a></p>")
+    files["robots.txt"] = "User-agent: *\nDisallow:\n"
+    for rel, txt in files.items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(txt)
+        os.chmod(path, 0o644)                              # nginx 以 www-data 读：别被 umask 收成 0600（403）
+    for d in (root, os.path.join(root, "posts"), os.path.join(root, "about")):
+        os.chmod(d, 0o755)
+    return name
+
+# 老的两张默认页（全网一样）：只认这两张，认出来才换；用户自己放的页面一律不碰
+_OLD_ITWORKS_PAGE = ("<!doctype html><html><head><meta charset='utf-8'><title>Welcome</title></head>"
+                     "<body><h1>It works!</h1><p>The server is running.</p></body></html>\n")
+_OLD_MAINT_PAGE = (
+    "<!doctype html>\n<html lang=\"en\">\n<head>\n"
+    "<meta charset=\"utf-8\">\n"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "<title>{title}</title>\n"
+    "<style>\n"
+    "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"
+    "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2933;background:#f5f7fa;"
+    "display:flex;min-height:100vh;align-items:center;justify-content:center}\n"
+    ".card{max-width:560px;margin:24px;padding:48px 40px;background:#fff;border-radius:14px;"
+    "box-shadow:0 8px 30px rgba(0,0,0,.06);text-align:center}\n"
+    "h1{margin:0 0 12px;font-size:1.6rem;font-weight:600}\n"
+    "p{margin:8px 0;line-height:1.6;color:#616e7c}\n"
+    ".dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#3ba55d;"
+    "margin-right:8px;vertical-align:middle}\n"
+    "footer{margin-top:28px;font-size:.82rem;color:#9aa5b1}\n"
+    "</style>\n</head>\n<body>\n<div class=\"card\">\n"
+    "<h1><span class=\"dot\"></span>We'll be back soon</h1>\n"
+    "<p>This site is currently undergoing scheduled maintenance.</p>\n"
+    "<p>Thank you for your patience — please check back a little later.</p>\n"
+    "<footer>&copy; {year} &middot; All rights reserved.</footer>\n"
+    "</div>\n</body>\n</html>\n")
+
+def _is_stock_page(path):
+    """首页还是老的全网一样的默认页吗（标题 = 当时的域名、年份不论）。读不到 / 改过一个字都算不是。"""
+    try:
+        t = open(path, encoding="utf-8").read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    if t == _OLD_ITWORKS_PAGE:
+        return True
+    m = re.search(r"<title>(.*?)</title>", t)
+    y = re.search(r"&copy; (\d{4}) &middot;", t)
+    return bool(m and y) and t == _OLD_MAINT_PAGE.replace("{title}", m.group(1)).replace("{year}", y.group(1))
+
+def fake_site_heal():
+    """老装机：伪装站首页还是那张全网一样的老默认页 → 换成本机生成的站。返回是否换了。"""
+    if not _is_stock_page(WEBROOT + "/index.html"):
+        return False
+    fake_site_write(WEBROOT)
+    return True
+
 def ensure_nginx():
     if not have("nginx") and not nginx_install_shared():
         sh("apt-get update -y", check=False)
         sh("DEBIAN_FRONTEND=noninteractive apt-get install -y nginx", check=False)
     clean_stale_nginx()                                  # 先清掉别人残留的坏块，保证 nginx -t 能过
     os.makedirs(WEBROOT, exist_ok=True)
-    if not os.path.exists(WEBROOT + "/index.html"):     # 伪装站首页
-        # 别用 Apache/nginx 默认页(一眼假)；放一个像样的通用静态站。
-        # 用户可直接覆盖 WEBROOT/index.html 换成自己的真站内容以增强伪装。
-        host = G.get("domain") or "this site"
-        open(WEBROOT + "/index.html", "w").write(
-            "<!doctype html>\n<html lang=\"en\">\n<head>\n"
-            "<meta charset=\"utf-8\">\n"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-            f"<title>{host}</title>\n"
-            "<style>\n"
-            "*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"
-            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2933;background:#f5f7fa;"
-            "display:flex;min-height:100vh;align-items:center;justify-content:center}\n"
-            ".card{max-width:560px;margin:24px;padding:48px 40px;background:#fff;border-radius:14px;"
-            "box-shadow:0 8px 30px rgba(0,0,0,.06);text-align:center}\n"
-            "h1{margin:0 0 12px;font-size:1.6rem;font-weight:600}\n"
-            "p{margin:8px 0;line-height:1.6;color:#616e7c}\n"
-            ".dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#3ba55d;"
-            "margin-right:8px;vertical-align:middle}\n"
-            "footer{margin-top:28px;font-size:.82rem;color:#9aa5b1}\n"
-            "</style>\n</head>\n<body>\n<div class=\"card\">\n"
-            "<h1><span class=\"dot\"></span>We'll be back soon</h1>\n"
-            "<p>This site is currently undergoing scheduled maintenance.</p>\n"
-            "<p>Thank you for your patience — please check back a little later.</p>\n"
-            "<footer>&copy; 2026 &middot; All rights reserved.</footer>\n"
-            "</div>\n</body>\n</html>\n")
+    idx = WEBROOT + "/index.html"
+    if not os.path.exists(idx) or _is_stock_page(idx):  # 伪装站：本机现生成一个（见 fake_site_write）
+        # 用户可直接覆盖 WEBROOT 里的文件换成自己的真站内容；换过的这里一律不碰。
+        fake_site_write(WEBROOT)
 
 def nginx_reload():
     chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
@@ -715,6 +1027,7 @@ def _nginx_https_server(listen):
             f"  ssl_certificate {ACME_CRT};\n  ssl_certificate_key {ACME_KEY};\n"
             f"  ssl_protocols TLSv1.2 TLSv1.3;\n"
             f"{_nginx_ws_locations()}"
+            f"  error_page 404 /404.html;\n"           # 伪装站自己的 404 页（fake_site_write 生成）
             f"  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
 
 def nginx_http2_listen(base):
@@ -2270,7 +2583,7 @@ def save_tokens(t):
 _PRIV_DIRS  = lambda: (BGP_DIR, SUB_DIR, "/etc/ssl/sb")
 _PRIV_FILES = lambda: (TOKENS_FILE, GHRELAY_TOKEN_FILE, STATE_FILE, PEERS_FILE,
                        GHDL_RELAYS, CUSTPL_FILE, TPLSRC_FILE, SUBPORT_FILE,
-                       HOST_FILE, NODE_FILE, CFG_FILE, SBOX_FILE, SR_FILE,
+                       HOST_FILE, NODE_FILE, CFG_FILE, SBOX_FILE, SR_FILE, SR_NODES_FILE, SR_MODE_FILE,
                        ACME_KEY, KEY)
 
 def harden_perms():
@@ -2308,7 +2621,8 @@ def sub_url(ext):
     scheme = "https" if _sub_https() else "http"
     return f"{scheme}://{_host()}:{sub_port()}/{t}.{ext}"
 
-SUB_TITLES = {"yaml": "mihomo / Clash", "json": "sing-box", "conf": "小火箭 Shadowrocket"}
+SUB_TITLES = {"yaml": "mihomo / Clash", "json": "sing-box", "conf": "小火箭 Shadowrocket",
+              "srnodes": "小火箭 节点订阅（首页 ➕ → Subscribe）"}
 
 def _sub_cert_domain():
     """证书管理里装的证书，有没有一个能给订阅用的域名 → (域名, 说明)。
@@ -2374,7 +2688,10 @@ def sub_offer_cert_domain():
 
 def _sub_items():
     ff = {"yaml": CFG_FILE, "json": SBOX_FILE, "conf": SR_FILE}; toks = load_tokens()
-    return [(e, sub_url(e)) for e in ("yaml", "json", "conf") if os.path.exists(ff[e]) and toks.get(e)]
+    items = [(e, sub_url(e)) for e in ("yaml", "json", "conf") if os.path.exists(ff[e]) and toks.get(e)]
+    if sr_nodes_url():                                   # 小火箭节点订阅：紧跟在小火箭配置后面
+        items.append(("srnodes", sr_nodes_url()))
+    return items
 
 def sub_urls_text():
     """写进文件 / 日志用的纯文本：标题一行、链接一行、空一行。"""
@@ -2420,8 +2737,9 @@ def print_sub_urls():
     items = _sub_items()
     for i, (e, u) in enumerate(items):
         # 标上这一格式当前用的模板（刷新、每天 03:20 自动更新都按它）；自定义的换个颜色，一眼看得出不是作者模板
-        cust = tpl_src_of(e) == "custom"
-        print(_hl("1;33", f"▸ {SUB_TITLES[e]}") + _hl("1;35" if cust else "36", "（自定义模板）" if cust else "（作者模板）"))
+        cust = e in FMT and tpl_src_of(e) == "custom"
+        mark = "" if e not in FMT else _hl("1;35" if cust else "36", "（自定义模板）" if cust else "（作者模板）")
+        print(_hl("1;33", f"▸ {SUB_TITLES[e]}") + mark)
         print(_hl("1;32", u))
         if i < len(items) - 1:
             print()
@@ -2551,12 +2869,14 @@ def serve_sub(reset=False, renew_port=True):
         renew_sub_port()                        # 重装换节点：端口随 token 一起换新
     toks = {} if reset else load_tokens()
     for f in os.listdir(SUB_DIR):                       # 清旧软链（含 .links）
-        if f.rsplit(".", 1)[-1] in SUB_EXTS or f.endswith(".links"):
+        if f.rsplit(".", 1)[-1] in SUB_EXTS or f.endswith((".links", ".txt")):
             os.remove(os.path.join(SUB_DIR, f))
     for ext, target in (("yaml", CFG_FILE), ("json", SBOX_FILE), ("conf", SR_FILE)):
         if os.path.exists(target):
             toks.setdefault(ext, secrets.token_urlsafe(12))
             os.symlink(target, f"{SUB_DIR}/{toks[ext]}.{ext}")
+    if toks.get("conf") and os.path.exists(SR_NODES_FILE):         # 小火箭节点订阅：跟小火箭配置同一个 token、.txt
+        os.symlink(SR_NODES_FILE, f"{SUB_DIR}/{toks['conf']}.txt")
     # 节点链接端点（.links）：纯本机分享链接，供别的机器聚合拉取；token 保护。
     # 重装换节点(reset)时和订阅一样换 .links token，旧地址失效（防泄露）；平时保持不变。
     local = read_saved_links()
@@ -3056,8 +3376,18 @@ def _sr_group_names(tpl):
        跳过它们不影响判断，反倒避免把锚点当成组名。"""
     return _sr_section_keys(tpl, "Proxy Group")
 
-def _sr_country_groups(names_list, existing=()):
+# 小火箭节点走订阅时（sr_sub_mode），节点不在配置里，分组没法显式列成员，只能按名字正则收（policy-regex-filter）。
+# 模板里各主分组本来就是 policy-regex-filter=.*，小火箭一直认这个写法。只用 (?! 否定前瞻、不用 (?= ：
+# 配置是「键=值」逗号分隔，值里再带 = 有被拆坏的风险。判定口径跟 is_cn_node 一致（有中国标记、没有别国标记）。
+_SR_NOT_CN = f"^(?!.*(?:{CN_PAT})).*|.*(?:{OTHER_CC_PAT})"        # 不是中国节点：没中国标记，或者带了别国标记
+_SR_IS_CN = f"^(?!.*(?:{OTHER_CC_PAT})).*(?:{CN_PAT})"            # 中国节点：没别国标记、有中国标记
+def _sr_other_rx(pats):
+    """漏网节点（🎲其他随机）：不属于任何已建国家组，也不是中国节点。"""
+    return f"^(?!.*(?:{'|'.join(pats)}))(?:(?!.*(?:{CN_PAT})).*|.*(?:{OTHER_CC_PAT}))"
+
+def _sr_country_groups(names_list, existing=(), regex=False):
     """shadowrocket 国家随机组：显式列成员（不依赖 shadowrocket 正则引擎，稳）。
+       regex=True（节点走订阅、不在配置里）：改成 policy-regex-filter 按名字收，正则见上。
        返回 (组定义行文本, 拼进服务组的组名片段[前导逗号, 裸名])。
 
        existing：模板 [Proxy Group] 段里已有的组名。**同名的不再生成**，让模板里那个说了算。
@@ -3070,15 +3400,15 @@ def _sr_country_groups(names_list, existing=()):
     existing = set(existing)
     lines, gnames = [], []
     if cn and CN_GROUP not in existing:                  # 🇨🇳中国随机：国内地址测速，不进 gnames
-        lines.append(f"{CN_GROUP} = url-test,{','.join(cn)},url={CN_TEST_URL},"
-                     "interval=120,tolerance=30,timeout=5")
+        lines.append(f"{CN_GROUP} = url-test,{('policy-regex-filter=' + _SR_IS_CN) if regex else ','.join(cn)},"
+                     f"url={CN_TEST_URL},interval=120,tolerance=30,timeout=5")
     if not present:                                      # 没有任何国家 → 不建国家组（含"其他随机"），与 mihomo 一致
         return "\n".join(lines), ""
     for gname, pat, _ in present:
         rx = re.compile(pat)
         members = [t for t in names_list if rx.search(_norm_us_flag(t))]
         if gname not in existing:
-            lines.append(f"{gname} = url-test,{','.join(members)},{U}")
+            lines.append(f"{gname} = url-test,{('policy-regex-filter=' + pat) if regex else ','.join(members)},{U}")
         gnames.append(gname)                             # 名字照样展开（指向模板里的同名组）
     if OTHER_GROUP:
         rxs = [re.compile(p) for _, p, _ in present]
@@ -3086,7 +3416,8 @@ def _sr_country_groups(names_list, existing=()):
                     and not is_cn_node(t)]
         if omembers:
             if OTHER_GROUP not in existing:
-                lines.append(f"{OTHER_GROUP} = url-test,{','.join(omembers)},{U}")
+                mem = ("policy-regex-filter=" + _sr_other_rx([p for _, p, _ in present])) if regex else ",".join(omembers)
+                lines.append(f"{OTHER_GROUP} = url-test,{mem},{U}")
             gnames.append(OTHER_GROUP)
     return "\n".join(lines), "".join(f",{g}" for g in gnames)
 
@@ -3118,7 +3449,7 @@ def _sr_fill_names(tpl, frag):
         return _SR_NAMES_RE.sub(rep, line)
     return re.sub(r"(?m)^.*" + A_NAMES + r".*$", lambda m: one(m.group(0)), tpl)
 
-def _sr_cn_isolate(tpl, names):
+def _sr_cn_isolate(tpl, names, regex=False):
     """小火箭的中国节点隔离（见 CN_PAT 那段）。没有中国节点时原样返回。
 
        🎯直连：DIRECT 后面插 🇨🇳中国随机，中国单节点插在第一个 key=value 参数前。
@@ -3144,8 +3475,11 @@ def _sr_cn_isolate(tpl, names):
             pol = items[1:first_kv]
             if CN_GROUP not in pol:
                 pol.insert(pol.index("DIRECT") + 1 if "DIRECT" in pol else 0, CN_GROUP)
-            pol += [n for n in cn if n not in pol]
+            if not regex:                                # 节点走订阅时单个中国节点不在配置里：只挂 🇨🇳中国随机
+                pol += [n for n in cn if n not in pol]
             items = items[:1] + pol + items[first_kv:]
+        elif drop and gname not in CN_KEEP and "policy-regex-filter=.*" in items and regex:
+            items = [("policy-regex-filter=" + _SR_NOT_CN) if it == "policy-regex-filter=.*" else it for it in items]
         elif drop and gname not in CN_KEEP and "policy-regex-filter=.*" in items:
             items = [it for it in items if it != "policy-regex-filter=.*"]
             first_kv = next((i for i, it in enumerate(items) if "=" in it), len(items))
@@ -3158,28 +3492,87 @@ def _sr_cn_isolate(tpl, names):
     body = "\n".join(one(l) for l in m.group(1).split("\n"))
     return tpl[:m.start(1)] + body + tpl[m.end(1):]
 
+# ---------------------------------------------------------------------------- 小火箭节点订阅
+# 小火箭手册原话：配置文件里写本地节点「仅是为了兼容部分其他类型的配置文件，不能当作添加节点的优先选择」。
+# 实测也是：配置里的节点有的出不来、有的全超时，同样的节点单条链接导入却能连。所以（仓库主人 10/11 点头）
+# 节点改走「节点订阅」——内容就是那些单条分享链接（base64），小火箭用解析单条链接的同一套来解析；
+# 配置只管规则和分组，分组按名字正则把订阅里的节点收进来。
+# 新装 / 全部重装默认这样；老装机节点原来在配置里，夜里自动更新要是直接把节点拿掉，没加订阅的设备一觉醒来
+# 节点全没了（CLAUDE.md 第四节），所以老装机要在「8 小火箭配置」里看清后果、确认了才切。
+def sr_sub_mode():
+    """小火箭节点走节点订阅（配置里不带节点）吗。"""
+    try:
+        return open(SR_MODE_FILE).read().strip() == "sub"
+    except OSError:
+        return False
+
+def sr_set_sub_mode(on):
+    """开：之后生成小火箭配置时节点写进节点订阅。关：删掉节点订阅文件和它的 .txt 软链，节点回到配置里。"""
+    os.makedirs(BGP_DIR, exist_ok=True)
+    if on:
+        open(SR_MODE_FILE, "w").write("sub\n")
+        return
+    for p in (SR_MODE_FILE, SR_NODES_FILE):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    _sr_nodes_link()
+
+def _sr_nodes_link():
+    """订阅目录里「小火箭配置 token.txt」→ SR_NODES_FILE：有文件就建、没有就删。
+       不重启 xy-sub——它是现读目录里的文件，夜里自动更新第一次生成节点订阅时也能直接拉到。"""
+    t = load_tokens().get("conf")
+    if not t or not os.path.isdir(SUB_DIR):
+        return
+    ln = f"{SUB_DIR}/{t}.txt"
+    try:
+        if os.path.lexists(ln):
+            os.remove(ln)
+        if os.path.exists(SR_NODES_FILE):
+            os.symlink(SR_NODES_FILE, ln)
+    except OSError:
+        pass
+
+def sr_nodes_url():
+    """小火箭节点订阅地址：跟小火箭配置同一个 token、扩展名 .txt（换 token 时一起换）。不是订阅模式返回 ''。"""
+    t = load_tokens().get("conf")
+    if not (t and sr_sub_mode() and os.path.exists(SR_NODES_FILE)):
+        return ""
+    return f"{'https' if _sub_https() else 'http'}://{_host()}:{sub_port()}/{t}.txt"
+
 def build_shadowrocket_sub(nodes, tpl_url):
-    lines, names_list = [], []
+    sub = sr_sub_mode()
+    lines, names_list, links = [], [], []
     for key, d in nodes:
         name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
+        if sub:
+            # 节点订阅照抄分享链接：小火箭不支持 xhttp，跳过；量子加密（VLESS Encryption）单条导入
+            # 仓库主人实测能连，照收（配置里的老写法查不到支不支持，所以那边还是跳过）
+            if d.get("network") != "xhttp" and d.get("_link"):
+                links.append(d["_link"]); names_list.append(name)
+            continue
         try:
             s = shadowrocket_line(name, d)
             if s: lines.append(s); names_list.append(name)
         except Exception:
             pass
-    if not lines:
+    if not lines and not links:
         return
     tpl = fetch_tpl(tpl_url)                                 # 中转改写 + 老锚点名归一
     # 国家检测/成员池 = 注入节点 + 用户手写进模板 [Proxy] 段的静态节点（"名 = 协议,..." 行）
     static = _sr_static_names(tpl)
     # 模板 [Proxy Group] 段里已有的组名：同名的国家组不再生成，避免同段两条同名定义
-    groups_txt, names_frag = _sr_country_groups(names_list + static, _sr_group_names(tpl))
+    groups_txt, names_frag = _sr_country_groups(names_list + static, _sr_group_names(tpl), regex=sub)
     out = tpl
-    out = _fill_block(out, A_NODES, "\n".join(lines))           # 块锚点整行替换，缩进容错
+    out = _fill_block(out, A_NODES, "\n".join(lines))           # 块锚点整行替换，缩进容错（节点走订阅时是空的）
     out = _fill_block(out, A_GROUPS, groups_txt)
     out = _sr_fill_names(out, names_frag)                       # 行内锚点（按行去重）
-    out = _sr_cn_isolate(out, names_list + static)
+    out = _sr_cn_isolate(out, names_list + static, regex=sub)
     open(SR_FILE, "w").write(out)
+    if sub:
+        open(SR_NODES_FILE, "w").write(base64.b64encode(("\n".join(links) + "\n").encode()).decode())
+        _sr_nodes_link()
 
 # --- 三格式元数据：文件 / 作者模板 / 生成器；自定义模板存 CUSTPL_FILE ---
 def _node_names(nodes):
@@ -4094,6 +4487,7 @@ def parse_nodes(all_links):
         if not d:
             continue
         ylines.append("  - {" + ", ".join(f"{k}: {_yfmt(v)}" for k, v in d.items()) + "}")
+        d["_link"] = u                                   # 原始分享链接（名字已规范化），小火箭节点订阅照抄它
         k = proto_key(d)
         if k:
             nodes.append((k, d))
@@ -4418,6 +4812,7 @@ def run(sb_names, xr_names):
     # 生成三格式订阅（mihomo / sing-box / Shadowrocket），各自一条链接
     ok = False
     try:
+        sr_set_sub_mode(True)                                # 小火箭节点走节点订阅（订阅地址本来就全换了，客户端都要重新导入）
         ok = build_subscription(all_links, new_token=True)   # 重装换了节点/域名 → 换 token 刷新订阅
     except Exception as e:
         print("\n订阅生成跳过（不影响节点使用）:", e)
@@ -4778,6 +5173,8 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 已修好配置里的中转地址")
     if _vmess_insec_heal():                     # 自签 vmess 缺跳过证书校验：补上（不进菜单的机器也能修好）
         print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
+    if fake_site_heal():                        # 伪装站还是老的全网一样的默认页：换成本机生成的（只写静态文件）
+        print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
     day = _cfg_auto_due()
     if not day:
         return                                  # 今天已跑过：安静退出
@@ -4840,6 +5237,31 @@ def cfg_auto_menu(ext):
     setup_cfg_auto_cron()
     print(f"  ✔ 自动更新已{'开' if cfg_auto_on(ext) else '关'}")
 
+def sr_mode_menu():
+    """「8 小火箭配置」→ 6 小火箭节点：写在配置里（老写法）⇄ 走节点订阅。两个方向都会让小火箭里有东西没掉，
+       红字说清、默认否（CLAUDE.md 第四节）。切完按当前模板重生成小火箭配置；生成失败就切回原样。"""
+    on = sr_sub_mode()
+    if on:
+        ui_warn("改回后节点订阅链接作废：小火箭里那条节点订阅要删掉，不删会留着旧节点")
+        q = "  改回节点写在配置里? [y/N]: "
+    else:
+        ui_warn("改完小火箭配置里不再带节点：没在小火箭里加「节点订阅」的设备会看不到节点")
+        q = "  改成节点走订阅? [y/N]: "
+    if _ask(q).strip().lower() not in ("y", "yes"):
+        return
+    keep = open(SR_NODES_FILE).read() if os.path.exists(SR_NODES_FILE) else None
+    sr_set_sub_mode(not on)
+    which = "自定义" if tpl_src_of("conf") == "custom" else "作者"
+    if not _regen_config("conf", tpl_url_current("conf"), which):
+        sr_set_sub_mode(on)                                     # 原配置 _regen_config 已保留；节点订阅也放回去
+        if keep is not None:
+            open(SR_NODES_FILE, "w").write(keep); _sr_nodes_link()
+        print("  ⚠ 没切成，小火箭节点还是原来的写法"); return
+    if not on:
+        print()
+        ui_url(SUB_TITLES["srnodes"], sr_nodes_url())
+        ui_tip("小火箭里先刷新一次配置，再到首页 ➕ 选 Subscribe 加上面这条")
+
 def config_menu(ext):
     """单个格式的配置子菜单：改配置 / 改订阅(换token) / 更新配置(作者·自定义) / 加自定义模板链接。"""
     meta = FMT[ext]
@@ -4854,15 +5276,20 @@ def config_menu(ext):
         ui_kv("当前生效", _hl("1;32", "自定义模板" if src == "custom" else "作者模板"))
         print()
         ui_url("订阅链接", sub_url(ext))
+        if ext == "conf" and sr_nodes_url():
+            print()
+            ui_url(SUB_TITLES["srnodes"], sr_nodes_url())
         print()
         ui_url("自定义模板链接", cust, "94")
         ui_line()
-        ui_items([(1, "修改配置（编辑器打开）", None),
-                  (2, "修改订阅（换 token）", None),
-                  (3, "更新配置（作者 / 自定义模板）", None),
-                  (4, "自定义模板链接（添加 / 更换 / 删除）", None),
-                  (5, "自动更新", _cfg_auto_state(ext)),
-                  (0, "返回", None)])
+        items = [(1, "修改配置（编辑器打开）", None),
+                 (2, "修改订阅（换 token）", None),
+                 (3, "更新配置（作者 / 自定义模板）", None),
+                 (4, "自定义模板链接（添加 / 更换 / 删除）", None),
+                 (5, "自动更新", _cfg_auto_state(ext))]
+        if ext == "conf":
+            items.append((6, "小火箭节点", "走节点订阅" if sr_sub_mode() else "写在配置里（老写法）"))
+        ui_items(items + [(0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             before = _file_sha(meta["file"])
@@ -4872,11 +5299,15 @@ def config_menu(ext):
                 ui_tip("手改过，自动更新已暂停（重新生成配置后自动恢复）")
         elif c == "5":
             cfg_auto_menu(ext)
+        elif c == "6" and ext == "conf":
+            sr_mode_menu()
         elif c == "2":
             ui_tip("换 token 后旧订阅链接立即失效，客户端要重新导入")
             if _ask("  换新 token? [y/N]: ").lower() in ("y", "yes"):
                 rotate_token_ext(ext); print("  ✔ 已换")
                 ui_url("新订阅链接", sub_url(ext))
+                if ext == "conf" and sr_nodes_url():             # 节点订阅跟小火箭配置同一个 token，一起换了
+                    ui_url("新" + SUB_TITLES["srnodes"], sr_nodes_url())
         elif c == "3":
             update_one_config(ext)
         elif c == "4":
@@ -7091,8 +7522,12 @@ def cdn_write_sub():
                     any(l for l in read_saved_links() if not any(l == _cdn_link(n) for n in nodes)))
     print(f"\n  全部 CDN 节点写入订阅（当前 {already}/{total} 条已写入）")
     for n in nodes:
-        sub = ("仅 mihomo（CDN量子加密，sing-box/小火箭写入时自动跳过）" if n.get("enc")
-               else CDN_PROTO_SUB[n['proto']])
+        if not n.get("enc"):
+            sub = CDN_PROTO_SUB[n['proto']]
+        elif sr_sub_mode() and n["proto"] != "vless-xhttp":     # 小火箭走节点订阅：量子加密单条导入实测能连，照收
+            sub = "mihomo / 小火箭（CDN量子加密，sing-box 不支持，写入时自动跳过）"
+        else:
+            sub = "仅 mihomo（CDN量子加密，sing-box/小火箭写入时自动跳过）"
         print(f"    · {n['domain']}:{n['cf_port']} [{n['proto']}] → {sub}")
     print("  写入后客户端拉一次订阅即见（不支持某协议的格式自动跳过）；单条备用链接不受影响。")
     if writing and not has_main:
@@ -9461,6 +9896,8 @@ def main_menu():
     if _relay_port_heal():
         print("  ✓ 已修好配置里的中转地址（订阅地址不变，客户端刷新一次订阅即可）")
     fw_sync()                                    # 老装机：开着防火墙、端口没放行的补上（放行了会说一行）
+    if fake_site_heal():
+        print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     if os.path.exists(CORE_CRON_FILE):
