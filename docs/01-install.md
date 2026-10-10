@@ -190,7 +190,7 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 
 ## 伪装 / 加密建议
 
-装机时脚本会自动做两项检查，帮你把伪装做扎实（都只提示、不阻断安装）：
+装机时脚本会自动做两项检查，帮你把伪装做扎实：
 
 - **Reality SNI 随机池 + 预检**：安装时**默认从内置的大厂/技术站池里随机挑一个**当 reality 借用目标
   （cisco/oracle/python/intel/dell/苹果CDN/微软 等 21 个，实测 TLS1.3+h2+X25519、国内可达、不套乱 CDN）——
@@ -198,11 +198,28 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
   装前还会探测借用目标是否**可达 + 支持 TLS1.3 + HTTP/2**，不合格给黄色警告并建议换站。
   > ⚠️ 伪装目标要用**国内可达的国外大站**：别用被墙的站（google/youtube 等），更**不能用国内域名**
   > （国外 IP 配国内 SNI = IP 与 SNI 极度不匹配，最容易被识别）。
-- **无域名自签提示**：不给域名时，依赖证书的 TLS 协议（vless-vision / trojan / ws 家族 / anytls）
-  只能走**自签证书 + 客户端 `allowInsecure`**——内容仍加密（各协议有自己的密码/UUID），
-  但失去证书校验、且自签本身是明显特征。**想要更强伪装：优先用 `reality-*` 系列**
-  （借真站证书，无需域名、无 insecure），或补一个域名走 acme 真证书。
-  hy2 / tuic 用自签是行业常规，无需担心。
+- **无域名默认只装 reality / hy2**（对齐 mack-a：没域名他只给 reality）：不给域名时，依赖证书的协议
+  （vless-vision / trojan / ws 家族 / anytls / xhttp-tls / tuic）只能走**自签证书 + 客户端 `allowInsecure`**——
+  证书冒充借用的大站、却不是那家签的，主动探测握一下手就露馅，是封 IP 的头号特征。安装时会红字列出这几个，问
+  `去掉这几个、只装 reality / hy2？`：**回车 = 去掉**，`n` = 照装。
+  hy2 有 salamander 混淆，探测拿不到握手，自签不碍事，留着；tuic 没有混淆，跟 TLS 类一起默认去掉。
+  **想要这些协议：补一个域名走 acme 真证书**（`15 证书管理` 装好后，安装时回车即用）。
+
+**对齐 mack-a 的细节**（新装 / 重装、新加的节点自动带上；已在用的老节点不动，anytls 的 Chrome 指纹例外——下次更新配置就补上）：
+
+- 分享链接一律带 `fp=chrome`（anytls 也是），客户端用 Chrome 的 TLS 指纹，不用 Go 自带的那个。
+- xray 的 TLS 入站最低 TLS 1.2；用真证书时开 `rejectUnknownSni`——拿 IP 扫端口、SNI 不对的直接拒握手，
+  扫描器拿不到证书、也就看不到你的域名（自签不开：自签证书没有 SAN，开了会把正常客户端也拒掉）。
+- xray reality 加 `maxTimeDiff: 70000`：客户端时间跟服务器差 70 秒以上的握手拒掉，防录下来的握手被重放探测。
+  手机 / 电脑时间要是自动同步的（默认就是）。
+- nginx 前置的 ws 路径：不是 WebSocket 升级的请求直接断开（444）。以前会原样转给后端、回一个
+  `400 Bad Request`，一眼看出后面挂着代理。
+
+**本机防火墙自动放行**（对齐 mack-a 的 allowPort）：机器开着 `ufw` / `firewalld`，或者 iptables 的 INPUT
+有一条不限端口的 REJECT/DROP 兜底（甲骨文镜像就是这样），装节点 / 加协议 / 加 CDN 节点 / 签证书（放 80）时
+会把用到的端口放行，规则带 `bgpeer` 注释；iptables 的放行插在兜底那条前面，封 IP 的规则照样先生效。
+老机器打开面板时自动补一次。防火墙都没开（大多数 VPS 默认如此）就什么都不动。
+⚠ **云厂商控制台里的安全组 / 防火墙脚本管不到**，那边还得自己放行。
 
 订阅还带两项客户端增强（服务端已同步支持，均自动生成、无需手动配置）：
 

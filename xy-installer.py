@@ -555,6 +555,8 @@ def ensure_acme():
                     "80 端口被占用，acme.sh --standalone 无法验证。"
                     "先停掉占用 80 的服务(nginx/caddy 等)，或改用自签(回车跳过域名)。")
             issue = f"{acme} --issue -d {G['domain']} --standalone --keylength ec-256"
+        if not wild:
+            fw_allow({(80, "tcp")})                  # HTTP-01 要从外面连 80：开着防火墙先放行（mack-a 同做法）
         # acme.sh 在证书仍有效时会以退出码 2 “跳过续期”，这不是错误；
         # 只要最终能 install-cert 导出证书就算成功，否则才把真实报错抛出来。
         r = subprocess.run(issue, shell=True, text=True, capture_output=True)
@@ -687,6 +689,9 @@ def _nginx_ws_locations():
     locs = ""
     for w in NGINX_WS:
         locs += (f"  location = {w['path']} {{\n"
+                 # 路径被人摸到、拿普通 GET 来试：直接断连接（mack-a 同做法）。以前是原样转给后端，
+                 # sing-box / xray 回一个 400 Bad Request——一眼看出后面挂着代理
+                 f"    if ($http_upgrade !~* \"^websocket$\") {{ return 444; }}\n"
                  f"    proxy_pass http://127.0.0.1:{w['port']};\n"
                  f"    proxy_http_version 1.1;\n"
                  f"    proxy_set_header Upgrade $http_upgrade;\n"
@@ -965,19 +970,19 @@ def precheck_sni(sb_names, xr_names):
     if proto_flag("reality", sb_names, xr_names):
         _sni_precheck_one()
 
+def selfsigned_risky(sb_names, xr_names):
+    """没域名时只能自签的协议：依赖证书的 TLS 类 + tuic。证书冒充借用的大站、却不是那家签的，
+       主动探测握一下手就露馅，是封 IP 的头号特征（mack-a 没域名只给 reality）。
+       tuic 没有混淆，握手证书一样探得到；hy2 有 salamander 混淆，探测拿不到握手，不在此列。"""
+    return proto_pick("cert", sb_names, xr_names) + (["tuic"] if "tuic" in sb_names else [])
+
 def warn_selfsigned(sb_names, xr_names):
-    """无域名时，依赖证书的 TLS 协议只能自签+insecure，是伪装/加密弱点。
-       给出明确引导：优先 reality，或补一个域名走真证书。hy2/tuic 自签是常规，不在此列。"""
+    """无域名还是装了自签协议（安装向导里回了 n、或命令行直接装）：再提醒一行。"""
     if G["domain"]:
         return
-    cert_tls = proto_pick("cert", sb_names, xr_names)
-    if not cert_tls:
-        return
-    Y, N = "\033[1;33m", "\033[0m"
-    print(f"{Y}  ⚠ 无域名：{', '.join(cert_tls)} 将用自签证书 + 客户端 allowInsecure。\n"
-          f"    这些协议内容仍加密(有各自密码/UUID)，但失去证书校验、且自签是明显特征。\n"
-          f"    更稳的伪装：优先选 reality-* 系列（借真站证书，无需域名、无 insecure），\n"
-          f"    或补一个域名走 acme 真证书。hy2/tuic 用自签属常规、无需担心。{N}")
+    risky = selfsigned_risky(sb_names, xr_names)
+    if risky:
+        ui_tip(f"无域名：{'、'.join(risky)} 用自签证书，一被探测就露馅、容易封 IP；补个域名走真证书更稳")
 
 # ---------------------------------------------------------------------------- 核心安装
 def arch_tag():
@@ -1466,7 +1471,7 @@ def sb_anytls(port, tag):
     ib = {"type": "anytls", "tag": tag, "listen": "::", "listen_port": port,
           "users": [{"password": pw}], "padding_scheme": [],
           "tls": {"enabled": True, "certificate_path": crt, "key_path": key}}
-    lk = (f"anytls://{pw}@{G['host']}:{port}?sni={tls_host()}"
+    lk = (f"anytls://{pw}@{G['host']}:{port}?sni={tls_host()}&fp=chrome"
           f"&insecure={1 if insec else 0}#{tag}")
     return ib, lk
 
@@ -1506,7 +1511,7 @@ def make_sb_vless(transport):
                 ib["multiplex"] = {"enabled": True}
             NGINX_WS.append({"path": path, "port": port})
             lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls"
-                  f"&sni={tls_host()}&type={_LINK_NET[transport]}&host={tls_host()}"
+                  f"&sni={tls_host()}&fp=chrome&type={_LINK_NET[transport]}&host={tls_host()}"
                   f"&path={path}{smk}#{tag}")
             return ib, lk
         crt, key, insec = ensure_acme()
@@ -1518,7 +1523,7 @@ def make_sb_vless(transport):
         if mux:
             ib["multiplex"] = {"enabled": True}
         lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=tls"
-              f"&sni={tls_host()}&type={_LINK_NET[transport]}&host={tls_host()}"
+              f"&sni={tls_host()}&fp=chrome&type={_LINK_NET[transport]}&host={tls_host()}"
               f"&path={path}&allowInsecure={1 if insec else 0}{smk}#{tag}")
         return ib, lk
     return b
@@ -1568,7 +1573,7 @@ def sb_trojan(port, tag):
           "users": [{"password": pw}],
           "tls": {"enabled": True, "server_name": tls_host(),
                   "certificate_path": crt, "key_path": key}}
-    lk = (f"trojan://{pw}@{G['host']}:{port}?security=tls&sni={tls_host()}"
+    lk = (f"trojan://{pw}@{G['host']}:{port}?security=tls&sni={tls_host()}&fp=chrome"
           f"&type=tcp&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
@@ -1819,7 +1824,9 @@ def _xr_reality_stream(priv, sid, network, extra=None):
           "realitySettings": {"show": False, "dest": f"{G['sni']}:443",
                               "xver": 0, "serverNames": [G["sni"]],
                               "privateKey": priv, "shortIds": [sid],
-                              "minClientVer": "1.0.0"}}
+                              "minClientVer": "1.0.0",
+                              # 客户端时间跟服务器差 70 秒以上的握手拒掉：防录下来的握手被重放探测（mack-a 同值）
+                              "maxTimeDiff": 70000}}
     if extra:
         st.update(extra)
     return st
@@ -1866,7 +1873,15 @@ def xr_reality_xhttp(port, tag):
     return ib, lk
 
 def _xr_tls(certfile, keyfile):
-    return {"certificates": [{"certificateFile": certfile, "keyFile": keyfile}]}
+    """xray TLS 入站的证书段。对齐 mack-a 的 Vision / XHTTP-TLS：TLS 最低 1.2；
+       用的是 acme 真证书时开 rejectUnknownSni——拿 IP 扫端口、SNI 不对的一律握手拒绝，
+       扫描器拿不到证书，也就看不到域名。自签证书只有 CN、没有 SAN，xray 按 SAN 比对会把
+       正常客户端也拒掉，所以自签不开。"""
+    tls = {"minVersion": "1.2",
+           "certificates": [{"certificateFile": certfile, "keyFile": keyfile}]}
+    if certfile == ACME_CRT:
+        tls["rejectUnknownSni"] = True
+    return tls
 
 def xr_vless_ws(port, tag):
     uid = new_uuid(); path = "/" + secrets.token_hex(3)
@@ -1877,7 +1892,7 @@ def xr_vless_ws(port, tag):
                              "wsSettings": {"path": path},
                              "tlsSettings": _xr_tls(crt, key)}}
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=tls"
-          f"&sni={tls_host()}&type=ws&host={tls_host()}&path={path}"
+          f"&sni={tls_host()}&fp=chrome&type=ws&host={tls_host()}&path={path}"
           f"&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
@@ -1909,13 +1924,9 @@ def xr_vless_xhttp_tls(port, tag):
        区别，只多一次本地转发和一条路由规则，所以直接监听公网口。"""
     uid = new_uuid(); path = "/" + secrets.token_hex(3)
     crt, key, insec = ensure_acme()
-    tls = _xr_tls(crt, key)
+    tls = _xr_tls(crt, key)                         # 含 minVersion 1.2；真证书时 rejectUnknownSni
     tls["serverName"] = tls_host()
-    tls["minVersion"] = "1.2"
     tls["alpn"] = ["h2", "http/1.1"]
-    if not insec:
-        # 真证书才开：自签场景下客户端可能按 IP 连、不发 SNI，开了会被直接拒
-        tls["rejectUnknownSni"] = True
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid}], "decryption": "none"},
           "streamSettings": {"network": "xhttp", "security": "tls",
@@ -1933,7 +1944,7 @@ def xr_trojan(port, tag):
           "settings": {"clients": [{"password": pw}]},
           "streamSettings": {"network": "raw", "security": "tls",
                              "tlsSettings": _xr_tls(crt, key)}}
-    lk = (f"trojan://{pw}@{G['host']}:{port}?security=tls&sni={tls_host()}"
+    lk = (f"trojan://{pw}@{G['host']}:{port}?security=tls&sni={tls_host()}&fp=chrome"
           f"&type=tcp&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
@@ -2167,6 +2178,7 @@ def link_to_proxy(u):
         d = {"name": nm("anytls"), "type": "anytls", "server": host, "port": port, "password": P.username, "udp": "true"}
         if qs.get("sni"): d["sni"] = qs["sni"]
         if insec: d["skip-cert-verify"] = "true"
+        d["client-fingerprint"] = qs.get("fp", "chrome")   # 跟 vless / trojan / vmess 一样，不用 Go 自带指纹
         return d
     if sch == "trojan":
         d = {"name": nm("trojan"), "type": "trojan", "server": host, "port": port, "password": P.username, "udp": "true"}
@@ -4187,6 +4199,118 @@ def takeover_cleanup():
             sh("iptables -t nat " + line.replace("-A", "-D", 1), check=False)
     print("已清理，端口/服务名/端口跳跃规则已腾出。\n")
 
+# ---------------------------------------------------------------------------- 防火墙
+# 对齐 mack-a 的 allowPort：机器开着防火墙时，把节点 / 订阅 / 伪装站要用的端口放行。以前完全不管——
+# Ubuntu 开了 ufw、甲骨文那种 INPUT 末尾一条 REJECT 兜底的镜像，装完节点全超时、订阅也拉不下来，
+# 看起来跟「IP 被墙」一模一样。规则都带 bgpeer 注释，认得出是谁加的。
+FW_TAG = "bgpeer"
+
+def _fw_wanted():
+    """本机实际在用的公网端口 → {(端口, tcp/udp)}。只收监听公网的，127.0.0.1 的不用开。"""
+    want = set()
+    def add(p, proto):
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            return
+        if 0 < p < 65536:
+            want.add((p, proto))
+    try:
+        for ib in json.load(open(f"{SB_DIR}/config.json")).get("inbounds", []):
+            if str(ib.get("listen", "")) in ("127.0.0.1", "localhost"):
+                continue
+            t = ib.get("type")
+            if t in ("hysteria2", "hysteria", "tuic"):
+                add(ib.get("listen_port"), "udp")      # hy2 端口跳跃靠 PREROUTING DNAT，过滤时已是真实端口
+            elif t == "shadowsocks":
+                add(ib.get("listen_port"), "tcp"); add(ib.get("listen_port"), "udp")
+            else:
+                add(ib.get("listen_port"), "tcp")
+    except Exception:
+        pass
+    try:
+        for ib in json.load(open(f"{XRAY_DIR}/config.json")).get("inbounds", []):
+            if str(ib.get("listen", "")) in ("127.0.0.1", "localhost"):
+                continue
+            add(ib.get("port"), "tcp")
+            if (ib.get("streamSettings") or {}).get("network") == "xhttp":
+                add(ib.get("port"), "udp")             # xhttp 能走 h3（mack-a 也开 udp）
+    except Exception:
+        pass
+    try:
+        for n in _cdn_load():
+            add(n.get("cf_port"), "tcp")
+    except Exception:
+        pass
+    try:
+        add(open(SUBPORT_FILE).read().strip(), "tcp")  # 直接读文件：sub_port() 没有时会现挑一个
+    except OSError:
+        pass
+    try:
+        ng = open(NGINX_CONF).read()
+        if re.search(r"listen\s+80\b", ng):
+            add(80, "tcp")
+        if re.search(r"listen\s+(?:\[::\]:)?443\b", ng):
+            add(443, "tcp")
+    except OSError:
+        pass
+    if os.path.exists(NGINX_STREAM_CONF):
+        add(443, "tcp")
+    return want
+
+def _ipt_catchall():
+    """iptables 的 INPUT 会不会挡新连接；挡的话返回放行规则该怎么加（"-I INPUT 7" / "-A INPUT"），不挡返回 ""。
+       兜底 = 不带任何条件的 REJECT/DROP（甲骨文镜像：-A INPUT -j REJECT --reject-with icmp-host-prohibited），
+       放行规则插在它前面、而不是顶到第 1 条——前面那些封 IP 的（手动 -s x.x.x.x -j DROP、CrowdSec 的 match-set）
+       照样先生效。只丢 INVALID 包、封某个来源 IP 的都不算兜底。默认策略 DROP 又没兜底行：接在最后。"""
+    out = sh("iptables -S INPUT", check=False) or ""
+    rules = [l.strip() for l in out.splitlines() if l.startswith("-A INPUT")]
+    for i, l in enumerate(rules, 1):
+        if re.fullmatch(r"-A INPUT(?: -m (?:state|conntrack) --(?:state|ctstate) NEW)? -j (?:REJECT|DROP)\b.*", l):
+            return f"-I INPUT {i}"                   # 一条条插在同一位置：兜底行跟着往下挪，全在它前面
+    return "-A INPUT" if re.search(r"(?m)^-P INPUT DROP", out) else ""
+
+def fw_allow(want, quiet=False):
+    """把 want={(端口, tcp/udp)} 在本机防火墙放行（幂等，已放行的不重复加）。返回新放行了几个。
+       ufw 开着 → ufw allow；firewalld 在跑 → firewall-cmd；都没有但 iptables 有拦截兜底 → 插 ACCEPT。
+       都没开 → 什么都不做（大多数 VPS 默认全放行）。"""
+    if not want:
+        return 0
+    opened, kind = 0, ""
+    ufw = sh("ufw status", check=False) if have("ufw") else ""
+    if "Status: active" in (ufw or ""):
+        kind = "ufw"
+        for p, proto in sorted(want):
+            if re.search(rf"(?m)^{p}(?:/{proto})?\s+ALLOW\b", ufw):     # 「80  ALLOW」不带协议 = tcp/udp 都放
+                continue
+            sh(f"ufw allow {p}/{proto} comment {FW_TAG}", check=False); opened += 1
+    elif have("firewall-cmd") and (sh("firewall-cmd --state", check=False) or "").strip() == "running":
+        kind = "firewalld"
+        cur = (sh("firewall-cmd --permanent --list-ports", check=False) or "").split()
+        for p, proto in sorted(want):
+            if f"{p}/{proto}" in cur:
+                continue
+            # 运行时 + 永久各加一遍，不 --reload：重载会让旧版 Docker 丢掉自己的转发规则，
+            # Emby / OpenList 容器端口当场断（CLAUDE.md 第六节：不许误伤播放）
+            sh(f"firewall-cmd --add-port={p}/{proto}", check=False)
+            sh(f"firewall-cmd --permanent --add-port={p}/{proto}", check=False); opened += 1
+    elif have("iptables") and _ipt_catchall():
+        kind, at = "iptables", _ipt_catchall()
+        for p, proto in sorted(want):
+            rule = f"-p {proto} --dport {p} -m comment --comment {FW_TAG} -j ACCEPT"
+            if subprocess.run(f"iptables -C INPUT {rule}", shell=True, capture_output=True).returncode == 0:
+                continue
+            sh(f"iptables {at} {rule}", check=False); opened += 1
+        if opened and have("netfilter-persistent"):
+            sh("netfilter-persistent save", check=False)
+    if opened and not quiet:
+        print(f"  ✔ 本机防火墙（{kind}）已放行 {opened} 个端口")
+    return opened
+
+def fw_sync(quiet=False):
+    """节点 / 订阅 / 伪装站实际在用的端口全部放行（见 _fw_wanted）。"""
+    return fw_allow(_fw_wanted(), quiet)
+
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
     if G.get("sni_split") and G["domain"]:
@@ -4317,6 +4441,7 @@ def run(sb_names, xr_names):
                   open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
         pass
+    fw_sync()                                            # 开着防火墙就把节点 / 订阅端口放行（对齐 mack-a）
 
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
@@ -6846,6 +6971,7 @@ def cdn_add():
     if not created:
         print("  ✗ 没有成功新增的节点。"); return
     _cdn_save(nodes)
+    fw_sync()                                            # CDN 端口（2053…）本机防火墙也得放行
     ports = "、".join(str(n["cf_port"]) for n in created)
     # 每条各自独立服务、与主节点互不影响；有优选地址时链接地址位已换成它，SNI/Host 仍是域名
     ui_title(f"已新增 {len(created)} 条 CDN 节点（共 {len(nodes)} 条）")
@@ -8068,6 +8194,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
             # 以后自动续期也照做。
             hooks = " --pre-hook 'systemctl stop nginx' --post-hook 'systemctl start nginx'"
             print("  80 端口被 nginx 占着 → 验证时自动停一下 nginx（约 10 秒）")
+        fw_allow({(80, "tcp")})                      # HTTP-01 要从外面连 80：开着防火墙先放行
         issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256{hooks}"
     print("  正在签发…（走 acme.sh，可能要十几秒到一分钟）")
     r = subprocess.run(issue, shell=True, text=True, capture_output=True, env=env, timeout=600)
@@ -9082,6 +9209,7 @@ def cert_fix_run():
             sh(f"{acme} --remove -d {d}", check=False)
         left = acme_hijackers(keep=dom)
         print(f"    {'✓ 已全部撤掉' if not left else R + '✗ 仍剩 ' + ', '.join(d for d, _ in left) + N}")
+    fw_allow({(80, "tcp")})                          # standalone 验证要从外面连 80：开着防火墙先放行
     print("  正在续期…（走 acme.sh，可能要十几秒）")
     # 用 --issue --force 而不是 --renew：--renew 会沿用记录里那套（可能已经失效的）
     # 验证方式，--issue 则把这次用的方式写回记录，往后自动续期就跟着走对的路。
@@ -9290,6 +9418,7 @@ def main_menu():
         print("  ✓ 已修好自签 vmess 节点（订阅地址不变，客户端刷新一次订阅即可）")
     if _relay_port_heal():
         print("  ✓ 已修好配置里的中转地址（订阅地址不变，客户端刷新一次订阅即可）")
+    fw_sync()                                    # 老装机：开着防火墙、端口没放行的补上（放行了会说一行）
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     if os.path.exists(CORE_CRON_FILE):
@@ -9795,6 +9924,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
         json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
         pass
+    fw_sync()                                            # 新加协议的端口也放行
 
     # 和「2 查看链接」一个样：新节点一条一行、条间空行，三大订阅高亮
     ui_title(f"已添加 {len(new_links)} 个节点（现有节点未改动）")
@@ -10147,6 +10277,16 @@ def install_flow():
     else:
         domain = _ask("\n域名(有则走 acme 真证书, 回车=自签): ")
     email = ""   # 证书自动续期、默认占位邮箱即可签发，不再交互问；想指定用命令行 --email
+    if not domain:
+        # 对齐 mack-a：没域名只给 reality（为什么见 selfsigned_risky）。默认去掉，回 n 照装（装时 warn_selfsigned 再提醒一行）
+        drop = selfsigned_risky(sb_names, xr_names)
+        if drop:
+            ui_warn(f"没域名：{'、'.join(drop)} 只能自签证书，一被探测就露馅、容易封 IP")
+            if (_ask("去掉这几个、只装 reality / hy2？（回车 = 去掉 / n = 照装）: ").strip().lower() or "y") not in ("n", "no"):
+                sb_names = [n for n in sb_names if n not in drop]
+                xr_names = [n for n in xr_names if n not in drop]
+                if not sb_names and not xr_names:
+                    print("去掉后没剩协议，退出。没域名请选 reality-vision / reality-grpc / reality-xhttp / hy2。"); return
     nginx = ""
     if domain:
         nginx = "1" if (_ask("用 nginx 前置(443伪装站+webroot证书, ws类藏443)? [y/N]: ")
