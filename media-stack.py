@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.377"
+SCRIPT_VERSION = "1.5.378"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -15825,8 +15825,7 @@ def retired_ghosts(d, ghosts):
     return out
 
 
-RETIRED_WAIT_S = 600
-RETIRED_POLL_S = 5
+RETIRED_BATCH = 50          # 一次删几条：Ids 拼在网址里，别太长
 
 
 def clear_retired_ghosts(d, key, confirm=True):
@@ -15849,40 +15848,45 @@ def clear_retired_ghosts(d, key, confirm=True):
         if not ask_yn("从 Emby 里清掉？", False):
             print("留着。")
             return 0
-    # 【先一口气报完，再统一等、边等边报数】1.5.376 是一批 300 条报一次、每批等 Emby 认下（最多 60 秒）再报下一批，
-    # 屏上一个字不打 —— 真机 2739 条干等十来分钟，仓库主人：「卡在这里好长时间了，也没显示是不是在运行」。
-    # 不改 emby_notify_changes：它在每小时那条上（铁律），这里自己发
-    sent = 0
-    for i in range(0, len(gone), EMBY_TARGETED_MAX):
-        part = gone[i:i + EMBY_TARGETED_MAX]
+    # 【直接删条目，不发「已删除」通知】1.5.376/377 发的是 /Library/Media/Updated（Deleted），真机 2739 条
+    # 等了 20 分钟一条没清 —— 整个主目录都没了的时候 Emby 不认这种通知（找不到还在的上级去刷）。
+    # 平时不用删除条目的接口，是因为它会连磁盘上的文件、甚至所在文件夹一起删（见 prune_emby_ghosts）；
+    # 这里每一条都确认过「它的 strm 和整个主目录本地都已经没了」（retired_ghosts，删之前再看一眼），
+    # 没有东西可以被它误删。先成批删（POST /Items/Delete?Ids=），这台 Emby 不认就一条条 DELETE。
+    root = os.path.join(strm_root(d), STRM_SUBDIR)
+    safe = [g for g in gone if not os.path.lexists(_strm_host_path(d, g[2]))
+            and not os.path.lexists(os.path.join(root, g[2][len(STRM_PATH) + 1:].split("/")[0]))]
+    done, t0 = 0, time.time()
+
+    def _one(iid):
         try:
-            _emby("/Library/Media/Updated", key, method="POST", timeout=60,
-                  body={"Updates": [{"Path": cp, "UpdateType": "Deleted"} for _i, _n, cp in part]})
-            sent += len(part)
-        except Exception as e:
-            warn(f"有一批没报出去：{_short_err(e)[:60]}")
-        print(f"\r    {DIM}已报给 Emby {sent}/{len(gone)}{RST}", end="", flush=True)
-    print()
-    if sent:
-        scan_log_line("清撤掉的盘", f"删除 {sent}：{'、'.join(tops)}")
-    left, t0 = gone, time.time()
+            _emby(f"/Items/{iid}", key, method="DELETE", timeout=60)
+            return True
+        except Exception:
+            return False
     try:
-        while left and time.time() - t0 < RETIRED_WAIT_S:
-            time.sleep(RETIRED_POLL_S)
-            now = emby_ghost_items(d, key)
-            if now is not None:
-                left = retired_ghosts(d, now)
+        for i in range(0, len(safe), RETIRED_BATCH):
+            ids = [g[0] for g in safe[i:i + RETIRED_BATCH]]
+            try:
+                _emby("/Items/Delete?Ids=" + ",".join(ids), key, method="POST", timeout=120)
+                done += len(ids)
+            except Exception:
+                done += sum(_one(x) for x in ids)
             el = int(time.time() - t0)
-            print(f"\r    {DIM}Emby 在清：已清 {len(gone) - len(left)}/{len(gone)}，已等 {el // 60}:{el % 60:02d}"
-                  f"（Ctrl-C 不等了，它在后台接着清）{RST}", end="", flush=True)
+            print(f"\r    {DIM}正在从 Emby 删：{done}/{len(safe)}，已用 {el // 60}:{el % 60:02d}"
+                  f"（Ctrl-C 先停，下次进来接着删）{RST}", end="", flush=True)
     except KeyboardInterrupt:
         pass
+    if done:
+        scan_log_line("清撤掉的盘", f"删除 {done}：{'、'.join(tops)}")
+    now = emby_ghost_items(d, key)
+    left = retired_ghosts(d, now) if now is not None else gone[done:]
     print()
     n = len(gone) - len(left)
     if n:
         ok(f"Emby 里 {n} 个条目已清掉（{'、'.join(tops)}）")
     if left:
-        warn(f"还有 {len(left)} 个 Emby 还没清完，过几分钟再进「3 挂载路径」看一眼")
+        warn(f"还有 {len(left)} 个没删掉，再进一次「3 挂载路径」接着删")
     return max(n, 0)
 
 
