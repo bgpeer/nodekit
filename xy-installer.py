@@ -126,7 +126,8 @@ CFG_FILE     = BGP_DIR + "/mihomo.yaml"      # mihomo 可编辑成品配置
 SBOX_FILE    = BGP_DIR + "/singbox.json"     # sing-box 客户端可编辑成品配置
 SR_FILE      = BGP_DIR + "/shadowrocket.conf" # Shadowrocket 可编辑成品配置
 SR_NODES_FILE = BGP_DIR + "/shadowrocket-nodes.txt"  # 小火箭节点订阅（base64 分享链接；跟小火箭配置同一个 token、扩展名 .txt）
-SR_MODE_FILE  = BGP_DIR + "/sr_mode"                 # "sub" = 小火箭节点走节点订阅、配置里不带节点；没有 = 老写法
+SR_MODE_FILE  = BGP_DIR + "/sr_mode"                 # "sub" = 小火箭节点走节点订阅、配置里不带节点；没有 = 写在配置里（一个链接）
+SR_ONELINK_MARK = BGP_DIR + "/sr_onelink"            # 订阅模式的老机器已一次性改回一个链接（见 sr_onelink_heal）
 HY2_BW_FILE   = BGP_DIR + "/hy2_bw.json"             # hy2 满速（Brutal）：{"up": 上行, "down": 下行}（Mbps）；没有 = 自动（BBR）
 SUB_DIR      = BGP_DIR + "/sub"              # 托管目录（<token>.yaml/.json/.conf 软链）
 SUB_SERVER   = BGP_DIR + "/xy-sub-server.py" # 订阅托管小服务（支持可选 TLS）
@@ -3412,54 +3413,57 @@ def build_singbox_sub(nodes, tpl_url):
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
+# 参数名用小火箭自己的那套：仓库主人 10/12 给的官方懒人配置注释里写的就是这些，小火箭导出节点时的内部字段
+# 也是这一套（password / tls / peer / allowInsecure / obfs / path / obfsParam / publicKey / shortId / xtls /
+# auth / user / udp / alpn / upmbps / downmbps）。以前写的 username / sni / skip-cert-verify / public-key / short-id /
+# obfs-uri / obfs-host 是 Surge / mihomo 的叫法——仓库主人 10/11 实测「配置里的节点有的出不来、有的超时，同样的节点
+# 单条链接导入能连」，多半栽在这。xtls=2 是 xtls-rprx-vision（1 是早废了的 direct）。
+# 这几类小火箭配置里写不出来 / 连不上，跳过（单条链接照样在）：xhttp（小火箭不支持）、VLESS Encryption（查不到支不支持）、
+# httpupgrade（小火箭会当成 websocket 连，必断）；xray 内核的 reality 在 build_shadowrocket_sub 里跳过。
+# hy2 端口跳跃小火箭配置里的写法查不到，不写：连跳跃段的起点端口，服务端 DNAT 到真端口照样通。
 def shadowrocket_line(name, d):
     t = d.get("type"); srv = d["server"]; port = d.get("port")
     sni = d.get("servername") or d.get("sni") or srv
-    scv = "1" if d.get("skip-cert-verify") else "0"
-    if d.get("network") == "xhttp":
-        return None                                   # 小火箭不支持 xhttp → 跳过（不写进小火箭订阅，单链接仍在）
-    if d.get("encryption"):
-        return None                                   # VLESS Encryption：小火箭支不支持查不到（闭源），宁可不写也别写个连不上的
+    net, wo = d.get("network"), d.get("ws-opts") or {}
+    if net == "xhttp" or d.get("encryption") or str(wo.get("v2ray-http-upgrade")).lower() == "true":
+        return None
+    tls = [f"peer={sni}"] + (["allowInsecure=1"] if str(d.get("skip-cert-verify")).lower() == "true" else [])
+    ws = (["obfs=websocket", f"path={wo.get('path') or '/'}", f"obfsParam={(wo.get('headers') or {}).get('Host') or sni}"]
+          if net == "ws" else [])
     if t == "vless":
-        p = [f"{name} = vless", srv, str(port), f"username={d['uuid']}", "tls=1", f"sni={sni}",
-             f"skip-cert-verify={scv}", "tfo=1"]
-        if d.get("flow"): p.append(f"flow={d['flow']}")
-        if d.get("reality-opts"):
-            p += [f"public-key={d['reality-opts'].get('public-key','')}",
-                  f"short-id={d['reality-opts'].get('short-id','')}", "fp=chrome"]
-        if d.get("network") == "ws":
-            p += ["obfs=websocket", f"obfs-uri={d['ws-opts'].get('path','/')}",
-                  f"obfs-host={d['ws-opts'].get('headers',{}).get('Host',sni)}"]
-        elif d.get("network") == "grpc":
-            p += ["transport=grpc", f"grpc-service-name={d.get('grpc-opts',{}).get('grpc-service-name','')}"]
-        return ",".join(p)
+        p = [f"{name} = vless", srv, str(port), f"password={d['uuid']}", "tls=true", *tls]
+        if d.get("flow") == "xtls-rprx-vision":
+            p.append("xtls=2")
+        ro = d.get("reality-opts")
+        if ro:
+            p += [f"publicKey={ro.get('public-key', '')}", f"shortId={ro.get('short-id', '')}"]
+        if net == "grpc":
+            p += ["obfs=grpc", f"path={(d.get('grpc-opts') or {}).get('grpc-service-name', '')}"]
+        else:
+            p += ws or ["obfs=none"]
+        return ",".join(p + ["udp=1", "tfo=1"])
     if t == "vmess":
-        p = [f"{name} = vmess", srv, str(port), f"username={d['uuid']}", "tls=1", f"sni={sni}",
-             "alterId=0", f"skip-cert-verify={scv}", "tfo=1",
-             "obfs=websocket", f"obfs-uri={d.get('ws-opts',{}).get('path','/')}",
-             f"obfs-host={d.get('ws-opts',{}).get('headers',{}).get('Host',sni)}"]
-        return ",".join(p)
+        p = [f"{name} = vmess", srv, str(port), f"password={d['uuid']}", f"alterId={d.get('alterId', 0)}",
+             f"method={d.get('cipher') or 'auto'}"]
+        if str(d.get("tls")).lower() == "true":
+            p += ["tls=true", *tls]
+        return ",".join(p + (ws or ["obfs=none"]) + ["udp=1", "tfo=1"])
     if t == "trojan":
-        p = [f"{name} = trojan", srv, str(port), f"password={d['password']}",
-             "tls=1", f"sni={sni}", f"skip-cert-verify={scv}", "tfo=1"]
-        if d.get("network") == "ws":                  # trojan+ws（CDN）
-            p += ["obfs=websocket", f"obfs-uri={d.get('ws-opts',{}).get('path','/')}",
-                  f"obfs-host={d.get('ws-opts',{}).get('headers',{}).get('Host',sni)}"]
-        return ",".join(p)
+        return ",".join([f"{name} = trojan", srv, str(port), f"password={d['password']}", "tls=true", *tls]
+                        + ws + ["udp=1", "tfo=1"])
     if t == "hysteria2":
         pt = port or (d["ports"].split("-")[0] if d.get("ports") else "")   # 跳跃时用起点端口
-        p = [f"{name} = hysteria2", srv, str(pt), f"password={d['password']}", f"sni={sni}",
-             f"skip-cert-verify={scv}"]
+        p = [f"{name} = hysteria2", srv, str(pt), f"auth={d['password']}", *tls, "alpn=h3", "udp=1"]
         if d.get("obfs") == "salamander" and d.get("obfs-password"):
-            p += ["obfs=salamander", f"obfs-password={d['obfs-password']}"]
-        if d.get("ports"): p.append(f"ports={d['ports']}")
+            p.append(f"obfsParam={d['obfs-password']}")
+        if d.get("up") and d.get("down"):                                    # 满速（Brutal）：开了才写，见 hy2_bw
+            p += [f"upmbps={str(d['up']).split()[0]}", f"downmbps={str(d['down']).split()[0]}"]
         return ",".join(p)
     if t == "tuic":
-        return ",".join([f"{name} = tuic", srv, str(port), f"uuid={d['uuid']}",
-                         f"password={d['password']}", f"sni={sni}", "alpn=h3", f"skip-cert-verify={scv}"])
+        return ",".join([f"{name} = tuic", srv, str(port), f"password={d['password']}", f"user={d['uuid']}",
+                         *tls, "alpn=h3", "udp=1"])
     if t == "anytls":
-        return ",".join([f"{name} = anytls", srv, str(port), f"password={d['password']}",
-                         "tls=1", f"sni={sni}", f"skip-cert-verify={scv}"])
+        return ",".join([f"{name} = anytls", srv, str(port), f"password={d['password']}", "tls=true", *tls, "udp=1"])
     return None
 
 def _sr_section_keys(tpl, section):
@@ -3679,14 +3683,45 @@ def sr_nodes_url():
         return ""
     return f"{'https' if _sub_https() else 'http'}://{_host()}:{sub_port()}/{t}.txt"
 
+def sr_onelink_heal():
+    """仓库主人 10/12：「订阅应该做成一个链接最好，两个订阅链接人家导入进去说不能用」。#939 起新装默认
+       「节点订阅」（配置 + .txt 两个链接）；这些机器一次性改回节点写在配置里，按当前模板重生成小火箭配置。
+       只动一次（记标记）：之后在「8 小火箭配置 → 6」自己选回节点订阅的照它的。小火箭配置手改过的不动
+       （重生成会盖掉手改的内容）。生成失败切回原样。改了返回 True。"""
+    if os.path.exists(SR_ONELINK_MARK):
+        return False
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        open(SR_ONELINK_MARK, "w").write("1\n")
+    except OSError:
+        return False
+    if not (sr_sub_mode() and os.path.exists(SR_FILE) and read_saved_links()) or cfg_auto_paused("conf"):
+        return False
+    keep = open(SR_NODES_FILE).read() if os.path.exists(SR_NODES_FILE) else None
+    sr_set_sub_mode(False)
+    G["host"] = _host()
+    ylines, nodes = parse_nodes(aggregated_links())
+    if not ylines or _regen_fmt("conf", ylines, nodes)[0] == "failed":
+        sr_set_sub_mode(True)                                    # 小火箭配置 _regen_fmt 已回滚；节点订阅放回去
+        if keep is not None:
+            open(SR_NODES_FILE, "w").write(keep); _sr_nodes_link()
+        return False
+    return True
+
 def build_shadowrocket_sub(nodes, tpl_url):
     sub = sr_sub_mode()
     lines, names_list, links = [], [], []
+    xr_reality, xr_skip = _local_xray_reality(), 0
     for key, d in nodes:
         name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
+        # 本机 xray 内核的 reality：xray 26.9.8+ 只收 ClientHello 带 X25519MLKEM768 的客户端，小火箭 2.2.92 没带，
+        # 握手被当成探测转去借用站（小火箭官方 config 仓库 issue #4，9 月底还开着）。跟 sing-box 订阅一样不写。
+        if d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0)) in xr_reality:
+            xr_skip += 1
+            continue
         if sub:
             # 节点订阅照抄分享链接：小火箭不支持 xhttp，跳过；量子加密（VLESS Encryption）单条导入
-            # 仓库主人实测能连，照收（配置里的老写法查不到支不支持，所以那边还是跳过）
+            # 仓库主人实测能连，照收（写在配置里的写法查不到支不支持，所以那边还是跳过）
             if d.get("network") != "xhttp" and d.get("_link"):
                 links.append(d["_link"]); names_list.append(name)
             continue
@@ -3708,6 +3743,8 @@ def build_shadowrocket_sub(nodes, tpl_url):
     out = _sr_fill_names(out, names_frag)                       # 行内锚点（按行去重）
     out = _sr_cn_isolate(out, names_list + static, regex=sub)
     open(SR_FILE, "w").write(out)
+    if xr_skip:
+        print(f"  小火箭跳过 {xr_skip} 条 xray 内核的 reality（小火箭连不上，mihomo 照常有）")
     if sub:
         open(SR_NODES_FILE, "w").write(base64.b64encode(("\n".join(links) + "\n").encode()).decode())
         _sr_nodes_link()
@@ -4950,7 +4987,7 @@ def run(sb_names, xr_names):
     # 生成三格式订阅（mihomo / sing-box / Shadowrocket），各自一条链接
     ok = False
     try:
-        sr_set_sub_mode(True)                                # 小火箭节点走节点订阅（订阅地址本来就全换了，客户端都要重新导入）
+        sr_set_sub_mode(False)                               # 小火箭节点写在配置里，一个链接（仓库主人 10/12，见 sr_onelink_heal）
         ok = build_subscription(all_links, new_token=True)   # 重装换了节点/域名 → 换 token 刷新订阅
     except Exception as e:
         print("\n订阅生成跳过（不影响节点使用）:", e)
@@ -5313,6 +5350,8 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
     if fake_site_heal():                        # 伪装站还是老的全网一样的默认页：换成本机生成的（只写静态文件）
         print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
+    if sr_onelink_heal():                       # 小火箭订阅改回一个链接（节点写进配置），只动一次
+        print(f"{time.strftime('%F %T')} 小火箭节点改回写在配置里（一个链接）")
     n = _xray_pq_health()                       # 借用目标站换了短证书链：关掉抗量子签名，不然 xray 的 reality 全断
     if n:
         print(f"{time.strftime('%F %T')} 借用目标站证书链变短，{n} 个 xray reality 节点关掉了抗量子签名（订阅已重建）")
@@ -5379,7 +5418,7 @@ def cfg_auto_menu(ext):
     print(f"  ✔ 自动更新已{'开' if cfg_auto_on(ext) else '关'}")
 
 def sr_mode_menu():
-    """「8 小火箭配置」→ 6 小火箭节点：写在配置里（老写法）⇄ 走节点订阅。两个方向都会让小火箭里有东西没掉，
+    """「8 小火箭配置」→ 6 小火箭节点：写在配置里（一个链接，默认）⇄ 走节点订阅（两个链接）。两个方向都会让小火箭里有东西没掉，
        红字说清、默认否（CLAUDE.md 第四节）。切完按当前模板重生成小火箭配置；生成失败就切回原样。"""
     on = sr_sub_mode()
     if on:
@@ -5429,7 +5468,7 @@ def config_menu(ext):
                  (4, "自定义模板链接（添加 / 更换 / 删除）", None),
                  (5, "自动更新", _cfg_auto_state(ext))]
         if ext == "conf":
-            items.append((6, "小火箭节点", "走节点订阅" if sr_sub_mode() else "写在配置里（老写法）"))
+            items.append((6, "小火箭节点", "走节点订阅（两个链接）" if sr_sub_mode() else "写在配置里（一个链接）"))
         ui_items(items + [(0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
@@ -10181,6 +10220,8 @@ def main_menu():
     fw_sync()                                    # 老装机：开着防火墙、端口没放行的补上（放行了会说一行）
     if fake_site_heal():
         print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
+    if sr_onelink_heal():
+        print("  ✔ 小火箭改回一个链接：节点写进配置了，小火箭里那条节点订阅可以删掉")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     if os.path.exists(CORE_CRON_FILE):
