@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.375"
+SCRIPT_VERSION = "1.5.376"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -15812,6 +15812,53 @@ def emby_ghost_items(d, key):
     return out
 
 
+def retired_ghosts(d, ghosts):
+    """空壳里【有意撤掉的盘】那一部分：所在主目录本地整个没了、而且已经不在扫描范围里（strm_mount_dir）。
+    两条都满足才算 —— 本地没了但还在扫的（AutoFilm 还没生成回来、目录出了问题）照旧归刹车管。"""
+    root = os.path.join(strm_root(d), STRM_SUBDIR)
+    scanned = {strm_mount_dir(p) for p in effective_scan_paths(d)}
+    out = []
+    for g in ghosts or []:
+        top = g[2][len(STRM_PATH) + 1:].split("/")[0] if g[2].startswith(STRM_PATH + "/") else ""
+        if top and top not in scanned and not os.path.lexists(os.path.join(root, top)):
+            out.append(g)
+    return out
+
+
+def clear_retired_ghosts(d, key, confirm=True):
+    """把撤掉的盘留在 Emby 里的条目清掉。返回清掉几个。
+
+    【每晚那道刹车拦的就是它】真机 10/11：七米蓝「删除所有路径」、本地 strm 也删了，Emby 里还挂着两千七百多个
+    点开必定放不了的条目 —— 空壳占了九成多，prune_emby_ghosts 当成「目录出了问题」一个不动，而删的那一屏
+    还写着「每小时的对齐任务也会做」。有意撤掉的盘不该走那道刹车，但也不放进每小时那条（铁律：白天看片时
+    一直在跑的路径不添大动作），只在人点的地方做：删盘那一下（已经确认过）、进「3 挂载路径」时问一句。
+    confirm：要不要先问（会让一批条目连同观看记录从 Emby 消失，第四节：醒目一行、默认否）。"""
+    if not key:
+        return 0
+    gone = retired_ghosts(d, emby_ghost_items(d, key) or [])
+    if not gone:
+        return 0
+    tops = sorted({g[2][len(STRM_PATH) + 1:].split("/")[0] for g in gone})
+    if confirm:
+        print(f"  {RED}{BOLD}{'、'.join(tops)}：本地 strm 已删、也不扫了，Emby 里还剩 {len(gone)} 个点不开的条目{RST}")
+        tip("清掉后这些片连同观看记录从 Emby 消失；网盘里的片一个不碰")
+        if not ask_yn("从 Emby 里清掉？", False):
+            print("留着。")
+            return 0
+    done = 0
+    for i in range(0, len(gone), EMBY_TARGETED_MAX):
+        part = gone[i:i + EMBY_TARGETED_MAX]
+        if emby_notify_changes(key, [(cp, "Deleted") for _i, _n, cp in part], timeout=60, quiet=True):
+            done += len(part)
+    left = retired_ghosts(d, emby_ghost_items(d, key) or [])
+    n = len(gone) - len(left)
+    if n:
+        ok(f"Emby 里 {n} 个条目已清掉（{'、'.join(tops)}）")
+    if left:
+        warn(f"还有 {len(left)} 个 Emby 没收下，过几分钟再进「3 挂载路径」会再问")
+    return max(n, 0)
+
+
 def prune_emby_ghosts(d, key, quiet=True):
     """把 emby_ghost_items 找到的空壳告诉 Emby（这几条路径已删除）。返回清掉几个。
 
@@ -26542,6 +26589,9 @@ def _mount_order_menu(stores):
     ok("新的顺序：" + " → ".join(new))
 
 
+_RETIRED_ASKED = [False]
+
+
 def mount_paths_menu():
     """挂载路径：一个盘一屏，各管各的。
 
@@ -26556,6 +26606,13 @@ def mount_paths_menu():
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
         return
     mark_drive_defaults_empty(d)          # 头一回来挂盘的新机器：之后挂的都算新盘
+    if not _RETIRED_ASKED[0]:
+        # 撤掉的盘在 Emby 里留下的条目（早先删的，或者删那一下 Emby 没收下）：一次运行只问一回
+        _RETIRED_ASKED[0] = True
+        try:
+            clear_retired_ghosts(d, read_emby_api_key(d))
+        except Exception:
+            pass
     while True:
         # 【小雅不单列一行 WebDAV】仓库主人：「这个怎么跑到外面来了……这个要放在小雅里面」。
         # 它的扫描路径、状态都在下面「小雅（WebDAV）」那一栏里管，见 _xiaoya_menu
@@ -26715,6 +26772,7 @@ def drop_orphan_strm_dirs(d, paths, unknown=()):
           f"「没时长」「没收录」的数字也会一直挂着。{RST}")
     print(f"  {DIM}删掉的只是本机生成的 strm 和刮削缓存，{RST}"
           f"{BOLD}网盘里的片子一个都不碰{RST}{DIM}。{RST}")
+    print(f"  {RED}{BOLD}Emby 里这些片（连同观看记录）会跟着清掉{RST}")
     if not ask_yn(f"把这 {sum(sizes.values())} 个 strm 从本地删掉？", False):
         print(f"  {DIM}留着。以后想清，再进这里改一次扫描路径就会再问。{RST}")
         return
@@ -26726,8 +26784,9 @@ def drop_orphan_strm_dirs(d, paths, unknown=()):
         except OSError as e:
             warn(f"{x} 没删干净：{_short_err(e)}")
     ok(f"删掉 {gone} 个 strm")
-    print(f"  {DIM}Emby 那边的条目要等它扫一次才会消失 —— 「4 生成媒体库」"
-          f"最后会通知扫描，每小时的对齐任务也会做。{RST}")
+    # 【当场就告诉 Emby】以前写「每小时的对齐任务也会做」—— 一下撤掉一整个盘，空壳占了库里一大半，
+    # 每小时那道刹车（GHOST_MAX_PCT）一个都不清。上面已经问过、点了头，这里不再问
+    clear_retired_ghosts(d, read_emby_api_key(d), confirm=False)
     print(f"  {YELLOW}媒体库本身还在 Emby 里{RST}{DIM}，路径指向的目录现在是空的。"
           f"不想要就去 Emby 的「媒体库」里把它删掉。{RST}")
 
