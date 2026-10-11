@@ -154,7 +154,7 @@
 | **acme.sh 里旧域名那条记录** | **它的每日 cron 半夜把证书覆盖回旧域名那张** |
 | Emby 的 `.env` + nginx + 证书 | Emby 那半边还留在旧域名上 |
 
-⚠ **最容易写错的一处**：reality 的 `sni=` 是**借用的第三方站**（`s0.awsstatic.com` 之类），
+⚠ **最容易写错的一处**：reality 的 `sni=` 是**借用的第三方站**（`www.cisco.com` 之类），
 跟你自己的域名没有半点关系。跟着换 = reality 全挂，而且是静默的握手失败。
 所以带 `security=reality` 的链接只动 `@主机名`、query 一个字不碰，两个核心的配置里
 也整块跳过 reality 入站。
