@@ -102,7 +102,7 @@ CERT, KEY = "/etc/ssl/sb/self.crt", "/etc/ssl/sb/self.key"     # 自签
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"  # acme 签发
 
 # 全局状态：域名/邮箱/SNI 由 CLI 注入；端口每次安装在大区间内随机分配
-G = {"host": "", "domain": "", "email": "", "sni": "s0.awsstatic.com", "prefix": ""}
+G = {"host": "", "domain": "", "email": "", "sni": "www.cisco.com", "prefix": ""}
 HY2_PORTS = "30000-31000"      # hy2 端口跳跃范围默认值；用户可自定义（--hy2-ports / 菜单）
 # 端口随机分配区间：每个协议每次重装都从这里随机挑不同的端口，避免连续端口被批量扫描识别
 PORT_LO, PORT_HI = 15000, 45000
@@ -1230,15 +1230,18 @@ def check_domain_or_die():
         raise SystemExit(f"{R}\n❌ 80 端口被占用，acme standalone 无法验证。先停掉占用 80 的服务"
                          f"（nginx/caddy 等）再装，或域名留空用自签，或用 nginx 前置模式。{N}")
 
-# reality 借用目标池：都是大厂/技术站，实测 TLS1.3+h2+X25519、国内可达、不套乱 CDN。
-# 安装时默认从这里随机挑一个（避免所有人都按回车挤在同一个 SNI 上被针对）。
+# reality 借用目标池：大厂 / 技术站的主站，要 TLS1.3 + h2 + X25519、国内可达、不套乱 CDN。
+# CDN 资源域名不收：同一个名字各地由不同边缘节点接，TLS 配置不一，有的机房连 TLS1.3 都握不上
+#   （仓库主人 10/11 撞上 updates.cdn-apple.com）。swcdn.apple.com / updates.cdn-apple.com /
+#   cdn-dynmedia-1.microsoft.com / s0.awsstatic.com 10/11 拿掉，从 mack-a 的随机池补了
+#   addons.mozilla.org / www.asus.com / react.dev / vuejs.org（他 xray、sing-box 两份名单都有）。
+# 安装时默认从这里随机挑一个（避免所有人都按回车挤在同一个 SNI 上被针对）；随机挑到的本机探不过会自己换（见 _sni_precheck_one）。
 REALITY_SNI_POOL = [
     "www.cisco.com", "www.oracle.com", "www.ibm.com", "www.vmware.com",
     "www.python.org", "www.mysql.com", "www.mongodb.com", "redis.io", "www.swift.com",
     "www.intel.com", "www.amd.com", "www.qualcomm.com", "www.dell.com",
-    "www.samsung.com", "academy.nvidia.com",
-    "swcdn.apple.com", "updates.cdn-apple.com", "cdn-dynmedia-1.microsoft.com",
-    "www.bing.com", "www.tesla.com", "s0.awsstatic.com",
+    "www.samsung.com", "academy.nvidia.com", "www.bing.com", "www.tesla.com",
+    "addons.mozilla.org", "www.asus.com", "react.dev", "vuejs.org",
 ]
 
 def _reality_sni_ok(sni):
@@ -3846,7 +3849,7 @@ def _direct_server_of(d):
        这种节点真正的归属是 Host 头里那个域名（你的真域名），直连该认它。
 
        判据：ws/xhttp 类且 Host 与 server 不同且是个域名。reality 排除在外——
-       它的 servername/host 是借用的伪装站（如 s0.awsstatic.com），更不能当直连目标。"""
+       它的 servername/host 是借用的伪装站（如 www.cisco.com），更不能当直连目标。"""
     s = str(d.get("server", "")).strip()
     if d.get("reality-opts"):
         return s
@@ -9107,7 +9110,7 @@ def cert_clean_flow():
 #   acme.sh 里旧域名那条记录        不撤掉的话它的每日 cron 半夜把证书覆盖回旧域名那张
 #   Emby 的 .env + nginx + 证书     Emby 对外是 <子域>.<域名>
 #
-# ⚠ 最容易写错的一处：reality 的 sni= 是【借用的第三方站】（s0.awsstatic.com 之类），
+# ⚠ 最容易写错的一处：reality 的 sni= 是【借用的第三方站】（www.cisco.com 之类），
 #   跟你自己的域名没有半点关系。跟着换 = reality 全挂，而且是静默的握手失败，
 #   现象还偏偏是「另外几个节点好好的」。所以带 security=reality 的链接只动 @host，
 #   query 一个字不碰；两个核心的配置里也整块跳过 reality 入站。

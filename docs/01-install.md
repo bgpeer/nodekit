@@ -196,7 +196,8 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 装机时脚本会自动做两项检查，帮你把伪装做扎实：
 
 - **Reality SNI 随机池 + 预检**：安装时**默认从内置的大厂/技术站池里随机挑一个**当 reality 借用目标
-  （cisco/oracle/python/intel/dell/苹果CDN/微软 等 21 个，实测 TLS1.3+h2+X25519、国内可达、不套乱 CDN）——
+  （cisco/oracle/python/intel/dell/mozilla/asus 等 21 个大站主站，要 TLS1.3+h2+X25519、国内可达、不套乱 CDN；
+  CDN 资源域名各地边缘节点 TLS 配置不一，不收）——
   避免所有人都按回车挤在同一个 SNI 上被针对。想指定就 `--sni 域名` 或交互里输入。选了 reality 系列协议时，
   装前还会从本机探测借用目标是否**可达 + 支持 TLS1.3 + HTTP/2**：**随机挑到的探不过，自动从池里另挑一个探得通的换上**
   （屏上一行 ✔ 说明换成了谁；池里同一个站在不同地区的机房表现不一，探过才算数）；自己填的探不过不替你换，
@@ -259,7 +260,7 @@ xray 内核会警告 `REALITY: Listening on non-443 ports may get your IP blocke
 reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为此脚本**默认把主力 reality
 协议绑到 443**（优先 sing-box `reality-vision`）：
 
-- 主动探测打你的 443 → sing-box 把握手转发到**借用的真站**（如 awsstatic），
+- 主动探测打你的 443 → sing-box 把握手转发到**借用的真站**（如 www.cisco.com），
   看到的是真站证书，和真访问该站无法区分——比任何本地伪装站都强。
 - 端口随机化削弱"一排代理端口"的扫描指纹；reality 上 443 再消掉"非 443 易被封"的风险，两者互补。
 
@@ -274,7 +275,7 @@ reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为
 比 reality 直绑 443 更进一步：用 nginx `stream` + `ssl_preread` 在 443 **按 SNI 不解密分流**，
 让 **reality + 网站 + ws 全部只用 443**，对外就是一个 HTTPS 网站：
 
-- SNI = reality 借用域名（如 `s0.awsstatic.com`）→ 转发给本地 reality 端口；
+- SNI = reality 借用域名（如 `www.cisco.com`）→ 转发给本地 reality 端口；
 - SNI = 你的真域名 / 默认 → 转发给本地 https（伪装站 + ws 反代）；
 - hy2 仍走自己的 UDP 端口 + 跳跃（QUIC 与 nginx 的 443/TCP 不冲突）；
 - 证书续期继续走 nginx `:80` webroot，不受影响。
