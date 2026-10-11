@@ -283,11 +283,26 @@ SELFDNS_FLAG     = BGP_DIR + "/selfdns.on"        # 主脚本：自建 DNS 是�
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid"  # 主脚本生成的 AdGuard ClientID
 
 def _selfdns_clientid():
-    """读主脚本生成的 ClientID（只读，不生成——它由菜单 6 打开写入订阅时创建）。"""
+    """AdGuard ClientID（DoH 网址末段 / DoT 主机名最前一段 / 「允许的客户端」里填的那串）。没有就生成一个存下来：
+       跟主脚本 selfdns_clientid 同一个文件、同一种格式（xy + 12 位十六进制），谁先用谁生成，另一边读到的是同一个。
+       以前这边只读、得先去菜单 6 打开一次才有——仓库主人签完泛域名证书，屏上还是「ClientID 还没有」，
+       安卓该填的那行主机名也出不来（10/12：「写一大堆，就是不写重要信息」）。
+       它等于一把口令（填进白名单后只认它），文件 root-only。写不进去返回 ''。"""
     try:
-        return open(SELFDNS_CID_FILE).read().strip()
+        t = open(SELFDNS_CID_FILE).read().strip()
+        if t:
+            return t
+    except OSError:
+        pass
+    t = "xy" + secrets.token_hex(6)
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        fd = os.open(SELFDNS_CID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(t)
     except OSError:
         return ""
+    return t
 
 def _doh_port():
     """当前 DoH(HTTPS) 端口：从 AdGuardHome.yaml 的 tls.port_https 读，读不到按 10443。"""
@@ -424,16 +439,30 @@ def _usage(port=None):
     print(f"    DoH 端口      : {G}{dohp}{N}        DoT 端口: {G}853{N}       明文: {G}53{N}")
     if cid:
         print(f"    {C}ClientID{N}      : {G}{cid}{N}")
-        print(f"                    {Y}这是给「访问设置 → 允许的客户端」用的{N}，填了它就只放行你自己；")
-        print(f"                    不填的话你的 DoH 挂在公网上，{R}谁扫到都能当免费解析器用{N}。")
     else:
-        print(f"    ClientID      : {Y}还没有 —— 菜单『6 把自建DNS写入订阅配置』打开一次即生成{N}")
+        print(f"    ClientID      : {Y}没生成出来（{BGP_DIR} 写不进去？）{N}")
     if allow:
         print(f"    访问白名单    : {G}已设置{N} {allow}   （只放行名单内，见第四步）")
     else:
         print(f"    访问白名单    : {R}未设置 —— 对全公网开放{N}"
               + ("（第四步教你关掉）" if cid else ""))
     print(f"    写入订阅      : {(G+'已写入 mihomo/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
+
+    # 要填的就这几行：放在一大段说明前面，标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）
+    print("\n  " + "=" * 56)
+    print(f"  {C}要填的就这几行{N}")
+    print("  " + "=" * 56)
+    if dom:
+        ui_url("安卓「专用DNS」主机名", dot_host)
+        if not wild:
+            ui_tip("这行不带 ClientID，设了白名单就会被挡；要带上先做菜单 8")
+        print()
+    ui_url("AdGuard「允许的客户端」", cid)
+    print()
+    if dom:
+        ui_url("DoH 地址（浏览器 / App）", doh_url)
+        print()
+    ui_url("明文 DNS（电视 / 盒子 / 路由器）", ip)
 
     print("\n  " + "=" * 56)
     print("  怎么让设备用上它 —— 照着下面三步做")
@@ -483,7 +512,7 @@ def _usage(port=None):
     # 不能只在菜单 6 打开开关的那一瞬间提示一次——用户回头再看时是进这个页面找的。
     print(f"\n  【第四步 · 关掉「开放解析器」{Y}强烈建议{N}】")
     if not cid:
-        print(f"    {Y}还没有 ClientID{N} —— 先去菜单『6 把自建DNS写入订阅配置』打开一次，会自动生成。")
+        print(f"    {Y}ClientID 没生成出来{N}（{BGP_DIR} 写不进去？），这一步先跳过。")
     elif allow:
         print(f"    {G}✓ 已经设好了{N}（当前白名单：{allow}），不用再动。")
     else:
@@ -733,12 +762,11 @@ def dot_clientid():
             print(f"  {Y}⚠ DoT 实测没通过（{err or 'rcode=' + str(rc)}）{N}——证书是对的，"
                   f"可能是 853 端口没开或 AdGuard 还没起好，稍后用菜单 7 自检再看。")
 
-    print(f"\n  {G}做完了。{N}安卓「专用DNS」现在填：")
-    print(f"      {G}{cid + '.' + dom if cid else '<ClientID>.' + dom}{N}")
-    if not cid:
-        print(f"  {Y}（还没有 ClientID —— 菜单 6 打开一次自建DNS写入订阅即生成）{N}")
-    print(f"  之后就可以放心在「允许的客户端」里只填 ClientID：DoH 和 DoT 都带得上它。")
-    print(f"  {Y}明文 53 仍然带不了{N}，电视/IoT 要么填固定 IP 进白名单，要么别用这台 DNS。")
+    print(f"\n  {G}✔ 做完了{N}\n")
+    ui_url("安卓「专用DNS」主机名", f"{cid}.{dom}" if cid else "")
+    print()
+    ui_url("AdGuard「允许的客户端」", cid)
+    ui_tip("设了白名单，明文 53（电视 / 盒子）就进不来了，要把它们的固定 IP 也加进去")
 
 def _do_free53():
     """真正腾 53：关掉 systemd-resolved 的桩监听 + 把 resolv.conf 指到公共 DNS（可逆）。
