@@ -4432,7 +4432,7 @@ def rename_prefix():
     print(f"  当前前缀：{cur or '(无)'}      节点名 = 前缀·协议名")
     print("  例：🇯🇵 / 🇺🇸2 / 东京 / DMIT / 家宽")
     print("  ⓘ 前缀带国旗或国家代码(JP/US/HK…)，客户端才能自动分出「日本随机」这类分组。")
-    new = _ask_free("  新前缀（回车取消；输 - 表示不要前缀）：").strip()
+    new = _ask_free("  新前缀（回车取消；输 - 表示不要前缀）：", confirm=False).strip()   # 下面有预览 + y 确认
     if not new:
         print("  已取消。"); return
     new = "" if new == "-" else new
@@ -10073,15 +10073,24 @@ def _ask(prompt=""):
         print(prompt + "(无终端，按默认继续)")
         return ""
 
-def _ask_free(prompt):
+def _ask_free(prompt, confirm=True):
     """要打中文/emoji 的自由文本输入（前缀之类）：提示语单独占一行，输入从下一行的 > 开始。
 
        为什么不像别处那样提示和输入挤同一行：终端的行编辑按【字符】发退格，而中文和
        emoji 占【两列】——删一个字只擦掉一列，光标会越删越往前跑，最后啃进提示语里，
        看着像把界面删坏了（其实输入缓冲区是好的，只是屏幕花了）。让输入独占一行，
-       删过头也只啃到那个 '> '，提示语毁不掉。"""
+       删过头也只啃到那个 '> '，提示语毁不掉。
+
+       输进来的不空，再单独确认一次（confirm）：仓库主人 10/11 输了个国旗、还没按回车就往下走了——
+       手机输入法发表情时自己带了个回车，脚本分不出是不是人按的。确认这一步要真按回车才算；
+       回别的就重输。后面自带「预览 + y 确认」的（更换前缀）传 confirm=False，不问两遍。"""
     print(prompt)
-    return _ask("  > ")
+    while True:
+        v = _ask("  > ")
+        if not v or not confirm:
+            return v
+        if _ask(f"  「{v}」回车确认 / n 重输：").strip().lower() in ("", "y", "yes"):
+            return v
 
 def _pick(title, options, default=None):
     """列出带编号的协议，返回选中的 key 列表。
