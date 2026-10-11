@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.378"
+SCRIPT_VERSION = "1.5.379"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -15853,9 +15853,30 @@ def clear_retired_ghosts(d, key, confirm=True):
     # 平时不用删除条目的接口，是因为它会连磁盘上的文件、甚至所在文件夹一起删（见 prune_emby_ghosts）；
     # 这里每一条都确认过「它的 strm 和整个主目录本地都已经没了」（retired_ghosts，删之前再看一眼），
     # 没有东西可以被它误删。先成批删（POST /Items/Delete?Ids=），这台 Emby 不认就一条条 DELETE。
+    # 【先把空文件夹建回来】1.5.378 真机 2739 条只删掉 95 条：Emby 删条目前要去所在文件夹里找配套文件，
+    # 文件夹没了就回 404「Could not find a part of the path」。临时按 Emby 的身份（PUID/PGID）建回空文件夹，
+    # 删完把整棵临时树拿掉（里面一个 strm 都不会有，有就不动）
     root = os.path.join(strm_root(d), STRM_SUBDIR)
     safe = [g for g in gone if not os.path.lexists(_strm_host_path(d, g[2]))
             and not os.path.lexists(os.path.join(root, g[2][len(STRM_PATH) + 1:].split("/")[0]))]
+    made = sorted({os.path.join(root, g[2][len(STRM_PATH) + 1:].split("/")[0]) for g in safe})
+    try:
+        uid = int(read_env(os.path.join(d, ".env"), "PUID") or 0)
+        gid = int(read_env(os.path.join(d, ".env"), "PGID") or 0)
+    except ValueError:
+        uid = gid = 0
+    for g in safe:
+        q = os.path.dirname(_strm_host_path(d, g[2]))
+        try:
+            os.makedirs(q, exist_ok=True)
+        except OSError:
+            continue
+        while q.startswith(root + os.sep):
+            try:
+                os.chown(q, uid, gid)
+            except OSError:
+                pass
+            q = os.path.dirname(q)
     done, t0 = 0, time.time()
 
     def _one(iid):
@@ -15877,6 +15898,10 @@ def clear_retired_ghosts(d, key, confirm=True):
                   f"（Ctrl-C 先停，下次进来接着删）{RST}", end="", flush=True)
     except KeyboardInterrupt:
         pass
+    finally:
+        for top in made:
+            if not any(f.endswith(".strm") for _p, _d, fs in os.walk(top) for f in fs):
+                shutil.rmtree(top, ignore_errors=True)
     if done:
         scan_log_line("清撤掉的盘", f"删除 {done}：{'、'.join(tops)}")
     now = emby_ghost_items(d, key)
