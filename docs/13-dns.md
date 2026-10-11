@@ -3,9 +3,10 @@
 # 13. 自建DNS
 
 - **自建 DNS 的 DoH 地址带 ClientID**（形如 `https://域名:10443/dns-query/xy<随机>`）：AdGuard 的 DoH 挂在公网上，
-  **不设白名单谁扫到都能拿去当免费解析器**。把开关打开时打印的那个 ClientID 填进 AdGuard 后台
+  **不设白名单谁扫到都能拿去当免费解析器**。ClientID 不用先开「写入订阅」：AdGuard 菜单「3 使用方法」最上面
+  「要填的就这几行」里就列着（安卓「专用DNS」主机名、允许的客户端、DoH 地址、明文 DNS），用到时自动生成。把它填进 AdGuard 后台
   **设置 → DNS 设置 → 访问设置 → 允许的客户端**，就只放行你自己。手机流量 IP 天天变、没法按 IP 白名单，
-  ClientID 与 IP 无关正合适。ID 存在 `/etc/bgpeer/selfdns.clientid`，不在托管目录、不会被下载。
+  ClientID 与 IP 无关正合适。ID 存在 `/etc/bgpeer/selfdns.clientid`（root-only），不在托管目录、不会被下载。
   向后兼容：没配「允许的客户端」时 AdGuard 对任意 ClientID 都放行，所以带上它不会让原本能用的配置失效
 - **自建 DNS 写入订阅时，mihomo 会写三处**（菜单 13 的开关打开时）：`nameserver`（默认解析）、`global-dns` 锚点
   （所有走代理的域名组共用）、`proxy-server-nameserver`（解析节点服务器域名）。三处都是**插到列表最前、
