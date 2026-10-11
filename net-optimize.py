@@ -42,6 +42,7 @@
 
 import argparse
 import atexit
+import base64
 import fcntl
 import glob
 import hashlib
@@ -66,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.5"
+VERSION = "4.5.6"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -280,10 +281,13 @@ def set_sysctl(key, value):
     return run(["sysctl", "-w", f"{key}={value}"], timeout=5).returncode == 0
 
 
+BBR_VERSION_FILE = "/sys/module/tcp_bbr/version"
+
+
 def cc_label(cc):
     """屏上显示用：bbr 带上版本。Google v3 补丁（XanMod 等）的 tcp_bbr 有 version 文件（值 3），
     原厂内核的 v1 没有这个文件，就只显示 bbr。写进 sysctl 文件的仍是纯名字。"""
-    v = read_text("/sys/module/tcp_bbr/version").strip() if cc == "bbr" else ""
+    v = read_text(BBR_VERSION_FILE).strip() if cc == "bbr" else ""
     return f"{cc}（v{v}）" if v else cc
 
 
@@ -2962,6 +2966,315 @@ def main_optimize(argv):
         echo("📌 非交互模式，请手动重启以应用优化")
 
 
+# === 换 BBRv3 内核（XanMod，--xanmod）===
+# 主线内核到 7.x 还是 BBRv1；XanMod 自带 Google 的 BBRv3（名字仍叫 bbr，默认就开）。
+# 仓库主人 10/11 点头加的。流程：查能不能换 → 问一次（默认否）→ 配源、装包 →
+# 把我们 sysctl 文件里的拥塞算法对成 bbr → 问要不要现在重启（默认否）。
+#
+# 【出网】dl.xanmod.org 拿签名公钥（https）；deb.xanmod.org 拿包，先试 https，不通再退回官方写法 http。
+#   对方能看到这台 VPS 的 IP（跟 nginx 官方源一样）；走 http 时路上看得出装的是 XanMod 内核，包有签名改不了。
+# 【选包】MAIN 优先、没有再 LTS：GRUB 默认引导版本最高的内核，MAIN 最新才稳压原厂内核；
+#   Debian 12 只有 LTS；CPU 只到 x86-64-v1 的也只有 LTS；v4 的 CPU 用 v3 包（XanMod 不出 v4）。
+# 【不碰】不自动重启（会断开正在看的片和所有连接）；不删原厂内核（起不来时在 GRUB 里选回它）。
+XANMOD_KEY_URL = "https://dl.xanmod.org/archive.key"
+XANMOD_HOST = "deb.xanmod.org"
+XANMOD_LIST = "/etc/apt/sources.list.d/xanmod-release.list"
+XANMOD_KEYRING = "/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+APT_SOURCES_DIR = "/etc/apt/sources.list.d"
+APT_SOURCES_MAIN = "/etc/apt/sources.list"
+CPUINFO = "/proc/cpuinfo"
+BOOT_DIR = "/boot"
+EFI_VARS = "/sys/firmware/efi/efivars"
+OLD_CODENAMES = {"stretch", "buster", "bullseye", "xenial", "bionic", "focal", "jammy"}
+APT_LOCK_WAIT = "DPkg::Lock::Timeout=300"   # 新机开机那会儿 unattended-upgrades 常占着锁：等它，别当成源连不上
+
+
+def _uname():
+    return os.uname()
+
+
+def _ask_tty(prompt):
+    """读一行回答：优先 /dev/tty（curl | python3 管道下 stdin 不是终端）；都读不到当回车（= 默认）。"""
+    try:
+        with open("/dev/tty") as t:
+            print(prompt, end="", flush=True)
+            return t.readline().strip()
+    except OSError:
+        pass
+    try:
+        return input(prompt).strip()
+    except (OSError, EOFError):
+        return ""
+
+
+def _tip(text):
+    _color("1;33", f"  提示：{text}")
+
+
+def cpu_x86_level():
+    """x86-64 psABI 档位 1~4，跟 XanMod 的 check_x86-64_psabi.sh 查同一套 flag；读不到返回 0。"""
+    m = re.search(r"^flags\s*:\s*(.*)$", read_text(CPUINFO), re.M)
+    if not m:
+        return 0
+    have, level = set(m.group(1).split()), 0
+    for need in ({"lm", "cmov", "cx8", "fpu", "fxsr", "mmx", "syscall", "sse2"},
+                 {"cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3"},
+                 {"avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave"},
+                 {"avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"}):
+        if not need <= have:
+            break
+        level += 1
+    return level
+
+
+def xanmod_pkgs(level):
+    """按 CPU 档位给候选包，MAIN 在前（见上面【选包】）。装错档位开不了机。"""
+    if level >= 3:
+        return ["linux-xanmod-x64v3", "linux-xanmod-lts-x64v3"]
+    if level == 2:
+        return ["linux-xanmod-x64v2", "linux-xanmod-lts-x64v2"]
+    return ["linux-xanmod-lts-x64v1"] if level == 1 else []
+
+
+def container_kind():
+    """在容器里返回类型（lxc / openvz / docker …），不在返回空。容器跟宿主机共用内核，换不了。"""
+    r = run(["systemd-detect-virt", "--container"], timeout=5)
+    v = r.stdout.strip()
+    if r.returncode == 0 and v and v != "none":
+        return v
+    if os.path.isdir("/proc/vz") and not os.path.isdir("/proc/bc"):
+        return "openvz"
+    for p, kind in (("/.dockerenv", "docker"), ("/run/.containerenv", "podman")):
+        if os.path.exists(p):
+            return kind
+    return ""
+
+
+def secure_boot_on():
+    """UEFI Secure Boot 开着：XanMod 内核没签名，开机会被拒。efivar 前 4 字节是属性，第 5 字节 1 = 开。"""
+    for p in glob.glob(f"{EFI_VARS}/SecureBoot-*"):
+        try:
+            with open(p, "rb") as f:
+                b = f.read()
+        except OSError:
+            continue
+        if len(b) >= 5 and b[4] == 1:
+            return True
+    return False
+
+
+def _kver(v):
+    """6.18.55-x64v3-xanmod1 → (6, 18, 55)，比谁新用（GRUB 默认引导版本最高的）。"""
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def _boot_kernels():
+    """/boot 里装着的内核版本（去掉 vmlinuz- 前缀）。"""
+    return [os.path.basename(p)[len("vmlinuz-"):] for p in glob.glob(f"{BOOT_DIR}/vmlinuz-*")]
+
+
+def _free_mb(path):
+    try:
+        return shutil.disk_usage(path).free // (1 << 20)
+    except OSError:
+        return 0
+
+
+def _apt_need_mb(out):
+    """apt-get install --assume-no 输出里「要下载 + 装完多占」合计（MB）；看不出来返回 None。"""
+    unit = {"B": 1 / 1048576, "kB": 1 / 1024, "MB": 1, "GB": 1024}
+    total, hit = 0.0, False
+    for pat in (r"Need to get ([\d.,]+) ([kMG]?B)",
+                r"After this operation, ([\d.,]+) ([kMG]?B) of additional"):
+        m = re.search(pat, out)
+        if m:
+            total += float(m.group(1).replace(",", "")) * unit[m.group(2)]
+            hit = True
+    return int(total) + 1 if hit else None
+
+
+def _dearmor(data):
+    """签名公钥 → apt 认的二进制 keyring（等于 gpg --dearmor），省得为这一步装 gnupg。不像公钥返回 None。"""
+    if data and data[0] & 0x80:                     # 本来就是二进制
+        return data
+    try:
+        txt = data.decode("ascii")
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    m = re.search(r"-----BEGIN PGP PUBLIC KEY BLOCK-----\r?\n(.*?)\r?\n-----END PGP PUBLIC KEY BLOCK-----",
+                  txt, re.S)
+    if not m:
+        return None
+    body = m.group(1).replace("\r", "").split("\n")
+    if "" in body:                                   # 头部（Version: / Comment:）到第一个空行为止
+        body = body[body.index("") + 1:]
+    b64 = "".join(ln.strip() for ln in body if ln.strip() and not ln.startswith("="))   # = 开头那行是校验和
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except ValueError:
+        return None
+    return raw if raw and raw[0] & 0x80 else None
+
+
+def _xanmod_other_sources():
+    """别的源文件里已经配着 deb.xanmod.org（手动装过）：再加一份 apt 会报 Signed-By 冲突、整个 update 失败。"""
+    files = [APT_SOURCES_MAIN] + sorted(glob.glob(f"{APT_SOURCES_DIR}/*.list")
+                                        + glob.glob(f"{APT_SOURCES_DIR}/*.sources"))
+    return [f for f in files if f != XANMOD_LIST and any(
+        XANMOD_HOST in ln and not ln.lstrip().startswith("#") for ln in read_text(f).splitlines())]
+
+
+def _apt_update_only(listfile):
+    """只更新这一个源：试 https / http 通不通、有没有这个系统的包，别的源坏了也不受牵连。
+       连不上时 apt-get update 只给 W: 警告、退出码照样是 0（实测 apt 2.7），所以看输出：有 Get/Hit、没有 Err。"""
+    r = run(["apt-get", "-o", APT_LOCK_WAIT, "update", "-o", f"Dir::Etc::sourcelist={listfile}",
+             "-o", "Dir::Etc::sourceparts=-", "-o", "APT::Get::List-Cleanup=0"], timeout=300,
+            env_extra={"DEBIAN_FRONTEND": "noninteractive", "LC_ALL": "C"})
+    out = (r.stdout or "") + (r.stderr or "")
+    return (r.returncode == 0 and re.search(r"^(Get|Hit):", out, re.M) is not None
+            and re.search(r"^Err:|Failed to fetch", out, re.M) is None)
+
+
+def _apt_candidate(pkg):
+    out = run(["apt-cache", "policy", pkg], timeout=60, env_extra={"LC_ALL": "C"}).stdout
+    m = re.search(r"Candidate:\s*(\S+)", out)
+    return m.group(1) if m and m.group(1) != "(none)" else ""
+
+
+def _xanmod_fix_cc():
+    """我们 sysctl 文件里的拥塞算法不是 bbr 系（4.5.4 及以前在原厂内核上会写成 cubic）就改成 bbr，
+       不然换了内核重启还是被它压回 cubic。没跑过网络优化（没这两个文件）不用管：XanMod 默认就是 bbr。"""
+    for f in (SYSCTL_AUTH_FILE, SYSCTL_OVERRIDE_FILE):
+        s = read_text(f)
+        n = re.sub(r"^(\s*net\.ipv4\.tcp_congestion_control\s*=\s*)(?!bbr)\S+[ \t]*$", r"\1bbr", s, flags=re.M)
+        if s and n != s:
+            write_text(f, n)
+
+
+def xanmod_precheck():
+    """能换返回 ("", 候选包, codename)；换不了返回 (原因, [], "")。只读，什么都不改。"""
+    machine = _uname().machine
+    if machine != "x86_64":
+        return f"只支持 x86_64（这台是 {machine}）", [], ""
+    kind = container_kind()
+    if kind:
+        return f"容器（{kind}）跟宿主机共用内核", [], ""
+    if not have_cmd("apt-get"):
+        return "只支持 Debian / Ubuntu", [], ""
+    distro, codename = detect_distro()
+    if distro not in ("debian", "ubuntu") or codename == "unknown":
+        return "只支持 Debian 12+ / Ubuntu 24.04+", [], ""
+    if codename in OLD_CODENAMES:
+        return f"系统太老（{codename}），要 Debian 12+ / Ubuntu 24.04+", [], ""
+    if secure_boot_on():
+        return "开着 Secure Boot，XanMod 内核没签名开不了机", [], ""
+    pkgs = xanmod_pkgs(cpu_x86_level())
+    if not pkgs:
+        return "读不到 CPU 指令集", [], ""
+    return "", pkgs, codename
+
+
+def _xanmod_finish(what, assume_yes):
+    """装好之后的那一行：GRUB 默认引导版本最高的内核，原厂的更新就说清楚、不问重启。"""
+    top = max(_boot_kernels(), key=lambda k: (_kver(k), "xanmod" in k))   # 同版本号时 GRUB 也排 XanMod 在前
+    if "xanmod" not in top:
+        yellow(f"  ⚠ {what}，但开机默认还是 {top}（比 XanMod 新）；重启时在 GRUB 里手动选 XanMod")
+        return
+    green(f"  ✔ {what}，重启后生效")
+    _xanmod_reboot_prompt(assume_yes)
+
+
+def _xanmod_reboot_prompt(assume_yes):
+    _tip("重启会断开所有连接，正在看的片也会断")
+    if assume_yes:          # --yes 只免掉安装那一问；重启从不替人做
+        return
+    if _ask_tty("  现在重启？[y/N]: ").lower() in ("y", "yes"):
+        run(["systemctl", "reboot"], timeout=10)
+
+
+def cmd_xanmod(assume_yes=False):
+    """菜单 12 → 6「换 BBRv3 内核（XanMod）」。每种结果屏上一行 ✔ / ⚠。"""
+    cc_key = "net.ipv4.tcp_congestion_control"
+    rel = _uname().release
+    if "xanmod" in rel or read_text(BBR_VERSION_FILE).strip() == "3":   # 别家 BBRv3 内核也算，不再装 XanMod
+        _xanmod_fix_cc()                       # 已经在跑：顺手把拥塞算法对上（装了 v3 却跑着 cubic 就是这样）
+        if not get_sysctl(cc_key).startswith("bbr"):
+            set_sysctl(cc_key, "bbr")
+        green(f"  ✔ 已经换好了（{rel}），拥塞算法：{cc_label(get_sysctl(cc_key))}")
+        return
+    done = sorted((k for k in _boot_kernels() if "xanmod" in k), key=_kver)
+    if done:
+        _xanmod_fix_cc()
+        return _xanmod_finish(f"XanMod 内核已装好（{done[-1]}）", assume_yes)
+
+    why, pkgs, codename = xanmod_precheck()
+    if why:
+        yellow(f"  ⚠ 这台换不了：{why}")
+        return
+    echo(f"  换 BBRv3 内核：XanMod · CPU x86-64-v{cpu_x86_level()} · {codename}")
+    _tip("要重启才生效；万一起不来，用服务商后台 VNC 在 GRUB 里选回原来的内核")
+    if not assume_yes and _ask_tty("  确认换？[y/N]: ").lower() not in ("y", "yes"):
+        return
+
+    # ① 软件源：别处手动配过就用它的；没有就加我们的（先 https 后 http）
+    added = False
+    others = _xanmod_other_sources()
+    if not others:
+        key = _dearmor(fetch_url(XANMOD_KEY_URL, timeout=20) or b"")
+        if not key:
+            yellow("  ⚠ 拿不到 XanMod 的签名公钥（dl.xanmod.org 连不上），什么都没改")
+            return
+        os.makedirs(os.path.dirname(XANMOD_KEYRING), exist_ok=True)
+        with open(XANMOD_KEYRING, "wb") as f:
+            f.write(key)
+        os.chmod(XANMOD_KEYRING, 0o644)
+        added = True
+        for scheme in ("https", "http"):
+            write_text(XANMOD_LIST, "# Net-Optimize: XanMod kernel (BBRv3)\n"
+                       f"deb [signed-by={XANMOD_KEYRING}] {scheme}://{XANMOD_HOST} {codename} main\n")
+            if _apt_update_only(XANMOD_LIST):
+                break
+        else:
+            _rm(XANMOD_LIST); _rm(XANMOD_KEYRING)
+            yellow(f"  ⚠ 连不上 XanMod 软件源，或它没有 {codename} 的包；已撤掉刚加的源")
+            return
+
+    def undo(msg):
+        if added:                               # apt 只读还配着的源的列表，撤掉就不会再被用到
+            _rm(XANMOD_LIST); _rm(XANMOD_KEYRING)
+            msg += "；已撤掉刚加的源"
+        yellow(f"  ⚠ {msg}")
+
+    # ② 全量 update（依赖可能在系统源里），挑有货的包，算空间
+    check_dpkg_clean()
+    apt(["-o", APT_LOCK_WAIT, "update"], timeout=600)
+    pkg = next((p for p in pkgs if _apt_candidate(p)), "")
+    if not pkg:
+        return undo(f"XanMod 源里没有 {' / '.join(pkgs)}")
+    r = run(["apt-get", "install", "--assume-no", "--no-install-recommends", pkg], timeout=120,
+            env_extra={"LC_ALL": "C", "DEBIAN_FRONTEND": "noninteractive"})
+    need = _apt_need_mb(r.stdout + r.stderr) or 1024
+    root_free = _free_mb("/")
+    if root_free < need + 200:
+        return undo(f"磁盘不够：要 {need + 200} MB，/ 只剩 {root_free} MB")
+    if os.path.ismount(BOOT_DIR) and _free_mb(BOOT_DIR) < 150:
+        return undo(f"/boot 只剩 {_free_mb(BOOT_DIR)} MB（要 150 MB）")
+
+    # ③ 装（几分钟；apt 输出不上屏，出错只报最后一行）
+    echo(f"  下载安装 {pkg}（几分钟，别关窗口）…")
+    # 依赖可能顺带升级 libc / libssl，needrestart 会接着重启用到它们的服务（sing-box / nginx …），
+    # 正在看的片就断了（CLAUDE.md 第六节）。这里让它歇着：只装内核，服务等重启时一起换。
+    r = run(["apt-get", "-o", APT_LOCK_WAIT, "install", "-y", "--no-install-recommends", pkg], timeout=1800,
+            env_extra={"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_SUSPEND": "1", "NEEDRESTART_MODE": "l"})
+    ks = sorted((k for k in _boot_kernels() if "xanmod" in k), key=_kver)
+    if r.returncode != 0 or not ks:
+        last = next((ln for ln in reversed((r.stderr or r.stdout).strip().splitlines()) if ln.strip()), "")
+        yellow(f"  ⚠ 没装上{('：' + last.strip()) if last else ''}；再选一次本项重试")
+        return
+    _xanmod_fix_cc()
+    _xanmod_finish(f"装好了：{pkg}（{ks[-1]}）", assume_yes)
+
+
 # === 状态检测（--check，原 net-optimize-check.sh v1.11 完整移植）===
 def _color(code, msg):
     print(f"\033[{code}m{msg}\033[0m", flush=True)
@@ -3688,6 +4001,10 @@ def main():
                    help="卸载网络优化：清除全部优化配置，恢复系统默认"
                         "（原 net-optimize-reset.sh）")
     g.add_argument("--status", action="store_true", help="仅打印优化状态报告")
+    g.add_argument("--xanmod", action="store_true",
+                   help="换 BBRv3 内核（XanMod）：查条件、确认、安装、问要不要重启")
+    parser.add_argument("--yes", action="store_true",
+                        help="配合 --xanmod：免掉安装前那一问（重启从不自动）")
     g.add_argument("--version", action="store_true", help="打印版本号")
     args, argv = parser.parse_known_args()
 
@@ -3719,6 +4036,9 @@ def main():
         cmd_reset()
     elif args.status:
         print_status()
+    elif args.xanmod:
+        require_root()
+        cmd_xanmod(assume_yes=args.yes)
     else:
         main_optimize(sys.argv[1:])
 
