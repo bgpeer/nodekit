@@ -45,7 +45,7 @@ sudo python3 /tmp/xy.py
 - [2. 节点链接 / 订阅](docs/02-links.md)
 - [3. 聚合节点链接（连机VPS合并多台VPS节点）](docs/03-merge.md)
 - [4. 更换伪装域名（reality 借用的 SNI·带连通检测，不用重装）](docs/04-sni.md)
-- [5. 多路复用开关 smux（只针对 ws / httpupgrade 协议）](docs/05-smux.md)
+- [5. 提速：多路复用 smux / hy2 满速](docs/05-smux.md)
 - [6. mihomo 配置 · 7. sing-box 配置 · 8. 小火箭配置](docs/06-08-client-config.md)
 - [9. CDN套用（利用CF中转，IP被墙时使用，延时比较高）](docs/09-cdn.md)
 - [10. 屏蔽中国域名和IP（可做白名单放行）](docs/10-cn-block.md)
