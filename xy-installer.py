@@ -1240,7 +1240,6 @@ REALITY_SNI_POOL = [
     "swcdn.apple.com", "updates.cdn-apple.com", "cdn-dynmedia-1.microsoft.com",
     "www.bing.com", "www.tesla.com", "s0.awsstatic.com",
 ]
-SNI_SUGGESTIONS = " / ".join(REALITY_SNI_POOL[:6]) + " 等"
 
 def _reality_sni_ok(sni):
     """探测 reality 借用目标站是否支持 TLS1.3 + HTTP/2。返回 (ok, 说明)。
@@ -1259,25 +1258,40 @@ def _reality_sni_ok(sni):
     except Exception as e:
         return True, f"探测失败，跳过校验（{e}）"
     if "CONNECTED" not in out:                        # TCP 都没连上：DNS 挂/不可达/被墙
-        return False, "从本机连不上该目标:443（reality 握手也需能到达它），换一个可达的大站"
+        return False, "连不上它的 443"
     tls13 = "TLSv1.3" in out and "Cipher is" in out
     h2 = "ALPN protocol: h2" in out
     if tls13 and h2:
         return True, "TLS1.3 + h2 ✓"
     if not tls13:
-        return False, "目标不支持 TLS1.3（reality 强制要求），必须换"
-    return False, "目标不支持 HTTP/2(h2)，reality 握手特征易露，建议换"
+        return False, "TLS1.3 握手不成功（reality 要求目标支持 TLS1.3）"
+    return False, "不支持 HTTP/2，reality 握手特征容易露"
+
+def _pick_ok_sni(exclude=(), tries=6):
+    """从内置池随机挑一个本机探得通的（连通 + TLS1.3 + h2），最多试 tries 个；都不通返回 None。"""
+    pool = [x for x in REALITY_SNI_POOL if x not in set(exclude)]
+    for cand in random.sample(pool, k=min(tries, len(pool))):
+        if _reality_sni_ok(cand)[0]:
+            return cand
+    return None
 
 def _sni_precheck_one():
-    """探一次当前 G["sni"] 够不够格给 reality 借用；不合格只警告不阻断。"""
+    """探一次当前 G["sni"] 够不够格给 reality 借用（不阻断安装）。
+       回车随机挑的（G["sni_auto"]）探不过：从池里另挑一个探得通的换上——那是脚本自己挑的，
+       不该拿个不合格的装（仓库主人 10/11 撞上：随机到 updates.cdn-apple.com，从那台机器 TLS1.3 握手不成功，
+       旧版照装还说「按你填的继续装」）。池里同一个站在不同地区的机房表现不一，探过才算数。
+       自己填的不替人换，一行提示；装好后可在「4 更换伪装域名」里换。"""
     ok, detail = _reality_sni_ok(G["sni"])
     if ok:
         print(f"  reality 借用目标 {G['sni']}: {detail}")
-    else:
-        Y, N = "\033[1;33m", "\033[0m"                # 黄色警告（不阻断）
-        print(f"{Y}  ⚠ reality 借用目标 {G['sni']} 可能不理想：{detail}\n"
-              f"    建议换成支持 TLS1.3+h2 的大站：{SNI_SUGGESTIONS}\n"
-              f"    （可 --sni 指定或在交互菜单里改；现按你填的继续装）{N}")
+        return
+    if G.get("sni_auto"):
+        new = _pick_ok_sni({G["sni"]})
+        if new:
+            print(f"  ✔ reality 借用目标换成 {new}（随机挑到的 {G['sni']} 从本机探不过：{detail}）")
+            G["sni"] = new
+            return
+    ui_tip(f"reality 借用目标 {G['sni']} 从本机探不过：{detail}；装好后可在「4 更换伪装域名」里换")
 
 def precheck_sni(sb_names, xr_names):
     """选了 reality 类协议时，装前探一次借用目标。选没选据注册表判断，不靠名字前缀。"""
@@ -2091,6 +2105,7 @@ def _asks_reality(mode):
     ans = _ask(f"\n  reality 借用目标 SNI（回车沿用上次的 {G['sni']}）: ").strip()
     if ans:
         G["sni"] = ans
+    G["sni_auto"] = ""                                   # 沿用的是老节点正在用的，不自己换（新老节点要一致）
     _sni_precheck_one()
 
 def _recap_reality():
@@ -6800,8 +6815,10 @@ def _choose_new_sni(cur):
     ui_items([(1, "随机挑一个（内置大站池，避开当前）", None), (2, "手动输入", None), (0, "取消", None)])
     c = _ask("选择: ").strip()
     if c == "1":
+        print("  从内置大站池里挑一个本机探得通的…")
+        new = _pick_ok_sni({cur})                        # 探不通的跳过；都不通就随便挑一个，下面会提示
         pool = [s for s in REALITY_SNI_POOL if s != cur]
-        return secrets.choice(pool) if pool else None
+        return new or (secrets.choice(pool) if pool else None)
     if c == "2":
         s = _ask("  输入域名（如 www.microsoft.com）: ").strip().lower().rstrip(".")
         if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", s):
@@ -10832,7 +10849,9 @@ def install_flow():
         nginx = "1" if (_ask("用 nginx 前置(443伪装站+webroot证书, ws类藏443)? [y/N]: ")
                         .lower() in ("y", "yes")) else ""
     _sni_rand = secrets.choice(REALITY_SNI_POOL)         # 回车就用这个随机挑的（不同机器各不同，不扎堆）
-    sni = _ask(f"reality 借用目标站 SNI (回车=随机挑，本次随机到 {_sni_rand}): ") or _sni_rand
+    sni_in = _ask(f"reality 借用目标站 SNI (回车=随机挑，本次随机到 {_sni_rand}): ").strip()
+    sni = sni_in or _sni_rand
+    G["sni_auto"] = "" if sni_in else "1"               # 随机挑的探不过，装的时候自己换一个（见 _sni_precheck_one）
     prefix = _ask_free("节点名称前缀（如 🇺🇸/🇯🇵/家宽，回车=无前缀）：")
     # 各协议自己的设置（hy2 跳跃范围、ws 的 smux …）交给注册表的 asks 去问：
     # 它们写进 G，所以得先把已经问到的填进 G，再 run_asks，最后读回来。
@@ -10935,6 +10954,7 @@ if __name__ == "__main__":
 
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["force"] = \
         a.domain, a.email, (a.sni or secrets.choice(REALITY_SNI_POOL)), a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes
+    G["sni_auto"] = "" if a.sni else "1"                # 没给 --sni 是随机挑的：探不过自己换（见 _sni_precheck_one）
     G["reality443"] = "" if a.no_reality_443 else "1"   # 默认把 reality 绑 443（抗封端口）
     G["sni_split"] = "1" if a.sni_split else ""         # 最强：nginx SNI 分流，全上 443
     G["smux"] = "1" if a.smux else ""                   # ws 类多路复用，默认关
