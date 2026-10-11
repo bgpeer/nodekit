@@ -4257,10 +4257,12 @@ def _sb_selfdns(cfg, url):
        不按字面量 "final"，更不按地址（8.8.8.8）——按地址锚定的话，别人把兜底换成
        9.9.9.9 就再也匹配不上，静默失效。dns.final 没写才退回找 tag=="final"。
 
-       为什么改兜底而不是像 mihomo/小火箭那样"插在列表最前留兜底"：sing-box 的 DNS
-       【没有列表回落】——一条 dns 规则只指一个 server tag，指到的那台挂了查询就直接
-       失败，不会自动换下一台。所以这里不做假的"兜底"，就是把它换掉，并在开关菜单里
-       把这个差别讲明白。
+       为什么是把它换掉而不是像 mihomo/小火箭那样"插在列表最前、原有的留着"：sing-box 的
+       一条 dns 规则只指一个 server tag，没有列表可插。换掉也不伤日常解析——兜底只接
+       没被任何规则分到的查询：作者模板里 A/AAAA 先给 fakeip（直连的再用 local 解真实 IP，
+       走代理的交给服务端）、局域网走 local、「全局」走 remote，落到兜底的只剩 MX / TXT 这类
+       零头。AdGuard 挂了也就这部分查不到（仓库主人 10/12：「不要瞎说什么 sing-box 解析不了」，
+       以前这里和开关菜单都写成了「挂了 sing-box 就解析不了」）。
 
        为什么是兜底那台而不是 local/remote：local 是国内解析，换掉就拿不到就近 CDN
        （同 mihomo 那边 cn-dns 不动）；remote 是 clash_mode=全局 专用。兜底那台是
@@ -6379,10 +6381,8 @@ def selfdns_toggle():
     """开关：把本机自建 DNS(AdGuard DoH) 写进订阅配置的 DNS，循环切换、写/删后自动刷新订阅。
        三个格式都写，但机制不同、后果也不同：
          mihomo / 小火箭 —— 列表型 DNS，自建 DoH 放最前当主用、原有留兜底，没通自动回落。
-         sing-box —— 【没有列表回落】，一条 dns 规则只指一个 server tag，指到的那台挂了
-                     查询就直接失败。所以是把 dns.final 整个换成自建 DoH，
-                     DNS 机器挂了 sing-box 的默认解析就断（另两个只是慢一下）。
-                     不做假的"兜底"，把差别在菜单里讲明白，让用户自己决定。
+         sing-box —— 把兜底那台（dns.final）换成自建 DoH；国内 local、国外 remote、fakeip 都不动，
+                     兜底只接没被规则分到的零头查询，AdGuard 挂了也只影响这部分（见 _sb_selfdns）。
        adguard 菜单调用（selfdns-toggle）。"""
     dom = _host()
     if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or ""):
@@ -6414,7 +6414,7 @@ def selfdns_toggle():
     G["host"] = dom; ensure_deps()
     if build_subscription(read_saved_links()):               # 重新生成三格式并托管（不换 token）
         # mihomo / 小火箭：放列表最前当主用，没通自动回落原 DNS，只是慢一下。
-        # sing-box：换的是 dns.final，它【没有 DNS 回落】——这台 DNS 挂了默认解析就断（多机聚合尤其要注意）。
+        # sing-box：换的是兜底那台，国内 / 国外 / fakeip 不动，挂了只影响没被规则分到的零头（见 _sb_selfdns）。
         # ClientID 与 IP 无关，手机流量换网也不影响；填进「允许的客户端」就关掉了开放解析器。
         print(f"\n  ✔ {act}自建 DNS，三个订阅已刷新，客户端重拉一次生效")
         if act == "已写入":
@@ -6422,7 +6422,6 @@ def selfdns_toggle():
             ui_url("写入的 DoH", _selfdns_doh())
             print()
             ui_url("AdGuard 后台 → DNS 设置 → 访问设置 → 允许的客户端，填这一行", selfdns_clientid())
-            ui_tip("sing-box 没有 DNS 回落：这台 AdGuard 挂了 sing-box 就解析不了")
     else:
         print("  刷新配置失败（没有可用节点？）。")
 
