@@ -2148,50 +2148,134 @@ SB = {
 # ============================================================================
 # xray 协议表 —— builder 返回 (inbound_dict, share_link)
 # ============================================================================
-def _xr_reality_stream(priv, sid, network, extra=None):
-    # minClientVer=1.0.0：xray v26.7.11+ 的 reality 服务端默认 minClientVer=26.3.27，会静默
-    # 拒掉上报旧版本的客户端（mihomo/Clash 系硬编码 1.8.2、sing-box、旧 xray）→ 连不上。
-    # 显式设成 1.0.0（接受所有客户端），兼容优先，避免自动升级 xray 后老客户端集体连不上。
+# xray reality 跟 mack-a 对齐的两项（仓库主人 10/11：「抗量子签名、最低客户端版本 1.8.2 这个我建议做」）。
+# sing-box 内核的 reality 没有这两个选项，不涉及。
+#  · minClientVer 1.8.2：上报版本比它低的客户端拒掉。实测（xray 26.9.30 服务端开 show 看上报值）：xray 客户端报自己的
+#    版本（26.x），mihomo / Clash 系固定报 1.8.2，正好放行；sing-box 系和不带 X25519MLKEM768 的 mihomo 本来就连不上
+#    xray 的 reality（见 _local_xray_reality），跟这项无关。早先写 1.0.0 是防 xray 26.7.11+ 默认的 26.3.27 把 mihomo
+#    拒掉（#133），1.8.2 一样防得住。
+#  · ML-DSA-65 抗量子签名（mldsa65Seed；链接带 pqv= 验证公钥）：服务端给 reality 的临时证书多签一道抗量子签名，
+#    链接带 pqv 的 xray 客户端会验，防以后有量子计算机的人冒充服务端；不验的客户端（mihomo、小火箭配置）照常连。
+#    代价是临时证书多出 3309 字节，借用目标站的证书链得比它长才「藏」得住——不是指纹问题，是连通问题。本机实测：
+#    开了以后目标站证书链 3457 字节时所有客户端都握不上手、3519 字节能连（叶子证书是 ECDSA 的最吃亏情况）；
+#    目标站有没有 X25519MLKEM768 不影响连通。所以：目标站支持 X25519MLKEM768（同 mack-a）、且带 SNI 握手拿到的证书链
+#    > 4000 字节才开——mack-a 是 > 3500、量的还是不带 SNI 那张默认证书，太贴边。开了以后每天 03:20 复查，目标站换成
+#    短证书链（< 3600）就自动关掉（见 _xray_pq_health），免得 reality 全断。
+#    服务端开着、链接里没 pqv 的客户端照常连；反过来链接带 pqv、服务端没开，xray 客户端会连不上——所以开 / 关都要
+#    同时改链接（_links_set_pqv）。pqv 有 2600 多字符，带它的链接二维码扫不了，订阅不受影响。
+XR_MIN_CLIENT_VER = "1.8.2"
+PQ_ON_MIN_CHAIN, PQ_OFF_BELOW = 4000, 3600
+
+def _xr_reality_stream(priv, sid, network, extra=None, seed=""):
     st = {"network": network, "security": "reality",
           "realitySettings": {"show": False, "dest": f"{G['sni']}:443",
                               "xver": 0, "serverNames": [G["sni"]],
                               "privateKey": priv, "shortIds": [sid],
-                              "minClientVer": "1.0.0",
+                              "minClientVer": XR_MIN_CLIENT_VER,
                               # 客户端时间跟服务器差 70 秒以上的握手拒掉：防录下来的握手被重放探测（mack-a 同值）
                               "maxTimeDiff": 70000}}
+    if seed:
+        st["realitySettings"]["mldsa65Seed"] = seed
     if extra:
         st.update(extra)
     return st
 
+def _pq_ping_parse(out):
+    """`xray tls ping` 的输出 → (证书链总长 或 None, 有没有 X25519MLKEM768)。只看「Pinging with SNI」那段：
+       reality 客户端握手都带 SNI，不带 SNI 那次拿到的可能是站点的默认证书，长短不一样。握手没成功返回 (None, False)。"""
+    s = out.split("Pinging with SNI", 1)
+    if len(s) < 2:
+        return None, False
+    s = s[1].split("-------------------", 1)[0]
+    if "Handshake succeeded" not in s:
+        return None, False
+    m = re.search(r"Certificate chain's total length:\s*(\d+)", s)
+    return (int(m.group(1)) if m else None), "X25519MLKEM768" in s
+
+_PQ_PING = {}
+
+def _reality_pq_ping(sni):
+    """从本机 xray tls ping 一次借用目标站（同一次运行里同一个站只 ping 一次）。探不了返回 (None, False)。"""
+    if sni not in _PQ_PING:
+        try:
+            r = subprocess.run([XRAY_BIN, "tls", "ping", f"{sni}:443"], capture_output=True, text=True, timeout=25)
+            _PQ_PING[sni] = _pq_ping_parse(r.stdout + r.stderr)
+        except Exception:
+            _PQ_PING[sni] = (None, False)
+    return _PQ_PING[sni]
+
+def _reality_pq_ok(sni):
+    """借用目标站够不够格开 ML-DSA-65（见 XR_MIN_CLIENT_VER 那段注释）。"""
+    n, mlkem = _reality_pq_ping(sni)
+    return bool(mlkem and n and n > PQ_ON_MIN_CHAIN)
+
+def _reality_pq_why(sni):
+    """目标站不够格开抗量子签名的原因，接在「借用目标站」后面念（屏上用）。"""
+    n, mlkem = _reality_pq_ping(sni)
+    if n is None:
+        return "从本机探不到证书"
+    if n <= PQ_ON_MIN_CHAIN:                             # 链太短是会断线的那个原因，先说它
+        return f"证书链只有 {n} 字节（要 > {PQ_ON_MIN_CHAIN}）"
+    return "不支持 X25519MLKEM768"
+
+def _xr_pq_keys():
+    """新生成一对 ML-DSA-65：(种子, 验证公钥)。种子只进服务端配置，验证公钥进链接（pqv=）。"""
+    out = sh(f"{XRAY_BIN} mldsa65").splitlines()
+    return out[0].split(":")[-1].strip(), out[1].split(":")[-1].strip()
+
+_PQ_SAID = set()
+
+def _xr_pq_new():
+    """新建 xray reality 入站时用：借用目标站够格就生成一对 (种子, 验证公钥)，不够格 / 生成失败返回 ("", "")。
+       同一个目标站只在屏上说一次开没开。"""
+    sni = G["sni"]
+    ok = _reality_pq_ok(sni)
+    if sni not in _PQ_SAID:
+        _PQ_SAID.add(sni)
+        print(f"  ✔ 抗量子签名已开（借用目标站证书链 {_reality_pq_ping(sni)[0]} 字节）" if ok
+              else f"  抗量子签名没开：借用目标站{_reality_pq_why(sni)}")
+    if not ok:
+        return "", ""
+    try:
+        return _xr_pq_keys()
+    except Exception:
+        return "", ""
+
+def _pqv(v):
+    return f"&pqv={v}" if v else ""
+
 def xr_reality_vision(port, tag):
     uid = new_uuid(); sid = short_id()
     priv, pub = reality_keys(XRAY_BIN, "x25519")
+    seed, pqv = _xr_pq_new()
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid, "flow": "xtls-rprx-vision"}],
                        "decryption": "none"},
-          "streamSettings": _xr_reality_stream(priv, sid, "raw")}
+          "streamSettings": _xr_reality_stream(priv, sid, "raw", seed=seed)}
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&flow=xtls-rprx-vision"
-          f"&security=reality&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=tcp#{tag}")
+          f"&security=reality&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=tcp{_pqv(pqv)}#{tag}")
     return ib, lk
 
 def xr_reality_grpc(port, tag):
     uid = new_uuid(); sid = short_id(); svc = "grpc" + secrets.token_hex(2)
     priv, pub = reality_keys(XRAY_BIN, "x25519")
+    seed, pqv = _xr_pq_new()
     st = _xr_reality_stream(priv, sid, "grpc",
-                            {"grpcSettings": {"serviceName": svc, "multiMode": True}})
+                            {"grpcSettings": {"serviceName": svc, "multiMode": True}}, seed=seed)
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid}], "decryption": "none"},
           "streamSettings": st}
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=reality"
           f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=grpc"
-          f"&serviceName={svc}&mode=multi#{tag}")
+          f"&serviceName={svc}&mode=multi{_pqv(pqv)}#{tag}")
     return ib, lk
 
 def xr_reality_xhttp(port, tag):
     uid = new_uuid(); sid = short_id(); path = "/" + secrets.token_hex(3)
     priv, pub = reality_keys(XRAY_BIN, "x25519")
+    seed, pqv = _xr_pq_new()
     st = _xr_reality_stream(priv, sid, "xhttp",
-                            {"xhttpSettings": {"path": path}})
+                            {"xhttpSettings": {"path": path}}, seed=seed)
     # xhttp 传输不支持 xtls-rprx-vision flow（那是 raw/tcp 专属），客户端也没带 flow，
     # 服务端这里若强设 vision flow 会导致握手对不上 → 连不上，所以留空。
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
@@ -2201,7 +2285,7 @@ def xr_reality_xhttp(port, tag):
     # 但写出来就不依赖客户端的回退实现，换客户端/版本也不会变。
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=reality"
           f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp"
-          f"&host={G['sni']}&path={path}#{tag}")
+          f"&host={G['sni']}&path={path}{_pqv(pqv)}#{tag}")
     return ib, lk
 
 def _xr_tls(certfile, keyfile):
@@ -5229,6 +5313,9 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
     if fake_site_heal():                        # 伪装站还是老的全网一样的默认页：换成本机生成的（只写静态文件）
         print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
+    n = _xray_pq_health()                       # 借用目标站换了短证书链：关掉抗量子签名，不然 xray 的 reality 全断
+    if n:
+        print(f"{time.strftime('%F %T')} 借用目标站证书链变短，{n} 个 xray reality 节点关掉了抗量子签名（订阅已重建）")
     day = _cfg_auto_due()
     if not day:
         return                                  # 今天已跑过：安静退出
@@ -5651,36 +5738,87 @@ def _core_update_schedule_str():
     _, times = bj_cron_lines(4, 0, "", day=2)
     return f"北京时间每月 2 号 04:00（本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）"
 
-def _xray_heal_minclientver(restart=True):
-    """给现有 xray reality 入站补 minClientVer（缺才补）。
-       xray v26.7.11+ reality 服务端默认 minClientVer=26.3.27，静默拒掉上报旧版本的客户端
-       (mihomo/Clash 系硬编码 1.8.2、sing-box、旧 xray)。补成 1.0.0(接受所有客户端)。
-       只在确有缺失时改配置+校验+重启；校验不过则回滚。改了返回 True。"""
-    cfg = f"{XRAY_DIR}/config.json"
-    if not os.path.exists(cfg):
-        return False
-    try:
-        data = json.load(open(cfg))
-    except Exception:
-        return False
-    changed = False
+def _xray_reality_targets(data):
+    """xray 配置里的 reality 入站 → [(入站, realitySettings, 借用目标站)]。"""
+    out = []
     for ib in data.get("inbounds", []):
         rs = (ib.get("streamSettings") or {}).get("realitySettings")
-        if isinstance(rs, dict) and not rs.get("minClientVer"):
-            rs["minClientVer"] = "1.0.0"
-            changed = True
-    if not changed:
-        return False
-    old = open(cfg).read()
+        if isinstance(rs, dict) and ib.get("port"):
+            names = rs.get("serverNames") or []
+            out.append((ib, rs, names[0] if names else str(rs.get("dest", "")).rsplit(":", 1)[0]))
+    return out
+
+def _xray_reality_commit(cfg, data, old, pq, restart):
+    """写回 xray 配置 → 校验（不过回滚、返回 False）→ 链接改 pqv、订阅重建 → 重启 xray。"""
     json.dump(data, open(cfg, "w"), indent=2)
     if os.path.exists(XRAY_BIN):
-        ok, msg = core_check(XRAY_BIN, cfg)
+        ok, _ = core_check(XRAY_BIN, cfg)
         if not ok:
             open(cfg, "w").write(old)                        # 回滚，绝不留坏配置
             return False
+    if pq and _links_set_pqv(pq):
+        try:
+            G["host"] = _host()
+            build_subscription(read_saved_links(), new_token=False)
+        except Exception:
+            pass
     if restart:
         sh("systemctl restart xray", check=False)
     return True
+
+def _xray_heal_minclientver(restart=True):
+    """老机器的 xray reality 入站一次性对齐 mack-a（见 XR_MIN_CLIENT_VER 那段注释）：
+       minClientVer 缺的、或还是早先兼容用的 1.0.0 → 1.8.2；同一趟里借用目标站够格的顺手开 ML-DSA-65，
+       链接补上 pqv=、订阅重建（客户端刷新订阅后才验签；没刷新的照常连，只是不验）。
+       改完要校验，不过就整个回滚；对齐过的再调就是 no-op。
+       没改返回 None；改了返回这次开了抗量子签名的节点数。"""
+    cfg = f"{XRAY_DIR}/config.json"
+    if not os.path.exists(cfg):
+        return None
+    try:
+        old = open(cfg).read()
+        data = json.loads(old)
+    except Exception:
+        return None
+    todo = [(ib, rs, sni) for ib, rs, sni in _xray_reality_targets(data)
+            if rs.get("minClientVer") in (None, "", "1.0.0")]
+    if not todo:
+        return None
+    pq = {}
+    for ib, rs, sni in todo:
+        rs["minClientVer"] = XR_MIN_CLIENT_VER
+        if rs.get("mldsa65Seed") or not sni or not _reality_pq_ok(sni):
+            continue
+        try:
+            seed, v = _xr_pq_keys()
+        except Exception:
+            continue
+        rs["mldsa65Seed"] = seed
+        pq[int(ib["port"])] = v
+    return len(pq) if _xray_reality_commit(cfg, data, old, pq, restart) else None
+
+def _xray_pq_health(restart=True):
+    """开着抗量子签名的 xray reality：借用目标站换成短证书链（< PQ_OFF_BELOW）就关掉——
+       不关的话所有客户端都握不上手（见 XR_MIN_CLIENT_VER 那段注释）。探不到证书（网络抖一下）不算数，不动。
+       链接去掉 pqv=、订阅重建、重启 xray（这时 reality 本来就断着，重启只会让它恢复）。返回关掉的节点数。"""
+    cfg = f"{XRAY_DIR}/config.json"
+    if not os.path.exists(cfg):
+        return 0
+    try:
+        old = open(cfg).read()
+        data = json.loads(old)
+    except Exception:
+        return 0
+    off = {}
+    for ib, rs, sni in _xray_reality_targets(data):
+        if rs.get("mldsa65Seed") and sni:
+            n, _ = _reality_pq_ping(sni)
+            if n is not None and n < PQ_OFF_BELOW:
+                rs.pop("mldsa65Seed")
+                off[int(ib["port"])] = ""
+    if not off:
+        return 0
+    return len(off) if _xray_reality_commit(cfg, data, old, off, restart) else 0
 
 # ── sing-box 服务端的本机 DNS ──────────────────────────────────────────────────
 # 服务端配置原来不写 dns 段，用 sing-box 默认的本机解析。sing-box 1.13 起，Linux 上的本机解析
@@ -5763,8 +5901,9 @@ def update_cores_auto(only=None):
             print(f"{ts} {name} 更新完成（{act}）: {ver}")
         except Exception as e:
             print(f"{ts} {name} 更新失败:", e)
-    if _xray_heal_minclientver():                            # 升级到 xray 26.7.11+ 后补 minClientVer，兼容旧客户端
-        print(f"{ts} xray reality 已补 minClientVer=1.0.0（兼容 mihomo/旧客户端）")
+    pq = _xray_heal_minclientver()                           # 老机器一次性对齐 mack-a：minClientVer 1.8.2 + 够格开抗量子签名
+    if pq is not None:
+        print(f"{ts} xray reality 已对齐 mack-a：最低客户端版本 1.8.2" + (f"，{pq} 个节点开了抗量子签名" if pq else ""))
     if _sb_heal_dns():                                       # 升到 sing-box 1.13+ 后补 prefer_go，防 DNS 走 resolved 全挂
         print(f"{ts} sing-box 已补本机 DNS prefer_go（不再依赖 systemd-resolved）")
     if _hy2_hop_heal():                                      # 端口跳跃 DNAT 丢了（持久化没生效）就补回
@@ -6729,9 +6868,65 @@ def _set_sni_xray(data, new):
             n += 1
     return n
 
-def _links_set_sni(new, path=NODE_FILE):
+def _xr_pq_sync(data, sni):
+    """换借用目标站时：按新站够不够格，给 xray 的 reality 入站开 / 关 ML-DSA-65（见 XR_MIN_CLIENT_VER 那段注释）。
+       返回要改链接的 {端口: 验证公钥（开）或 ""（关）}；已开着、新站也够格的不动，链接里的 pqv 照旧。"""
+    ok = _reality_pq_ok(sni)
+    out = {}
+    for ib in data.get("inbounds", []):
+        rs = (ib.get("streamSettings") or {}).get("realitySettings")
+        if not isinstance(rs, dict) or not ib.get("port"):
+            continue
+        if ok and not rs.get("mldsa65Seed"):
+            try:
+                seed, v = _xr_pq_keys()
+            except Exception:
+                continue
+            rs["mldsa65Seed"] = seed
+            out[int(ib["port"])] = v
+        elif not ok and rs.get("mldsa65Seed"):
+            rs.pop("mldsa65Seed")
+            out[int(ib["port"])] = ""
+    return out
+
+def _link_set_q(ln, key, val):
+    """改分享链接 query 里的一个参数（val 空 = 去掉），# 后面的节点名原样保留。"""
+    head, sep, frag = ln.partition("#")
+    base, _, query = head.partition("?")
+    parts = [x for x in query.split("&") if x and x.split("=", 1)[0] != key]
+    if val:
+        parts.append(f"{key}={val}")
+    return base + ("?" + "&".join(parts) if parts else "") + sep + frag
+
+def _links_set_pqv(by_port, path=None):
+    """按端口给保存的 reality 分享链接加上 / 去掉 pqv=（ML-DSA-65 验证公钥；"" = 去掉）。
+       『# 订阅链接:』尾部原样保留。返回改了几条。"""
+    path = path or NODE_FILE                             # 调用时再取：测试 / 改路径时跟 read_saved_links 对得上
+    try:
+        lines = open(path).read().split("\n")
+    except OSError:
+        return 0
+    out, tail, n = [], False, 0
+    for ln in lines:
+        if ln.strip().startswith("#"):
+            tail = True
+        if not tail and "://" in ln and "security=reality" in ln:
+            try:
+                port = urllib.parse.urlsplit(ln.strip()).port
+            except ValueError:
+                port = None
+            if port in by_port:
+                new = _link_set_q(ln, "pqv", by_port[port])
+                n += new != ln
+                ln = new
+        out.append(ln)
+    open(path, "w").write("\n".join(out))
+    return n
+
+def _links_set_sni(new, path=None):
     """改写保存的分享链接里 reality 节点的 sni=（只动带 security=reality 的，域名类节点不误伤）；
        『# 订阅链接:』尾部原样保留。"""
+    path = path or NODE_FILE
     try:
         lines = open(path).read().split("\n")
     except OSError:
@@ -6773,10 +6968,12 @@ def change_sni_apply(new):
             old_text = open(sbcfg).read()
             json.dump(data, open(sbcfg, "w"), indent=2)
             items.append((sbcfg, SB_BIN, "sing-box", old_text))
+    pq = {}                                               # xray reality 的抗量子签名跟着新目标站开 / 关
     if os.path.exists(xrcfg):
         try: xd = json.load(open(xrcfg))
         except Exception: xd = None
         if xd and _set_sni_xray(xd, new):
+            pq = _xr_pq_sync(xd, new)
             old_text = open(xrcfg).read()
             json.dump(xd, open(xrcfg, "w"), indent=2)
             items.append((xrcfg, XRAY_BIN, "xray", old_text))
@@ -6806,6 +7003,11 @@ def change_sni_apply(new):
                   + (chk.stderr or chk.stdout).strip().replace("\n", "\n   ")); return False
         sh("systemctl reload nginx", check=False)
     _links_set_sni(new)                                   # 校验都过了才动链接/订阅
+    if pq:
+        _links_set_pqv(pq)
+        on = sum(1 for v in pq.values() if v)
+        print(f"  ✔ {on} 个 xray reality 节点开了抗量子签名" if on else
+              f"  ⚠ 新目标站{_reality_pq_why(new)}，{len(pq)} 个 xray reality 节点关掉了抗量子签名")
     G["host"] = _host()
     try:
         build_subscription(read_saved_links(), new_token=False)
@@ -9963,11 +10165,11 @@ def cert_fix():
     _follow_log(CERT_FIX_LOG, start, CERT_DONE_MARK)
 
 def main_menu():
-    # 一次性自愈：xray 26.7.11+ 默认 minClientVer=26.3.27 会拒旧客户端(mihomo 硬编码 1.8.2 等)，
-    # 给缺这项的 reality 入站补 1.0.0。只在首次(确有缺失时)改配置+重启 xray，之后即为 no-op。
-    if _xray_heal_minclientver():
-        print("  ⓘ 已给 xray reality 补 minClientVer=1.0.0：新版 xray(26.7.11+)默认会静默拒掉\n"
-              "     mihomo/Clash 等上报旧版本的客户端，补上后它们又能连了（xray 已后台重启一次）。")
+    # 一次性：xray reality 对齐 mack-a（最低客户端版本 1.8.2 + 目标站够格开抗量子签名）。改了才重启 xray，之后是 no-op。
+    pq = _xray_heal_minclientver()
+    if pq is not None:
+        print("  ✔ xray reality 已对齐 mack-a：最低客户端版本 1.8.2"
+              + (f"，{pq} 个节点开了抗量子签名（客户端刷新订阅生效）" if pq else ""))
     if _sb_heal_dns():
         print("  ✓ 已修好 sing-box 的本机 DNS（sing-box 已重启）")
     if _hy2_hop_heal():
