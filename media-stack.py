@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.376"
+SCRIPT_VERSION = "1.5.377"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -15825,6 +15825,10 @@ def retired_ghosts(d, ghosts):
     return out
 
 
+RETIRED_WAIT_S = 600
+RETIRED_POLL_S = 5
+
+
 def clear_retired_ghosts(d, key, confirm=True):
     """把撤掉的盘留在 Emby 里的条目清掉。返回清掉几个。
 
@@ -15845,17 +15849,40 @@ def clear_retired_ghosts(d, key, confirm=True):
         if not ask_yn("从 Emby 里清掉？", False):
             print("留着。")
             return 0
-    done = 0
+    # 【先一口气报完，再统一等、边等边报数】1.5.376 是一批 300 条报一次、每批等 Emby 认下（最多 60 秒）再报下一批，
+    # 屏上一个字不打 —— 真机 2739 条干等十来分钟，仓库主人：「卡在这里好长时间了，也没显示是不是在运行」。
+    # 不改 emby_notify_changes：它在每小时那条上（铁律），这里自己发
+    sent = 0
     for i in range(0, len(gone), EMBY_TARGETED_MAX):
         part = gone[i:i + EMBY_TARGETED_MAX]
-        if emby_notify_changes(key, [(cp, "Deleted") for _i, _n, cp in part], timeout=60, quiet=True):
-            done += len(part)
-    left = retired_ghosts(d, emby_ghost_items(d, key) or [])
+        try:
+            _emby("/Library/Media/Updated", key, method="POST", timeout=60,
+                  body={"Updates": [{"Path": cp, "UpdateType": "Deleted"} for _i, _n, cp in part]})
+            sent += len(part)
+        except Exception as e:
+            warn(f"有一批没报出去：{_short_err(e)[:60]}")
+        print(f"\r    {DIM}已报给 Emby {sent}/{len(gone)}{RST}", end="", flush=True)
+    print()
+    if sent:
+        scan_log_line("清撤掉的盘", f"删除 {sent}：{'、'.join(tops)}")
+    left, t0 = gone, time.time()
+    try:
+        while left and time.time() - t0 < RETIRED_WAIT_S:
+            time.sleep(RETIRED_POLL_S)
+            now = emby_ghost_items(d, key)
+            if now is not None:
+                left = retired_ghosts(d, now)
+            el = int(time.time() - t0)
+            print(f"\r    {DIM}Emby 在清：已清 {len(gone) - len(left)}/{len(gone)}，已等 {el // 60}:{el % 60:02d}"
+                  f"（Ctrl-C 不等了，它在后台接着清）{RST}", end="", flush=True)
+    except KeyboardInterrupt:
+        pass
+    print()
     n = len(gone) - len(left)
     if n:
         ok(f"Emby 里 {n} 个条目已清掉（{'、'.join(tops)}）")
     if left:
-        warn(f"还有 {len(left)} 个 Emby 没收下，过几分钟再进「3 挂载路径」会再问")
+        warn(f"还有 {len(left)} 个 Emby 还没清完，过几分钟再进「3 挂载路径」看一眼")
     return max(n, 0)
 
 
