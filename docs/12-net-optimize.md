@@ -20,9 +20,24 @@
 不想优化了选 `5` **卸载网络优化**（`--reset`）：清除全部优化配置（服务/内核参数/防火墙标记/
 持久化规则），恢复系统默认，节点本身不受影响；建议卸载后重启一次。
 
-> **BBRv3**：原厂内核只有 BBRv1，要 v3 得换 XanMod 内核（自带 v3，名字仍叫 `bbr`）。换完重启、再跑一次本菜单，
-> `4 网络优化状况` 里显示 `bbr（v3）` 就是用上了。
-> 4.5.4 及以前在原厂内核上可能选成 `cubic`（bbr 模块没加载，脚本看不到它）；跑一次本菜单就改回 `bbr`。
+选 `6` **换 BBRv3 内核（XanMod）**（`--xanmod`）：原厂内核只有 BBRv1，XanMod 自带 v3（名字仍叫 `bbr`、默认就开）。
+后面「当前」显示这台是 `BBRv3` / `已装好，重启后生效` / `原厂内核（BBRv1）`。
+
+- **先查能不能换**：x86_64、不是容器（LXC / OpenVZ 跟宿主机共用内核）、Debian 12+ / Ubuntu 24.04+、
+  没开 Secure Boot、磁盘够；CPU 档位自动认（v1 / v2 / v3，v4 用 v3 包），装错档位会开不了机。不合格一行说原因，什么都不改。
+- **问一次、默认「否」**；装 MAIN 分支，没有就装 LTS（Debian 12 只有 LTS）。几分钟，装完一行 ✔。
+  装的时候不让 needrestart 重启服务（依赖顺带升级库时它会重启 sing-box / nginx，正在看的片就断了）。
+- **已经是 BBRv3 的**（XanMod 或别家 v3 内核）不再装，只把拥塞算法对成 `bbr`——「当前」显示
+  `BBRv3 内核，在用 cubic` 时选它就修好。
+- **不自动重启**：会再问一次（默认「否」）——重启会断开所有连接，正在看的片也会断。
+  万一起不来，用服务商后台 VNC 在 GRUB 里选回原来的内核（原厂内核不删）。
+- **会连 XanMod**：`dl.xanmod.org` 拿签名公钥、`deb.xanmod.org` 拿包，对方能看到这台 VPS 的 IP（跟 nginx 官方源一样）。
+  软件源先试 https，不通才用 http；走 http 时路上看得出装的是 XanMod 内核，包有签名改不了。
+- 重启后 `4 网络优化状况` 里显示 `bbr（v3）` 就是用上了。想换回原厂内核：GRUB 里选原来那个启动，
+  再 `apt purge 'linux-xanmod*' 'linux-image-*xanmod*' 'linux-headers-*xanmod*'`，
+  删掉 `/etc/apt/sources.list.d/xanmod-release.list`。
+
+> 4.5.4 及以前在原厂内核上可能选成 `cubic`（bbr 模块没加载，脚本看不到它）；跑一次本菜单的档位就改回 `bbr`。
 >
 > 优化脚本自带 SHA256 校验的自动更新（对照仓库里的 `SHA256SUMS`），每次执行都是最新版。
 > 也可单独运行：`python3 <(curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py)`

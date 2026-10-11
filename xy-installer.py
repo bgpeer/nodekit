@@ -6608,6 +6608,34 @@ def _netopt_version():
     return ""
 
 
+def _bbr_kernel_cur(vf="/sys/module/tcp_bbr/version", ccf="/proc/sys/net/ipv4/tcp_congestion_control", boot="/boot"):
+    """菜单 12 第 6 项的「当前」：BBRv3 / BBRv3 内核但在用别的 / 装好待重启 / 原厂内核（BBRv1）。
+       原厂 v1 没有 version 文件。「装了 v3 却跑着 cubic」仓库主人 10/11 真碰上过，所以连在用的一起看。"""
+    def rd(p):
+        try:
+            return open(p).read().strip()
+        except OSError:
+            return ""
+    v, cc = rd(vf), rd(ccf)
+    if v:
+        return _hl("1;32", f"BBRv{v}") if cc == "bbr" else _hl("1;33", f"BBRv{v} 内核，在用 {cc or '?'}")
+    if "xanmod" in os.uname().release:
+        return _hl("1;32", "XanMod")
+    try:
+        pending = any(f.startswith("vmlinuz-") and "xanmod" in f for f in os.listdir(boot))
+    except OSError:
+        pending = False
+    return _hl("1;33", "已装好，重启后生效") if pending else "原厂内核（BBRv1）"
+
+def _netopt_xanmod():
+    """菜单 12 → 6：查条件、确认、安装、问重启都在 net-optimize.py --xanmod 里（也能单独跑）。"""
+    if not ensure_remote_script(NETOPT_URL, NETOPT_LOCAL):
+        print("拉取 net-optimize.py 失败，且本地无缓存。请检查网络。"); return
+    # 旧缓存不认 --xanmod：它用 parse_known_args，不认的参数直接忽略、转头跑整套优化 —— 这里先拦住
+    if "--xanmod" not in open(NETOPT_LOCAL, encoding="utf-8", errors="replace").read():
+        print("  ⚠ 网络优化脚本没拉到新版，过会儿再试"); return
+    _run_child(f"python3 {NETOPT_LOCAL} --xanmod")
+
 def net_optimize_menu():
     """网络优化（本仓库 net-optimize.py：BBR/QoS/缓冲区等内核调优，依赖工具自动安装）。"""
     MARK = "  " + _hl("1;32", "← 当前")
@@ -6638,7 +6666,8 @@ def net_optimize_menu():
         print(f"  1. 自适应 + 抢带宽（10MB/s 激活，内存 <1G）{m1}")
         print(f"  2. 自适应 + 抢带宽（阈值可调，内存 2G 左右）{m2}")
         print(f"  3. 固定 cake 纯智能算法（高性能机器）{m3}")
-        ui_items([(4, "网络优化状况", None), (5, "卸载网络优化（恢复系统默认）", None), (0, "返回", None)])
+        ui_items([(4, "网络优化状况", None), (5, "卸载网络优化（恢复系统默认）", None),
+                  (6, "换 BBRv3 内核（XanMod）", _bbr_kernel_cur()), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             _run_net_optimize()
@@ -6661,6 +6690,8 @@ def net_optimize_menu():
                        "  节点本身不受影响（建议卸载后重启一次）。y 确认 / n 返回: ").strip().lower()
             if ans in ("y", "yes"):
                 _run_net_optimize("--reset")
+        elif c == "6":
+            _netopt_xanmod()
         elif c in ("0", ""):
             return
 
