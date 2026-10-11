@@ -127,6 +127,7 @@ SBOX_FILE    = BGP_DIR + "/singbox.json"     # sing-box 客户端可编辑成品
 SR_FILE      = BGP_DIR + "/shadowrocket.conf" # Shadowrocket 可编辑成品配置
 SR_NODES_FILE = BGP_DIR + "/shadowrocket-nodes.txt"  # 小火箭节点订阅（base64 分享链接；跟小火箭配置同一个 token、扩展名 .txt）
 SR_MODE_FILE  = BGP_DIR + "/sr_mode"                 # "sub" = 小火箭节点走节点订阅、配置里不带节点；没有 = 老写法
+HY2_BW_FILE   = BGP_DIR + "/hy2_bw.json"             # hy2 满速（Brutal）：{"up": 上行, "down": 下行}（Mbps）；没有 = 自动（BBR）
 SUB_DIR      = BGP_DIR + "/sub"              # 托管目录（<token>.yaml/.json/.conf 软链）
 SUB_SERVER   = BGP_DIR + "/xy-sub-server.py" # 订阅托管小服务（支持可选 TLS）
 HOST_FILE    = BGP_DIR + "/sub.host"         # 记住订阅用的 host（域名或 IP），换 token 时保持不变
@@ -2478,6 +2479,9 @@ def link_to_proxy(u):
         if qs.get("obfs") == "salamander" and qs.get("obfs-password"):   # salamander 混淆
             d["obfs"] = "salamander"; d["obfs-password"] = qs["obfs-password"]
         if qs.get("mport"): d["ports"] = qs["mport"]; d.pop("port")   # 端口跳跃：只留跳跃段，不写固定端口
+        bw = hy2_bw()                                                 # 满速（Brutal）：开了才写，见 hy2_bw
+        if bw:
+            d["up"], d["down"] = f"{bw[0]} Mbps", f"{bw[1]} Mbps"
         return d
     if sch == "tuic":
         d = {"name": nm("tuic"), "type": "tuic", "server": host, "port": port,
@@ -2991,6 +2995,8 @@ def mihomo_to_sb_outbound(key, d):
             ob["server_ports"] = [d["ports"].replace("-", ":")]; ob["hop_interval"] = "30s"
         else:
             ob["server_port"] = int(d["port"])
+        if d.get("up") and d.get("down"):                    # hy2 满速（Brutal），见 hy2_bw
+            ob["up_mbps"] = int(str(d["up"]).split()[0]); ob["down_mbps"] = int(str(d["down"]).split()[0])
         return ob
     if t == "tuic":
         return {"tag": tag, "type": "tuic", "server": srv, "server_port": int(d["port"]),
@@ -3499,6 +3505,36 @@ def _sr_cn_isolate(tpl, names, regex=False):
 # 配置只管规则和分组，分组按名字正则把订阅里的节点收进来。
 # 新装 / 全部重装默认这样；老装机节点原来在配置里，夜里自动更新要是直接把节点拿掉，没加订阅的设备一觉醒来
 # 节点全没了（CLAUDE.md 第四节），所以老装机要在「8 小火箭配置」里看清后果、确认了才切。
+# ---------------------------------------------------------------------------- hy2 满速（Brutal）
+# hy2 不填带宽时用 BBR：探着走、一丢包就收。填了上下行就是 Brutal：按这个速度一直发、丢包不减速——
+# 出国线路丢包多，上传（手机 → VPS）尤其吃亏（仓库主人 10/11：「不管是上传还是下载都用最大的口子来」）。
+# 只写进客户端配置（mihomo up / down、sing-box up_mbps / down_mbps），服务端不填，跟着客户端报的走。
+# 数要填宽带套餐的上下行：填得比线路还大不会更快，多出来的包在半路丢掉——下载方向是 VPS 往外发，丢掉的
+# 也算 VPS 流量；Hysteria 官方文档也说设高了丢包严重反而变慢。小火箭的 hy2 不认这两个参数，不受影响。
+def hy2_bw():
+    """(上行, 下行) Mbps；没开返回 None（hy2 用 BBR 自动）。"""
+    try:
+        d = json.load(open(HY2_BW_FILE))
+        up, down = int(d["up"]), int(d["down"])
+        return (up, down) if up > 0 and down > 0 else None
+    except Exception:
+        return None
+
+def hy2_bw_set(up=None, down=None):
+    """填上下行 = 开；都不给 = 关（回到 BBR 自动）。"""
+    if up and down:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        json.dump({"up": int(up), "down": int(down)}, open(HY2_BW_FILE, "w"))
+    else:
+        try:
+            os.remove(HY2_BW_FILE)
+        except OSError:
+            pass
+
+def hy2_bw_text():
+    bw = hy2_bw()
+    return _hl("1;32", f"下行 {bw[1]} · 上行 {bw[0]} Mbps") if bw else "关（自动，BBR）"
+
 def sr_sub_mode():
     """小火箭节点走节点订阅（配置里不带节点）吗。"""
     try:
@@ -6581,21 +6617,46 @@ def smux_apply(on):
     print("  客户端重新拉取订阅、或到各配置菜单点『3 更新配置』即可生效。")
 
 def smux_menu():
+    """主菜单 5 提速：ws 类多路复用 smux / hy2 满速（Brutal）。两项互不相干，各自开关。"""
     while True:
         st = smux_current_state()
-        ui_title("多路复用 smux（只对 ws / httpupgrade 类协议有效）")
-        if st is None:
-            print("  ⚠ 本机没有 ws / httpupgrade 类 sing-box 节点，smux 不适用")
-            return
-        ui_items([(1, "smux 开关", _hl("1;32", "开") if st else "关"), (0, "返回", None)])
-        ui_tip("开启后网页 / 小请求更顺，大文件下载 / 丢包线路可能变慢")
+        ui_title("提速：多路复用 / hy2 满速")
+        ui_items([(1, "smux 开关（ws / httpupgrade）",
+                   "没有 ws 类节点" if st is None else (_hl("1;32", "开") if st else "关")),
+                  (2, "hy2 满速（Brutal）", hy2_bw_text()),
+                  (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
+            if st is None:
+                print("  ⚠ 本机没有 ws / httpupgrade 类 sing-box 节点，smux 不适用"); continue
+            ui_tip("开启后网页 / 小请求更顺，大文件下载 / 丢包线路可能变慢")
             ans = _ask(f"  确认{'关闭' if st else '开启'} smux? y 确认 / n 返回: ").strip().lower()
             if ans in ("y", "yes"):
                 smux_apply(not st)
+        elif c == "2":
+            hy2_bw_menu()
         elif c in ("0", ""):
             return
+
+def hy2_bw_menu():
+    """hy2 满速：填宽带套餐的下行 / 上行（Mbps），0 = 关回自动。存好后三大配置按当前模板刷新（地址不变）。"""
+    cur = hy2_bw() or (100, 1000)
+    ui_tip("填宽带套餐的上下行，hy2 就按这个速度满速发；填得比宽带大不会更快，多发的包还要耗 VPS 流量")
+    raw = _ask(f"  下行 Mbps（回车 = {cur[1]}，0 = 关、回到自动）: ").strip()
+    if raw == "0":
+        if not hy2_bw():
+            print("  本来就是自动，没变。"); return
+        hy2_bw_set(); print("  ✔ hy2 满速已关，回到自动（BBR）")
+    else:
+        up_raw = _ask(f"  上行 Mbps（回车 = {cur[0]}）: ").strip()
+        try:
+            down, up = int(raw or cur[1]), int(up_raw or cur[0])
+        except ValueError:
+            print("  ⚠ 要填数字（单位 Mbps），没改。"); return
+        if not (1 <= down <= 100000 and 1 <= up <= 100000):
+            print("  ⚠ 数字不对（1 ~ 100000），没改。"); return
+        hy2_bw_set(up, down); print(f"  ✔ hy2 满速：下行 {down} · 上行 {up} Mbps")
+    cfg_refresh_all()                                    # 带宽写在客户端配置里：三大配置刷一遍（地址不变）
 
 # ============================================================================ 更换伪装域名（reality 借用的 SNI）
 _SNI_LINK_RE = re.compile(r'([?&]sni=)[^&#]*')
@@ -9921,7 +9982,7 @@ def main_menu():
         print("  2. 节点链接 / 订阅")
         print("  3. 聚合节点链接（连机VPS合并多台VPS节点）")
         print("  4. 更换伪装域名（reality 借用的 SNI·带连通检测，不用重装）")
-        print("  5. 多路复用开关 smux（只针对 ws / httpupgrade 协议）")
+        print("  5. 提速：多路复用 smux / hy2 满速")
         print("  6. mihomo 配置")
         print("  7. sing-box 配置")
         print("  8. 小火箭配置")
