@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.4"
+VERSION = "4.5.5"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -278,6 +278,13 @@ def get_sysctl(key):
 
 def set_sysctl(key, value):
     return run(["sysctl", "-w", f"{key}={value}"], timeout=5).returncode == 0
+
+
+def cc_label(cc):
+    """屏上显示用：bbr 带上版本。Google v3 补丁（XanMod 等）的 tcp_bbr 有 version 文件（值 3），
+    原厂内核的 v1 没有这个文件，就只显示 bbr。写进 sysctl 文件的仍是纯名字。"""
+    v = read_text("/sys/module/tcp_bbr/version").strip() if cc == "bbr" else ""
+    return f"{cc}（v{v}）" if v else cc
 
 
 def detect_distro():
@@ -867,6 +874,12 @@ def setup_tcp_congestion():
         else:
             FINAL_QDISC = get_sysctl("net.core.default_qdisc")
 
+    # 原厂内核（Debian / Ubuntu）的 bbr 是模块 tcp_bbr，没加载前 tcp_available_congestion_control
+    # 里只有「reno cubic」。以前只看这张表：原厂内核上选成 cubic、写进 sysctl 文件，
+    # 换上 XanMod（默认就是 bbr）重启后又被这个文件压回 cubic。所以先挨个 modprobe 再看表
+    # （没有的模块报错无妨，编进内核的本来就在表里）。
+    for cc in ("bbr3", "bbr2", "bbrplus", "bbr"):
+        run(["modprobe", f"tcp_{cc}"], timeout=10)
     available = get_sysctl("net.ipv4.tcp_available_congestion_control").split()
     target_cc = "cubic"
     # 优先级：bbr3 > bbr2 > bbrplus > bbr > cubic
@@ -878,7 +891,7 @@ def setup_tcp_congestion():
         set_sysctl("net.ipv4.tcp_congestion_control", target_cc)
     FINAL_CC = get_sysctl("net.ipv4.tcp_congestion_control")
 
-    echo(f"✅ 最终生效拥塞算法: {FINAL_CC}")
+    echo(f"✅ 最终生效拥塞算法: {cc_label(FINAL_CC)}")
     echo(f"✅ 最终生效队列算法: {FINAL_QDISC}")
     if target_cc.startswith("bbr") and FINAL_CC != target_cc:
         echo(f"⚠️ 提示: 尝试启用 {target_cc} 失败，系统自动回退到了 {FINAL_CC}")
@@ -2611,7 +2624,7 @@ def print_status():
     echo("📊 基 础 状 态 :")
     if Cfg.AGGRESSIVE_MODE:
         echo(f"  ⚡ {'激进模式':<20} : 已开启")
-    echo(f"  {'TCP 拥塞算法':<22} : {get_sysctl('net.ipv4.tcp_congestion_control')}")
+    echo(f"  {'TCP 拥塞算法':<22} : {cc_label(get_sysctl('net.ipv4.tcp_congestion_control'))}")
     echo(f"  {'默认队列':<22} : {get_sysctl('net.core.default_qdisc')}")
     try:
         import resource
@@ -3054,7 +3067,7 @@ def cmd_check():
     if aggressive:
         green("⚡ 激进模式：已开启")
     if cc.startswith("bbr"):
-        green(f"✅ 拥塞算法：{cc}")
+        green(f"✅ 拥塞算法：{cc_label(cc)}")
     else:
         yellow(f"⚠️ 拥塞算法：{cc}（非 BBR 系列）")
     if iface_qdisc:
