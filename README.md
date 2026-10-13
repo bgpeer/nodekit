@@ -5,7 +5,7 @@ sing-box + xray 双核心、多协议一键部署，自动生成 **mihomo / sing
 
 > ⚠️ 仅供个人学习与合法用途，使用前请阅读文末[免责声明](#免责声明)。
 
-[视频演示](https://youtu.be/XXuaw14Vpk4?is=WR6nu-35Zj5rvD5n) · [Telegram频道](https://t.me/ruleset_bgpeer)
+[视频演示](https://youtu.be/XXuaw14Vpk4?is=WR6nu-35Zj5rvD5n) · [Telegram频道](https://t.me/ruleset_bgpeer) · [DMIT-VPS](https://www.dmit.io/aff.php?aff=12857)
 
 ## 环境要求
 
