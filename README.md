@@ -53,7 +53,7 @@ sudo python3 /tmp/xy.py
 - [12. 网络优化（BBR/QoS 内核调优）](docs/12-net-optimize.md)
 - [13. 自建DNS（AdGuard Home·自己的解析服务器，兼带广告过滤）](docs/13-dns.md)
 - [14. GitHub中转（规则/图标走本机·默认开，可关）](docs/14-github-relay.md)
-- [15. 证书管理（状态 / 安装 / 换域名 / 重签）](docs/15-cert.md)
+- [15. 域名证书管理（状态 / 安装 / 换域名 / 重签）](docs/15-cert.md)
 - [16. 自建Emby（网盘直链媒体服务器·不影响节点）](docs/16-emby.md)
 - [17. VPS线路检测（三网回程骨干 + IP纯净度）](docs/17-vps-check.md)
 - [18. 更新脚本（不影响节点）](docs/18-update-script.md)

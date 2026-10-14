@@ -1,8 +1,8 @@
 [← 返回主页](../README.md#目录)
 
-# 15. 证书管理
+# 15. 域名证书管理
 
-> **`15 证书管理`**：证书是全机共用的地基——节点、订阅服务、nginx 443、AdGuard 的 DoT 全指着
+> **`15 域名证书管理`**：证书是全机共用的地基——节点、订阅服务、nginx 443、AdGuard 的 DoT 全指着
 > 同一个 `/etc/ssl/sb/acme.crt`，它一坏就是**全部一起挂**，而且日志里只有一句「连不上」。
 > 所以这个菜单先把状况摆出来（域名 / 颁发机构 / 剩多少天 / 续期模式 / 覆盖了哪些域名），
 > 有问题的环节红字点名，再给四个按钮：
@@ -48,6 +48,41 @@
   正在使用:  sing-box, xray, 订阅服务, nginx, AdGuard
   Emby 证书: media.example.com   还剩 61 天   已被本证书覆盖
 ```
+
+面板下半截是**域名用在哪**：本机用到的每个域名一块，标题写域名和靠哪张证书（✔ 盖得住 / ✗ 盖不住），
+下面一行一个用途。换域名、重签、删 DNS 记录之前看一眼，就知道动它会牵连到哪些东西：
+
+```
+  域名用在哪
+▸ example.com　节点证书 ✔
+  节点 5 个：reality-vision、vless-ws、hy2、tuic、anytls
+  订阅地址 + GitHub 中转
+  伪装站（nginx）
+  自建 DNS：DoT 853 / DoH 10443
+
+▸ *.example.com　节点证书 ✔
+  安卓专用 DNS（主机名带 ClientID）
+
+▸ emby.media.example.com　Emby 证书 ✔
+  Emby
+
+▸ cdn.example.org　Cloudflare 的证书
+  CDN 备用节点：vless-ws 2053
+
+▸ www.example.net　别人家的站，不用证书
+  借来当 SNI：reality-vision
+```
+
+| 用途 | 从哪读出来的 |
+|---|---|
+| 节点 | `xy-nodes.txt` 里每条分享链接的地址和 `sni=`（reality / 自签节点的 `sni=` 是借来的别人家站名，单独列在最后） |
+| 订阅地址 + GitHub 中转 | `sub.host`（中转默认开，有域名、真证书、没手动关时规则 / 图标走它） |
+| 伪装站 | nginx `bgpeer.conf` 的 `server_name` |
+| 自建 DNS / 安卓专用 DNS | `AdGuardHome.yaml` 加密设置里的服务器名；证书里有 `*.域名` 时安卓主机名才带得上 ClientID |
+| Emby 那套 | `media-stack.conf` 里真在跑的子域（首页入口 / Emby / OpenList） |
+| CDN 备用节点 | CDN 节点的域名和优选地址（客户端看到的是 Cloudflare 的证书，源站自签） |
+
+证书里写着、却哪儿都没用上的名字也会列出来，标「没找到在用的地方」。整段只读本机文件，不联网。
 
 真正会让证书悄悄过期的是这两环，缺了会红字点名：
 
