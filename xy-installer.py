@@ -4636,6 +4636,24 @@ def _dedup_names(links):
             out.append(u)
     return out
 
+def _group_by_prefix(links):
+    """名称前缀一样的节点排在一起（只在生成配置时排，节点文件不动）。
+
+       仓库主人：「新加的节点在写进singbox配置的时候这个节点会写到最后面去……能不能在写节点的时候
+       名称前缀是一样的写在一起」。节点文件是按装的先后追加的：先装的主节点、后写进订阅的 CDN 节点
+       和优选候选、再后来增量加的协议——新加的那条就跟在 CDN 后面，客户端里排到最后。
+         · 前缀按第一次出现的先后排（本机的在前、成员机的在后，跟原来一样）
+         · 同一前缀里主节点在前，CDN 节点（含优选）在后
+         · 别的都保持原来的先后
+       认不出协议段的自定义名字自成一组，跟在前面那些组后面。"""
+    first, keyed = {}, []
+    for i, u in enumerate(links):
+        pfx, seg = _split_tag(_link_name(u))
+        grp = pfx if pfx is not None else f"\0{i}"
+        first.setdefault(grp, i)
+        keyed.append((first[grp], 1 if (seg or "").startswith("CDN·") else 0, i, u))
+    return [k[-1] for k in sorted(keyed, key=lambda k: k[:3])]
+
 def aggregated_links(local=None):
     """本机链接 + 各成员机 .links（去重；拉不到的成员直接跳过）。
        只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。撞名的自动加 ¹²³ 区分。
@@ -4656,7 +4674,7 @@ def aggregated_links(local=None):
             if s.startswith(_NODE_SCHEMES) and s not in seen:
                 seen.add(s); links.append(s)
     links = [_link_rename(u, _sep_name(_link_name(u))) for u in links]   # 统一补「前缀·协议」
-    return _dedup_names(links)
+    return _dedup_names(_group_by_prefix(links))                        # 同前缀排一起；撞名的再加 ¹²
 
 def parse_nodes(all_links):
     ylines, nodes = [], []
