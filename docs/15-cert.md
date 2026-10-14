@@ -49,40 +49,26 @@
   Emby 证书: media.example.com   还剩 61 天   已被本证书覆盖
 ```
 
-面板下半截是**域名用在哪**：本机用到的每个域名一块，标题写域名和靠哪张证书（✔ 盖得住 / ✗ 盖不住），
-下面一行一个用途。换域名、重签、删 DNS 记录之前看一眼，就知道动它会牵连到哪些东西：
+面板下半截是**域名一览**：本机用到的每个域名一行，后面写它用哪张证书（按用途叫）：
 
 ```
-  域名用在哪
-▸ example.com　节点证书 ✔
-  节点 5 个：reality-vision、vless-ws、hy2、tuic、anytls
-  订阅地址 + GitHub 中转
-  伪装站（nginx）
-  自建 DNS：DoT 853 / DoH 10443
-
-▸ *.example.com　节点证书 ✔
-  安卓专用 DNS（主机名带 ClientID）
-
-▸ emby.media.example.com　Emby 证书 ✔
-  Emby
-
-▸ cdn.example.org　Cloudflare 的证书
-  CDN 备用节点：vless-ws 2053
-
-▸ www.example.net　别人家的站，不用证书
-  借来当 SNI：reality-vision
+  域名一览
+  example.com          节点证书
+  *.example.com        DNS 证书
+  *.media.example.com  Emby 证书
+  cdn.example.org      CDN 证书（Cloudflare）
 ```
 
-| 用途 | 从哪读出来的 |
+| 证书 | 是什么 |
 |---|---|
-| 节点 | `xy-nodes.txt` 里每条分享链接的地址和 `sni=`（reality / 自签节点的 `sni=` 是借来的别人家站名，单独列在最后） |
-| 订阅地址 + GitHub 中转 | `sub.host`（中转默认开，有域名、真证书、没手动关时规则 / 图标走它） |
-| 伪装站 | nginx `bgpeer.conf` 的 `server_name` |
-| 自建 DNS / 安卓专用 DNS | `AdGuardHome.yaml` 加密设置里的服务器名；证书里有 `*.域名` 时安卓主机名才带得上 ClientID |
-| Emby 那套 | `media-stack.conf` 里真在跑的子域（首页入口 / Emby / OpenList） |
-| CDN 备用节点 | CDN 节点的域名和优选地址（客户端看到的是 Cloudflare 的证书，源站自签） |
+| 节点证书 | 节点域名。订阅、nginx 伪装站、自建 DNS 用的是同一个域名时就算在这一行，不另列 |
+| DNS 证书 | `*.域名`——其实就是节点那张证书里的泛域名，安卓专用 DNS 带 ClientID 靠它。自建 DNS 开着、证书里却没有它时，黄字提醒「还没签（13 自建DNS → 8）」 |
+| 订阅证书 | 订阅地址换成了别的域名时 |
+| Emby 证书 | `*.Emby 的域名`（跟节点共用一张时也这么叫） |
+| CDN 证书 | CDN 备用节点的域名，客户端看到的是 Cloudflare 的证书 |
 
-证书里写着、却哪儿都没用上的名字也会列出来，标「没找到在用的地方」。整段只读本机文件，不联网。
+证书盖不住、过期、没有时，后面红字 `✗`。reality / 自签节点借来的伪装站名不列（别人家的站，跟本机证书无关）。
+整段只读本机文件，不联网。
 
 真正会让证书悄悄过期的是这两环，缺了会红字点名：
 
