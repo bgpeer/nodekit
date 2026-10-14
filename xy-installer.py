@@ -8738,15 +8738,18 @@ def _left_color(secs):
     d = secs / 86400
     return "\033[1;32m" if d > 30 else ("\033[1;33m" if d >= 7 else "\033[1;31m")
 
-# ── 域名用在哪（菜单 15 面板下半截）────────────────────────────────────────────
-# 仓库主人：「在那个证书管理里面，把所有域名对应用在什么地方的给他列出来」。
-# 一台机器上的域名散在好几处：节点链接、订阅地址、nginx 伪装站、AdGuard 加密 DNS、
-# Emby 那套的子域、CDN 备用节点、reality 借来的站名。换域名 / 重签 / 删 DNS 记录之前，
-# 得一眼看清哪个域名牵着哪些东西、各自靠哪张证书。
+# ── 域名一览（菜单 15 面板下半截）──────────────────────────────────────────────
+# 仓库主人：「把所有域名对应用在什么地方的给他列出来」；看了第一版（每个节点、订阅、伪装站都列）又说
+# 「不用把每个节点都列出来那么详细，你就看多少域名用在什么证书就可以了」「伪装域名不用写在这里面」。
+# 所以一个域名一行：域名 + 哪张证书。证书按用途叫，跟仓库主人的叫法一致：
+#   节点证书   节点域名（订阅、nginx 伪装站、AdGuard 用同一个域名时也算在这行里，不另列）
+#   DNS 证书   *.域名 —— 其实就是节点那张证书里的泛域名，安卓专用 DNS 带 ClientID 靠它；
+#              自建 DNS 开着、证书里却没有它时，黄字提醒「还没签」
+#   订阅证书   订阅换成了别的域名时
+#   Emby 证书  *.<Emby 的域名>（共用节点那张也这么叫）
+#   CDN 证书   CDN 备用节点的域名，客户端看到的是 Cloudflare 的证书
+# reality / 自签节点借来的伪装站名不列：那是别人家的站，跟本机证书无关。
 # 只读本机文件：不联网、不调核心 —— 每进一次菜单 15 都要画一遍。
-
-# media-stack 的子域 → 用途（跟 media-stack.py 的 SUBDOMAINS 对齐；那边新加的子域认不出，就写「媒体服务」）
-_MS_SUB_USE = {"home": "Emby 首页入口", "emby": "Emby", "list": "OpenList（网盘）"}
 AGH_YAML = "/opt/AdGuardHome/AdGuardHome.yaml"
 
 def _link_addr(u):
@@ -8763,11 +8766,6 @@ def _link_addr(u):
         return P.hostname or "", q.get("sni") or q.get("peer") or "", q.get("security") == "reality", insec
     except Exception:
         return None
-
-def _link_proto_label(u):
-    """分享链接 → 协议名（节点名里的协议段，去掉双核心尾标）；名字是自己起的就用链接头。"""
-    head, seg = _split_tag(_link_name(u))
-    return seg.rstrip(_TAG_MARKS) if head is not None and seg else u.split("://", 1)[0]
 
 def _server_names(path):
     """nginx 配置里所有 server_name（一行写几个的也拆开；"_" 是兜底站，不算域名）。"""
@@ -8801,115 +8799,93 @@ def _agh_tls():
         return v.group(1).strip("\"'") if v else ""
     return {k: val(k) for k in ("enabled", "server_name", "port_https", "port_dns_over_tls")}
 
-_DU_NODE, _DU_WILD, _DU_EMBY, _DU_CDN, _DU_LENT = range(5)   # 排序：节点证书的在前，借来的站名在最后
+_DU_RANK = {"节点": 0, "DNS": 1, "订阅": 2, "Emby": 3, "CDN": 4}       # 一览里的先后
 
 def domain_uses(i=None):
-    """这台机器上的每个域名用在哪 → [(域名, 证书, 证书对不对, [用途…])]，按类排好。
-       证书对不对：True 盖得住 / False 盖不住、过期或没有 / None 不归本机管（CDN、借来的站名）。"""
+    """域名各用哪张证书 → [(域名, 证书, 提醒, 提醒级别)]，按 节点 → DNS → 订阅 → Emby → CDN 排好。
+       提醒级别：'' 没事 / 'bad' 红字（盖不住、过期、没有）/ 'hint' 黄字（DNS 证书还没签）。"""
     i = i or cert_info()
     names = [n.lower() for n in (i.get("names") or [])]
-    uses, kind = {}, {}
-    def add(d, use, k):
+    use = {}                                          # 域名 → [用途…]，按先来后到
+    def add(d, what):
         d = (d or "").strip().lower().rstrip(".")
-        if not d or _is_ip(d):
-            return
-        uses.setdefault(d, [])
-        if use and use not in uses[d]:
-            uses[d].append(use)
-        kind[d] = min(kind.get(d, k), k)
+        if d and not _is_ip(d) and what not in use.setdefault(d, []):
+            use[d].append(what)
     nd = (i.get("node_domain") or "").lower()
-    add(nd, "", _DU_NODE)
-    for n in names:                                   # 证书里写着的名字都列上，没人用的也看得见
-        add(n, "", _DU_WILD if n.startswith("*.") else _DU_NODE)
-    # CDN 备用节点：域名挂在 Cloudflare 后面，客户端看到的是 CF 的证书（源站自签）
-    cdn_doms = set()
-    for c in _cdn_load():
-        d = (c.get("domain") or "").lower()
-        if not d:
-            continue
-        cdn_doms.add(d)
-        pref = (c.get("pref") or "").strip()
-        add(d, f"CDN 备用节点：{c.get('proto', 'vless-ws')} {c.get('cf_port', '')}".rstrip()
-               + (f"（优选 {pref}）" if pref else ""), _DU_CDN)
-    # 节点：地址是谁、sni 是谁。reality / 自签节点的 sni 是借来的别人家站名，跟本机证书无关
-    nodes, lent = {}, {}
-    for u in read_saved_links():
+    add(nd, "节点")
+    cdn = [d for d in dict.fromkeys((c.get("domain") or "").lower() for c in _cdn_load()) if d]
+    for u in read_saved_links():                      # 节点链接里的地址 / sni（借来的伪装站名不算）
         r = _link_addr(u)
         if not r:
             continue
         host, sni, reality, insec = r
         host = host.lower(); sni = (sni or host).lower()
-        if sni in cdn_doms:                           # CDN 节点上面已经单独列了
+        if sni in cdn:                                # CDN 节点下面单独算
             continue
-        p = _link_proto_label(u)
-        if host and not _is_ip(host):
-            nodes.setdefault(host, []).append(p)
-        if sni and sni != host and not _is_ip(sni):
-            (lent if (reality or insec) else nodes).setdefault(sni, []).append(p)
-    for d, ps in nodes.items():
-        add(d, f"节点 {len(ps)} 个：{'、'.join(dict.fromkeys(ps))}", _DU_NODE)
-    # 订阅地址（+ 本机 GitHub 中转：有域名、真证书、没手动关时规则 / 图标都走它）
+        add(host, "节点")
+        if not (reality or insec):
+            add(sni, "节点")
+    t = _agh_tls()
+    dns = (t.get("server_name") or "").lower() if t.get("enabled") == "true" else ""
+    if dns:
+        if dns != nd:
+            add(dns, "DNS")
+        add("*." + dns, "DNS")
     try:
-        sub = open(HOST_FILE).read().strip()
+        sub = open(HOST_FILE).read().strip().lower()
     except OSError:
         sub = ""
-    if sub and load_tokens():
-        relay = not os.path.exists(GHRELAY_OFF) and i.get("exists")
-        add(sub, "订阅地址 + GitHub 中转" if relay else "订阅地址", _DU_NODE)
+    if sub and sub != nd and load_tokens():
+        add(sub, "订阅")
     for d in _server_names(NGINX_CONF):
-        add(d, "伪装站（nginx）", _DU_NODE)
-    t = _agh_tls()
-    if t.get("enabled") == "true" and t.get("server_name"):
-        x = t["server_name"].lower()
-        ports = [f"{k} {t[f]}" for k, f in (("DoT", "port_dns_over_tls"), ("DoH", "port_https"))
-                 if t.get(f) not in ("", "0")]
-        add(x, "自建 DNS" + (f"：{' / '.join(ports)}" if ports else ""), _DU_NODE)
-        if f"*.{x}" in names:
-            add(f"*.{x}", "安卓专用 DNS（主机名带 ClientID）", _DU_WILD)
-    # Emby 那套：真在跑的 nginx 站点里写了哪些子域就列哪些
+        add(d, "节点")
     ed = (i.get("emby_domain") or "").lower()
-    for d in _server_names(MS_NGINX_CONF):
-        add(d, _MS_SUB_USE.get(d.split(".", 1)[0].lower(), "媒体服务"), _DU_EMBY)
-        if i.get("emby_shared"):
-            for w in names:
-                if w.startswith("*.") and _name_covers([w], d):
-                    add(w, "Emby 那几个子域", _DU_WILD)
-    for d, ps in lent.items():
-        add(d, f"借来当 SNI：{'、'.join(dict.fromkeys(ps))}", _DU_LENT)
+    if ed:
+        add("*." + ed, "Emby")
+    for d in cdn:
+        add(d, "CDN")
+    for n in names:                                   # 证书里还写着、上面没认出用途的：算节点那张的
+        if n not in use:
+            add(n, "节点")
 
-    secs = i.get("secs")
-    def cert_of(d, k):
-        if k == _DU_CDN:
-            return "Cloudflare 的证书", None
-        if k == _DU_LENT:
-            return "别人家的站，不用证书", None
-        if k == _DU_EMBY and ed and d.endswith("." + ed) and not i.get("emby_shared"):
-            es = i.get("emby_secs")
-            return "Emby 证书", bool(es and es > 0)
+    secs, es = i.get("secs"), i.get("emby_secs")
+    def status(d, whats):
+        if whats == ["CDN"]:
+            return "", ""
+        if d.startswith("*.") and "DNS" in whats and d not in names:
+            return "还没签（13 自建DNS → 8）", "hint"
+        if "Emby" in whats and not i.get("emby_shared"):
+            if es is None:
+                return "没有证书", "bad"
+            return ("", "") if es > 0 else ("已过期", "bad")
         if not i.get("exists"):
-            return "没有证书", False
+            return "没有证书", "bad"
         if secs is not None and secs <= 0:
-            return "节点证书已过期", False
-        ok = (d in names) if d.startswith("*.") else _name_covers(names, d)
-        return ("节点证书" if ok else "节点证书盖不住"), ok
-    rows = [(d, *cert_of(d, kind[d]), uses[d]) for d in uses]
-    return sorted(rows, key=lambda r: kind[r[0]])
+            return "已过期", "bad"
+        if not _name_covers(names, d):
+            return "证书里没有" if d.startswith("*.") else "证书盖不住", "bad"
+        return "", ""
+    def label(whats):
+        if whats == ["CDN"]:
+            return "CDN 证书（Cloudflare）"
+        s = " / ".join(whats)
+        return s + (" 证书" if s[-1].isascii() else "证书")
+    rows = [(d, label(w), *status(d, w)) for d, w in use.items()]
+    return sorted(rows, key=lambda r: min(_DU_RANK[x] for x in use[r[0]]))
 
 def domain_uses_print(i=None):
-    """面板下半截：一个域名一块——黄色标题「▸ 域名　哪张证书 ✔/✗」，下面一行一个用途，块之间空一行。"""
+    """面板下半截：一个域名一行「域名　哪张证书」，证书那列对齐；有毛病的后面红字 ✗，DNS 证书没签黄字提醒。"""
     rows = domain_uses(i)
     if not rows:
         return
+    w = max(len(r[0]) for r in rows)
     print("-" * 60)
-    print("  " + _hl("1;36", "域名用在哪"))
-    for n, (d, cert, ok, us) in enumerate(rows):
-        if n:
-            print()
-        col = "2" if ok is None else ("1;32" if ok else "1;31")
-        mark = "" if ok is None else (" ✔" if ok else " ✗")
-        print(_hl("1;33", f"▸ {d}") + "　" + _hl(col, cert + mark))
-        for u in us or ["没找到在用的地方"]:
-            print(f"  {u}")
+    print("  " + _hl("1;36", "域名一览"))
+    for d, cert, note, lv in rows:
+        tail = ""
+        if note:
+            tail = "　" + (_hl("1;31", "✗ " + note) if lv == "bad" else _hl("1;33", note))
+        print("  " + _hl("1;33", d) + " " * (w - len(d) + 2) + _hl("1;32", cert) + tail)
 
 def cert_panel(info=None):
     """把证书状况摆出来。只读，不改任何东西。"""
