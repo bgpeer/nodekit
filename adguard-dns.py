@@ -1469,7 +1469,7 @@ def selfcheck():
     # 「无法访问私人 DNS 服务器」——后台查询日志里却有手机的验证查询 xxxx-dnsotls-ds.metric.gstatic.com，
     # 说明服务器这头没毛病，是手机所在的网络时好时坏地拦 853。安卓私人 DNS 只走 853、改不了端口，
     # 服务器这边绕不过去，只能换网络或者私人 DNS 改「自动」交给代理。
-    print(f"    {Y}提醒：本机没拦 ≠ 外面能连。{N}上面 4/6 全绿、手机还连不上，就是半路被拦：")
+    print(f"    {Y}提醒：本机没拦 ≠ 外面能连。{N}上面 4/6 全绿、手机还连不上，就是半路被拦（选 9 手机实测能看清）：")
     print( "       ① 云商后台的安全组 / 防火墙没放行 853（DMIT/甲骨文等）")
     print( "       ② 手机所在的网络拦了 853（国内有的网络会拦；安卓私人 DNS 只走 853，换不了端口）")
     print( "          WiFi 和流量各试一次，一个行一个不行就是 ②：私人 DNS 改「自动」，开代理时 DNS 由代理接管")
@@ -1507,6 +1507,124 @@ def selfcheck():
     print(f"\n  {Y}万一手机整机没网、又连不上代理自救：{N}")
     print( "    设置 → 网络和互联网 → 私人DNS → 改成「关闭」或「自动」，解析立刻恢复。")
 
+# ===================== 手机实测 =====================
+# 仓库主人 10/14：自检全绿（证书、通配记录、白名单、带 ClientID 的 DoT 本机实测都通），手机私人 DNS 照样
+# 「无法访问私人 DNS 服务器」。自检是在服务器上测的，看不见「手机 → 服务器」这一段。这里反过来：让手机去连，
+# 服务器这边用 tcpdump 盯着 853，看手机的连接到没到、握手走没走完。只在本机看包，不往外发任何东西。
+_TCPDUMP_RE = re.compile(r"IP6? (\S+)\.(\d+) > (\S+)\.(\d+): Flags \[([^\]]*)\].*?length (\d+)")
+
+def _tcpdump_argv(port):
+    return ["tcpdump", "-nn", "-l", "-i", "any", f"tcp port {port}"]
+
+def _probe_summary(lines, port, local=()):
+    """tcpdump 的行 → {远端IP: {cport: {"in": [客户端发的字节…], "out": [服务器回的字节…]}}}，本机自己的连接不算。"""
+    peers = {}
+    for ln in lines:
+        m = _TCPDUMP_RE.search(ln)
+        if not m:
+            continue
+        a, ap, b, bp, flags, n = m.group(1), int(m.group(2)), m.group(3), int(m.group(4)), m.group(5), int(m.group(6))
+        if bp == port:
+            remote, cport, inbound = a, ap, True
+        elif ap == port:
+            remote, cport, inbound = b, bp, False
+        else:
+            continue
+        if remote in local or remote.startswith("127.") or remote == "::1":
+            continue
+        c = peers.setdefault(remote, {}).setdefault(cport, {"in": [], "out": []})
+        if n > 0:
+            (c["in"] if inbound else c["out"]).append(n)
+    return peers
+
+def _probe_verdict(peers):
+    """→ (结论, 远端IP, (收, 发) 字节)。结论按好到坏取最好的那条连接：
+         ok      握手走完、查询在走（ClientHello 之后手机又发了 ≥50 字节：Finished + 查询）
+         reject  手机拿到服务器的证书就断了（之后只发了个告警 / 什么都没发）
+         noreply 手机发了 ClientHello，服务器没回
+         path    只有 TCP 握手、一个数据都没有 —— 半路被掐
+         none    一个外面的包都没收到"""
+    rank = {"ok": 0, "reject": 1, "noreply": 2, "path": 3}
+    best = ("none", "", (0, 0))
+    for ip, conns in peers.items():
+        for c in conns.values():
+            if c["in"] and c["out"]:
+                kind = "ok" if sum(c["in"][1:]) >= 50 else "reject"
+            elif c["in"]:
+                kind = "noreply"
+            else:
+                kind = "path"
+            if best[0] == "none" or rank[kind] < rank[best[0]]:
+                best = (kind, ip, (sum(c["in"]), sum(c["out"])))
+    return best
+
+def phone_probe(secs=60):
+    """菜单 9：手机实测——让手机去连私人 DNS，服务器这边盯着 853，说清卡在哪一段。"""
+    G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    if not (_installed() and _running()):
+        print("  AdGuardHome 没在运行——先选 1 安装，或选 7 自检看原因。"); return
+    try: txt = open(_agh_yaml()).read()
+    except OSError: txt = ""
+    tb = _tls_block(txt)
+    port = int(_yaml_val(tb, "port_dns_over_tls") or 0)
+    if _yaml_val(tb, "enabled") != "true" or not port:
+        print("  加密（DoT）没开，安卓私人 DNS 本来就用不了——先按『3 使用方法』把加密开上。"); return
+    if not shutil.which("tcpdump"):
+        ui_tip("要装抓包工具 tcpdump（只在本机看包，不往外发任何东西）")
+        if _ask("  装? [Y/n]: ").strip().lower() in ("n", "no"):
+            return
+        sh("DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y tcpdump")
+        if not shutil.which("tcpdump"):
+            print("  ⚠ tcpdump 没装上，这项测不了。"); return
+    ui_title("手机实测（看手机连没连进来）")
+    ui_tip("先把手机上的代理（VPN）关掉")
+    print("  现在拿手机：私人 DNS 先选「关闭」，再选回主机名 → 保存")
+    print(f"  {secs} 秒内我在这边看着 {port} 端口（Ctrl-C 提前结束）…")
+    local = set(sh("hostname -I").split()) | {"127.0.0.1", "::1"}
+    import select
+    lines, seen, rest = [], set(), b""
+    p = subprocess.Popen(_tcpdump_argv(port), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    fd = p.stdout.fileno()                      # 直接读 fd：用 readline 的话 Python 先把整段吞进缓冲，select 就再也叫不醒
+    try:
+        end = time.time() + secs
+        while time.time() < end:
+            if not select.select([fd], [], [], 0.5)[0]:
+                if p.poll() is not None:
+                    break
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            *done, rest = (rest + chunk).split(b"\n")
+            lines += [ln.decode(errors="replace") for ln in done]
+            peers = _probe_summary(lines, port, local)
+            for ip in peers:
+                if ip not in seen:
+                    seen.add(ip); print(f"  · 收到 {ip} 的连接")
+            if _probe_verdict(peers)[0] == "ok":
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        p.terminate()
+        try: p.wait(3)
+        except Exception: p.kill()
+    kind, ip, (nin, nout) = _probe_verdict(_probe_summary(lines, port, local))
+    print()
+    if kind == "ok":
+        print(f"  {G}✔ {ip} 连进来了，查询也在走（收 {nin} / 发 {nout} 字节）—— 服务器这边全通{N}")
+        ui_tip("手机还报连不上：关掉手机上的其它 VPN / 安全软件再试")
+    elif kind == "reject":
+        print(f"  {Y}⚠ {ip} 连进来了，拿到证书就断开 —— 手机不认这张证书，或 TLS 握手没过{N}")
+        ui_tip("把这屏和手机的报错截图发来再查")
+    elif kind == "noreply":
+        print(f"  {R}✗ 收到 {ip} 的握手，服务器没回 —— systemctl restart AdGuardHome 再测一次{N}")
+    else:
+        print(f"  {R}✗ " + (f"收到 {ip} 的连接请求，可握手没走下去" if kind == "path" else
+                            f"{secs} 秒里外面一个连到 {port} 的包都没收到")
+              + f" —— 手机的请求半路被拦了（手机所在网络 / 运营商拦 {port}），服务器这边没法绕{N}")
+        ui_tip("WiFi 和流量各测一次；都不行就把私人 DNS 改「自动」，开代理时 DNS 由代理接管")
+
 def _selfdns_toggle():
     """把"自建DNS写入订阅"的开关交给主脚本处理（订阅生成/刷新都在主脚本里）。"""
     xy = BGP_DIR + "/xy-installer.py"
@@ -1534,6 +1652,7 @@ def menu():
                   (6, "自建 DNS 写入订阅", "已写入" if os.path.exists(SELFDNS_FLAG) else "未写入"),
                   (7, "自检（只读）", None),
                   (8, "DoT 带 ClientID（签泛域名证书）", None),
+                  (9, "手机实测（开私人 DNS，看它连没连进来）", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -1544,6 +1663,7 @@ def menu():
         elif c == "6": _selfdns_toggle()
         elif c == "7": selfcheck()
         elif c == "8": dot_clientid()
+        elif c == "9": phone_probe()
         elif c in ("0", ""):
             return
 
