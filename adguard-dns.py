@@ -375,14 +375,32 @@ def _cert_wildcard_ok(dom):
         return False
     return f"DNS:*.{dom}" in sh(f"openssl x509 -in {ACME_CRT} -noout -text 2>/dev/null")
 
-def _wildcard_dns_ok(dom):
-    """*.dom 的 DNS 通配记录是否已生效：随便取个不存在的子域，能解析出 IP 就算通。
-       证书能签下来不代表客户端找得到路——通配 A 记录得单独加。"""
+def _resolve4(name):
+    """name 的 IPv4 地址（走本机的解析器，查的是公网上的记录）；查不到返回 []。"""
     try:
-        socket.getaddrinfo(f"dotcheck{secrets.token_hex(3)}.{dom}", None, socket.AF_INET)
-        return True
+        return sorted({a[4][0] for a in socket.getaddrinfo(name, None, socket.AF_INET)})
     except OSError:
-        return False
+        return []
+
+def _wildcard_dns_check(dom):
+    """*.dom 的通配记录能不能把手机带到这台机器 → (行不行, 一句话说明)。
+
+       安卓私人 DNS 按主机名（ID.域名）找服务器：先用当前网络的 DNS 把它解析成 IP，再去连那个 IP 的 853。
+       光「解析得出来」不够——Cloudflare 新加的记录默认开着黄云（代理），解析出来是 CF 的 IP，CF 不转发 853，
+       手机就报「无法访问私人 DNS 服务器」；而自检的 DoT 是直连本机测的，照样全绿，查不出来。
+       所以拿它跟主域名的解析结果比：主域名是节点在用的，一定是灰云直连本机。
+       随便取个不存在的子域去查：证书能签下来不代表客户端找得到路——通配 A 记录得单独加。"""
+    wild = _resolve4(f"dotcheck{secrets.token_hex(3)}.{dom}")
+    if not wild:
+        return False, f"*.{dom} 没有解析记录（通配 A 记录还没加，或还没生效）"
+    base = _resolve4(dom)
+    if base and not set(wild) & set(base):
+        return False, (f"*.{dom} 解析到 {wild[0]}，跟 {dom}（{base[0]}）不一样"
+                       f"——多半是 Cloudflare 里通配那条开了黄云（代理）")
+    return True, ""
+
+def _wildcard_dns_ok(dom):
+    return _wildcard_dns_check(dom)[0]
 
 def _allowed_clients():
     """AdGuardHome.yaml 里的访问白名单 allowed_clients；没这个键返回 None，空列表返回 []。"""
@@ -689,9 +707,10 @@ def dot_clientid():
         print(f"  {G}✓ 证书已经覆盖 *.{dom}，这一步做过了。{N}")
         if cid:
             print(f"    安卓「专用DNS」填：{G}{cid}.{dom}{N}")
-        if not _wildcard_dns_ok(dom):
-            print(f"  {R}⚠ 但 *.{dom} 的 DNS 通配记录没生效{N}——手机会解析不出这个主机名。")
-            print(f"    去 Cloudflare 加一条：类型 {G}A{N}  名称 {G}*.{dom.split('.',1)[0] if dom.count('.')>1 else '*'}{N}"
+        okw, why = _wildcard_dns_check(dom)
+        if not okw:
+            print(f"  {R}⚠ {why}{N}——手机找不到这台机器，安卓专用 DNS 连不上。")
+            print(f"    Cloudflare 里那条：类型 {G}A{N}  名称 {G}*.{dom}{N}"
                   f"  内容 {G}{_public_ip()}{N}  代理状态 {Y}仅DNS(灰云){N}")
         print(f"  Token 存在 {G}~/.acme.sh/account.conf{N}，约 90 天后自动续期还要用它。")
         ui_line()
@@ -715,9 +734,11 @@ def dot_clientid():
 
     if _ask("\n  两样都准备好了，继续? [y/N]: ").lower() not in ("y", "yes"):
         print("  已取消，没有任何改动。"); return
-    if not _wildcard_dns_ok(dom):
-        print(f"\n  {R}❌ 检测不到 *.{dom} 的解析{N}——通配 A 记录还没加或还没生效。")
-        print(f"     先去 Cloudflare 加好（灰云），等一两分钟再回来。签证书前就查，省得签完才发现没路。")
+    okw, why = _wildcard_dns_check(dom)
+    if not okw:
+        print(f"\n  {R}❌ {why}{N}")
+        print(f"     去 Cloudflare 弄好（名称 *.{dom}、内容本机 IP、灰云「仅 DNS」），等一两分钟再回来。"
+              f"签证书前就查，省得签完才发现没路。")
         return
     print(f"  {G}✓ 通配解析已生效{N}")
 
@@ -1325,6 +1346,14 @@ def selfcheck():
                            f"{ACME_CRT} / {ACME_KEY}")
             else:
                 fix.append("DoT 连不上：确认加密设置里 DoT 端口填了、服务已重启")
+    if enc_on and dom and p_dot and wild_p:
+        okw, why = _wildcard_dns_check(dom)
+        if okw:
+            print(f"    {ok} 安卓主机名 {cid_p or 'ID'}.{dom} 解析到本机")
+        else:
+            print(f"    {bad} {why}")
+            print(f"       {Y}手机按主机名找不到这台机器 →「无法访问私人 DNS 服务器」（上面直连本机测的照样通）{N}")
+            fix.append(f"Cloudflare 里 *.{dom} 那条：代理状态改灰云（仅 DNS），内容填本机 IP")
     if enc_on and dom and p_doh:
         path = f"/dns-query/{cid_p}" if cid_p else "/dns-query"
         code, rc, ips, pc, err = _q_doh(p_doh, dom, probe, path)
