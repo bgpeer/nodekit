@@ -21,6 +21,7 @@ import os, re, sys, time, json, socket, shutil, secrets, struct, base64, ssl, su
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"   # 主脚本 acme 证书
+CERT_META = BGP_DIR + "/cert.json"                # 主脚本记的「这张证书该是什么样」（见 _cert_meta_set）
 AGH_DIR = "/opt/AdGuardHome"
 AGH_BIN = AGH_DIR + "/AdGuardHome"
 RESOLVED_DIR    = "/etc/systemd/resolved.conf.d"
@@ -568,6 +569,23 @@ def _replace_cf_token():
     print(f"  下次证书续期(约90天后)会用新 Token；想立刻验证可跑：")
     print(f"      ~/.acme.sh/acme.sh --renew -d {_domain()} --ecc --force")
 
+def _cert_meta_set(**kw):
+    """把证书现在的样子记进主脚本的 cert.json（只改传进来的字段）。
+
+       主脚本重签证书之前靠它判断「这台本来该不该是泛域名」（xy-installer 的 _wildcard_wanted），
+       面板也靠它。这边签了泛域名却不记，哪天磁盘上的证书被换掉（重装、换证书），主脚本就以为
+       这台本来只要单域名，照着 HTTP-01 签回去 —— 安卓「ID.域名」悄无声息地失效。撤销时同理。"""
+    try:
+        cur = json.load(open(CERT_META))
+    except Exception:
+        cur = {}
+    cur.update(kw)
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        json.dump(cur, open(CERT_META, "w"), ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
 def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
     """撤销泛域名：把证书重签回只覆盖『域名』，DoT 就不能再带 ClientID 了。
 
@@ -624,6 +642,7 @@ def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
     sh("systemctl restart AdGuardHome", check=False)
     time.sleep(3)
     print(f"  {G}✓ 证书已改回只覆盖 {dom}{N}")
+    _cert_meta_set(domain=dom, wildcard=False, mode="standalone" if http01 else "dns-cf")
     if ask:
         print(f"  安卓「专用DNS」现在要填：{G}{dom}{N}")
     # DNS-01 重签的话续期还要读 Token，不能清；HTTP-01 才是真的用不着了
@@ -737,6 +756,7 @@ def dot_clientid():
               f"建议看 `openssl x509 -in {ACME_CRT} -noout -text | grep DNS:`。")
         return
     print(f"  {G}✓ 证书已覆盖 *.{dom}{N}")
+    _cert_meta_set(domain=dom, wildcard=True, mode="dns-cf")
 
     sh("systemctl restart AdGuardHome", check=False)
     time.sleep(3)

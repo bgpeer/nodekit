@@ -8482,10 +8482,18 @@ def cert_meta():
        现推一份出来并落盘，老机器升级上来不用手工补。"""
     try:
         m = json.load(open(CERT_META))
-        if m.get("domain"):
-            return m
     except Exception:
-        pass
+        m = {}
+    if isinstance(m, dict) and m.get("domain"):
+        # 旧版自建 DNS 菜单 8 签了泛域名却没记进来：磁盘上这张就是泛域名的，补记上。
+        # 不补的话哪天这张被换掉（重装时证书没了之类），重签就不知道这台本来该是泛域名，
+        # 照 HTTP-01 签回单域名 —— 安卓「ID.域名」悄无声息地失效。
+        try:
+            if not m.get("wildcard") and f"*.{m['domain']}" in cert_names(ACME_CRT):
+                m = save_cert_meta(wildcard=True, mode=_acme_mode(m["domain"]) or "dns-cf")
+        except Exception:
+            pass
+        return m
     m = {"domain": "", "wildcard": False, "mode": ""}
     names = cert_names(ACME_CRT)
     if names:
@@ -8713,7 +8721,9 @@ def cert_info():
         "secs": secs,
         "exists": os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY),
         "key_ok": cert_key_ok(ACME_CRT, ACME_KEY) if os.path.exists(ACME_KEY) else False,
-        "mode": meta.get("mode") or (_acme_mode(dom) if dom else ""),
+        # 续期模式以 acme.sh 的记录为准（它才是真正拿来续期的那套）：cert.json 是本脚本自己记的，
+        # 旧版自建 DNS 菜单 8 改签泛域名（DNS-01）后它还写着 standalone，面板就把 DNS-01 说成「HTTP-01」
+        "mode": (_acme_mode(dom) if dom else "") or meta.get("mode") or "",
         "cron_ok": _acme_cron_ok(),
         "hook_ok": _acme_hook_ok(dom) if dom else False,
         "emby_domain": emby_dom,
