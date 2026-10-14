@@ -1518,7 +1518,8 @@ def selfcheck():
 _TCPDUMP_RE = re.compile(r"IP6? (\S+)\.(\d+) > (\S+)\.(\d+): Flags \[([^\]]*)\]"
                          r"(?:, seq (\d+)(?::(\d+))?)?(?:, ack (\d+))?.*?length (\d+)")
 _HEX_RE = re.compile(r"^\s+0x[0-9a-f]+:\s+([0-9a-f ]+?)\s*$")
-_PROBE_GRACE = 15       # 手机的连接有了结果后再看几秒就收：等查询、等回答、等手机确认（安卓下一轮验证要隔一分钟）
+_PROBE_GRACE = 15       # 最后一条新连接来了以后再看几秒就收：等查询、等回答、等手机确认（安卓下一轮验证要隔一分钟）
+_PROBE_SETTLE = 5       # 来过的 IP 全通了、又这么久没来新连接，就不用干等到 _PROBE_GRACE
 
 def _tcpdump_argv(port):
     return ["tcpdump", "-nn", "-l", "-x", "-i", "any", f"tcp port {port}"]
@@ -1625,14 +1626,41 @@ def _conn_kind(c):
         return "noanswer" if cl > 120 else "handshake"
     return "ok" if ack >= ans[0] else "lost"
 
-def _probe_verdict(cap):
-    """→ (结论, 远端IP, 手机填的主机名)，取走得最远的那条连接；一条新连接都没有 → ("none", "", "")。"""
-    best = ("none", "", "")
+def _probe_verdicts(cap):
+    """→ [(结论, 远端IP, 手机填的主机名)…]：每个 IP 取走得最远的那条连接，按先来后到。
+       手机的 WiFi 和流量出口不同，各算一个 IP、各验各的（10/15 截图：来了两个 IP，只报了通的那个，
+       没通的那个被盖住了——手机报「无法访问」的正是流量那一路）。"""
+    best = {}
     for c in cap.conns.values():
-        kind = _conn_kind(c)
-        if best[0] == "none" or _PROBE_RANK.index(kind) < _PROBE_RANK.index(best[0]):
-            best = (kind, c["ip"], c["sni"] or "")
-    return best
+        kind, b = _conn_kind(c), best.get(c["ip"])
+        if not b or _PROBE_RANK.index(kind) < _PROBE_RANK.index(b[0]):
+            best[c["ip"]] = (kind, c["ip"], c["sni"] or "")
+    return list(best.values())
+
+_PROBE_SAY = {
+    "ok":         ("✔", "{ip} 连进来了，查询有来有回、手机也收到了 —— 这条线路通"),
+    "lost":       ("✗", "{ip} 的查询到了、AdGuard 也回了，可手机一直没确认收到 —— 回答在半路被丢"),
+    "noanswer":   ("✗", "{ip} 的查询到了，AdGuard 没回 —— systemctl restart AdGuardHome 再测一次"),
+    "handshake":  ("✗", "{ip} 握手走完了（证书没问题），可查询一直没到 —— 半路被拦"),
+    "reject":     ("⚠", "{ip} 连进来了，拿到证书就断开 —— 手机不认这张证书，或 TLS 握手没过"),
+    "flightlost": ("✗", "{ip} 连进来了，可服务器发的证书手机没收到 —— 半路被拦"),
+    "noreply":    ("✗", "收到 {ip} 的握手，服务器没回 —— systemctl restart AdGuardHome 再测一次"),
+    "path":       ("✗", "收到 {ip} 的连接请求，可握手没走下去 —— 手机的请求半路被拦了（手机所在网络 / 运营商拦 {port}），服务器这边没法绕"),
+}
+
+def _probe_host_msg(sni, ask, sname, cid):
+    """手机的主机名在本机那一问没过 → (✗ 那行, 提示)。"""
+    s = sni.lower()
+    pid = s[:-len(sname) - 1] if sname and s.endswith("." + sname) else ""
+    if ask[0] == 5:
+        why = "没带 ClientID" if s == sname else (f"ClientID「{pid}」不在白名单里" if pid else "跟 AdGuard 的域名对不上")
+        tip = (f"AdGuard 后台 → 设置 → DNS 设置 → 允许的客户端，把 {cid} 加回去" if cid and pid == cid else
+               f"手机私人 DNS 改填：{cid}.{sname}" if cid and sname else "回菜单 8 把 ClientID 弄好，再按『3 使用方法』填手机")
+        return f"手机填的主机名是 {sni} —— {why}，AdGuard 拒了它的查询", tip
+    if ask[0] < 0:
+        return f"用手机的主机名 {sni} 在本机问 AdGuard 出错：{ask[2]}", "把这屏截图发来再查"
+    return (f"AdGuard 答不出安卓的检测域名（rcode={ask[0]}，没有地址）—— 手机收不到地址就判「无法访问」",
+            "后台 → 查询日志搜 dnsotls，看是被过滤规则拦了还是上游没回")
 
 def _probe_ask(port, sni):
     """用手机填的主机名，在本机照安卓的检测查询问一遍 AdGuard → (rcode, [IP], 错误)。"""
@@ -1668,25 +1696,26 @@ def phone_probe(secs=60):
     fd = p.stdout.fileno()                      # 直接读 fd：用 readline 的话 Python 先把整段吞进缓冲，select 就再也叫不醒
     try:
         end = time.time() + secs
-        while time.time() < end:
-            if not select.select([fd], [], [], 0.5)[0]:
-                if p.poll() is not None:
+        stop, fresh, n = end, 0.0, 0            # stop：最晚收工；fresh：最近一条新连接来的时间
+        while time.time() < stop:
+            if select.select([fd], [], [], 0.5)[0]:
+                chunk = os.read(fd, 65536)
+                if not chunk:
                     break
-                continue
-            chunk = os.read(fd, 65536)
-            if not chunk:
+                *done, rest = (rest + chunk).split(b"\n")
+                for ln in done:
+                    cap.feed(ln.decode(errors="replace"))
+                if len(cap.conns) > n:          # 来了新连接（WiFi 和流量各来各的）：从它算起再看一会儿
+                    n, fresh = len(cap.conns), time.time()
+                    stop = min(end, fresh + _PROBE_GRACE)
+                    for c in cap.conns.values():
+                        if c["ip"] not in seen:
+                            seen.add(c["ip"]); print(f"  · 收到 {c['ip']} 的连接")
+            elif p.poll() is not None:
                 break
-            *done, rest = (rest + chunk).split(b"\n")
-            for ln in done:
-                cap.feed(ln.decode(errors="replace"))
-            for c in cap.conns.values():
-                if c["ip"] not in seen:
-                    seen.add(c["ip"]); print(f"  · 收到 {c['ip']} 的连接")
-            kind = _probe_verdict(cap)[0]
-            if kind == "ok":
-                break
-            if kind != "none":
-                end = min(end, time.time() + _PROBE_GRACE)
+            vs = _probe_verdicts(cap)
+            if vs and all(v[0] == "ok" for v in vs) and time.time() - fresh >= _PROBE_SETTLE:
+                break                           # 来过的全通了，又静了一阵没新连接：不用干等
     except KeyboardInterrupt:
         pass
     finally:
@@ -1694,53 +1723,37 @@ def phone_probe(secs=60):
         try: p.wait(3)
         except Exception: p.kill()
     cap.done()
-    kind, ip, sni = _probe_verdict(cap)
-    # 握手走完了就用手机的主机名在本机问一遍：白名单对不上 / 检测域名解析不出来，手机都会判「无法访问」
-    ask = _probe_ask(port, sni) if sni and kind in ("ok", "lost", "noanswer", "handshake") else None
-    bad = ask and not (ask[0] == 0 and ask[1])
-    net = f"网络在干扰 {port}：WiFi 和流量各测一次；都不行就私人 DNS 改「自动」，开代理时 DNS 由代理接管"
+    vs = _probe_verdicts(cap)
+    # 握手走完了的，用手机填的主机名在本机问一遍（同一个主机名问一次）：白名单对不上 / 检测域名解析不出来，手机都会判「无法访问」
+    asks = {}
+    for kind, _ip, sni in vs:
+        if sni and kind in ("ok", "lost", "noanswer", "handshake") and sni not in asks:
+            asks[sni] = _probe_ask(port, sni)
+    bad = {s: a for s, a in asks.items() if not (a[0] == 0 and a[1])}
     print()
-    if kind == "ok":
-        if not bad:                                     # 主机名被拒的话，包是通的也不算通，只报下面那行
-            print(f"  {G}✔ {ip} 连进来了，查询有来有回、手机也收到了 —— 服务器和线路都通{N}")
-            ui_tip("手机还报连不上：私人 DNS 先「关闭」再选回主机名，等半分钟再看")
-    elif kind == "lost":
-        print(f"  {R}✗ {ip} 的查询到了、AdGuard 也回了，可手机一直没确认收到 —— 回答在半路被丢{N}")
-    elif kind == "noanswer":
-        print(f"  {R}✗ {ip} 的查询到了，AdGuard 没回 —— systemctl restart AdGuardHome 再测一次{N}")
-    elif kind == "handshake":
-        print(f"  {R}✗ {ip} 握手走完了（证书没问题），可查询一直没到 —— 半路被拦{N}")
-    elif kind == "reject":
-        print(f"  {Y}⚠ {ip} 连进来了，拿到证书就断开 —— 手机不认这张证书，或 TLS 握手没过{N}")
+    col = {"✔": G, "✗": R, "⚠": Y}
+    for kind, ip, sni in vs:                    # 每个 IP 一行
+        if kind == "ok" and sni in bad:
+            continue                            # 主机名被拒：包是通的也不算通，只报下面主机名那行
+        mark, say = _PROBE_SAY[kind]
+        print(f"  {col[mark]}{mark} {say.format(ip=ip, port=port)}{N}")
+    if not vs:
+        print(f"  {R}✗ {secs} 秒里外面一个连到 {port} 的包都没收到 —— 手机的请求半路被拦了（手机所在网络 / 运营商拦 {port}），服务器这边没法绕{N}")
+    sname = (_yaml_val(tb, "server_name") or _domain() or "").lower()
+    try: cid = open(SELFDNS_CID_FILE).read().strip()
+    except OSError: cid = ""
+    host = [_probe_host_msg(s, a, sname, cid) for s, a in bad.items()]
+    for line, _tip in host:
+        print(f"  {R}✗ {line}{N}")
+    kinds = {v[0] for v in vs}                  # 提示只留一行，挑最要紧的那件
+    if host:
+        ui_tip(host[0][1])
+    elif not vs or kinds & {"handshake", "lost", "flightlost", "path"}:
+        ui_tip(f"网络在干扰 {port}：WiFi 和流量各测一次；都不行就私人 DNS 改「自动」，开代理时 DNS 由代理接管")
+    elif "reject" in kinds:
         ui_tip("把这屏和手机的报错截图发来再查")
-    elif kind == "flightlost":
-        print(f"  {R}✗ {ip} 连进来了，可服务器发的证书手机没收到 —— 半路被拦{N}")
-        ui_tip(net)
-    elif kind == "noreply":
-        print(f"  {R}✗ 收到 {ip} 的握手，服务器没回 —— systemctl restart AdGuardHome 再测一次{N}")
-    else:
-        print(f"  {R}✗ " + (f"收到 {ip} 的连接请求，可握手没走下去" if kind == "path" else
-                            f"{secs} 秒里外面一个连到 {port} 的包都没收到")
-              + f" —— 手机的请求半路被拦了（手机所在网络 / 运营商拦 {port}），服务器这边没法绕{N}")
-        ui_tip("WiFi 和流量各测一次；都不行就把私人 DNS 改「自动」，开代理时 DNS 由代理接管")
-    if bad:
-        sname = (_yaml_val(tb, "server_name") or _domain() or "").lower()
-        try: cid = open(SELFDNS_CID_FILE).read().strip()
-        except OSError: cid = ""
-        pid = sni.lower()[:-len(sname) - 1] if sname and sni.lower().endswith("." + sname) else ""
-        if ask[0] == 5:
-            why = "没带 ClientID" if sni.lower() == sname else (f"ClientID「{pid}」不在白名单里" if pid else "跟 AdGuard 的域名对不上")
-            print(f"  {R}✗ 手机填的主机名是 {sni} —— {why}，AdGuard 拒了它的查询{N}")
-            ui_tip(f"AdGuard 后台 → 设置 → DNS 设置 → 允许的客户端，把 {cid} 加回去" if cid and pid == cid else
-                   f"手机私人 DNS 改填：{cid}.{sname}" if cid and sname else "回菜单 8 把 ClientID 弄好，再按『3 使用方法』填手机")
-        elif ask[0] < 0:
-            print(f"  {R}✗ 用手机的主机名 {sni} 在本机问 AdGuard 出错：{ask[2]}{N}")
-            ui_tip("把这屏截图发来再查")
-        else:
-            print(f"  {R}✗ AdGuard 答不出安卓的检测域名（rcode={ask[0]}，没有地址）—— 手机收不到地址就判「无法访问」{N}")
-            ui_tip("后台 → 查询日志搜 dnsotls，看是被过滤规则拦了还是上游没回")
-    elif kind in ("lost", "handshake"):
-        ui_tip(net)
+    elif kinds == {"ok"}:
+        ui_tip("手机还报连不上：只开报错的那个网络（关掉 WiFi 或流量）再测一次")
 
 def _selfdns_toggle():
     """把"自建DNS写入订阅"的开关交给主脚本处理（订阅生成/刷新都在主脚本里）。"""
