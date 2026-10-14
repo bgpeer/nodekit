@@ -5354,6 +5354,8 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 已修好配置里的中转地址")
     if _vmess_insec_heal():                     # 自签 vmess 缺跳过证书校验：补上（不进菜单的机器也能修好）
         print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
+    if _cdn_links_heal():                       # CDN 节点旧格式链接没撤掉、叠出同名两条：只留该有的那份
+        print(f"{time.strftime('%F %T')} 已清掉重复的 CDN 节点")
     if fake_site_heal():                        # 伪装站还是老的全网一样的默认页：换成本机生成的（只写静态文件）
         print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
     if sr_onelink_heal():                       # 小火箭订阅改回一个链接（节点写进配置），只动一次
@@ -7851,12 +7853,34 @@ def _node_file_parts():
             links.append(l.strip())
     return links, tail
 
+def _cdn_link_key(u):
+    """CDN 链接的「身份」：协议 + 凭据 + path + sni + 端口（不含地址位和名字）。认不出返回 None。
+
+       认「这是哪条 CDN 节点的链接」不能按整串比：链接格式会随版本变（10/10 给 vmess 加了
+       "fp":"chrome"，量子加密开关改 encryption=），按整串撤旧的撤不掉、新的又追加进去，
+       订阅里就多出一条同名的（客户端显示 ¹🇯🇵·CDN·vmess-ws / ²🇯🇵·CDN·vmess-ws）。
+       地址位不算进身份：优选换的就是它，候选节点跟基础节点也只差它。"""
+    try:
+        if u.startswith("vmess://"):
+            b = u[8:]
+            j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+            return ("vmess", str(j.get("id", "")), str(j.get("path", "")),
+                    str(j.get("sni") or j.get("host") or "").lower(), str(j.get("port", "")))
+        P = urllib.parse.urlparse(u)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(P.query).items()}
+        return (P.scheme, urllib.parse.unquote(P.username or ""), q.get("path", ""),
+                (q.get("sni") or q.get("host") or "").lower(), str(P.port or ""))
+    except Exception:
+        return None
+
 def _cdn_sub_apply(remove_links=(), add_links=()):
-    """从节点文件移除 remove_links、加入 add_links（全整条匹配，去重），再刷新订阅。
+    """从节点文件撤掉 remove_links、加入 add_links（去重），再刷新订阅。
+       撤的时候按身份认（见 _cdn_link_key）：格式改过的旧链接也撤得掉，同一条节点不会叠出两份。
        没有主节点也能生成——此时订阅仅含 CDN 节点。"""
     links, tail = _node_file_parts()
-    remove_set = set(l for l in remove_links if l)
-    keep = [l for l in links if l not in remove_set]
+    drop = {l for l in list(remove_links) + list(add_links) if l}
+    keys = {_cdn_link_key(l) for l in drop} - {None}
+    keep = [l for l in links if l not in drop and _cdn_link_key(l) not in keys]
     for al in add_links:
         if al and al not in keep:
             keep.append(al)
@@ -7867,6 +7891,26 @@ def _cdn_sub_apply(remove_links=(), add_links=()):
             f.write(tail if tail.startswith("\n") else "\n" + tail)
     G["host"] = _host()
     build_subscription(read_saved_links(), new_token=False)   # 保持 token，刷新三格式
+
+def _cdn_links_heal():
+    """老装机自愈：节点文件里 CDN 节点的链接跟现在该有的对不上（旧格式没撤掉、同一条叠了两份），
+       按身份认出来，只留当前该有的那一份，刷新订阅（token 不变）。修了返回 True。
+
+       来由：10/10 起 vmess 链接带 "fp":"chrome"，CDN·vmess 新旧两串对不上——之后一次优选 / 改地址，
+       旧的按整串撤不掉、新的又追加进去，客户端里就成了 ¹🇯🇵·CDN·vmess-ws / ²🇯🇵·CDN·vmess-ws 两条。"""
+    try:
+        want = _cdn_sub_links(_cdn_load(), _pref_load())
+        if not want:
+            return False                    # CDN 没写进订阅：不动（菜单 4 写入 / 移出时会按身份一起清）
+        # 只认「该在订阅里」的那几条的身份：只把叠出来的、旧格式的收成当前这一份，不会把哪条节点整个撤掉
+        keys = {_cdn_link_key(l) for l in want} - {None}
+        have = [l for l in _node_file_parts()[0] if _cdn_link_key(l) in keys]
+        if sorted(have) == sorted(want):
+            return False
+        _cdn_sub_apply(remove_links=have, add_links=want)
+        return True
+    except Exception:
+        return False
 
 def cdn_write_sub():
     nodes = _cdn_load()
@@ -8035,16 +8079,19 @@ def _dl_probe(top, port, cfg, say):
     out.sort(key=lambda r: -r["mbps"])
     return out
 
-def cdn_speedtest(cfg=None, quiet=False):
+def cdn_speedtest(cfg=None, quiet=False, exclude=(), extra=None):
     """粗筛一轮：拉 CF 段 → 采样 → 延迟筛 → 下载测速。
-       返回按吞吐降序的 [{"ip","ms","mbps"}]；一个可用的都没有则返回 []。"""
+       返回按吞吐降序的 [{"ip","ms","mbps"}]；一个可用的都没有则返回 []。
+       exclude：这轮不要的 IP（现有候选等）；「不通」名单（cfg["bad"]，客户端那边连不上被换下来的）一律不选。
+       extra 给个 dict：延迟排得上、但没轮到下载测速的 IP 放进 extra["ranked"]，留着当后备。"""
     nodes = _cdn_load()
     cfg = cfg or _pref_load()
     port = _pref_port(nodes, cfg)
     say = (lambda *a: None) if quiet else (lambda *a: print(*a))
     cidrs, official = _cf_cidrs()
     say(f"  · CF IP 段 {len(cidrs)} 段（{'官方最新' if official else '拉取失败·用内置兜底段'}）")
-    ips = _sample_ips(cidrs, int(cfg["n_cand"]))
+    skip = set(exclude) | set(cfg.get("bad") or [])
+    ips = [ip for ip in _sample_ips(cidrs, int(cfg["n_cand"])) if ip not in skip]
     if not ips:
         say("  ✗ 没采到候选 IP（IP 段异常），本轮放弃。"); return []
     say(f"  · 候选 {len(ips)} 个，测握手延迟（端口 {port}，并发 {cfg['n_thread']}）...")
@@ -8056,6 +8103,8 @@ def cdn_speedtest(cfg=None, quiet=False):
         say(f"  ✗ 候选 IP 没有一个连得上 {port} 端口——检查本机出网是否被限，或到「测速参数」换个端口。")
         return []
     top = ranked[:max(1, int(cfg["n_top"]))]
+    if extra is not None:
+        extra["ranked"] = [ip for ip, _ms in ranked[len(top):len(top) + 10]]
     say(f"  · 通了 {len(ranked)} 个，取延迟最优 {len(top)} 个做下载测速"
         f"（每个最多 {cfg['dl_time']}s / {cfg['dl_mb']}MB）...")
     res = _dl_probe(top, port, cfg, say)
@@ -8126,11 +8175,13 @@ def _cdn_resync(old_links, was_in_sub):
     nodes, cfg = _cdn_load(), _pref_load()
     add = _cdn_sub_links(nodes, cfg)
     if not was_in_sub and not add:
-        return                                            # 订阅本来就没它、现在也不该有 → 不动
+        return None                                       # 订阅本来就没它、现在也不该有 → 不动
     try:
         _cdn_sub_apply(remove_links=old_links, add_links=add)
+        return True
     except Exception as e:
         print("  ⚠ 订阅刷新失败（状态已存下，可回上级菜单 4 重写一次订阅）：", e)
+        return False
 
 def _cdn_set_pref(addr):
     """手动优选：把地址写进全部 CDN 节点。传空 = 取消优选、回到用域名。
@@ -8166,7 +8217,8 @@ def cdn_pref_scan(ask=True):
         ui_tip(f"下载测速最多耗约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量")
     if ask and (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
         return
-    res = cdn_speedtest(cfg)
+    extra = {}
+    res = cdn_speedtest(cfg, extra=extra)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     if not res:
         cfg["last"] = {"time": stamp, "ok": False}
@@ -8177,20 +8229,90 @@ def cdn_pref_scan(ask=True):
     was = any(n.get("in_sub") for n in nodes)
     old = _cdn_state_links(nodes, cfg)
     cfg["cands"] = picked
+    # 后备：测通了没选上的 + 延迟排得上没轮到下载的。「更换优选 IP」先拿它们补，不用再测一轮
+    cfg["spare"] = [r["ip"] for r in res[n_out:]] + [ip for ip in extra.get("ranked", []) if ip not in picked]
     cfg["last"] = {"time": stamp, "ok": True, "n": len(picked),
                    "best": res[0]["ip"], "mbps": res[0]["mbps"]}
     _pref_save(cfg)
-    _cdn_resync(old, was)
+    ok = _cdn_resync(old, was)
     ui_title(f"选出 {len(picked)} 条优选节点")
     for i, r in enumerate(res[:n_out], 1):
         print(f"  {_hl('1;36', f'{_cdn_tag_prefix(base)}CDN·优选{i}')}  {r['ip']:<16}"
               f"本机测 {r['ms']}ms / {r['mbps']} Mbps")
     ui_line()
     # 本机测的是 VPS→CF 这一段，只作粗筛；哪条对你的网络最快，只有客户端的 URLTest 说了算
-    if was:
-        print("  ✔ 订阅已刷新")
-        ui_tip("客户端重拉订阅，随机组（URLTest）自动挑最快的、不通的自动跳过")
-    else:
+    if was and ok:
+        print("  ✔ 三大配置已刷新")
+        ui_tip("客户端刷新订阅；哪条在客户端里一直不通，用「5 更换优选 IP」换掉")
+    elif not was:
+        ui_warn("CDN 节点还没写进订阅，优选也不会进——到菜单 4 写入")
+
+def _pick_nums(raw, top):
+    """「3,5」「3，5」「3 5」→ [3, 5]（去重、保序）；有一个不在 1..top 就返回 None。"""
+    out = []
+    for tok in re.split(r"[,，\s]+", raw.strip()):
+        if not tok:
+            continue
+        if not tok.isdigit() or not 1 <= int(tok) <= top:
+            return None
+        if int(tok) not in out:
+            out.append(int(tok))
+    return out or None
+
+def cdn_cand_swap():
+    """更换优选 IP：客户端里一直不通 / 很慢的候选，按编号换成别的 CF 边缘，换完直接刷新三大配置。
+       仓库主人：「优选5 一直连不上……做一个按钮更换优选IP，而且优选完了之后直接刷新三大配置」。
+
+       本机测的是 VPS→CF，你的网络到某个 CF 边缘通不通只有客户端看得见（URLTest 里的 Timeout），
+       所以由你点名哪几条不行：先拿上次测速留下的后备补，不够再测一轮；换下来的记进「不通」名单
+       （留最近 50 个），以后测速不再选它。编号跟客户端里「优选N」对得上，换完名字不变、只换地址。"""
+    nodes, cfg = _cdn_load(), _pref_load()
+    if not nodes:
+        print("  还没配置 CDN 节点，先回上级菜单选 1 装一条。"); return
+    cands = [c for c in (cfg.get("cands") or []) if c]
+    if not cands:
+        print("  还没有候选节点，先选 1 测速筛候选。"); return
+    pfx = _cdn_tag_prefix(_cdn_cand_base(nodes))
+    ui_title("更换优选 IP")
+    ui_items([(i, f"{pfx}CDN·优选{i}", ip) for i, ip in enumerate(cands, 1)])
+    ui_line()
+    raw = _ask("换哪几条（客户端里不通的，如 5 或 3,5；回车返回）: ").strip()
+    if not raw:
+        return
+    idxs = _pick_nums(raw, len(cands))
+    if not idxs:
+        print(f"  ⚠ 编号要在 1~{len(cands)} 之间，没换。"); return
+    bad = [ip for ip in (cfg.get("bad") or []) if ip]
+    spare = [ip for ip in (cfg.get("spare") or []) if ip not in cands and ip not in bad]
+    if len(spare) < len(idxs):
+        ui_tip(f"上次测速剩的后备不够，要再测一轮（最多约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量）")
+        if (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
+            return
+        extra = {}
+        res = cdn_speedtest(cfg, exclude=set(cands) | set(spare), extra=extra)
+        spare += [ip for ip in [r["ip"] for r in res] + extra.get("ranked", []) if ip not in spare]
+    if not spare:
+        print("  ⚠ 没找到能换的 IP，候选保持原样。"); return
+    was = any(n.get("in_sub") for n in nodes)
+    old = _cdn_state_links(nodes, cfg)
+    done = []
+    for i in idxs:
+        if not spare:
+            break
+        new = spare.pop(0)
+        bad.append(cands[i - 1]); done.append((i, cands[i - 1], new))
+        cands[i - 1] = new
+    cfg["cands"], cfg["spare"], cfg["bad"] = cands, spare, bad[-50:]
+    _pref_save(cfg)
+    ok = _cdn_resync(old, was)
+    for i, a, b in done:
+        print(f"  ✔ {pfx}CDN·优选{i}：{a} → {b}")
+    if len(done) < len(idxs):
+        print(f"  ⚠ 后备不够，还有 {len(idxs) - len(done)} 条没换（选 1 重新测速）")
+    if was and ok:
+        print("  ✔ 三大配置已刷新")
+        ui_tip("客户端刷新一次订阅就换上了")
+    elif not was:
         ui_warn("CDN 节点还没写进订阅，优选也不会进——到菜单 4 写入")
 
 def cdn_cand_clear():
@@ -8299,6 +8421,7 @@ def cdn_pref_menu():
                   (2, "手动填优选域名 / IP（留空 = 取消优选）", None),
                   (3, "清空候选节点", None),
                   (4, "测速参数", None),
+                  (5, "更换优选 IP（换掉不通的候选）", None),
                   (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
@@ -8309,6 +8432,8 @@ def cdn_pref_menu():
             cdn_cand_clear()
         elif c == "4":
             _pref_settings(cfg)
+        elif c == "5":
+            cdn_cand_swap()
         elif c in ("0", ""):
             return
 
@@ -10437,6 +10562,8 @@ def main_menu():
         print("  ✓ 已修好自签 vmess 节点（订阅地址不变，客户端刷新一次订阅即可）")
     if _relay_port_heal():
         print("  ✓ 已修好配置里的中转地址（订阅地址不变，客户端刷新一次订阅即可）")
+    if _cdn_links_heal():
+        print("  ✓ 已清掉重复的 CDN 节点（订阅地址不变，客户端刷新一次订阅即可）")
     fw_sync()                                    # 老装机：开着防火墙、端口没放行的补上（放行了会说一行）
     if fake_site_heal():
         print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
