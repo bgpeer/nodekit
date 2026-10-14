@@ -5374,6 +5374,8 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 已修好自签 vmess 节点")
     if _cdn_links_heal():                       # CDN 节点旧格式链接没撤掉、叠出同名两条：只留该有的那份
         print(f"{time.strftime('%F %T')} 已清掉重复的 CDN 节点")
+    if _acme_cron_heal():                       # crontab 里 acme.sh 的续期任务没了：补上，不然证书到期全断
+        print(f"{time.strftime('%F %T')} 已补上 acme.sh 的证书自动续期任务")
     if fake_site_heal():                        # 伪装站还是老的全网一样的默认页：换成本机生成的（只写静态文件）
         print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
     if sr_onelink_heal():                       # 小火箭订阅改回一个链接（节点写进配置），只动一次
@@ -8814,6 +8816,20 @@ def _acme_cron_ok():
     """acme.sh 的每日续期任务在不在 crontab 里。"""
     return "acme.sh" in (sh("crontab -l 2>/dev/null", check=False) or "")
 
+def _acme_cron_heal():
+    """自愈：用着 acme 证书、acme.sh 也在，可 crontab 里没有它的每日续期任务 → 补上。补了返回 True。
+
+       它没了一点声响都没有，等发现时证书已经过期，吃证书的节点 / 订阅 / 自建 DNS 一起断。本脚本从不改
+       root 的 crontab，来路通常在外面：别的一键脚本整份重写了 crontab、有人 crontab -r 过。
+       只补这一条（acme.sh --install-cronjob 自己会先查有没有），别的定时任务一个不碰。
+       连 cron 都没装的不在这里装包——面板会提示，选『3 强制重签』会连 cron 一起装上。"""
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not (os.path.exists(ACME_CRT) and os.path.exists(acme) and have("crontab")) or _acme_cron_ok():
+        return False
+    _ensure_cron_running()
+    sh(f"{acme} --install-cronjob", check=False)
+    return _acme_cron_ok()
+
 def _emby_cert():
     """Emby 那张证书 → (基础域名, 剩余秒)。没装 Emby 或没配域名返回 ('', None)。
 
@@ -9075,7 +9091,8 @@ def cert_panel(info=None):
     auto = i["cron_ok"] and i["hook_ok"]
     print(f"  续期模式:  {'自动' if auto else Y + '不完整' + N}   {mode}")
     if not i["cron_ok"]:
-        print(f"    {R}✗ crontab 里没有 acme.sh 的每日续期任务 —— 到期不会自动重签{N}")
+        print(f"    {R}✗ " + ("本机没装 cron —— 证书到期不会自动重签，选 3 会连 cron 一起装上" if not have("crontab") else
+                               "crontab 里没有 acme.sh 的每日续期任务 —— 到期不会自动重签，选 3 会补上") + N)
     if not i["hook_ok"]:
         print(f"    {R}✗ acme.sh 没记 reloadcmd —— 就算重签了，节点/订阅也不会重读新证书{N}")
     if not i["key_ok"]:
@@ -10582,6 +10599,8 @@ def main_menu():
         print("  ✓ 已修好配置里的中转地址（订阅地址不变，客户端刷新一次订阅即可）")
     if _cdn_links_heal():
         print("  ✓ 已清掉重复的 CDN 节点（订阅地址不变，客户端刷新一次订阅即可）")
+    if _acme_cron_heal():
+        print("  ✓ 已补上证书自动续期任务（crontab 里原来没有 acme.sh，到期不会自动重签）")
     fw_sync()                                    # 老装机：开着防火墙、端口没放行的补上（放行了会说一行）
     if fake_site_heal():
         print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
