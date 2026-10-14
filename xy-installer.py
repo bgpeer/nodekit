@@ -459,11 +459,15 @@ def cert_covers(path, domain):
 # 没有这条 hook，acme 把磁盘上的证书换了新的，三个进程还捏着旧的——90 天一到，客户端撞上
 # 过期证书，节点和订阅一起挂，而且日志里看不出所以然（就是「连不上」）。
 # 有 nginx 顺带 reload；对应服务不存在则静默跳过，末尾 true 保证 hook 本身永不失败。
+# AdGuardHome（自建 DNS 的 DoT/DoH）同样启动时读证书；它装了菜单 8 写的 hook 里有它，可这里每次 --install-cert
+# 都会把 acme.sh 记的 reloadcmd 整条换掉——不带上它，下次续期后 AdGuard 还捏着旧证书，到期那天安卓私人 DNS 整机断网。
+# try-restart：没装 / 没在跑就什么都不做。
 _ACME_RELOAD_HOOK = (" --reloadcmd '"
                      "systemctl reload nginx 2>/dev/null; "
                      "systemctl restart sing-box 2>/dev/null; "
                      "systemctl restart xray 2>/dev/null; "
-                     "systemctl restart xy-sub 2>/dev/null; true'")
+                     "systemctl restart xy-sub 2>/dev/null; "
+                     "systemctl try-restart AdGuardHome 2>/dev/null; true'")
 
 _ACME_HOOK_DONE = False          # 一次运行里只补一次：ensure_acme 每个协议都会调一遍
 
@@ -10005,12 +10009,22 @@ def cert_fix_run():
             print("  ✓ 续期任务已装上（以后每天自动检查）")
         else:
             print("  ✗ 续期任务仍没装上，检查 cron 服务：systemctl status cron")
+    # 【泛域名不能修丢】这里原来一律 HTTP-01 重签，只签得出单域名：AdGuard 菜单 8 签的 *.域名 就这么被换掉，
+    # 安卓私人 DNS 填的「ClientID.域名」当场证书对不上、整机断网（Emby 子域名同理）。泛域名只能走 DNS-01：
+    # 有 Cloudflare 凭据就照原样签回来；没有就不修——宁可不动，也不静默降级。
+    G["domain"] = dom
+    wild, why = _wildcard_wanted()
+    if wild and not _acme_has_cf():
+        R, N = "\033[1;31m", "\033[0m"
+        print(f"{R}  ✗ 这张是泛域名证书（{why}），可 acme.sh 里没存 Cloudflare 凭据，修复只签得出单域名，没动。{N}")
+        print("    要修：『15 证书管理 → 1 安装证书』选泛域名、填 Cloudflare 令牌重签")
+        return
     # 续期方式必须跟【现在】的 80 端口状况对上。
     # 装机时没有 nginx，acme.sh 记下的就是 standalone（要独占 80）；可后来别的功能
     # （443 伪装站 / 自建 Emby / AdGuard）把 nginx 拉起来占了 80，standalone 从此永远
     # 验证失败——而且失败只写在 acme 自己的日志里，面板上一个字都看不到。
     # 这次翻车就是这么来的：cron 补上了也没用，续期照样跑不过。
-    owner = _port80_owner()
+    owner = "" if wild else _port80_owner()          # DNS-01 不走 80，谁占着都无所谓
     hooks = ""
     if owner:
         if "nginx" not in owner:
@@ -10038,12 +10052,17 @@ def cert_fix_run():
             sh(f"{acme} --remove -d {d}", check=False)
         left = acme_hijackers(keep=dom)
         print(f"    {'✓ 已全部撤掉' if not left else R + '✗ 仍剩 ' + ', '.join(d for d, _ in left) + N}")
-    fw_allow({(80, "tcp")})                          # standalone 验证要从外面连 80：开着防火墙先放行
-    print("  正在续期…（走 acme.sh，可能要十几秒）")
     # 用 --issue --force 而不是 --renew：--renew 会沿用记录里那套（可能已经失效的）
     # 验证方式，--issue 则把这次用的方式写回记录，往后自动续期就跟着走对的路。
-    r = subprocess.run(f"{acme} --issue -d {dom} --standalone --keylength ec-256 "
-                       f"--force{hooks}", shell=True, text=True, capture_output=True)
+    if wild:
+        print("  泛域名证书 → 走 Cloudflare DNS 验证重签（不用 80 端口），可能要一两分钟")
+        issue = (f"{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' --keylength ec-256 "
+                 f"--server letsencrypt --force")
+    else:
+        fw_allow({(80, "tcp")})                      # standalone 验证要从外面连 80：开着防火墙先放行
+        print("  正在续期…（走 acme.sh，可能要十几秒）")
+        issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256 --force{hooks}"
+    r = subprocess.run(issue, shell=True, text=True, capture_output=True)
     if r.returncode:
         # 续期失败要把原文打出来——十次有九次是「80 端口被占」或「域名没解析到本机」，
         # 吞掉报错就只剩一句「修复失败」，等于没说
@@ -10051,11 +10070,11 @@ def cert_fix_run():
         print("    " + ((r.stdout or "") + (r.stderr or "")).strip().replace("\n", "\n    ")[-1200:])
         print("  常见原因：80 端口被占（standalone 验证要用）、域名没解析到本机、出网被墙。")
         return
-    G["domain"] = dom
     sh(f"{acme} --install-cert -d {dom} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
     for svc in ("nginx", "sing-box", "xray", "xy-sub"):
         sh(f"systemctl restart {svc}", check=False)
+    sh("systemctl try-restart AdGuardHome", check=False)   # 自建 DNS 也换上新证书（没装就不动）
     left = _cert_secs_left()
     if left is not None and left > 0:
         print(f"  ✓ 完成，证书{_cert_left_text(left)}。")
@@ -10218,7 +10237,7 @@ def cert_fix():
     print(f"\n  域名 {dom}    磁盘上的证书：{_cert_left_text(_cert_secs_left())}")
     print("  会依次做：确认 cron 和 acme 续期任务都在 → 看 80 端口被谁占着、据此选验证方式")
     print("            → 强制重签 → 导出到 /etc/ssl/sb/ → 把 reloadcmd 记进 acme.sh")
-    print("            → 重启 nginx / sing-box / xray / xy-sub")
+    print("            → 重启 nginx / sing-box / xray / xy-sub / AdGuard")
     print("  ⚠ 重启核心会掐断代理链路。你要是挂着本机代理连的 SSH，这一步会断线——")
     print("    不用管，任务在后台跑完，重连进来看日志即可。")
     if (_ask("  继续? y 确认 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):

@@ -144,33 +144,6 @@ def _ask(prompt=""):
     except (OSError, EOFError):
         return input(prompt).strip()
 
-def _ask_secret(prompt=""):
-    """读密钥类输入且【不回显】。API Token 一旦回显就会留在终端回滚缓冲里，
-       随手一张截图、一次录屏、一次贴日志求助就泄露了——而它能改你整个域名的 DNS。"""
-    try:
-        import termios
-        with open("/dev/tty", "r+") as t:
-            fd = t.fileno()
-            old = termios.tcgetattr(fd)
-            new = termios.tcgetattr(fd)
-            new[3] &= ~termios.ECHO                      # 关掉回显
-            try:
-                termios.tcsetattr(fd, termios.TCSADRAIN, new)
-                t.write(prompt); t.flush()
-                line = t.readline()
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                t.write("\n"); t.flush()
-            if line == "":
-                raise EOFError
-            return line.rstrip("\n").strip()
-    except Exception:
-        try:
-            import getpass
-            return getpass.getpass(prompt).strip()        # 兜底：非 tty 环境
-        except Exception:
-            return _ask(prompt)
-
 def _host():
     try: return open(HOST_FILE).read().strip()
     except OSError: return ""
@@ -449,20 +422,28 @@ def _usage(port=None):
     print(f"    写入订阅      : {(G+'已写入 mihomo/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
 
     # 要填的就这几行：放在一大段说明前面，标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）
+    # 【列出来的几行不能互相打架】仓库主人 10/14：照着这里把 ClientID 填进了「允许的客户端」，安卓专用 DNS 当场断了——
+    # 没签泛域名证书时安卓主机名带不上 ClientID，白名单一设就被挡。所以白名单那行只在签了泛域名之后才列；
+    # 已经设了白名单、又没签泛域名的，最上面直说用不了、二选一怎么办。
     print("\n  " + "=" * 56)
     print(f"  {C}要填的就这几行{N}")
     print("  " + "=" * 56)
+    if dom and allow and not wild:
+        print(f"  {R}⚠ 安卓专用 DNS 现在用不了：白名单已设，没签泛域名证书，主机名带不上 ClientID{N}")
+        ui_tip("二选一：菜单 8 签泛域名证书（之后安卓填 ID.域名）；或后台清空「允许的客户端」，安卓填下面这行")
+        print()
     if dom:
         ui_url("安卓「专用DNS」主机名", dot_host)
-        if not wild:
-            ui_tip("这行不带 ClientID，设了白名单就会被挡；要带上先做菜单 8")
         print()
-    ui_url("AdGuard「允许的客户端」", cid)
-    print()
+    if dom and wild and cid:
+        ui_url("AdGuard 后台 → DNS 设置 → 允许的客户端", cid)
+        print()
     if dom:
         ui_url("DoH 地址（浏览器 / App）", doh_url)
         print()
     ui_url("明文 DNS（电视 / 盒子 / 路由器）", ip)
+    if dom and cid and not wild and not allow:
+        ui_tip("想只放行自己（白名单）：先做菜单 8，不然安卓专用 DNS 会被挡")
 
     print("\n  " + "=" * 56)
     print("  怎么让设备用上它 —— 照着下面三步做")
@@ -513,11 +494,15 @@ def _usage(port=None):
     print(f"\n  【第四步 · 关掉「开放解析器」{Y}强烈建议{N}】")
     if not cid:
         print(f"    {Y}ClientID 没生成出来{N}（{BGP_DIR} 写不进去？），这一步先跳过。")
+    elif allow and dom and not wild:
+        print(f"    {Y}白名单已设{N}（{allow}），可没签泛域名证书：{R}安卓专用 DNS 会被挡{N}——做菜单 8，或清空白名单。")
     elif allow:
         print(f"    {G}✓ 已经设好了{N}（当前白名单：{allow}），不用再动。")
     else:
         print(f"    你的 DoH 挂在公网上，{R}不设白名单谁扫到都能拿去当免费解析器用{N}"
               f"（烧你的 CPU 和流量，查询日志里还会混进陌生人的记录）。")
+        if dom and not wild:
+            print(f"    {R}⚠ 先做菜单 8 再设：没签泛域名证书，安卓专用 DNS 会被白名单挡掉{N}")
         print(f"    AdGuard 后台 → 设置 → DNS设置 → {C}访问设置{N} → {C}允许的客户端{N}，填入这一行：")
         print(f"\n        {G}{cid}{N}\n")
         print(f"    手机流量 IP 天天变、没法按 IP 做白名单，这个 ClientID 与 IP 无关，换网络也不影响。")
@@ -564,7 +549,8 @@ def _replace_cf_token():
     conf = os.path.expanduser("~/.acme.sh/account.conf")
     if not os.path.exists(conf):
         print(f"  {R}找不到 {conf}{N}，你的证书可能不是本脚本签的。"); return
-    new = _ask_secret("  粘贴新的 Cloudflare API Token（不回显）: ").strip()
+    # 明文显示：仓库主人 10/14「令牌是可以显示出来的，没必要隐藏，都是自己装自己的」——盲贴看不见贴没贴上
+    new = _ask("  粘贴新的 Cloudflare API Token（粘完回车）: ").strip()
     if not new:
         print("  没输入，未改动。"); return
     txt = open(conf).read()
@@ -716,7 +702,7 @@ def dot_clientid():
         return
     print(f"  {G}✓ 通配解析已生效{N}")
 
-    token = _ask_secret("  粘贴 Cloudflare API Token（不回显，粘完直接回车）: ").strip()
+    token = _ask("  粘贴 Cloudflare API Token（粘完回车）: ").strip()      # 明文显示，同 _replace_cf_token
     if not token:
         print("  没输入，已取消。"); return
 
@@ -765,7 +751,7 @@ def dot_clientid():
     print(f"\n  {G}✔ 做完了{N}\n")
     ui_url("安卓「专用DNS」主机名", f"{cid}.{dom}" if cid else "")
     print()
-    ui_url("AdGuard「允许的客户端」", cid)
+    ui_url("AdGuard 后台 → DNS 设置 → 允许的客户端", cid)
     ui_tip("设了白名单，明文 53（电视 / 盒子）就进不来了，要把它们的固定 IP 也加进去")
 
 def _do_free53():
