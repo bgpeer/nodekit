@@ -359,7 +359,7 @@ def _install_cert_guarded(acme, dom, reload_hook, what=""):
             sh(f"systemctl restart {svc}")
         print(f"     {'' if not what else what + '未生效。'}"
               f"节点域名和本机 sub.host 可能对不上，"
-              f"到主面板『15 证书管理』看一眼。")
+              f"到主面板『15 域名证书管理』看一眼。")
         return False
     for b in bak.values():
         try: os.remove(b)

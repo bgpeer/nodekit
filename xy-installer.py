@@ -552,7 +552,7 @@ def ensure_acme():
                   f"（HTTP-01 只能签单域名，这是 Let's Encrypt 的硬规定）。{N_}")
             print(f"{R_}    这次会签成单域名，后果：Emby 对外是 <子域>.{G['domain']}，"
                   f"单域名盖不住，共用关系会被拆成两张证书、两条续期链。{N_}")
-            print(f"{Y_}    装完回面板『15 证书管理 → 1 安装证书』用 DNS-01 重签一张"
+            print(f"{Y_}    装完回面板『15 域名证书管理 → 1 安装证书』用 DNS-01 重签一张"
                   f"泛域名的，再『4 Emby 证书』合并回去。{N_}")
             wild = False
         if not wild and G.get("nginx"):
@@ -2736,7 +2736,7 @@ SUB_TITLES = {"yaml": "mihomo / Clash", "json": "sing-box", "conf": "小火箭 S
               "srnodes": "小火箭 节点订阅（首页 ➕ → Subscribe）"}
 
 def _sub_cert_domain():
-    """证书管理里装的证书，有没有一个能给订阅用的域名 → (域名, 说明)。
+    """域名证书管理里装的证书，有没有一个能给订阅用的域名 → (域名, 说明)。
        要求：证书盖得住它、而且【解析到本机】（灰色云直连）。橙色云解析到 CF，订阅端口过不了 CF，不能用。
        泛域名证书挑不出具体子域名，就让人填一个（被泛域名盖住、解析到本机才收）。"""
     try:
@@ -2763,7 +2763,7 @@ def _sub_cert_domain():
     return "", "；".join(bad)
 
 def sub_offer_cert_domain():
-    """订阅还在用 IP、证书管理里又装了证书 → 问要不要把订阅地址换成证书域名（回车 = 换）。
+    """订阅还在用 IP、域名证书管理里又装了证书 → 问要不要把订阅地址换成证书域名（回车 = 换）。
        仓库主人：「检测到证书域名，询问是否用证书域名来替换订阅，已经是证书域名的就忽略」。
 
        换的只是订阅地址（sub.host），节点链接不动；换完订阅走 HTTPS + 真证书——明文 HTTP 订阅
@@ -5081,7 +5081,7 @@ def show_links():
             print("（已把订阅托管服务同步到 " + ("HTTPS" if _sub_https() else "HTTP") + "，URL 不变）")
         except Exception as e:
             print("（订阅服务同步失败，可稍后『更新配置』重试）:", e)
-    sub_offer_cert_domain()               # 订阅还是 IP、证书管理里装了证书 → 问要不要换成证书域名
+    sub_offer_cert_domain()               # 订阅还是 IP、域名证书管理里装了证书 → 问要不要换成证书域名
     ui_title("分享链接")
     # 和订阅里保持一致：同样补上「前缀·协议」的分隔点（只影响显示，NODE_FILE 不动）
     print_node_links([_link_rename(u, _sep_name(_link_name(u))) for u in links])
@@ -7821,7 +7821,7 @@ def cdn_add():
         _cdn_save(nodes)
         _cdn_resync(old, was)
         print("  ✔ 已写进三大订阅（订阅地址不变）")
-        sub_offer_cert_domain()           # 订阅还是 IP、证书管理里装了证书 → 问要不要换成证书域名
+        sub_offer_cert_domain()           # 订阅还是 IP、域名证书管理里装了证书 → 问要不要换成证书域名
     else:
         print("  已只留备用链接，想写随时进菜单 4")
 
@@ -7902,7 +7902,7 @@ def cdn_write_sub():
     _cdn_save(nodes)
     print(f"  ✓ 已{'写入' if writing else '移出'}全部 CDN 节点并刷新三格式订阅。客户端重新拉订阅即可生效。")
     if writing:
-        sub_offer_cert_domain()           # 订阅还是 IP、证书管理里装了证书 → 问要不要换成证书域名
+        sub_offer_cert_domain()           # 订阅还是 IP、域名证书管理里装了证书 → 问要不要换成证书域名
     if not writing and not read_saved_links():
         # 移出后订阅里一个节点都不剩：build_subscription 对空列表不再刷新，托管的旧订阅内容不会自动清空
         print("  ℹ️ 订阅里已无任何节点，之前托管的订阅内容不会再更新；如需彻底清空可到菜单 2「节点/订阅」重置。")
@@ -8738,12 +8738,185 @@ def _left_color(secs):
     d = secs / 86400
     return "\033[1;32m" if d > 30 else ("\033[1;33m" if d >= 7 else "\033[1;31m")
 
+# ── 域名用在哪（菜单 15 面板下半截）────────────────────────────────────────────
+# 仓库主人：「在那个证书管理里面，把所有域名对应用在什么地方的给他列出来」。
+# 一台机器上的域名散在好几处：节点链接、订阅地址、nginx 伪装站、AdGuard 加密 DNS、
+# Emby 那套的子域、CDN 备用节点、reality 借来的站名。换域名 / 重签 / 删 DNS 记录之前，
+# 得一眼看清哪个域名牵着哪些东西、各自靠哪张证书。
+# 只读本机文件：不联网、不调核心 —— 每进一次菜单 15 都要画一遍。
+
+# media-stack 的子域 → 用途（跟 media-stack.py 的 SUBDOMAINS 对齐；那边新加的子域认不出，就写「媒体服务」）
+_MS_SUB_USE = {"home": "Emby 首页入口", "emby": "Emby", "list": "OpenList（网盘）"}
+AGH_YAML = "/opt/AdGuardHome/AdGuardHome.yaml"
+
+def _link_addr(u):
+    """分享链接 → (地址, sni, 是不是 reality, 是不是跳过证书校验)。认不出返回 None。"""
+    try:
+        if u.startswith("vmess://"):
+            b = u[8:]
+            j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+            return (str(j.get("add") or ""), str(j.get("sni") or j.get("host") or ""), False,
+                    str(j.get("allowInsecure", "")) in ("1", "true"))
+        P = urllib.parse.urlparse(u)
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(P.query).items()}
+        insec = "1" in (q.get("insecure"), q.get("allowInsecure"), q.get("allow_insecure"))
+        return P.hostname or "", q.get("sni") or q.get("peer") or "", q.get("security") == "reality", insec
+    except Exception:
+        return None
+
+def _link_proto_label(u):
+    """分享链接 → 协议名（节点名里的协议段，去掉双核心尾标）；名字是自己起的就用链接头。"""
+    head, seg = _split_tag(_link_name(u))
+    return seg.rstrip(_TAG_MARKS) if head is not None and seg else u.split("://", 1)[0]
+
+def _server_names(path):
+    """nginx 配置里所有 server_name（一行写几个的也拆开；"_" 是兜底站，不算域名）。"""
+    try:
+        txt = open(path).read()
+    except OSError:
+        return []
+    out = []
+    for line in txt.splitlines():
+        for names in re.findall(r"(?:^|[\s{;])server_name\s+([^;]+);", line.split("#", 1)[0]):
+            out += [d for d in names.split() if d != "_"]
+    return list(dict.fromkeys(out))
+
+def _agh_tls():
+    """AdGuardHome.yaml 顶层 tls 段 → {enabled, server_name, port_https, port_dns_over_tls}。没装返回 {}。"""
+    try:
+        txt = open(AGH_YAML).read()
+    except OSError:
+        return {}
+    m = re.search(r"(?m)^tls:[ \t]*$", txt)
+    if not m:
+        return {}
+    blk = []
+    for line in txt[m.end():].splitlines():
+        if line and not line[0].isspace():
+            break
+        blk.append(line)
+    blk = "\n".join(blk)
+    def val(k):
+        v = re.search(rf"(?m)^\s*{k}:[ \t]*(\S.*?)[ \t]*$", blk)
+        return v.group(1).strip("\"'") if v else ""
+    return {k: val(k) for k in ("enabled", "server_name", "port_https", "port_dns_over_tls")}
+
+_DU_NODE, _DU_WILD, _DU_EMBY, _DU_CDN, _DU_LENT = range(5)   # 排序：节点证书的在前，借来的站名在最后
+
+def domain_uses(i=None):
+    """这台机器上的每个域名用在哪 → [(域名, 证书, 证书对不对, [用途…])]，按类排好。
+       证书对不对：True 盖得住 / False 盖不住、过期或没有 / None 不归本机管（CDN、借来的站名）。"""
+    i = i or cert_info()
+    names = [n.lower() for n in (i.get("names") or [])]
+    uses, kind = {}, {}
+    def add(d, use, k):
+        d = (d or "").strip().lower().rstrip(".")
+        if not d or _is_ip(d):
+            return
+        uses.setdefault(d, [])
+        if use and use not in uses[d]:
+            uses[d].append(use)
+        kind[d] = min(kind.get(d, k), k)
+    nd = (i.get("node_domain") or "").lower()
+    add(nd, "", _DU_NODE)
+    for n in names:                                   # 证书里写着的名字都列上，没人用的也看得见
+        add(n, "", _DU_WILD if n.startswith("*.") else _DU_NODE)
+    # CDN 备用节点：域名挂在 Cloudflare 后面，客户端看到的是 CF 的证书（源站自签）
+    cdn_doms = set()
+    for c in _cdn_load():
+        d = (c.get("domain") or "").lower()
+        if not d:
+            continue
+        cdn_doms.add(d)
+        pref = (c.get("pref") or "").strip()
+        add(d, f"CDN 备用节点：{c.get('proto', 'vless-ws')} {c.get('cf_port', '')}".rstrip()
+               + (f"（优选 {pref}）" if pref else ""), _DU_CDN)
+    # 节点：地址是谁、sni 是谁。reality / 自签节点的 sni 是借来的别人家站名，跟本机证书无关
+    nodes, lent = {}, {}
+    for u in read_saved_links():
+        r = _link_addr(u)
+        if not r:
+            continue
+        host, sni, reality, insec = r
+        host = host.lower(); sni = (sni or host).lower()
+        if sni in cdn_doms:                           # CDN 节点上面已经单独列了
+            continue
+        p = _link_proto_label(u)
+        if host and not _is_ip(host):
+            nodes.setdefault(host, []).append(p)
+        if sni and sni != host and not _is_ip(sni):
+            (lent if (reality or insec) else nodes).setdefault(sni, []).append(p)
+    for d, ps in nodes.items():
+        add(d, f"节点 {len(ps)} 个：{'、'.join(dict.fromkeys(ps))}", _DU_NODE)
+    # 订阅地址（+ 本机 GitHub 中转：有域名、真证书、没手动关时规则 / 图标都走它）
+    try:
+        sub = open(HOST_FILE).read().strip()
+    except OSError:
+        sub = ""
+    if sub and load_tokens():
+        relay = not os.path.exists(GHRELAY_OFF) and i.get("exists")
+        add(sub, "订阅地址 + GitHub 中转" if relay else "订阅地址", _DU_NODE)
+    for d in _server_names(NGINX_CONF):
+        add(d, "伪装站（nginx）", _DU_NODE)
+    t = _agh_tls()
+    if t.get("enabled") == "true" and t.get("server_name"):
+        x = t["server_name"].lower()
+        ports = [f"{k} {t[f]}" for k, f in (("DoT", "port_dns_over_tls"), ("DoH", "port_https"))
+                 if t.get(f) not in ("", "0")]
+        add(x, "自建 DNS" + (f"：{' / '.join(ports)}" if ports else ""), _DU_NODE)
+        if f"*.{x}" in names:
+            add(f"*.{x}", "安卓专用 DNS（主机名带 ClientID）", _DU_WILD)
+    # Emby 那套：真在跑的 nginx 站点里写了哪些子域就列哪些
+    ed = (i.get("emby_domain") or "").lower()
+    for d in _server_names(MS_NGINX_CONF):
+        add(d, _MS_SUB_USE.get(d.split(".", 1)[0].lower(), "媒体服务"), _DU_EMBY)
+        if i.get("emby_shared"):
+            for w in names:
+                if w.startswith("*.") and _name_covers([w], d):
+                    add(w, "Emby 那几个子域", _DU_WILD)
+    for d, ps in lent.items():
+        add(d, f"借来当 SNI：{'、'.join(dict.fromkeys(ps))}", _DU_LENT)
+
+    secs = i.get("secs")
+    def cert_of(d, k):
+        if k == _DU_CDN:
+            return "Cloudflare 的证书", None
+        if k == _DU_LENT:
+            return "别人家的站，不用证书", None
+        if k == _DU_EMBY and ed and d.endswith("." + ed) and not i.get("emby_shared"):
+            es = i.get("emby_secs")
+            return "Emby 证书", bool(es and es > 0)
+        if not i.get("exists"):
+            return "没有证书", False
+        if secs is not None and secs <= 0:
+            return "节点证书已过期", False
+        ok = (d in names) if d.startswith("*.") else _name_covers(names, d)
+        return ("节点证书" if ok else "节点证书盖不住"), ok
+    rows = [(d, *cert_of(d, kind[d]), uses[d]) for d in uses]
+    return sorted(rows, key=lambda r: kind[r[0]])
+
+def domain_uses_print(i=None):
+    """面板下半截：一个域名一块——黄色标题「▸ 域名　哪张证书 ✔/✗」，下面一行一个用途，块之间空一行。"""
+    rows = domain_uses(i)
+    if not rows:
+        return
+    print("-" * 60)
+    print("  " + _hl("1;36", "域名用在哪"))
+    for n, (d, cert, ok, us) in enumerate(rows):
+        if n:
+            print()
+        col = "2" if ok is None else ("1;32" if ok else "1;31")
+        mark = "" if ok is None else (" ✔" if ok else " ✗")
+        print(_hl("1;33", f"▸ {d}") + "　" + _hl(col, cert + mark))
+        for u in us or ["没找到在用的地方"]:
+            print(f"  {u}")
+
 def cert_panel(info=None):
     """把证书状况摆出来。只读，不改任何东西。"""
     C, Y, R, B, N = "\033[1;36m", "\033[1;33m", "\033[1;31m", "\033[1m", "\033[0m"
     i = info or cert_info()
     print("\n" + "=" * 60)
-    print("  证书管理")
+    print("  域名证书管理")
     print("=" * 60)
     if not i["exists"]:
         if i["selfsigned"]:
@@ -8751,6 +8924,7 @@ def cert_panel(info=None):
             print("        且自签本身就是明显特征。有域名的话建议装一张真证书。")
         else:
             print(f"  {Y}当前：还没有证书。{N}")
+        domain_uses_print(i)
         print("-" * 60)
         return i
     lc = _left_color(i["secs"])
@@ -8792,6 +8966,7 @@ def cert_panel(info=None):
         print(f"  Emby 证书: *.{i['emby_domain']}   {ec}{_cert_left_text(i['emby_secs'])}{N}"
               + (f"   {C}与节点共用一张{N}" if i["emby_shared"] else
                  (f"   {C}本证书已能顶替它{N}" if i["emby_covered"] else "   （另一张，独立续期）")))
+    domain_uses_print(i)
     print("-" * 60)
     return i
 
@@ -9939,7 +10114,7 @@ def cert_change_domain_flow(i):
                       lambda: cert_change_domain_apply(new, cf_token, emby_new))
 
 def cert_menu():
-    """菜单 15：证书管理。"""
+    """菜单 15：域名证书管理。"""
     while True:
         i = cert_panel()
         _nd = node_domain()
@@ -10017,7 +10192,7 @@ def cert_fix_run():
     if wild and not _acme_has_cf():
         R, N = "\033[1;31m", "\033[0m"
         print(f"{R}  ✗ 这张是泛域名证书（{why}），可 acme.sh 里没存 Cloudflare 凭据，修复只签得出单域名，没动。{N}")
-        print("    要修：『15 证书管理 → 1 安装证书』选泛域名、填 Cloudflare 令牌重签")
+        print("    要修：『15 域名证书管理 → 1 安装证书』选泛域名、填 Cloudflare 令牌重签")
         return
     # 续期方式必须跟【现在】的 80 端口状况对上。
     # 装机时没有 nginx，acme.sh 记下的就是 standalone（要独占 80）；可后来别的功能
@@ -10304,7 +10479,7 @@ def main_menu():
         print("  12. 网络优化（BBR/QoS 内核调优）")
         print("  13. 自建DNS（AdGuard Home·自己的解析服务器，兼带广告过滤）")
         print("  14. GitHub中转（规则/图标走本机·默认开，可关）")
-        print("  15. 证书管理（状态 / 安装 / 换域名 / 重签）")
+        print("  15. 域名证书管理（状态 / 安装 / 换域名 / 重签）")
         print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
         print("  18. 更新脚本（不影响节点）")
@@ -11125,7 +11300,7 @@ def install_flow():
         # sing-box 订阅会自动跳过这几条；sing-box 内核开的 reality 所有客户端都能连
         ui_tip("xray 的 reality-vision / grpc：sing-box App / Hiddify / NekoBox 连不上，给它们用请装在 sing-box 内核")
 
-    # 证书可能是先在『15 证书管理』里装好的（那边不需要先有节点）。这里认出来，
+    # 证书可能是先在『15 域名证书管理』里装好的（那边不需要先有节点）。这里认出来，
     # 把域名直接摆上、回车即用，免得手打错一个字符就变成重新申请一张。
     _ci = cert_info()
     if _ci["exists"] and _ci["domain"]:
