@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.6"
+VERSION = "4.5.7"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -3193,7 +3193,7 @@ def _xanmod_reboot_prompt(assume_yes):
 
 
 def cmd_xanmod(assume_yes=False):
-    """菜单 12 → 6「换 BBRv3 内核（XanMod）」。每种结果屏上一行 ✔ / ⚠。"""
+    """菜单 12 → 4「换 BBRv3 内核（XanMod）」。每种结果屏上一行 ✔ / ⚠。"""
     cc_key = "net.ipv4.tcp_congestion_control"
     rel = _uname().release
     if "xanmod" in rel or read_text(BBR_VERSION_FILE).strip() == "3":   # 别家 BBRv3 内核也算，不再装 XanMod
