@@ -561,6 +561,26 @@ def _usage(port=None):
     print("    · 后台 → 过滤器 → DNS 拦截列表 → 添加名单（推荐 anti-AD：https://anti-ad.net/easylist.txt）")
     print("    · 后台 → 查询日志 → 找到广告域名 → 点『屏蔽』")
 
+def _root_of(dom):
+    """可注册的主域名：dns.example.com → example.com（常见 com.cn 这类二级后缀多留一段）。"""
+    parts = (dom or "").strip(".").split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in ("com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+                                                     "com.hk", "com.tw", "co.uk", "co.jp", "com.au"):
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+def _cf_token_steps(dom):
+    """要粘 Cloudflare 令牌前，先把在 CF 后台怎么做列出来（仓库主人 10/15 给的步骤，照抄）。"""
+    print()
+    print(_hl("1;33", "▸ Cloudflare 令牌怎么做"))
+    print("  CF 主页右上头像 → 配置文件 → API 令牌 → 创建令牌 → 用「编辑区域 DNS」模板")
+    print("  令牌名称：DNS-DOT")
+    print("  权限：区域 - DNS - 编辑")
+    print("     ＋ 区域 - 区域 - 读取")
+    print(f"  区域资源：包括 - 特定区域 - {_root_of(dom)}")
+    print("  其他不动 → 继续以显示摘要 → 创建令牌 → 复制令牌")
+    print()
+
 def _replace_cf_token():
     """换掉 acme.sh 存的 Cloudflare Token（旧的泄露/被吊销时用）。
        acme.sh 把它存成 account.conf 里的 SAVED_CF_Token='…'，续期时读这里。
@@ -570,6 +590,7 @@ def _replace_cf_token():
     if not os.path.exists(conf):
         print(f"  {R}找不到 {conf}{N}，你的证书可能不是本脚本签的。"); return
     # 明文显示：仓库主人 10/14「令牌是可以显示出来的，没必要隐藏，都是自己装自己的」——盲贴看不见贴没贴上
+    _cf_token_steps(_domain())
     new = _ask("  粘贴新的 Cloudflare API Token（粘完回车）: ").strip()
     if not new:
         print("  没输入，未改动。"); return
@@ -730,8 +751,8 @@ def dot_clientid():
     print(f"\n  {Y}需要你先准备两样：{N}")
     print(f"    1) Cloudflare 上加一条通配 A 记录，指向本机 {G}{_public_ip()}{N}，{Y}灰云(仅DNS){N}")
     print(f"       —— 没有它，手机连 {cid or '<ID>'}.{dom} 时根本解析不出地址")
-    print(f"    2) Cloudflare API Token（{C}Zone:DNS:Edit{N} + {C}Zone:Zone:Read{N} 权限，限定到这个域名即可）")
-    print(f"       在 CF 后台 → 右上头像 → My Profile → API Tokens → Create Token 生成")
+    print(f"    2) Cloudflare API 令牌（做法见下）")
+    _cf_token_steps(dom)
 
     if _ask("\n  两样都准备好了，继续? [y/N]: ").lower() not in ("y", "yes"):
         print("  已取消，没有任何改动。"); return

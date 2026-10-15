@@ -3918,6 +3918,18 @@ def _self_ip():
         _SELF_IP_CACHE = ip or ""
     return _SELF_IP_CACHE
 
+def _cf_token_steps(dom):
+    """要粘 Cloudflare 令牌前，先把在 CF 后台怎么做列出来（仓库主人 10/15 给的步骤，照抄）。"""
+    print()
+    print(_hl("1;33", "▸ Cloudflare 令牌怎么做"))
+    print("  CF 主页右上头像 → 配置文件 → API 令牌 → 创建令牌 → 用「编辑区域 DNS」模板")
+    print("  令牌名称：DNS-DOT")
+    print("  权限：区域 - DNS - 编辑")
+    print("     ＋ 区域 - 区域 - 读取")
+    print(f"  区域资源：包括 - 特定区域 - {_root_domain(dom)}")
+    print("  其他不动 → 继续以显示摘要 → 创建令牌 → 复制令牌")
+    print()
+
 def _root_domain(host):
     """收敛到可注册域：node2.example.com → example.com。
 
@@ -6658,7 +6670,7 @@ def _netopt_version():
 
 
 def _bbr_kernel_cur(vf="/sys/module/tcp_bbr/version", ccf="/proc/sys/net/ipv4/tcp_congestion_control", boot="/boot"):
-    """菜单 12 第 6 项的「当前」：BBRv3 / BBRv3 内核但在用别的 / 装好待重启 / 原厂内核（BBRv1）。
+    """菜单 12 第 4 项的「当前」：BBRv3 / BBRv3 内核但在用别的 / 装好待重启 / 原厂内核（BBRv1）。
        原厂 v1 没有 version 文件。「装了 v3 却跑着 cubic」仓库主人 10/11 真碰上过，所以连在用的一起看。"""
     def rd(p):
         try:
@@ -6677,7 +6689,7 @@ def _bbr_kernel_cur(vf="/sys/module/tcp_bbr/version", ccf="/proc/sys/net/ipv4/tc
     return _hl("1;33", "已装好，重启后生效") if pending else "原厂内核（BBRv1）"
 
 def _netopt_xanmod():
-    """菜单 12 → 6：查条件、确认、安装、问重启都在 net-optimize.py --xanmod 里（也能单独跑）。"""
+    """菜单 12 → 4：查条件、确认、安装、问重启都在 net-optimize.py --xanmod 里（也能单独跑）。"""
     if not ensure_remote_script(NETOPT_URL, NETOPT_LOCAL):
         print("拉取 net-optimize.py 失败，且本地无缓存。请检查网络。"); return
     # 旧缓存不认 --xanmod：它用 parse_known_args，不认的参数直接忽略、转头跑整套优化 —— 这里先拦住
@@ -6707,7 +6719,7 @@ def net_optimize_menu():
         m3 = MARK if mode == "fixed_cake" else ""
         _v = _netopt_version()
         # 档位说明：1 适合内存 <1G；2 默认 20MB/s 激活、阈值可调，输入 0 = 纯暴力发包无智能算法，适合 2G 左右；
-        # 3 不切换，适合高性能机器。5 清除全部优化配置、恢复系统默认。
+        # 3 不切换，适合高性能机器。6 清除全部优化配置、恢复系统默认。
         ui_title("网络优化（BBR / QoS 内核调优）")
         ui_kv("版本", _hl("1;32", f"v{_v}") if _v else _hl("2", "未安装"))
         ui_kv("当前档位", _hl("1;32", cur))
@@ -6715,8 +6727,9 @@ def net_optimize_menu():
         print(f"  1. 自适应 + 抢带宽（10MB/s 激活，内存 <1G）{m1}")
         print(f"  2. 自适应 + 抢带宽（阈值可调，内存 2G 左右）{m2}")
         print(f"  3. 固定 cake 纯智能算法（高性能机器）{m3}")
-        ui_items([(4, "网络优化状况", None), (5, "卸载网络优化（恢复系统默认）", None),
-                  (6, "换 BBRv3 内核（XanMod）", _bbr_kernel_cur()), (0, "返回", None)])
+        # 换内核排在 4（仓库主人 10/15「移到第 4 位去」），状况 / 卸载顺延到 5 / 6
+        ui_items([(4, "换 BBRv3 内核（XanMod）", _bbr_kernel_cur()), (5, "网络优化状况", None),
+                  (6, "卸载网络优化（恢复系统默认）", None), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             _run_net_optimize()
@@ -6733,14 +6746,14 @@ def net_optimize_menu():
         elif c == "3":
             _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_cake"})
         elif c == "4":
-            _run_net_optimize("--check")
+            _netopt_xanmod()
         elif c == "5":
+            _run_net_optimize("--check")
+        elif c == "6":
             ans = _ask("  确认卸载网络优化？优化写入的内核参数/服务/防火墙标记将全部清除，\n"
                        "  节点本身不受影响（建议卸载后重启一次）。y 确认 / n 返回: ").strip().lower()
             if ans in ("y", "yes"):
                 _run_net_optimize("--reset")
-        elif c == "6":
-            _netopt_xanmod()
         elif c in ("0", ""):
             return
 
@@ -9218,8 +9231,7 @@ def cert_install_flow(info):
         if _acme_has_cf():
             print("  ✓ acme.sh 里已经存着 Cloudflare 凭据，直接用。")
         else:
-            print("  需要一个 Cloudflare API Token（后台 → 我的个人资料 → API 令牌 →")
-            print("  创建令牌 → 用「编辑区域 DNS」模板，区域选这个域名）")
+            _cf_token_steps(dom)
             cf_token = _ask("  粘贴 Token: ").strip()
             if not cf_token:
                 print("  没填 Token，已取消。")
@@ -9291,8 +9303,7 @@ def cert_upgrade_flow(i):
     if _acme_has_cf():
         print("  ✓ acme.sh 里已经存着 Cloudflare 凭据，直接用。")
     else:
-        print("  需要一个 Cloudflare API Token（后台 → 我的个人资料 → API 令牌 →")
-        print("  创建令牌 → 用「编辑区域 DNS」模板，区域选这个域名）")
+        _cf_token_steps(dom)
         cf_token = _ask("  粘贴 Token: ").strip()
         if not cf_token:
             print("  没填 Token，已取消。")
@@ -10230,8 +10241,7 @@ def cert_change_domain_flow(i):
         print("  证书:     要重签一张泛域名的（acme.sh 里已存着 Cloudflare 凭据，直接用）")
     else:
         print("  证书:     要重签一张泛域名的，需要 Cloudflare API Token")
-        print("            （CF 后台 → 我的个人资料 → API 令牌 → 创建令牌 →")
-        print("             用「编辑区域 DNS」模板，区域选新域名那个）")
+        _cf_token_steps(new)
         cf_token = _ask("  粘贴 Token: ").strip()
         if not cf_token:
             print("  没填 Token，已取消。"); return
