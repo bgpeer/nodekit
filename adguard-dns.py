@@ -1777,7 +1777,11 @@ def phone_probe(secs=60):
     ui_tip("先把手机上的代理（VPN）关掉")
     print("  现在拿手机：私人 DNS 先选「关闭」，再选回主机名 → 保存")
     print(f"  {secs} 秒内我在这边看着 {port} 端口（Ctrl-C 提前结束）…")
-    cap = _Cap(port, set(sh("hostname -I").split()) | {"127.0.0.1", "::1"})
+    # 本机自己的 IP 来的连接不再滤掉：手机开着代理、选的又是这台 VPS 上的节点时，私人 DNS 的流量是节点从本机绕回来的
+    # （10/15：规则模式连不上，那一路实测里一直看不见）。自检走 127.0.0.1，照旧不算。
+    me = set(sh("hostname -I").split())
+    who = lambda ip: "本机节点转来的那路" if ip in me else ip
+    cap = _Cap(port, {"127.0.0.1", "::1"})
     import select
     seen, rest = set(), b""
     p = subprocess.Popen(_tcpdump_argv(port), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -1798,7 +1802,8 @@ def phone_probe(secs=60):
                     stop = min(end, fresh + _PROBE_GRACE)
                     for c in cap.conns.values():
                         if c["ip"] not in seen:
-                            seen.add(c["ip"]); print(f"  · 收到 {c['ip']} 的连接")
+                            seen.add(c["ip"])
+                            print("  · 收到经本机节点转来的连接（手机开着代理）" if c["ip"] in me else f"  · 收到 {c['ip']} 的连接")
             elif p.poll() is not None:
                 break
             vs = _probe_verdicts(cap)
@@ -1826,7 +1831,7 @@ def phone_probe(secs=60):
         mark, say = _PROBE_SAY[kind]
         rtxs = f"（服务器重发了 {rtx} 次）" if rtx else " "
         took = (f"（连上到回答 {first:.1f} 秒" + (f"，服务器重发了 {rtx} 次" if rtx else "") + "）") if first is not None else " "
-        print(f"  {col[mark]}{mark} " + say.format(ip=ip, port=port, n=n, got=got, took=took, rtxs=rtxs,
+        print(f"  {col[mark]}{mark} " + say.format(ip=who(ip), port=port, n=n, got=got, took=took, rtxs=rtxs,
                                                    first=first or 0, slow=slow or 0, back=back or 0) + N)
     if not vs:
         print(f"  {R}✗ {secs} 秒里外面一个连到 {port} 的包都没收到 —— 手机的请求半路被拦了（手机所在网络 / 运营商拦 {port}），服务器这边没法绕{N}")
