@@ -1572,16 +1572,23 @@ class _Cap:
         if ip in self.local or ip.startswith("127.") or ip == "::1":
             return
         if inbound and "S" in flags and "." not in flags:     # 手机的 SYN（带 ECN 是 [SEW]）
-            self.conns[(ip, cport)] = {"ip": ip, "seq": [], "ack": 0, "seen": set(), "hello": b"", "sni": None, "t0": t}
+            self.conns[(ip, cport)] = {"ip": ip, "seq": [], "ack": 0, "seen": set(), "hello": b"", "sni": None,
+                                       "t0": t, "last": t, "oend": 0}
         c = self.conns.get((ip, cport))
         if not c:
             return
         if inbound and ack:
             c["ack"] = max(c["ack"], int(ack))
-        if n and (inbound, s0, s1) not in c["seen"]:      # 重传的同一段只记一次
-            c["seen"].add((inbound, s0, s1))
-            c["seq"].append((inbound, n, int(s1 or 0), t))
-            if inbound and c["sni"] is None:
+        if t is not None:
+            c["last"] = t
+        if n:                                           # 段：(手机发的?, 字节, 到第几字节, 时刻, 是不是重发)
+            e, key = int(s1 or 0), (inbound, s0, s1)
+            rtx = key in c["seen"] or (not inbound and 0 < e <= c["oend"])     # 原样重发 / 服务器合并重发
+            c["seen"].add(key)
+            if not inbound:
+                c["oend"] = max(c["oend"], e)
+            c["seq"].append((inbound, n, e, t, rtx))
+            if inbound and not rtx and c["sni"] is None:
                 self._pk = (c, [])
 
     def done(self):
@@ -1610,74 +1617,97 @@ class _Cap:
 #   手机先发 ClientHello，服务器回一串（证书等）；手机再发 ≥50 字节 = Finished（认了证书、握手走完），
 #   查询跟在后面（光 Finished 是 64 / 80 字节，带上查询就过 120）；之后服务器单段 ≥40 字节的是回答
 #   （AdGuard 先单发 2 字节长度、再发报文，前一段只有 24 字节）；手机的 ACK 盖过回答 = 手机收到了。
-_PROBE_RANK = ["ok", "lost", "noanswer", "handshake", "reject", "flightlost", "noreply", "path"]
+# 10/15 第五轮：v1.1.93 只核对了头一个回答，屏上「回了 5 个查询、手机也收到了 ✔」，查询日志里手机却 5 秒后
+#   又发了一次检测——后面的回答手机没收到。现在每个回答逐个核对：发出去 1 秒还没确认（服务器在重发）就算丢了；
+#   抓包快结束才发、还没来得及确认的不算。前面收到、后面丢了 = partlost（线路先放行、后掐断，最典型的干扰）。
+_PROBE_RANK = ["ok", "partlost", "lost", "noanswer", "handshake", "reject", "flightlost", "noreply", "path"]
+
+def _conn_split(c):
+    """头一回发的段（重发的不算）切成：服务器头一回回数据的位置 k、Finished 之后那一截 tail、手机在那截里发了多少 cl、
+       那截里的回答 ans。还没走到那一步的，返回里对应的是 None。"""
+    seq = [x for x in c["seq"] if not x[4]]
+    k = next((i for i, x in enumerate(seq) if not x[0]), len(seq))     # 服务器头一回发数据
+    if not k or k == len(seq):
+        return seq, k, None, 0, None
+    rest = seq[k:]
+    f = next((i for i, x in enumerate(rest) if x[0]), len(rest))       # 手机接着发的头一段（Finished）
+    tail = rest[f:]
+    return seq, k, rest[:f], sum(x[1] for x in tail if x[0]), [x for x in tail if not x[0] and x[1] >= 40]
+
+def _answers_fate(c, ans):
+    """→ (手机确认收到几个, 丢了几个)：没确认、而且发出去以后这条连接又过了 1 秒还有包（服务器在重发 / 手机还在发别的）就算丢。"""
+    got = sum(1 for x in ans if c["ack"] >= x[2])
+    lost = sum(1 for x in ans if c["ack"] < x[2] and x[3] is not None and c.get("last") is not None
+               and (c["last"] - x[3]) % 86400 >= 1.0)
+    return got, lost
 
 def _conn_kind(c):
-    seq, ack = c["seq"], c["ack"]
-    k = next((i for i, s in enumerate(seq) if not s[0]), len(seq))     # 服务器头一回发数据
+    seq, k, flight, cl, ans = _conn_split(c)
     if not k:
         return "path"                                   # 只有 TCP 握手，手机一个数据都没发过来
     if k == len(seq):
         return "noreply"                                # 手机发了 ClientHello，服务器没回
-    rest = seq[k:]
-    f = next((i for i, s in enumerate(rest) if s[0]), len(rest))       # 手机接着发的头一段（Finished）
-    cl = sum(s[1] for s in rest[f:] if s[0])
     if cl < 50:                                         # 手机没走完握手：收到证书了（确认过）就是不认，没收到就是半路丢了
-        return "reject" if ack >= max(s[2] for s in rest[:f]) else "flightlost"
-    ans = [s[2] for s in rest[f:] if not s[0] and s[1] >= 40]
+        return "reject" if c["ack"] >= max(x[2] for x in flight) else "flightlost"
     if not ans:
         return "noanswer" if cl > 120 else "handshake"
-    return "ok" if ack >= ans[0] else "lost"
+    got, lost = _answers_fate(c, ans)
+    if lost:
+        return "partlost" if got else "lost"
+    return "ok" if got else "lost"                      # 一个都还没确认的（刚发出去）也先算 lost
 
 def _conn_stats(c):
-    """→ (AdGuard 回了几个查询, 从手机连上到头一个回答几秒, AdGuard 最慢一个回答几秒)。没时刻的算不出来就是 None。
+    """→ (AdGuard 回了几个查询, 手机收到几个, 丢了几个, 从手机连上到头一个回答几秒, AdGuard 最慢一个回答几秒)。没时刻的秒数是 None。
        仓库主人 10/15：实测两个网络都 ✔，手机照样报「无法访问」——光说通不够，还得看快不快：
        安卓等回答只等几秒，回得慢（上游慢 / 线路慢）它照样判失败，而包是一个不少都到了。"""
-    seq, t0 = c["seq"], c.get("t0")
-    k = next((i for i, s in enumerate(seq) if not s[0]), len(seq))
-    rest = seq[k:]
-    f = next((i for i, s in enumerate(rest) if s[0]), len(rest))
-    n, first, slow, q = 0, None, None, None
-    for inbound, size, _end, t in rest[f:]:
+    seq, k, flight, cl, ans = _conn_split(c)
+    if ans is None:
+        return 0, 0, 0, None, None
+    t0, first, slow, q = c.get("t0"), None, None, None
+    for x in seq[k:][len(flight):]:
+        inbound, size, _end, t, _rtx = x
         if inbound:
             q = t                                       # 手机最近发的那段（查询）
         elif size >= 40:
-            n += 1
             if first is None and t is not None and t0 is not None:
                 first = (t - t0) % 86400               # 跨零点也对
             if t is not None and q is not None:
                 slow = max(slow or 0.0, (t - q) % 86400)
-    return n, first, slow
+    return (len(ans), *_answers_fate(c, ans), first, slow)
 
 _PROBE_SLOW_AGH, _PROBE_SLOW_ALL = 2.0, 4.0     # AdGuard 回一个查询超过这么久 / 从连上到回答超过这么久，就算慢
 
 def _probe_verdicts(cap):
-    """→ [(结论, 远端IP, 手机填的主机名, 回了几个, 连上到回答几秒, AdGuard 最慢几秒)…]：
+    """→ [(结论, 远端IP, 手机填的主机名, 回了几个, 手机收到几个, 连上到回答几秒, AdGuard 最慢几秒)…]：
        每个 IP 取走得最远的那条连接，按先来后到；个数加总、快慢取那个 IP 所有连接里最快到 / 最慢回的。
        手机的 WiFi 和流量出口不同，各算一个 IP、各验各的（10/15 截图：来了两个 IP，只报了通的那个，
-       没通的那个被盖住了）。通是通、但慢到安卓等不及的，结论改成 slowagh（AdGuard 慢）/ slowpath（线路慢）。"""
-    best, n, first, slow = {}, {}, {}, {}
+       没通的那个被盖住了）。那个 IP 哪条连接丢过回答，就不算全通（partlost）；通是通、但慢到安卓等不及的，
+       结论改成 slowagh（AdGuard 慢）/ slowpath（线路慢）。"""
+    best, n, got, lost, first, slow = {}, {}, {}, {}, {}, {}
     for c in cap.conns.values():
         ip, kind = c["ip"], _conn_kind(c)
         if ip not in best or _PROBE_RANK.index(kind) < _PROBE_RANK.index(best[ip][0]):
             best[ip] = (kind, c["sni"] or "")
-        cn, cf, cs = _conn_stats(c)
-        n[ip] = n.get(ip, 0) + cn
+        cn, cg, cl, cf, cs = _conn_stats(c)
+        n[ip], got[ip], lost[ip] = n.get(ip, 0) + cn, got.get(ip, 0) + cg, lost.get(ip, 0) + cl
         if cf is not None:
             first[ip] = min(first.get(ip, cf), cf)
         if cs is not None:
             slow[ip] = max(slow.get(ip, cs), cs)
     out = []
     for ip, (kind, sni) in best.items():
-        if kind == "ok" and (slow.get(ip) or 0) >= _PROBE_SLOW_AGH:
+        if kind == "ok" and lost[ip]:
+            kind = "partlost"
+        elif kind == "ok" and (slow.get(ip) or 0) >= _PROBE_SLOW_AGH:
             kind = "slowagh"
         elif kind == "ok" and (first.get(ip) or 0) >= _PROBE_SLOW_ALL:
             kind = "slowpath"
-        out.append((kind, ip, sni, n[ip], first.get(ip), slow.get(ip)))
+        out.append((kind, ip, sni, n[ip], got[ip], first.get(ip), slow.get(ip)))
     return out
 
 _PROBE_SAY = {
-    "ok":         ("✔", "{ip} 连进来了，回了 {n} 个查询、手机也收到了{took}—— 这条线路通"),
+    "ok":         ("✔", "{ip} 连进来了，回了 {n} 个查询、手机都收到了{took}—— 这条线路通"),
+    "partlost":   ("✗", "{ip} 回了 {n} 个查询，手机只收到 {got} 个 —— 后面的回答在半路被丢（先放行、后掐断）"),
     "slowagh":    ("⚠", "{ip} 通是通，可 AdGuard 回得慢（最慢 {slow:.1f} 秒）—— 安卓只等几秒，等不到就判「无法访问」"),
     "slowpath":   ("⚠", "{ip} 通是通，可从连上到回答用了 {first:.1f} 秒 —— 线路太慢，安卓只等几秒就判「无法访问」"),
     "lost":       ("✗", "{ip} 的查询到了、AdGuard 也回了，可手机一直没确认收到 —— 回答在半路被丢"),
@@ -1768,17 +1798,17 @@ def phone_probe(secs=60):
     # 握手走完了的，用手机填的主机名在本机问一遍（同一个主机名问一次）：白名单对不上 / 检测域名解析不出来，手机都会判「无法访问」
     asks = {}
     for kind, _ip, sni, *_st in vs:
-        if sni and kind in ("ok", "slowagh", "slowpath", "lost", "noanswer", "handshake") and sni not in asks:
+        if sni and kind in ("ok", "slowagh", "slowpath", "partlost", "lost", "noanswer", "handshake") and sni not in asks:
             asks[sni] = _probe_ask(port, sni)
     bad = {s: a for s, a in asks.items() if not (a[0] == 0 and a[1])}
     print()
     col = {"✔": G, "✗": R, "⚠": Y}
-    for kind, ip, sni, n, first, slow in vs:    # 每个 IP 一行
+    for kind, ip, sni, n, got, first, slow in vs:   # 每个 IP 一行
         if kind == "ok" and sni in bad:
             continue                            # 主机名被拒：包是通的也不算通，只报下面主机名那行
         mark, say = _PROBE_SAY[kind]
         took = f"（连上到回答 {first:.1f} 秒）" if first is not None else " "
-        print(f"  {col[mark]}{mark} {say.format(ip=ip, port=port, n=n, took=took, first=first or 0, slow=slow or 0)}{N}")
+        print(f"  {col[mark]}{mark} {say.format(ip=ip, port=port, n=n, got=got, took=took, first=first or 0, slow=slow or 0)}{N}")
     if not vs:
         print(f"  {R}✗ {secs} 秒里外面一个连到 {port} 的包都没收到 —— 手机的请求半路被拦了（手机所在网络 / 运营商拦 {port}），服务器这边没法绕{N}")
     sname = (_yaml_val(tb, "server_name") or _domain() or "").lower()
@@ -1794,7 +1824,7 @@ def phone_probe(secs=60):
     kinds = {v[0] for v in vs}                  # 提示只留一行，挑最要紧的那件
     if host:
         ui_tip(host[0][1])
-    elif not vs or kinds & {"handshake", "lost", "flightlost", "path", "slowpath"}:
+    elif not vs or kinds & {"handshake", "partlost", "lost", "flightlost", "path", "slowpath"}:
         ui_tip(f"网络在干扰 {port}：WiFi 和流量各测一次；都不行就私人 DNS 改「自动」，开代理时 DNS 由代理接管")
     elif "slowagh" in kinds:
         ui_tip("AdGuard 后台 → 设置 → DNS 设置 → 上游 DNS 服务器：点「测试上游」，慢的、不通的删掉")
