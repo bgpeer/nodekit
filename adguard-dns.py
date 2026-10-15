@@ -438,7 +438,8 @@ def _usage(port=None):
     else:
         print(f"    访问白名单    : {R}未设置 —— 对全公网开放{N}"
               + ("（第四步教你关掉）" if cid else ""))
-    print(f"    写入订阅      : {(G+'已写入 mihomo/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
+    # 三个订阅都写：mihomo / 小火箭放 DNS 列表最前，sing-box 换掉 dns.final（见主脚本 _*_selfdns）
+    print(f"    写入订阅      : {(G+'已写入 mihomo/sing-box/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
 
     # 要填的就这几行：放在一大段说明前面，标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）
     # 【列出来的几行不能互相打架】仓库主人 10/14：照着这里把 ClientID 填进了「允许的客户端」，安卓专用 DNS 当场断了——
