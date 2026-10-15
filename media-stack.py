@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.379"
+SCRIPT_VERSION = "1.5.380"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -16002,6 +16002,71 @@ def emby_refresh_parents(key, paths, cap=8):
     return n
 
 
+BULK_WAIT_S = 1200          # 一次加几千个：最多陪着等这么久，等不完 Emby 在后台接着收
+BULK_POLL_S = 10
+
+
+def bulk_roots(created, known):
+    """新加的 strm（容器内路径）→ 要报给 Emby 的最少几条：整个新文件夹只报最上面那一层，
+    已有文件夹里新加的单个文件照报文件。known = 开工前就有的 strm（它们的上级文件夹 Emby 都认得）。"""
+    seen = set()
+    for p in known:
+        q = p.rsplit("/", 1)[0]
+        while q.startswith(STRM_PATH) and q not in seen:
+            seen.add(q)
+            q = q.rsplit("/", 1)[0]
+    out = set()
+    for p in created:
+        q, top = p.rsplit("/", 1)[0], p
+        while q.startswith(STRM_PATH + "/") and q not in seen:
+            top, q = q, q.rsplit("/", 1)[0]
+        out.add(top)
+    return sorted(x for x in out if not any(x.startswith(y + "/") for y in out))
+
+
+def emby_notify_bulk(key, created, deleted, known, wait_s=None):
+    """「4 生成媒体库」一次变动几百上千条时用：报新加的那几个文件夹（bulk_roots）+ 删掉的文件，
+    然后边等边报 Emby 收进了几个。【不扫整个库】—— 不碰别的片。返回等没等齐。
+
+    只在人点的那条路上用（strm_finish）；每小时那条照旧走 emby_notify_changes（铁律，不动）。"""
+    wait_s = BULK_WAIT_S if wait_s is None else wait_s
+    roots = bulk_roots(created, known)
+    ups = [(p, "Created") for p in roots] + [(p, "Deleted") for p in deleted]
+    sent = 0
+    for i in range(0, len(ups), EMBY_TARGETED_MAX):
+        part = ups[i:i + EMBY_TARGETED_MAX]
+        try:
+            _emby("/Library/Media/Updated", key, method="POST", timeout=60,
+                  body={"Updates": [{"Path": p, "UpdateType": k} for p, k in part]})
+            sent += len(part)
+        except Exception as e:
+            warn(f"有一批没报给 Emby：{_short_err(e)[:60]}")
+    scan_log_line("报新文件夹", f"新增 {len(created)}（报了 {len(roots)} 个文件夹）/ 删除 {len(deleted)}")
+    if not created:
+        return True
+    info(f"新加 {len(created)} 个：只让 Emby 收这 {len(roots)} 个新文件夹，不扫整个库")
+    want, t0, got = set(created), time.time(), 0
+    try:
+        while time.time() - t0 < wait_s:
+            time.sleep(BULK_POLL_S)
+            have = emby_strm_paths(key)
+            if have is not None:
+                got = len(want & have)
+            el = int(time.time() - t0)
+            print(f"\r    {DIM}Emby 已收进 {got}/{len(want)}，已等 {el // 60}:{el % 60:02d}"
+                  f"（Ctrl-C 不等了，它在后台接着收）{RST}", end="", flush=True)
+            if got >= len(want):
+                break
+    except KeyboardInterrupt:
+        pass
+    print()
+    if got >= len(want):
+        ok(f"Emby 已收进 {len(want)} 个")
+        return True
+    info(f"Emby 收进了 {got}/{len(want)}，剩下的它在后台接着收（海报、简介要它一部部去刮）")
+    return False
+
+
 def emby_notify_changes(key, changes, timeout=90, quiet=False, nudge=False):
     """把【具体变了哪几条路径】告诉 Emby，而不是让它重扫整个媒体库。
 
@@ -19660,7 +19725,12 @@ def strm_finish(d, only, snap0):
         # 变动少就只报这几条（几秒）。多了、没变动、或者这条路没走通，都退回全库扫描 ——
         # 【"没变动"也要退回去扫】本地没变不等于 Emby 里就是对的：媒体库可能是刚建的，
         # 里头一个条目都没有。emby_scan_wait 自己有去重，刚扫过就不会真扫。
-        if emby_notify_changes(key, diff, nudge=True):
+        if len(diff) > EMBY_TARGETED_MAX:
+            # 【一次加几百上千个：只报新加的那几个文件夹，不扫整个库】仓库主人：「删除可以这么快，添加也可以
+            # 这么快吗」。以前这里退回「扫描整个媒体库」—— 慢，还把别的片的音视频轨冲掉（每晚掉轨道就是它）。
+            emby_notify_bulk(key, sorted(snap1 - snap0), sorted(snap0 - snap1), snap0)
+            scan_mark_shift(d, len(snap1 - snap0) - len(snap0 - snap1))
+        elif emby_notify_changes(key, diff, nudge=True):
             scan_mark_shift(d, len(snap1 - snap0) - len(snap0 - snap1))
         else:
             if emby_scan_wait(key, timeout=900, label="扫描媒体库"):
