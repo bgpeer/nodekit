@@ -4218,6 +4218,28 @@ def _mihomo_direct_ip(tpl, targets):
     return re.sub(r"(?m)^rules:[ \t]*$",
                   "rules:\n" + "\n".join(f"  - {r}" for r in rules), tpl, count=1)
 
+def _mihomo_direct_dns(tpl, targets):
+    """mihomo：自己的域名（本机 / 各节点，含 AdGuard DoT 的 <ClientID>.域名）直连时用国内 DoH 解析，不用 system。
+
+       仓库主人 10/15：安卓私人 DNS 填自建 DoT，sing-box 能连、Bettbox（mihomo）规则模式连不上。两边规则一样，
+       都把自己的域名判直连（_mihomo_direct_ip / _sb_direct_ip）；差在直连前怎么把域名解析成 IP——
+       sing-box 用 default_domain_resolver（阿里 DoH，走直连）；mihomo 用 direct-nameserver: system。
+       安卓上开着 VPN 时，「系统 DNS」可能就是代理软件自己那个回假 IP 的 DNS（或又绕回私人 DNS 本身），
+       直连拿着假 IP 去连，当然连不上。
+
+       模板开着 direct-nameserver-follow-policy（直连解析也跟 nameserver-policy 走），所以在 nameserver-policy
+       最前面给自己的域名指定 *cn-dns 就够了；没有 cn-dns 锚点的自定义模板用写死的阿里 / 腾讯 DoH。
+       只动自己的域名，别的直连解析照旧用 system。没有 nameserver-policy 段的模板原样返回。"""
+    doms = [v for k, v in targets if k == "domain"]
+    m = re.search(r"(?m)^([ \t]*)nameserver-policy:[ \t]*$", tpl)
+    if not doms or not m:
+        return tpl
+    nxt = re.match(r"\n([ \t]+)\S", tpl[m.end():])           # 跟着下一条的缩进走
+    ind = nxt.group(1) if nxt else m.group(1) + "  "
+    val = "*cn-dns" if re.search(r"&cn-dns\b", tpl) else '["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"]'
+    add = "".join(f'\n{ind}"+.{d}": {val}' for d in doms if f'"+.{d}"' not in tpl)
+    return tpl[:m.end()] + add + tpl[m.end():] if add else tpl
+
 def _sb_direct_ip(cfg, targets):
     """sing-box：把直连规则插到 route.rules 最前（引用模板里的 🎯直连 出站）；
        就地改 cfg dict，交由 sb_dumps 按模板的紧凑风格序列化——不破坏格式。
@@ -4367,6 +4389,7 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _mihomo_fill_names(tpl, names_frag)                  # 行内锚点：填国家组名
     tpl = _mihomo_cn_isolate(tpl, _node_names(nodes) + static)  # 中国节点：进 🎯直连、出国组剔除
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
+    tpl = _mihomo_direct_dns(tpl, _direct_targets(nodes))      # 自己的域名直连时用国内 DoH 解析（别走 system）
     tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):

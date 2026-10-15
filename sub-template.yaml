@@ -126,7 +126,7 @@ sniffer:
   force-dns-mapping: true
   parse-pure-ip: true
   override-destination: true
-  sniff: {HTTP: {ports: [80, 8080-8880], override-destination: true}, TLS: {ports: [443, 8443]}, QUIC: {ports: [443, 8443]}}
+  sniff: {HTTP: {ports: [80, 8080-8880], override-destination: true}, TLS: {ports: [443, 853, 8443]}, QUIC: {ports: [443, 8443]}}
   force-domain: ["+.cloudflare.net","+.akamaized.net","+.akamai.net","+.fastly.net","+.cloudfront.net","+.googlevideo.com","+.ytimg.com","+.youtube.com","+.netflix.com","+.instagram.com","+.tiktokcdn.com","+.tiktokv.com","+.douyin.com","+.douyincdn.com","+.telegram.org","+.t.me","+.tdesktop.com","+.cdn-telegram.org","+.telegram-cdn.org"]
   skip-domain: ["localhost","+.lan","+.local","+.arpa","+.invalid","+.test","+.push.apple.com","+.pvp.net","+.riotgames.com","+.openai.com","+.oaistatic.com","+.oaiusercontent.com","+.chatgpt.com"]
   skip-src-address: ["127.0.0.0/8","::1/128"]
