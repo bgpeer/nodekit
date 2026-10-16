@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.7"
+VERSION = "4.5.8"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -3007,6 +3007,15 @@ def _ask_tty(prompt):
         return ""
 
 
+def cloud_vendor():
+    """读 DMI 认云厂商：谷歌云 / AWS / Azure 用自家专用内核（网卡、硬盘驱动在里面），换通用内核最容易开不了机。"""
+    v = (read_text("/sys/class/dmi/id/sys_vendor") + " " + read_text("/sys/class/dmi/id/product_name")).lower()
+    for key, name in (("google", "谷歌云"), ("amazon", "AWS"), ("microsoft", "Azure / Hyper-V")):
+        if key in v:
+            return name
+    return ""
+
+
 def _tip(text):
     _color("1;33", f"  提示：{text}")
 
@@ -3212,8 +3221,13 @@ def cmd_xanmod(assume_yes=False):
         yellow(f"  ⚠ 这台换不了：{why}")
         return
     echo(f"  换 BBRv3 内核：XanMod · CPU x86-64-v{cpu_x86_level()} · {codename}")
-    _tip("要重启才生效；万一起不来，用服务商后台 VNC 在 GRUB 里选回原来的内核")
-    if not assume_yes and _ask_tty("  确认换？[y/N]: ").lower() not in ("y", "yes"):
+    # 仓库主人 10/16：谷歌云一台换完直接起不来、重启也没用、SSH 连不上 —— 云厂商用自家专用内核
+    # （网卡 / 硬盘驱动在里面），换通用内核最容易出事。要求：上面写红色警告，输入 yes 才装。
+    vendor = cloud_vendor()
+    _color("1;31", "  ⚠ 换内核可能开不了机、SSH 连不上，只能用服务商后台 VNC 救或重装"
+           + (f"（这台是{vendor}，自带专用内核，最容易出事）" if vendor else ""))
+    if not assume_yes and _ask_tty("  确认换就输入 yes（其他一律取消）: ").strip().lower() != "yes":
+        echo("  已取消，什么都没改")
         return
 
     # ① 软件源：别处手动配过就用它的；没有就加我们的（先 https 后 http）
