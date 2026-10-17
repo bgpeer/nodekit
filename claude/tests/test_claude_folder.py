@@ -23,6 +23,9 @@ for f in sorted(x for x in os.listdir(tools) if x.endswith(".py")):
                                      r"method=\"(POST|DELETE)\"|save_ms_state", src))
     check(f"{f} 写进了 README", f in open(os.path.join(tools, "README.md"), encoding="utf-8").read())
 
+cd = open(os.path.join(tools, "coverdiag.py"), encoding="utf-8").read()
+check("coverdiag 不印 OpenList 的主机名（那就是安装人的域名，10/17 真机印出来过）", "你的 OpenList" in cd)
+
 print("二、没有安装人信息")
 OK_HOSTS = ("raw.githubusercontent.com", "github.com", "auth.xiaoya.pro", "openapi.aliyundrive.com", "www.aliyundrive.com",
             "qrcodeapi.115.com", "drive-pc.quark.cn", "uop.quark.cn", "pan.quark.cn", "su.quark.cn", "xiaoya.host",
