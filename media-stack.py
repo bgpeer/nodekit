@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.380"
+SCRIPT_VERSION = "1.5.381"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -6694,6 +6694,7 @@ COVER_NEW_WAIT = 1800      # 等 Emby 扫完、刮完最多等多久（秒）
 COVER_NEW_POLL = 15        # 等的时候多久看一眼（「点了立刻补」一睡，最多这么久就开截）
 COVER_NEW_GRACE = 180      # Emby 扫描停下来以后再等多久（刮削器下图要时间）
 COVER_NEW_Q = "media-stack-covers-new.json"
+COVER_NEW_NIGHT_MAX = 500   # 凌晨对齐一夜新进来超过这么多就不排截图（见 emby_sync_changes）
 
 
 def _cover_new_q(change=None):
@@ -12452,7 +12453,7 @@ EMBY_SYNC_WAIT_S = 240                   # 只报变动之后等 Emby 收下最�
 EMBY_SEEN_FILE = "emby_strm_seen.json"   # 上一次跟 Emby 对齐时本地有哪些 strm（容器内路径）
 
 
-def emby_sync_changes(d, key, label="扫描媒体库", force=False):
+def emby_sync_changes(d, key, label="扫描媒体库", force=False, covers=False):
     """让 Emby 跟上本地 strm 的增删：能只报变动就只报变动，报不了才扫整个库（只扫一次）。返回有没有对上。
 
     【为什么不直接扫整个库】真机 10/05：每扫一次整个库，刚补上的音视频轨就被清掉一批（09:52 那次
@@ -12461,6 +12462,9 @@ def emby_sync_changes(d, key, label="扫描媒体库", force=False):
     【报哪些】只报新增 = 本地有、上次对齐时还没有、Emby 里也没有的（1.5.349 起不报删除，见下面）。上次报过却没进库的
     （坏文件）不再反复报，不然每次都退回扫整个库。
     force（改了库选项，必须整个重扫）→ 直接扫整个库。
+    covers：对上之后，这一轮新加的排进「没刮到图的截一帧」（queue_new_covers）。只有凌晨那条（do_sync）传：
+    仓库主人 10/17：「凌晨自动更新的片没刮削……他也没有自动截图」—— 以前只有手点「4 生成媒体库」才排。
+    每小时那条（scan_if_grown）不传：白天看片时一直在跑的路径不添新动作（铁律）。
     """
     if not key:
         return False
@@ -12472,6 +12476,7 @@ def emby_sync_changes(d, key, label="扫描媒体库", force=False):
     except Exception:
         prev = None
     ok = False
+    first = prev is None                # 头一回没有记账：Emby 里已有的当成上次的，这一轮不算「新加」去截图
     have = None if force else emby_strm_paths(key)
     if have is not None:
         if prev is None:
@@ -12486,6 +12491,9 @@ def emby_sync_changes(d, key, label="扫描媒体库", force=False):
     if not ok:
         ok = emby_scan_wait(key, timeout=900, label=label, force=force)
     if ok:
+        if covers and not first and 0 < len(cur - prev) <= COVER_NEW_NIGHT_MAX:
+            # 后台那一轮自己等 Emby 刮完、等没人看片再截；一夜进来几千部（小雅那种）不排 —— 那是整个盘，不是新片
+            queue_new_covers(sorted(cur - prev))
         write_atomic(mf, json.dumps(sorted(cur), ensure_ascii=False), 0o600)
         try:
             with open(os.path.join(d, "strm_seen.txt"), "w") as f:
@@ -12589,7 +12597,7 @@ def do_sync():
             emby_auto_scan_off(key)    # 新装的、被人加回去的，凌晨这一轮兜住
             # 【只报变动，报不了才扫整个库，只扫一次】下面 align_library 的 scan_if_grown 看到
             # 数对上了就不会再扫第二次（原来 04:50、05:00 连扫两次）
-            emby_sync_changes(d, key, label="每日对齐的扫描")
+            emby_sync_changes(d, key, label="每日对齐的扫描", covers=True)
             align_library(d, key)      # 和小时级那轮同一份，不会飘
             rec["nodur_after"] = len(items_without_duration(key, "all"))
             rec["missing"] = len(strm_not_in_emby(d, key))
