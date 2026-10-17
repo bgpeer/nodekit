@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.383"
+SCRIPT_VERSION = "1.5.384"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -6281,6 +6281,21 @@ def cover_candidates(key, d=None):
     return [x[:5] for x in out]
 
 
+def resolve_once(url, ua, timeout=30):
+    """问一次 url，它 302 去哪就返回哪（网盘的直链）；不跳 / 问不到就原样返回。只读几个字节。"""
+    try:
+        op = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, headers={"User-Agent": ua, "Range": "bytes=0-0"})
+        op.open(req, timeout=timeout).close()
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location") or ""
+        if e.code in (301, 302, 303, 307, 308) and loc.startswith("http"):
+            return loc
+    except Exception:
+        pass
+    return url
+
+
 def cover_frame(url, sec, timeout=COVER_FRAME_T, ua=None, watch=None):
     """用 Emby 容器里的 ffmpeg 在 url 的第 sec 秒截一帧 → (JPEG 字节, 截不到的原因)。
 
@@ -6635,6 +6650,12 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
                                   + (f"?sign={sign}" if sign else ""))
             except Exception:
                 pass
+        # 【每部只向网盘要一次地址】/d/ 每被请求一次，OpenList 就去网盘换一次直链；ffmpeg 截一帧要读开头、跳到
+        # 文件尾读时长索引、再跳到三分之一 —— 一部片要换好几次。真机 10/17–18 夸克那三部 FC2：同一部诊断工具
+        # 10 秒截到，正式截却五花八门地失败（partial file / Invalid data / Input/output error / 读不出时长 /
+        # 拿不到地址），网盘那边一抖，其中某一次就是半截。先把 /d/ 换成它 302 出去的那条，后面几次都读这同一条
+        routes = [resolve_once(u, PLAYER_UA) if (".m3u8" not in u.lower() and u not in only_player) else u
+                  for u in routes]
         url = routes[0] if routes else ""
         why, jpg, at, no_range = "", b"", 0.0, False
         _rx0 = meter()
