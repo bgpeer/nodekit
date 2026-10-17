@@ -9796,12 +9796,11 @@ def _relink_domain(link, old, new):
     return urllib.parse.urlunsplit((P.scheme, netloc, P.path, query, P.fragment))
 
 def _links_set_domain(text, old, new):
-    """整份 xy-nodes.txt 的域名改写。『# 订阅链接:』那段尾注原样保留。"""
-    out, tail = [], False
+    """整份 xy-nodes.txt 的域名改写。『# 订阅链接:』那段尾注里的订阅地址也跟着换 host
+       （换域名不换 token，换完的地址就是现在真能用的那条；以前原样留着，文件里抄到的还是旧域名）。"""
+    out = []
     for ln in text.split("\n"):
-        if ln.strip().startswith("#"):
-            tail = True
-        if not tail and "://" in ln:
+        if "://" in ln and not ln.strip().startswith("#"):
             ln = _relink_domain(ln.strip(), old, new)
         out.append(ln)
     return "\n".join(out)
