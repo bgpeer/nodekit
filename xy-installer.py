@@ -10217,6 +10217,31 @@ def _emby_default_base(new):
     parts = new.split(".")
     return ".".join(parts[1:]) if len(parts) >= 3 else new
 
+def _domain_map(d, old, new, emby_old="", emby_new=""):
+    """当前在用的一个域名 → 换完之后对应的新名字（*. 照样带）。跟这次换的无关 → ''。
+       先认节点域名（更长、更具体）：jp.a.com 换 jp2.b.net 时，Emby 的 emby.a.com 才不会被它误吃。"""
+    w = d.startswith("*.")
+    b = d[2:] if w else d
+    for o, n in ((old, new), (emby_old, emby_new)):
+        if o and n and (b == o or b.endswith("." + o)):
+            return ("*." if w else "") + b[:len(b) - len(o)] + n
+    return ""
+
+def _domain_record_plan(rows, old, new, emby_old="", emby_new=""):
+    """换之前新域名要先建好的 A 记录 → [(要建的名字, 拿来查的主机名)]。
+       只要真在用的（证书里写着、却没人用的泛域名不算）；新的节点域名一定在。
+       泛域名查一个具体名字：有 ClientID 就查安卓真填的 <ID>.新域名，没有就查 xycheck.新域名。"""
+    try: cid = open(SELFDNS_CID_FILE).read().strip()
+    except OSError: cid = ""
+    want = [new]
+    for d, _c, _lv, us in rows:
+        if us == ["没找到在用的地方"]:
+            continue
+        nd = _domain_map(d, old, new, emby_old, emby_new)
+        if nd and nd not in want:
+            want.append(nd)
+    return [(n, f"{cid or 'xycheck'}.{n[2:]}" if n.startswith("*.") else n) for n in want]
+
 def cert_change_domain_flow(i):
     """菜单 15 → 2 更换域名。交互问完 + 把要动的东西全摆出来，确认后转后台。"""
     Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
@@ -10252,33 +10277,6 @@ def cert_change_domain_flow(i):
     if new == old:
         print("  跟现在一样，没什么可换的。"); return
 
-    ok, why = _domain_resolves_here(new)
-    print(f"  解析检测: {(GRN + '通过') if ok else (R + '不对')} · {why}{N}")
-    if not ok:
-        print(f"{R}  换完之后客户端连的就是这个域名，解析不到本机 = 所有节点一起断。{N}")
-        print(f"     去 DNS 服务商那边把 {new} 的 A 记录指到 "
-              f"{_ip or '本机公网 IP'}，等生效（几分钟到几十分钟）再回来。")
-        print(f"     本机查一下：dig +short {new}　或　nslookup {new}")
-        print(f"     {Y}走 CF 小黄云代理的话这里会查到 CF 的 IP，那是正常的——"
-              f"但节点不能套 CF，请先关掉小黄云改成【仅 DNS】。{N}")
-        if (_ask("  仍要继续? y 继续 / 回车取消: ") or "n").strip().lower() not in ("y", "yes"):
-            print("  已取消，一个字节都没改。"); return
-
-    # ── 证书：够用就不重签 ──────────────────────────────────────────
-    have = cert_names()
-    covered = _name_covers(have, new) and _name_covers(have, "x." + new)
-    cf_token = ""
-    if covered:
-        print(f"  证书:     {GRN}现有证书已经盖得住 {new} 和 *.{new}，不用重签{N}")
-    elif _acme_has_cf():
-        print("  证书:     要重签一张泛域名的（acme.sh 里已存着 Cloudflare 凭据，直接用）")
-    else:
-        print("  证书:     要重签一张泛域名的，需要 Cloudflare API Token")
-        _cf_token_steps(new)
-        cf_token = _ask("  粘贴 Token: ").strip()
-        if not cf_token:
-            print("  没填 Token，已取消。"); return
-
     # ── Emby ──────────────────────────────────────────────────────
     emby_old, emby_new = i.get("emby_domain") or _emby_cert()[0], ""
     if emby_old:
@@ -10294,6 +10292,42 @@ def cert_change_domain_flow(i):
             emby_new = ans or dft
             if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", emby_new):
                 print("  域名格式不对，已取消。"); return
+
+    # ── 当前关联的域名 + 换之前要建好的 DNS 记录（仓库主人 10/17：全部列出来，没建好就换不成）──
+    rows = [r for r in domain_uses(i or None) if r[2] != ""]          # CDN 走自己的域名，不归换域名管
+    plan = _domain_record_plan(rows, old, new, emby_old, emby_new)
+    print()
+    print(_hl("1;33", f"▸ 当前 {old} 关联的域名（{len(rows)} 个）"))
+    for d, _c, _lv, us in rows:
+        print(f"  {d}")
+        print(f"      {' / '.join(us)}")
+    print()
+    print(_hl("1;33", f"▸ 换之前先在 DNS 建好这些 A 记录（灰云）→ {_ip or '本机公网 IP'}"))
+    bad = 0
+    for nd, probe in plan:
+        ok, why = _domain_resolves_here(probe)
+        bad += not ok
+        print(f"  {(GRN + '✔') if ok else (R + '✗')} {nd}{N}　{why}")
+    if bad:
+        print(f"{R}  ⚠ 还有 {bad} 条没建好：现在换，这些地方会连不上，换了也会失败回退{N}")
+        ui_tip("建好、等生效（几分钟到几十分钟）再来；走 Cloudflare 的要灰云（仅 DNS）")
+        print("  已取消，一个字节都没改。")
+        return
+
+    # ── 证书：够用就不重签 ──────────────────────────────────────────
+    have = cert_names()
+    covered = _name_covers(have, new) and _name_covers(have, "x." + new)
+    cf_token = ""
+    if covered:
+        print(f"  证书:     {GRN}现有证书已经盖得住 {new} 和 *.{new}，不用重签{N}")
+    elif _acme_has_cf():
+        print("  证书:     要重签一张泛域名的（acme.sh 里已存着 Cloudflare 凭据，直接用）")
+    else:
+        print("  证书:     要重签一张泛域名的，需要 Cloudflare API Token")
+        _cf_token_steps(new)
+        cf_token = _ask("  粘贴 Token: ").strip()
+        if not cf_token:
+            print("  没填 Token，已取消。"); return
 
     # ── 把要动的东西全摆出来再问 ────────────────────────────────────
     targets = _domain_targets(old)
