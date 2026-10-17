@@ -7,6 +7,7 @@
 |---|---|---|
 | `trk.py` | 整个库几个条目有音视频轨、Emby 计划任务最近什么时候跑完（有没有扫整个库） | `curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/trk.py \| python3 - [片名]` |
 | `orphan.py` | OpenList 挂着哪些盘、扫描路径、本地每个盘几个 strm、Emby 收了几个、撤掉的盘有没有留下空条目 | `curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/orphan.py \| python3 -` |
+| `coverdiag.py` | 某一部片截封面为什么不成：每条路（转码流 / 115 直链 / /d/）、每种身份各自截不截得到、花几秒；只截不存 | `curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/coverdiag.py \| python3 - 片名` |
 | `churn.py` | 某几部片本地 strm 和 Emby 条目对不对得上（每晚删了又建、重复条目） | `curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/churn.py \| python3 - 片名1 片名2` |
 
 日志类的直接用现成的：`media-stack heal-log 40`（补时长 / 截封面）、`cat /var/log/media-stack/scan.log`（报给 Emby 的增删、
