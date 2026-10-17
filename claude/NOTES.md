@@ -22,8 +22,8 @@
 | Emby 里的空壳 | `emby_ghost_items` / `prune_emby_ghosts`（每小时，有两成刹车）/ `clear_retired_ghosts`（撤掉的盘，人点的） |
 | 开播门 | `do_heal_gate`（15 秒硬上限）；改它要单独上、等仓库主人实测退出后进度刷新 |
 | 截封面 | `fill_covers`；按钮 → 后台 `do_covers_mount`；生成后 / 凌晨新片 → `queue_new_covers` → `do_covers_new` |
-| 盘那一屏 | `_drive_menu`，公共项 `_drive_std_items` / `_drive_tail_items`；小雅那一屏 `_xiaoya_menu` 也用它们 |
-| 小雅 | `xiaoya_*`；令牌照小雅官方仓库 xiaoyaDev/xiaoya-alist 的 `glue_python` 拿；快速生成 `xiaoya_fast_strm` |
+| 盘那一屏 | `_drive_menu`，公共项 `_drive_std_items` / `_drive_tail_items` |
+| 小雅 | 1.5.385 整栏删了（仓库主人：片不多、找不到想看的）；要挂走「4 WebDAV」。卸载里只留带走旧版装的那份 |
 | 测试里加载脚本 | `importlib` 按路径加载 `media-stack.py`，再把要隔离的函数换成假的（看 `claude/tests` 里现成的写法） |
 
 ## 真机结论（踩过的坑）
@@ -36,13 +36,12 @@
 - **Emby 收到通知要先攒 60–90 秒才动**，前一两分钟「0」是正常的。
 - **115 的直链按来访 UA 签发**：谁要的地址只认谁来下。播放、截封面都要用 `pan115_url(播放器的脸)`。
 - **夸克 / 阿里的服务器在阿里云**：仓库主人那台 VPS 晚高峰连它们的接口常超时（本机也超时，不是 Docker 的事），
-  小雅（底子是阿里分享）晚上取不到下载地址、夸克截封面会断。白天正常。走 115 救不了（秒传前也要问阿里）。
+  晚上阿里系的接口会卡、夸克截封面会断；白天正常。
 - **OpenList 的 /d/ 每请求一次就去网盘换一次直链**：ffmpeg 读一部片要请求好几次（开头、文件尾的 moov、三分之一处），
   网盘一抖其中某次就是半截（partial file / Invalid data）。要连读几次的，先 `resolve_once` 换成直链再读。
 - **阿里没会员原画限速约 0.7 Mbps**，超清片必卡；转码流不限速。
-- **小雅的开放 token 必须走小雅自己那家（auth.xiaoya.pro）拿**，别家拿的续期报 `invalid client_id`。
-- **夸克 cookie 要带 `__puus`**（官方脚本认它）；115 换 cookie 走 `qrcodeapi.115.com`，不用网页那种客户端
-  （OpenList 的 /115 在用，同一种会互踢）。
+- **小雅（已删，留着备查）**：开放 token 要走小雅自己那家（auth.xiaoya.pro）拿；它的 /d/ 不带签名一律给提示图；
+  播放前要把片转存进自己阿里盘，空间不够就「获取新file id失败」。
 - **网页播放器放不了很多 mkv**（HEVC / DTS），测能不能播要用 Hills / Emby 客户端。
 - 会话容器会被回收，scratchpad 会清空：测试、笔记一律放仓库 `claude/`。
 

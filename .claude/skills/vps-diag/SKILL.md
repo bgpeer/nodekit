@@ -30,8 +30,6 @@ curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/cove
 - 补时长 / 截封面结果 → `media-stack heal-log 40`（截封面一轮跑完才写日志）
 - 某一部截封面不成 → `coverdiag.py 片名`（每条路、每种身份各截一次，只截不存）
 - 开播慢 → `tail -30 /var/log/media-stack/gate.log`
-- 小雅 → `docker logs --tail 40 xiaoya 2>&1 | grep -v -i -e token -e cookie`；
-  在容器里试拉：`docker exec xiaoya sh -c 'timeout 40 wget -O /dev/null "http://127.0.0.1/d/<路径>" 2>&1 | tail -2'`
 - 连不连得上某个接口：本机 `curl -so /dev/null -m 15 -w "%{time_appconnect}\n" https://<主机>/`，
   容器里用 `docker run --rm --network mediastack alpine wget ...` 对照。
 

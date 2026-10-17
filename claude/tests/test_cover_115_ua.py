@@ -33,6 +33,7 @@ m.rebuild_cfg_from_disk = lambda d: {}
 m.openlist_public_url = lambda cfg: "https://list.example"
 m.hls_probe_url = lambda iid, key: ""
 m.range_ok = lambda url, ua: True
+m.resolve_once = lambda u, ua, timeout=30: u      # 1.5.384 起 /d/ 先换直链；这里不出网，原样返回
 m.emby_ffprobe = lambda url, ua: (3600, 1, "")
 m.heal_backlog_hold = lambda *a, **k: ""
 m._heal_meter = lambda: ((lambda: 0), "x")
