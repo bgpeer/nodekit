@@ -55,7 +55,10 @@
 ## 三、改完要做的事
 
 - 改了就自己提 PR 并合并，不用等回覆。
-- 每次改动都要有回归测试，测试放在 scratchpad 的 `t/` 下，改完把整套跑一遍。
+- 每次改动都要有回归测试，测试放在 scratchpad 的 `t/` 下。跑多少分两档（仓库主人 10/17 定）：
+  - **只跑相关的几项**：改模板、规则文件、注释、文档、屏上文字这类不动脚本逻辑的。
+  - **跑整套**：改了 `xy-installer.py` / `adguard-dns.py` / `net-optimize.py` / `media-stack.py` 等脚本的逻辑。
+  - 拿不准算哪档就跑整套。
 - 模板（`sub-template.yaml` / `subbox-template.json` / `shadowrocket-template.conf`）
   是运行期从 raw 直接拉的，合并即生效；但 VPS 上已生成的成品配置要重新生成订阅才更新。
 
