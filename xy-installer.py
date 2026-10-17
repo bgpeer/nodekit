@@ -9853,6 +9853,23 @@ def _nginx_sub_domain(txt, old, new):
     """nginx 配置里的 server_name 改写（只认完全等于 old 的那条）。"""
     return re.sub(_SRVNAME_RE % re.escape(old), lambda m: m.group(1) + new + m.group(2), txt)
 
+def _agh_set_domain(txt, old, new):
+    """AdGuardHome.yaml 顶层 tls 段里 server_name 等于 old 的那一行换成 new（引号写法也认），别的一个字节不动。
+       必须跟着换（10/17 真 AdGuard v0.107.79 实测）：它按 server_name 从 DoT 的 SNI 里拆 ClientID ——
+       还是旧域名的话，手机填 <ID>.新域名 拆不出 ID，白名单一设就回 REFUSED，安卓专用 DNS 整机断网；
+       adguard-dns.py 也会因为 server_name 对不上域名，把加密当成「未开启」。"""
+    m = re.search(r"(?m)^tls:[ \t]*\n", txt)
+    if not m:
+        return txt
+    end = m.end()
+    for line in txt[m.end():].splitlines(True):
+        if line.strip() and not line[0].isspace():
+            break
+        end += len(line)
+    blk = re.sub(r"(?m)^(\s+server_name:[ \t]*)(['\"]?)" + re.escape(old) + r"\2([ \t]*)$",
+                 lambda x: x.group(1) + new + x.group(3), txt[m.end():end])
+    return txt[:m.end()] + blk + txt[end:]
+
 def _domain_targets(old):
     """这次换域名会动到哪些文件 → [(路径, 说明)]。只列真的存在、真的含旧域名的。
        给确认框用：让你在按下去之前看到完整清单，而不是事后猜它动了什么。"""
@@ -9862,7 +9879,8 @@ def _domain_targets(old):
                    (NODE_FILE, "分享链接"),
                    (f"{SB_DIR}/config.json", "sing-box 入站"),
                    (f"{XRAY_DIR}/config.json", "xray 入站"),
-                   (NGINX_CONF, "nginx server_name")):
+                   (NGINX_CONF, "nginx server_name"),
+                   (AGH_YAML, "自建 DNS（AdGuard）加密服务器名")):
         try:
             if old in open(p, encoding="utf-8", errors="replace").read():
                 out.append((p, why))
@@ -9996,6 +10014,11 @@ def _domain_switch_notice(new, emby_new=""):
                         "面板 13　手机「专用DNS」/ 路由器里填的那个要改"))
     except Exception:
         pass
+    if _agh_tls().get("enabled") == "true":
+        try: cid = open(SELFDNS_CID_FILE).read().strip()      # 只读，没有就不生成
+        except OSError: cid = ""
+        out.append(("安卓专用 DNS", f"{cid}.{new}" if cid else new,
+                    "手机里改成这个；苹果描述文件重装（面板 13 → 10）"))
     try:
         gh = _ghrelay_prefix()
         if gh:
@@ -10080,6 +10103,15 @@ def cert_change_domain_apply(new, cf_token="", emby_new=""):
                   + (chk.stderr or chk.stdout).strip().replace("\n", "\n   "))
             return False
         print("  nginx: server_name 已改，nginx -t 通过")
+
+    # ── 2b. 自建 DNS（AdGuard）的加密服务器名：不换的话 <ID>.新域名 拆不出 ClientID，白名单回 REFUSED ──
+    if os.path.exists(AGH_YAML):
+        txt = open(AGH_YAML, encoding="utf-8").read()
+        nt = _agh_set_domain(txt, old, new)
+        if nt != txt:
+            snap(AGH_YAML)
+            open(AGH_YAML, "w", encoding="utf-8").write(nt)
+            print("  自建 DNS: AdGuard 加密服务器名已改（重启后生效）")
 
     # ── 3. 证书（到这一步才动，前面全是可回滚的本地改动）─────────────────
     names = [new, f"*.{new}"]
@@ -10208,6 +10240,8 @@ def cert_change_domain_flow(i):
     print(f"{Y}     ② 这个域名要在 Cloudflare 的区域里（DNS 托管在 CF）{N}")
     print(f"       泛域名证书走 DNS-01，acme 要用 CF 的 API 往区域里写一条 TXT 验证记录。")
     print(f"       域名不在 CF 名下，Token 权限再对也签不出来。")
+    if _agh_tls().get("enabled") == "true":
+        print(f"{Y}     ③ 装了自建 DNS：再加一条 *.新域名 的 A 记录（灰云），安卓专用 DNS 要用{N}")
     print(f"     解析改完【等生效】再来——DNS 有缓存，改完立刻查多半还是旧值。")
     print("-" * 60)
     new = _ask("  新域名（上面两条都做好了再填，回车取消）: ").strip().lower().rstrip(".")
