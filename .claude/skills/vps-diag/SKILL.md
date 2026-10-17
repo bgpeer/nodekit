@@ -21,12 +21,14 @@ description: 仓库主人报真机问题（播不了、卡、掉轨道、截不�
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/trk.py | python3 - [片名]
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/orphan.py | python3 -
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/churn.py | python3 - 片名1 片名2
+curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/coverdiag.py | python3 - 片名
 ```
 
 - 掉轨道 / 有没有扫整个库 → `trk.py` + `cat /var/log/media-stack/scan.log`
 - 盘和 strm、Emby 对不上（撤掉的盘还有条目、新盘没进库）→ `orphan.py`
 - 某几部片每晚删了又建、重复条目 → `churn.py`
 - 补时长 / 截封面结果 → `media-stack heal-log 40`（截封面一轮跑完才写日志）
+- 某一部截封面不成 → `coverdiag.py 片名`（每条路、每种身份各截一次，只截不存）
 - 开播慢 → `tail -30 /var/log/media-stack/gate.log`
 - 小雅 → `docker logs --tail 40 xiaoya 2>&1 | grep -v -i -e token -e cookie`；
   在容器里试拉：`docker exec xiaoya sh -c 'timeout 40 wget -O /dev/null "http://127.0.0.1/d/<路径>" 2>&1 | tail -2'`
