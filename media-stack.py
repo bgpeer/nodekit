@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.381"
+SCRIPT_VERSION = "1.5.382"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -6597,6 +6597,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
     made = dict(ms_state().get("cover_made") or {})
     done, logs = 0, []
     manual_mb[0] = 0.0
+    p115 = pan115_mounts(d)
     meter, _mlab = _heal_meter()
     for _n, (uid, iid, name, path, secs) in enumerate(todo):
         if polite and heal_backlog_hold(key, cache_s=10):
@@ -6607,7 +6608,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
             break
         # 【两条路，前一条截不到就换后一条】转码流的 m3u8 最省（一个分片），可截帧要把
         # 那个分片真拉下来，有的盘这一步拦；那就退回原片的 /d/。
-        routes = []
+        routes, only_player = [], set()
         try:
             if not os.environ.get("MS_HEAL_NO_M3U8"):
                 _m = hls_probe_url(iid, key)
@@ -6619,6 +6620,14 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
             try:
                 with open(_strm_host_path(d, path), encoding="utf-8") as f:
                     tp = strm_target_path(f.read())
+                # 【115 的直链按 UA 签发】真机 10/17：三部 FC2 截封面，两部「Input/output error」（拉了十几 MB
+                # 跳到中间就断）、一部「读不出时长」—— /d/ 那条 302 出去的 115 直链是按 OpenList 那张脸签的，
+                # ffmpeg 拿播放器的脸去读就被掐。跟播放一样（pan115_url），按播放器的脸向 OpenList 要直链，排最前
+                if tp and any(tp == m or tp.startswith(m.rstrip("/") + "/") for m in p115):
+                    _raw = pan115_url(d, tp, PLAYER_UA)
+                    if _raw:
+                        routes.append(_raw)
+                        only_player.add(_raw)
                 sign = ((_ol_api("/api/fs/get", {"path": tp, "password": ""}, token,
                                  timeout=60).get("data") or {}).get("sign", "")) if tp else ""
                 if tp:
@@ -6635,10 +6644,11 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
             if ".m3u8" not in url.lower() and range_ok(url, PLAYER_UA) is False:
                 why, no_range = "这个源不认跳转，截封面只能从头拉整部片", True
                 continue
+            _uas = (PLAYER_UA,) if url in only_player else (PLAYER_UA, BROWSER_UA)
             if not secs:
                 # 【Emby 里还没时长】自己读一下文件头的索引，只拿来算三分之一在哪
                 secs, _n, _e = emby_ffprobe(url, PLAYER_UA)
-                if not secs:
+                if not secs and len(_uas) > 1:
                     secs, _n, _e = emby_ffprobe(url, BROWSER_UA)
                 if not secs:
                     why = "读不出时长"
@@ -6646,7 +6656,7 @@ def fill_covers(d, key, limit=COVER_PER_RUN, say=None, mount=None, manual=False,
             at = secs * COVER_AT
             # 【先播放器那张脸，不成换浏览器那张】见 PLAYER_UA：夸克对浏览器脸限速到几十 KB/s，
             # 截一帧要跳到中间读几 MB，用浏览器脸多半超时 —— 前几轮「截不到画面」里就有这种
-            for _ua in (PLAYER_UA, BROWSER_UA):
+            for _ua in _uas:                # 115 那条是按播放器的脸签的，换浏览器的脸只会白等
                 jpg, why = cover_frame(url, at, ua=_ua,
                                        watch=lambda: _cover_meter_mb(_rx0, meter) > COVER_ONE_MB)
                 if jpg or _cover_meter_mb(_rx0, meter) > COVER_ONE_MB:
