@@ -1886,6 +1886,73 @@ def _selfdns_toggle():
         print("  没找到主脚本(xy-installer.py)，请从主面板进入本菜单。"); return
     subprocess.run(f"python3 {xy} selfdns-toggle", shell=True)
 
+def _ios_fetch(dom, port, path):
+    """从本机拉一遍描述文件（SNI 用域名，连本机，不出网）：→ (ServerName 或 '', 出错原因)。
+       AdGuard 的 HTTPS 后台跟 http.address 绑同一个地址，0.0.0.0 / 空 就连 127.0.0.1。"""
+    import plistlib
+    try:
+        m = re.search(r'(?m)^\s*address:\s+(\S+):(\d+)\s*$', open(_agh_yaml()).read())
+    except OSError:
+        m = None
+    host = m.group(1).strip("[]") if m else ""
+    host = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+    ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE   # 本机自检，只看内容
+    try:
+        with socket.create_connection((host, port), timeout=5) as raw, ctx.wrap_socket(raw, server_hostname=dom) as t:
+            t.sendall(f"GET {path} HTTP/1.0\r\nHost: {dom}:{port}\r\nUser-Agent: {HTTP_UA}\r\n\r\n".encode())
+            buf = b""
+            while True:
+                d = t.recv(65536)
+                if not d:
+                    break
+                buf += d
+    except OSError as e:
+        return "", f"连不上本机 {host}:{port}（{e.__class__.__name__}）"
+    head, _, body = buf.partition(b"\r\n\r\n")
+    if b" 200 " not in head.split(b"\r\n", 1)[0]:
+        return "", "AdGuard 没给出描述文件（" + head.split(b"\r\n", 1)[0].decode(errors="replace") + "）"
+    try:
+        pl = plistlib.loads(body)
+        return pl["PayloadContent"][0]["DNSSettings"]["ServerName"], ""
+    except Exception:
+        return "", "描述文件内容不对"
+
+def ios_profile():
+    """苹果手机（iOS 14+）没有安卓那种「专用 DNS」框，要装 .mobileconfig 描述文件。
+       用 AdGuard 自带的 /apple/dot.mobileconfig（不用登录就能下）：DoT 走 853，跟安卓专用 DNS 同一条路。
+       【不给 DoH 版】实测 v0.107.79：/apple/doh.mobileconfig 的 ServerURL 写死成 https://域名/dns-query/…，
+       不带端口；我们的 DoH 在 port_https（默认 10443），443 是节点的，照它装苹果连不上。
+       ClientID 规则跟安卓一样：签了泛域名证书才带（主机名 ID.域名），没签就只给域名；
+       白名单已设又没签泛域名 → 苹果也会被挡，跟安卓同一句提醒。
+       装之前在本机按同一个链接拉一遍，核对里面的主机名，屏上一行 ✔ / ⚠。
+       链接里带 ClientID（等于口令），只印到 root 自己的屏上。"""
+    ui_title("苹果手机描述文件（iOS 14+）")
+    if not _installed():
+        print("  ⚠ 还没装 AdGuard Home，先选 1 安装"); return
+    hp = _https_panel()
+    if not hp:
+        print("  ⚠ 没域名或没开加密（DoT），苹果描述文件用不了")
+        ui_tip("先按菜单 3「使用方法」第二步开加密"); return
+    dom, port = hp
+    wild = _cert_wildcard_ok(dom); allow = _allowed_clients()
+    cid = _selfdns_clientid() if wild else ""
+    want = f"{cid}.{dom}" if cid else dom
+    path = f"/apple/dot.mobileconfig?host={dom}" + (f"&client_id={cid}" if cid else "")
+    if allow and not wild:
+        print(_hl("1;31", "⚠ 白名单已设、没签泛域名证书：描述文件带不上 ClientID，苹果会被挡"))
+        ui_tip("二选一：菜单 8 签泛域名证书；或后台清空「允许的客户端」")
+    print()
+    ui_url("Safari 打开这个链接，下载描述文件", f"https://{dom}:{port}{path}")
+    print()
+    ui_url("装好后苹果走的 DNS（DoT）", want)
+    print()
+    got, why = _ios_fetch(dom, port, path)
+    if got == want:
+        print("  " + _hl("1;32", f"✔ 本机试拉成功，描述文件里的主机名是 {got}"))
+    else:
+        print("  " + _hl("1;33", "⚠ " + (why or f"描述文件里的主机名是 {got}，应为 {want}")))
+    ui_tip("装法：设置 → 已下载描述文件 → 安装；开着小火箭时 DNS 由小火箭接管，订阅里已带自建 DNS")
+
 def menu():
     while True:
         # 2 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
@@ -1907,6 +1974,7 @@ def menu():
                   (7, "自检（只读）", None),
                   (8, "DoT 带 ClientID（签泛域名证书）", None),
                   (9, "手机实测（开私人 DNS，看它连没连进来）", None),
+                  (10, "苹果手机描述文件（iOS 一键装 DNS）", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -1918,6 +1986,7 @@ def menu():
         elif c == "7": selfcheck()
         elif c == "8": dot_clientid()
         elif c == "9": phone_probe()
+        elif c == "10": ios_profile()
         elif c in ("0", ""):
             return
 
