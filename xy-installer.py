@@ -1242,6 +1242,7 @@ def check_domain_or_die():
 #   仓库主人在洛杉矶一台实测（openssl 看 TLS1.3 / h2，xray tls ping 看 MLKEM 和链长），原池 21 个里只有 9 个够格；
 #   不够格的 12 个拿掉（python / mysql / mongodb / redis / intel / amd / dell / bing / tesla / asus 链短，
 #   vuejs.org 没 MLKEM，www.swift.com 没 h2），从 40 个大厂主站候选里补了实测全过的 10 个。
+#   同日又测 45 个，过了 14 个，挑证书链最长（余量最大、不同行业）的 6 个补上，共 25 个。
 #   同一个站换个地区的机房可能不一样，所以装的时候照样在本机探一遍（_sni_precheck_one / _xr_pq_new）。
 # 安装时默认从这里随机挑一个（避免所有人都按回车挤在同一个 SNI 上被针对）；随机挑到的本机探不过会自己换（见 _sni_precheck_one）。
 REALITY_SNI_POOL = [
@@ -1249,6 +1250,7 @@ REALITY_SNI_POOL = [
     "www.samsung.com", "academy.nvidia.com", "addons.mozilla.org", "react.dev",
     "www.nvidia.com", "developer.nvidia.com", "www.broadcom.com", "www.nxp.com", "www.analog.com",
     "www.docker.com", "www.atlassian.com", "www.mastercard.com", "www.ebay.com", "www.mozilla.org",
+    "www.boeing.com", "www.airbus.com", "www.fedex.com", "www.schneider-electric.com", "www.3m.com", "www.infineon.com",
 ]
 
 def _reality_sni_ok(sni):
