@@ -3436,7 +3436,11 @@ def shadowrocket_line(name, d):
     if net == "xhttp" or d.get("encryption") or str(wo.get("v2ray-http-upgrade")).lower() == "true":
         return None
     tls = [f"peer={sni}"] + (["allowInsecure=1"] if str(d.get("skip-cert-verify")).lower() == "true" else [])
+    # ws 走 TLS 时钉死 alpn=http/1.1：服务端 443 那个 nginx 开着 HTTP/2，小火箭不写 alpn 会协商成 h2，
+    # ws 升级只认 HTTP/1.1，h2 上建不起来——C 测试（真走代理）超时，T 测试（只连端口）却是绿的。
+    # 10/18 仓库主人朋友的苹果实测：yaml（mihomo 自己钉 http/1.1）通、小火箭 ws 不通；服务器本机 curl --http1.1 → 101、--http2 → 握手失败。
     ws = (["obfs=websocket", f"path={wo.get('path') or '/'}", f"obfsParam={(wo.get('headers') or {}).get('Host') or sni}"]
+          + (["alpn=http/1.1"] if str(d.get("tls")).lower() == "true" or t == "trojan" else [])
           if net == "ws" else [])
     if t == "vless":
         p = [f"{name} = vless", srv, str(port), f"password={d['uuid']}", "tls=true", *tls]
