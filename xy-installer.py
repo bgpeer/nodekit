@@ -1237,16 +1237,18 @@ def check_domain_or_die():
 
 # reality 借用目标池：大厂 / 技术站的主站，要 TLS1.3 + h2 + X25519、国内可达、不套乱 CDN。
 # CDN 资源域名不收：同一个名字各地由不同边缘节点接，TLS 配置不一，有的机房连 TLS1.3 都握不上
-#   （仓库主人 10/11 撞上 updates.cdn-apple.com）。swcdn.apple.com / updates.cdn-apple.com /
-#   cdn-dynmedia-1.microsoft.com / s0.awsstatic.com 10/11 拿掉，从 mack-a 的随机池补了
-#   addons.mozilla.org / www.asus.com / react.dev / vuejs.org（他 xray、sing-box 两份名单都有）。
+#   （仓库主人 10/11 撞上 updates.cdn-apple.com）。
+# 10/18 只留能开 ML-DSA-65 抗量子签名的（目标站支持 X25519MLKEM768、带 SNI 握手的证书链 > 4000 字节，见 PQ_ON_MIN_CHAIN）：
+#   仓库主人在洛杉矶一台实测（openssl 看 TLS1.3 / h2，xray tls ping 看 MLKEM 和链长），原池 21 个里只有 9 个够格；
+#   不够格的 12 个拿掉（python / mysql / mongodb / redis / intel / amd / dell / bing / tesla / asus 链短，
+#   vuejs.org 没 MLKEM，www.swift.com 没 h2），从 40 个大厂主站候选里补了实测全过的 10 个。
+#   同一个站换个地区的机房可能不一样，所以装的时候照样在本机探一遍（_sni_precheck_one / _xr_pq_new）。
 # 安装时默认从这里随机挑一个（避免所有人都按回车挤在同一个 SNI 上被针对）；随机挑到的本机探不过会自己换（见 _sni_precheck_one）。
 REALITY_SNI_POOL = [
-    "www.cisco.com", "www.oracle.com", "www.ibm.com", "www.vmware.com",
-    "www.python.org", "www.mysql.com", "www.mongodb.com", "redis.io", "www.swift.com",
-    "www.intel.com", "www.amd.com", "www.qualcomm.com", "www.dell.com",
-    "www.samsung.com", "academy.nvidia.com", "www.bing.com", "www.tesla.com",
-    "addons.mozilla.org", "www.asus.com", "react.dev", "vuejs.org",
+    "www.cisco.com", "www.oracle.com", "www.ibm.com", "www.vmware.com", "www.qualcomm.com",
+    "www.samsung.com", "academy.nvidia.com", "addons.mozilla.org", "react.dev",
+    "www.nvidia.com", "developer.nvidia.com", "www.broadcom.com", "www.nxp.com", "www.analog.com",
+    "www.docker.com", "www.atlassian.com", "www.mastercard.com", "www.ebay.com", "www.mozilla.org",
 ]
 
 def _reality_sni_ok(sni):

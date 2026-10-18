@@ -196,7 +196,7 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 装机时脚本会自动做两项检查，帮你把伪装做扎实：
 
 - **Reality SNI 随机池 + 预检**：安装时**默认从内置的大厂/技术站池里随机挑一个**当 reality 借用目标
-  （cisco/oracle/python/intel/dell/mozilla/asus 等 21 个大站主站，要 TLS1.3+h2+X25519、国内可达、不套乱 CDN；
+  （cisco/oracle/ibm/qualcomm/nvidia/broadcom/mozilla 等 19 个大站主站，要 TLS1.3+h2+X25519、国内可达、不套乱 CDN，且都能开抗量子签名；
   CDN 资源域名各地边缘节点 TLS 配置不一，不收）——
   避免所有人都按回车挤在同一个 SNI 上被针对。想指定就 `--sni 域名` 或交互里输入。选了 reality 系列协议时，
   装前还会从本机探测借用目标是否**可达 + 支持 TLS1.3 + HTTP/2**：**随机挑到的探不过，自动从池里另挑一个探得通的换上**
