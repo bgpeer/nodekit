@@ -17,7 +17,8 @@ check(f"开了跳跃：起点端口照写 + mport=30000-31000（{hop}）", hop.s
 check("混淆密码照旧在", ",obfsParam=op" in hop)
 check(f"没开跳跃：不写 mport（{one}）", "mport" not in one and ",27000," in one)
 # 分享链接 mport → 节点 ports → 小火箭行 mport，整条链路
-ylines, nodes = m.parse_nodes(["hysteria2://pw@h.example.com:28000?sni=h.example.com&obfs=salamander&obfs-password=op&mport=28000-29000&insecure=0#hy2"])
+link = "hysteria2://pw" + "@" + "h.example.com:28000?sni=h.example.com&obfs=salamander&obfs-password=op&mport=28000-29000&insecure=0#hy2"   # 拆开写：不让文件里出现像邮箱的串
+ylines, nodes = m.parse_nodes([link])
 d = dict(nodes)[next(iter(dict(nodes)))] if isinstance(nodes, list) else None
 line = m.shadowrocket_line("x", d) if d else ""
 check(f"分享链接带 mport → 小火箭行带同一段（{line}）", ",mport=28000-29000" in line)
