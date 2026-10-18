@@ -3731,8 +3731,10 @@ def build_shadowrocket_sub(nodes, tpl_url):
     for key, d in nodes:
         name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
         # 本机 xray 内核的 reality：xray 26.9.8+ 只收 ClientHello 带 X25519MLKEM768 的客户端，小火箭 2.2.92 没带，
-        # 握手被当成探测转去借用站（小火箭官方 config 仓库 issue #4，9 月底还开着）。跟 sing-box 订阅一样不写。
-        if d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0)) in xr_reality:
+        # 握手被当成探测转去借用站（小火箭官方 config 仓库 issue #4，9 月底还开着）。
+        # 例外 vision²：仓库主人 10/18「vision²」要写进来（小火箭哪天带上 MLKEM 就能直接用），其余照旧不写。
+        if (d.get("reality-opts") and d.get("flow") != "xtls-rprx-vision"
+                and (str(d.get("server", "")), int(d.get("port") or 0)) in xr_reality):
             xr_skip += 1
             continue
         if sub:
