@@ -15,7 +15,7 @@ ws = {"network": "ws", "ws-opts": {"path": "/p", "headers": {"Host": "h.example.
 vl = L("a", dict(type="vless", server="h.example.com", port=443, uuid="u", tls=True, servername="h.example.com", **ws))
 vm = L("b", dict(type="vmess", server="h.example.com", port=443, uuid="u", alterId=0, cipher="auto", tls=True, servername="h.example.com", **ws))
 tj = L("c", dict(type="trojan", server="h.example.com", port=443, password="x", sni="h.example.com", **ws))
-pl = L("d", dict(type="vmess", server="192.0.2.1", port=80, uuid="u", **ws))
+pl = L("d", dict(type="vmess", server="plain.example.com", port=80, uuid="u", **ws))
 gr = L("e", dict(type="vless", server="h.example.com", port=44, uuid="u", tls=True, servername="h.example.com", network="grpc",
                  **{"grpc-opts": {"grpc-service-name": "g"}}))
 rv = L("f", dict(type="vless", server="h.example.com", port=443, uuid="u", tls=True, servername="r.example.com", flow="xtls-rprx-vision",
