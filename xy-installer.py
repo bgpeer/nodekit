@@ -3428,7 +3428,7 @@ def build_singbox_sub(nodes, tpl_url):
 # 单条链接导入能连」，多半栽在这。xtls=2 是 xtls-rprx-vision（1 是早废了的 direct）。
 # 这几类小火箭配置里写不出来 / 连不上，跳过（单条链接照样在）：xhttp（小火箭不支持）、VLESS Encryption（查不到支不支持）、
 # httpupgrade（小火箭会当成 websocket 连，必断）；xray 内核的 reality 在 build_shadowrocket_sub 里跳过。
-# hy2 端口跳跃小火箭配置里的写法查不到，不写：连跳跃段的起点端口，服务端 DNAT 到真端口照样通。
+# hy2 端口跳跃写 mport=起-止（小火箭分享链接的字段名）；起点端口照写，不认 mport 也能连（服务端 DNAT 到真端口）。
 def shadowrocket_line(name, d):
     t = d.get("type"); srv = d["server"]; port = d.get("port")
     sni = d.get("servername") or d.get("sni") or srv
@@ -3466,6 +3466,10 @@ def shadowrocket_line(name, d):
     if t == "hysteria2":
         pt = port or (d["ports"].split("-")[0] if d.get("ports") else "")   # 跳跃时用起点端口
         p = [f"{name} = hysteria2", srv, str(pt), f"auth={d['password']}", *tls, "alpn=h3", "udp=1"]
+        # 端口跳跃：mport=起-止（小火箭分享链接认的字段名，配置行沿用它自己的内部字段名，同 obfsParam / peer）。
+        # 不认也不坏事：照样连起点端口，服务端 DNAT 到真端口。仓库主人 10/18 要加；真机认不认待朋友苹果实测。
+        if d.get("ports"):
+            p.append(f"mport={d['ports']}")
         if d.get("obfs") == "salamander" and d.get("obfs-password"):
             p.append(f"obfsParam={d['obfs-password']}")
         if d.get("up") and d.get("down"):                                    # 满速（Brutal）：开了才写，见 hy2_bw
