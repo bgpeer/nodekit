@@ -2732,14 +2732,16 @@ def _sub_https():
 def sub_label():
     """订阅地址末尾的名字：<token>/<名字>.<ext>。小火箭 / Clash 拿文件名当订阅名，原来显示的是 token，
        截个图就把 token 漏了（仓库主人 10/19）。取本机节点前缀：国旗换成国家代码（🇭🇰→HK），
-       只留字母数字 _ -（中文进 URL 会被转成 %E4… 显示）；什么都不剩就叫 VPS。"""
+       只留字母数字 _ -（中文进 URL 会被转成 %E4… 显示）；什么都不剩就叫 VPS，
+       只剩数字 / 符号（「东京2」→「2」）就接在 VPS 后面（VPS2），不然订阅名光秃秃一个数字。"""
     try:
         cur = next((p for p, _ in (_split_tag(_link_name(u)) for u in read_saved_links()) if p), "")
     except Exception:
         cur = ""
     cur = cur or _state_prefix()
     s = "".join(chr(ord(c) - 0x1F1E6 + 65) if 0x1F1E6 <= ord(c) <= 0x1F1FF else c for c in cur)
-    return re.sub(r"[^A-Za-z0-9_-]+", "", s)[:24] or "VPS"
+    s = re.sub(r"[^A-Za-z0-9_-]+", "", s).strip("_-")[:24]
+    return s if re.search(r"[A-Za-z]", s) else "VPS" + s
 
 def sub_url(ext):
     t = load_tokens().get(ext)

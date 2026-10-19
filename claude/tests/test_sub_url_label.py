@@ -12,7 +12,7 @@ def check(l, ok):
     global bad; bad += not ok; print(("  ✔ " if ok else "  ✖ ") + l)
 
 # 1. 名字
-for pfx, want in (("🇭🇰", "HK"), ("🇺🇸2", "US2"), ("DMIT", "DMIT"), ("东京", "VPS"), ("", "VPS"), ("🇯🇵 东京-1", "JP-1")):
+for pfx, want in (("🇭🇰", "HK"), ("🇺🇸2", "US2"), ("DMIT", "DMIT"), ("东京", "VPS"), ("", "VPS"), ("🇯🇵 东京-1", "JP-1"), ("东京2", "VPS2"), ("洛杉矶-CN2", "CN2"), ("家宽_1", "VPS1")):
     m.read_saved_links = lambda: []; m._state_prefix = lambda p=pfx: p
     got = m.sub_label()
     check(f"前缀「{pfx}」→ {got}", got == want)
