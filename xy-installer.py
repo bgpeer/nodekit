@@ -2729,19 +2729,45 @@ def _sub_https():
     h = _host()
     return (not _is_ip(h)) and os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY)
 
+_DMI_DIR = "/sys/class/dmi/id"
+# DMI 里认得出的云厂商 → 订阅名；小写子串匹配，按顺序取第一个。
+# Azure 认资产标签那串固定号：sys_vendor 写 Microsoft 的也可能是别家用 Hyper-V 开的小鸡
+_SUB_VENDORS = (("google", "Google"), ("amazon", "AWS"), ("7783-7084-3265-9085-8269-3286-77", "Azure"), ("oraclecloud", "Oracle"),
+                ("alibaba", "Aliyun"), ("tencent", "Tencent"), ("digitalocean", "DigitalOcean"), ("vultr", "Vultr"),
+                ("linode", "Linode"), ("akamai", "Linode"), ("hetzner", "Hetzner"), ("huawei", "Huawei"))
+# 虚拟化软件 / 主板通用名：写的是这些说明厂商没署名，不拿来当名字
+_DMI_GENERIC = ("qemu", "kvm", "red hat", "openstack", "bochs", "xen", "vmware", "innotek", "virtualbox",
+                "microsoft", "standard pc", "system manufacturer", "to be filled", "default string", "not specified", "nutanix")
+
+def _kernel_release():
+    return os.uname().release
+
 def sub_label():
     """订阅地址末尾的名字：<token>/<名字>.<ext>。小火箭 / Clash 拿文件名当订阅名，原来显示的是 token，
-       截个图就把 token 漏了（仓库主人 10/19）。取本机节点前缀：国旗换成国家代码（🇭🇰→HK），
-       只留字母数字 _ -（中文进 URL 会被转成 %E4… 显示）；什么都不剩就叫 VPS，
-       只剩数字 / 符号（「东京2」→「2」）就接在 VPS 后面（VPS2），不然订阅名光秃秃一个数字。"""
-    try:
-        cur = next((p for p, _ in (_split_tag(_link_name(u)) for u in read_saved_links()) if p), "")
-    except Exception:
-        cur = ""
-    cur = cur or _state_prefix()
-    s = "".join(chr(ord(c) - 0x1F1E6 + 65) if 0x1F1E6 <= ord(c) <= 0x1F1FF else c for c in cur)
-    s = re.sub(r"[^A-Za-z0-9_-]+", "", s).strip("_-")[:24]
-    return s if re.search(r"[A-Za-z]", s) else "VPS" + s
+       截个图就把 token 漏了（仓库主人 10/19）。名字认机器、不跟节点前缀（前缀会改）：
+       先读 DMI（云厂商虚拟主板自己写的：谷歌云 Google、AWS Amazon EC2、甲骨文资产标签 OracleCloud.com…），
+       再看内核名后缀（Ubuntu 云镜像 -gcp / -aws / -azure / -oracle），都认不出（DMIT、搬瓦工这类 KVM 小鸡
+       写的是 QEMU）就叫 VPS。厂商自己署了名但不在表里的，照它写的（只留字母数字）。只读本机文件，不出网。
+       名字不参与鉴权：哪天认出来的不一样了，客户端里的老地址照样能拉（见 _SUB_SERVER_PY）。"""
+    def rd(n):
+        try:
+            return open(f"{_DMI_DIR}/{n}").read().strip()
+        except OSError:
+            return ""
+    vendor = rd("sys_vendor")
+    dmi = " ".join((vendor, rd("product_name"), rd("chassis_asset_tag"), rd("bios_vendor"))).lower()
+    for key, name in _SUB_VENDORS:
+        if key in dmi:
+            return name
+    rel = _kernel_release().lower()
+    for suf, name in (("-gcp", "Google"), ("-aws", "AWS"), ("-azure", "Azure"), ("-oracle", "Oracle")):
+        if rel.endswith(suf):
+            return name
+    if vendor and not any(g in vendor.lower() for g in _DMI_GENERIC):
+        v = re.sub(r"[^A-Za-z0-9]+", "", vendor.split()[0])[:16]
+        if re.search(r"[A-Za-z]", v):
+            return v
+    return "VPS"
 
 def sub_url(ext):
     t = load_tokens().get(ext)

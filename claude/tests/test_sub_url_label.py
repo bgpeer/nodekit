@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """订阅地址末尾换成机器名 —— 仓库主人 10/19：小火箭拿文件名当订阅名，显示的是 token，截图就漏了。
-  新地址 /<token>/<名字>.<ext>：名字取节点前缀（国旗→国家代码，只留字母数字 _ -），取不到叫 VPS。
+  新地址 /<token>/<名字>.<ext>：名字认机器（谷歌云 Google、AWS…），认不出叫 VPS；不跟节点前缀（前缀会改）。
   老地址 /<token>.<ext> 照样能拉；名字不参与鉴权，token 错照样 404；老装机的小服务脚本自动换新。
 """
 import os, sys, socket, subprocess, tempfile, time, urllib.request, urllib.error, importlib.util
@@ -11,14 +11,36 @@ bad = 0
 def check(l, ok):
     global bad; bad += not ok; print(("  ✔ " if ok else "  ✖ ") + l)
 
-# 1. 名字
-for pfx, want in (("🇭🇰", "HK"), ("🇺🇸2", "US2"), ("DMIT", "DMIT"), ("东京", "VPS"), ("", "VPS"), ("🇯🇵 东京-1", "JP-1"), ("东京2", "VPS2"), ("洛杉矶-CN2", "CN2"), ("家宽_1", "VPS1")):
-    m.read_saved_links = lambda: []; m._state_prefix = lambda p=pfx: p
-    got = m.sub_label()
-    check(f"前缀「{pfx}」→ {got}", got == want)
+# 1. 名字：认机器（DMI → 内核后缀 → 厂商自己署的名 → VPS），不跟节点前缀
+tmp0 = tempfile.mkdtemp(); m._DMI_DIR = tmp0
+def dmi(rel="6.1.0-25-amd64", **kv):
+    for n in ("sys_vendor", "product_name", "chassis_asset_tag", "bios_vendor"):
+        p = f"{tmp0}/{n}"
+        if n in kv: open(p, "w").write(kv[n] + "\n")
+        elif os.path.exists(p): os.remove(p)
+    m._kernel_release = lambda: rel
+    return m.sub_label()
+for kv, want in (({"sys_vendor": "Google", "product_name": "Google Compute Engine"}, "Google"),
+                 ({"sys_vendor": "Amazon EC2", "product_name": "t3.micro"}, "AWS"),
+                 ({"sys_vendor": "Microsoft Corporation", "chassis_asset_tag": "7783-7084-3265-9085-8269-3286-77"}, "Azure"),
+                 ({"sys_vendor": "Microsoft Corporation", "product_name": "Virtual Machine"}, "VPS"),
+                 ({"sys_vendor": "QEMU", "chassis_asset_tag": "OracleCloud.com"}, "Oracle"),
+                 ({"sys_vendor": "Alibaba Cloud", "product_name": "Alibaba Cloud ECS"}, "Aliyun"),
+                 ({"sys_vendor": "Vultr", "product_name": "VC2"}, "Vultr"),
+                 ({"sys_vendor": "QEMU", "product_name": "Standard PC (i440FX + PIIX, 1996)", "bios_vendor": "SeaBIOS"}, "VPS"),
+                 ({"sys_vendor": "Red Hat", "product_name": "KVM"}, "VPS"),
+                 ({"sys_vendor": "Contabo GmbH"}, "Contabo"),
+                 ({}, "VPS")):
+    got = dmi(**kv)
+    check(f"{kv or '没有 DMI'} → {got}", got == want)
+check("甲骨文 DMI 写 QEMU：认内核 -oracle", dmi("6.8.0-1013-oracle", sys_vendor="QEMU") == "Oracle")
+check("谷歌云内核 -gcp", dmi("6.8.0-1015-gcp") == "Google")
+m.read_saved_links = lambda: ["x"]; m._split_tag = lambda n: ("🇭🇰", n); m._link_name = lambda u: u
+check("节点前缀改成什么都不影响名字", dmi(sys_vendor="QEMU") == "VPS")
+dmi(sys_vendor="Google")
 m.load_tokens = lambda: {"conf": "TokA_b-1"}; m._sub_https = lambda: True
-m._host = lambda: "sub.example"; m.sub_port = lambda: 31000; m._state_prefix = lambda: "🇭🇰"
-check(f"小火箭地址：{m.sub_url('conf')}", m.sub_url("conf") == "https://sub.example:31000/TokA_b-1/HK.conf")
+m._host = lambda: "sub.example"; m.sub_port = lambda: 31000
+check(f"小火箭地址：{m.sub_url('conf')}", m.sub_url("conf") == "https://sub.example:31000/TokA_b-1/Google.conf")
 
 # 2. 小服务：新老地址都能拉，token 错 404，不列目录
 tmp = tempfile.mkdtemp()
