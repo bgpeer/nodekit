@@ -2729,12 +2729,24 @@ def _sub_https():
     h = _host()
     return (not _is_ip(h)) and os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY)
 
+def sub_label():
+    """订阅地址末尾的名字：<token>/<名字>.<ext>。小火箭 / Clash 拿文件名当订阅名，原来显示的是 token，
+       截个图就把 token 漏了（仓库主人 10/19）。取本机节点前缀：国旗换成国家代码（🇭🇰→HK），
+       只留字母数字 _ -（中文进 URL 会被转成 %E4… 显示）；什么都不剩就叫 VPS。"""
+    try:
+        cur = next((p for p, _ in (_split_tag(_link_name(u)) for u in read_saved_links()) if p), "")
+    except Exception:
+        cur = ""
+    cur = cur or _state_prefix()
+    s = "".join(chr(ord(c) - 0x1F1E6 + 65) if 0x1F1E6 <= ord(c) <= 0x1F1FF else c for c in cur)
+    return re.sub(r"[^A-Za-z0-9_-]+", "", s)[:24] or "VPS"
+
 def sub_url(ext):
     t = load_tokens().get(ext)
     if not t:
         return "(未生成)"
     scheme = "https" if _sub_https() else "http"
-    return f"{scheme}://{_host()}:{sub_port()}/{t}.{ext}"
+    return f"{scheme}://{_host()}:{sub_port()}/{t}/{sub_label()}.{ext}"   # 老地址 /<token>.<ext> 照样能拉（见 _SUB_SERVER_PY）
 
 SUB_TITLES = {"yaml": "mihomo / Clash", "json": "sing-box", "conf": "小火箭 Shadowrocket",
               "srnodes": "小火箭 节点订阅（首页 ➕ → Subscribe）"}
@@ -2887,7 +2899,7 @@ def rotate_links_token():
 # 订阅托管小服务：静态发订阅文件；另带一个 /gh/ GitHub 中转（规则/图标走本机、不依赖外部 CDN / 反代）。
 # 中转和订阅共用同一端口（客户端本就从这端口拉订阅，无需额外放行）。多线程，中转不卡订阅。
 # 安全：中转只白名单 GitHub 几个主机——绝不做成"谁都能拿它转发任意网址"的开放代理。
-_SUB_SERVER_PY = r'''import http.server, ssl, sys, urllib.request, urllib.parse
+_SUB_SERVER_PY = r'''import http.server, ssl, sys, re, urllib.request, urllib.parse
 port = int(sys.argv[1]); directory = sys.argv[2]
 tokenfile = sys.argv[3]
 cert = sys.argv[4] if len(sys.argv) > 4 else ''
@@ -2917,6 +2929,10 @@ class H(http.server.SimpleHTTPRequestHandler):
         i = self.path.find('/gh/')       # 路径形如 /<token>/gh/<github-url>
         if i >= 0:
             self._relay(self.path[1:i], self.path[i + 4:]); return
+        # /<token>/<名字>.<ext> → /<token>.<ext>：名字只给客户端当订阅名显示，不参与鉴权；老地址照旧
+        m = re.match(r'^/([A-Za-z0-9_-]+)/[^/?#]+\.(yaml|json|conf|txt)(?=$|[?#])', self.path)
+        if m:
+            self.path = '/%s.%s' % (m.group(1), m.group(2))
         super().do_GET()
     def _relay(self, tok, target):
         ftok = ''
@@ -2972,6 +2988,18 @@ if cert and key:
     httpd.ctx = ctx
 httpd.serve_forever()
 '''
+
+def _sub_server_heal():
+    """xy-sub 小服务的脚本跟本版不一样（老装机）→ 换成本版并重启 xy-sub。只在内容变了时动一次。
+       这次是为了认 /<token>/<名字>.<ext> 新地址：不换的话面板给的新地址拉不到。"""
+    try:
+        if not os.path.exists(SUB_SERVER) or open(SUB_SERVER).read() == _SUB_SERVER_PY:
+            return False
+        open(SUB_SERVER, "w").write(_SUB_SERVER_PY)
+    except OSError:
+        return False
+    sh("systemctl restart xy-sub", check=False)
+    return True
 
 def serve_sub(reset=False, renew_port=True):
     """SUB_DIR 放 <token>.<ext> 软链指向各格式配置文件；每格式独立 token（存 TOKENS_FILE）。
@@ -3697,7 +3725,7 @@ def sr_nodes_url():
     t = load_tokens().get("conf")
     if not (t and sr_sub_mode() and os.path.exists(SR_NODES_FILE)):
         return ""
-    return f"{'https' if _sub_https() else 'http'}://{_host()}:{sub_port()}/{t}.txt"
+    return f"{'https' if _sub_https() else 'http'}://{_host()}:{sub_port()}/{t}/{sub_label()}.txt"
 
 def sr_onelink_heal():
     """仓库主人 10/12：「订阅应该做成一个链接最好，两个订阅链接人家导入进去说不能用」。#939 起新装默认
@@ -5429,6 +5457,8 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
     if sr_onelink_heal():                       # 小火箭订阅改回一个链接（节点写进配置），只动一次
         print(f"{time.strftime('%F %T')} 小火箭节点改回写在配置里（一个链接）")
+    if _sub_server_heal():                      # 订阅小服务换成认 /<token>/<名字>.<ext> 的版本
+        print(f"{time.strftime('%F %T')} 订阅服务已更新")
     n = _xray_pq_health()                       # 借用目标站换了短证书链：关掉抗量子签名，不然 xray 的 reality 全断
     if n:
         print(f"{time.strftime('%F %T')} 借用目标站证书链变短，{n} 个 xray reality 节点关掉了抗量子签名（订阅已重建）")
@@ -10720,6 +10750,8 @@ def main_menu():
         print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
     if sr_onelink_heal():
         print("  ✔ 小火箭改回一个链接：节点写进配置了，小火箭里那条节点订阅可以删掉")
+    if _sub_server_heal():
+        print("  ✔ 订阅地址末尾换成机器名（不再显示 token），老地址照样能用")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     if os.path.exists(CORE_CRON_FILE):
