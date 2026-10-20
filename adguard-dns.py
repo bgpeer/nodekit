@@ -1884,7 +1884,15 @@ def _selfdns_toggle():
     xy = BGP_DIR + "/xy-installer.py"
     if not os.path.exists(xy):
         print("  没找到主脚本(xy-installer.py)，请从主面板进入本菜单。"); return
-    subprocess.run(f"python3 {xy} selfdns-toggle", shell=True)
+    was = os.path.exists(SELFDNS_FLAG)
+    rc = subprocess.run(f"python3 {xy} selfdns-toggle", shell=True).returncode
+    # 结果自己再核一遍、停一下再回菜单：仓库主人 10/20 选 6 屏上一个字没出就回了菜单、也没写进去，
+    # 第二次直接跑主脚本又好了，没复现出来。至少别再「悄悄没反应」：退出码不是 0、或者要写却没写进去，都说一行
+    if rc:
+        print("  " + _hl("1;31", f"⚠ 主脚本出错退出（退出码 {rc}），没改动；直接跑看原因：python3 {xy} selfdns-toggle"))
+    elif not was and not os.path.exists(SELFDNS_FLAG):
+        print("  " + _hl("1;33", "⚠ 自建 DNS 没写进订阅（原因见上面；没有原因就再选一次 6）"))
+    _ask("  按回车返回菜单…")
 
 def _ios_fetch(dom, port, path):
     """从本机拉一遍描述文件（SNI 用域名，连本机，不出网）：→ (ServerName 或 '', 出错原因)。
