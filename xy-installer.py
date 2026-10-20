@@ -1996,7 +1996,7 @@ def sb_vless_vision(port, tag):
 #   3. 客户端侧另有三个按【节点类型】分发的地方，新协议若走了新的传输方式才要动：
 #        link_to_proxy()     分享链接 -> mihomo 节点（按 scheme/type 通用解析，通常不用动）
 #        proto_key()         mihomo 节点 -> 协议键（决定 sing-box 订阅里映射到哪个 tag）
-#        shadowrocket_line() mihomo 节点 -> 小火箭行（不支持的返回 None 自动跳过）
+#        shadowrocket_line() mihomo 节点 -> 小火箭行（不支持的返回 None 自动跳过：httpupgrade、量子加密）
 #   其余地方（安装/增量添加/删除/自签告警/UDP 冲突检测/确认框）全部读这张表，
 #   不要再往那些流程里写协议名——写死一个名字，就是下一个没人记得的坑。
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3489,7 +3489,7 @@ def shadowrocket_line(name, d):
     t = d.get("type"); srv = d["server"]; port = d.get("port")
     sni = d.get("servername") or d.get("sni") or srv
     net, wo = d.get("network"), d.get("ws-opts") or {}
-    if net == "xhttp" or d.get("encryption") or str(wo.get("v2ray-http-upgrade")).lower() == "true":
+    if d.get("encryption") or str(wo.get("v2ray-http-upgrade")).lower() == "true":
         return None
     tls = [f"peer={sni}"] + (["allowInsecure=1"] if str(d.get("skip-cert-verify")).lower() == "true" else [])
     # ws 的路径 / Host 在小火箭配置行里叫 obfs-uri / obfs-host（跟它的 Snell 行同名），不是分享链接里的 path / obfsParam。
@@ -3509,6 +3509,11 @@ def shadowrocket_line(name, d):
             # grpc 服务名跟 ws 路径一样写 obfs-uri（不带 /）：10/20 仓库主人苹果实测，path= / obfsParam= / grpc-service-name=
             # 全超时，obfs-uri=服务名 通；写成 obfs-uri=/服务名 不通
             p += ["obfs=grpc", f"obfs-uri={(d.get('grpc-opts') or {}).get('grpc-service-name', '')}"]
+        elif net == "xhttp":
+            # xhttp 同一套：obfs=xhttp,obfs-uri=路径,obfs-host=Host。10/20 仓库主人苹果实测 xhttp-tls / reality-xhttp 都通；
+            # path= + obfsParam= 不通，obfs=splithttp 不通（量子加密的 xhttp 上面已经跳过，配置行写不了 VLESS Encryption）
+            xo = d.get("xhttp-opts") or {}
+            p += ["obfs=xhttp", f"obfs-uri={xo.get('path') or '/'}", f"obfs-host={xo.get('host') or sni}"]
         else:
             p += ws or ["obfs=none"]
         return ",".join(p + ["udp=1", "tfo=1"])
