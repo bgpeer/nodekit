@@ -2070,7 +2070,7 @@ def _td_ws_front(plan=False):
        不重写的话，那条 path 还挂在 nginx 上、反代到一个已经没人听的本地端口，
        客户端拿到的是 502 而不是「节点没了」，排查起来更费劲。
        只在 nginx 真的前置着 ws 时才动它（reality 绑 443 的布局下 ws 走自己的端口）。"""
-    if not _nginx_front():
+    if not _nginx_front() or G.get("sni_split"):          # sni-split 的 443 归 stream，这里写会抢 443；由 _sni_split_shrink 收拾
         return ""
     if plan:
         return "nginx 443 上对应的 location 反代"
@@ -11350,6 +11350,13 @@ def _rebuild_nginx_ws_from_cfg():
             NGINX_WS.append({"path": path, "port": port})
     return list(NGINX_WS)
 
+def _sni_split_shrink():
+    """sni-split 下挂在 nginx 后面的节点一个不剩了：分流表收成只有本机域名 / 默认 → 本地 https（伪装站），
+       ws 反代清空。就是 write_nginx_sni_split 本身，两张表空着写；nginx -t 不过它自己整体回滚。"""
+    NGINX_WS.clear(); NGINX_STREAM.clear()
+    return ("nginx 443 分流已收成只剩伪装站" if write_nginx_sni_split()
+            else "⚠ nginx 分流重写没通过校验，已回滚原配置（指向已删节点的分流还在，不影响伪装站）")
+
 def _nginx_backed(names):
     """这些 sb 协议里，哪些的入站是挂在 nginx 后面的（监听 127.0.0.1）。
 
@@ -11409,9 +11416,13 @@ def del_protocols_flow(st, have_sb, have_xr):
 
     # sni-split 下 nginx 是 stream 分流 + 本地 https server 两层，443 的走向依赖具体后端；
     # 删了它的后端再去重建这套结构，出错就是整个 443 崩掉。挡住，让走重装。
+    # 例外：挂在 nginx 后面的一个不剩（「全部删除」就是这样）——那就不用重建后端，只把分流收成
+    # 「只剩伪装站」（_sni_split_shrink），跟装好时的结构一样，nginx -t 不过整体回滚。
+    split_shrink = False
     if G.get("sni_split"):
         backing = _nginx_backed(del_sb)
-        if backing:
+        split_shrink = bool(backing) and not [n for n in _nginx_backed(have_sb) if n not in del_sb]
+        if backing and not split_shrink:
             print(f"{RED}  ✗ 本机开着 nginx SNI 分流，443 的走向依赖 "
                   f"{', '.join(backing)} 做后端。{OFF}")
             print("    删它们要重建整套 nginx 结构，增量模式不碰。请走『全部重新安装』。")
@@ -11433,6 +11444,8 @@ def del_protocols_flow(st, have_sb, have_xr):
         what = td(plan=True)
         if what:
             print("  连带清理:     ", what)
+    if split_shrink:
+        print("  连带清理:      nginx 443 分流去掉这些后端，只留伪装站")
     if not left_sb:
         print(f"{RED}  ⚠ sing-box 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
     if not left_xr and have_xr:
@@ -11545,6 +11558,12 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
         except Exception as e:
             print(f"{RED}  ⚠ 善后清理失败（{getattr(td, '__name__', td)}），"
                   f"可能有残留，需手工确认：{e}{OFF}")
+
+    if G.get("sni_split") and ok_sb and not _nginx_backed([_ib_proto(ib) for ib in _load_core_cfg("sb")[1]]):
+        try:
+            print("  " + _sni_split_shrink())
+        except Exception as e:
+            print(f"{RED}  ⚠ nginx 分流收尾失败，可能有残留，需手工确认：{e}{OFF}")
 
     # 摘掉对应的分享链接（CDN 节点的协议段是 CDN·xxx，天然不会命中，不受影响）
     links, tail = _node_file_parts()
