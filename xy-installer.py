@@ -2561,6 +2561,10 @@ def link_to_proxy(u):
         net = qs.get("type", "tcp"); sec = qs.get("security", "none")
         d = {"name": nm("vless"), "type": "vless", "server": host, "port": port, "uuid": P.username, "udp": "true"}
         if qs.get("flow"): d["flow"] = qs["flow"]
+        # UDP 走 xudp（对齐 mack-a v3.5.26「为 Reality Vision 节点添加 xudp 编码」，仓库主人 10/20 要加）：
+        # sing-box 订阅早就是 packet_encoding xudp（mihomo_to_sb_outbound），小火箭不写也默认 xudp，只有 mihomo 缺。
+        # mack-a 只加 reality-vision，这里跟 sing-box 订阅一样所有 vless 都加——两个核心的 vless 入站都认 xudp
+        d["packet-encoding"] = "xudp"
         # VLESS Encryption（CDN量子加密）：mihomo 1.19.13+ 认 encryption 字段；"none" 等于没开，不写
         if qs.get("encryption", "none") not in ("", "none"): d["encryption"] = qs["encryption"]
         d["tls"] = "true"; d["client-fingerprint"] = qs.get("fp", "chrome")
