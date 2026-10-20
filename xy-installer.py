@@ -3492,11 +3492,11 @@ def shadowrocket_line(name, d):
     if net == "xhttp" or d.get("encryption") or str(wo.get("v2ray-http-upgrade")).lower() == "true":
         return None
     tls = [f"peer={sni}"] + (["allowInsecure=1"] if str(d.get("skip-cert-verify")).lower() == "true" else [])
-    # ws 走 TLS 时钉死 alpn=http/1.1：服务端 443 那个 nginx 开着 HTTP/2，小火箭不写 alpn 会协商成 h2，
-    # ws 升级只认 HTTP/1.1，h2 上建不起来——C 测试（真走代理）超时，T 测试（只连端口）却是绿的。
-    # 10/18 仓库主人朋友的苹果实测：yaml（mihomo 自己钉 http/1.1）通、小火箭 ws 不通；服务器本机 curl --http1.1 → 101、--http2 → 握手失败。
-    ws = (["obfs=websocket", f"path={wo.get('path') or '/'}", f"obfsParam={(wo.get('headers') or {}).get('Host') or sni}"]
-          + (["alpn=http/1.1"] if str(d.get("tls")).lower() == "true" or t == "trojan" else [])
+    # ws 的路径 / Host 在小火箭配置行里叫 obfs-uri / obfs-host（跟它的 Snell 行同名），不是分享链接里的 path / obfsParam。
+    # 10/20 仓库主人苹果实测同一组节点五种写法：path + obfsParam（加不加 alpn=http/1.1、Host 写成 JSON）全超时，
+    # 只写 obfs-uri + obfs-host 的 vless-ws / vmess-ws（经 nginx 443）和 vless-ws²（xray 直连）全通。
+    # 10/18 以为是 nginx 开着 h2、加了 alpn=http/1.1，实测不是：小火箭读不到 path，请求打到伪装站首页（nginx 日志 200 不是 101）。
+    ws = (["obfs=websocket", f"obfs-uri={wo.get('path') or '/'}", f"obfs-host={(wo.get('headers') or {}).get('Host') or sni}"]
           if net == "ws" else [])
     if t == "vless":
         p = [f"{name} = vless", srv, str(port), f"password={d['uuid']}", "tls=true", *tls]
