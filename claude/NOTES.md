@@ -45,6 +45,16 @@
 - **网页播放器放不了很多 mkv**（HEVC / DTS），测能不能播要用 Hills / Emby 客户端。
 - 会话容器会被回收，scratchpad 会清空：测试、笔记一律放仓库 `claude/`。
 
+## 小火箭配置行（10/20 苹果实测，结论已写进 shadowrocket_line）
+
+- 路径 / Host / grpc 服务名：`obfs-uri=` / `obfs-host=`，**不是**分享链接里的 `path=` / `obfsParam=`（那样小火箭读不到，
+  请求打到伪装站首页，nginx 日志 200 不是 101）。ws：`obfs=websocket`；httpupgrade：`obfs=httpupgrade`；
+  grpc：`obfs=grpc,obfs-uri=服务名`（不带 /）；xhttp：`obfs=xhttp,obfs-uri,obfs-host`。`alpn=http/1.1` 不是解药，别加回去。
+- 小火箭握手带 X25519MLKEM768（指纹 Safari26_3）：xray 26.9.8+ 的 reality（²）小火箭能连，不再跳过。
+- 还没测出来：VLESS Encryption（量子加密）在配置行里的参数名，目前跳过；单条链接导入实测能连。
+- 测写法用 `claude/tools/srtest.py`：同一节点放几种写法生成测试订阅，手机 C 测试一轮就定，别一次猜一种。
+- 订阅 .conf 加到小火箭首页刷新报「不能获取订阅节点」：小火箭没连接时直连订阅端口，可能被干扰；先连节点再刷新。
+
 ## 仓库主人的偏好
 
 - 屏上精简、整齐；危险操作醒目一行 + 默认否；功能不许悄悄删。
