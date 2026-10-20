@@ -1996,7 +1996,7 @@ def sb_vless_vision(port, tag):
 #   3. 客户端侧另有三个按【节点类型】分发的地方，新协议若走了新的传输方式才要动：
 #        link_to_proxy()     分享链接 -> mihomo 节点（按 scheme/type 通用解析，通常不用动）
 #        proto_key()         mihomo 节点 -> 协议键（决定 sing-box 订阅里映射到哪个 tag）
-#        shadowrocket_line() mihomo 节点 -> 小火箭行（不支持的返回 None 自动跳过：httpupgrade、量子加密）
+#        shadowrocket_line() mihomo 节点 -> 小火箭行（不支持的返回 None 自动跳过：量子加密）
 #   其余地方（安装/增量添加/删除/自签告警/UDP 冲突检测/确认框）全部读这张表，
 #   不要再往那些流程里写协议名——写死一个名字，就是下一个没人记得的坑。
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3489,14 +3489,18 @@ def shadowrocket_line(name, d):
     t = d.get("type"); srv = d["server"]; port = d.get("port")
     sni = d.get("servername") or d.get("sni") or srv
     net, wo = d.get("network"), d.get("ws-opts") or {}
-    if d.get("encryption") or str(wo.get("v2ray-http-upgrade")).lower() == "true":
+    if d.get("encryption"):
         return None
     tls = [f"peer={sni}"] + (["allowInsecure=1"] if str(d.get("skip-cert-verify")).lower() == "true" else [])
     # ws 的路径 / Host 在小火箭配置行里叫 obfs-uri / obfs-host（跟它的 Snell 行同名），不是分享链接里的 path / obfsParam。
     # 10/20 仓库主人苹果实测同一组节点五种写法：path + obfsParam（加不加 alpn=http/1.1、Host 写成 JSON）全超时，
     # 只写 obfs-uri + obfs-host 的 vless-ws / vmess-ws（经 nginx 443）和 vless-ws²（xray 直连）全通。
     # 10/18 以为是 nginx 开着 h2、加了 alpn=http/1.1，实测不是：小火箭读不到 path，请求打到伪装站首页（nginx 日志 200 不是 101）。
-    ws = (["obfs=websocket", f"obfs-uri={wo.get('path') or '/'}", f"obfs-host={(wo.get('headers') or {}).get('Host') or sni}"]
+    # httpupgrade（mihomo 里是 ws + v2ray-http-upgrade）写 obfs=httpupgrade，路径 / Host 同 ws：10/20 同一轮实测，
+    # http-upgrade、websocket 加 httpupgrade=1 / v2ray-http-upgrade=true、path= + obfsParam= 都不通
+    hu = str(wo.get("v2ray-http-upgrade")).lower() == "true"
+    ws = ([f"obfs={'httpupgrade' if hu else 'websocket'}", f"obfs-uri={wo.get('path') or '/'}",
+           f"obfs-host={(wo.get('headers') or {}).get('Host') or sni}"]
           if net == "ws" else [])
     if t == "vless":
         p = [f"{name} = vless", srv, str(port), f"password={d['uuid']}", "tls=true", *tls]
