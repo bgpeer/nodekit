@@ -355,14 +355,16 @@ def sub_port():
        更新脚本、更新配置都用同一个端口，订阅 URL 稳定；只有重装换节点时
        才随 token 一起换新端口（见 renew_sub_port）。"""
     global _SUB_PORT
-    if _SUB_PORT:
-        return _SUB_PORT
+    # 每次先读文件、不先信缓存：重装是后台进程跑的（_node_op_dispatch），它换了端口写进文件，
+    # 前台菜单进程缓存的还是旧端口——10/20 仓库主人重装后「14 GitHub 中转」还显示旧端口。
     try:
         p = int(open(SUBPORT_FILE).read().strip())
         if 1024 <= p <= 65535:
             _SUB_PORT = p; return p
     except (OSError, ValueError):
         pass
+    if _SUB_PORT:
+        return _SUB_PORT
     try:                                        # 老安装：沿用服务里正在用的端口
         m = re.search(r"xy-sub-server\.py (\d+)", open("/etc/systemd/system/xy-sub.service").read())
         if m:
@@ -4818,6 +4820,9 @@ def build_subscription(all_links, new_token=False):
     # 订阅地址是新端口，里面的中转地址全是旧端口，规则集一个都拉不下来（仓库主人实测撞上）。
     if new_token:
         renew_sub_port()
+        # 中转 token 一起换（仓库主人 10/20：重装订阅全换新了，中转还是老 token 让人误会）。同样要在生成配置之前
+        open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))
+        harden_perms()
     for ext, meta in FMT.items():
         try:
             meta["gen"](ylines, nodes, tpl_url_current(ext))   # 跟随该格式当前选的模板
