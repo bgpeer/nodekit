@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""小火箭写进本机 xray 内核的 vision² —— 仓库主人 10/18：「vision²」。
-  xray 26.9.8+ 只收带 X25519MLKEM768 的 ClientHello，小火箭现在连不上，但照写（哪天小火箭带上就能用）；
-  本机 xray 内核的其余 reality（grpc / xhttp）照旧跳过，屏上一行说明跳过几条。
+"""小火箭配置照写本机 xray 内核的 reality —— 10/18 先放行 vision²；10/20 仓库主人苹果实测小火箭里 vision² 通了
+  （小火箭带 X25519MLKEM768，指纹 Safari26_3），不再跳过 xray 的 reality。grpc 服务名写 obfs-uri（同日实测：
+  path= / obfsParam= / grpc-service-name= / obfs-uri=/服务名 都超时，obfs-uri=服务名 通）。xhttp 小火箭配置行不支持，照旧不写。
 """
 import os, sys, io, json, tempfile, contextlib, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,7 +28,8 @@ with contextlib.redirect_stdout(buf):
     m.build_shadowrocket_sub(nodes, "u")
 conf = open(m.SR_FILE).read() if os.path.exists(m.SR_FILE) else ""
 v2 = [l for l in conf.splitlines() if l.startswith("reality-vision² = ")]
+g2 = [l for l in conf.splitlines() if l.startswith("reality-grpc² = ")]
 check(f"vision² 写进配置，带 xtls=2 和 reality 公钥（{v2}）", len(v2) == 1 and ",xtls=2" in v2[0] and "publicKey=K" in v2[0])
-check("xray 内核的 grpc reality 照旧不写", "reality-grpc² = " not in conf)
-check(f"屏上一行：跳过 1 条（{buf.getvalue().strip()}）", "小火箭跳过 1 条 xray 内核的 reality" in buf.getvalue())
+check(f"grpc² 也写进配置，服务名写 obfs-uri=g（{g2}）", len(g2) == 1 and ",obfs=grpc,obfs-uri=g," in g2[0] and "path=" not in g2[0])
+check(f"屏上不再印「小火箭跳过」（{buf.getvalue().strip()}）", "小火箭跳过" not in buf.getvalue())
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)

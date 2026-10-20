@@ -3506,7 +3506,9 @@ def shadowrocket_line(name, d):
         if ro:
             p += [f"publicKey={ro.get('public-key', '')}", f"shortId={ro.get('short-id', '')}"]
         if net == "grpc":
-            p += ["obfs=grpc", f"path={(d.get('grpc-opts') or {}).get('grpc-service-name', '')}"]
+            # grpc 服务名跟 ws 路径一样写 obfs-uri（不带 /）：10/20 仓库主人苹果实测，path= / obfsParam= / grpc-service-name=
+            # 全超时，obfs-uri=服务名 通；写成 obfs-uri=/服务名 不通
+            p += ["obfs=grpc", f"obfs-uri={(d.get('grpc-opts') or {}).get('grpc-service-name', '')}"]
         else:
             p += ws or ["obfs=none"]
         return ",".join(p + ["udp=1", "tfo=1"])
@@ -3783,16 +3785,10 @@ def sr_onelink_heal():
 def build_shadowrocket_sub(nodes, tpl_url):
     sub = sr_sub_mode()
     lines, names_list, links = [], [], []
-    xr_reality, xr_skip = _local_xray_reality(), 0
     for key, d in nodes:
         name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
-        # 本机 xray 内核的 reality：xray 26.9.8+ 只收 ClientHello 带 X25519MLKEM768 的客户端，小火箭 2.2.92 没带，
-        # 握手被当成探测转去借用站（小火箭官方 config 仓库 issue #4，9 月底还开着）。
-        # 例外 vision²：仓库主人 10/18「vision²」要写进来（小火箭哪天带上 MLKEM 就能直接用），其余照旧不写。
-        if (d.get("reality-opts") and d.get("flow") != "xtls-rprx-vision"
-                and (str(d.get("server", "")), int(d.get("port") or 0)) in xr_reality):
-            xr_skip += 1
-            continue
+        # 本机 xray 内核的 reality 照写：原先以为小火箭不带 X25519MLKEM768、连不上 xray 26.9.8+ 而跳过，
+        # 10/20 仓库主人苹果实测小火箭配置里的 vision² 通了（指纹 Safari26_3），不再跳过（xhttp 照旧不写，见 shadowrocket_line）
         if sub:
             # 节点订阅照抄分享链接：小火箭不支持 xhttp，跳过；量子加密（VLESS Encryption）单条导入
             # 仓库主人实测能连，照收（写在配置里的写法查不到支不支持，所以那边还是跳过）
@@ -3817,8 +3813,6 @@ def build_shadowrocket_sub(nodes, tpl_url):
     out = _sr_fill_names(out, names_frag)                       # 行内锚点（按行去重）
     out = _sr_cn_isolate(out, names_list + static, regex=sub)
     open(SR_FILE, "w").write(out)
-    if xr_skip:
-        print(f"  小火箭跳过 {xr_skip} 条 xray 内核的 reality（小火箭连不上，mihomo 照常有）")
     if sub:
         open(SR_NODES_FILE, "w").write(base64.b64encode(("\n".join(links) + "\n").encode()).decode())
         _sr_nodes_link()
