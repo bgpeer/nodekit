@@ -22,4 +22,9 @@ for nm, s in (("vless-ws", vl), ("vmess-ws", vm), ("trojan-ws", tj), ("明文 vm
           ",obfs=websocket,obfs-uri=/p,obfs-host=h.example.com," in s)
     check(f"{nm}：不再写 path= / obfsParam= / alpn=", not any(k in s for k in (",path=", "obfsParam=", "alpn=")))
 check(f"没写路径 / Host：obfs-uri=/、obfs-host 用 SNI（{nh}）", ",obfs-uri=/,obfs-host=s.example.com," in nh)
+# httpupgrade：10/20 实测 obfs=httpupgrade,obfs-uri,obfs-host 通（http-upgrade / websocket+开关 / path+obfsParam 不通）
+hu = L("h", dict(type="vmess", server="h.example.com", port=443, uuid="u", alterId=0, cipher="auto", tls=True, servername="h.example.com",
+                 network="ws", **{"ws-opts": {"path": "/hu", "headers": {"Host": "h.example.com"}, "v2ray-http-upgrade": True}}))
+check(f"vmess-httpupgrade：obfs=httpupgrade,obfs-uri=/hu,obfs-host=h.example.com（{hu}）",
+      hu and ",obfs=httpupgrade,obfs-uri=/hu,obfs-host=h.example.com," in hu and "websocket" not in hu)
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)
