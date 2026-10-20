@@ -2114,7 +2114,7 @@ def _asks_reality(mode):
        当伪装 Host，见 tls_host()），不能挪进来按协议问。"""
     if mode != "add":
         return
-    ans = _ask(f"\n  reality 借用目标 SNI（回车沿用上次的 {G['sni']}）: ").strip()
+    ans = _ask(f"\n  reality 借用目标 SNI（回车沿用当前的 {G['sni']}，或输入别的域名）: ").strip().lower().rstrip(".")
     if ans:
         G["sni"] = ans
     G["sni_auto"] = ""                                   # 沿用的是老节点正在用的，不自己换（新老节点要一致）
@@ -7214,6 +7214,11 @@ def change_sni_apply(new):
         on = sum(1 for v in pq.values() if v)
         print(f"  ✔ {on} 个 xray reality 节点开了抗量子签名" if on else
               f"  ⚠ 新目标站{_reality_pq_why(new)}，{len(pq)} 个 xray reality 节点关掉了抗量子签名")
+    try:                                                  # 安装记录跟着换：「只添加新协议」/ 重装默认沿用它（10/20 漏了，加协议还问老域名）
+        st = json.load(open(STATE_FILE)); st["sni"] = new
+        json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     G["host"] = _host()
     try:
         build_subscription(read_saved_links(), new_token=False)
@@ -11105,7 +11110,7 @@ def _link_hits(u, sb_protos, xr_protos):
 def _restore_state_to_G(st):
     """把上次安装的参数灌回 G，保证新加的节点跟老节点同域名/同 SNI/同前缀。"""
     G["domain"]     = st.get("domain", "")
-    G["sni"]        = st.get("sni") or G["sni"]
+    G["sni"]        = _current_sni() or st.get("sni") or G["sni"]   # 以节点正在用的为准：老版本「4 更换伪装域名」没回写记录
     G["prefix"]     = st.get("prefix", "")
     G["hy2_ports"]  = st.get("hy2_ports", "")
     G["nginx"]      = st.get("nginx", "")
