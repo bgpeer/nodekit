@@ -267,6 +267,13 @@ CFG_AUTO_FILE = BGP_DIR + "/cfg_auto.json"      # {"off": [关掉的格式], "ha
 CFG_AUTO_CRON = "/etc/cron.d/bgpeer-cfgupdate"
 CFG_AUTO_LOG  = "/var/log/bgpeer-cfgupdate.log"
 CFG_AUTO_AT   = (3, 20)                          # 北京时间
+# 脚本本体每天自动更新：北京时间 02:50 调 `self-update`，排在凌晨所有活最前面（03:00 cn-block 刷新、03:10 每月 nginx
+# 升级、03:20 三大配置、03:30 Emby 元数据、04:00 每月内核……），后面的活直接用新版。跟「配置自动更新」分开管：
+# 关了配置自动更新，脚本照样更新（仓库主人 10/21）。开关在菜单 18。
+SELFUPD_CRON = "/etc/cron.d/bgpeer-selfupdate"
+SELFUPD_LOG  = "/var/log/bgpeer-selfupdate.log"
+SELFUPD_OFF  = BGP_DIR + "/selfupdate.off"       # 有这个文件 = 关
+SELFUPD_AT   = (2, 50)                           # 北京时间
 CERT_FIX_LOG   = "/var/log/bgpeer-certfix.log"   # 证书修复日志（转后台跑，SSH 断了也查得到）
 NODE_OP_LOG    = "/var/log/bgpeer-nodeop.log"    # 装/加/删协议日志（同上，转后台跑）
 NODE_OP_PLAN   = BGP_DIR + "/nodeop.json"        # 交互里选好的方案，交给后台那半程去执行
@@ -5159,6 +5166,7 @@ def run(sb_names, xr_names):
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
     setup_cfg_auto_cron()                                # 三大配置每天北京 03:20 按当前模板自动更新
+    setup_selfupd_cron()                                 # 脚本本体每天北京 02:50 自动更新（菜单 18 开关）
     if sched:
         print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 19 手动立即更新。')
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
@@ -5480,10 +5488,9 @@ def cfg_auto_run():
 
        不动节点、不换 token、不重启任何服务——订阅目录里是指向配置文件的软链，文件换了客户端
        下次拉就是新的，xy-sub 不用重启（重启那一下正好有客户端在拉就会失败一次）。
-       生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。
-       开头先把脚本本体更新到最新（_auto_self_update），不上服务器的人也能用上新版。"""
-    _auto_self_update()
-    setup_cfg_auto_cron()                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
+       生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。"""
+    setup_cfg_auto_cron()
+    setup_selfupd_cron()                        # 老装机补上脚本每日自动更新（开关在菜单 18）                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                # 内核每月那条也一起对齐（老装机是按 6 月写死的）
     _heal_other_crons()
@@ -5674,11 +5681,8 @@ def _vt(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or ""))
 
 def _auto_self_update():
-    """每天 03:20 先把脚本本体拉到最新再干活（仓库主人 10/21：有的人不上服务器、不开面板，脚本就一直停在老版本，
-       修的 bug、加的功能都用不上）。拉不到、版本没变新、新版连语法都过不了 → 什么都不动，照旧用本地这份。
-       换成新版后 execv 重跑 cfg-auto，让今天这一轮就用新版；环境变量挡住二次更新，不会来回跳。"""
-    if os.environ.get("BGPEER_SELFUPD"):
-        return False
+    """脚本本体更新到最新（每天 02:50 的 self-update 调；仓库主人 10/21：有的人不上服务器、不开面板，脚本就一直停在
+       老版本，修的 bug、加的功能都用不上）。拉不到、版本没变新、新版连语法都过不了 → 什么都不动。换上了返回 True。"""
     try:
         latest = fetch_url(_RAW + "xy-installer.py")
     except Exception as e:
@@ -5694,9 +5698,60 @@ def _auto_self_update():
         return False
     install_shortcut(latest)
     print(f"{time.strftime('%F %T')} 脚本自动更新 v{SCRIPT_VERSION} → v{new}")
-    os.environ["BGPEER_SELFUPD"] = "1"
-    import sys
-    os.execv(sys.executable, [sys.executable, SELF_LOCAL, "cfg-auto"])
+    return True
+
+def selfupd_on():
+    return not os.path.exists(SELFUPD_OFF)
+
+def setup_selfupd_cron():
+    """装 / 撤脚本每天 02:50 自动更新的 cron（按开关；时区 / 夏令时换算见 bj_cron_lines，进排队器）。幂等。"""
+    try:
+        if not selfupd_on():
+            if os.path.exists(SELFUPD_CRON):
+                os.remove(SELFUPD_CRON)
+            return True
+        if os.path.abspath(__file__) != SELF_LOCAL and not os.path.exists(SELF_LOCAL):
+            os.makedirs(BGP_DIR, exist_ok=True)
+            shutil.copy(os.path.abspath(__file__), SELF_LOCAL)
+        lines, times = bj_job_lines(*SELFUPD_AT, "selfupdate", f"python3 {SELF_LOCAL} self-update >> {SELFUPD_LOG} 2>&1")
+        txt = (f"# bgpeer 脚本每日自动更新（北京时间 {SELFUPD_AT[0]:02d}:{SELFUPD_AT[1]:02d}"
+               f" = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点，进排队器）\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               + "".join(l + "\n" for l in lines))
+        try:
+            if open(SELFUPD_CRON).read() == txt:
+                return True
+        except OSError:
+            pass
+        open(SELFUPD_CRON, "w").write(txt); os.chmod(SELFUPD_CRON, 0o644)
+        return True
+    except OSError:
+        return False
+
+def script_update_menu():
+    """菜单 18：立即更新 / 每天自动更新开关。"""
+    while True:
+        ui_title("更新脚本（不影响节点）")
+        ui_kv("当前版本", f"v{SCRIPT_VERSION}")
+        ui_line()
+        ui_items([(1, "立即更新", None),
+                  (2, "自动更新", f"开（每天 {SELFUPD_AT[0]:02d}:{SELFUPD_AT[1]:02d}）" if selfupd_on() else "关"),
+                  (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c == "1":
+            update_script(); return
+        if c == "2":
+            if selfupd_on():
+                open(SELFUPD_OFF, "w").write("1")
+            else:
+                try: os.remove(SELFUPD_OFF)
+                except OSError: pass
+            ok = setup_selfupd_cron()
+            print(f"  ✔ 自动更新已{'开' if selfupd_on() else '关'}" if ok else "  ⚠ 定时任务没写进去（/etc/cron.d 写不了？）")
+            continue
+        if c in ("0", ""):
+            return
 
 def update_script():
     """只更新脚本本体到最新，不动节点、不改配置；有新版则自动重载新版面板。"""
@@ -6246,7 +6301,7 @@ def _uninstall_core():
              "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", WEBROOT,
              # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
              "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
-             CORE_CRON_FILE, CORE_CRON_LOG, CFG_AUTO_CRON, CFG_AUTO_LOG]
+             CORE_CRON_FILE, CORE_CRON_LOG, CFG_AUTO_CRON, CFG_AUTO_LOG, SELFUPD_CRON, SELFUPD_LOG]
     if not _keep_cert:
         # 证书是节点签的，没人用就跟着走
         paths.append("/etc/ssl/sb")
@@ -10829,6 +10884,7 @@ def main_menu():
         print("  ✔ 订阅地址末尾换成机器名（不再显示 token），老地址照样能用")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
+    setup_selfupd_cron()                         # 老装机补上脚本每日自动更新（默认开，菜单 18 关）
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                 # 老装机那条是按 6 月写死的，换成冬夏两季都对的写法
     _heal_other_crons()                          # cn-block 03:00 / 网络优化 nginx 月度：换成冬夏两季都对的写法
@@ -10889,7 +10945,7 @@ def main_menu():
         elif c == "15":  cert_menu()
         elif c == "16":  media_stack_menu()
         elif c == "17":  vps_check_menu()
-        elif c == "18":  update_script()
+        elif c == "18":  script_update_menu()
         elif c == "19":  update_cores()
         elif c == "20":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
@@ -11787,6 +11843,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单19 转后台都调这个
         update_cores_auto(sys.argv[2] if len(sys.argv) > 2 else None)   # 可选 sing-box/xray/both
+        sys.exit(0)
+    if sys.argv[1] == "self-update":     # cron 每天北京 02:50：脚本本体更新到最新（菜单 18 开关）
+        _auto_self_update()
         sys.exit(0)
     if sys.argv[1] == "cfg-auto":        # cron 每天北京 03:20：三大配置按当前模板自动更新
         cfg_auto_run()
