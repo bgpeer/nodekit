@@ -5480,7 +5480,9 @@ def cfg_auto_run():
 
        不动节点、不换 token、不重启任何服务——订阅目录里是指向配置文件的软链，文件换了客户端
        下次拉就是新的，xy-sub 不用重启（重启那一下正好有客户端在拉就会失败一次）。
-       生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。"""
+       生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。
+       开头先把脚本本体更新到最新（_auto_self_update），不上服务器的人也能用上新版。"""
+    _auto_self_update()
     setup_cfg_auto_cron()                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                # 内核每月那条也一起对齐（老装机是按 6 月写死的）
@@ -5667,6 +5669,34 @@ def _script_ver(text):
     """从脚本源码里抠 SCRIPT_VERSION；老版本没有这行则返回 '?'。"""
     m = re.search(r'^SCRIPT_VERSION\s*=\s*"([^"]+)"', text, re.M)
     return m.group(1) if m else "?"
+
+def _vt(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+def _auto_self_update():
+    """每天 03:20 先把脚本本体拉到最新再干活（仓库主人 10/21：有的人不上服务器、不开面板，脚本就一直停在老版本，
+       修的 bug、加的功能都用不上）。拉不到、版本没变新、新版连语法都过不了 → 什么都不动，照旧用本地这份。
+       换成新版后 execv 重跑 cfg-auto，让今天这一轮就用新版；环境变量挡住二次更新，不会来回跳。"""
+    if os.environ.get("BGPEER_SELFUPD"):
+        return False
+    try:
+        latest = fetch_url(_RAW + "xy-installer.py")
+    except Exception as e:
+        print(f"{time.strftime('%F %T')} 脚本自动更新：拉不到新版（{e}），照旧用 v{SCRIPT_VERSION}")
+        return False
+    new = _script_ver(latest)
+    if _vt(new) <= _vt(SCRIPT_VERSION):
+        return False                                     # 已是最新（或镜像缓存还是旧的）：不动
+    try:
+        compile(latest, "xy-installer.py", "exec")         # 下了半截 / 坏文件：不换
+    except SyntaxError as e:
+        print(f"{time.strftime('%F %T')} 脚本自动更新：v{new} 校验没过（{e}），照旧用 v{SCRIPT_VERSION}")
+        return False
+    install_shortcut(latest)
+    print(f"{time.strftime('%F %T')} 脚本自动更新 v{SCRIPT_VERSION} → v{new}")
+    os.environ["BGPEER_SELFUPD"] = "1"
+    import sys
+    os.execv(sys.executable, [sys.executable, SELF_LOCAL, "cfg-auto"])
 
 def update_script():
     """只更新脚本本体到最新，不动节点、不改配置；有新版则自动重载新版面板。"""
