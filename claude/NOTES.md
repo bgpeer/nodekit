@@ -55,6 +55,15 @@
 - 测写法用 `claude/tools/srtest.py`：同一节点放几种写法生成测试订阅，手机 C 测试一轮就定，别一次猜一种。
 - 订阅 .conf 加到小火箭首页刷新报「不能获取订阅节点」：小火箭没连接时直连订阅端口，可能被干扰；先连节点再刷新。
 
+## nginx 443 后面挂了谁（10/22 起）
+
+- 挂在 nginx 后面 = 入站监听 127.0.0.1。sing-box：ws² 家族、sni-split 下的 reality-vision；xray：vless-ws、vmess-ws、
+  xhttp-tls（nginx 用 grpc_pass 进 h2c）、sni-split 下的 reality-vision（要跟 sing-box 用不同伪装域名才进分流）。
+- 两个核心各一个伪装域名：state 里 `sni` / `sni_xr`，`_xr_sni()` 取 xray 的；nginx stream 只能按 SNI 分，重复了分不开。
+- reality-grpc / reality-xhttp 留在自己的端口：跟 vision 同一个 SNI、ALPN 也一样，nginx 认不出该给谁。
+- 增删协议、换伪装域名后一律 `_nginx_sync_from_cfg()` 按两个核心【当前配置】重建反代表 + 分流表，nginx -t 不过放回原文件。
+- pq（pqv）按 UUID 对链接，不按端口（挂 nginx 后链接端口都是 443）。
+
 ## 仓库主人的偏好
 
 - 屏上精简、整齐；危险操作醒目一行 + 默认否；功能不许悄悄删。

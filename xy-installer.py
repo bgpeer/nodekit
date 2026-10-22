@@ -1012,9 +1012,22 @@ def _V6_80():
     return _v6("  listen [::]:80;\n")       # 单独拎出来：f-string 里不能写反斜杠（老 Python）
 
 def _nginx_ws_locations():
-    """ws 家族的 location 反代块（供 443 或本地 https server 复用）。"""
+    """ws 家族 / xhttp 的 location 反代块（供 443 或本地 https server 复用）。"""
     locs = ""
     for w in NGINX_WS:
+        if w.get("kind") == "xhttp":
+            # xray 的 xhttp 挂 nginx 后面：后端是 xray 明文 h2c，nginx 用 grpc_pass 转（XTLS 官方 nginx 示例同做法），
+            # stream-one / stream-up / packet-up 三种上行都走得通；proxy_pass(http/1.1) 只有 packet-up 能用。
+            # xhttp 的路径后面还会跟 /会话ID/序号，所以这里是前缀匹配（ws 是精确匹配）。
+            locs += (f"  location {w['path']}/ {{\n"
+                     f"    client_max_body_size 0;\n"
+                     f"    client_body_timeout 1h;\n"
+                     f"    grpc_read_timeout 1h;\n"
+                     f"    grpc_send_timeout 1h;\n"
+                     f"    grpc_set_header Host $host;\n"
+                     f"    grpc_set_header X-Real-IP $remote_addr;\n"
+                     f"    grpc_pass grpc://127.0.0.1:{w['port']};\n  }}\n")
+            continue
         locs += (f"  location = {w['path']} {{\n"
                  # 路径被人摸到、拿普通 GET 来试：直接断连接（mack-a 同做法）。以前是原样转给后端，
                  # sing-box / xray 回一个 400 Bad Request——一眼看出后面挂着代理
@@ -1296,28 +1309,32 @@ def _pick_ok_sni(exclude=(), tries=6):
             return cand
     return None
 
-def _sni_precheck_one():
-    """探一次当前 G["sni"] 够不够格给 reality 借用（不阻断安装）。
-       回车随机挑的（G["sni_auto"]）探不过：从池里另挑一个探得通的换上——那是脚本自己挑的，
-       不该拿个不合格的装（仓库主人 10/11 撞上：随机到 updates.cdn-apple.com，从那台机器 TLS1.3 握手不成功，
-       旧版照装还说「按你填的继续装」）。池里同一个站在不同地区的机房表现不一，探过才算数。
+def _sni_precheck_one(key="sni", avoid=""):
+    """探一次 G[key]（"sni" = sing-box / "sni_xr" = xray 的伪装域名）够不够格给 reality 借用（不阻断安装）。
+       回车随机挑的（G[key + "_auto"]）探不过：从池里另挑一个探得通的换上（避开 avoid = 另一个核心的）——
+       那是脚本自己挑的，不该拿个不合格的装（仓库主人 10/11 撞上：随机到 updates.cdn-apple.com，从那台机器
+       TLS1.3 握手不成功，旧版照装还说「按你填的继续装」）。池里同一个站在不同地区的机房表现不一，探过才算数。
        自己填的不替人换，一行提示；装好后可在「4 更换伪装域名」里换。"""
-    ok, detail = _reality_sni_ok(G["sni"])
-    if ok:
-        print(f"  reality 借用目标 {G['sni']}: {detail}")
+    if not G.get(key):
         return
-    if G.get("sni_auto"):
-        new = _pick_ok_sni({G["sni"]})
+    ok, detail = _reality_sni_ok(G[key])
+    if ok:
+        print(f"  reality 借用目标 {G[key]}: {detail}")
+        return
+    if G.get(key + "_auto"):
+        new = _pick_ok_sni({G[key], avoid} - {""})
         if new:
-            print(f"  ✔ reality 借用目标换成 {new}（随机挑到的 {G['sni']} 从本机探不过：{detail}）")
-            G["sni"] = new
+            print(f"  ✔ reality 借用目标换成 {new}（随机挑到的 {G[key]} 从本机探不过：{detail}）")
+            G[key] = new
             return
-    ui_tip(f"reality 借用目标 {G['sni']} 从本机探不过：{detail}；装好后可在「4 更换伪装域名」里换")
+    ui_tip(f"reality 借用目标 {G[key]} 从本机探不过：{detail}；装好后可在「4 更换伪装域名」里换")
 
 def precheck_sni(sb_names, xr_names):
-    """选了 reality 类协议时，装前探一次借用目标。选没选据注册表判断，不靠名字前缀。"""
+    """选了 reality 类协议时，装前探一次借用目标（两个核心各一个的话各探各的）。选没选据注册表判断，不靠名字前缀。"""
     if proto_flag("reality", sb_names, xr_names):
-        _sni_precheck_one()
+        _sni_precheck_one("sni", avoid=G.get("sni_xr", ""))
+    if G.get("sni_xr") and proto_flag("reality", (), xr_names):
+        _sni_precheck_one("sni_xr", avoid=G["sni"])
 
 def selfsigned_risky(sb_names, xr_names):
     """没域名时只能自签的协议：依赖证书的 TLS 类 + tuic。证书冒充借用的大站、却不是那家签的，
@@ -1992,7 +2009,7 @@ def sb_vless_vision(port, tag):
 #   2. 在下面的表里加一行 PROTO(...)，据实填这几项（不填=没有这个性质）：
 #        udp=True       入站是 UDP（hy2 跳跃段的冲突检测据此判断会不会被劫走）
 #        reality=True   reality 类（借用 SNI 的预检、443 优先级要用）
-#        ws_front=True  nginx 前置时藏在 443 后面（增量添加/删除的守卫要用）
+#        ws_front=True  nginx 前置时藏在 443 后面（增删后按配置重建 nginx，见 _nginx_sync_from_cfg）
 #        cert=True      吃服务器证书（无域名时退化成自签+insecure，要进自签告警）
 #        teardown=fn    删它时要清的副作用。fn(plan=True) 只回答「会清什么」给确认框看，
 #                       fn() 才真动手并回报清了什么；不适用时两种模式都返回 ""
@@ -2073,20 +2090,6 @@ def _td_hy2(plan=False):
     n = _drop_hy2_dnat()
     return f"已清掉 {n} 条端口跳跃 DNAT 规则" if n else "没有残留的端口跳跃 DNAT 规则"
 
-def _td_ws_front(plan=False):
-    """删 nginx 前置的 ws 类：按【剩下的】节点重写 443 的 location 反代表。
-
-       不重写的话，那条 path 还挂在 nginx 上、反代到一个已经没人听的本地端口，
-       客户端拿到的是 502 而不是「节点没了」，排查起来更费劲。
-       只在 nginx 真的前置着 ws 时才动它（reality 绑 443 的布局下 ws 走自己的端口）。"""
-    if not _nginx_front() or G.get("sni_split"):          # sni-split 的 443 归 stream，这里写会抢 443；由 _sni_split_shrink 收拾
-        return ""
-    if plan:
-        return "nginx 443 上对应的 location 反代"
-    ws = _rebuild_nginx_ws_from_cfg()
-    write_nginx_conf()
-    return f"nginx 反代表已按剩下的 {len(ws)} 个 ws 节点重写"
-
 # ── asks / recap：选中该协议才问的设置，以及确认框里的回显 ────────────────
 
 def _asks_hy2(mode):
@@ -2116,21 +2119,59 @@ def _asks_smux(mode):
 def _recap_smux():
     return ("ws 多路复用", "开启 smux" if G.get("smux") else "不开(默认)")
 
-def _asks_reality(mode):
-    """选了 reality 类：确认借用目标 SNI 并做连通性预检。
+_SNI_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
 
-       只在增量添加时问——全新安装时 SNI 是统一问的（没有域名时 ws/trojan 也拿它
-       当伪装 Host，见 tls_host()），不能挪进来按协议问。"""
+def ask_reality_sni(label, default="", avoid=""):
+    """问一个 reality 伪装域名 → (域名, 是不是随机挑的)。
+       default 给了：回车沿用它；没给：回车从池里随机挑一个（避开 avoid）。
+       填的跟 avoid（另一个核心的伪装域名）一样 → 红字说重复、回到这一问重填（仓库主人 10/22：sing-box、xray 各一个，
+       sni-split 下 nginx 按伪装域名分流，同一个分不开）；格式不对也回来重填。"""
+    rand = secrets.choice([x for x in REALITY_SNI_POOL if x != avoid] or REALITY_SNI_POOL)
+    hint = f"回车沿用当前的 {default}" if default else f"回车=随机挑，本次随机到 {rand}"
+    while True:
+        v = _ask(f"{label}（{hint}）: ").strip().lower().rstrip(".")
+        if v and not _SNI_RE.match(v):
+            print(_hl("1;31", f"  ✗ {v} 不是域名格式，重填")); continue
+        sni = v or default or rand
+        if avoid and sni == avoid:
+            print(_hl("1;31", f"  ✗ {sni} 跟另一个核心的伪装域名重复了，重填（回车随机挑）"))
+            default = ""; hint = f"回车=随机挑，本次随机到 {rand}"
+            continue
+        return sni, ("1" if not v and not default else "")
+
+def _asks_reality(mode):
+    """选了 sing-box 的 reality：增量添加时确认借用域名（跟 xray 的不能重复）并预检。
+       全新安装时伪装域名在安装向导里统一问（没有域名时 ws/trojan 也拿它当伪装 Host，见 tls_host()）。"""
     if mode != "add":
         return
-    ans = _ask(f"\n  reality 借用目标 SNI（回车沿用当前的 {G['sni']}，或输入别的域名）: ").strip().lower().rstrip(".")
-    if ans:
-        G["sni"] = ans
-    G["sni_auto"] = ""                                   # 沿用的是老节点正在用的，不自己换（新老节点要一致）
-    _sni_precheck_one()
+    other, have = _current_sni("xray"), _current_sni("sb")
+    if have and have != other:                   # 这个核心已有 reality：一个核心一个伪装域名，沿用，不再问
+        G["sni"] = have
+        print(f"  sing-box 的 reality 伪装域名沿用 {have}")
+        return
+    cur = G["sni"] if G["sni"] != other else ""
+    G["sni"], G["sni_auto"] = ask_reality_sni("\n  sing-box 的 reality 伪装域名", cur, other)
+    _sni_precheck_one("sni", avoid=other)
+
+def _asks_reality_xr(mode):
+    """选了 xray 的 reality：同上，问 xray 自己那个（跟 sing-box 的不能重复）。"""
+    if mode != "add":
+        return
+    other, have = _current_sni("sb"), _current_sni("xray")
+    if have and have != other:                   # 同上：xray 已有 reality 就沿用它那个
+        G["sni_xr"] = have
+        print(f"  xray 的 reality 伪装域名沿用 {have}")
+        return
+    cur = have or G.get("sni_xr", "")
+    cur = cur if cur != other else ""
+    G["sni_xr"], G["sni_xr_auto"] = ask_reality_sni("\n  xray 的 reality 伪装域名", cur, other)
+    _sni_precheck_one("sni_xr", avoid=other)
 
 def _recap_reality():
-    return ("借用 SNI", G["sni"])
+    return ("sing-box 伪装域名", G["sni"])
+
+def _recap_reality_xr():
+    return ("xray 伪装域名", _xr_sni())
 
 # ── 表本体 ───────────────────────────────────────────────────────────────
 # 当前只装这 10 个协议（对齐 mack-a 的输出，顺序也一致）。
@@ -2138,9 +2179,9 @@ def _recap_reality():
 SB = {
     "vless-vision":      PROTO(sb_vless_vision, cert=True),
     "vless-ws":          PROTO(make_sb_vless("ws"), cert=True, ws_front=True,
-                               teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+                               asks=_asks_smux, recap=_recap_smux),
     "vmess-ws":          PROTO(make_sb_vmess("ws"), cert=True, ws_front=True,
-                               teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+                               asks=_asks_smux, recap=_recap_smux),
     "trojan":            PROTO(sb_trojan, cert=True),
     "hy2":               PROTO(sb_hysteria2, udp=True,
                                teardown=_td_hy2, asks=_asks_hy2, recap=_recap_hy2),
@@ -2150,14 +2191,14 @@ SB = {
                                asks=_asks_reality, recap=_recap_reality),
     "tuic":              PROTO(sb_tuic, udp=True),
     "vmess-httpupgrade": PROTO(make_sb_vmess("httpupgrade"), cert=True, ws_front=True,
-                               teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+                               asks=_asks_smux, recap=_recap_smux),
     "anytls":            PROTO(sb_anytls, cert=True),
 }
 # 备用（以后想加回，取消注释挪进上面的 SB，按上面的清单据实填标志位）：
 #   "ss2022":            PROTO(sb_ss2022),
 #   "vless-h2":          PROTO(make_sb_vless("h2"), cert=True),
 #   "vless-httpupgrade": PROTO(make_sb_vless("httpupgrade"), cert=True, ws_front=True,
-#                              teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+#                              asks=_asks_smux, recap=_recap_smux),
 #   "vmess-h2":          PROTO(make_sb_vmess("h2"), cert=True),
 #   "socks5":            PROTO(sb_socks5),
 #   "naive": sb_naive,
@@ -2184,10 +2225,20 @@ SB = {
 XR_MIN_CLIENT_VER = "1.8.2"
 PQ_ON_MIN_CHAIN, PQ_OFF_BELOW = 4000, 3600
 
+def _xr_sni():
+    """xray reality 的借用域名。仓库主人 10/22：sing-box、xray 各填一个、不许重复——sni-split 下 nginx 按借用域名
+       分流，两个核心同一个域名分不出该给谁。老装机没有第二个，沿用 sing-box 那个。"""
+    return G.get("sni_xr") or G["sni"]
+
+def _xr_behind_split():
+    """xray reality-vision 挂到 nginx 443 分流后面：开着 sni-split、而且 xray 的借用域名跟 sing-box 不一样才行
+       （一样的话 nginx 分不开，留在自己端口，跟以前一样）。"""
+    return bool(G.get("sni_split")) and _xr_sni() != G["sni"]
+
 def _xr_reality_stream(priv, sid, network, extra=None, seed=""):
     st = {"network": network, "security": "reality",
-          "realitySettings": {"show": False, "dest": f"{G['sni']}:443",
-                              "xver": 0, "serverNames": [G["sni"]],
+          "realitySettings": {"show": False, "dest": f"{_xr_sni()}:443",
+                              "xver": 0, "serverNames": [_xr_sni()],
                               "privateKey": priv, "shortIds": [sid],
                               "minClientVer": XR_MIN_CLIENT_VER,
                               # 客户端时间跟服务器差 70 秒以上的握手拒掉：防录下来的握手被重放探测（mack-a 同值）
@@ -2246,7 +2297,7 @@ _PQ_SAID = set()
 def _xr_pq_new():
     """新建 xray reality 入站时用：借用目标站够格就生成一对 (种子, 验证公钥)，不够格 / 生成失败返回 ("", "")。
        同一个目标站只在屏上说一次开没开。"""
-    sni = G["sni"]
+    sni = _xr_sni()
     ok = _reality_pq_ok(sni)
     if sni not in _PQ_SAID:
         _PQ_SAID.add(sni)
@@ -2266,12 +2317,16 @@ def xr_reality_vision(port, tag):
     uid = new_uuid(); sid = short_id()
     priv, pub = reality_keys(XRAY_BIN, "x25519")
     seed, pqv = _xr_pq_new()
-    ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
+    # sni-split：跟 sing-box 的 reality-vision 一样挂 nginx 443 后面，nginx 按 xray 自己的借用域名转进来（仓库主人 10/22）
+    split = _xr_behind_split()
+    ib = {"listen": "127.0.0.1" if split else "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid, "flow": "xtls-rprx-vision"}],
                        "decryption": "none"},
           "streamSettings": _xr_reality_stream(priv, sid, "raw", seed=seed)}
-    lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&flow=xtls-rprx-vision"
-          f"&security=reality&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=tcp{_pqv(pqv)}#{tag}")
+    if split:
+        NGINX_STREAM.append({"sni": _xr_sni(), "port": port})
+    lk = (f"vless://{uid}@{G['host']}:{443 if split else port}?encryption=none&flow=xtls-rprx-vision"
+          f"&security=reality&sni={_xr_sni()}&fp=chrome&pbk={pub}&sid={sid}&type=tcp{_pqv(pqv)}#{tag}")
     return ib, lk
 
 def xr_reality_grpc(port, tag):
@@ -2284,7 +2339,7 @@ def xr_reality_grpc(port, tag):
           "settings": {"clients": [{"id": uid}], "decryption": "none"},
           "streamSettings": st}
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=reality"
-          f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=grpc"
+          f"&sni={_xr_sni()}&fp=chrome&pbk={pub}&sid={sid}&type=grpc"
           f"&serviceName={svc}&mode=multi{_pqv(pqv)}#{tag}")
     return ib, lk
 
@@ -2302,8 +2357,8 @@ def xr_reality_xhttp(port, tag):
     # host 显式带上、并与 sni 保持一致：mihomo 留空时会回退到 servername，结果一样，
     # 但写出来就不依赖客户端的回退实现，换客户端/版本也不会变。
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=reality"
-          f"&sni={G['sni']}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp"
-          f"&host={G['sni']}&path={path}{_pqv(pqv)}#{tag}")
+          f"&sni={_xr_sni()}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp"
+          f"&host={_xr_sni()}&path={path}{_pqv(pqv)}#{tag}")
     return ib, lk
 
 def _xr_tls(certfile, keyfile):
@@ -2319,6 +2374,15 @@ def _xr_tls(certfile, keyfile):
 
 def xr_vless_ws(port, tag):
     uid = new_uuid(); path = "/" + secrets.token_hex(3)
+    if _nginx_front():
+        # nginx 前置：跟 sing-box 的 ws 一样藏 443 后面，本地明文口、TLS 由 nginx 终结、按 path 反代（仓库主人 10/22）
+        ib = {"listen": "127.0.0.1", "port": port, "protocol": "vless", "tag": tag,
+              "settings": {"clients": [{"id": uid}], "decryption": "none"},
+              "streamSettings": {"network": "ws", "wsSettings": {"path": path}}}
+        NGINX_WS.append({"path": path, "port": port})
+        lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls"
+              f"&sni={tls_host()}&fp=chrome&type=ws&host={tls_host()}&path={path}#{tag}")
+        return ib, lk
     crt, key, insec = ensure_acme()
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid}], "decryption": "none"},
@@ -2332,6 +2396,15 @@ def xr_vless_ws(port, tag):
 
 def xr_vmess_ws(port, tag):
     uid = new_uuid(); path = "/" + secrets.token_hex(3)
+    if _nginx_front():                                  # 同 xr_vless_ws：藏 nginx 443 后面
+        ib = {"listen": "127.0.0.1", "port": port, "protocol": "vmess", "tag": tag,
+              "settings": {"clients": [{"id": uid, "alterId": 0}]},
+              "streamSettings": {"network": "ws", "wsSettings": {"path": path}}}
+        NGINX_WS.append({"path": path, "port": port})
+        lk = vmess_link({"v": "2", "ps": tag, "add": G["host"], "port": "443",
+                         "id": uid, "aid": "0", "net": "ws", "type": "none",
+                         "host": tls_host(), "path": path, "tls": "tls", "sni": tls_host(), "fp": "chrome"})
+        return ib, lk
     crt, key, insec = ensure_acme()
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vmess", "tag": tag,
           "settings": {"clients": [{"id": uid, "alterId": 0}]},
@@ -2345,7 +2418,8 @@ def xr_vmess_ws(port, tag):
     return ib, lk
 
 def xr_vless_xhttp_tls(port, tag):
-    """VLESS + XHTTP + TLS：独立随机端口、自带证书、【不经 nginx】。
+    """VLESS + XHTTP + TLS：nginx 前置时挂在 443 后面（本地明文 h2c，nginx grpc_pass 进来，仓库主人 10/22），
+       否则独立随机端口、自带证书。
 
        跟 reality-xhttp 的区别只在伪装方式：reality 借别人的站，这个用自己的
        域名证书。好处是不依赖借用目标站的存活/可达性，也不受 reality 那套
@@ -2357,6 +2431,18 @@ def xr_vless_xhttp_tls(port, tag):
        本脚本每个入站各自独立、出站只有 direct/block，中间这一跳不产生任何
        区别，只多一次本地转发和一条路由规则，所以直接监听公网口。"""
     uid = new_uuid(); path = "/" + secrets.token_hex(3)
+    if _nginx_front():
+        # nginx 前置：藏 443 后面（仓库主人 10/22）。xray 听本地明文 h2c，nginx 终结 TLS、grpc_pass 转进来
+        # （见 _nginx_ws_locations 的 xhttp 分支）；链接照样 TLS + h2 连 443
+        ib = {"listen": "127.0.0.1", "port": port, "protocol": "vless", "tag": tag,
+              "settings": {"clients": [{"id": uid}], "decryption": "none"},
+              "streamSettings": {"network": "xhttp",
+                                 "xhttpSettings": {"host": tls_host(), "path": path, "mode": "auto"}}}
+        NGINX_WS.append({"path": path, "port": port, "kind": "xhttp"})
+        lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls"
+              f"&sni={tls_host()}&fp=chrome&type=xhttp&host={tls_host()}&path={path}"
+              f"&mode=auto&alpn=h2#{tag}")
+        return ib, lk
     crt, key, insec = ensure_acme()
     tls = _xr_tls(crt, key)                         # 含 minVersion 1.2；真证书时 rejectUnknownSni
     tls["serverName"] = tls_host()
@@ -2387,16 +2473,16 @@ def xr_trojan(port, tag):
 # sing-box 那边同样的东西就叫 reality-vision/grpc。统一砍成两段。
 XRAY = {
     "reality-vision": PROTO(xr_reality_vision, reality=True,
-                            asks=_asks_reality, recap=_recap_reality),
+                            asks=_asks_reality_xr, recap=_recap_reality_xr),
     "reality-grpc":   PROTO(xr_reality_grpc, reality=True,
-                            asks=_asks_reality, recap=_recap_reality),
+                            asks=_asks_reality_xr, recap=_recap_reality_xr),
     "reality-xhttp":  PROTO(xr_reality_xhttp, reality=True,
-                            asks=_asks_reality, recap=_recap_reality),
-    # xray 的 ws/trojan/xhttp-tls 都听自己的端口、自己终结 TLS，不挂 nginx
-    # （所以不是 ws_front），无域名时退化成自签+allowInsecure → cert=True。
-    "xhttp-tls":      PROTO(xr_vless_xhttp_tls, cert=True),
-    "vless-ws":       PROTO(xr_vless_ws, cert=True),
-    "vmess-ws":       PROTO(xr_vmess_ws, cert=True),
+                            asks=_asks_reality_xr, recap=_recap_reality_xr),
+    # xray 的 ws / xhttp-tls：nginx 前置时跟 sing-box 的 ws 一样藏 443 后面（仓库主人 10/22），否则听自己的端口、
+    # 自己终结 TLS；无域名时退化成自签+allowInsecure → cert=True。trojan 不走 HTTP 路径，留在自己端口。
+    "xhttp-tls":      PROTO(xr_vless_xhttp_tls, cert=True, ws_front=True),
+    "vless-ws":       PROTO(xr_vless_ws, cert=True, ws_front=True),
+    "vmess-ws":       PROTO(xr_vmess_ws, cert=True, ws_front=True),
     "trojan":         PROTO(xr_trojan, cert=True),
 }
 # 已移除 ss2022：纯全加密无伪装，易被 GFW 全加密流量探测识别；有 reality 完全无需它。
@@ -3365,7 +3451,9 @@ def _cn_into_direct(members, cn):
     return out + [n for n in cn if n not in out]
 
 def _local_xray_reality():
-    """本机 xray 内核开的 reality 入站 → {(对外地址, 端口)}。
+    """本机 xray 内核开的 reality 入站 → {(对外地址, 链接里的端口, 借用域名)}。
+       挂在 nginx 443 分流后面的（监听 127.0.0.1）链接里报的是 443——sing-box 的 reality-vision 也是 443，
+       光看端口分不开，所以带上借用域名（两个核心的借用域名不一样才会挂进去，见 _xr_behind_split）。
 
        sing-box 订阅要跳过它们：xray 新版的 REALITY 只收 ClientHello 里带 X25519MLKEM768 的客户端
        （XTLS/REALITY tls.go：reject outdated/strange Client Hello that doesn't have X25519MLKEM768），
@@ -3382,8 +3470,10 @@ def _local_xray_reality():
     for ib in cfg.get("inbounds", []):
         st = ib.get("streamSettings") or {}
         if st.get("security") == "reality" and ib.get("port"):
+            sni = ((st.get("realitySettings") or {}).get("serverNames") or [""])[0]
+            local = str(ib.get("listen", "")) in ("127.0.0.1", "localhost")
             try:
-                ports.add(int(ib["port"]))
+                ports.add((443 if local else int(ib["port"]), sni))
             except (TypeError, ValueError):
                 pass
     if not ports:
@@ -3394,7 +3484,7 @@ def _local_xray_reality():
         hosts |= {h for h in (st.get("host"), st.get("domain")) if h}
     except Exception:
         pass
-    return {(h, p) for h in hosts for p in ports}
+    return {(h, p, sni) for h in hosts for p, sni in ports}
 
 def build_singbox_sub(nodes, tpl_url):
     """对象级替换锚点：_NOD_ 换节点对象、_GRP_ 换国家组、
@@ -3403,7 +3493,8 @@ def build_singbox_sub(nodes, tpl_url):
     objs, xr_skip = [], 0
     xr_reality = _local_xray_reality()
     for key, d in nodes:
-        if d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0)) in xr_reality:
+        if d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0),
+                                      str(d.get("servername", ""))) in xr_reality:
             xr_skip += 1                                     # 见 _local_xray_reality：sing-box 客户端连不上
             continue
         try:
@@ -5083,14 +5174,6 @@ def run(sb_names, xr_names):
         # pin 只给归属核心：同名协议两边都 pin 会一起抢 443
         ins, lks = build(SB, sb_names, pin if r443_core == "sb" else {},
                          dup=dup_protos, mark="¹"); all_links += lks
-        if G.get("sni_split"):
-            ensure_acme()                               # 确保证书就绪（本地 https server 要用）
-            if not write_nginx_sni_split():             # 写 http(本地https)+stream(443分流)，失败已回滚
-                print("  ⚠ sni-split 生效失败（nginx 已回滚到安全状态）。此时 reality 监听在本地、"
-                      "暂不可达；请用 --no-sni-split 重装，或改用 reality-443 直连模式。")
-        elif _nginx_front() and NGINX_WS:
-            write_nginx_conf()                          # 收集完 ws 家族，写 443 伪装站+反代
-        # reality 绑 443 时 nginx 只留 :80 acme stub（续期用），不写 443 块，443 归 reality
         cfg = f"{SB_DIR}/config.json"
         sb_cfg = {"log": {"level": "info"}, "inbounds": ins, "outbounds": [{"type": "direct"}]}
         sb_fix_dns(sb_cfg)                              # 1.13+ 本机 DNS 不走 resolved（见 sb_fix_dns）
@@ -5107,6 +5190,17 @@ def run(sb_names, xr_names):
                                  {"protocol": "blackhole", "tag": "block"}]},
                   open(cfg, "w"), indent=2)
         write_service("xray", XRAY_BIN, cfg)
+
+    # 两个核心都建完再写 nginx：xray 的 ws / xhttp-tls / reality-vision 也挂在 443 后面（仓库主人 10/22），
+    # 以前在 sing-box 那段里写，xray 的还没登记进 NGINX_WS / NGINX_STREAM
+    if G.get("sni_split"):
+        ensure_acme()                                   # 确保证书就绪（本地 https server 要用）
+        if not write_nginx_sni_split():                 # 写 http(本地https)+stream(443分流)，失败已回滚
+            print("  ⚠ sni-split 生效失败（nginx 已回滚到安全状态）。此时 reality 监听在本地、"
+                  "暂不可达；请用 --no-sni-split 重装，或改用 reality-443 直连模式。")
+    elif _nginx_front() and NGINX_WS:
+        write_nginx_conf()                              # 收集完 ws 家族，写 443 伪装站+反代
+    # reality 绑 443 时 nginx 只留 :80 acme stub（续期用），不写 443 块，443 归 reality
 
     # 之前开过「屏蔽中国域名/IP」的话，重装重写了 config 会丢规则，这里自动重新注入
     if sb_names:
@@ -5153,7 +5247,7 @@ def run(sb_names, xr_names):
 
     # 记住这次安装（节点不再随重装丢失：下次进安装默认「保持节点、只更新配置」）
     try:
-        json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"],
+        json.dump({"host": G["host"], "domain": G["domain"], "sni": G["sni"], "sni_xr": G.get("sni_xr", ""),
                    "prefix": G.get("prefix", ""), "hy2_ports": G.get("hy2_ports", ""),
                    "nginx": G.get("nginx", ""), "reality443": G.get("reality443", ""),
                    "sni_split": G.get("sni_split", ""), "smux": G.get("smux", ""),
@@ -6009,6 +6103,11 @@ def _core_update_schedule_str():
     _, times = bj_cron_lines(4, 0, "", day=2)
     return f"北京时间每月 2 号 04:00（本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）"
 
+def _xr_ib_uuid(ib):
+    """xray 入站第一个用户的 UUID（跟分享链接 vless://UUID@ 对得上）；没有返回 ''。"""
+    cl = ((ib.get("settings") or {}).get("clients") or [{}])
+    return str((cl[0] or {}).get("id", "")) if cl else ""
+
 def _xray_reality_targets(data):
     """xray 配置里的 reality 入站 → [(入站, realitySettings, 借用目标站)]。"""
     out = []
@@ -6065,7 +6164,7 @@ def _xray_heal_minclientver(restart=True):
         except Exception:
             continue
         rs["mldsa65Seed"] = seed
-        pq[int(ib["port"])] = v
+        pq[_xr_ib_uuid(ib)] = v
     return len(pq) if _xray_reality_commit(cfg, data, old, pq, restart) else None
 
 def _xray_pq_health(restart=True):
@@ -6086,7 +6185,7 @@ def _xray_pq_health(restart=True):
             n, _ = _reality_pq_ping(sni)
             if n is not None and n < PQ_OFF_BELOW:
                 rs.pop("mldsa65Seed")
-                off[int(ib["port"])] = ""
+                off[_xr_ib_uuid(ib)] = ""
     if not off:
         return 0
     return len(off) if _xray_reality_commit(cfg, data, old, off, restart) else 0
@@ -7122,14 +7221,17 @@ def _sb_reality_inbounds(data):
     return [ib for ib in data.get("inbounds", [])
             if isinstance(ib.get("tls"), dict) and isinstance(ib["tls"].get("reality"), dict)]
 
-def _current_sni():
-    """读当前 reality 借用域名(SNI)：sing-box 优先，回落 xray；没有 reality 节点返回 ''。"""
-    data, _ = _load_sb_cfg()
+def _current_sni(core=None):
+    """读当前 reality 借用域名(SNI)：core="sb" / "xray" 只看那个核心；不给 = sing-box 优先，回落 xray。
+       没有 reality 节点返回 ''。"""
+    data, _ = _load_sb_cfg() if core != "xray" else (None, None)
     if data:
         for ib in _sb_reality_inbounds(data):
             s = ib["tls"].get("server_name")
             if s:
                 return s
+    if core == "sb":
+        return ""
     try:
         xd = json.load(open(f"{XRAY_DIR}/config.json"))
         for ib in xd.get("inbounds", []):
@@ -7170,7 +7272,8 @@ def _set_sni_xray(data, new):
 
 def _xr_pq_sync(data, sni):
     """换借用目标站时：按新站够不够格，给 xray 的 reality 入站开 / 关 ML-DSA-65（见 XR_MIN_CLIENT_VER 那段注释）。
-       返回要改链接的 {端口: 验证公钥（开）或 ""（关）}；已开着、新站也够格的不动，链接里的 pqv 照旧。"""
+       返回要改链接的 {UUID: 验证公钥（开）或 ""（关）}；已开着、新站也够格的不动，链接里的 pqv 照旧。
+       按 UUID 不按端口：挂在 nginx 443 后面的链接端口是 443，跟 sing-box 的撞（10/22）。"""
     ok = _reality_pq_ok(sni)
     out = {}
     for ib in data.get("inbounds", []):
@@ -7183,10 +7286,10 @@ def _xr_pq_sync(data, sni):
             except Exception:
                 continue
             rs["mldsa65Seed"] = seed
-            out[int(ib["port"])] = v
+            out[_xr_ib_uuid(ib)] = v
         elif not ok and rs.get("mldsa65Seed"):
             rs.pop("mldsa65Seed")
-            out[int(ib["port"])] = ""
+            out[_xr_ib_uuid(ib)] = ""
     return out
 
 def _link_set_q(ln, key, val):
@@ -7198,8 +7301,15 @@ def _link_set_q(ln, key, val):
         parts.append(f"{key}={val}")
     return base + ("?" + "&".join(parts) if parts else "") + sep + frag
 
-def _links_set_pqv(by_port, path=None):
-    """按端口给保存的 reality 分享链接加上 / 去掉 pqv=（ML-DSA-65 验证公钥；"" = 去掉）。
+def _link_uuid(ln):
+    """分享链接 vless://UUID@... 的 UUID（其它写法返回 ''）。"""
+    try:
+        return urllib.parse.unquote(urllib.parse.urlsplit(ln.strip()).username or "")
+    except ValueError:
+        return ""
+
+def _links_set_pqv(by_uuid, path=None):
+    """按 UUID 给保存的 reality 分享链接加上 / 去掉 pqv=（ML-DSA-65 验证公钥；"" = 去掉）。
        『# 订阅链接:』尾部原样保留。返回改了几条。"""
     path = path or NODE_FILE                             # 调用时再取：测试 / 改路径时跟 read_saved_links 对得上
     try:
@@ -7211,21 +7321,19 @@ def _links_set_pqv(by_port, path=None):
         if ln.strip().startswith("#"):
             tail = True
         if not tail and "://" in ln and "security=reality" in ln:
-            try:
-                port = urllib.parse.urlsplit(ln.strip()).port
-            except ValueError:
-                port = None
-            if port in by_port:
-                new = _link_set_q(ln, "pqv", by_port[port])
+            uid = _link_uuid(ln)
+            if uid and uid in by_uuid:
+                new = _link_set_q(ln, "pqv", by_uuid[uid])
                 n += new != ln
                 ln = new
         out.append(ln)
     open(path, "w").write("\n".join(out))
     return n
 
-def _links_set_sni(new, path=None):
+def _links_set_sni(new, path=None, uuids=None):
     """改写保存的分享链接里 reality 节点的 sni=（只动带 security=reality 的，域名类节点不误伤）；
-       『# 订阅链接:』尾部原样保留。"""
+       uuids 给了就只动这些 UUID 的（只换一个核心的伪装域名时，另一个核心的不能跟着变）；
+       reality-xhttp 的 host= 跟 sni 是同一个，一起换。『# 订阅链接:』尾部原样保留。"""
     path = path or NODE_FILE
     try:
         lines = open(path).read().split("\n")
@@ -7235,10 +7343,26 @@ def _links_set_sni(new, path=None):
     for ln in lines:
         if ln.strip().startswith("#"):
             tail = True
-        if not tail and "://" in ln and "security=reality" in ln:
+        if (not tail and "://" in ln and "security=reality" in ln
+                and (uuids is None or _link_uuid(ln) in uuids)):
+            m = _SNI_LINK_RE.search(ln)
+            old = m.group(0).split("=", 1)[1] if m else ""
             ln = _SNI_LINK_RE.sub(lambda m: m.group(1) + new, ln)
+            if old:
+                ln = re.sub(r"([?&]host=)" + re.escape(old) + r"(?=[&#]|$)", lambda m: m.group(1) + new, ln)
         out.append(ln)
     open(path, "w").write("\n".join(out))
+
+def _reality_uuids(core):
+    """某个核心 reality 入站的 UUID 集合（换伪装域名时只改这些节点的链接）。"""
+    out = set()
+    for ib in _load_core_cfg(core)[1]:
+        if core == "sb":
+            if isinstance((ib.get("tls") or {}).get("reality"), dict):
+                out |= {str(u.get("uuid", "")) for u in ib.get("users") or [] if u.get("uuid")}
+        elif ((ib.get("streamSettings") or {}).get("security")) == "reality":
+            out |= {str(c.get("id", "")) for c in (ib.get("settings") or {}).get("clients") or [] if c.get("id")}
+    return out
 
 def _nginx_split_set_sni(old, new):
     """sni-split(443 分流)启用时，把 stream map 里旧 SNI 的那条映射改成新 SNI。改了返回 True。"""
@@ -7255,24 +7379,28 @@ def _nginx_split_set_sni(old, new):
     open(NGINX_STREAM_CONF, "w").write(new_txt)
     return True
 
-def change_sni_apply(new):
-    """把 reality 借用域名换成 new：改两核心配置 + nginx 分流 + 链接 + 订阅，
-       任一核心校验不过就整体回滚、不重启（单台 VPS 也不会被坏配置锁死）。"""
-    old = _current_sni()
+def change_sni_apply(new, core=None):
+    """把 reality 借用域名换成 new：改核心配置 + nginx 分流 + 链接 + 订阅，
+       任一核心校验不过就整体回滚、不重启（单台 VPS 也不会被坏配置锁死）。
+       core="sb" / "xray" 只换那个核心的（仓库主人 10/22：两个核心各一个伪装域名，菜单 4 分开换）；不给 = 两个都换（老用法）。"""
+    cores = ("sb", "xray") if core is None else (core,)
+    old = _current_sni(core)
     sbcfg, xrcfg = f"{SB_DIR}/config.json", f"{XRAY_DIR}/config.json"
-    items = []                                            # (cfg, bin, svc, old_text)
-    if os.path.exists(sbcfg):
+    items, uuids = [], set()                              # (cfg, bin, svc, old_text)
+    if "sb" in cores and os.path.exists(sbcfg):
         try: data = json.load(open(sbcfg))
         except Exception: data = None
         if data and _set_sni_singbox(data, new):
+            uuids |= _reality_uuids("sb")
             old_text = open(sbcfg).read()
             json.dump(data, open(sbcfg, "w"), indent=2)
             items.append((sbcfg, SB_BIN, "sing-box", old_text))
     pq = {}                                               # xray reality 的抗量子签名跟着新目标站开 / 关
-    if os.path.exists(xrcfg):
+    if "xray" in cores and os.path.exists(xrcfg):
         try: xd = json.load(open(xrcfg))
         except Exception: xd = None
         if xd and _set_sni_xray(xd, new):
+            uuids |= _reality_uuids("xray")
             pq = _xr_pq_sync(xd, new)
             old_text = open(xrcfg).read()
             json.dump(xd, open(xrcfg, "w"), indent=2)
@@ -7292,8 +7420,14 @@ def change_sni_apply(new):
         for svc, msg in errors:
             print(f"    {svc}: {msg.splitlines()[-1] if msg else '校验失败'}")
         return False
-    # nginx sni-split（如启用）：改 map → nginx -t，不过则连核心配置一起回滚
-    if _nginx_split_set_sni(old, new):
+    # nginx sni-split：按改过的配置重建分流表（nginx -t 不过它自己退回），不过就连核心配置一起回滚
+    if G.get("sni_split") and os.path.exists(NGINX_STREAM_CONF):
+        r = _nginx_sync_from_cfg()
+        if r.startswith("⚠"):
+            for cfg, binp, svc, old_text in items:
+                open(cfg, "w").write(old_text)
+            print("  ✗ nginx 分流校验未通过，已整体回滚（节点照常）"); return False
+    elif _nginx_split_set_sni(old, new):                  # 老装机（记录里没 sni_split）：照旧改 map 那一行
         chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
         if chk.returncode:
             _nginx_split_set_sni(new, old)
@@ -7302,17 +7436,25 @@ def change_sni_apply(new):
             print("  ✗ nginx 分流校验未通过，已整体回滚：\n   "
                   + (chk.stderr or chk.stdout).strip().replace("\n", "\n   ")); return False
         sh("systemctl reload nginx", check=False)
-    _links_set_sni(new)                                   # 校验都过了才动链接/订阅
+    _links_set_sni(new, uuids=uuids if core else None)    # 校验都过了才动链接/订阅
     if pq:
         _links_set_pqv(pq)
         on = sum(1 for v in pq.values() if v)
         print(f"  ✔ {on} 个 xray reality 节点开了抗量子签名" if on else
               f"  ⚠ 新目标站{_reality_pq_why(new)}，{len(pq)} 个 xray reality 节点关掉了抗量子签名")
     try:                                                  # 安装记录跟着换：「只添加新协议」/ 重装默认沿用它（10/20 漏了，加协议还问老域名）
-        st = json.load(open(STATE_FILE)); st["sni"] = new
+        st = json.load(open(STATE_FILE))
+        if core in (None, "sb"):
+            st["sni"] = new
+        if core == "xray":
+            st["sni_xr"] = new
         json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except Exception:
         pass
+    if core in (None, "sb"):
+        G["sni"] = new
+    if core == "xray":
+        G["sni_xr"] = new
     G["host"] = _host()
     try:
         build_subscription(read_saved_links(), new_token=False)
@@ -7321,59 +7463,79 @@ def change_sni_apply(new):
     restart_services(*[svc for _, _, svc, _ in items])
     return True
 
-def _choose_new_sni(cur):
-    ui_items([(1, "随机挑一个（内置大站池，避开当前）", None), (2, "手动输入", None), (0, "取消", None)])
-    c = _ask("选择: ").strip()
-    if c == "1":
-        print("  从内置大站池里挑一个本机探得通的…")
-        new = _pick_ok_sni({cur})                        # 探不通的跳过；都不通就随便挑一个，下面会提示
-        pool = [s for s in REALITY_SNI_POOL if s != cur]
-        return new or (secrets.choice(pool) if pool else None)
-    if c == "2":
-        s = _ask("  输入域名（如 www.microsoft.com）: ").strip().lower().rstrip(".")
-        if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", s):
-            print("  域名格式不对。"); return None
-        return s
-    return None
-
-def change_sni_menu():
-    G_, Y_, R_, N_ = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+def _choose_new_sni(cur, avoid=""):
+    """挑新的伪装域名：随机（池里本机探得通的，避开当前和另一个核心的）/ 手动输入。
+       手填跟另一个核心的重复 → 红字说重复、回到这一步重选（仓库主人 10/22）。取消返回 None。"""
     while True:
-        cur = _current_sni()
-        ui_title("更换伪装域名（reality 借用的 SNI 目标站）")
-        if not cur:
-            print("  ⚠ 本机没有 reality 类节点，没有伪装域名可换")
-            return
-        ui_kv("当前伪装域名", _hl("1;32", cur))
-        ok, detail = _reality_sni_ok(cur)                 # 从本机实连一下：连通 + TLS1.3 + h2
-        ui_kv("连通性检测", _hl("1;32", f"通 · {detail}") if ok else _hl("1;31", f"不通 · {detail}"))
-        ui_line()
-        ui_items([(1, "更换（随机挑 / 手动输入）", None), (0, "返回", None)])
-        if not ok:
-            ui_tip("这个站从本机连不上或不合格，reality 伪装会打折，建议更换")
+        ui_items([(1, "随机挑一个（内置大站池，避开当前）", None), (2, "手动输入", None), (0, "取消", None)])
         c = _ask("选择: ").strip()
         if c == "1":
-            new = _choose_new_sni(cur)
-            if not new or new == cur:
-                if new == cur:
-                    print("  和当前一样，未改动。")
-                continue
-            ok2, detail2 = _reality_sni_ok(new)
-            if ok2:
-                print(f"  新域名 {new}: {G_}通 · {detail2}{N_}")
-            else:
-                print(f"  新域名 {new}: {R_}不通 · {detail2}{N_}")
-                if _ask("  这个站从你 VPS 检测不理想，仍要用? y 继续 / n 重选: ").strip().lower() \
-                        not in ("y", "yes"):
-                    continue
-            if _ask(f"  确认把伪装域名从 {cur} 换成 {new}? y 确认 / n 取消: ").strip().lower() \
-                    in ("y", "yes"):
-                if change_sni_apply(new):
-                    print(f"\n  ✓ 已更换为 {new}，配置 + 订阅已刷新，核心正在后台重启（订阅 URL 不变）。")
-                    print("  客户端重新拉取订阅即可生效——无需重装、无需重新导入。")
-                    print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常，操作已在服务端完成。")
-        elif c in ("0", ""):
+            print("  从内置大站池里挑一个本机探得通的…")
+            skip = {cur, avoid} - {""}
+            new = _pick_ok_sni(skip)                     # 探不通的跳过；都不通就随便挑一个，下面会提示
+            pool = [x for x in REALITY_SNI_POOL if x not in skip]
+            return new or (secrets.choice(pool) if pool else None)
+        if c == "2":
+            v = _ask("  输入域名（如 www.microsoft.com）: ").strip().lower().rstrip(".")
+            if not _SNI_RE.match(v):
+                print(_hl("1;31", "  ✗ 域名格式不对，重选")); continue
+            if avoid and v == avoid:
+                print(_hl("1;31", f"  ✗ {v} 跟另一个核心的伪装域名重复了，重选")); continue
+            return v
+        return None
+
+def change_sni_menu():
+    """菜单 4：两个核心的 reality 各一个伪装域名，各换各的（仓库主人 10/22）；只有一个核心有 reality 就只列一项。"""
+    G_, Y_, R_, N_ = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    try:
+        _restore_state_to_G(json.load(open(STATE_FILE)))  # nginx 分流要按记录里的布局（sni_split / 域名）重建
+    except Exception:
+        pass
+    while True:
+        cur = {"sb": _current_sni("sb"), "xray": _current_sni("xray")}
+        cores = [c for c in ("sb", "xray") if cur[c]]
+        ui_title("更换伪装域名（reality 借用的 SNI 目标站）")
+        if not cores:
+            print("  ⚠ 本机没有 reality 类节点，没有伪装域名可换")
             return
+        label = {"sb": "sing-box", "xray": "xray"}
+        oks = {}
+        for c in cores:
+            ok, detail = _reality_sni_ok(cur[c])          # 从本机实连一下：连通 + TLS1.3 + h2
+            oks[c] = ok
+            ui_kv(f"{label[c]} 伪装域名", _hl("1;32", cur[c]) + "　" +
+                  (_hl("1;32", f"通 · {detail}") if ok else _hl("1;31", f"不通 · {detail}")))
+        ui_line()
+        ui_items([(i + 1, f"换 {label[c]} 的（随机挑 / 手动输入）", None) for i, c in enumerate(cores)]
+                 + [(0, "返回", None)])
+        if not all(oks.values()):
+            ui_tip("不通的站 reality 伪装会打折，建议更换")
+        c = _ask("选择: ").strip()
+        if c in ("0", ""):
+            return
+        if not c.isdigit() or not 1 <= int(c) <= len(cores):
+            continue
+        core = cores[int(c) - 1]
+        other = cur["xray" if core == "sb" else "sb"]
+        new = _choose_new_sni(cur[core], other)
+        if not new or new == cur[core]:
+            if new == cur[core]:
+                print("  和当前一样，未改动。")
+            continue
+        ok2, detail2 = _reality_sni_ok(new)
+        if ok2:
+            print(f"  新域名 {new}: {G_}通 · {detail2}{N_}")
+        else:
+            print(f"  新域名 {new}: {R_}不通 · {detail2}{N_}")
+            if _ask("  这个站从你 VPS 检测不理想，仍要用? y 继续 / n 重选: ").strip().lower() \
+                    not in ("y", "yes"):
+                continue
+        if _ask(f"  确认把 {label[core]} 的伪装域名从 {cur[core]} 换成 {new}? y 确认 / n 取消: ").strip().lower() \
+                in ("y", "yes"):
+            if change_sni_apply(new, core):
+                print(f"\n  ✓ 已更换为 {new}，配置 + 订阅已刷新，核心正在后台重启（订阅 URL 不变）。")
+                print("  客户端重新拉取订阅即可生效——无需重装、无需重新导入。")
+                print("  若你挂着本机代理来管理，重启会让 SSH 瞬断，属正常，操作已在服务端完成。")
 
 # ============================================================================ BT/PT 下载屏蔽
 def bt_enabled():
@@ -11205,7 +11367,8 @@ def _link_hits(u, sb_protos, xr_protos):
 def _restore_state_to_G(st):
     """把上次安装的参数灌回 G，保证新加的节点跟老节点同域名/同 SNI/同前缀。"""
     G["domain"]     = st.get("domain", "")
-    G["sni"]        = _current_sni() or st.get("sni") or G["sni"]   # 以节点正在用的为准：老版本「4 更换伪装域名」没回写记录
+    G["sni"]        = _current_sni("sb") or st.get("sni") or _current_sni() or G["sni"]   # 以节点正在用的为准：老版本「4 更换伪装域名」没回写记录
+    G["sni_xr"]     = _current_sni("xray") or st.get("sni_xr") or ""   # xray 自己的借用域名（没有 = 跟 sing-box 共用一个，老装机）
     G["prefix"]     = st.get("prefix", "")
     G["hy2_ports"]  = st.get("hy2_ports", "")
     G["nginx"]      = st.get("nginx", "")
@@ -11242,19 +11405,6 @@ def add_protocols_flow(st, have_sb, have_xr):
         pick_xr = _pick("【xray 可添加的协议】", avail_xr, default=[])
     if not pick_sb and not pick_xr:
         print("  没选任何协议，返回。")
-        return
-
-    # ws 家族藏在 nginx 443 后面时，新加一个就得把 nginx 的 location 表整个重写；
-    # 而旧节点的 path 只存在于运行中的配置里，重建容易出错（sni-split 还多一层 stream）。
-    # 与其冒险改坏正在用的 443，不如在这里挡掉，让用户走全部重装那条路。
-    if _nginx_front():
-        blocked = proto_pick("ws_front", pick_sb)
-        if blocked:
-            print(f"\n  ⚠ 跳过 {', '.join(blocked)}：这些协议现在藏在 nginx 443 后面，"
-                  f"新增要改动 nginx 反代表，增量模式不碰它。要加请选『全部重新安装』。")
-            pick_sb = [n for n in pick_sb if n not in blocked]
-    if not pick_sb and not pick_xr:
-        print("  没有可增量添加的协议，返回。")
         return
 
     # 首装时是【按选中的协议】决定问不问那几项的：没装 hy2 就没问过跳跃范围，
@@ -11307,6 +11457,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     # 服务器上跑着、订阅里却没有，客户端永远看不到它，而且毫无报错。失败只 break，
     # 下面照样把已经装好的那部分写进链接、刷订阅、记进 state。
     new_links, failed = [], []
+    nginx_redo = False                   # 新加的有挂在 nginx 后面的 → 装完按全部节点重建 nginx
     for core, picks in (("sb", pick_sb), ("xray", pick_xr)):
         if not picks:
             continue
@@ -11361,6 +11512,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
             break
         if backup:
             os.remove(backup)
+        nginx_redo = nginx_redo or any(ib.get("listen") == "127.0.0.1" for ib in add_ins)
         new_links += add_lks
         if core == "sb":
             # 去重：残留协议本来就还挂在记录里（配置里没有而已），直接相加会写进去两遍
@@ -11371,6 +11523,13 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     if not new_links:
         print("  没有新增任何节点。")
         return
+    if nginx_redo:
+        try:
+            msg = _nginx_sync_from_cfg()
+            if msg:
+                print("  " + msg)
+        except Exception as e:
+            print(f"  ⚠ nginx 重建失败，挂在 443 后面的新节点可能连不上：{e}")
 
     # 追加链接 + 刷新订阅（不换 token：客户端里那条订阅地址继续有效）
     links, tail = _node_file_parts()
@@ -11391,7 +11550,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     except Exception as e:
         print("  ⚠ 订阅刷新失败（节点已装好，可到配置菜单点『更新配置』重试）:", e)
 
-    st.update({"sb": have_sb, "xray": have_xr, "sni": G["sni"],
+    st.update({"sb": have_sb, "xray": have_xr, "sni": G["sni"], "sni_xr": G.get("sni_xr", ""),
                "hy2_ports": G.get("hy2_ports", ""), "smux": G.get("smux", "")})
     try:
         json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
@@ -11433,31 +11592,80 @@ def _ib_proto(ib):
     _, seg = _split_tag(ib.get("tag", ""))
     return (seg or "").rstrip(_TAG_MARKS)
 
-def _rebuild_nginx_ws_from_cfg():
-    """从现有 sing-box 配置还原 nginx 前置的 ws 反代表。
-       前置模式下 ws 家族监听 127.0.0.1 且带 transport.path，据此能完整重建。"""
-    NGINX_WS.clear()
-    for ib in _load_core_cfg("sb")[1]:
-        if ib.get("listen") != "127.0.0.1":
-            continue
-        path, port = (ib.get("transport") or {}).get("path"), _cfg_port(ib)
-        if path and port:
-            NGINX_WS.append({"path": path, "port": port})
-    return list(NGINX_WS)
+def _nginx_backends_from_cfg():
+    """两个核心配置里挂在 nginx 后面（监听 127.0.0.1）的入站 → (ws/xhttp 反代表, reality 分流表)。
+       分流表只存在于正在用的配置里，增删一个协议后照着剩下的重建（仓库主人 10/22：要能一个一个加、一个一个删）。
+       reality：sing-box tls.server_name / xray realitySettings.serverNames[0] → 本地端口；
+       ws：transport.path / wsSettings.path；xray xhttp：xhttpSettings.path（kind=xhttp，nginx 用 grpc_pass）。
+       同一个借用域名只认第一个后端：nginx map 里重复的键 nginx -t 过不了。"""
+    ws, stream, seen = [], [], set()
+    for core in ("sb", "xray"):
+        for ib in _load_core_cfg(core)[1]:
+            if str(ib.get("listen", "")) not in ("127.0.0.1", "localhost"):
+                continue
+            port = _cfg_port(ib)
+            if not port:
+                continue
+            if core == "sb":
+                tls = ib.get("tls") or {}
+                sni = tls.get("server_name") if isinstance(tls.get("reality"), dict) else ""
+                path = (ib.get("transport") or {}).get("path")
+                kind = "ws"
+            else:
+                st = ib.get("streamSettings") or {}
+                rs = st.get("realitySettings") if st.get("security") == "reality" else None
+                sni = ((rs or {}).get("serverNames") or [""])[0] if rs else ""
+                net = st.get("network")
+                path = ((st.get("wsSettings") or {}).get("path") if net == "ws" else
+                        (st.get("xhttpSettings") or {}).get("path") if net == "xhttp" else None)
+                kind = "xhttp" if net == "xhttp" else "ws"
+            if sni:
+                if sni not in seen:
+                    seen.add(sni); stream.append({"sni": sni, "port": port})
+            elif path:
+                ws.append({"path": path, "port": port, **({"kind": "xhttp"} if kind == "xhttp" else {})})
+    return ws, stream
 
-def _sni_split_shrink():
-    """sni-split 下挂在 nginx 后面的节点一个不剩了：分流表收成只有本机域名 / 默认 → 本地 https（伪装站），
-       ws 反代清空。就是 write_nginx_sni_split 本身，两张表空着写；nginx -t 不过它自己整体回滚。"""
-    NGINX_WS.clear(); NGINX_STREAM.clear()
-    return ("nginx 443 分流已收成只剩伪装站" if write_nginx_sni_split()
-            else "⚠ nginx 分流重写没通过校验，已回滚原配置（指向已删节点的分流还在，不影响伪装站）")
+def _nginx_sync_from_cfg():
+    """按两个核心【当前的】配置重写 nginx：sni-split 写 stream 分流 + 本地 https；普通前置写 443 伪装站 + 反代。
+       nginx -t 不过就把动过的文件原样放回去再 reload —— 退回【改之前那份能用的】，不是退回装分流之前
+       （write_nginx_sni_split 自带的回滚是给首装用的，会把 stream 整个拆掉，443 就没了，这里不用它）。
+       没开 nginx 前置 / reality 独占 443 的布局：nginx 不在路上，什么都不做。返回 屏上一行 或 ""。"""
+    if not G.get("domain") or not (G.get("sni_split") or _nginx_front()):
+        return ""
+    ws, stream = _nginx_backends_from_cfg()
+    NGINX_WS[:] = ws; NGINX_STREAM[:] = stream
+    split = bool(G.get("sni_split"))
+    files = [NGINX_CONF] + ([NGINX_STREAM_CONF, NGINX_MAIN] if split else [])
+    old = {f: (open(f).read() if os.path.exists(f) else None) for f in files}
+    if split:
+        listen = nginx_http2_listen(f"127.0.0.1:{SNI_HTTPS_PORT} ssl") + nginx_http2_on()
+    else:
+        listen = (nginx_http2_listen("443 ssl") + _v6(nginx_http2_listen("[::]:443 ssl")) + nginx_http2_on())
+    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
+    if split:
+        open(NGINX_STREAM_CONF, "w").write(_stream_conf_text())
+        _nginxconf_add_stream()
+    chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+    if chk.returncode:
+        for f, txt in old.items():
+            if txt is None:
+                sh(f"rm -f {f}", check=False)
+            else:
+                open(f, "w").write(txt)
+        sh("nginx -t && systemctl reload nginx", check=False)
+        return "⚠ nginx 重建没通过校验，已退回原配置"
+    nginx_reload()
+    if split:
+        return f"✔ nginx 443 分流已按现有节点重建（{len(stream)} 个 reality、{len(ws)} 个 ws/xhttp）"
+    return f"✔ nginx 443 反代表已按现有节点重建（{len(ws)} 个 ws/xhttp）"
 
-def _nginx_backed(names):
-    """这些 sb 协议里，哪些的入站是挂在 nginx 后面的（监听 127.0.0.1）。
+def _nginx_backed(names, core="sb"):
+    """这个核心的这些协议里，哪些的入站是挂在 nginx 后面的（监听 127.0.0.1）。
 
-       从运行中的配置读，不靠名字猜：ws 家族前置、sni-split 的 reality 后端都是
+       从运行中的配置读，不靠名字猜：ws 家族前置、sni-split 的 reality 后端、xray 的 xhttp 都是
        这个形态，以后再多一种也自动认得。"""
-    local = {_ib_proto(ib) for ib in _load_core_cfg("sb")[1] if ib.get("listen") == "127.0.0.1"}
+    local = {_ib_proto(ib) for ib in _load_core_cfg(core)[1] if ib.get("listen") == "127.0.0.1"}
     return [n for n in names if n in local]
 
 def _drop_hy2_dnat():
@@ -11509,19 +11717,10 @@ def del_protocols_flow(st, have_sb, have_xr):
         print("  没选任何协议，返回。")
         return
 
-    # sni-split 下 nginx 是 stream 分流 + 本地 https server 两层，443 的走向依赖具体后端；
-    # 删了它的后端再去重建这套结构，出错就是整个 443 崩掉。挡住，让走重装。
-    # 例外：挂在 nginx 后面的一个不剩（「全部删除」就是这样）——那就不用重建后端，只把分流收成
-    # 「只剩伪装站」（_sni_split_shrink），跟装好时的结构一样，nginx -t 不过整体回滚。
-    split_shrink = False
-    if G.get("sni_split"):
-        backing = _nginx_backed(del_sb)
-        split_shrink = bool(backing) and not [n for n in _nginx_backed(have_sb) if n not in del_sb]
-        if backing and not split_shrink:
-            print(f"{RED}  ✗ 本机开着 nginx SNI 分流，443 的走向依赖 "
-                  f"{', '.join(backing)} 做后端。{OFF}")
-            print("    删它们要重建整套 nginx 结构，增量模式不碰。请走『全部重新安装』。")
-            return
+    # 挂在 nginx 后面的（ws/xhttp 反代、sni-split 的 reality 后端，两个核心都算）删掉后，
+    # _del_apply 按【剩下的】节点把 nginx 整个重建一遍；nginx -t 不过退回原样（仓库主人 10/22：要能一个一个删）。
+    nginx_redo = bool((G.get("sni_split") or _nginx_front()) and
+                      (_nginx_backed(del_sb, "sb") or _nginx_backed(del_xr, "xray")))
 
     # 要清哪些副作用，全问注册表要（teardown）。加新协议时只要在表里填上 teardown，
     # 这里的确认框和下面的真动手都自动带上它，不会像以前那样漏掉一处。
@@ -11539,8 +11738,8 @@ def del_protocols_flow(st, have_sb, have_xr):
         what = td(plan=True)
         if what:
             print("  连带清理:     ", what)
-    if split_shrink:
-        print("  连带清理:      nginx 443 分流去掉这些后端，只留伪装站")
+    if nginx_redo:
+        print("  连带清理:      nginx 443 按剩下的节点重建")
     if not left_sb:
         print(f"{RED}  ⚠ sing-box 将没有任何入站，服务会被停掉并禁用开机自启{OFF}")
     if not left_xr and have_xr:
@@ -11574,6 +11773,9 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
     # 两个核心是分别处理的，其中一个失败【不能】把另一个已经做完的事丢在半路：
     # 那样入站删了、订阅和记录却没跟着改，正是最难收拾的「删了一半」。失败只 break
     # 出循环，下面的收尾照跑，但一律按【真正处理掉的】那部分算，不按用户当初勾的清单。
+    # 删之前先记下：要删的里面有没有挂在 nginx 后面的（删完配置里就查不到了）
+    nginx_redo = bool((G.get("sni_split") or _nginx_front()) and
+                      (_nginx_backed(del_sb, "sb") or _nginx_backed(del_xr, "xray")))
     removed, stale = [], []          # removed: 真摘掉的入站；stale: 配置里本来就没有的
     done = {"sb": [], "xray": []}    # 每个核心真正处理掉的协议
     failed = []
@@ -11654,11 +11856,13 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
             print(f"{RED}  ⚠ 善后清理失败（{getattr(td, '__name__', td)}），"
                   f"可能有残留，需手工确认：{e}{OFF}")
 
-    if G.get("sni_split") and ok_sb and not _nginx_backed([_ib_proto(ib) for ib in _load_core_cfg("sb")[1]]):
+    if nginx_redo:
         try:
-            print("  " + _sni_split_shrink())
+            msg = _nginx_sync_from_cfg()
+            if msg:
+                print("  " + msg)
         except Exception as e:
-            print(f"{RED}  ⚠ nginx 分流收尾失败，可能有残留，需手工确认：{e}{OFF}")
+            print(f"{RED}  ⚠ nginx 重建失败，可能有残留，需手工确认：{e}{OFF}")
 
     # 摘掉对应的分享链接（CDN 节点的协议段是 CDN·xxx，天然不会命中，不受影响）
     links, tail = _node_file_parts()
@@ -11783,10 +11987,18 @@ def install_flow():
     if domain:
         nginx = "1" if (_ask("用 nginx 前置(443伪装站+webroot证书, ws类藏443)? [y/N]: ")
                         .lower() in ("y", "yes")) else ""
-    _sni_rand = secrets.choice(REALITY_SNI_POOL)         # 回车就用这个随机挑的（不同机器各不同，不扎堆）
-    sni_in = _ask(f"reality 借用目标站 SNI (回车=随机挑，本次随机到 {_sni_rand}): ").strip()
-    sni = sni_in or _sni_rand
-    G["sni_auto"] = "" if sni_in else "1"               # 随机挑的探不过，装的时候自己换一个（见 _sni_precheck_one）
+    # reality 伪装域名：两个核心都选了 reality 就各问一个、不许重复（仓库主人 10/22：sni-split 下 nginx 按伪装域名
+    # 分流，xray 的 reality-vision 也挂 443 后面，同一个域名分不出该给谁）。回车随机挑（不同机器各不同，不扎堆）；
+    # 随机挑的探不过，装的时候自己换一个（见 _sni_precheck_one）。没选 reality 也问第一个：无域名时 ws/trojan 拿它当伪装 Host。
+    r_sb, r_xr = proto_flag("reality", sb_names), proto_flag("reality", (), xr_names)
+    sni, sni_auto = ask_reality_sni("sing-box 的 reality 伪装域名" if r_sb and r_xr else
+                                    "xray 的 reality 伪装域名" if r_xr else "reality 伪装域名（借用目标站 SNI）")
+    G["sni_auto"] = "1" if sni_auto else ""
+    sni_xr = ""
+    if r_sb and r_xr:
+        sni_xr, xr_auto = ask_reality_sni("xray 的 reality 伪装域名", avoid=sni)
+        G["sni_xr_auto"] = "1" if xr_auto else ""
+    G["sni_xr"] = sni_xr
     prefix = _ask_free("节点名称前缀（如 🇺🇸/🇯🇵/家宽，回车=无前缀）：")
     # 各协议自己的设置（hy2 跳跃范围、ws 的 smux …）交给注册表的 asks 去问：
     # 它们写进 G，所以得先把已经问到的填进 G，再 run_asks，最后读回来。
@@ -11819,9 +12031,9 @@ def install_flow():
     else:
         print("  nginx前置:", "是（443伪装站+webroot，ws类走443）" if nginx else "否")
     print("  名称前缀:", prefix or "(无)")
-    print("  SNI:     ", sni)
+    print("  伪装域名:", sni + (f"（sing-box）/ {sni_xr}（xray）" if sni_xr else ""))
     for label, value in recap_lines(sb_names, xr_names):
-        if label == "借用 SNI":                 # 上面那行已经报过了，别重复
+        if label in ("sing-box 伪装域名", "xray 伪装域名"):   # 上面那行已经报过了，别重复
             continue
         print("  " + _pad(label + ":", 10) + str(value))
     print("-" * 60)
@@ -11876,6 +12088,7 @@ if __name__ == "__main__":
     ap.add_argument("--domain", default="", help="有域名则走 acme 真证书")
     ap.add_argument("--email", default="", help="acme 注册邮箱")
     ap.add_argument("--sni", default="", help="reality 借用的目标站（不填=从内置大厂池随机挑一个）")
+    ap.add_argument("--sni-xr", default="", help="xray 的 reality 借用目标站（两个核心都装 reality 时用；不填=随机挑一个跟 --sni 不同的）")
     ap.add_argument("--prefix", default="", help="节点名称前缀(如 🇺🇸/🇯🇵)，默认无")
     ap.add_argument("--hy2-ports", default="", help="hy2 端口跳跃范围 起-止，默认 30000-31000；填 off 关闭跳跃走单端口")
     ap.add_argument("--nginx", action="store_true",
@@ -11909,4 +12122,11 @@ if __name__ == "__main__":
     if bad_sb or bad_xr:
         if bad_sb: ap.error(f"未知的 sing-box 协议: {','.join(bad_sb)}\n  可选: {','.join(SB)}")
         ap.error(f"未知的 xray 协议: {','.join(bad_xr)}\n  可选: {','.join(XRAY)}")
+    # 两个核心都装 reality：xray 用自己的伪装域名，跟 sing-box 的不能一样（见 ask_reality_sni）
+    G["sni_xr"] = G["sni_xr_auto"] = ""
+    if proto_flag("reality", sb) and proto_flag("reality", (), xr):
+        if a.sni_xr and a.sni_xr == G["sni"]:
+            ap.error(f"--sni-xr 跟 --sni 一样（{a.sni_xr}）：两个核心的伪装域名不能重复")
+        G["sni_xr"] = a.sni_xr or secrets.choice([x for x in REALITY_SNI_POOL if x != G["sni"]])
+        G["sni_xr_auto"] = "" if a.sni_xr else "1"
     run(sb, xr)
