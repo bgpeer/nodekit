@@ -27,16 +27,23 @@ check(f"记录旧、节点新：加协议沿用节点在用的（{m.G['sni']}）
 for f in ("_nginx_split_set_sni", "_links_set_sni", "build_subscription", "restart_services", "_xr_pq_sync"):
     setattr(m, f, lambda *a, **k: False)
 m._host = lambda: "h.example.com"
-ok = m.change_sni_apply("www.third.example")
+ok = m.change_sni_apply("www.third.example", "sb")
 check(f"换伪装域名成功，节点配置改了（{m._current_sni()}）", ok and m._current_sni() == "www.third.example")
 check(f"安装记录跟着换（{json.load(open(m.STATE_FILE))}）", json.load(open(m.STATE_FILE)).get("sni") == "www.third.example"
       and json.load(open(m.STATE_FILE)).get("prefix") == "P")
 
-# 3. 提示：显示当前的，可输入别的；输入的大写 / 末尾点归一
+# 3. sing-box 已有 reality → 一个核心一个伪装域名，加协议沿用、不再问
+asked = []
+m._ask = lambda q: (asked.append(q), "x.example")[1]
+m._sni_precheck_one = lambda *a, **k: None
+m._asks_reality("add")
+check(f"sing-box 已有 reality：沿用它那个、不问（{m.G['sni']}）", not asked and m.G["sni"] == "www.third.example")
+
+# 4. sing-box 还没有 reality → 问；显示当前的、可输入别的；大写 / 末尾点归一
+os.remove(f"{m.SB_DIR}/config.json")
 m.G["sni"] = "www.third.example"; asked = []
 m._ask = lambda q: (asked.append(q), " WWW.Other.Example. ")[1]
-m._sni_precheck_one = lambda: None
 m._asks_reality("add")
-check(f"提示写明沿用当前的、可以输入别的（{asked[0].strip()}）", "回车沿用当前的 www.third.example" in asked[0] and "输入别的域名" in asked[0])
+check(f"提示写明回车沿用当前的（{asked[0].strip()}）", "回车沿用当前的 www.third.example" in asked[0])
 check(f"输入的域名归一成小写、去掉末尾点（{m.G['sni']}）", m.G["sni"] == "www.other.example")
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)
