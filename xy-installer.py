@@ -5214,6 +5214,73 @@ def _fw_wanted():
         add(443, "tcp")
     return want
 
+def _link_ports(u):
+    """分享链接 → 节点在服务器上占的端口（字符串集合）；hy2 端口跳跃的 mport=起-止 原样带上。认不出返回空集。"""
+    try:
+        if u.startswith("vmess://"):
+            b = u[8:]; j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+            return {str(int(j.get("port")))}
+        sp = urllib.parse.urlsplit(u)
+        out = {str(sp.port)} if sp.port else set()
+        mp = urllib.parse.parse_qs(sp.query).get("mport", [""])[0]
+        if re.fullmatch(r"\d+-\d+", mp):
+            out.add(mp)
+        return out
+    except (ValueError, TypeError, json.JSONDecodeError, base64.binascii.Error):
+        return set()
+
+def _port_csv(ports):
+    """端口集合 → 「443,18047,31000-32000」：单端口按大小排，跳跃段按起点插进去；落在跳跃段里的单端口不重复列。"""
+    ps = {str(p) for p in ports}
+    rngs = [tuple(map(int, p.split("-"))) for p in ps if "-" in p]
+    ps = {p for p in ps if "-" in p or not any(a <= int(p) <= b for a, b in rngs)}
+    return ",".join(sorted(ps, key=lambda p: int(p.split("-")[0])))
+
+def cloud_ports():
+    """云厂商防火墙（GCP / AWS 安全组这类，本机管不到）要放行的端口：[(标题, 「443,…」)]。
+       本机：_fw_wanted 收的（节点 / 订阅 / 伪装站 / CDN 回源）+ hy2 跳跃段；
+       聚合的成员机：拉它的 .links，按链接收端口（CDN 节点的端口在 Cloudflare 上，不算）+ 它的订阅端口（主机要从这拉）。
+       仓库主人 10/23：GCP 少放行一个端口，trojan² 一直不通，自己从订阅里摘端口漏了。"""
+    def label(links, fallback):
+        for u in links:
+            pre = _split_tag(_link_name(u))[0]
+            if pre:
+                return pre
+        return fallback
+    local = read_saved_links()
+    mine = {str(p) for p, _ in _fw_wanted()}
+    for u in local:
+        if "CDN·" not in _link_name(u):
+            mine |= {p for p in _link_ports(u) if "-" in p}
+    out = [(f"本机 {label(local, '')}".strip(), _port_csv(mine))] if mine else []
+    for i, url in enumerate(load_peers(), 1):
+        try:
+            links = [l.strip() for l in _fetch_text(url, timeout=6).splitlines() if l.strip().startswith(_NODE_SCHEMES)]
+        except Exception:
+            out.append((f"成员 {i}", "拉不到它的节点链接，到那台机器上看"))
+            continue
+        ports = set()
+        for u in links:
+            if "CDN·" not in _link_name(u):
+                ports |= _link_ports(u)
+        sp = urllib.parse.urlsplit(url).port
+        if sp:
+            ports.add(str(sp))
+        out.append((f"成员 {label(links, str(i))}", _port_csv(ports) if ports else "没有节点"))
+    return out
+
+def print_cloud_ports():
+    """「云防火墙要放行的端口」那一屏：每台一行高亮标题 + 端口顶格一行（长按复制），台与台之间空一行。"""
+    rows = cloud_ports()
+    if not rows:
+        return
+    ui_title("云防火墙要放行的端口（tcp、udp 两栏都填）")
+    for i, (t, ports) in enumerate(rows):
+        print(_hl("1;36", f"[{t}]"))
+        print(ports)
+        if i < len(rows) - 1:
+            print()
+
 def _ipt_catchall():
     """iptables 的 INPUT 会不会挡新连接；挡的话返回放行规则该怎么加（"-I INPUT 7" / "-A INPUT"），不挡返回 ""。
        兜底 = 不带任何条件的 REJECT/DROP（甲骨文镜像：-A INPUT -j REJECT --reject-with icmp-host-prohibited），
@@ -5382,6 +5449,7 @@ def run(sb_names, xr_names):
         ok = build_subscription(all_links, new_token=True)   # 重装换了节点/域名 → 换 token 刷新订阅
     except Exception as e:
         print("\n订阅生成跳过（不影响节点使用）:", e)
+    print_cloud_ports()                                      # 订阅端口这时才定下来，放订阅生成之后、订阅链接之前
     if ok:
         urls = sub_urls_text()
         if out_file:
@@ -5471,6 +5539,7 @@ def show_links():
     ui_title("分享链接")
     # 和订阅里保持一致：同样补上「前缀·协议」的分隔点（只影响显示，NODE_FILE 不动）
     print_node_links([_link_rename(u, _sep_name(_link_name(u))) for u in links])
+    print_cloud_ports()
     if _sub_items():
         ui_title("订阅链接（按客户端选一条）")
         print_sub_urls()
@@ -11717,6 +11786,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     # 和「2 查看链接」一个样：新节点一条一行、条间空行，三大订阅高亮
     ui_title(f"已添加 {len(new_links)} 个节点（现有节点未改动）")
     print_node_links(new_links)
+    print_cloud_ports()
     if _sub_items():
         ui_title("订阅链接（地址没变，客户端重拉即可）")
         print_sub_urls()
