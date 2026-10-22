@@ -175,6 +175,8 @@ NGINX_MAIN_BAK    = "/etc/nginx/nginx.conf.bgpeer-bak"
 NGINX_STREAM_CONF = "/etc/nginx/bgpeer-stream.conf"   # stream(ssl_preread) 分流配置
 NGINX_STREAM      = []          # 运行期收集：reality 后端 [{sni, port}]（监听 127.0.0.1）
 SNI_HTTPS_PORT    = 8443        # 本地 https(网站+ws)端口，藏在 stream 443 后面
+REALITY_FB_PORT   = 8444        # 本地 h2c：xray reality 入口解开后回落进来，nginx 按路径分给 reality-grpc² / reality-xhttp²
+                                # 用 TCP 不用 unix socket：nginx 异常退出留下的 .sock 会让它再也起不来（bind 98），443 跟着全断
 
 # 屏蔽中国域名/IP 功能拆到独立文件 cn-block.py，方便单独维护；主脚本只负责拉取+调用。
 CNBLOCK_FILE   = BGP_DIR + "/cnblock.json"       # cn-block.py 存的状态（这里只读它判断是否已开启）
@@ -1197,7 +1199,7 @@ def write_nginx_sni_split():
        nginx -t 不过则整体回滚（还原 nginx.conf、删 stream 配置），返回 False。"""
     listen = (nginx_http2_listen(f"127.0.0.1:{SNI_HTTPS_PORT} ssl")
               + nginx_http2_on())
-    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
+    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen) + _nginx_fb_server())
     open(NGINX_STREAM_CONF, "w").write(_stream_conf_text())
     _nginxconf_add_stream()
     chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
@@ -2313,12 +2315,136 @@ def _xr_pq_new():
 def _pqv(v):
     return f"&pqv={v}" if v else ""
 
+# ── xray reality 入口（sni-split 下）：vision² / grpc² / xhttp² 共用 443 上一个 reality 入口 ──
+# nginx stream 只能按伪装域名分流，三个同一个伪装域名分不开（仓库主人 10/22 要都上 443、又不想多填域名）。
+# 做法：reality-vision² 那个入站当入口，vision 用户直接在它里面；不是 vision 的连接（grpc / xhttp 都是 h2）
+# 解开 reality 后走 fallbacks 回落到 nginx 本地 h2c（REALITY_FB_PORT），按服务名 / 路径分给本地明文的
+# grpc² / xhttp² 入站。REALITY 解开后拿不到 ALPN（realAlpn 为空），所以回落不能按 alpn=h2 匹配，只能写默认回落。
+# 删掉 vision² 时入口不能跟着没：把它改名成 XR_ENTRY_TAG、用户清空，留着给 grpc² / xhttp²（实测零用户的
+# 入口照样回落）；三个都删了入口才拆。再加回 vision² 时用户并回入口。见 _xr_entry_fixup。
+XR_ENTRY_TAG = "reality-entry"
+_XR_FB_PROTOS = ("reality-grpc", "reality-xhttp")
+_XR_ENTRY = {}
+_XR_ENTRY_FROM_DISK = [True]        # 全新安装（run）不沿用磁盘上旧配置的密钥
+
+def _xr_is_entry(ib):
+    st = ib.get("streamSettings") or {}
+    return (st.get("security") == "reality" and str(ib.get("listen", "")) == "127.0.0.1"
+            and (ib.get("tag") == XR_ENTRY_TAG or _ib_proto(ib) == "reality-vision"))
+
+def _xr_is_fb_backed(ib):
+    """挂在 reality 入口后面的 grpc² / xhttp²：本地、明文、协议名对得上。"""
+    st = ib.get("streamSettings") or {}
+    return (_ib_proto(ib) in _XR_FB_PROTOS and str(ib.get("listen", "")) == "127.0.0.1"
+            and st.get("security") in (None, "", "none"))
+
+def _xr_entry_keys():
+    """reality 入口的一套 (私钥, 公钥, shortId, ML-DSA 种子, pqv)。已有入口（增量添加）就从它的配置里取，
+       公钥 / pqv 用 xray 从私钥 / 种子算回来；没有就新生成。同一次运行里只算一次。"""
+    if _XR_ENTRY.get("k"):
+        return _XR_ENTRY["k"]
+    k = None
+    if _XR_ENTRY_FROM_DISK[0]:
+        for ib in _load_core_cfg("xray")[1]:
+            if _xr_is_entry(ib):
+                rs = ib["streamSettings"].get("realitySettings") or {}
+                try:
+                    pub = [l for l in sh(f"{XRAY_BIN} x25519 -i {rs['privateKey']}").splitlines()
+                           if "PublicKey" in l][0].split(":")[-1].strip()
+                    seed = rs.get("mldsa65Seed", "")
+                    pqv = ([l for l in sh(f"{XRAY_BIN} mldsa65 -i {seed}").splitlines()
+                            if l.startswith("Verify")][0].split(":")[-1].strip() if seed else "")
+                    k = (rs["privateKey"], pub, (rs.get("shortIds") or [""])[0], seed, pqv)
+                except Exception:
+                    k = None
+                break
+    if not k:
+        priv, pub = reality_keys(XRAY_BIN, "x25519")
+        seed, pqv = _xr_pq_new()
+        k = (priv, pub, short_id(), seed, pqv)
+    _XR_ENTRY["k"] = k
+    return k
+
+def _xr_entry_fixup(inbounds, removed_vision=None):
+    """让 xray 入站表里的 reality 入口跟挂在它后面的 grpc² / xhttp² 对得上，返回新的入站表：
+       有后端没入口 → 建一个零用户入口；有入口没后端 → 去掉回落（零用户的入口直接拆）；
+       新加的 vision² 碰上已有的零用户入口 → 用户并进入口；removed_vision（这次删掉的 vision² 入站）
+       后面还挂着后端 → 改名成零用户入口留下。"""
+    ibs = list(inbounds)
+    backed = [ib for ib in ibs if _xr_is_fb_backed(ib)]
+    if removed_vision is not None and backed and not any(_xr_is_entry(ib) for ib in ibs):
+        ent = dict(removed_vision, tag=XR_ENTRY_TAG)
+        ent["settings"] = dict(ent.get("settings") or {}, clients=[])
+        ibs.append(ent)
+    entries = [ib for ib in ibs if _xr_is_entry(ib)]
+    hidden = [ib for ib in entries if ib.get("tag") == XR_ENTRY_TAG]
+    vision = [ib for ib in entries if ib.get("tag") != XR_ENTRY_TAG]
+    if hidden and vision:                               # 加回 vision²：用户并进入口，入口改回 vision² 的名字
+        ent, new = hidden[0], vision[0]
+        ent["settings"] = dict(ent.get("settings") or {},
+                               clients=(new.get("settings") or {}).get("clients") or [])
+        ent["tag"] = new.get("tag")
+        ibs = [ib for ib in ibs if ib is not new]
+        entries = [ent]
+    if backed and not entries:
+        priv, pub, sid, seed, pqv = _xr_entry_keys()
+        ent = {"listen": "127.0.0.1", "port": next_port(), "protocol": "vless", "tag": XR_ENTRY_TAG,
+               "settings": {"clients": [], "decryption": "none"},
+               "streamSettings": _xr_reality_stream(priv, sid, "raw", seed=seed)}
+        ibs.append(ent)
+        entries = [ent]
+    for ent in entries:
+        st = ent.setdefault("settings", {})
+        if backed:
+            st["fallbacks"] = [{"dest": REALITY_FB_PORT}]
+        else:
+            st.pop("fallbacks", None)
+    if not backed:
+        ibs = [ib for ib in ibs if ib.get("tag") != XR_ENTRY_TAG]
+    return ibs
+
+def _xr_link_uuids(data, ib):
+    """这个 xray 入站对应哪些分享链接（按 UUID）：自己的用户；reality 入口再加上挂在它后面的 grpc² / xhttp²
+       ——它们的链接用的是入口的伪装域名 / 公钥 / pqv，换伪装域名、开关抗量子签名要一起改。"""
+    out = [str(c.get("id")) for c in (ib.get("settings") or {}).get("clients") or [] if c.get("id")]
+    if (ib.get("settings") or {}).get("fallbacks"):
+        for b in data.get("inbounds", []):
+            if _xr_is_fb_backed(b):
+                out.append(_xr_ib_uuid(b))
+    return [u for u in out if u]
+
+def _nginx_fb_server():
+    """reality 入口回落进来的本地 h2c：按 grpc 服务名 / xhttp 路径分给本地明文入站。没有后端返回 ""。"""
+    locs = ""
+    for ib in _load_core_cfg("xray")[1]:
+        if not _xr_is_fb_backed(ib):
+            continue
+        st = ib.get("streamSettings") or {}
+        if st.get("network") == "grpc":
+            loc = "/" + (st.get("grpcSettings") or {}).get("serviceName", "").strip("/") + "/"
+        else:
+            loc = (st.get("xhttpSettings") or {}).get("path", "").rstrip("/") + "/"
+        if len(loc) < 3:
+            continue
+        locs += (f"  location {loc} {{\n    client_max_body_size 0;\n    client_body_timeout 1h;\n"
+                 f"    grpc_read_timeout 1h;\n    grpc_send_timeout 1h;\n"
+                 f"    grpc_pass grpc://127.0.0.1:{_cfg_port(ib)};\n  }}\n")
+    if not locs:
+        return ""
+    return ("server {\n" + nginx_http2_listen(f"127.0.0.1:{REALITY_FB_PORT}") + nginx_http2_on() +
+            locs + "  location / {\n    return 404;\n  }\n}\n")
+
 def xr_reality_vision(port, tag):
-    uid = new_uuid(); sid = short_id()
-    priv, pub = reality_keys(XRAY_BIN, "x25519")
-    seed, pqv = _xr_pq_new()
-    # sni-split：跟 sing-box 的 reality-vision 一样挂 nginx 443 后面，nginx 按 xray 自己的借用域名转进来（仓库主人 10/22）
+    uid = new_uuid()
+    # sni-split：跟 sing-box 的 reality-vision 一样挂 nginx 443 后面，nginx 按 xray 自己的借用域名转进来（仓库主人 10/22）；
+    # 它同时是 reality-grpc² / reality-xhttp² 的入口，三个共用一套 reality 密钥（见 _xr_entry_keys）
     split = _xr_behind_split()
+    if split:
+        priv, pub, sid, seed, pqv = _xr_entry_keys()
+    else:
+        sid = short_id()
+        priv, pub = reality_keys(XRAY_BIN, "x25519")
+        seed, pqv = _xr_pq_new()
     ib = {"listen": "127.0.0.1" if split else "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid, "flow": "xtls-rprx-vision"}],
                        "decryption": "none"},
@@ -2331,6 +2457,16 @@ def xr_reality_vision(port, tag):
 
 def xr_reality_grpc(port, tag):
     uid = new_uuid(); sid = short_id(); svc = "grpc" + secrets.token_hex(2)
+    if _xr_behind_split():
+        # 挂在 reality 入口后面：本地明文 grpc，入口解开 reality 后回落给 nginx h2c，按服务名转进来（仓库主人 10/22）
+        priv, pub, sid, seed, pqv = _xr_entry_keys()
+        ib = {"listen": "127.0.0.1", "port": port, "protocol": "vless", "tag": tag,
+              "settings": {"clients": [{"id": uid}], "decryption": "none"},
+              "streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": svc, "multiMode": True}}}
+        lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=reality"
+              f"&sni={_xr_sni()}&fp=chrome&pbk={pub}&sid={sid}&type=grpc"
+              f"&serviceName={svc}&mode=multi{_pqv(pqv)}#{tag}")
+        return ib, lk
     priv, pub = reality_keys(XRAY_BIN, "x25519")
     seed, pqv = _xr_pq_new()
     st = _xr_reality_stream(priv, sid, "grpc",
@@ -2345,6 +2481,16 @@ def xr_reality_grpc(port, tag):
 
 def xr_reality_xhttp(port, tag):
     uid = new_uuid(); sid = short_id(); path = "/" + secrets.token_hex(3)
+    if _xr_behind_split():
+        # 同 reality-grpc：挂在 reality 入口后面，本地明文 xhttp（h2c），nginx 按路径转进来
+        priv, pub, sid, seed, pqv = _xr_entry_keys()
+        ib = {"listen": "127.0.0.1", "port": port, "protocol": "vless", "tag": tag,
+              "settings": {"clients": [{"id": uid}], "decryption": "none"},
+              "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": path}}}
+        lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=reality"
+              f"&sni={_xr_sni()}&fp=chrome&pbk={pub}&sid={sid}&type=xhttp"
+              f"&host={_xr_sni()}&path={path}{_pqv(pqv)}#{tag}")
+        return ib, lk
     priv, pub = reality_keys(XRAY_BIN, "x25519")
     seed, pqv = _xr_pq_new()
     st = _xr_reality_stream(priv, sid, "xhttp",
@@ -5133,6 +5279,7 @@ def run(sb_names, xr_names):
     warn_selfsigned(sb_names, xr_names)  # 无域名自签的伪装弱点引导
     NGINX_WS.clear()
     NGINX_STREAM.clear()
+    _XR_ENTRY.clear(); _XR_ENTRY_FROM_DISK[0] = False    # 全新安装：reality 入口新生成密钥
     _USED_PORTS.clear()                  # 本次安装重新随机分配端口
     dup_protos = set(sb_names) & set(xr_names)   # 两核心同名协议 → 各自尾部加 ¹/² 区分
 
@@ -5184,6 +5331,7 @@ def run(sb_names, xr_names):
         install_xray()
         ins, lks = build(XRAY, xr_names, pin if r443_core == "xray" else {},
                          dup=dup_protos, mark="²"); all_links += lks
+        ins = _xr_entry_fixup(ins)                      # grpc² / xhttp² 挂 reality 入口后面时补上回落
         cfg = f"{XRAY_DIR}/config.json"
         json.dump({"log": {"loglevel": "warning"}, "inbounds": ins,
                    "outbounds": [{"protocol": "freedom", "tag": "direct"},
@@ -5195,6 +5343,7 @@ def run(sb_names, xr_names):
     # 以前在 sing-box 那段里写，xray 的还没登记进 NGINX_WS / NGINX_STREAM
     if G.get("sni_split"):
         ensure_acme()                                   # 确保证书就绪（本地 https server 要用）
+        NGINX_WS[:], NGINX_STREAM[:] = _nginx_backends_from_cfg()   # 按刚写好的两份配置（含 reality 入口）
         if not write_nginx_sni_split():                 # 写 http(本地https)+stream(443分流)，失败已回滚
             print("  ⚠ sni-split 生效失败（nginx 已回滚到安全状态）。此时 reality 监听在本地、"
                   "暂不可达；请用 --no-sni-split 重装，或改用 reality-443 直连模式。")
@@ -6164,7 +6313,8 @@ def _xray_heal_minclientver(restart=True):
         except Exception:
             continue
         rs["mldsa65Seed"] = seed
-        pq[_xr_ib_uuid(ib)] = v
+        for u in _xr_link_uuids(data, ib):
+            pq[u] = v
     return len(pq) if _xray_reality_commit(cfg, data, old, pq, restart) else None
 
 def _xray_pq_health(restart=True):
@@ -6185,7 +6335,8 @@ def _xray_pq_health(restart=True):
             n, _ = _reality_pq_ping(sni)
             if n is not None and n < PQ_OFF_BELOW:
                 rs.pop("mldsa65Seed")
-                off[_xr_ib_uuid(ib)] = ""
+                for u in _xr_link_uuids(data, ib):
+                    off[u] = ""
     if not off:
         return 0
     return len(off) if _xray_reality_commit(cfg, data, old, off, restart) else 0
@@ -7286,10 +7437,12 @@ def _xr_pq_sync(data, sni):
             except Exception:
                 continue
             rs["mldsa65Seed"] = seed
-            out[_xr_ib_uuid(ib)] = v
+            for u in _xr_link_uuids(data, ib):
+                out[u] = v
         elif not ok and rs.get("mldsa65Seed"):
             rs.pop("mldsa65Seed")
-            out[_xr_ib_uuid(ib)] = ""
+            for u in _xr_link_uuids(data, ib):
+                out[u] = ""
     return out
 
 def _link_set_q(ln, key, val):
@@ -7360,7 +7513,7 @@ def _reality_uuids(core):
         if core == "sb":
             if isinstance((ib.get("tls") or {}).get("reality"), dict):
                 out |= {str(u.get("uuid", "")) for u in ib.get("users") or [] if u.get("uuid")}
-        elif ((ib.get("streamSettings") or {}).get("security")) == "reality":
+        elif ((ib.get("streamSettings") or {}).get("security")) == "reality" or _xr_is_fb_backed(ib):
             out |= {str(c.get("id", "")) for c in (ib.get("settings") or {}).get("clients") or [] if c.get("id")}
     return out
 
@@ -11450,6 +11603,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     _USED_PORTS.update(_ports_in_cfgs())        # 避开现有节点的端口
     NGINX_WS.clear()
     NGINX_STREAM.clear()
+    _XR_ENTRY.clear(); _XR_ENTRY_FROM_DISK[0] = True     # 已有 reality 入口就沿用它的密钥（见 _xr_entry_keys）
     # 同名协议（两核心都有）加小上标区分：跟已装的一起算，免得新旧重名
     dup = (set(have_sb) | set(pick_sb)) & (set(have_xr) | set(pick_xr))
 
@@ -11486,6 +11640,8 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
         if not add_ins:
             continue
         cfg["inbounds"] = ibs + add_ins
+        if core == "xray":
+            cfg["inbounds"] = _xr_entry_fixup(cfg["inbounds"])
         backup = path + ".bak"
         try:
             shutil.copyfile(path, backup)
@@ -11612,6 +11768,8 @@ def _nginx_backends_from_cfg():
                 path = (ib.get("transport") or {}).get("path")
                 kind = "ws"
             else:
+                if _xr_is_fb_backed(ib):             # 挂在 reality 入口后面的，走 _nginx_fb_server 那条路
+                    continue
                 st = ib.get("streamSettings") or {}
                 rs = st.get("realitySettings") if st.get("security") == "reality" else None
                 sni = ((rs or {}).get("serverNames") or [""])[0] if rs else ""
@@ -11642,7 +11800,8 @@ def _nginx_sync_from_cfg():
         listen = nginx_http2_listen(f"127.0.0.1:{SNI_HTTPS_PORT} ssl") + nginx_http2_on()
     else:
         listen = (nginx_http2_listen("443 ssl") + _v6(nginx_http2_listen("[::]:443 ssl")) + nginx_http2_on())
-    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen))
+    open(NGINX_CONF, "w").write(_nginx_80_server() + _nginx_https_server(listen)
+                                + (_nginx_fb_server() if split else ""))
     if split:
         open(NGINX_STREAM_CONF, "w").write(_stream_conf_text())
         _nginxconf_add_stream()
@@ -11799,6 +11958,10 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
             stale += dels
             done[core] += dels
             continue
+        if core == "xray":
+            # 删的是 reality 入口（vision²）、后面还挂着 grpc² / xhttp²：入口改名留下；后端删光了入口跟着拆
+            vis = [ib for ib in gone if _xr_is_entry(ib)]
+            keep = _xr_entry_fixup(keep, vis[0] if vis else None)
         cfg["inbounds"] = keep
         backup = path + ".bak"
         try:

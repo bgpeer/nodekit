@@ -60,7 +60,11 @@
 - 挂在 nginx 后面 = 入站监听 127.0.0.1。sing-box：ws² 家族、sni-split 下的 reality-vision；xray：vless-ws、vmess-ws、
   xhttp-tls（nginx 用 grpc_pass 进 h2c）、sni-split 下的 reality-vision（要跟 sing-box 用不同伪装域名才进分流）。
 - 两个核心各一个伪装域名：state 里 `sni` / `sni_xr`，`_xr_sni()` 取 xray 的；nginx stream 只能按 SNI 分，重复了分不开。
-- reality-grpc / reality-xhttp 留在自己的端口：跟 vision 同一个 SNI、ALPN 也一样，nginx 认不出该给谁。
+- xray 的 reality-grpc² / xhttp² 挂在 vision² 那个 reality 入口后面（sni-split 下）：入口解开 reality 后默认回落到
+  nginx 本地 h2c `REALITY_FB_PORT`，按服务名 / 路径分。回落不能按 alpn 配（REALITY 解开后 realAlpn 为空）；
+  回落口用 TCP 不用 unix socket（nginx 异常退出留下 .sock 会再也起不来）。删 vision² 入口改名 `reality-entry` 留下，
+  零用户照样回落；见 `_xr_entry_fixup`。sing-box 的 reality-grpc¹ 没有回落，还在自己的端口。
+- 测抗量子签名要用长证书链的目标站，短链 xray 不签，错的 pqv 也能连；本机测代理记得 `env -u no_proxy`（127.0.0.1 在里面）。
 - 增删协议、换伪装域名后一律 `_nginx_sync_from_cfg()` 按两个核心【当前配置】重建反代表 + 分流表，nginx -t 不过放回原文件。
 - pq（pqv）按 UUID 对链接，不按端口（挂 nginx 后链接端口都是 443）。
 
