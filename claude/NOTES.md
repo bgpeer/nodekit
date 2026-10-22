@@ -65,6 +65,8 @@
   回落口用 TCP 不用 unix socket（nginx 异常退出留下 .sock 会再也起不来）。删 vision² 入口改名 `reality-entry` 留下，
   零用户照样回落；见 `_xr_entry_fixup`。sing-box 的 reality-grpc¹ 没有回落，还在自己的端口。
 - 测抗量子签名要用长证书链的目标站，短链 xray 不签，错的 pqv 也能连；本机测代理记得 `env -u no_proxy`（127.0.0.1 在里面）。
+- sing-box 的 grpc-tls（10/23 新增）：自己域名证书的 grpc，nginx 前置时本地明文、nginx 按 /服务名/ grpc_pass；reality-grpc¹ 照旧在自己的端口。
+- tuic 有域名真证书时上 UDP 443（nginx / reality 都只占 TCP 443）；`_udp443_ok` 建 IPv6 socket 要包 try（没开 IPv6 的机器报 97）。
 - 增删协议、换伪装域名后一律 `_nginx_sync_from_cfg()` 按两个核心【当前配置】重建反代表 + 分流表，nginx -t 不过放回原文件。
 - pq（pqv）按 UUID 对链接，不按端口（挂 nginx 后链接端口都是 443）。
 

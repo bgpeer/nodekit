@@ -1017,7 +1017,8 @@ def _nginx_ws_locations():
     """ws 家族 / xhttp 的 location 反代块（供 443 或本地 https server 复用）。"""
     locs = ""
     for w in NGINX_WS:
-        if w.get("kind") == "xhttp":
+        if w.get("kind") in ("xhttp", "grpc"):
+            # grpc-tls（sing-box）同一套：后端明文 h2c，路径是 /服务名/Tun，前缀匹配
             # xray 的 xhttp 挂 nginx 后面：后端是 xray 明文 h2c，nginx 用 grpc_pass 转（XTLS 官方 nginx 示例同做法），
             # stream-one / stream-up / packet-up 三种上行都走得通；proxy_pass(http/1.1) 只有 packet-up 能用。
             # xhttp 的路径后面还会跟 /会话ID/序号，所以这里是前缀匹配（ws 是精确匹配）。
@@ -1824,8 +1825,30 @@ def sb_hysteria2(port, tag):
           f"{mport}&insecure={1 if insec else 0}#{tag}")
     return ib, lk
 
+def _udp443_ok():
+    """UDP 443 能不能给 tuic：没人占，或者占着的就是本机的 sing-box（重装 / 增删时它自己那个 tuic）。
+       nginx / reality 都只用 TCP 443，UDP 443 平时是空的。"""
+    for fam, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        try:
+            s = socket.socket(fam, socket.SOCK_DGRAM)
+        except OSError:                                  # 机器没开 IPv6：建 socket 这一步就报 97，不算占用
+            continue
+        try:
+            s.bind((addr, 443))
+        except OSError as e:
+            if fam == socket.AF_INET6 and e.errno in (97, 99):
+                continue
+            return "sing-box" in (sh("ss -ulpnH 'sport = :443'", check=False) or "")
+        finally:
+            s.close()
+    return True
+
 def sb_tuic(port, tag):
     uid = new_uuid(); pw = new_pw(); crt, key, insec = ensure_acme()
+    # 有域名真证书就上 UDP 443（仓库主人 10/23）：同一个域名 TCP 443 是网站、UDP 443 是 h3，跟真网站开 HTTP/3 一模一样；
+    # 运营商对 UDP 443 基本放行（YouTube / 谷歌的 QUIC 都走这），随机高端口的 UDP 在 4G 下最容易被限速丢包
+    if G.get("domain") and not insec and _udp443_ok():
+        port = 443
     ib = {"type": "tuic", "tag": tag, "listen": "::", "listen_port": port,
           "users": [{"uuid": uid, "password": pw}], "congestion_control": "bbr",
           "tls": {"enabled": True, "alpn": ["h3"],
@@ -1864,6 +1887,26 @@ def _nginx_front():
     """ws 家族是否走 nginx 443 前置：reality 绑 443 时 443 归 reality，
        此时 nginx 只留 :80 续期、不再前置 ws，ws 改走自己端口的真证书。"""
     return bool(G.get("nginx")) and not G.get("reality443")
+
+def sb_vless_grpc_tls(port, tag):
+    """VLESS + gRPC + TLS（自己的域名证书）。nginx 前置时挂 443 后面：本地明文 grpc，nginx 按服务名 grpc_pass 进来，
+       跟 ws / xhttp-tls 同一个域名（仓库主人 10/23：随机端口的 grpc 容易被阻断，挂 nginx、不想多填伪装域名）。
+       没有 nginx 前置时听自己的端口、自带证书。"""
+    uid = new_uuid(); svc = "grpc" + secrets.token_hex(3)
+    if _nginx_front():
+        ib = {"type": "vless", "tag": tag, "listen": "127.0.0.1", "listen_port": port,
+              "users": [{"uuid": uid}], "transport": {"type": "grpc", "service_name": svc}}
+        NGINX_WS.append({"path": "/" + svc, "port": port, "kind": "grpc"})
+        lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls&sni={tls_host()}&fp=chrome"
+              f"&alpn=h2&type=grpc&serviceName={svc}&mode=gun#{tag}")
+        return ib, lk
+    crt, key, insec = ensure_acme()
+    ib = {"type": "vless", "tag": tag, "listen": "::", "listen_port": port,
+          "users": [{"uuid": uid}], "transport": {"type": "grpc", "service_name": svc},
+          "tls": {"enabled": True, "alpn": ["h2"], "certificate_path": crt, "key_path": key}}
+    lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=tls&sni={tls_host()}&fp=chrome"
+          f"&alpn=h2&type=grpc&serviceName={svc}&mode=gun&allowInsecure={1 if insec else 0}#{tag}")
+    return ib, lk
 
 def make_sb_vless(transport):
     def b(port, tag):
@@ -1994,7 +2037,7 @@ def sb_vless_vision(port, tag):
           f"&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
-# 当前只装这 10 个协议（对齐 mack-a 的输出，顺序也一致）。
+# 前 10 个对齐 mack-a 的输出，顺序也一致；grpc-tls 是 10/23 加的（grpc 挂 nginx 443、用自己的域名）。
 # 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
 # ═══════════════════════════════════════════════════════════════════════════════
 # 协议注册表
@@ -2176,7 +2219,7 @@ def _recap_reality_xr():
     return ("xray 伪装域名", _xr_sni())
 
 # ── 表本体 ───────────────────────────────────────────────────────────────
-# 当前只装这 10 个协议（对齐 mack-a 的输出，顺序也一致）。
+# 前 10 个对齐 mack-a 的输出，顺序也一致；grpc-tls 是 10/23 加的（grpc 挂 nginx 443、用自己的域名）。
 # 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
 SB = {
     "vless-vision":      PROTO(sb_vless_vision, cert=True),
@@ -2195,6 +2238,7 @@ SB = {
     "vmess-httpupgrade": PROTO(make_sb_vmess("httpupgrade"), cert=True, ws_front=True,
                                asks=_asks_smux, recap=_recap_smux),
     "anytls":            PROTO(sb_anytls, cert=True),
+    "grpc-tls":          PROTO(sb_vless_grpc_tls, cert=True, ws_front=True),
 }
 # 备用（以后想加回，取消注释挪进上面的 SB，按上面的清单据实填标志位）：
 #   "ss2022":            PROTO(sb_ss2022),
@@ -3332,6 +3376,8 @@ def proto_key(d):
             return "reality-grpc" if d.get("network") == "grpc" else "reality-vision"
         if d.get("flow"):
             return "vless-vision"
+        if d.get("network") == "grpc":
+            return "vless-grpc"
         return "vless-ws"
     return None
 
@@ -3341,6 +3387,7 @@ PROTO_TO_SBTAG = {
     "vmess-ws": "🇺🇲 VMess_WS", "trojan": "🇺🇲 Trojan_TCP", "hy2": "🇺🇲 Hysteria2_TLS",
     "reality-vision": "🇺🇲 VLESS_Reality_Vision", "reality-grpc": "🇺🇲 VLESS_Reality_gPRC",
     "tuic": "🇺🇲 singbox_tuic", "anytls": "🇺🇲 AnyTLS", "vmess-httpupgrade": "🇺🇲 VMess_HTTPUpgrade_TLS",
+    "vless-grpc": "🇺🇲 VLESS_gRPC_TLS",
 }
 
 def _sb_vmess_security(d):
@@ -11835,8 +11882,11 @@ def _nginx_backends_from_cfg():
             if core == "sb":
                 tls = ib.get("tls") or {}
                 sni = tls.get("server_name") if isinstance(tls.get("reality"), dict) else ""
-                path = (ib.get("transport") or {}).get("path")
-                kind = "ws"
+                tr = ib.get("transport") or {}
+                if tr.get("type") == "grpc" and tr.get("service_name"):
+                    path, kind = "/" + tr["service_name"], "grpc"
+                else:
+                    path, kind = tr.get("path"), "ws"
             else:
                 if _xr_is_fb_backed(ib):             # 挂在 reality 入口后面的，走 _nginx_fb_server 那条路
                     continue
@@ -11851,7 +11901,7 @@ def _nginx_backends_from_cfg():
                 if sni not in seen:
                     seen.add(sni); stream.append({"sni": sni, "port": port})
             elif path:
-                ws.append({"path": path, "port": port, **({"kind": "xhttp"} if kind == "xhttp" else {})})
+                ws.append({"path": path, "port": port, **({"kind": kind} if kind in ("xhttp", "grpc") else {})})
     return ws, stream
 
 def _nginx_sync_from_cfg():
