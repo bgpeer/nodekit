@@ -5916,6 +5916,9 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 小火箭节点改回写在配置里（一个链接）")
     if _sub_server_heal():                      # 订阅小服务换成认 /<token>/<名字>.<ext> 的版本
         print(f"{time.strftime('%F %T')} 订阅服务已更新")
+    ng = _nginx_rules_heal()                    # nginx 还是老规则（路径被摸到不回 404 页）：重建一次，平滑重载不断连接
+    if ng:
+        print(f"{time.strftime('%F %T')} {ng}")
     n = _xray_pq_health()                       # 借用目标站换了短证书链：关掉抗量子签名，不然 xray 的 reality 全断
     if n:
         print(f"{time.strftime('%F %T')} 借用目标站证书链变短，{n} 个 xray reality 节点关掉了抗量子签名（订阅已重建）")
@@ -11359,6 +11362,9 @@ def main_menu():
     fw_sync()                                    # 老装机：开着防火墙、端口没放行的补上（放行了会说一行）
     if fake_site_heal():
         print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
+    ng = _nginx_rules_heal()                     # nginx 还是老规则：重建一次（平滑重载，连着的不断）
+    if ng:
+        print("  " + ng)
     if sr_onelink_heal():
         print("  ✔ 小火箭改回一个链接：节点写进配置了，小火箭里那条节点订阅可以删掉")
     if _sub_server_heal():
@@ -11988,6 +11994,45 @@ def _nginx_sync_from_cfg():
     if split:
         return f"✔ nginx 443 分流已按现有节点重建（{len(stream)} 个 reality、{len(ws)} 个 ws/xhttp）"
     return f"✔ nginx 443 反代表已按现有节点重建（{len(ws)} 个 ws/xhttp）"
+
+def _nginx_rules_old(text):
+    """bgpeer.conf 还是老规则吗：挂在 443 后面的路径被摸到不回伪装站的 404 页（ws 是 444 断连接；xhttp / grpc 不带斜杠
+       的路径没有单独回 404、会被 nginx 自动 301；xhttp 没把 xray 回的错误码换成 404 页）。只看对外的那部分——
+       reality 入口回落用的本地 h2c（REALITY_FB_PORT）在最后，外面摸不到，不算。"""
+    pub = text.split(f"127.0.0.1:{REALITY_FB_PORT}")[0]
+    if "return 444;" in pub:
+        return True
+    for m_ in re.finditer(r"location (/[^\s{]+)/ \{(.*?)\n  \}", pub, re.S):
+        path, body = m_.group(1), m_.group(2)
+        if "grpc_pass" not in body:
+            continue
+        if f"location = {path} {{" not in pub:
+            return True
+        if "application/grpc" not in body and "grpc_intercept_errors" not in body:
+            return True
+    return False
+
+def _nginx_rules_heal():
+    """老机器：bgpeer.conf 还是老规则（见 _nginx_rules_old）就按两个核心当前的配置重建一遍（仓库主人 10/23）。
+       平时只读一下这个文件就走，重建过一次以后就是新规则，以后都跳过。重建用 nginx 平滑重载：连着的节点、
+       在播的 Emby 都不断（铁律：不误伤播放）；nginx -t 不过放回原文件。不动节点、不换链接、不重启核心。
+       返回屏上一行，没动返回 ""。"""
+    try:
+        text = open(NGINX_CONF).read()
+        st = json.load(open(STATE_FILE))
+    except (OSError, ValueError):
+        return ""
+    if not _nginx_rules_old(text):
+        return ""
+    saved = dict(G)
+    try:
+        _restore_state_to_G(st)
+        msg = _nginx_sync_from_cfg()
+        return ("✔ nginx 规则已更新：443 后面的路径被人摸到，回伪装站的 404 页" if msg.startswith("✔") else msg)
+    except Exception as e:
+        return f"⚠ nginx 规则没更新成（{e}），原配置照用"
+    finally:
+        G.clear(); G.update(saved)
 
 def _nginx_backed(names, core="sb"):
     """这个核心的这些协议里，哪些的入站是挂在 nginx 后面的（监听 127.0.0.1）。
