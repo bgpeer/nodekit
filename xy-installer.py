@@ -1014,7 +1014,12 @@ def _V6_80():
     return _v6("  listen [::]:80;\n")       # 单独拎出来：f-string 里不能写反斜杠（老 Python）
 
 def _nginx_ws_locations():
-    """ws 家族 / xhttp 的 location 反代块（供 443 或本地 https server 复用）。"""
+    """ws 家族 / xhttp / grpc 的 location 反代块（供 443 或本地 https server 复用）。
+
+       路径被人摸到（浏览器 / curl / 扫描器拿普通请求来试）时，回的一律是伪装站自己的 404 页，跟访问网站上
+       别的不存在的页面一模一样（server 里的 error_page 404 /404.html）——仓库主人 10/23 让逐个协议对齐。
+       以前 ws 是直接断连接（444，mack-a 同做法）、xhttp 是 301 跳转 / xray 回 400，都跟别的路径不一样，
+       等于告诉人「这个路径后面有东西」。"""
     locs = ""
     for w in NGINX_WS:
         if w.get("kind") in ("xhttp", "grpc"):
@@ -1022,11 +1027,14 @@ def _nginx_ws_locations():
             # xray 的 xhttp 挂 nginx 后面：后端是 xray 明文 h2c，nginx 用 grpc_pass 转（XTLS 官方 nginx 示例同做法），
             # stream-one / stream-up / packet-up 三种上行都走得通；proxy_pass(http/1.1) 只有 packet-up 能用。
             # xhttp 的路径后面还会跟 /会话ID/序号，所以这里是前缀匹配（ws 是精确匹配）。
-            # grpc：路径被人摸到、拿浏览器 / curl 来试，不是 gRPC 请求一律 404，跟网站别的不存在的路径一样
-            # （mack-a 同做法；ws 那边是不 Upgrade 就 444）。xhttp 的请求不带 grpc 的 content-type，不能加。
+            # 不带斜杠的那个路径单独回 404：不然 nginx 对前缀 location 自动回 301 跳到带斜杠的，等于把路径认了。
+            # grpc：不是 gRPC 请求一律 404（mack-a 同做法）。xhttp 的请求不带 grpc 的 content-type，不能这么挡，
+            # 改成后端（xray）回的错误码换成伪装站的 404 页——正常的 xhttp 流量 xray 回 200，不受影响。
             guard = ('    if ($content_type !~ "application/grpc") {\n      return 404;\n    }\n'
-                     if w.get("kind") == "grpc" else "")
-            locs += (f"  location {w['path']}/ {{\n" + guard +
+                     if w.get("kind") == "grpc" else
+                     "    grpc_intercept_errors on;\n    error_page 400 403 404 405 =404 /404.html;\n")
+            locs += (f"  location = {w['path']} {{\n    return 404;\n  }}\n"
+                     f"  location {w['path']}/ {{\n" + guard +
                      f"    client_max_body_size 0;\n"
                      f"    client_body_timeout 1h;\n"
                      f"    grpc_read_timeout 1h;\n"
@@ -1036,9 +1044,9 @@ def _nginx_ws_locations():
                      f"    grpc_pass grpc://127.0.0.1:{w['port']};\n  }}\n")
             continue
         locs += (f"  location = {w['path']} {{\n"
-                 # 路径被人摸到、拿普通 GET 来试：直接断连接（mack-a 同做法）。以前是原样转给后端，
-                 # sing-box / xray 回一个 400 Bad Request——一眼看出后面挂着代理
-                 f"    if ($http_upgrade !~* \"^websocket$\") {{ return 444; }}\n"
+                 # 不是 WebSocket 升级的请求：回伪装站的 404 页。更早是原样转给后端（回 400 Bad Request，一眼看出
+                 # 后面挂着代理），后来改成 444 直接断连接——也跟别的路径不一样，10/23 改成 404
+                 f"    if ($http_upgrade !~* \"^websocket$\") {{ return 404; }}\n"
                  f"    proxy_pass http://127.0.0.1:{w['port']};\n"
                  f"    proxy_http_version 1.1;\n"
                  f"    proxy_set_header Upgrade $http_upgrade;\n"
