@@ -4,7 +4,7 @@
   运营商 4G 对随机高端口 UDP 限速丢包最狠。没域名 / 自签 / 被别人占着：照旧随机端口。没开 IPv6 的机器不能崩。
   grpc-tls：nginx 前置时本地明文 grpc、nginx 按 /服务名/ grpc_pass，链接 443 + 自己的域名；不前置时自带证书听自己的端口。
   grpc 路径被浏览器 / curl 摸到：不是 gRPC 请求回 404（伪装站自己的 404 页），10/23 照 mack-a 加的。
-  reality-grpc 一个不动（功能不许悄悄没了）。真 nginx + sing-box + mihomo / sing-box 客户端的端到端在会话里跑过。
+  sing-box 的 reality-grpc 10/23 仓库主人点头停用（见 test_sb_reality_grpc_retired），xray 的不动。真 nginx + sing-box + mihomo / sing-box 客户端的端到端在会话里跑过。
 """
 import os, sys, json, socket, tempfile, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -79,5 +79,5 @@ check(f"按配置重建：认得出 grpc-tls（{ws}）", ws == [{"path": "/" + s
 m.G["nginx"] = ""
 ib, lk = m.sb_vless_grpc_tls(30003, "P·grpc-tls")
 check("没有 nginx 前置：自带证书 h2、听自己的端口", ib["listen"] == "::" and ib["tls"]["alpn"] == ["h2"] and ":30003?" in lk)
-check("reality-grpc 还在两张表里", "reality-grpc" in m.SB and "reality-grpc" in m.XRAY and m.SB["grpc-tls"]["ws_front"])
+check("xray 的 reality-grpc 还在（sing-box 的 10/23 停用，见 test_sb_reality_grpc_retired）", "reality-grpc" in m.XRAY and m.SB["grpc-tls"]["ws_front"])
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)
