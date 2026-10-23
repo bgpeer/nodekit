@@ -681,15 +681,16 @@ _FS_KINDS = {
                   "I like walking, cooking for friends and reading on slow afternoons.",
                   "Nothing here is sponsored; it is just a notebook that happens to be public."],
     },
+    # 插画小站（原来是「摄影」：配图只是渐变色块，一个摄影站全是色块反倒怪——仓库主人 10/23。图在本机按标题画，见 _fs_scene_svg）
     "photo": {
-        "names": ["{A} Light", "{N} Frames", "{A} {N} Photography", "Frames from {N}", "{N} & Light"],
-        "tag": ["Photographs and short notes", "Light, places and quiet moments",
-                "A small gallery of everyday scenes", "Photos from walks near and far"],
-        "nav": ["Gallery", "About"],
-        "lens": ["35mm", "50mm", "28mm", "85mm"],
-        "about": ["I take photographs mostly on walks, close to home or while travelling.",
-                  "This site is a small archive of the pictures I want to keep.",
-                  "I shoot with a simple setup and try not to edit too much.",
+        "names": ["{A} Sketches", "{N} Postcards", "{A} {N} Sketchbook", "{N} & Ink", "{A} {N} Drawings"],
+        "tag": ["Small drawings and short notes", "Sketches of places, light and quiet moments",
+                "A small sketchbook of everyday scenes", "Drawings from walks near and far"],
+        "nav": ["Sketches", "About"],
+        "pen": ["fountain pen", "soft pencil", "small watercolour set", "brush pen", "box of pastels"],
+        "about": ["I draw mostly on walks, close to home or while travelling.",
+                  "This site is a small archive of the sketches I want to keep.",
+                  "I use a simple kit and try not to fix things too much afterwards.",
                   "Thanks for stopping by and taking a look."],
     },
     "studio": {
@@ -794,40 +795,40 @@ _FS_THEMES = {
 "photo": {
   "{Season} light at {place}": [
     "The {season} light at {place} is low and soft for most of the day.",
-    "Most of these were taken within an hour, before the light went flat.",
+    "I sat on a low wall and made three quick sketches before the light went flat.",
     "I like how ordinary places change completely with a bit of low sun."],
   "A morning at {place}": [
     "I got to {place} just after sunrise, before most people were up.",
-    "The fog cleared just enough to see the outline of the hills.",
-    "There were a few quiet minutes when nobody walked through the frame."],
+    "The first sketch was too careful, the second one was quicker and better.",
+    "There were a few quiet minutes when nobody walked through the view."],
   "Shadows in {month}": [
     "In {month} the shadows get long early in the afternoon.",
-    "I spent a few days just following them around the neighbourhood.",
-    "A few frames were slightly out of focus, but I kept them anyway."],
-  "Walking with a {lens} lens": [
-    "I only took the {lens} lens with me, which made things easier, not harder.",
-    "With one focal length you stop thinking about gear and start looking.",
-    "Walking slowly is still the best way I know to find pictures."],
+    "I spent a few days just drawing them around the neighbourhood.",
+    "Some of the lines are a bit wobbly, but I kept them anyway."],
+  "Sketching with a {pen}": [
+    "For a few weeks I only took a {pen} with me.",
+    "With one tool you stop thinking about materials and start looking.",
+    "Walking slowly is still the best way I know to find things to draw."],
   "Colors of {place}": [
     "{Place} has more color than I expected once you look for it.",
     "Painted doors, faded signs and a lot of green.",
-    "These are straight from the camera, with only small adjustments."],
+    "I mixed most of these colors on the spot and wrote down which ones worked."],
   "Rain over {place}": [
     "It rained over {place} for most of the afternoon.",
-    "The reflections on the wet streets did most of the work here.",
-    "I stood under a doorway and waited for the quiet moments."],
-  "Notes from a {season} roll": [
-    "This roll sat in the camera for most of the {season}.",
-    "The colors came back muted, almost like an old postcard.",
-    "Some rolls give you one picture you like, and that is enough."],
+    "I drew from under a doorway, which made the view narrow and the lines simple.",
+    "A few drops landed on the page, and I left them there."],
+  "Pages from a {season} sketchbook": [
+    "This sketchbook was in my bag for most of the {season}.",
+    "Some pages are quick notes, some took a whole afternoon.",
+    "Most pages give you one drawing you like, and that is enough."],
   "Late afternoon at {place}": [
     "Late afternoon is my favourite time at {place}.",
     "The light turns warm for about twenty minutes and then it is gone.",
-    "I went back the next day for the same view and it was completely different."],
+    "I went back the next day for the same view and it looked completely different."],
   "Small details in {month}": [
-    "In {month} I tried to photograph only small things.",
+    "In {month} I tried to draw only small things.",
     "Door handles, leaves on a windowsill, a cup left on a wall.",
-    "I am trying to print a few of these for the wall."],
+    "I am planning to frame a few of these for the wall."],
 },
 "studio": {
   "Rebuilding a {thing} for a local {client}": [
@@ -905,7 +906,7 @@ _FS_FILLER = {
            "I am trying to write here more often, even if the posts are short.",
            "It was a good reminder to slow down a little.", "Thanks for reading, as always."],
   "photo": ["Thanks for looking.", "More from this series soon.",
-            "These are straight from the camera, with only small adjustments.", "I hope to go back there soon."],
+            "These were scanned straight from the sketchbook, with only small adjustments.", "I hope to go back there soon."],
   "studio": ["We are always happy to work with neighbours and small teams.",
              "Afterwards we wrote down what we would do differently next time.", "Thanks to everyone involved."],
   "notes": ["Mostly a note for future me.", "If something here helps you too, that makes me happy.",
@@ -918,6 +919,117 @@ _FS_FONTS = ["Georgia, 'Times New Roman', serif",
              "'Trebuchet MS', 'Segoe UI', Tahoma, sans-serif",
              "'Gill Sans', 'Gill Sans MT', Calibri, sans-serif"]
 _FS_MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+
+# 插画站的配图：按标题在本机画一张矢量风景（仓库主人 10/23：不联网下载——访问图库会暴露这台机器，
+# 而且同一批照片在很多台机器上出现本身就是特征）。海边 → 海平线和倒影，山谷 / 山里 → 几层山，城镇 / 车站 / 市场 →
+# 一排房子，下雨 → 雨丝，小物件 → 窗台；季节定配色（标题没写就按发布日期的月份），早晨 / 傍晚定太阳高低和天色。
+# 每张的山形、房子、云都是随机的，同一个站里也不会两张一样。
+_FS_SEASON_COL = {   # 天顶, 天边, 远景, 中景, 近景, 点缀
+    "winter": ("#9fb4c8", "#e9eef3", "#c4d0db", "#dde5ec", "#f4f6f8", "#6f8296"),
+    "spring": ("#8ec3e6", "#eaf5fb", "#a9c9a0", "#84b77a", "#5f9a5c", "#e6a3b8"),
+    "summer": ("#4f9fd8", "#d6ecfa", "#8fb58a", "#5f9a55", "#3f7a3c", "#f2c14e"),
+    "autumn": ("#e3a873", "#f8e3cc", "#c99a6b", "#b0703f", "#7d4b2a", "#d8662f"),
+}
+
+def _fs_scene_svg(title, date, R):
+    t = title.lower()
+    season = next((x for x in _FS_SEASON if x in t), None) or \
+        ("winter", "winter", "spring", "spring", "spring", "summer", "summer", "summer",
+         "autumn", "autumn", "autumn", "winter")[date.month - 1]
+    sky0, sky1, far, mid, near, acc = _FS_SEASON_COL[season]
+    if "morning" in t:                                     # 早晨 / 傍晚太阳低，但要挂在山和海平线上面，别被挡住
+        sky1, sun_y, sun_c = "#fbe3c6", R.randint(170, 205), "#fff1d6"
+    elif "late afternoon" in t or "shadows" in t:
+        sky1, sun_y, sun_c = "#f6c58f", R.randint(150, 195), "#ffd9a0"
+    else:
+        sun_y, sun_c = R.randint(80, 170), "#fff6dc"
+    rain = "rain" in t
+    if rain:
+        sky0, sky1 = "#7f8b96", "#c7ced4"
+    if any(w in t for w in ("coast", "shore", "harbor", "lake", "river", "canal", "seaside")):
+        scene = "sea"
+    elif any(w in t for w in ("valley", "hills", "mountains", "countryside")):
+        scene = "hills"
+    elif any(w in t for w in ("town", "market", "station", "bridge", "park", "village", "railway")):
+        scene = "town"
+    elif "details" in t or "sketchbook" in t:
+        scene = "still"
+    else:
+        scene = R.choice(["sea", "hills", "town"])
+    W, H = 800, 500
+    def darker(c, k=0.72):
+        return "#%02x%02x%02x" % tuple(int(int(c[i:i + 2], 16) * k) for i in (1, 3, 5))
+    def ridge(y0, amp, n, color):
+        xs = sorted(R.sample(range(40, W - 40), n - 2)) if n > 2 else []
+        pts = [(0, y0 + R.randint(-amp, amp))] + [(x, y0 + R.randint(-amp, amp)) for x in xs] + [(W, y0 + R.randint(-amp, amp))]
+        d = f"M0,{H} L{pts[0][0]},{pts[0][1]} "
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            d += f"Q{x1 + (x2 - x1) // 2},{min(y1, y2) - R.randint(0, amp)} {x2},{y2} "
+        return f'<path d="{d}L{W},{H} Z" fill="{color}"/>'
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}">',
+           f'<defs><linearGradient id="s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{sky0}"/>'
+           f'<stop offset="1" stop-color="{sky1}"/></linearGradient></defs>',
+           f'<rect width="{W}" height="{H}" fill="url(#s)"/>']
+    if not rain:
+        out.append(f'<circle cx="{R.randint(120, 680)}" cy="{sun_y}" r="{R.randint(26, 46)}" fill="{sun_c}" opacity="0.9"/>')
+    for _ in range(R.randint(1, 4)):                       # 云
+        cx, cy, k = R.randint(60, 740), R.randint(40, 180), R.uniform(0.7, 1.4)
+        out.append(f'<g fill="#ffffff" opacity="{0.5 if rain else 0.75}">'
+                   + "".join(f'<ellipse cx="{cx + int(dx * k)}" cy="{cy + int(dy * k)}" rx="{int(rx * k)}" ry="{int(ry * k)}"/>'
+                             for dx, dy, rx, ry in ((0, 0, 46, 16), (-34, 6, 30, 12), (36, 5, 34, 13), (8, -10, 28, 14)))
+                   + "</g>")
+    if scene == "sea":
+        hz = R.randint(250, 300)
+        out.append(ridge(hz - 8, 10, R.randint(3, 5), far))
+        out.append(f'<rect y="{hz}" width="{W}" height="{H - hz}" fill="{sky0}" opacity="0.85"/>')
+        for i in range(R.randint(6, 12)):                   # 水面的光
+            y = R.randint(hz + 10, H - 10); x = R.randint(0, W - 120)
+            out.append(f'<rect x="{x}" y="{y}" width="{R.randint(40, 140)}" height="3" fill="#ffffff" opacity="0.35"/>')
+        if R.random() < 0.6:                                # 小船
+            bx, by = R.randint(120, 640), hz + R.randint(40, 120)
+            out.append(f'<path d="M{bx},{by} l60,0 l-10,14 l-40,0 Z" fill="{acc}"/>'
+                       f'<path d="M{bx + 28},{by} l0,-46 l24,40 Z" fill="#fafafa"/>')
+        out.append(ridge(H - 40, 12, 3, near))
+    elif scene == "hills":
+        for y0, amp, col in ((230, 50, far), (300, 40, mid), (380, 30, near)):
+            out.append(ridge(y0 + R.randint(-20, 20), amp, R.randint(3, 6), col))
+        for _ in range(R.randint(3, 9)):                     # 树
+            x, y = R.randint(20, 780), R.randint(400, 470)
+            out.append(f'<path d="M{x},{y} l14,-46 l14,46 Z" fill="{darker(near)}"/>'
+                       f'<rect x="{x + 12}" y="{y}" width="4" height="8" fill="{darker(near, 0.5)}"/>')
+    elif scene == "town":
+        out.append(ridge(320, 24, 4, far))
+        x = -10
+        while x < W:
+            w, h = R.randint(60, 120), R.randint(90, 210)
+            top = 430 - h
+            out.append(f'<rect x="{x}" y="{top}" width="{w}" height="{h + 80}" fill="{R.choice([mid, far, acc, near])}" opacity="0.92"/>')
+            if R.random() < 0.6:
+                out.append(f'<path d="M{x - 4},{top} L{x + w // 2},{top - R.randint(20, 40)} L{x + w + 4},{top} Z" fill="{near}"/>')
+            for wy in range(top + 18, 420, 34):
+                for wx in range(x + 12, x + w - 16, 28):
+                    if R.random() < 0.7:
+                        out.append(f'<rect x="{wx}" y="{wy}" width="12" height="16" fill="#fdf6e3" opacity="0.8"/>')
+            x += w + R.randint(2, 14)
+        out.append(f'<rect y="430" width="{W}" height="70" fill="{near}" opacity="0.9"/>')
+    else:                                                   # 窗台小景
+        out.append(f'<rect x="60" y="40" width="680" height="380" fill="none" stroke="{near}" stroke-width="22"/>')
+        out.append(f'<line x1="400" y1="40" x2="400" y2="420" stroke="{near}" stroke-width="14"/>')
+        out.append(f'<rect y="420" width="{W}" height="80" fill="{mid}"/>')
+        px = R.randint(160, 560)
+        out.append(f'<path d="M{px},420 l70,0 l-10,-60 l-50,0 Z" fill="{acc}"/>')
+        for _ in range(R.randint(4, 7)):
+            out.append(f'<ellipse cx="{px + 35 + R.randint(-40, 40)}" cy="{350 - R.randint(0, 70)}" rx="{R.randint(10, 18)}" '
+                       f'ry="{R.randint(22, 34)}" fill="{far}" transform="rotate({R.randint(-50, 50)} {px + 35} 360)"/>')
+        if R.random() < 0.7:
+            cx = R.randint(120, 680)
+            out.append(f'<rect x="{cx}" y="392" width="34" height="28" rx="4" fill="#fafafa"/>')
+    if rain:
+        for _ in range(R.randint(60, 110)):
+            x, y = R.randint(0, W), R.randint(-20, H)
+            out.append(f'<line x1="{x}" y1="{y}" x2="{x - 6}" y2="{y + 22}" stroke="#ffffff" stroke-width="1.5" opacity="0.45"/>')
+    out.append("</svg>")
+    return "\n".join(out) + "\n"
 
 def fake_site_write(root, rnd=None):
     """在 root 现生成一个小静态站（首页 / 文章 / 关于 / 404 / robots.txt），返回站名。各项都随机，见上。"""
@@ -948,7 +1060,7 @@ def fake_site_write(root, rnd=None):
     # 标题里的空位按「洗一遍牌、依次发」取，同一个站里尽量不撞词（别三篇都是「…for a bookshop」）
     src = {"place": _FS_PLACE, "walk": _FS_WALK, "trip": _FS_TRIP, "season": _FS_SEASON, "month": _FS_MONTH,
            "titles": list(themes)}
-    src.update({k: K[k] for k in ("topic", "verb", "food", "lens", "thing", "client", "audience", "tech", "tool")
+    src.update({k: K[k] for k in ("topic", "verb", "food", "pen", "thing", "client", "audience", "tech", "tool")
                 if k in K})                                     # 标题句式本身也按牌发，不连着几篇都是「Notes on …」
     decks = {k: [] for k in src}
     def deal(k):
@@ -1016,7 +1128,8 @@ def fake_site_write(root, rnd=None):
                 f".post{{background:{card};padding:18px;border-radius:{radius}px;margin:0;"
                 f"box-shadow:0 1px 3px rgba(0,0,0,.08)}}")
     if kind == "photo":
-        css += (f".ph{{height:{R.choice([150, 170, 190])}px;border-radius:{radius}px;margin:0 0 .6rem}}")
+        css += (f".ph{{display:block;width:100%;height:auto;aspect-ratio:8/5;object-fit:cover;"
+                f"border-radius:{radius}px;margin:0 0 .6rem}}")
     links = [("/", K["nav"][0])] + [("/about/", n) if n == "About" else ("/", n) for n in K["nav"][1:]]
     def page(title, main):
         nav = "".join(f'<a href="{h}">{E(t)}</a>' for h, t in links)
@@ -1028,12 +1141,10 @@ def fake_site_write(root, rnd=None):
                 f"<nav>{nav}</nav></header>\n<main>\n{main}\n</main>\n</div>\n"
                 f"<div class=\"wrap\" style=\"padding-top:0\"><footer>&copy; {years} {E(name)}</footer></div>\n"
                 "</body>\n</html>\n")
-    def grad():
-        h2 = (hue + R.uniform(.05, .3)) % 1
-        return (f'<div class="ph" style="background:linear-gradient({R.randint(0, 359)}deg,'
-                f'{hexc(hue, R.uniform(.35, .7), .4)},{hexc(h2, R.uniform(.3, .75), .45)})"></div>')
+    def pic(p):                                             # 插画站：配图是本机画的 /img/<文章>.svg（见 _fs_scene_svg）
+        return f'<img class="ph" src="/img/{p["slug"]}.svg" alt="{E(p["title"])}" loading="lazy">'
     items = "\n".join(
-        f'<article class="post">{grad() if kind == "photo" else ""}'
+        f'<article class="post">{pic(p) if kind == "photo" else ""}'
         f'<h2><a href="/posts/{p["slug"]}.html">{E(p["title"])}</a></h2>'
         f'<div class="meta">{datefmt.format(d=p["date"])}</div>'
         + (f'<p>{E(p["paras"][0].split(". ")[0].rstrip("."))}.</p>' if layout != "cards" else "")
@@ -1042,7 +1153,7 @@ def fake_site_write(root, rnd=None):
     for j, p in enumerate(posts):
         nxt = posts[j + 1] if j + 1 < len(posts) else None
         main = (f'<article><h1>{E(p["title"])}</h1><div class="meta">{datefmt.format(d=p["date"])}</div>\n'
-                + (grad() if kind == "photo" else "")
+                + (pic(p) if kind == "photo" else "")
                 + "".join(f"<p>{E(x)}</p>\n" for x in p["paras"])
                 + "</article>\n<p class=\"meta\"><a href=\"/\">&larr; All posts</a>"
                 + (f' &middot; Older: <a href="/posts/{nxt["slug"]}.html">{E(nxt["title"])}</a>' if nxt else "")
@@ -1055,15 +1166,34 @@ def fake_site_write(root, rnd=None):
     files["404.html"] = page(f"Page not found – {name}", "<h1>Page not found</h1>\n"
                              "<p>The page you are looking for does not exist or has moved.</p>\n"
                              "<p><a href=\"/\">Back to the homepage</a></p>")
+    # 归档页：访问 /posts/ 别回 403（nginx 列目录被禁时就是 403，跟别的不存在的路径不一样）
+    arch = "\n".join(f'<li><a href="/posts/{p["slug"]}.html">{E(p["title"])}</a> '
+                     f'<span class="meta">{datefmt.format(d=p["date"])}</span></li>' for p in posts)
+    files["posts/index.html"] = page(f"Archive – {name}", f"<h1>Archive</h1>\n<ul>\n{arch}\n</ul>")
+    if kind == "photo":
+        for p in posts:
+            files[f"img/{p['slug']}.svg"] = _fs_scene_svg(p["title"], p["date"], R)
     files["robots.txt"] = "User-agent: *\nDisallow:\n"
+    # 文件时间跟着文章走：nginx 回的 Last-Modified 就是文件时间，全是装机那一刻等于说「这站是某天一口气生成的」。
+    # 文章 / 配图 = 发布那天的某个钟点；首页、归档 = 最新一篇；关于 / 404 / robots = 建站那年的某天
+    def stamp(d):
+        return calendar.timegm(d.timetuple()) + R.randint(7 * 3600, 23 * 3600)
+    newest = stamp(posts[0]["date"])
+    oldest = stamp(datetime.date(since, R.randint(1, 12), R.randint(1, 28)))
+    when = {"index.html": newest, "posts/index.html": newest}
+    for p in posts:
+        when[f"posts/{p['slug']}.html"] = when[f"img/{p['slug']}.svg"] = stamp(p["date"])
     for rel, txt in files.items():
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(txt)
         os.chmod(path, 0o644)                              # nginx 以 www-data 读：别被 umask 收成 0600（403）
-    for d in (root, os.path.join(root, "posts"), os.path.join(root, "about")):
-        os.chmod(d, 0o755)
+        ts = when.get(rel, oldest)
+        os.utime(path, (ts, ts))
+    for d in (root, os.path.join(root, "posts"), os.path.join(root, "about"), os.path.join(root, "img")):
+        if os.path.isdir(d):
+            os.chmod(d, 0o755)
     return name
 
 # 老的两张默认页（全网一样）：只认这两张，认出来才换；用户自己放的页面一律不碰
@@ -1138,7 +1268,8 @@ def ensure_site_fallback():
        扫端口的人连上来、发的不是 trojan，看到的是网站首页 / 网站自己的 404 页，跟 443 上一模一样，
        而不是「握手完一句话不回就断」。单独一个文件，bgpeer.conf 怎么重写都不碰它；写过、内容没变就不动。"""
     conf = (f"server {{\n  listen 127.0.0.1:{SITE_FB_PORT};\n  server_name _;\n  server_tokens off;\n"
-            f"  error_page 404 /404.html;\n  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
+            f"  error_page 404 /404.html;\n"
+            f"  location / {{ root {WEBROOT}; index index.html; try_files $uri $uri/index.html =404; }}\n}}\n")
     try:
         if open(NGINX_FB_CONF).read() == conf:
             return
@@ -1233,7 +1364,7 @@ def _nginx_https_server(listen):
             f"  ssl_protocols TLSv1.2 TLSv1.3;\n"
             f"{_nginx_ws_locations()}"
             f"  error_page 404 /404.html;\n"           # 伪装站自己的 404 页（fake_site_write 生成）
-            f"  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
+            f"  location / {{ root {WEBROOT}; index index.html; try_files $uri $uri/index.html =404; }}\n}}\n")
 
 def nginx_http2_listen(base):
     """按 nginx 版本给出 listen 行 —— 1.25.1 起 `listen ... http2` 被弃用。
@@ -12139,6 +12270,8 @@ def _nginx_rules_old(text):
     pub = text.split(f"127.0.0.1:{REALITY_FB_PORT}")[0]
     if "return 444;" in pub:
         return True
+    if "error_page 404 /404.html;" in pub and "try_files" not in pub:   # 伪装站的目录（/posts/ 这种）回 403 而不是 404 页
+        return True
     for m_ in re.finditer(r"location (/[^\s{]+)/ \{(.*?)\n  \}", pub, re.S):
         path, body = m_.group(1), m_.group(2)
         if "grpc_pass" not in body:
@@ -12154,6 +12287,8 @@ def _nginx_rules_heal():
        平时只读一下这个文件就走，重建过一次以后就是新规则，以后都跳过。重建用 nginx 平滑重载：连着的节点、
        在播的 Emby 都不断（铁律：不误伤播放）；nginx -t 不过放回原文件。不动节点、不换链接、不重启核心。
        返回屏上一行，没动返回 ""。"""
+    if os.path.exists(NGINX_FB_CONF):
+        ensure_site_fallback()                           # trojan 回落用的本机伪装站：内容没变就不动，变了重写 + 平滑重载
     try:
         text = open(NGINX_CONF).read()
         st = json.load(open(STATE_FILE))
