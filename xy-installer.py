@@ -655,6 +655,9 @@ _FS_NOUN = ["Harbor", "Lantern", "Garden", "Field", "River", "Window", "Compass"
             "Stone", "Cloud", "Island", "Bridge", "Willow", "Harvest"]
 _FS_PLACE = ["the coast", "the old town", "the market", "the hills", "the harbor", "the station", "the park",
              "the river", "the bridge", "the lake", "a small village", "the north shore", "the valley"]
+_FS_WALK = ["the coast", "the river", "the harbor", "the lake", "the north shore", "the canal", "the old railway line"]
+_FS_TRIP = ["the old town", "the hills", "a small village", "the mountains", "the valley", "the countryside",
+            "a seaside town"]                            # 散步 / 周末出游各用各的：「沿着公园走」「在车站过周末」读着别扭
 _FS_SEASON = ["spring", "summer", "autumn", "winter"]
 _FS_MONTH = ["January", "February", "March", "April", "May", "June", "July", "August", "September",
              "October", "November", "December"]
@@ -668,33 +671,11 @@ _FS_KINDS = {
         "tag": ["Small notes on everyday things", "Thoughts, walks and the occasional recipe",
                 "Writing about books, food and slow weekends", "A personal journal, updated now and then"],
         "nav": ["Home", "About"],
-        "titles": ["A walk along {place}", "What I read this {season}", "Notes on {topic}", "Learning to {verb}",
-                   "A weekend at {place}", "Small things I liked in {month}", "On {topic} and patience",
-                   "Cooking {food} again", "Three lessons from {topic}", "Coffee, rain and {topic}",
-                   "Starting over with {topic}", "A slow {season} morning"],
         "topic": ["gardening", "bread baking", "long walks", "journaling", "slow travel", "old maps",
                   "home cooking", "learning a language", "second-hand books", "keeping a sketchbook"],
         "verb": ["bake bread", "draw again", "run in the morning", "keep a notebook", "grow tomatoes",
                  "fix my bicycle", "write by hand"],
         "food": ["soup", "dumplings", "pasta", "curry", "pancakes", "risotto", "lentil stew"],
-        "body": ["I did not plan much this time, and it turned out to be the best part.",
-                 "The weather changed three times before noon, which is normal around here.",
-                 "Most of the afternoon went by without me noticing.",
-                 "I wrote a few lines in my notebook and then simply watched people pass by.",
-                 "It is funny how the smallest routines end up holding the whole week together.",
-                 "There is a bakery on the corner that opens before sunrise, and I have become a regular.",
-                 "I keep a short list of things that made the day better, and this one made it.",
-                 "A friend recommended it years ago and I finally got around to it.",
-                 "Nothing dramatic happened, but I came home in a much better mood.",
-                 "I am trying to write here more often, even if the posts are short.",
-                 "The first attempt was a small disaster, the second one was surprisingly good.",
-                 "Sometimes the best plan is to leave the phone at home and walk.",
-                 "I took the long way back, past the old houses near the water.",
-                 "It reminded me how much I enjoy doing one thing at a time.",
-                 "The recipe is simple, the trick is to be patient with it.",
-                 "By the evening the light was soft and everything looked a little kinder.",
-                 "I still have a few pages left to read, so maybe more on this later.",
-                 "If you have a favourite version of this, I would love to hear about it someday."],
         "about": ["This is a small personal site where I write about ordinary days.",
                   "Posts are irregular and mostly short.",
                   "I like walking, cooking for friends and reading on slow afternoons.",
@@ -705,24 +686,7 @@ _FS_KINDS = {
         "tag": ["Photographs and short notes", "Light, places and quiet moments",
                 "A small gallery of everyday scenes", "Photos from walks near and far"],
         "nav": ["Gallery", "About"],
-        "titles": ["{Season} light at {place}", "A morning at {place}", "Shadows in {month}",
-                   "Walking with a {lens} lens", "Colors of {place}", "Rain over {place}",
-                   "Notes from a {season} roll", "Late afternoon at {place}", "Small details in {month}"],
         "lens": ["35mm", "50mm", "28mm", "85mm"],
-        "body": ["Most of these were taken within an hour, before the light went flat.",
-                 "I only had one lens with me, which made things easier, not harder.",
-                 "The fog cleared just enough to see the outline of the hills.",
-                 "I like how ordinary places change completely with a bit of low sun.",
-                 "A few frames were slightly out of focus, but I kept them anyway.",
-                 "Walking slowly is still the best way I know to find pictures.",
-                 "The colors were muted, almost like an old postcard.",
-                 "I went back the next day for the same view and it was gone.",
-                 "There were more people than usual, so I waited for the quiet moments.",
-                 "These are straight from the camera, with only small adjustments.",
-                 "Some days you get one picture you like, and that is enough.",
-                 "The reflections on the water did most of the work here.",
-                 "I am trying to print a few of these for the wall.",
-                 "Every season this place looks like a different town."],
         "about": ["I take photographs mostly on walks, close to home or while travelling.",
                   "This site is a small archive of the pictures I want to keep.",
                   "I shoot with a simple setup and try not to edit too much.",
@@ -733,27 +697,10 @@ _FS_KINDS = {
         "tag": ["Design and small web projects", "Brand, print and web for small teams",
                 "A small independent design studio", "Simple design for local businesses"],
         "nav": ["Journal", "About"],
-        "titles": ["Rebuilding a {thing} for a local {client}", "Notes on {topic}", "Why we keep things simple",
-                   "A new identity for a {client}", "What we learned from {topic}", "Designing for {audience}",
-                   "A small {thing} for a {client}", "Sketches from a {season} project"],
         "thing": ["website", "menu", "booklet", "logo", "shop page", "poster series"],
         "client": ["bakery", "bookshop", "cafe", "florist", "bike shop", "small library", "music school"],
         "audience": ["slow readers", "small screens", "busy people", "local shops"],
         "topic": ["typography", "color", "small budgets", "accessibility", "print", "white space"],
-        "body": ["The brief was short and clear, which is always a good start.",
-                 "We started with paper sketches before opening any software.",
-                 "Most of the work was removing things rather than adding them.",
-                 "The client knew their customers very well, so we listened a lot.",
-                 "We tested a few versions on real phones before choosing one.",
-                 "Good typography solved more problems here than any illustration could.",
-                 "The budget was small, so every decision had to earn its place.",
-                 "We kept the color palette to two colors and one neutral.",
-                 "Printing a draft and pinning it to the wall helped us see the problems.",
-                 "Small details like spacing and line length made the biggest difference.",
-                 "The final version feels calm, which is exactly what we wanted.",
-                 "We are always happy to work with neighbours and small teams.",
-                 "Afterwards we wrote down what we would do differently next time.",
-                 "It took three rounds of feedback, which felt just right."],
         "about": ["We are a small design studio based in {city}.",
                   "We work with local shops, cafes and cultural projects on identity, print and simple websites.",
                   "Our process is calm and practical: listen first, sketch a lot, ship something useful.",
@@ -764,33 +711,207 @@ _FS_KINDS = {
         "tag": ["Things I learned and do not want to forget", "Small notes on code and tools",
                 "A notebook for everyday programming", "Short write-ups of small problems"],
         "nav": ["Notes", "About"],
-        "titles": ["Notes on {tech}", "A small trick with {tool}", "Cleaning up my {thing}", "Why I like {tool}",
-                   "Reading about {tech}", "Debugging a slow {thing}", "Things I got wrong about {tech}",
-                   "Keeping a tidy {thing}"],
         "tech": ["text encodings", "time zones", "regular expressions", "SQL indexes", "unit tests",
                  "shell scripts", "image compression", "CSS grid", "date parsing", "plain text files"],
         "tool": ["make", "sqlite", "awk", "git", "vim", "a plain text editor", "spreadsheets"],
         "thing": ["dotfiles", "build script", "backup routine", "photo library", "static site", "notes folder"],
-        "body": ["I ran into this again last week, so here is a short note for future me.",
-                 "The fix turned out to be one line, after an hour of looking in the wrong place.",
-                 "Writing a tiny test first made the problem obvious.",
-                 "Most of the time the simplest tool is good enough.",
-                 "I keep relearning this, which is exactly why it goes here.",
-                 "The documentation was correct, I just did not read it carefully.",
-                 "Measuring before changing anything saved me from a pointless rewrite.",
-                 "Plain text keeps winning for small personal projects.",
-                 "It is worth writing down the commands you only need twice a year.",
-                 "After cleaning things up, the whole thing runs noticeably faster.",
-                 "I wish someone had told me this when I started.",
-                 "There is probably a better way, but this one is easy to remember.",
-                 "Naming things clearly helped more than any clever trick.",
-                 "Next time I will start with the boring solution and see if it is enough."],
         "about": ["I write software for a living and keep these notes mostly for myself.",
                   "Posts are short and practical: small problems, small fixes.",
                   "If something here helps you too, that makes me happy.",
                   "Opinions are my own and change over time."],
     },
 }
+# 标题句式 → 跟它配套的句子（仓库主人 10/23：摘要跟标题对不上、秋天的早晨写在一月，认真看会觉得怪）。
+# 句子里的 {place}/{topic}/… 用标题里同一个词填；首页摘要就是第一句。
+_FS_THEMES = {
+"blog": {
+  "A walk along {walk}": [
+    "The path along {walk} is quieter than I remembered.",
+    "I walked for almost two hours and only turned back when the light started to fade.",
+    "There is a bench near {walk} where I always stop for a minute.",
+    "I took the long way back, past the old houses near the water.",
+    "Sometimes the best plan is to leave the phone at home and walk."],
+  "What I read this {season}": [
+    "This {season} I finally made a dent in the pile of books next to my bed.",
+    "Most of what I read this {season} was second-hand, picked up for almost nothing.",
+    "One of them stayed with me longer than the others, and I keep coming back to it.",
+    "I still have a few pages left of the last one, so maybe more on it later.",
+    "A friend recommended one of these years ago and I finally got around to it."],
+  "Notes on {topic}": [
+    "I have been thinking about {topic} a lot lately, so here are a few notes.",
+    "{Topic} looked simple from the outside, and of course it is not.",
+    "Most of what I know about {topic} I learned by getting it wrong first.",
+    "What I like most about {topic} is that it cannot be rushed.",
+    "I will probably add to these notes as I go."],
+  "Learning to {verb}": [
+    "This year I decided to finally learn to {verb}.",
+    "The first attempts were clumsy, but each one was a little better than the last.",
+    "A short practice every day works better than a long one on Sundays.",
+    "I am nowhere near good yet, and I am enjoying that part more than I expected."],
+  "A weekend in {trip}": [
+    "We spent two slow days in {trip} and did almost nothing, on purpose.",
+    "I did not plan much this time, and it turned out to be the best part.",
+    "On the first morning we found a small cafe there and went back every day after.",
+    "The weather changed three times before noon, which is normal around there.",
+    "Nothing dramatic happened, but I came home in a much better mood."],
+  "Small things I liked in {month}": [
+    "{Month} went by quickly, so here are a few small things worth remembering.",
+    "A good loaf from the bakery on the corner, more than once.",
+    "Long evenings with a book and the window open.",
+    "I keep a short list of things that made the days better, and in {month} it got long."],
+  "On {topic} and patience": [
+    "{Topic} has taught me more about patience than anything else this year.",
+    "Every time I try to hurry it, it goes wrong in a new way.",
+    "It reminded me how much I enjoy doing one thing at a time.",
+    "Most of the progress happened on the days I almost gave up."],
+  "Cooking {food} again": [
+    "I made {food} again this week, the way I first learned it.",
+    "The recipe is simple, the trick is to be patient with it.",
+    "The first pot was a small disaster, the second one was surprisingly good.",
+    "There was far too much {food}, so the neighbours got some too.",
+    "If you have a favourite way of making {food}, I would love to hear about it someday."],
+  "Three lessons from {topic}": [
+    "After a few months of {topic}, three things stand out.",
+    "First, start smaller than you think you need to.",
+    "Second, the boring days count as much as the good ones.",
+    "Third, it is fine to take a week off and come back."],
+  "Coffee, rain and {topic}": [
+    "It rained all afternoon, so I made coffee and went back to {topic}.",
+    "There is something about rain on the window that makes it easier to focus.",
+    "Most of the afternoon went by without me noticing.",
+    "By the evening the rain had stopped and the street smelled of wet stone."],
+  "Starting over with {topic}": [
+    "I gave up on {topic} a few years ago, and this month I started over.",
+    "This time I am keeping it small and not expecting much.",
+    "It feels easier the second time, maybe because I stopped trying to be good at it.",
+    "I will write again once it has become a habit."],
+  "A slow {season} morning": [
+    "{Season} mornings here start slowly, and I have stopped fighting it.",
+    "I made coffee, opened the window for a minute and just listened.",
+    "By the time the street woke up, I had already written two pages.",
+    "It is funny how the smallest routines end up holding the whole week together."],
+},
+"photo": {
+  "{Season} light at {place}": [
+    "The {season} light at {place} is low and soft for most of the day.",
+    "Most of these were taken within an hour, before the light went flat.",
+    "I like how ordinary places change completely with a bit of low sun."],
+  "A morning at {place}": [
+    "I got to {place} just after sunrise, before most people were up.",
+    "The fog cleared just enough to see the outline of the hills.",
+    "There were a few quiet minutes when nobody walked through the frame."],
+  "Shadows in {month}": [
+    "In {month} the shadows get long early in the afternoon.",
+    "I spent a few days just following them around the neighbourhood.",
+    "A few frames were slightly out of focus, but I kept them anyway."],
+  "Walking with a {lens} lens": [
+    "I only took the {lens} lens with me, which made things easier, not harder.",
+    "With one focal length you stop thinking about gear and start looking.",
+    "Walking slowly is still the best way I know to find pictures."],
+  "Colors of {place}": [
+    "{Place} has more color than I expected once you look for it.",
+    "Painted doors, faded signs and a lot of green.",
+    "These are straight from the camera, with only small adjustments."],
+  "Rain over {place}": [
+    "It rained over {place} for most of the afternoon.",
+    "The reflections on the wet streets did most of the work here.",
+    "I stood under a doorway and waited for the quiet moments."],
+  "Notes from a {season} roll": [
+    "This roll sat in the camera for most of the {season}.",
+    "The colors came back muted, almost like an old postcard.",
+    "Some rolls give you one picture you like, and that is enough."],
+  "Late afternoon at {place}": [
+    "Late afternoon is my favourite time at {place}.",
+    "The light turns warm for about twenty minutes and then it is gone.",
+    "I went back the next day for the same view and it was completely different."],
+  "Small details in {month}": [
+    "In {month} I tried to photograph only small things.",
+    "Door handles, leaves on a windowsill, a cup left on a wall.",
+    "I am trying to print a few of these for the wall."],
+},
+"studio": {
+  "Rebuilding a {thing} for a local {client}": [
+    "A local {client} asked us to rebuild their {thing}.",
+    "The brief was short and clear, which is always a good start.",
+    "Most of the work was removing things rather than adding them.",
+    "The new {thing} feels calm, which is exactly what they wanted."],
+  "Notes on {topic}": [
+    "A few notes on {topic} from the last projects.",
+    "{Topic} solved more problems for us than any illustration could.",
+    "Small details made the biggest difference."],
+  "Why we keep things simple": [
+    "Most of our clients are small teams with little time to maintain anything complicated.",
+    "Simple things are easier to change later, and they always need to change later.",
+    "We would rather ship something plain and useful than something clever and fragile."],
+  "A new identity for a {client}": [
+    "Recently we worked on a new identity for a {client}.",
+    "We started with paper sketches before opening any software.",
+    "We kept the palette to two colors and one neutral."],
+  "What we learned from {topic}": [
+    "Working on {topic} this year changed a few of our habits.",
+    "We now test drafts on real phones much earlier.",
+    "Printing a draft and pinning it to the wall still helps us see the problems."],
+  "Designing for {audience}": [
+    "Designing for {audience} means cutting more than you would like.",
+    "We tested a few versions with real people before choosing one.",
+    "Short lines and generous spacing did most of the work."],
+  "A small {thing} for a {client}": [
+    "A small {thing} for a {client} in our neighbourhood.",
+    "The budget was small, so every decision had to earn its place.",
+    "It took three rounds of feedback, which felt just right."],
+  "Sketches from a {season} project": [
+    "A few sketches from a project we worked on this {season}.",
+    "Most of these never made it into the final version.",
+    "We keep them because they show how we got there."],
+},
+"notes": {
+  "Notes on {tech}": [
+    "A few notes on {tech} that I keep having to look up.",
+    "{Tech} is one of those things that looks simple until it is not.",
+    "I keep relearning this, which is exactly why it goes here."],
+  "A small trick with {tool}": [
+    "A small trick with {tool} that saved me some time this week.",
+    "The fix turned out to be one line, after an hour of looking in the wrong place.",
+    "There is probably a better way, but this one is easy to remember."],
+  "Cleaning up my {thing}": [
+    "I finally spent an evening cleaning up my {thing}.",
+    "Most of it was things I added years ago and never used.",
+    "After cleaning things up, the whole thing feels noticeably lighter."],
+  "Why I like {tool}": [
+    "I have used {tool} for years and it still surprises me sometimes.",
+    "Most of the time the simplest tool is good enough.",
+    "It does one thing and stays out of the way."],
+  "Reading about {tech}": [
+    "I spent a weekend reading about {tech}.",
+    "The documentation was correct, I just had not read it carefully before.",
+    "I wish someone had told me some of this when I started."],
+  "Debugging a slow {thing}": [
+    "My {thing} had become slow, so I finally looked into it.",
+    "Measuring before changing anything saved me from a pointless rewrite.",
+    "In the end it was one small change in the wrong place."],
+  "Things I got wrong about {tech}": [
+    "A short list of things I got wrong about {tech}.",
+    "Writing a tiny test first made most of them obvious.",
+    "Naming things clearly helped more than any clever trick."],
+  "Keeping a tidy {thing}": [
+    "Keeping a tidy {thing} is mostly about small habits.",
+    "Plain text keeps winning for small personal projects like this.",
+    "It is worth writing down the commands you only need twice a year."],
+},
+}
+# 跟哪篇放在一起都不突兀的句子（正文后半段补几句用；不当摘要）
+_FS_FILLER = {
+  "blog": ["I wrote a few lines in my notebook afterwards.", "More on this another time.",
+           "I am trying to write here more often, even if the posts are short.",
+           "It was a good reminder to slow down a little.", "Thanks for reading, as always."],
+  "photo": ["Thanks for looking.", "More from this series soon.",
+            "These are straight from the camera, with only small adjustments.", "I hope to go back there soon."],
+  "studio": ["We are always happy to work with neighbours and small teams.",
+             "Afterwards we wrote down what we would do differently next time.", "Thanks to everyone involved."],
+  "notes": ["Mostly a note for future me.", "If something here helps you too, that makes me happy.",
+            "Next time I will start with the boring solution and see if it is enough."],
+}
+
 _FS_FONTS = ["Georgia, 'Times New Roman', serif",
              "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
              "'Palatino Linotype', Palatino, 'Book Antiqua', serif",
@@ -821,38 +942,54 @@ def fake_site_write(root, rnd=None):
     width = R.choice([640, 680, 720, 760, 820])
     radius = R.choice([0, 4, 8, 12])
     datefmt = R.choice(["{d:%Y-%m-%d}", "{d:%B} {d.day}, {d.year}", "{d.day} {d:%b} {d.year}"])
-    # 文章：5~10 篇，日期往前随机撒，新的在前
+    # 文章：5~10 篇，日期往前随机撒，新的在前；每篇日期不撞，标题里带季节 / 月份的日期就落在那个季节 / 月份里
     today = datetime.date.today()
+    themes = _FS_THEMES[kind]
     # 标题里的空位按「洗一遍牌、依次发」取，同一个站里尽量不撞词（别三篇都是「…for a bookshop」）
-    src = {"place": _FS_PLACE, "season": _FS_SEASON, "month": _FS_MONTH}
-    src.update({k: K[k] for k in ("titles", "topic", "verb", "food", "lens", "thing", "client", "audience", "tech", "tool")
+    src = {"place": _FS_PLACE, "walk": _FS_WALK, "trip": _FS_TRIP, "season": _FS_SEASON, "month": _FS_MONTH,
+           "titles": list(themes)}
+    src.update({k: K[k] for k in ("topic", "verb", "food", "lens", "thing", "client", "audience", "tech", "tool")
                 if k in K})                                     # 标题句式本身也按牌发，不连着几篇都是「Notes on …」
     decks = {k: [] for k in src}
     def deal(k):
         if not decks[k]:
             decks[k] = R.sample(src[k], len(src[k]))
         return decks[k].pop()
-    fill = {k: (lambda k=k: deal(k)) for k in src if k != "titles"}
-    fill["Season"] = lambda: deal("season").capitalize()
-    posts, seen, firsts = [], set(), set()
+    season_months = {"winter": (12, 1, 2), "spring": (3, 4, 5), "summer": (6, 7, 8), "autumn": (9, 10, 11)}
+    days = [today - datetime.timedelta(days=n) for n in range(4, 901)]
+    used_days = set()
+    def sub(text, vals):
+        def one(m):
+            k = m.group(1)
+            v = vals[k.lower()]
+            return v[:1].upper() + v[1:] if k[:1].isupper() else v
+        return re.sub(r"\{(\w+)\}", one, text)
+    posts, seen = [], set()
     for _ in range(R.randint(5, 10)):
         for _try in range(20):
-            t = re.sub(r"\{(\w+)\}", lambda m: fill[m.group(1)](), deal("titles"))
+            tpl = deal("titles")
+            vals = {k.lower(): deal(k.lower()) for k in re.findall(r"\{(\w+)\}", tpl)}
+            t = sub(tpl, vals)
             if t not in seen:
                 break
         seen.add(t)
         slug = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:60] or "post"
         while any(p["slug"] == slug for p in posts):
             slug += "-" + str(R.randint(2, 9))
-        body = R.sample(K["body"], len(K["body"]))
-        fresh = [x for x in body if x not in firsts] or body     # 每篇开头一句不重样（首页摘要就是它）
-        body.remove(fresh[0]); body.insert(0, fresh[0]); firsts.add(fresh[0])
+        ok = [d for d in days if d not in used_days
+              and ("season" not in vals or d.month in season_months[vals["season"]])
+              and ("month" not in vals or _FS_MONTH[d.month - 1] == vals["month"])]
+        date = R.choice(ok or [d for d in days if d not in used_days])
+        used_days.add(date)
+        lines = [sub(x, vals) for x in themes[tpl]]
+        # 按写好的顺序（第一句是摘要、跟标题直接对上，最后一句收尾）；句子多的随机省掉中间一句，各站不全一样
+        body = lines if len(lines) <= 3 else [x for x in lines if x != R.choice(lines[1:-1])]
+        body += R.sample(_FS_FILLER[kind], R.randint(1, 2))
         paras, i = [], 0
-        for _p in range(R.randint(3, 5)):
-            k = R.randint(2, 4)
-            paras.append(" ".join(body[i:i + k]) or R.choice(K["body"])); i += k
-        posts.append({"title": t, "slug": slug, "date": today - datetime.timedelta(days=R.randint(4, 900)),
-                      "paras": paras})
+        while i < len(body):
+            k = R.randint(2, 3)
+            paras.append(" ".join(body[i:i + k])); i += k
+        posts.append({"title": t, "slug": slug, "date": date, "paras": paras})
     posts.sort(key=lambda p: p["date"], reverse=True)
     since = min(p["date"] for p in posts).year - R.randint(0, 3)
     years = f"{since}&ndash;{today.year}" if since < today.year else str(today.year)
