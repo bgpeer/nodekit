@@ -175,6 +175,8 @@ NGINX_MAIN_BAK    = "/etc/nginx/nginx.conf.bgpeer-bak"
 NGINX_STREAM_CONF = "/etc/nginx/bgpeer-stream.conf"   # stream(ssl_preread) 分流配置
 NGINX_STREAM      = []          # 运行期收集：reality 后端 [{sni, port}]（监听 127.0.0.1）
 SNI_HTTPS_PORT    = 8443        # 本地 https(网站+ws)端口，藏在 stream 443 后面
+SITE_FB_PORT      = 8445        # 本地明文伪装站：trojan 收到不是 trojan 的连接（扫端口的人）回落到这，看到的是网站
+NGINX_FB_CONF     = "/etc/nginx/conf.d/bgpeer-fallback.conf"   # 上面那个小站点单独一份，不跟 bgpeer.conf 的几种写法搅在一起
 REALITY_FB_PORT   = 8444        # 本地 h2c：xray reality 入口解开后回落进来，nginx 按路径分给 reality-grpc² / reality-xhttp²
                                 # 用 TCP 不用 unix socket：nginx 异常退出留下的 .sock 会让它再也起不来（bind 98），443 跟着全断
 
@@ -988,6 +990,29 @@ def nginx_reload():
     if chk.returncode:
         raise RuntimeError("nginx 配置校验未通过:\n" + (chk.stderr or chk.stdout).strip())
     sh("systemctl enable --now nginx", check=False)
+    sh("systemctl reload nginx", check=False)
+
+def _site_fallback_ok():
+    """这台机器有没有伪装站可回落：有域名、nginx 在（前置 / SNI 分流 / reality 占 443 时 nginx 只留 :80，伪装站文件照样在）。"""
+    return bool(G.get("domain")) and bool(G.get("nginx") or G.get("sni_split"))
+
+def ensure_site_fallback():
+    """本机 127.0.0.1:SITE_FB_PORT 起一个只服务伪装站的明文站点，给自己端口上的 trojan 当回落（仓库主人 10/23）：
+       扫端口的人连上来、发的不是 trojan，看到的是网站首页 / 网站自己的 404 页，跟 443 上一模一样，
+       而不是「握手完一句话不回就断」。单独一个文件，bgpeer.conf 怎么重写都不碰它；写过、内容没变就不动。"""
+    conf = (f"server {{\n  listen 127.0.0.1:{SITE_FB_PORT};\n  server_name _;\n  server_tokens off;\n"
+            f"  error_page 404 /404.html;\n  location / {{ root {WEBROOT}; index index.html; }}\n}}\n")
+    try:
+        if open(NGINX_FB_CONF).read() == conf:
+            return
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(NGINX_FB_CONF), exist_ok=True)
+    open(NGINX_FB_CONF, "w").write(conf)
+    chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
+    if chk.returncode:                                   # 万一 nginx -t 不过：撤掉这份，别连累 443
+        os.remove(NGINX_FB_CONF)
+        return
     sh("systemctl reload nginx", check=False)
 
 def write_nginx_acme_stub():
@@ -1996,6 +2021,10 @@ def sb_trojan(port, tag):
           "users": [{"password": pw}],
           "tls": {"enabled": True, "server_name": tls_host(),
                   "certificate_path": crt, "key_path": key}}
+    if not insec and _site_fallback_ok():
+        # 不是 trojan 的连接回落到本机伪装站（见 ensure_site_fallback）；TLS 没设 alpn，浏览器走 http/1.1，正好对上明文站
+        ensure_site_fallback()
+        ib["fallback"] = {"server": "127.0.0.1", "server_port": SITE_FB_PORT}
     lk = (f"trojan://{pw}@{G['host']}:{port}?security=tls&sni={tls_host()}&fp=chrome"
           f"&type=tcp&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
@@ -2465,7 +2494,7 @@ def _xr_link_uuids(data, ib):
     """这个 xray 入站对应哪些分享链接（按 UUID）：自己的用户；reality 入口再加上挂在它后面的 grpc² / xhttp²
        ——它们的链接用的是入口的伪装域名 / 公钥 / pqv，换伪装域名、开关抗量子签名要一起改。"""
     out = [str(c.get("id")) for c in (ib.get("settings") or {}).get("clients") or [] if c.get("id")]
-    if (ib.get("settings") or {}).get("fallbacks"):
+    if _xr_is_entry(ib) and (ib.get("settings") or {}).get("fallbacks"):   # 只认 reality 入口：trojan² 也带回落（回伪装站）
         for b in data.get("inbounds", []):
             if _xr_is_fb_backed(b):
                 out.append(_xr_ib_uuid(b))
@@ -2668,6 +2697,12 @@ def xr_trojan(port, tag):
           "settings": {"clients": [{"password": pw}]},
           "streamSettings": {"network": "raw", "security": "tls",
                              "tlsSettings": _xr_tls(crt, key)}}
+    if not insec and _site_fallback_ok():
+        # 不是 trojan 的连接回落到本机伪装站（见 ensure_site_fallback）。TLS 只报 http/1.1：xray 默认会跟浏览器谈成 h2，
+        # 回落过去的就是 h2 帧，明文站读不懂、回 400，反倒露馅
+        ensure_site_fallback()
+        ib["settings"]["fallbacks"] = [{"dest": SITE_FB_PORT}]
+        ib["streamSettings"]["tlsSettings"]["alpn"] = ["http/1.1"]
     lk = (f"trojan://{pw}@{G['host']}:{port}?security=tls&sni={tls_host()}&fp=chrome"
           f"&type=tcp&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
@@ -6666,6 +6701,7 @@ def _uninstall_core():
     sh("netfilter-persistent save", check=False)
     if os.path.exists(NGINX_CONF):                      # 移除本脚本的 nginx 前置块（不动用户其它站点）
         sh(f"rm -f {NGINX_CONF}", check=False)
+    sh(f"rm -f {NGINX_FB_CONF}", check=False)           # trojan 回落用的本机伪装站
     _nginxconf_remove_stream()                          # 撤掉 sni-split 加进 nginx.conf 的 stream 块
     sh(f"rm -f {NGINX_STREAM_CONF}", check=False)
     if have("nginx"):
