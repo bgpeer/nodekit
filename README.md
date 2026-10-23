@@ -18,15 +18,13 @@ sing-box + xray 双核心、多协议一键部署，自动生成 **mihomo / sing
 ## 👇一键安装代码
 
 ```bash
-curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py -o /tmp/xy.py
-sudo python3 /tmp/xy.py
+curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py -o /tmp/xy.py && sudo python3 /tmp/xy.py
 ```
 
 若 `raw.githubusercontent.com` 被 GitHub 限流（HTTP 429），改用 jsDelivr 镜像（基本不会限流）：
 
 ```bash
-curl -sL https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py -o /tmp/xy.py
-sudo python3 /tmp/xy.py
+curl -fsSL https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py -o /tmp/xy.py && sudo python3 /tmp/xy.py
 ```
 
 装过一次之后，以后直接敲 **`bgpeer`** 就能打开管理面板（内部已带镜像兜底，会尽量拉最新脚本）。
