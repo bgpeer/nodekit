@@ -241,6 +241,10 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
   跟访问网站上别的不存在的页面一模一样，看不出这个路径后面有东西：ws 不是 WebSocket 升级就回 404，grpc 不是 gRPC 请求就回 404，
   xhttp 由 xray 回的错误码换成 404 页，不带斜杠的路径也回 404（不让 nginx 自动 301 跳转）。
   以前 ws 是原样转给后端回 `400 Bad Request`、后来改成直接断开（mack-a 同做法），都跟别的路径不一样。
+- 自己端口上的 **trojan¹ / trojan²** 加了回落：扫端口的人连上来、发的不是 trojan，转给本机 `127.0.0.1:8445` 的伪装站，
+  看到的是网站首页 / 网站自己的 404 页，跟 443 上一样（以前是握手完一句话不回就断）。有域名 + nginx 时才开（前置 / SNI 分流 /
+  reality 占 443 时 nginx 留 :80 都算），自签不开。`vless-vision`、`anytls` 是 sing-box 的，这两个协议本身没有回落功能，做不了。
+  老机器上已装的 trojan 删了再从「只添加新协议」加回来就带上。
 
 **本机防火墙自动放行**（对齐 mack-a 的 allowPort）：机器开着 `ufw` / `firewalld`，或者 iptables 的 INPUT
 有一条不限端口的 REJECT/DROP 兜底（甲骨文镜像就是这样），装节点 / 加协议 / 加 CDN 节点 / 签证书（放 80）时
