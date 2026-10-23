@@ -237,8 +237,10 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
   扫描器拿不到证书、也就看不到你的域名（自签不开：自签证书没有 SAN，开了会把正常客户端也拒掉）。
 - xray reality 加 `maxTimeDiff: 70000`：客户端时间跟服务器差 70 秒以上的握手拒掉，防录下来的握手被重放探测。
   手机 / 电脑时间要是自动同步的（默认就是）。
-- nginx 前置的 ws 路径：不是 WebSocket 升级的请求直接断开（444）。以前会原样转给后端、回一个
-  `400 Bad Request`，一眼看出后面挂着代理。
+- 挂在 nginx 443 后面的路径（ws 类、xhttp-tls、grpc-tls）被人拿浏览器 / curl 摸到时，回的一律是**伪装站自己的 404 页**，
+  跟访问网站上别的不存在的页面一模一样，看不出这个路径后面有东西：ws 不是 WebSocket 升级就回 404，grpc 不是 gRPC 请求就回 404，
+  xhttp 由 xray 回的错误码换成 404 页，不带斜杠的路径也回 404（不让 nginx 自动 301 跳转）。
+  以前 ws 是原样转给后端回 `400 Bad Request`、后来改成直接断开（mack-a 同做法），都跟别的路径不一样。
 
 **本机防火墙自动放行**（对齐 mack-a 的 allowPort）：机器开着 `ufw` / `firewalld`，或者 iptables 的 INPUT
 有一条不限端口的 REJECT/DROP 兜底（甲骨文镜像就是这样），装节点 / 加协议 / 加 CDN 节点 / 签证书（放 80）时
