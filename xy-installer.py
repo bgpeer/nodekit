@@ -1022,7 +1022,11 @@ def _nginx_ws_locations():
             # xray 的 xhttp 挂 nginx 后面：后端是 xray 明文 h2c，nginx 用 grpc_pass 转（XTLS 官方 nginx 示例同做法），
             # stream-one / stream-up / packet-up 三种上行都走得通；proxy_pass(http/1.1) 只有 packet-up 能用。
             # xhttp 的路径后面还会跟 /会话ID/序号，所以这里是前缀匹配（ws 是精确匹配）。
-            locs += (f"  location {w['path']}/ {{\n"
+            # grpc：路径被人摸到、拿浏览器 / curl 来试，不是 gRPC 请求一律 404，跟网站别的不存在的路径一样
+            # （mack-a 同做法；ws 那边是不 Upgrade 就 444）。xhttp 的请求不带 grpc 的 content-type，不能加。
+            guard = ('    if ($content_type !~ "application/grpc") {\n      return 404;\n    }\n'
+                     if w.get("kind") == "grpc" else "")
+            locs += (f"  location {w['path']}/ {{\n" + guard +
                      f"    client_max_body_size 0;\n"
                      f"    client_body_timeout 1h;\n"
                      f"    grpc_read_timeout 1h;\n"

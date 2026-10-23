@@ -3,6 +3,7 @@
   tuic：有域名真证书、UDP 443 空着（或占着的是本机 sing-box）就用 443——同一个域名 TCP 443 网站、UDP 443 h3，跟真网站开 HTTP/3 一样；
   运营商 4G 对随机高端口 UDP 限速丢包最狠。没域名 / 自签 / 被别人占着：照旧随机端口。没开 IPv6 的机器不能崩。
   grpc-tls：nginx 前置时本地明文 grpc、nginx 按 /服务名/ grpc_pass，链接 443 + 自己的域名；不前置时自带证书听自己的端口。
+  grpc 路径被浏览器 / curl 摸到：不是 gRPC 请求回 404（伪装站自己的 404 页），10/23 照 mack-a 加的。
   reality-grpc 一个不动（功能不许悄悄没了）。真 nginx + sing-box + mihomo / sing-box 客户端的端到端在会话里跑过。
 """
 import os, sys, json, socket, tempfile, importlib.util
@@ -53,6 +54,10 @@ check("链接：443 + 自己的域名 + tls + grpc 服务名", "@d.example:443?"
       and f"serviceName={svc}" in lk and "type=grpc" in lk)
 loc = m._nginx_ws_locations()
 check("nginx：/服务名/ 前缀匹配、grpc_pass", f"location /{svc}/ {{" in loc and "grpc_pass grpc://127.0.0.1:30002;" in loc)
+check("nginx：不是 gRPC 请求回 404（走伪装站自己的 404 页，跟不存在的页面一样；mack-a 同做法）",
+      loc.index(f"location /{svc}/") < loc.index('if ($content_type !~ "application/grpc")') < loc.index("grpc_pass grpc://127.0.0.1:30002;"))
+m.NGINX_WS[:] = [{"path": "/xp", "port": 30009, "kind": "xhttp"}]
+check("xhttp 不加这条（它的请求不带 grpc 的 content-type）", "content_type" not in m._nginx_ws_locations())
 d = m.link_to_proxy(lk)
 check(f"mihomo：vless + tls + grpc（{d.get('network')}）", d["type"] == "vless" and d.get("tls") in (True, "true")
       and d.get("network") == "grpc" and d["grpc-opts"]["grpc-service-name"] == svc and "reality-opts" not in d)
