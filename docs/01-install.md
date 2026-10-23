@@ -31,8 +31,11 @@
 
 | 核心 | 协议 |
 |------|------|
-| **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、reality-grpc、tuic、vmess-httpupgrade、anytls |
+| **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、tuic（有域名时 UDP 443）、vmess-httpupgrade、anytls、grpc-tls（nginx 前置时挂 443） |
 | **xray** | reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、xhttp-tls、reality-vision、reality-grpc、vless-ws、vmess-ws、trojan |
+
+> sing-box 的 reality-grpc 已停用（2026-10-23）：随机端口的 grpc 容易被阻断。要 grpc 用 sing-box 的 `grpc-tls`，
+> 或 xray 的 `reality-grpc`（SNI 分流时挂 reality 入口走 443）。已经装了的机器照常跑，「删除协议」里照样能删。
 
 可以只装 sing-box、只装 xray，或两个一起装。**端口/服务/配置都互不冲突**（两核心是独立进程、各绑各的随机端口、各写各的 config）。
 

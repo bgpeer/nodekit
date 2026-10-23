@@ -2236,8 +2236,6 @@ SB = {
                                teardown=_td_hy2, asks=_asks_hy2, recap=_recap_hy2),
     "reality-vision":    PROTO(sb_reality_vision, reality=True,
                                asks=_asks_reality, recap=_recap_reality),
-    "reality-grpc":      PROTO(sb_reality_grpc, reality=True,
-                               asks=_asks_reality, recap=_recap_reality),
     "tuic":              PROTO(sb_tuic, udp=True),
     "vmess-httpupgrade": PROTO(make_sb_vmess("httpupgrade"), cert=True, ws_front=True,
                                asks=_asks_smux, recap=_recap_smux),
@@ -2245,6 +2243,10 @@ SB = {
     "grpc-tls":          PROTO(sb_vless_grpc_tls, cert=True, ws_front=True),
 }
 # 备用（以后想加回，取消注释挪进上面的 SB，按上面的清单据实填标志位）：
+#   reality-grpc：仓库主人 10/23 点头停用——随机端口的 grpc 两台机器都被阻断（Timeout）；grpc 有 grpc-tls（挂 nginx 443）
+#   和 xray 的 reality-grpc（挂 reality 入口 443）。已经装了的机器照常跑、「删除协议」里照样能删，只是新装 / 添加不再列。
+#   "reality-grpc":      PROTO(sb_reality_grpc, reality=True,
+#                              asks=_asks_reality, recap=_recap_reality),
 #   "ss2022":            PROTO(sb_ss2022),
 #   "vless-h2":          PROTO(make_sb_vless("h2"), cert=True),
 #   "vless-httpupgrade": PROTO(make_sb_vless("httpupgrade"), cert=True, ws_front=True,
@@ -12198,7 +12200,8 @@ def install_flow():
     # token 全部重新生成，所有客户端都得重新导入一遍；只加新协议则一个字节都不动老节点。
     st, have_sb, have_xr = _installed_state()
     if (have_sb or have_xr) and read_saved_links():
-        n_sb, n_xr = len(SB) - len(have_sb), len(XRAY) - len(have_xr)
+        # 按表里还有的数：停用的协议（sing-box 的 reality-grpc）装着也不该把「还没装的」减成负数
+        n_sb, n_xr = len([n for n in SB if n not in have_sb]), len([n for n in XRAY if n not in have_xr])
         # 1 只加新协议：老节点端口 / UUID / 密码 / 订阅地址全不变；2 全部重装：订阅地址也换，客户端要重新导入；
         # 3 删除协议：只删选中的，其余不动（含清理 DNAT / nginx 反代）
         ui_title("检测到本机已安装 bgpeer 节点")
@@ -12407,6 +12410,8 @@ if __name__ == "__main__":
     bad_sb = [n for n in sb if n not in SB]
     bad_xr = [n for n in xr if n not in XRAY]
     if bad_sb or bad_xr:
+        if "reality-grpc" in bad_sb:
+            ap.error("sing-box 的 reality-grpc 已停用（随机端口容易被阻断），grpc 请用 --sb grpc-tls 或 --xray reality-grpc")
         if bad_sb: ap.error(f"未知的 sing-box 协议: {','.join(bad_sb)}\n  可选: {','.join(SB)}")
         ap.error(f"未知的 xray 协议: {','.join(bad_xr)}\n  可选: {','.join(XRAY)}")
     # 两个核心都装 reality：xray 用自己的伪装域名，跟 sing-box 的不能一样（见 ask_reality_sni）
