@@ -41,8 +41,17 @@
 
 > **`xhttp-tls`（VLESS + XHTTP + TLS）**：跟 `reality-xhttp` 只差伪装方式——reality 借别人的站，
 > 这个用你自己的域名证书。好处是不依赖借用目标站的存活和可达性，也不受 reality 那套「借用站必须
-> 支持 TLS1.3 + H2、不能是 CDN」的挑剔；代价是暴露自己的域名。走独立随机端口、**不经 nginx**，
-> 跟 443 上那套互不干扰，所以随时可以单独加一个。
+> 支持 TLS1.3 + H2、不能是 CDN」的挑剔；代价是暴露自己的域名。开了 nginx 前置（或 SNI 分流）时
+> **挂在 nginx 443 后面**（nginx 用 `grpc_pass` 转给本地明文的 xray），没有就走自己的随机端口。
+
+> **`grpc-tls`（sing-box，VLESS + gRPC + TLS）**：用你自己的域名证书的 grpc。开了 nginx 前置（或 SNI 分流）时
+> 挂在 nginx 443 后面，按 `/服务名/` 转进来，跟 ws、xhttp-tls 同一个域名，不用多填伪装域名；
+> 有人拿浏览器 / curl 摸到这个路径，回的是伪装站自己的 404 页（不是 gRPC 请求一律 404，跟不存在的页面一样）。
+> 没开 nginx 前置时听自己的端口、自带证书。
+
+> **`tuic` 有域名时上 UDP 443**：同一个域名 TCP 443 是网站、UDP 443 是 HTTP/3，跟真网站开 HTTP/3 一模一样；
+> 运营商对 UDP 443 基本放行（YouTube / 谷歌的 QUIC 都走这），随机高端口的 UDP 在 4G 下最容易被限速丢包。
+> nginx、reality 都只占 TCP 443，不冲突。没域名 / 自签，或 UDP 443 被别的程序占着，照旧随机端口。
 >
 > ⚠ xhttp 是 xray 专属传输：`sing-box` 和 `小火箭` 都不支持，这两种格式的订阅会自动跳过它
 > （跟 `reality-xhttp` 一样），mihomo 订阅和单条分享链接照常可用。
@@ -91,6 +100,9 @@
 > 全新安装时本脚本自己正在监听的节点不算冲突（它们马上要重建），否则每次重装都误报一堆。
 > 选好之后还会提醒一句：**那一整段 UDP 要在云厂商防火墙里放行**，否则跳到的端口连不上。
 >
+> **加 reality 类协议时问伪装域名，一个核心一个**：这个核心已经有 reality 节点就直接沿用它那个、不再问；
+> 还没有才问，而且不能跟另一个核心的重复（重复会红字、回到这一问重填）。
+>
 > 增量模式会沿用 `state.json` 里上次的域名 / SNI / 名称前缀，新节点跟老节点风格一致；端口从现有
 > 配置里读出来先占位，不会撞车。写进去之前先跑一遍内核自带的配置校验（`sing-box check` /
 > `xray -test`），**校验不过就原样回滚、连服务都不重启**，现有节点不受影响。
@@ -101,7 +113,7 @@
 > | 要清的东西 | 不清会怎样 |
 > |---|---|
 > | 端口跳跃的 iptables DNAT + 开机补规则的兜底（删 hy2 时） | 整段 UDP 继续转给一个已经不存在的端口，还会**劫走以后装在那段里的服务** |
-> | nginx 443 上的 location 反代（删 nginx 前置的 ws 类时） | 那条 path 反代到死端口，客户端拿到 502 |
+> | nginx 443 上的反代 / SNI 分流表（删挂在 nginx 后面的协议时：ws 类、xhttp-tls、grpc-tls、分流后面的 reality） | 那条 path 反代到死端口，客户端拿到 502 |
 > | `xy-nodes.txt` 里的分享链接 | 订阅里留着连不上的死节点，客户端每次都去测它 |
 > | `state.json` 的协议表 | 下次「只添加新协议」会以为它还装着，列不出来 |
 >
@@ -116,10 +128,13 @@
 > "hy2":      PROTO(sb_hysteria2, udp=True,
 >                   teardown=_td_hy2, asks=_asks_hy2, recap=_recap_hy2),
 > "vless-ws": PROTO(make_sb_vless("ws"), cert=True, ws_front=True,
->                   teardown=_td_ws_front, asks=_asks_smux, recap=_recap_smux),
+>                   asks=_asks_smux, recap=_recap_smux),
 > ```
 >
 > 规矩只有一条：**builder 里顺手建的系统副作用，必须配一个 `teardown` 把它收回来。**
+> （挂在 nginx 后面的协议不用各写 teardown：增删完一律按两个核心**当前的配置**把 nginx 反代表和 SNI 分流表
+> 整个重建一遍，`nginx -t` 不过就把改过的文件原样放回去，443 不会断。）
+>
 > 以前 hy2 的 iptables 规则、ws 的 nginx 反代都是散在各处建的，只有「建」没有「拆」，
 > 删的时候全靠人肉记得。现在安装 / 增量添加 / 删除 / 自签告警 / UDP 冲突检测 / 确认框
 > 六处流程**全部读这张表**，没有一处再写死协议名，所以：
@@ -167,10 +182,10 @@
 > 订阅里却没有」，而且都没有报错。现在失败只停掉后续核心，收尾照跑，且一律按**真正处理掉的
 > 那部分**来算，最后红字说清楚哪个核心失败了、它下面选的协议一个都没动。
 >
-> 两种情况增量模式会挡下来、提示你走重装：
-> - **ws 家族藏在 nginx 443 后面时**再加 ws 类——新增要重写 nginx 的 location 反代表，而旧节点的
->   path 只存在于运行中的配置里，与其冒险改坏正在用的 443，不如重装一次。
-> - **想让新的 reality 独占 443**——那要改端口/证书布局，增量只给随机端口。
+> **挂在 nginx 后面的协议也能一个一个加、一个一个删**（以前会挡下来让你重装）：加完 / 删完按两个核心
+> 当前的配置把 nginx 反代表和 SNI 分流表重建一遍，`nginx -t` 不过就原样放回，正在用的 443 不受影响。
+>
+> 只有一种情况增量模式不做：**想让新的 reality 独占 443**——那要改端口 / 证书布局，增量只给随机端口，要走重装。
 
 ## 命令行用法（非交互）
 
@@ -189,9 +204,10 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 ```
 
 常用参数：`--sb` / `--xray`（协议，逗号分隔或 `all`）、`--domain`、`--email`、
-`--sni`（reality 借用目标站，**不填=从内置大厂池随机挑一个**，避免所有人挤在同一个 SNI）、`--prefix`（节点名前缀）、
+`--sni`（reality 借用目标站，**不填=从内置大厂池随机挑一个**，避免所有人挤在同一个 SNI）、
+`--sni-xr`（两个核心都装 reality 时 xray 用的那个，不填=随机挑一个跟 `--sni` 不一样的；填成一样直接报错）、`--prefix`（节点名前缀）、
 `--hy2-ports`（hy2 端口跳跃范围，默认 `30000-31000`；填 `off` 关闭跳跃、走单端口）、`--nginx`、
-`--no-reality-443`（默认会把主力 reality 绑 443 抗封端口，加此参数则不绑）、
+`--no-reality-443`（默认会把主力 reality 绑 443 抗封端口，加此参数则不绑）、`--sni-split`（SNI 分流，见下）、`--smux`（ws 类多路复用）、
 `--yes`（检测到 mack-a 等现有安装直接接管）。
 
 ## 伪装 / 加密建议
@@ -228,7 +244,8 @@ sudo python3 xy-installer.py --sb all --domain a.example.com --nginx
 有一条不限端口的 REJECT/DROP 兜底（甲骨文镜像就是这样），装节点 / 加协议 / 加 CDN 节点 / 签证书（放 80）时
 会把用到的端口放行，规则带 `bgpeer` 注释；iptables 的放行插在兜底那条前面，封 IP 的规则照样先生效。
 老机器打开面板时自动补一次。防火墙都没开（大多数 VPS 默认如此）就什么都不动。
-⚠ **云厂商控制台里的安全组 / 防火墙脚本管不到**，那边还得自己放行。
+⚠ **云厂商控制台里的安全组 / 防火墙脚本管不到**，那边还得自己放行。要放行哪些端口，装完、加完协议、
+「2 节点链接」三屏都会在节点链接和订阅之间列一行（见[节点链接页](02-links.md#云防火墙要放行的端口)），复制粘进去就行。
 
 **xray 的 reality 节点对齐 mack-a 的两项**（节点名带 ²；sing-box 内核的 reality 没有这两个选项）：
 
@@ -282,7 +299,7 @@ reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为
 
 与 nginx 前置的关系：reality 独占 443/TCP 时，**nginx 只保留 :80 用于 acme 证书续期**
 （续期不会因此中断），ws 家族不再藏 443、改走各自端口的真证书；443 的"网站伪装"
-由 reality 借用的真站接管。其余协议（trojan/tuic/anytls/vless-vision 等）留在随机端口作备用。
+由 reality 借用的真站接管。其余协议（trojan/anytls/vless-vision 等）留在随机端口作备用；tuic 有域名时走 UDP 443（reality 只占 TCP 443，不冲突）。
 
 加 `--no-reality-443` 可关闭此行为（reality 回到随机端口、保留 nginx 443 前置）。
 
@@ -300,8 +317,24 @@ reality 跑在非 443 高端口，从国内长期用有被封 IP 的风险。为
 探测不过就**自动退回 reality-443 直连**；正式写入若 `nginx -t` 不过则**整体回滚**并还原
 `nginx.conf`，绝不把现有能用的 443 改坏。交互安装选了域名 + reality-vision 时会询问是否启用。
 
-> v1 只把 sing-box `reality-vision` 放到 443 SNI 分流后面；其余 reality（xray xhttp 等）仍在随机端口。
-> 这是较大的架构改动，务必在你自己的机器上实测（`openssl s_client` 打 443 分别用两个 SNI 验证走向 + 客户端逐协议连通）。
+**两个核心各一个伪装域名**：nginx stream 只能按 SNI 分流，同一个伪装域名分不出该给谁。所以两个核心都装 reality 时，
+安装会问两次（先 sing-box、再 xray，回车都是随机挑），第二个跟第一个重复会红字让你重填。只装一个核心的 reality 就只问一次。
+
+**分流模式下谁挂在 443 后面**：
+
+| 走 443 的 | 怎么进去 |
+|---|---|
+| sing-box `reality-vision` | 按 sing-box 的伪装域名分进来 |
+| xray `reality-vision` / `reality-grpc` / `reality-xhttp` | 按 xray 的伪装域名分进 reality 入口；vision 直接在入口里，grpc / xhttp 解开 reality 后转给本地 nginx，按服务名 / 路径分 |
+| ws 类、`xhttp-tls`、`grpc-tls`、伪装站 | 你自己的域名 → 本地 https 站，按路径反代 |
+| `tuic` | 不走 nginx，直接 UDP 443 |
+
+xray 那三个共用一个 reality 入口（同一套密钥、同一个伪装域名，一个域名都不用多填）。**删掉 vision 不影响另外两个**：
+入口会改成一个隐藏的空入口留下来继续转发，三个都删了才拆；再加回 vision 会并回去。
+hy2、trojan、anytls、vless-vision 等仍在自己的端口。
+
+> 装好后可以自己验一下：`openssl s_client -connect 你的IP:443 -servername 伪装域名` 看到的应是那个大站的证书，
+> 换成你自己的域名看到的是你的证书；再在客户端里逐个节点测一遍。
 
 ---
 
