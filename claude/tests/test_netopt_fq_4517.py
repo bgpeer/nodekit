@@ -44,6 +44,7 @@ check("_cfg_file_get 读得到菜单开关记的 ADAPTIVE_DAEMON", n._cfg_file_g
 check("_cfg_file_get 没有的键给默认值", n._cfg_file_get("NOPE", "x") == "x")
 
 # ── 2. 队列一律优先 fq ───────────────────────────────────────────────────────
+n.QDISC_MODULES_CONF = f"{tmp}/net-optimize-qdisc.conf"     # 4.5.19 起会写开机加载，别写到真 /etc
 def qorder(fq_pie=False, aggressive=False, ok=("fq", "fq_pie", "pie", "pfifo_fast")):
     tried = []
     n.Cfg.ENABLE_FQ_PIE, n.Cfg.AGGRESSIVE_MODE = fq_pie, aggressive
