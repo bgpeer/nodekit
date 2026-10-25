@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.11"
+VERSION = "4.5.12"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -497,8 +497,14 @@ def fetch_url(url, timeout=10):
     return None
 
 
+def _bust(url):
+    """给 URL 加时间戳破 CDN 缓存，每次都从源站取最新。主脚本 ensure_remote_script 一直这么做；
+       net-optimize 自更新以前漏了——新版合并后 raw 边缘/jsDelivr（@main 缓存约 12h）可能还是旧副本，
+       自更新拿到旧的就自以为已是最新、一直卡在旧版。两个文件都破缓存，保证脚本和 SHA256SUMS 口径一致。"""
+    return f"{url}{'&' if '?' in url else '?'}_t={int(time.time())}"
+
 def auto_update(argv):
-    data = fetch_url(REMOTE_URL)
+    data = fetch_url(_bust(REMOTE_URL))
     if not data:
         return
     remote_hash = hashlib.sha256(data).hexdigest()
@@ -512,7 +518,7 @@ def auto_update(argv):
     if remote_hash == local_hash:
         return
 
-    sums = fetch_url(REMOTE_SHA256SUMS_URL)
+    sums = fetch_url(_bust(REMOTE_SHA256SUMS_URL))
     if not sums:
         echo("⚠️ 无法获取 SHA256SUMS，跳过自动更新（安全策略）")
         return
