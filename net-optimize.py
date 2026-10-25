@@ -14,7 +14,7 @@
 #   conntrack 调优+hashsize=max/4 / 网卡 offload(GRO/GSO/TSO/LRO off/
 #   UDP GRO 转发/发送分段卸载) / 中断合并自适应 / WireGuard GRO /
 #   RPS/RFS/XPS / CPU performance 调频 / MSS 自动探测+双栈 Clamping /
-#   iptables 双后端检测 / conntrack be_liberal / initcwnd 线路自适应 /
+#   iptables 双后端检测 / conntrack be_liberal / initcwnd 线路自适应 / 按节点画像保留端口 /
 #   激进模式 / 游戏 QoS(cake diffserv4→prio+fq_codel) / 自适应 QoS 守护（可选，默认关）/
 #   Nginx 官方源+Pin+月度自动升级 / 开机恢复(flock 幂等) /
 #   networkd-dispatcher DHCP 续约恢复 initcwnd / netfilter-persistent 兼容
@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.17"
+VERSION = "4.5.18"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -78,6 +78,7 @@ MODULES_FILE = f"{CONFIG_DIR}/modules.list"
 ADAPTIVE_CONF = f"{CONFIG_DIR}/adaptive-qos.conf"
 SYSCTL_AUTH_FILE = "/etc/sysctl.d/99-net-optimize.conf"
 SYSCTL_OVERRIDE_FILE = "/etc/sysctl.d/zzz-net-optimize-override.conf"
+SYSCTL_AUTH_MODE = 0o600     # 里面有保留端口（= 节点端口），只给 root 看
 SYSCTL_BACKUP_DIR = f"{CONFIG_DIR}/sysctl-backup"
 # 【必须带 net-optimize 前缀】这个文件名以前是通用的 conntrack.conf：别的软件
 # 只要也用这个名字，装本模块就会把人家的盖掉，--reset 还会无条件删掉它 ——
@@ -154,8 +155,9 @@ class Cfg:
     ENABLE_IPV6_MSS = _flag("ENABLE_IPV6_MSS")
     ENABLE_INITCWND = _flag("ENABLE_INITCWND")
     TCP_NOTSENT_LOWAT = _env("TCP_NOTSENT_LOWAT", "4096")
-    # 代理节点监听口从临时端口池保留（nodekit 的协议/订阅/hy2跳跃端口都在这一个区间里）
-    RESERVED_PORTS = _env("RESERVED_PORTS", "15000-45000")
+    # 保留端口（从临时端口池摘掉，出站连接不会占走）：默认按节点画像算（见 reserved_plan）；
+    # 显式给了 RESERVED_PORTS 就照它（空 = 不保留），跑完记进 config，之后节点变了也不按画像改。None = 没给
+    RESERVED_PORTS = _env("RESERVED_PORTS", None)
     AGGRESSIVE_MODE = _flag("AGGRESSIVE_MODE", "0")
     ENABLE_GAME_QOS = _flag("ENABLE_GAME_QOS")
     # 自适应切换（守护进程）：仓库主人 10/25 同意改成可选、默认关——服务端出口网卡几乎不是瓶颈，
@@ -994,6 +996,182 @@ def setup_tcp_congestion():
         echo(f"⚠️ 提示: 尝试启用 {target_cc} 失败，系统自动回退到了 {FINAL_CC}")
 
 
+# === 节点画像 → 保留端口（ip_local_reserved_ports）===
+# 以前写死 15000-45000：跟 xy-installer 挑节点端口的区间碰巧一样才罩住（两边各写死），池子外的全漏了——
+# CDN 节点 2053 / 8443、nginx 本地 8443-8445、自己指定的订阅端口、20000-60000 里挑的 hy2 跳跃段，
+# 还有 OpenList 5244 / Emby 8096 / AdGuard 这些：重启那一下端口要是正被出站连接占着，就起不来。
+# 现在 xy-installer 把节点占的端口写成「节点画像」，这边照单摘；节点一变它调 --apply-profile，
+# 只刷这一个内核参数，不重跑整套、不重启任何服务。
+# 【不漏】画像只有端口（没有 UUID / 密码 / 域名），放在 /etc/bgpeer（root-only）；写端口的 sysctl 文件也收成 0600。
+# 本机进程照样能从 /proc/sys 读到保留了哪些端口——它们本来就能从 /proc/net/tcp、ps 看到节点在监听什么，
+# 不多漏东西，也不出这台机器。
+NETPROFILE = "/etc/bgpeer/netprofile.json"
+EPHEMERAL = (1024, 65535)               # 写进 ip_local_port_range 的临时端口池
+RESERVED_PROC = "/proc/sys/net/ipv4/ip_local_reserved_ports"
+POOL_DEFAULT = "15000-45000"            # 没有画像时的老规矩（节点脚本挑端口的区间）
+_RESERVED_SIG = ""                      # 这一趟按哪版画像算的，跑完记进 config 的 PROFILE_SIG
+
+
+def _spec_parse(spec):
+    """「443,15000-45000」→ [(443, 443), (15000, 45000)]；认不出的段跳过。"""
+    out = []
+    for part in str(spec or "").split(","):
+        a, _, b = part.strip().partition("-")
+        if a.isdigit() and (b == "" or b.isdigit()) and int(a) <= int(b or a) <= 65535:
+            out.append((int(a), int(b or a)))
+    return out
+
+
+def _spec_join(ivs):
+    """[(起, 止)…] → 合并重叠 / 相邻的段 →「443,15000-45000」（内核读回来也是这个写法）。"""
+    merged = []
+    for lo, hi in sorted(ivs):
+        if merged and lo <= merged[-1][1] + 1:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return ",".join(str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in merged)
+
+
+def _spec_covers(have, lo, hi):
+    """have（内核读回来的合并段）里有一段整个罩住 lo-hi。"""
+    return any(a <= lo and hi <= b for a, b in have)
+
+
+def tcp_listen_ports():
+    """本机正在监听的 TCP 端口（/proc/net/tcp、tcp6 里状态 0A）。只读本机文件。
+       UDP 不收：sing-box 替用户发的 QUIC、DNS 这些客户端套接字在表里跟服务端口长得一样，
+       收进来会把一堆随机端口锁死；节点自己的 UDP 端口画像里有。"""
+    ports = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in read_text(f).splitlines()[1:]:
+            col = line.split()
+            if len(col) > 3 and col[3] == "0A":
+                try:
+                    ports.add(int(col[1].rsplit(":", 1)[1], 16))
+                except (IndexError, ValueError):
+                    pass
+    return ports
+
+
+def read_netprofile():
+    """节点画像 → (dict, 签名)；没有 / 读不了 / 不像画像返回 (None, "")。
+       签名 = 文件 sha256 前 12 位：跑完记进 config 的 PROFILE_SIG，xy-installer 拿它对——对不上就叫这边刷新。"""
+    try:
+        with open(NETPROFILE, "rb") as f:
+            raw = f.read()
+        prof = json.loads(raw)
+    except (OSError, ValueError):
+        return None, ""
+    if not isinstance(prof, dict):
+        return None, ""
+    return prof, hashlib.sha256(raw).hexdigest()[:12]
+
+
+def reserved_plan():
+    """要从临时端口池摘掉的端口 → (「2053,5244,15000-45000」, 个数说明, 画像签名)。
+       有画像：节点脚本挑新端口的整段池子 + 池子外的节点端口 + hy2 跳跃段；
+       没画像（没装节点脚本 / 还是老版）：老规矩整段 15000-45000。两种都再加本机正在监听的 TCP 端口。
+       只收临时端口池里的（1024-65535），池外的本来不会被出站连接占。
+       【整段池子为什么还留着】新协议从挑端口到真正绑上要几十秒（下内核、签证书）：只留在用的端口，
+       这段空档里出站连接可能正好占走新端口，节点就起不来。"""
+    lo, hi = EPHEMERAL
+    prof, sig = read_netprofile()
+    ivs, node, hops = [], set(), []
+    if prof is not None:
+        ivs += _spec_parse(prof.get("pool"))
+        for k in ("tcp", "udp"):
+            node |= {p for p in prof.get(k) or [] if isinstance(p, int) and lo <= p <= hi}
+        for r in prof.get("ranges") or []:
+            hops += _spec_parse(r)
+    else:
+        ivs += _spec_parse(POOL_DEFAULT)
+    listen = tcp_listen_ports()
+    if prof is not None:     # 画像那会儿在听、这会儿正好在重启的也算上
+        listen |= {p for p in prof.get("listen") or [] if isinstance(p, int)}
+    listen = {p for p in listen if lo <= p <= hi}
+    ivs += hops + [(p, p) for p in node | listen]
+    ivs = [(max(a, lo), min(b, hi)) for a, b in ivs if a <= hi and b >= lo]
+    info = {"profile": prof is not None, "node": len(node), "ranges": len(hops),
+            "listen": len(listen - node)}
+    return _spec_join(ivs), info, sig
+
+
+def reserved_spec():
+    """这一趟写进 sysctl 的保留端口：显式给了 RESERVED_PORTS 就照它（空 = 不保留），否则按节点画像算。"""
+    global _RESERVED_SIG
+    if Cfg.RESERVED_PORTS is not None:
+        return Cfg.RESERVED_PORTS.strip()
+    spec, _info, _RESERVED_SIG = reserved_plan()
+    return spec
+
+
+def _remember_reserved():
+    """记下保留端口按什么来的：手动指定的记 RESERVED_PORTS（之后 --apply-profile 不按画像改）；
+       按画像的记 PROFILE_SIG（xy-installer 拿它对上号）。setup_mss_clamping 会整份重写 config，所以排在它后面。"""
+    if Cfg.RESERVED_PORTS is not None:
+        config_set("RESERVED_PORTS", Cfg.RESERVED_PORTS.strip())
+    else:
+        config_set("PROFILE_SIG", _RESERVED_SIG)
+
+
+def _reserved_summary(info):
+    return (f"节点端口 {info['node']} 个 · 跳跃段 {info['ranges']} 段 · "
+            f"本机其它服务 {info['listen']} 个")
+
+
+def cmd_apply_profile():
+    """--apply-profile：节点变了（装 / 删协议、换订阅端口、CDN 增删）由 xy-installer 调。
+       只按节点画像刷新保留端口：一个内核参数 + sysctl 文件里那一行。不重跑整套优化、不出网、
+       不重启任何服务——保留端口只管以后自动分配的端口，连着的连接、在播的片都不受影响。"""
+    if not os.path.isfile(SYSCTL_AUTH_FILE):
+        echo("⚠️ 还没跑过网络优化，跳过")
+        return
+    cfg = config_read()
+    if "RESERVED_PORTS" in cfg:
+        echo("ℹ️ 保留端口是手动指定的（RESERVED_PORTS），不按节点画像改")
+        return
+    spec, info, sig = reserved_plan()
+    conf = read_text(SYSCTL_AUTH_FILE)
+    line = f"net.ipv4.ip_local_reserved_ports = {spec}"
+    pat = re.compile(r"^[ \t]*net\.ipv4\.ip_local_reserved_ports[ \t]*=.*$", re.M)
+    rng = re.compile(r"^[ \t]*net\.ipv4\.ip_local_port_range[ \t]*=.*$", re.M)
+    if pat.search(conf):
+        new = pat.sub(lambda _m: line, conf)
+    elif rng.search(conf):
+        new = rng.sub(lambda m: m.group(0) + "\n" + line, conf, count=1)
+    else:
+        new = conf.rstrip("\n") + "\n" + line + "\n"
+    if new != conf:
+        if read_text(SYSCTL_AUTH_FILE) != conf:     # 整套优化正好在跑、刚重写了这个文件：别拿旧内容盖回去
+            echo("⚠️ 网络优化正在跑，这次先不刷（它跑完自己会按画像写）")
+            return
+        write_text(SYSCTL_AUTH_FILE, new, mode=SYSCTL_AUTH_MODE)
+    else:
+        os.chmod(SYSCTL_AUTH_FILE, SYSCTL_AUTH_MODE)   # 老版写的是 0644
+    live = set_sysctl("net.ipv4.ip_local_reserved_ports", spec) or write_proc(RESERVED_PROC, spec)
+    config_set("PROFILE_SIG", sig)               # 写不进内核也记：不然节点脚本每进一次面板都叫一遍
+    if live:
+        echo(f"✔ 保留端口已按节点画像刷新（{_reserved_summary(info)}）")
+    else:
+        echo("⚠️ 保留端口写不进内核（容器里没权限？），已记进 sysctl 文件")
+
+
+def check_reserved(cfg):
+    """--check 里保留端口那一行：跟节点对上没有。只报个数，不把端口印上屏（这屏常截图发给别人看）。"""
+    if "RESERVED_PORTS" in cfg:
+        echo("ℹ️ 保留端口：手动指定（RESERVED_PORTS）")
+        return
+    spec, info, _sig = reserved_plan()
+    have = _spec_parse(read_text(RESERVED_PROC).strip())
+    if any(not _spec_covers(have, a, b) for a, b in _spec_parse(spec)):
+        yellow("⚠️ 保留端口：跟节点还没对上（进一次节点面板或再跑一次优化就补上）")
+    elif info["profile"]:
+        green(f"✅ 保留端口：已跟节点对上（{_reserved_summary(info)}）")
+    else:
+        echo(f"ℹ️ 保留端口：没有节点画像，按老规矩整段 {POOL_DEFAULT}（另加本机服务 {info['listen']} 个）")
+
+
 # === Sysctl 深度整合 ===
 def write_sysctl_conf():
     echo("📊 写入内核参数配置文件...")
@@ -1047,10 +1225,11 @@ def write_sysctl_conf():
     a("net.ipv4.tcp_keepalive_intvl = 15")
     a("net.ipv4.tcp_keepalive_probes = 2")
     a("net.ipv4.tcp_max_tw_buckets = 32768")
-    a("net.ipv4.ip_local_port_range = 1024 65535")
-    if Cfg.RESERVED_PORTS:
-        # 代理节点监听口从临时端口池保留，避免出站临时端口撞上节点监听口
-        a(f"net.ipv4.ip_local_reserved_ports = {Cfg.RESERVED_PORTS}")
+    a(f"net.ipv4.ip_local_port_range = {EPHEMERAL[0]} {EPHEMERAL[1]}")
+    reserved = reserved_spec()
+    if reserved:
+        # 节点 / 本机服务的监听口从临时端口池摘掉，出站临时端口就撞不上（按节点画像算，见 reserved_plan）
+        a(f"net.ipv4.ip_local_reserved_ports = {reserved}")
     a("")
     a("# === TCP算法优化 ===")
     a(f"net.ipv4.tcp_mtu_probing = {Cfg.ENABLE_MTU_PROBE}")
@@ -1061,6 +1240,8 @@ def write_sysctl_conf():
     a("net.ipv4.tcp_ecn = 1")
     a("net.ipv4.tcp_ecn_fallback = 1")
     a(f"net.ipv4.tcp_notsent_lowat = {Cfg.TCP_NOTSENT_LOWAT}")
+    # TFO 只是内核允许，节点的监听套接字故意不开：reality 冒充别人家网站，别人不回 TFO、我们回了就露馅；
+    # 国内运营商还常丢带数据的 SYN，开了反而偶发连不上
     a("net.ipv4.tcp_fastopen = 3")
     a("net.ipv4.tcp_timestamps = 1")
     a("net.ipv4.tcp_autocorking = 0")
@@ -1189,7 +1370,7 @@ def write_sysctl_conf():
         a("net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 120")
         a("")
 
-    write_text(SYSCTL_AUTH_FILE, "\n".join(L) + "\n")
+    write_text(SYSCTL_AUTH_FILE, "\n".join(L) + "\n", mode=SYSCTL_AUTH_MODE)
     if run(["sysctl", "-e", "--system"], timeout=60).returncode != 0:
         echo("⚠️ 部分参数不支持，但不影响其他项")
     echo(f"✅ sysctl 参数已写入并应用：{SYSCTL_AUTH_FILE}")
@@ -3043,6 +3224,7 @@ def main_optimize(argv):
     setup_rps_rfs()
     setup_cpu_governor()
     setup_mss_clamping()
+    _remember_reserved()        # 保留端口按哪版节点画像算的（config 刚被 setup_mss_clamping 整份重写过）
     clear_dscp_residue()        # DSCP 4.5.17 起不再打；clean_old_config 没触发时（新机器）也兜一下
     setup_initcwnd()
     setup_aggressive_tc()
@@ -3277,7 +3459,7 @@ def _xanmod_fix_cc():
         s = read_text(f)
         n = re.sub(r"^(\s*net\.ipv4\.tcp_congestion_control\s*=\s*)(?!bbr)\S+[ \t]*$", r"\1bbr", s, flags=re.M)
         if s and n != s:
-            write_text(f, n)
+            write_text(f, n, mode=SYSCTL_AUTH_MODE if f == SYSCTL_AUTH_FILE else 0o644)
 
 
 def xanmod_precheck():
@@ -3576,6 +3758,7 @@ def cmd_check():
               "2": (green, "✅ rp_filter = 2（松散，推荐）")}
     fn, msg = rp_msg.get(rp, (echo, f"ℹ️ rp_filter = {rp}"))
     fn(msg)
+    check_reserved(cfg)
 
     # === [2] 网卡 Offload / RPS / RFS ===
     c_sep()
@@ -4125,6 +4308,8 @@ def main():
                    help="只把脚本本体更到最新，不重跑优化、不碰服务（月度 cron 调）")
     g.add_argument("--adaptive", choices=["on", "off"],
                    help="自适应切换（守护进程）开关：只改这一项，不重跑整套优化（菜单 12 → 7 调）")
+    g.add_argument("--apply-profile", action="store_true",
+                   help="只按节点画像刷新保留端口（xy-installer 在节点变了时调；不重跑优化、不重启服务）")
     g.add_argument("--version", action="store_true", help="打印版本号")
     args, argv = parser.parse_known_args()
 
@@ -4149,6 +4334,9 @@ def main():
     elif getattr(args, "reapply_initcwnd"):
         require_root()
         cmd_reapply_initcwnd()
+    elif getattr(args, "apply_profile"):
+        require_root()
+        cmd_apply_profile()
     elif args.check:
         cmd_check()
     elif args.reset:

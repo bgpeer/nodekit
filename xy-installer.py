@@ -197,6 +197,7 @@ GHDL_RELAYS  = BGP_DIR + "/gh-relays.json"   # 取件用的【自己人】中转
 # 网络优化脚本已并入本仓库（net-optimize.py，BBR/QoS 等内核调优，依赖工具自动安装）；
 # 主脚本只负责拉取+调用，状态检测走同一脚本的 --check。
 NETOPT_LOCAL = BGP_DIR + "/net-optimize.py"      # 本地缓存的网络优化脚本
+NETOPT_SBIN  = "/usr/local/sbin/net-optimize.py" # 装在机器上的那份（开机恢复、守护进程、月度自更新跑它）
 NETOPT_URL   = _RAW + "net-optimize.py"
 # VPS 线路检测（三网回程骨干 + IP 纯净度），同样是拉本仓库脚本来跑
 VPSCHK_LOCAL = BGP_DIR + "/vps-check.py"
@@ -207,6 +208,8 @@ VPSCHK_URL   = _RAW + "vps-check.py"
 #   adaptive-qos.conf JSON，含 threshold（激活阈值，单位字节）
 NETOPT_CONFIG   = "/etc/net-optimize/config"
 NETOPT_ADAPTIVE = "/etc/net-optimize/adaptive-qos.conf"
+# 节点画像：节点在本机占的端口（只有端口），交给网络优化从临时端口池摘掉，见 netprofile_sync
+NETPROFILE      = BGP_DIR + "/netprofile.json"
 
 # CDN 灾备节点：独立 sing-box 实例(VLESS+WS+TLS)，靠 Cloudflare 橙云中转——
 # 客户端连的是 CF 的 IP，VPS 真 IP 被墙时仍能续命。与主节点隔离，重装主节点不受影响。
@@ -3305,7 +3308,7 @@ _PRIV_DIRS  = lambda: (BGP_DIR, SUB_DIR, "/etc/ssl/sb")
 _PRIV_FILES = lambda: (TOKENS_FILE, GHRELAY_TOKEN_FILE, STATE_FILE, PEERS_FILE,
                        GHDL_RELAYS, CUSTPL_FILE, TPLSRC_FILE, SUBPORT_FILE,
                        HOST_FILE, NODE_FILE, CFG_FILE, SBOX_FILE, SR_FILE, SR_NODES_FILE, SR_MODE_FILE,
-                       ACME_KEY, KEY)
+                       NETPROFILE, ACME_KEY, KEY)
 
 def harden_perms():
     """把只该 root 看的目录/文件收成 root-only。幂等、极快，每次入口都过一遍。
@@ -5837,6 +5840,7 @@ def run(sb_names, xr_names):
     except OSError:
         pass
     fw_sync()                                            # 开着防火墙就把节点 / 订阅端口放行（对齐 mack-a）
+    netprofile_sync()                                    # 节点端口交给网络优化保留（装着才叫它）
 
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
@@ -7014,7 +7018,7 @@ def _uninstall_core():
     jobq_cleanup_if_unused()             # 凌晨任务排队器：没有别的定时任务在用了才撤（网络优化可能还在用）
     if _ms:
         # 【目录留着，但节点自己的文件要清干净】留下的只有别人的东西。
-        for p in ("/etc/bgpeer/state.json", CFG_AUTO_FILE):
+        for p in ("/etc/bgpeer/state.json", CFG_AUTO_FILE, NETPROFILE):
             sh(f"rm -f {p}", check=False)
         print("  ↷ /etc/bgpeer 保留：Emby 那套（media-stack）的状态也存在这里。")
         print("    里面记着它的安装目录、分片重定向端口、每个盘的探测 UA 开关 ——")
@@ -7042,6 +7046,8 @@ def uninstall_all():
     if c == "1":
         if _ask("\n  确认卸载代理主体（AdGuard 一并卸；网络优化保留）? [y/N]: ").lower() in ("y", "yes"):
             _uninstall_core()
+            if nopt:
+                _netopt_apply_profile()              # 画像没了：保留端口退回老规矩（整段池子 + 本机服务）
             print("\n已卸载代理主体。" + ("网络优化仍在（想卸进『网络优化→卸载』或重跑本项选 2）。" if nopt else ""))
     elif c == "2":
         if _ask("\n  确认全部卸载（含网络优化，恢复系统默认）? [y/N]: ").lower() in ("y", "yes"):
@@ -7310,6 +7316,7 @@ def ghrelay_menu():
             open(GHRELAY_TOKEN_FILE, "w").write(secrets.token_urlsafe(12))
             harden_perms()                # 刚落地是 0644，当场收紧，别留窗口
             print("  正在换端口 + token 并刷新订阅…")
+            netprofile_sync()                                 # 新订阅端口交给网络优化保留
             if _ghrelay_regen():
                 print(f"  ✓ 新订阅端口：\033[1;32m{sub_port()}\033[0m　新中转前缀：https://{dom}:{sub_port()}/{_ghrelay_token()}/gh/")
                 print(f"  ▸ 客户端到菜单『2 节点链接/订阅』复制新订阅地址重新导入；确认防火墙已放行 {sub_port()}、可关掉旧端口。")
@@ -7560,7 +7567,7 @@ def _netopt_version():
     自适应 QoS 守护、月度 nginx 升级实际执行的那份。/etc/bgpeer 下的只是菜单每次
     拉新的缓存副本 —— 报它的话，屏上写着新版、常驻的东西却还在跑旧代码。
     """
-    for f in ("/usr/local/sbin/net-optimize.py", NETOPT_LOCAL):
+    for f in (NETOPT_SBIN, NETOPT_LOCAL):
         try:
             m = re.search(r'^VERSION = "([^"]+)"', open(f, encoding="utf-8").read(), re.M)
         except OSError:
@@ -7606,6 +7613,129 @@ def _netopt_adaptive(on):
     if "--adaptive" not in open(NETOPT_LOCAL, encoding="utf-8", errors="replace").read():
         print("  ⚠ 网络优化脚本没拉到新版，过会儿再试"); return
     _run_child(f"python3 {NETOPT_LOCAL} --adaptive {'on' if on else 'off'}")
+
+# ── 节点画像：节点和网络优化对上号 ────────────────────────────────────────
+# 以前网络优化对节点是「盲调」：保留端口写死 15000-45000（跟这边挑端口的区间碰巧一样才罩住），
+# CDN 2053 / 8443、nginx 本地 8443-8445、自己指定的订阅端口、池子外的 hy2 跳跃段全漏了。
+# 现在这边把节点占的端口写成画像，网络优化照单从临时端口池摘掉（出站连接占不走，节点重启也绑得上）；
+# 节点一变（装 / 删协议、CDN 增删、换订阅端口）就叫它 --apply-profile 只刷这一项——一个内核参数，
+# 不重启任何服务、不影响在播。画像在 /etc/bgpeer（root-only），只有端口，不出这台机器。
+
+def netprofile():
+    """节点画像 → {"v", "pool", "tcp", "udp", "ranges", "listen"}，只有端口（不记 UUID / 密码 / 域名）。
+       pool = 挑新端口的整段（新协议从挑端口到绑上有几十秒，整段留着才不会被出站连接抢走）；
+       tcp / udp = 两核心的入站（含挂在 nginx 后面、听 127.0.0.1 的）、CDN 节点、订阅端口、nginx 自己听的口；
+       ranges = hy2 跳跃段（DNAT 的那段 UDP，别让出站连接的临时端口落进去）；
+       listen = 本机别的服务正在听的 TCP 端口（OpenList / Emby / AdGuard / 改过的 SSH…）——记进画像，
+       它们一变签名就变，netprofile_sync 才知道要叫网络优化刷新。"""
+    tcp, udp, ranges, hy2 = set(), set(), [], False
+    for core in _CORE_META:
+        for ib in _load_core_cfg(core)[1]:
+            p = _cfg_port(ib)
+            if not p:
+                continue
+            t = ib.get("type") or ib.get("protocol") or ""
+            if t in ("hysteria2", "hysteria", "tuic"):
+                udp.add(p)
+                hy2 = hy2 or t == "hysteria2"
+                continue
+            tcp.add(p)
+            if t == "shadowsocks" or (ib.get("streamSettings") or {}).get("network") == "xhttp":
+                udp.add(p)                                    # 同 _fw_wanted：ss 两种都听，xhttp 能走 h3
+    for n in _cdn_load():
+        if isinstance(n.get("cf_port"), int):
+            tcp.add(n["cf_port"])
+    try:
+        tcp.add(int(open(SUBPORT_FILE).read().strip()))       # 直接读文件：sub_port() 没有时会现挑一个
+    except (OSError, ValueError):
+        pass
+    for path in (NGINX_CONF, NGINX_FB_CONF, NGINX_STREAM_CONF):   # 443 / 80 之外还有本地 8443-8445
+        try:
+            tcp |= {int(m) for m in re.findall(r"(?m)^\s*listen\s+(?:\S*:)?(\d+)\b", open(path).read())}
+        except OSError:
+            pass
+    if hy2:                                                   # 跟 _hy2_hop_heal 一个判法：state 里没关跳跃就是开着
+        try:
+            raw = (json.load(open(STATE_FILE)).get("hy2_ports") or "").strip()
+        except Exception:
+            raw = ""
+        if raw.lower() not in ("off", "n", "no", "none"):
+            ranges.append(raw if re.match(r"^\d+-\d+$", raw) else HY2_PORTS)
+    tcp, udp = {p for p in tcp if 0 < p < 65536}, {p for p in udp if 0 < p < 65536}
+    return {"v": 1, "pool": f"{PORT_LO}-{PORT_HI}", "ranges": ranges, "tcp": sorted(tcp), "udp": sorted(udp),
+            "listen": sorted(p for p in _tcp_listen_ports() if 1024 <= p and p not in tcp | udp)}
+
+def _tcp_listen_ports():
+    """本机正在监听的 TCP 端口（/proc/net/tcp、tcp6 里状态 0A），跟 net-optimize 的 tcp_listen_ports 同一个算法。
+       UDP 不收：sing-box 替用户发 QUIC / DNS 的客户端套接字在表里跟服务端口长得一样。"""
+    ports = set()
+    for f in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            lines = open(f).read().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            col = line.split()
+            if len(col) > 3 and col[3] == "0A":
+                try:
+                    ports.add(int(col[1].rsplit(":", 1)[1], 16))
+                except (IndexError, ValueError):
+                    pass
+    return ports
+
+def _netopt_apply_profile():
+    """叫网络优化按画像刷新保留端口（--apply-profile）。用本机现成的那份、不出网：装在机器上的（每月自更新）
+       和面板缓存的，挑认 --apply-profile、版本高的；都是老版就不叫——老版用 parse_known_args，
+       不认的参数直接忽略、转头跑整套优化，绝不能喂给它。"""
+    best, bestv = "", ()
+    for path in (NETOPT_SBIN, NETOPT_LOCAL):
+        try:
+            txt = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if "--apply-profile" in txt and (not best or _vt(_remote_ver(txt)) > bestv):
+            best, bestv = path, _vt(_remote_ver(txt))
+    if not best:
+        return False
+    try:
+        return subprocess.run(["python3", best, "--apply-profile"], capture_output=True,
+                              timeout=60).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+def netprofile_sync():
+    """节点画像写盘（0600），再看网络优化跟上没有：它跑完记下按哪版画像调的（config 的 PROFILE_SIG =
+       画像文件 sha256 前 12 位），对不上就叫它刷新——两边对上号，不用每次去比内核参数。
+       没跑过网络优化只写画像；手动指定过保留端口（RESERVED_PORTS）的不动。
+       装 / 删协议、CDN 增删、换订阅端口之后调；进面板也过一遍（老装机、错过的变动在这补上）。永不抛异常。"""
+    import hashlib
+    try:
+        prof = netprofile()
+        body = json.dumps(prof, sort_keys=True, separators=(",", ":")) + "\n"
+        try:
+            old = open(NETPROFILE).read()
+        except OSError:
+            old = ""
+        if body != old:
+            os.makedirs(BGP_DIR, exist_ok=True)
+            tmp = NETPROFILE + ".new"
+            with open(tmp, "w") as f:
+                os.chmod(tmp, 0o600)
+                f.write(body)
+            os.replace(tmp, NETPROFILE)
+        if not os.path.exists(NETOPT_CONFIG):
+            return False
+        cfg = {}
+        for ln in open(NETOPT_CONFIG):
+            k, _, v = ln.strip().partition("=")
+            cfg[k] = v
+        if "RESERVED_PORTS" in cfg:
+            return False
+        if cfg.get("PROFILE_SIG") == hashlib.sha256(body.encode()).hexdigest()[:12]:
+            return False
+        return _netopt_apply_profile()
+    except Exception:
+        return False
 
 def _netopt_confirm():
     """跑优化档位(1/2/3)前确认：会重应用内核参数、期间可能短暂重启服务，默认否，要明确 y 才跑。"""
@@ -8855,6 +8985,7 @@ def cdn_add():
         print("  ✗ 没有成功新增的节点。"); return
     _cdn_save(nodes)
     fw_sync()                                            # CDN 端口（2053…）本机防火墙也得放行
+    netprofile_sync()                                    # 网络优化那边也把它摘出临时端口池
     ports = "、".join(str(n["cf_port"]) for n in created)
     # 每条各自独立服务、与主节点互不影响；有优选地址时链接地址位已换成它，SNI/Host 仍是域名
     ui_title(f"已新增 {len(created)} 条 CDN 节点（共 {len(nodes)} 条）")
@@ -9546,6 +9677,7 @@ def cdn_remove():
         except OSError: pass
         cfg = _pref_load(); cfg["cands"] = []; _pref_save(cfg)   # 节点没了，候选也没意义
     _cdn_resync(old_links, was_in_sub)                  # 撤旧的、把还留着的（含候选）写回
+    netprofile_sync()                                   # 撤掉的 CDN 端口网络优化那边也放回去
     print(f"  ✓ 已卸载 {len(targets)} 条 CDN 节点（Cloudflare 那边的 DNS 记录请自行删除）。")
 
 def cdn_menu():
@@ -11713,6 +11845,7 @@ def main_menu():
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                 # 老装机那条是按 6 月写死的，换成冬夏两季都对的写法
     _heal_other_crons()                          # cn-block 03:00 / 网络优化 nginx 月度：换成冬夏两季都对的写法
+    netprofile_sync()                            # 节点画像：网络优化的保留端口跟节点对上（老装机、错过的变动在这补）
     while True:
         print("\n" + "=" * 60)
         print(f"  bgpeer 一键脚本 v{SCRIPT_VERSION}  （sing-box + xray 多协议 / 订阅）")
@@ -12223,6 +12356,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
     except OSError:
         pass
     fw_sync()                                            # 新加协议的端口也放行
+    netprofile_sync()                                    # 网络优化那边也保留上
 
     # 和「2 查看链接」一个样：新节点一条一行、条间空行，三大订阅高亮
     ui_title(f"已添加 {len(new_links)} 个节点（现有节点未改动）")
@@ -12605,6 +12739,7 @@ def _del_apply(st, del_sb, del_xr, have_sb, have_xr):
         json.dump(st, open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
         pass
+    netprofile_sync()                                    # 删掉的端口网络优化那边也放回去
 
     print("\n" + "=" * 60)
     print(f"  已删除 {len(removed)} 个节点，摘掉 {dropped} 条分享链接")
