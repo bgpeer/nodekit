@@ -33,6 +33,9 @@
 - **Emby 收到「已删除」通知不一定认**：整个主目录都没了时找不到上级去刷，等多久都不删。要删就按条目 id 删
   （`DELETE /Items/{id}`），而且**所在文件夹必须存在**，不然回 404「Could not find a part of the path」——
   临时按 Emby 的 PUID/PGID 建回空文件夹再删。
+- **机器重启后 MediaWarp 可能没登录上 OpenList**（容器一起起来，它登录时 OpenList 还没好）：之后每次播放都回 Emby 的
+  404「Could not find a part of the path」、播放器闪退，挂载里却能播。`docker restart mediawarp` 就好；每小时那轮由
+  `mediawarp_cold_start_broken` 认出来自动重启（1.5.386）。nginx 每月自动升级只重载 nginx，不会触发。
 - **Emby 收到通知要先攒 60–90 秒才动**，前一两分钟「0」是正常的。
 - **115 的直链按来访 UA 签发**：谁要的地址只认谁来下。播放、截封面都要用 `pan115_url(播放器的脸)`。
 - **夸克 / 阿里的服务器在阿里云**：仓库主人那台 VPS 晚高峰连它们的接口常超时（本机也超时，不是 Docker 的事），
