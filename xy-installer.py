@@ -5849,10 +5849,20 @@ def run(sb_names, xr_names):
 # ============================================================================ 管理面板 / 快捷命令
 def install_shortcut(content=None):
     """安装 bgpeer 快捷命令：本地存一份脚本，wrapper 每次尽量拉最新再运行。
-       content 给了就存它（更新脚本时传刚下载的新版，避免又被当前运行的旧版覆盖）。"""
+       content 给了就存它（self-update / 菜单18 传刚下载的新版，强制写）。
+       不带 content = 装/重装时存「当前跑的这份」，但只升不降：若磁盘已有更新的一份就留磁盘那份。
+       （真机踩过：有人用旧脚本跑重装，把 SELF_LOCAL 降级到连 self-update/SCRIPT_VERSION 都没有的老版本，
+         每天 02:50 的自动更新 python3 SELF_LOCAL self-update 再也跑不起来、永远卡死，而 bgpeer 每次临时
+         下载最新一直显示新版把问题盖住。降级守卫断掉这条路。）"""
     try:
         os.makedirs(BGP_DIR, exist_ok=True)
-        open(SELF_LOCAL, "w").write(content if content is not None else open(__file__).read())
+        if content is None:
+            content = open(__file__).read()
+            try:    cur = open(SELF_LOCAL).read()
+            except OSError: cur = ""
+            if cur and _vt(_script_ver(cur)) > _vt(_script_ver(content)):
+                content = cur                            # 磁盘那份更新，别覆盖成旧的
+        open(SELF_LOCAL, "w").write(content)
         # raw.githubusercontent 常被 GitHub 限流(429)，加 jsDelivr 镜像兜底；
         # 只有真的下到非空内容才覆盖本地，拉不到就继续用本地缓存（不会退回旧版失败）。
         wrapper = ("#!/usr/bin/env bash\n"
