@@ -100,6 +100,21 @@
 - 增删协议、换伪装域名后一律 `_nginx_sync_from_cfg()` 按两个核心【当前配置】重建反代表 + 分流表，nginx -t 不过放回原文件。
 - pq（pqv）按 UUID 对链接，不按端口（挂 nginx 后链接端口都是 443）。
 
+## 网络优化 ↔ 节点（节点画像，10/25 起）
+
+- xy-installer 的 `netprofile_sync` 写 `/etc/bgpeer/netprofile.json`（只有端口：两核心入站含 127.0.0.1 的、CDN、订阅、
+  nginx 本地 8443-8445、hy2 跳跃段、本机别的服务在听的 TCP），签名对不上 net-optimize config 里的 `PROFILE_SIG`
+  才叫 `--apply-profile`（只改 `ip_local_reserved_ports` + sysctl 文件那一行，不重启服务）。调用点：装 / 加 / 删协议、
+  CDN 增删、换订阅端口、进面板。
+- **老版 net-optimize 绝不能喂新参数**：它用 `parse_known_args`，不认的参数直接忽略、转头跑整套优化。新加子命令一律
+  先查本地那份认不认（`"--apply-profile" in 文件`），菜单里的 `--adaptive`、`--xanmod` 同理。
+- 挑端口的整段 15000-45000 故意照留：只留在用的端口的话，新协议从挑端口到绑上（下内核、签证书）有几十秒空档，
+  出站连接可能正好占走。UDP 监听口不扫：sing-box 替用户发 QUIC / DNS 的客户端套接字在 /proc/net/udp 里跟服务端口一样。
+- 节点不开 TFO（内核 `tcp_fastopen=3` 只是允许，套接字不开就不生效）：reality 冒充别人家网站，别人不回 TFO、我们回了
+  就露馅；国内运营商还常丢带数据的 SYN。UDP 大缓冲、网卡 UDP GRO 本来就对所有机器开着，不用按画像开关。
+- 端到端测试 `test_netprofile_e2e.py` 在 `unshare --mount --net` 里跑真脚本、真内核参数（/etc 那几个目录盖 tmpfs），
+  不碰本机；改保留端口相关的逻辑先跑它。
+
 ## 客户端的坑（真机踩过）
 
 - **Bettbox 推荐换成 ClashMi**（仓库主人 10/24）：Bettbox 用自己一套 DNS / 规则 / TUN 复写盖掉订阅里的原生配置
