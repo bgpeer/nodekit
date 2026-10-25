@@ -2,7 +2,7 @@
 """net-optimize 脚本本体月度自更新 —— 仓库主人：「网络优化也加进自动更新时间表里面排队，
   跟 Nginx 一样每个月更新一次」。有人装好就不进菜单，脚本修的 bug / 加的兜底一直用不上。
   新增 --self-update：只换 /usr/local/sbin 的 .py 文件，不重跑优化、不碰服务（不影响播放）；
-  挂月度 cron（每月 1 号北京 03:40，进排队器），开机 / 首次手动跑也补装。
+  挂月度 cron（每月 1 号北京 03:05，排在 03:10 nginx 升级前，进排队器），开机 / 首次手动跑也补装。
 """
 import os, re, sys, io, tempfile, contextlib, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
