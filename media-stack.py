@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.385"
+SCRIPT_VERSION = "1.5.386"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2352,8 +2352,66 @@ def mediawarp_token_broken():
     return ("token is invalidated" in log or "响应状态码: 401" in log), log
 
 
+MW_OL_GAP_S = 60     # MediaWarp 比 OpenList 晚起不到这么多秒，就怀疑它启动时 OpenList 还没好、没登录上
+
+
+def _started_at(name):
+    """容器这一次是什么时候起来的 → (epoch 秒, 原串)；问不到 → (None, "")。"""
+    try:
+        raw = (sh(f"docker inspect -f '{{{{.State.StartedAt}}}}' {name}", timeout=30).stdout or "").strip().strip("'")
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(raw[:19]).replace(tzinfo=_dt.timezone.utc).timestamp(), raw
+    except Exception:
+        return None, ""
+
+
+def mediawarp_cold_start_broken(d, key):
+    """机器重启那种「一起起来」之后，MediaWarp 有没有登录上 OpenList。→ True = 没登录上（要重启它）。
+
+    【真机 10/25】机器重启（换内核），几个容器同时起来；MediaWarp 登录 OpenList 那一刻 OpenList 还没好
+    （nginx 日志 20:23:09「连 OpenList 被拒绝」），之后每次播放都换不到直链、原样交给 Emby，Emby 拿网盘
+    路径当本地文件开，回 404「Could not find a part of the path」，播放器闪退。日志里没有「令牌作废」，
+    mediawarp_token_broken 认不出来，每小时那一轮一直没修。
+    【只在可疑的时候真试一次】MediaWarp 比 OpenList 早起、或晚起不到 MW_OL_GAP_S 秒才试；每次启动只试一回
+    （记 mw_probe_start）。试法：拿一个 strm 条目问 MediaWarp 要视频流、不跟跳转 —— 302 = 好的；
+    404 且是 Emby 那句「找不到路径」= 没登录上。试一次就是换一次直链，所以不随便试。"""
+    t_mw, raw_mw = _started_at("mediawarp")
+    t_ol, _r = _started_at("openlist")
+    if t_mw is None or t_ol is None or t_mw - t_ol > MW_OL_GAP_S:
+        return False
+    if ms_state().get("mw_probe_start") == raw_mw:
+        return False
+    save_ms_state(mw_probe_start=raw_mw)
+    if not key or not wait_openlist_ready(d):
+        return False
+    try:
+        r = _emby("/Items?Recursive=true&IncludeItemTypes=Movie,Episode&Limit=30&Fields=Path", key, timeout=30)
+        iid = next((str(i["Id"]) for i in r.get("Items") or []
+                    if str(i.get("Path") or "").startswith(STRM_PATH + "/")), "")
+    except Exception:
+        return False
+    if not iid:
+        return False
+    self_touch(iid)                   # 自己的探测，别当成有人点了播放
+    try:
+        op = urllib.request.build_opener(_NoRedirect)
+        op.open(urllib.request.Request(
+            f"http://127.0.0.1:{MEDIAWARP_PORT}/emby/videos/{iid}/stream"
+            f"?MediaSourceId=mediasource_{iid}&Static=true&api_key={key}",
+            headers={"User-Agent": PLAYER_UA, "Range": "bytes=0-0"}), timeout=60).close()
+        return False
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(300)
+        except Exception:
+            body = b""
+        return e.code == 404 and b"Could not find a part of the path" in body
+    except Exception:
+        return False
+
+
 def heal_mediawarp_token():
-    """发现 MediaWarp 令牌作废就重启它。返回有没有重启。
+    """发现 MediaWarp 令牌作废（或机器重启时就没登录上 OpenList）就重启它。返回有没有重启。
 
     这个故障原来只有体检报得出来，而体检是【已经发现出事了】才会去跑的东西 ——
     偏偏它坏的那一刻什么都看不出来，等直链缓存全过期，人才发现"Emby 全放不了、
@@ -2361,6 +2419,13 @@ def heal_mediawarp_token():
     重启的代价是清空直链缓存，下面顺手预热补回来。
     """
     bad, _log = mediawarp_token_broken()
+    if not bad:
+        try:
+            d = ms_install_dir()
+            bad = mediawarp_cold_start_broken(
+                d, read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"), "auth"))
+        except Exception:
+            bad = False
     if not bad:
         return False
     r = subprocess.run(["docker", "restart", "mediawarp"],
