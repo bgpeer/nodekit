@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.13"
+VERSION = "4.5.14"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -2242,6 +2242,7 @@ NGINX_KEYRING = "/usr/share/keyrings/nginx-archive-keyring.gpg"
 NGINX_OFFICIAL_LIST = "/etc/apt/sources.list.d/nginx-official.list"
 NGINX_PIN = "/etc/apt/preferences.d/99-nginx-official"
 NGINX_CRON = "/etc/cron.d/net-optimize-nginx-update"
+SELFUPD_CRON = "/etc/cron.d/net-optimize-selfupdate"   # 脚本本体每月自更新（--self-update）
 
 # 【谁在用这份 nginx】nginx 在这套东西里是共用件，但"共用"这件事以前只写在文档里，
 # 机器上看不出来。这里按各家【实际会落盘的固定文件名】判断 —— 名字都是写死的，
@@ -2552,6 +2553,7 @@ WantedBy=multi-user.target
     if have_cmd("netfilter-persistent"):
         run(["netfilter-persistent", "save"], timeout=60)
         echo("✅ iptables 规则已持久化（nat 端口跳跃将在重启后自动恢复）")
+    write_selfupd_cron()        # 脚本本体每月自更新（只换文件、不碰服务，不影响播放）
     echo("✅ 开机自启服务配置完成")
 
 
@@ -2568,6 +2570,34 @@ def write_nginx_cron():
            + "".join(l + "\n" for l in lines))
     if read_text(NGINX_CRON) != txt:
         write_text(NGINX_CRON, txt)
+
+
+def write_selfupd_cron():
+    """脚本本体每月 1 号北京 03:40 自更新的 cron（--self-update，进排队器）。内容没变不重写。
+       跟 nginx 月度升级并列：有的人装好就不进菜单了，脚本修的 bug / 加的兜底一直用不上。
+       【更新不影响播放】--self-update 只换 /usr/local/sbin 的 .py 文件，不 apply sysctl、
+       不 restart nginx/sing-box、不动 conntrack，对正在播的开播连接和进度刷新毫无影响。"""
+    lines, times = bj_job_lines(3, 40, "netopt-selfupd", f"{PYTHON_BIN} {SCRIPT_PATH} --self-update", day=1)
+    txt = ("SHELL=/bin/bash\n"
+           "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+           "# Net-Optimize: monthly script self-update (--self-update)"
+           f"（北京时间每月 1 号 03:40 = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）\n"
+           + "".join(l + "\n" for l in lines))
+    if read_text(SELFUPD_CRON) != txt:
+        write_text(SELFUPD_CRON, txt)
+
+
+def cmd_self_update():
+    """只把脚本本体更到最新，不重跑优化、不碰任何服务（月度 cron 调；也可手动跑）。
+       auto_update：有新版→SHA256 校验通过→替换并 execv(--self-update)（再进来版本就一致、原样返回）；
+       没新版→原样返回。顺手把月度自更新 cron 补上（第一次手动跑 --self-update 就把定时装好）。"""
+    require_root()
+    auto_update(["--self-update"])     # 有更新会 execv 换上新版再回到这里
+    try:
+        write_selfupd_cron()
+    except Exception:  # noqa
+        pass
+    echo(f"net-optimize 已是最新 v{VERSION}")
 
 
 def cmd_boot_apply():
@@ -2587,6 +2617,10 @@ def cmd_boot_apply():
             write_nginx_cron()
         except Exception:
             pass
+    try:                        # 老装机没有月度自更新 cron，开机顺手补上
+        write_selfupd_cron()
+    except Exception:
+        pass
 
     # 模块 + sysctl
     for module in read_text(MODULES_FILE).split():
@@ -2943,9 +2977,10 @@ def cmd_reset():
             run(args + ["route", "change"] + parts, timeout=5)
             echo(f"  ✅ 已清除 {fam} initcwnd")
 
-    # [9] Nginx 自动更新 cron（nginx 本体与源保留，不影响正在用的网站/证书）
+    # [9] Nginx 自动更新 cron（nginx 本体与源保留，不影响正在用的网站/证书）+ 脚本月度自更新 cron
     echo("🔧 [9] 清理 Nginx 自动更新 cron...")
     _rm(NGINX_CRON)
+    _rm(SELFUPD_CRON)
     echo("  ✅ 已删除 Nginx 自动更新 cron")
     if jobq_cleanup_if_unused():     # 凌晨任务排队器：没有别的定时任务在用了才撤（代理主体可能还在用）
         echo("  ✅ 已删除凌晨任务排队器（没有别的任务在用）")
@@ -4103,6 +4138,8 @@ def main():
                    help="换 BBRv3 内核（XanMod）：查条件、确认、安装、问要不要重启")
     parser.add_argument("--yes", action="store_true",
                         help="配合 --xanmod：免掉安装前那一问（重启从不自动）")
+    g.add_argument("--self-update", action="store_true",
+                   help="只把脚本本体更到最新，不重跑优化、不碰服务（月度 cron 调）")
     g.add_argument("--version", action="store_true", help="打印版本号")
     args, argv = parser.parse_known_args()
 
@@ -4137,6 +4174,8 @@ def main():
     elif args.xanmod:
         require_root()
         cmd_xanmod(assume_yes=args.yes)
+    elif getattr(args, "self_update"):
+        cmd_self_update()
     else:
         main_optimize(sys.argv[1:])
 
