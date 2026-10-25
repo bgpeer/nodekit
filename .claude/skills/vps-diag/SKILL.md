@@ -24,6 +24,7 @@ curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/trk.
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/orphan.py | python3 -
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/churn.py | python3 - 片名1 片名2
 curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/coverdiag.py | python3 - 片名
+curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/progwatch.py | python3 - [分钟]
 ```
 
 - 掉轨道 / 有没有扫整个库 → `trk.py` + `cat /var/log/media-stack/scan.log`
@@ -31,6 +32,7 @@ curl -sL https://raw.githubusercontent.com/bgpeer/nodekit/main/claude/tools/cove
 - 某几部片每晚删了又建、重复条目 → `churn.py`
 - 补时长 / 截封面结果 → `media-stack heal-log 40`（截封面一轮跑完才写日志）
 - 某一部截封面不成 → `coverdiag.py 片名`（每条路、每种身份各截一次，只截不存）
+- 退出后进度没刷新 → `progwatch.py`（开着它让仓库主人播 / 退出几次，看读页面是不是比 Emby 记上早）
 - 开播慢 → `tail -30 /var/log/media-stack/gate.log`
 - 连不连得上某个接口：本机 `curl -so /dev/null -m 15 -w "%{time_appconnect}\n" https://<主机>/`，
   容器里用 `docker run --rm --network mediastack alpine wget ...` 对照。
