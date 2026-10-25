@@ -40,7 +40,9 @@
 
 > 4.5.4 及以前在原厂内核上可能选成 `cubic`（bbr 模块没加载，脚本看不到它）；跑一次本菜单的档位就改回 `bbr`。
 >
-> 优化脚本自带 SHA256 校验的自动更新（对照仓库里的 `SHA256SUMS`），每次执行都是最新版。
+> 优化脚本自带 SHA256 校验的自动更新（对照仓库里的 `SHA256SUMS`），每次执行都是最新版；
+> 并且每月 1 号北京 03:40 自动把脚本本体更到最新（`--self-update`，只换文件、不重跑优化、不碰服务，不影响在播），
+> 跟 nginx 月度升级并列、进排队器。装好不进菜单的机器也能跟上修的 bug / 加的兜底。
 > 也可单独运行：`python3 <(curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py)`
 
 ---
