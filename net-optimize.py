@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.12"
+VERSION = "4.5.13"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -503,9 +503,22 @@ def _bust(url):
        自更新拿到旧的就自以为已是最新、一直卡在旧版。两个文件都破缓存，保证脚本和 SHA256SUMS 口径一致。"""
     return f"{url}{'&' if '?' in url else '?'}_t={int(time.time())}"
 
+def _vt(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+def _remote_ver(text):
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else ""
+
 def auto_update(argv):
     data = fetch_url(_bust(REMOTE_URL))
     if not data:
+        return
+    # 只升不降：raw 被限流(429)回落 jsDelivr（@main 缓存约 12h）时可能拿到旧副本——
+    # auto_update 原来只比哈希、不比版本，会把正在跑的新版 execv 降级回旧版（菜单就显示旧版本号）。
+    # 拉到的版本号 ≤ 正在跑的这份，就什么都不动（SHA256SUMS 校验仍保留，防篡改）。
+    newv = _remote_ver(data.decode(errors="replace"))
+    if newv and _vt(newv) <= _vt(VERSION):
         return
     remote_hash = hashlib.sha256(data).hexdigest()
     local_hash = ""

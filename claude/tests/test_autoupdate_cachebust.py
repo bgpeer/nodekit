@@ -44,9 +44,34 @@ with contextlib.redirect_stdout(io.StringIO()):
 check("已是最新：只拉脚本一次就早退，不碰 SHA256SUMS", len(urls) == 1 and "SHA256SUMS" not in urls[0])
 check("已是最新：本地脚本不动", open(m.SCRIPT_PATH, "rb").read() == data)
 
-# 4. 版本号 ≥ 4.5.12
+# 4. 只升不降：拉到的版本号 ≤ 正在跑的 → 早退，不碰 SHA256SUMS、不写 SCRIPT_PATH
+m.VERSION = "4.5.13"
+open(m.SCRIPT_PATH, "wb").write(b'VERSION = "4.5.13"\n')     # 本地（正在跑的）是新的
+urls.clear()
+def fetch_old(u, timeout=10):
+    urls.append(u)
+    return b'VERSION = "4.5.9"\nprint(1)\n'                  # 镜像拿到的是旧的
+m.fetch_url = fetch_old
+with contextlib.redirect_stdout(io.StringIO()):
+    m.auto_update([])
+check("镜像给旧版(4.5.9 ≤ 4.5.13)：早退，不拉 SHA256SUMS", len(urls) == 1 and "SHA256SUMS" not in urls[0])
+check("镜像给旧版：SCRIPT_PATH 不被降级", b'4.5.13' in open(m.SCRIPT_PATH, "rb").read())
+
+# 5. 真有新版（> 正在跑的）→ 继续走校验（会去拉 SHA256SUMS）
+m.VERSION = "4.5.13"
+open(m.SCRIPT_PATH, "wb").write(b'VERSION = "4.5.13"\n')
+urls.clear()
+def fetch_new(u, timeout=10):
+    urls.append(u)
+    return b"deadbeef  net-optimize.py\n" if "SHA256SUMS" in u else b'VERSION = "4.5.99"\nprint(1)\n'
+m.fetch_url = fetch_new
+with contextlib.redirect_stdout(io.StringIO()):
+    m.auto_update([])
+check("真有新版(4.5.99 > 4.5.13)：继续走到 SHA256SUMS 校验", any("SHA256SUMS" in u for u in urls))
+
+# 6. 版本号 ≥ 4.5.13
 src = open(os.path.join(ROOT, "net-optimize.py"), encoding="utf-8").read()
 mv = tuple(int(x) for x in re.findall(r"\d+", re.search(r'VERSION = "([\d.]+)"', src).group(1)))
-check("VERSION ≥ 4.5.12", mv >= (4, 5, 12))
+check("VERSION ≥ 4.5.13", mv >= (4, 5, 13))
 
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)
