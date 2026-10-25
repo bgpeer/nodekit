@@ -37,10 +37,10 @@
 | 每天 02:50 | 节点脚本自更新【队】 | xy-installer | 无 |
 | 每天 03:00 | 规则刷新【队】 | cn-block | sing-box |
 | 每天 03:00 | whitelist-inject（mack-a 共存用，没装就没有；不进队） | vps-net | 规则变了才重启 mack-a 的 xray |
+| 每月 1 日 03:05 | 网络优化脚本自更新【队】（排在 nginx 升级前；新调优参数要手动重跑优化） | net-optimize | 自适应 QoS（出口闲着时） |
 | 每月 1 日 03:10 | nginx 升级【队】 | net-optimize | nginx |
 | 每天 03:20 | 三大配置重生成【队】 | xy-installer | 无 |
 | 每天 03:30 | 刷新元数据（按盘，默认关）【队】 | media-stack | 无（Emby 后台忙） |
-| 每月 1 日 03:40 | 网络优化脚本自更新【队】 | net-optimize | 无 |
 | 每月 2 日 04:00 | 内核更新【队】 | xy-installer | sing-box / xray |
 | 每天 04:10 | Emby 脚本自更新【队】 | media-stack | 开播门（没人播时） |
 | 每天 04:15 | 刷目录缓存（不进队，要赶 04:20） | media-stack | 无 |

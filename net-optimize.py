@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.15"
+VERSION = "4.5.16"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -555,6 +555,7 @@ def auto_update(argv):
         f.write(data)
     os.chmod(tmp, 0o755)
     os.replace(tmp, SCRIPT_PATH)
+    os.environ["NETOPT_JUST_UPDATED"] = "1"     # 告诉换上来的新版：刚换过（月度自更新要据此重启 QoS 守护进程）
     os.execv(PYTHON_BIN, [PYTHON_BIN, SCRIPT_PATH] + argv)
 
 
@@ -2575,15 +2576,17 @@ def write_nginx_cron():
 
 
 def write_selfupd_cron():
-    """脚本本体每月 1 号北京 03:40 自更新的 cron（--self-update，进排队器）。内容没变不重写。
+    """脚本本体每月 1 号北京 03:05 自更新的 cron（--self-update，进排队器）。内容没变不重写。
        跟 nginx 月度升级并列：有的人装好就不进菜单了，脚本修的 bug / 加的兜底一直用不上。
+       【排在 03:10 nginx 升级前面】仓库主人 10/25：原来 03:40，nginx 升级用的是上个月的脚本。
+       两条都进排队器、按登记先后跑，03:05 先登记就一定先跑完（03:00 规则刷新拖久了也一样）。
        【更新不影响播放】--self-update 只换 /usr/local/sbin 的 .py 文件，不 apply sysctl、
-       不 restart nginx/sing-box、不动 conntrack，对正在播的开播连接和进度刷新毫无影响。"""
-    lines, times = bj_job_lines(3, 40, "netopt-selfupd", f"{PYTHON_BIN} {SCRIPT_PATH} --self-update", day=1)
+       不 restart nginx/sing-box、不动 conntrack；只有自适应 QoS 守护进程会在出口闲着时重启一下（见 restart_qos_if_idle）。"""
+    lines, times = bj_job_lines(3, 5, "netopt-selfupd", f"{PYTHON_BIN} {SCRIPT_PATH} --self-update", day=1)
     txt = ("SHELL=/bin/bash\n"
            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
            "# Net-Optimize: monthly script self-update (--self-update)"
-           f"（北京时间每月 1 号 03:40 = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）\n"
+           f"（北京时间每月 1 号 03:05 = 本机 {' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}）\n"
            + "".join(l + "\n" for l in lines))
     if read_text(SELFUPD_CRON) != txt:
         write_text(SELFUPD_CRON, txt)
@@ -2600,6 +2603,46 @@ def cmd_self_update():
     except Exception:  # noqa
         pass
     echo(f"net-optimize 已是最新 v{VERSION}")
+    if os.environ.get("NETOPT_JUST_UPDATED"):
+        restart_qos_if_idle()
+
+
+def _iface_rate(iface, secs=5):
+    """出口这几秒的速率（入 / 出取大的，B/s）。"""
+    def rd(n):
+        try:
+            with open(f"/sys/class/net/{iface}/statistics/{n}") as f:
+                return int(f.read())
+        except (OSError, ValueError):
+            return 0
+    rx, tx = rd("rx_bytes"), rd("tx_bytes")
+    time.sleep(secs)
+    return max(rd("rx_bytes") - rx, rd("tx_bytes") - tx) // secs
+
+
+def restart_qos_if_idle(tries=10, gap=60):
+    """脚本换了新版，自适应 QoS 守护进程还在跑旧代码（常驻进程，换文件不会自己换）→ 出口闲着时重启它。
+       仓库主人 10/25：「两个都做吧」（QoS 跟着换新版 + 自更新挪到 nginx 升级前）。
+       【为什么要等闲着】重启后它会重新下一遍出口的 tc 队列规则，正在大流量的那一刻换队列可能丢几个包；
+       闲着的判据跟它自己切模式用的同一个阈值。等 tries 轮还忙就不动 —— 下次开机自然是新版。
+       返回 True = 重启了。"""
+    if run(["systemctl", "is-active", ADAPTIVE_QOS_SERVICE], timeout=5).returncode != 0:
+        return False
+    try:
+        with open(ADAPTIVE_CONF) as f:
+            conf = json.load(f)
+        iface, thr = conf["iface"], int(conf.get("threshold", 1048576))
+    except Exception:  # noqa
+        return False
+    for i in range(tries):
+        if _iface_rate(iface) < thr:
+            run(["systemctl", "restart", ADAPTIVE_QOS_SERVICE], timeout=30)
+            echo("✅ 自适应 QoS 已换成新版")
+            return True
+        if i < tries - 1:
+            time.sleep(gap)
+    echo("⚠️ 出口一直忙，自适应 QoS 没重启（下次开机换成新版）")
+    return False
 
 
 def cmd_boot_apply():
