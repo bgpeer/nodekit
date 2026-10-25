@@ -95,8 +95,9 @@ check("更新时顺手装上每月那条 cron", "install_imgup_cron(d)" in up)
 print("四、时刻")
 hm = lambda t: tuple(map(int, t.split(":")))
 check("02:30，在 02:50 节点脚本自更新 / 03:00 规则刷新之前", hm(m.IMGUP_HOUR_CST) < (2, 50))
-check("窗口收在 04:00 前（04:15 刷目录缓存、04:20 AutoFilm 之前留余量）",
-      hm(m.IMGUP_WINDOW[1]) <= (4, 0) and hm(m.IMGUP_WINDOW[0]) <= hm(m.IMGUP_HOUR_CST))
+_end = hm(m.IMGUP_WINDOW[1]); _end = _end[0] * 60 + _end[1] + 20 + 20   # 最晚起头 + 等没人播 20 分 + 拉镜像约 20 分
+check("最晚起头的那一轮也在 04:15 刷目录缓存之前做完",
+      _end <= 4 * 60 + 15 and hm(m.IMGUP_WINDOW[0]) <= hm(m.IMGUP_HOUR_CST) < hm(m.IMGUP_WINDOW[1]))
 
 print("五、cron")
 spec2 = importlib.util.spec_from_file_location("ms2", SRC)
@@ -114,5 +115,5 @@ check("卸载带走", "IMGUP_CRON" in un)
 tz = src[src.index("def cron_tz_resync("):]; tz = tz[:tz.index("\ndef ", 1)]
 check("时区变了重写", "install_imgup_cron(d)" in tz)
 check("子命令 imgupdate 抢锁再跑", 'take_task_lock("imgupdate")' in src)
-check("版本 1.5.388 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 388))
+check("版本 1.5.389 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 389))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
