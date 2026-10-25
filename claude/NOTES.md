@@ -36,6 +36,9 @@
 - **机器重启后 MediaWarp 可能没登录上 OpenList**（容器一起起来，它登录时 OpenList 还没好）：之后每次播放都回 Emby 的
   404「Could not find a part of the path」、播放器闪退，挂载里却能播。`docker restart mediawarp` 就好；每小时那轮由
   `mediawarp_cold_start_broken` 认出来自动重启（1.5.386）；「8 更新」换了 OpenList 容器当场等它起好再重启 MediaWarp（1.5.387）。nginx 每月自动升级只重载 nginx，不会触发。
+- **晚高峰夸克接口慢 → Emby 里一直转圈**（10/25）：MediaWarp 问 OpenList 要直链超时（它自己 30 秒放弃回 404），
+  跟没登录上（秒回 404、闪退）是两回事；开播门先替它取好地址后就能播。看 `docker logs mediawarp` 里
+  「context deadline exceeded」/「failed get link」区分。
 - **Emby 收到通知要先攒 60–90 秒才动**，前一两分钟「0」是正常的。
 - **115 的直链按来访 UA 签发**：谁要的地址只认谁来下。播放、截封面都要用 `pan115_url(播放器的脸)`。
 - **夸克 / 阿里的服务器在阿里云**：仓库主人那台 VPS 晚高峰连它们的接口常超时（本机也超时，不是 Docker 的事），
