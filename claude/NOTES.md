@@ -21,6 +21,7 @@
 | 只报变动给 Emby | `emby_notify_changes`（≤300 条，每小时那条也用它，**别改**）；大批量用 `emby_notify_bulk` |
 | Emby 里的空壳 | `emby_ghost_items` / `prune_emby_ghosts`（每小时，有两成刹车）/ `clear_retired_ghosts`（撤掉的盘，人点的） |
 | 开播门 | `do_heal_gate`（15 秒硬上限）；改它要单独上、等仓库主人实测退出后进度刷新 |
+| 「8 更新」 | `update_menu`：1 立即 → `do_update`；2 每月自动开关 → cron 每天 02:30 `do_imgupdate`（3 号起、本月没做成才做，`do_update(auto=True)`） |
 | 截封面 | `fill_covers`；按钮 → 后台 `do_covers_mount`；生成后 / 凌晨新片 → `queue_new_covers` → `do_covers_new` |
 | 盘那一屏 | `_drive_menu`，公共项 `_drive_std_items` / `_drive_tail_items` |
 | 小雅 | 1.5.385 整栏删了（仓库主人：片不多、找不到想看的）；要挂走「4 WebDAV」。卸载里只留带走旧版装的那份 |

@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.387"
+SCRIPT_VERSION = "1.5.388"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2193,6 +2193,7 @@ KEEPALIVE_CRON = "/etc/cron.d/media-stack-keepalive"
 SYNC_CRON      = "/etc/cron.d/media-stack-sync"
 WARM_CRON      = "/etc/cron.d/media-stack-warm"
 SELFUP_CRON    = "/etc/cron.d/media-stack-selfupdate"
+IMGUP_CRON     = "/etc/cron.d/media-stack-imgupdate"
 TRAFFIC_CRON   = "/etc/cron.d/media-stack-traffic"
 HEAL_CRON      = "/etc/cron.d/media-stack-heal"
 
@@ -2264,6 +2265,18 @@ PRECACHE_HOUR_CST = "04:15"
 # 自动更新【只换脚本，不动容器、不重生成配置】。放在每日对齐之前一点，
 # 换完那一轮对齐就是新版脚本在跑。见 do_selfupdate 里为什么只换脚本。
 SELFUP_HOUR_CST = "04:10"
+# 【镜像每月自动更新】仓库主人 10/25：「想让他每个月自动更新一次」。跟上面每天那条（只换脚本）不是一回事：
+# 这条走一遍「8 更新」—— 拉新镜像、按新版重刷配置、只重启变了的容器、换了 OpenList 就让 MediaWarp 重新登录。
+# 【时刻】仓库主人给的是 3 号 03:50，有冲突让我调：排队器里 03:30 的刷新元数据最多跑半小时，排在它后面再拉
+# 十几分钟镜像，就撞上 04:15 刷目录缓存 / 04:20 AutoFilm 扫库（重启 OpenList 清掉刚热好的目录缓存、
+# 重启 AutoFilm 扫一半就断）。挪到 02:30：排在凌晨所有活前面（02:50 节点脚本自更新、03:00 规则刷新……）。
+# 【每天看一眼、一个月只做一次】cron 每天 02:30 起；3 号起、这个月还没做成才做 —— 3 号那天有人在播、
+# 镜像拉不动，第二天接着试，不白等一个月。开机续跑的排队器可能白天才轮到它：不在 IMGUP_WINDOW 里
+# 就留到明天（白天重启容器会打断看片，第六节）。
+IMGUP_DAY      = 3
+IMGUP_HOUR_CST = "02:30"
+IMGUP_WINDOW   = ("02:00", "04:00")     # 北京时间，左闭右开
+IMGUP_LOG      = "/var/log/media-stack/imgupdate.log"
 # 每 20 分钟一次 ≈ 72 次/天。别为了"让链路更热"去调小它 —— 实测耗时和空闲时间
 # 不相关，理由见 do_keepalive() 的文档字符串。
 # 【一小时一次就够，而且要轮流打】这个探测是【真实】列目录（带 refresh），
@@ -2321,6 +2334,8 @@ CRON_TIMEOUT   = {
     # 冷却却已经记下，于是下一次点开也不补 —— 看起来就是"点了不补"。
     "heal-tick": 900,
     "selfupdate": 300,                       # 就一次 HTTPS 下载 + 语法自检
+    # 每月自动「8 更新」：等没人播最多 20 分钟 + 拉镜像（跨境慢的时候十几分钟）+ 重刷配置，给足
+    "imgupdate":  3600 + 1200,
     "precache":   300,                       # 每个盘两个 HTTP 请求，不该跑这么久
     # 只读 /proc + 每个容器两条 docker 命令，几十毫秒的事；给 60 秒够宽了
     "traffic-sample": 60,
@@ -5487,6 +5502,99 @@ def install_selfupdate_cron(install_dir):
         return False
 
 
+def imgup_on():
+    """镜像每月自动更新开没开。仓库主人要的默认是开。"""
+    return ms_state().get("imgup_auto", True) is not False
+
+
+def imgup_desc():
+    return (f"{GREEN}开{RST}（每月 {IMGUP_DAY} 日 {IMGUP_HOUR_CST}）" if imgup_on()
+            else f"{DIM}关{RST}")
+
+
+def imgup_last(d=None):
+    try:
+        with open(os.path.join(d or ms_install_dir(), "imgupdate.json")) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def install_imgup_cron(install_dir):
+    """装镜像每月自动更新的 cron（每天看一眼，一个月只做一次，见 IMGUP_HOUR_CST）。关着也装 —— 开关在状态文件里。"""
+    ensure_jobq()
+    m, h = cst_to_local_cron(IMGUP_HOUR_CST)
+    try:
+        os.makedirs(os.path.dirname(IMGUP_LOG), exist_ok=True)
+        txt = (f"# media-stack 每月 {IMGUP_DAY} 日起自动「8 更新」（拉镜像、重刷配置），一个月只做一次；\n"
+               f"# 每天北京时间 {IMGUP_HOUR_CST}（本机 {h:02d}:{m:02d}）看一眼，开关在「8 更新 → 2」。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"{m} {h} * * * root {jobq_wrap('ms-imgupdate', cron_cmd('imgupdate') + f' >>{IMGUP_LOG} 2>&1')}\n")
+        write_atomic(IMGUP_CRON, txt, mode=0o644)
+        return True
+    except OSError as e:
+        warn(f"装每月自动更新任务失败（不影响使用）：{e}")
+        return False
+
+
+def do_imgupdate():
+    """cron 每天调：该做这个月的自动更新了才做。结果写 imgupdate.json 给体检读。"""
+    d = ms_install_dir()
+    if not is_installed(d) or not imgup_on():
+        return
+    month = bj_fmt("%Y-%m")
+    if int(bj_fmt("%d")) < IMGUP_DAY or imgup_last(d).get("month") == month:
+        return
+    if not IMGUP_WINDOW[0] <= bj_fmt("%H:%M") < IMGUP_WINDOW[1]:
+        return                                  # 排队器白天才轮到：留到明天凌晨
+    # 【有人在播就等，等不到明天再试】更新要重启容器，正在播的会断（第六节）
+    if not play_quiet_wait(read_emby_api_key(d), "每月自动更新", max_s=1200, step=60):
+        return
+    print(f"\n==== {bj_fmt('%Y-%m-%d %H:%M')} 每月自动更新 ====")
+    rec = {"ts": int(time.time()), "month": "", "ok": False, "error": ""}
+    try:
+        r = do_update(auto=True)
+        if r is True:
+            rec["ok"], rec["month"] = True, month
+        else:
+            rec["error"] = "有人在播" if r is None else "镜像没拉全，明天再试"
+    except Exception as e:
+        rec["error"] = _short_err(e)
+    try:
+        with open(os.path.join(d, "imgupdate.json"), "w") as f:
+            json.dump(rec, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def update_menu():
+    """「8 更新」：立即更新 / 每月自动更新开关。"""
+    d = ms_install_dir()
+    while True:
+        print("\n" + "=" * 60)
+        print(f"  {BOLD}更新{RST}")
+        print("-" * 60)
+        print("  1. 立即更新")
+        print(f"  2. 自动更新          当前：{imgup_desc()}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            do_update(from_menu=True)
+            ask("\n按回车返回菜单...")
+        elif c == "2":
+            on = not imgup_on()
+            save_ms_state(imgup_auto=on)
+            if on and is_installed(d):
+                install_imgup_cron(d)
+            ok(f"每月自动更新：{'开' if on else '关'}")
+        else:
+            print("无效选择。")
+
+
 def cron_tz_resync():
     """本机相对 UTC 的偏移变了 → 把按北京时间排的那几条定时（自动更新、每日对齐、刷新元数据）重写一遍。
 
@@ -5504,6 +5612,8 @@ def cron_tz_resync():
             install_sync_cron(d)
         if os.path.exists(SELFUP_CRON):
             install_selfupdate_cron(d)
+        if os.path.exists(IMGUP_CRON):
+            install_imgup_cron(d)
         install_meta_cron()
         save_ms_state(cron_gmtoff=off)
         return old is not None
@@ -13528,10 +13638,12 @@ def purge_node_rule(d):
              f"{'、'.join(hit)}{DIM}（这个功能已撤销）{RST}")
 
 
-def do_update(from_menu=False):
+def do_update(from_menu=False, auto=False):
     """更新：脚本自身 + 镜像 + 按新脚本重新生成配置。用户数据和密码都不动。
 
     from_menu 只影响自我更新之后 re-exec 的走法：菜单里进来的，跑完要回菜单。
+    auto = 每月自动更新（cron 调，没人在终端前）：不换脚本（每天 04:10 那条管）、有人在播不问直接不做。
+    返回 True = 镜像拉到并换上了；False = 镜像没拉全 / 没换上（配置照样刷了）；None = 没做。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -13544,7 +13656,7 @@ def do_update(from_menu=False):
     #     ✔ 脚本 v1.5.30 → v1.5.30（已是最新，仓库里没有更新的版本）
     # 看着像更新了两次。用环境变量把"我是被 re-exec 起来的"带过去（execv 继承当前
     # environ），顺手也省掉第二次那趟没用的网络请求。
-    if not os.environ.get("MS_SELF_UPDATED") and self_update():
+    if not auto and not os.environ.get("MS_SELF_UPDATED") and self_update():
         me = os.path.realpath(__file__)
         # 【把"我是从菜单进来的"这件事带过去】re-exec 会把当前进程整个换掉，调用栈
         # 连同"跑完该回哪儿"一起没了。用命令行那条 update 参数的话，新进程做完就
@@ -13560,6 +13672,8 @@ def do_update(from_menu=False):
     # 【有人在看片先问一声】换镜像会重启容器、正在播的那一场会断（见 play_quiet 那段铁律）
     _k0 = read_emby_api_key(d)
     if _k0 and someone_playing(_k0):
+        if auto:
+            return None
         tip("有人在看片：更新会重启容器，正在播的会断")
         if not ask_yn("还是现在就更新？", False):
             print("没有更新。")
@@ -13571,6 +13685,7 @@ def do_update(from_menu=False):
     # 正是出问题时最想知道的一件事。
     _ver_before = stack_versions(read_emby_api_key(d) or "")
     _ol_start0 = _started_at("openlist")[1]
+    _imgs_ok = False
     if not pull_images(compose, env_file):
         warn("镜像没拉全，跳过换镜像，继续刷新配置。")
     else:
@@ -13583,6 +13698,7 @@ def do_update(from_menu=False):
             warn("用新镜像重启失败，看上面的报错；配置照常刷新。")
         else:
             ok("镜像已更新")
+            _imgs_ok = True
             _print_version_diff(_ver_before, _versions_settle(d))
             sh("docker image prune -f", timeout=300)
     sync_net_mtu(d)           # 容器网络 MTU 跟出口网卡（对得上就什么都不动）
@@ -13683,6 +13799,7 @@ def do_update(from_menu=False):
     # 【自动更新】用户的原话："我不可能每过几天点更新一次吧"。只换脚本，
     # 不拉镜像也不重生成配置 —— 理由见 do_selfupdate 的文档字符串。
     install_selfupdate_cron(d)
+    install_imgup_cron(d)     # 镜像每月自动更新（开关在「8 更新 → 2」）
     # 配置刚按新版重写过（定时可能变了），AutoFilm 内存里还是旧的 —— 对不上就当场重启，
     # 别等每小时那轮
     try:
@@ -13758,6 +13875,7 @@ def do_update(from_menu=False):
                 start_new_session=True)
         except Exception as e:
             warn(f"后台对齐没起来（不影响更新）：{_short_err(e)}")
+    return _imgs_ok
 
 
 def do_uninstall():
@@ -13802,7 +13920,7 @@ def do_uninstall():
         else:
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
-              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, TRAFFIC_CRON,
+              KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, IMGUP_CRON, TRAFFIC_CRON,
               HEAL_CRON, META_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
@@ -28739,6 +28857,18 @@ def do_healthcheck():
         todo.append(("脚本自动更新没装，修复不会自己到这台机器上",
                      "跑一次「8 更新」会自动补上"))
 
+    if imgup_on():
+        _iu = imgup_last(d)
+        if not _iu:
+            _hc("镜像自动更新", "skip", f"开，每月 {IMGUP_DAY} 日 {IMGUP_HOUR_CST}，还没跑过")
+        elif _iu.get("ok"):
+            _hc("镜像自动更新", "ok", f"{bj_fmt('%m-%d %H:%M', _iu.get('ts', 0))} 更新过")
+        else:
+            _hc("镜像自动更新", "warn",
+                f"{bj_fmt('%m-%d %H:%M', _iu.get('ts', 0))} 没做成：{str(_iu.get('error', ''))[:40]}，明天凌晨再试")
+    else:
+        _hc("镜像自动更新", "skip", "关（「8 更新 → 2」打开）")
+
     _hc_group("其它", "背景信息和到期提醒")
 
     # 版本必须看得见。全用 :latest 标签，「8 更新」每次都会拉最新的 —— 但用户
@@ -28874,7 +29004,8 @@ def main_menu():
             params_menu()
             continue          # 子菜单自己管停顿，回来别再多按一次回车
         elif c == "8":
-            do_update(from_menu=True)
+            update_menu()
+            continue          # 子菜单自己管停顿
         elif c == "9":
             do_uninstall()
         else:
@@ -29133,6 +29264,10 @@ if __name__ == "__main__":
             require_root()
             if take_task_lock("selfupdate"):
                 do_selfupdate()
+        elif arg == "imgupdate":          # cron 每天看一眼：每月自动「8 更新」，见 do_imgupdate
+            require_root()
+            if take_task_lock("imgupdate"):
+                do_imgupdate()
         elif arg == "update":
             do_update()
         elif arg == "update-menu":        # 菜单里点的更新，且中途自我更新过；跑完回菜单
