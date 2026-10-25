@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.14"
+VERSION = "4.5.15"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -2423,8 +2423,10 @@ def fix_nginx_repo(install_if_missing=False):
     # 1) 清理明显错误的 nginx 源
     nginx_sources_selfheal(distro)
 
-    # 2) 配置 nginx.org 官方 stable 源 + Pin 1001
-    base = "https://nginx.org/packages/" + ("ubuntu" if distro == "ubuntu" else "debian")
+    # 2) 配置 nginx.org 官方 mainline 源 + Pin 1001
+    #    仓库主人 10/25：默认用主线（mainline，1.31.x）——最新功能+性能，安全修复也先到这条，
+    #    nginx.org 官方也推荐大多数人用它；老机器从 stable(1.30.x) 月度升级时自动切到主线（升级，apt 直接处理）。
+    base = "https://nginx.org/packages/mainline/" + ("ubuntu" if distro == "ubuntu" else "debian")
     if codename != "unknown":
         if not (os.path.isfile(NGINX_KEYRING) and os.path.getsize(NGINX_KEYRING) > 0):
             r = sh("curl -fsSL https://nginx.org/keys/nginx_signing.key | "
@@ -2444,7 +2446,7 @@ def fix_nginx_repo(install_if_missing=False):
 
         if os.path.isfile(NGINX_KEYRING) and os.path.getsize(NGINX_KEYRING) > 0:
             write_text(NGINX_OFFICIAL_LIST,
-                       "# Net-Optimize: nginx.org official stable repo\n"
+                       "# Net-Optimize: nginx.org official mainline repo\n"
                        f"deb [signed-by={NGINX_KEYRING}] {base} {codename} nginx\n")
             echo(f"✅ 已配置 nginx.org 官方源：{base} {codename}")
             write_text(NGINX_PIN,
