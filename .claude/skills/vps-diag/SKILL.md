@@ -11,7 +11,9 @@ description: 仓库主人报真机问题（播不了、卡、掉轨道、截不�
 
 - 只给只读命令。要改他机器上的东西，走脚本菜单或者改代码，不让他手敲修改命令。
 - 每条命令说清「看什么、结果怎么判断」，按结果分几种情况写好下一步。
-- 提醒他贴之前把 token、cookie、域名打码（`docker logs` 用 `grep -v -i -e token -e cookie` 先滤掉）。
+- 提醒他贴之前把 token、cookie、域名打码。给的命令自己先滤干净，别指望他手打码：
+  `docker logs mediawarp` 的 Access 行带 `api_key=`、警告行带 OpenList 域名和夸克 `device_id` ——
+  末尾接 `| sed -E 's/(api_key|device_id|token)=[^&\" ]*/\1=***/g; s#https?://[^/\" ]+#https://<主机>#g'`。
 - 命令里不要出现他的域名 / IP；需要的话让他自己替换。
 - 先拿原文（报错原句、日志行），别凭猜改代码。
 
