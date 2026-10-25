@@ -74,6 +74,8 @@ if orig_fstype:
 # 7. 源码层：卸载/reset 新旧两个残留路径都清；版本号到 4.5.10
 src = open(os.path.join(ROOT, "net-optimize.py"), encoding="utf-8").read()
 check("reset 同时清 /var 和 /tmp 旧残留", '"/var/.net-optimize-swap", "/tmp/.net-optimize-swap"' in src)
-check("VERSION 升到 4.5.10", 'VERSION = "4.5.10"' in src)
+import re
+mv = tuple(int(x) for x in re.findall(r"\d+", re.search(r'VERSION = "([\d.]+)"', src).group(1)))
+check("VERSION ≥ 4.5.10（本修复起）", mv >= (4, 5, 10))
 
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)

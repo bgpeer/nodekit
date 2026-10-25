@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.10"
+VERSION = "4.5.11"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -440,9 +440,31 @@ def detect_outbound_iface():
         m = re.search(r"\bdev\s+(\S+)", r.stdout)
         if m:
             return m.group(1)
-    r = run(["ip", "route", "show", "default"], timeout=5)
-    m = re.search(r"^default\s.*?\bdev\s+(\S+)", r.stdout, re.M)
-    return m.group(1) if m else ""
+    # 默认路由：main 表，再兜 all 表（防策略路由/fwmark 把默认路由挪出 main）
+    for args in (["ip", "route", "show", "default"],
+                 ["ip", "route", "show", "default", "table", "all"]):
+        r = run(args, timeout=5)
+        m = re.search(r"^default\s.*?\bdev\s+(\S+)", r.stdout, re.M)
+        if m:
+            return m.group(1)
+    # 不 fork 的兜底：直接读 /proc/net/route —— 内存紧张 ip 起不来、或 ip 缺失时也能用。
+    # 字段：Iface Destination Gateway …（16 进制），默认路由 Destination=00000000。真机（GCP 1G 机）
+    # OOM 时上面的 ip 全空，就靠这条把出口网卡找回来，别让 offload/RPS/MSS/QoS 整步跳过。
+    for line in read_text("/proc/net/route").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2 and f[1] == "00000000":
+            return f[0]
+    # 最后一招：挑一张 UP、非 lo、非虚拟/隧道的网卡（单网卡 VPS 必中，多网卡也强过整步跳过）
+    try:
+        for nic in sorted(os.listdir("/sys/class/net")):
+            if nic == "lo" or nic.startswith(("docker", "veth", "br-", "virbr",
+                                              "tun", "tap", "wg", "sing", "utun")):
+                continue
+            if read_text(f"/sys/class/net/{nic}/operstate").strip() in ("up", "unknown"):
+                return nic
+    except OSError:
+        pass
+    return ""
 
 
 def strip_route_params(route):
