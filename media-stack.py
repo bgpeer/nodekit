@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.386"
+SCRIPT_VERSION = "1.5.387"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13570,6 +13570,7 @@ def do_update(from_menu=False):
     # 【拉之前先记一份版本】拉完再问就没有对照物了 —— 而"这次到底更了什么"
     # 正是出问题时最想知道的一件事。
     _ver_before = stack_versions(read_emby_api_key(d) or "")
+    _ol_start0 = _started_at("openlist")[1]
     if not pull_images(compose, env_file):
         warn("镜像没拉全，跳过换镜像，继续刷新配置。")
     else:
@@ -13621,6 +13622,12 @@ def do_update(from_menu=False):
     # 【老版本 OpenList（alist v3）还有「网站 URL」这个设置，有就顺手填上】
     # v4 已经把它去掉了，那边靠的是上面重新生成的 mediawarp 配置里那个 addr。
     ensure_openlist_site_url(d, cfg, quiet=True)
+    # 【OpenList 换了新容器 → 等它起好再让 MediaWarp 重新登录】真机 10/25：「8 更新」把 OpenList 换成新版，
+    # MediaWarp 手里的令牌跟着作废（或者跟 OpenList 一起起来、登录时 OpenList 还没好），之后除了开播门
+    # 先替它取好的那一集，别的集一点就闪退。每小时那一轮最多晚一小时才修 —— 更新这条路上当场修。
+    # 只在 OpenList 真被重启了才做：配置没变的容器不重启（重启 MediaWarp 会清空直链缓存，见第六节）
+    if _started_at("openlist")[1] != _ol_start0:
+        restart_mediawarp_when_ready(d)
     if os.path.exists(mw_cfg) and not cfg["emby_api_key"]:
         warn("Emby API Key 是空的，302 直链不会生效 —— 到「7 设置 → 1」填上")
 
