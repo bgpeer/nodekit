@@ -7519,13 +7519,34 @@ def _netopt_state():
     if mode in ("fixed_cake", "fixed_burst"):
         return mode, None
     mb = None
-    try:
-        thr = int(json.load(open(NETOPT_ADAPTIVE)).get("threshold", 0))
-        if thr > 0:
-            mb = thr / 1048576.0
-    except Exception:
-        pass
+    thr = 0
+    try:            # 4.5.17 起阈值也记在 config（守护关着时 adaptive-qos.conf 不会更新）
+        for ln in open(NETOPT_CONFIG):
+            if ln.startswith("ADAPTIVE_QOS_THRESHOLD="):
+                thr = int(ln.split("=", 1)[1].strip() or 0)
+    except (OSError, ValueError):
+        thr = 0
+    if thr <= 0:
+        try:
+            thr = int(json.load(open(NETOPT_ADAPTIVE)).get("threshold", 0))
+        except Exception:
+            thr = 0
+    if thr > 0:
+        mb = thr / 1048576.0
     return "adaptive", mb
+
+def _netopt_daemon_on():
+    """自适应切换（守护进程）开没开：看 config 里菜单开关记的 ADAPTIVE_DAEMON；
+       老机器还没这一项（4.5.17 前守护默认开）就看服务在不在跑。没优化过 = 关。"""
+    if not os.path.exists(NETOPT_CONFIG):
+        return False
+    try:
+        for ln in open(NETOPT_CONFIG):
+            if ln.startswith("ADAPTIVE_DAEMON="):
+                return ln.split("=", 1)[1].strip() == "1"
+    except OSError:
+        return False
+    return sh("systemctl is-active net-optimize-adaptive-qos 2>/dev/null", check=False) == "active"
 
 def _fmt_mb(mb):
     if mb is None:
@@ -7577,6 +7598,15 @@ def _netopt_xanmod():
         print("  ⚠ 网络优化脚本没拉到新版，过会儿再试"); return
     _run_child(f"python3 {NETOPT_LOCAL} --xanmod")
 
+def _netopt_adaptive(on):
+    """菜单 12 → 7：自适应切换（守护进程）开 / 关。只改这一项，不重跑整套优化。"""
+    if not ensure_remote_script(NETOPT_URL, NETOPT_LOCAL):
+        print("拉取 net-optimize.py 失败，且本地无缓存。请检查网络。"); return
+    # 旧缓存不认 --adaptive：它用 parse_known_args，不认的参数直接忽略、转头跑整套优化 —— 先拦住
+    if "--adaptive" not in open(NETOPT_LOCAL, encoding="utf-8", errors="replace").read():
+        print("  ⚠ 网络优化脚本没拉到新版，过会儿再试"); return
+    _run_child(f"python3 {NETOPT_LOCAL} --adaptive {'on' if on else 'off'}")
+
 def _netopt_confirm():
     """跑优化档位(1/2/3)前确认：会重应用内核参数、期间可能短暂重启服务，默认否，要明确 y 才跑。"""
     print("  " + _hl("1;33", "提示：会重新应用内核参数/队列/防火墙标记，期间可能短暂重启 nginx/sing-box，完全生效需重启一次。"))
@@ -7598,6 +7628,9 @@ def net_optimize_menu():
             cur = f"自适应+抢带宽 · {_fmt_mb(mb)}MB/s 激活"
         else:
             cur = "自适应+抢带宽（阈值未知）"
+        d_on = _netopt_daemon_on()
+        if mode == "adaptive" and not d_on:
+            cur += " · 切换关"          # 4.5.17 起默认关：出口固定 fq，阈值只在开了切换后才用
         m1 = MARK if is_10 else ""
         m2 = MARK if (mode == "adaptive" and mb is not None and not is_10) \
             or mode == "fixed_burst" else ""
@@ -7605,6 +7638,8 @@ def net_optimize_menu():
         _v = _netopt_version()
         # 档位说明：1 适合内存 <1G；2 默认 20MB/s 激活、阈值可调，输入 0 = 纯暴力发包无智能算法，适合 2G 左右；
         # 3 不切换，适合高性能机器。6 清除全部优化配置、恢复系统默认。
+        # 7 自适应切换（守护进程）开关：仓库主人 10/25 同意改成可选、默认关（服务端队列基本不堆，
+        #   每隔几秒切 cake/prio 收益小，还多一个常驻进程）。只开关这一项，不重跑整套优化。
         ui_title("网络优化（BBR / QoS 内核调优）")
         ui_kv("版本", _hl("1;32", f"v{_v}") if _v else _hl("2", "未安装"))
         ui_kv("当前档位", _hl("1;32", cur))
@@ -7614,7 +7649,8 @@ def net_optimize_menu():
         print(f"  3. 固定 cake 纯智能算法（高性能机器）{m3}")
         # 换内核排在 4（仓库主人 10/15「移到第 4 位去」），状况 / 卸载顺延到 5 / 6
         ui_items([(4, "换 BBRv3 内核（XanMod）", _bbr_kernel_cur()), (5, "网络优化状况", None),
-                  (6, "卸载网络优化（恢复系统默认）", None), (0, "返回", None)])
+                  (6, "卸载网络优化（恢复系统默认）", None),
+                  (7, "自适应切换（守护进程）", "开" if d_on else "关"), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             if _netopt_confirm():
@@ -7637,6 +7673,8 @@ def net_optimize_menu():
             _netopt_xanmod()
         elif c == "5":
             _run_net_optimize("--check")
+        elif c == "7":
+            _netopt_adaptive(not d_on)
         elif c == "6":
             ans = _ask("  确认卸载网络优化？优化写入的内核参数/服务/防火墙标记将全部清除，\n"
                        "  节点本身不受影响（建议卸载后重启一次）。y 确认 / n 返回: ").strip().lower()

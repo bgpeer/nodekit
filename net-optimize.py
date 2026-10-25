@@ -9,13 +9,13 @@
 #      "write init-p: broken pipe"，且 dmesg 无 OOM 记录，极难排查。
 # 功能对齐 bash v3.8.1，所有功能 1:1 保留：
 #   自动更新(SHA256SUMS 校验) / 低内存临时 swap / dpkg 自愈 / ulimit /
-#   BBRv3→BBRv2→bbrplus→BBR 拥塞算法 / fq_pie 队列 / RAM 自适应缓冲区 /
+#   BBRv3→BBRv2→bbrplus→BBR 拥塞算法 / fq 队列（BBR 标准搭档）/ RAM 自适应缓冲区 /
 #   tcp_mem 动态计算 / sysctl 权威收敛(last-wins override) / rp_filter 逐接口 /
 #   conntrack 调优+hashsize=max/4 / 网卡 offload(GRO/GSO/TSO/LRO off/
 #   UDP GRO 转发/发送分段卸载) / 中断合并自适应 / WireGuard GRO /
-#   RPS/RFS/XPS / CPU performance 调频 / MPTCP / MSS 自动探测+双栈 Clamping /
-#   iptables 双后端检测 / DSCP EF(QUIC)+AF41(游戏小包) / initcwnd 线路自适应 /
-#   激进模式 / 游戏 QoS(cake diffserv4→prio+fq_codel) / 自适应 QoS 守护 /
+#   RPS/RFS/XPS / CPU performance 调频 / MSS 自动探测+双栈 Clamping /
+#   iptables 双后端检测 / conntrack be_liberal / initcwnd 线路自适应 /
+#   激进模式 / 游戏 QoS(cake diffserv4→prio+fq_codel) / 自适应 QoS 守护（可选，默认关）/
 #   Nginx 官方源+Pin+月度自动升级 / 开机恢复(flock 幂等) /
 #   networkd-dispatcher DHCP 续约恢复 initcwnd / netfilter-persistent 兼容
 #
@@ -55,7 +55,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -67,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.16"
+VERSION = "4.5.17"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -106,6 +105,7 @@ SYSCTL_KEYS = [
     "net.netfilter.nf_conntrack_max",
     "net.netfilter.nf_conntrack_udp_timeout",
     "net.netfilter.nf_conntrack_udp_timeout_stream",
+    "net.netfilter.nf_conntrack_tcp_be_liberal",
 ]
 
 V4_CMDS = ["iptables", "iptables-legacy", "iptables-nft"]
@@ -121,8 +121,23 @@ def _flag(name, default="1"):
     return _env(name, default) == "1"
 
 
+def _cfg_file_get(key, default=""):
+    """在 Cfg 之前读 /etc/net-optimize/config 里的一项（read_text 这时还没定义）。
+       「自适应切换开没开」要在脚本一加载就知道：整套运行第一步 clean_old_config 会删掉这个文件，
+       跑完再写回；菜单开关、开机恢复也都靠它。"""
+    try:
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k.strip() == key:
+                    return v.strip()
+    except OSError:
+        pass
+    return default
+
+
 class Cfg:
-    ENABLE_FQ_PIE = _flag("ENABLE_FQ_PIE")
+    ENABLE_FQ_PIE = _flag("ENABLE_FQ_PIE", "0")   # 默认 fq（BBR 标准搭档）；要 fq_pie 显式 ENABLE_FQ_PIE=1
     ENABLE_MTU_PROBE = _env("ENABLE_MTU_PROBE", "1")
     ENABLE_MSS_CLAMP = _flag("ENABLE_MSS_CLAMP")
     MSS_USER_SET = "MSS_VALUE" in os.environ  # 用户显式指定 MSS 时跳过自动探测
@@ -137,14 +152,20 @@ class Cfg:
     ENABLE_NIC_OFFLOAD = _flag("ENABLE_NIC_OFFLOAD")
     ENABLE_RPS_RFS = _flag("ENABLE_RPS_RFS")
     ENABLE_IPV6_MSS = _flag("ENABLE_IPV6_MSS")
-    ENABLE_DSCP = _flag("ENABLE_DSCP")
     ENABLE_INITCWND = _flag("ENABLE_INITCWND")
     TCP_NOTSENT_LOWAT = _env("TCP_NOTSENT_LOWAT", "4096")
     # 代理节点监听口从临时端口池保留（nodekit 的协议/订阅/hy2跳跃端口都在这一个区间里）
     RESERVED_PORTS = _env("RESERVED_PORTS", "15000-45000")
     AGGRESSIVE_MODE = _flag("AGGRESSIVE_MODE", "0")
     ENABLE_GAME_QOS = _flag("ENABLE_GAME_QOS")
-    ADAPTIVE_QOS = _flag("ADAPTIVE_QOS")
+    # 自适应切换（守护进程）：仓库主人 10/25 同意改成可选、默认关——服务端出口网卡几乎不是瓶颈，
+    # 本机队列基本是空的，每隔几秒切 cake/prio 收益很小，还多挂一个常驻进程。
+    # ADAPTIVE_PREF = 用户的选择（环境变量显式给了以它为准，否则看菜单开关记在 config 的
+    # ADAPTIVE_DAEMON，没有 = 关）；ADAPTIVE_QOS = 这一趟真跑不跑（固定档会在下面压成 False，
+    # 但不改 PREF——切到「3 固定 cake」再切回来，开关还在）。
+    ADAPTIVE_PREF = (_env("ADAPTIVE_QOS", "0") == "1") if "ADAPTIVE_QOS" in os.environ \
+        else _cfg_file_get("ADAPTIVE_DAEMON", "0") == "1"
+    ADAPTIVE_QOS = ADAPTIVE_PREF
     ADAPTIVE_QOS_MODE = _env("ADAPTIVE_QOS_MODE", "adaptive")  # adaptive / fixed_cake / fixed_burst
     ADAPTIVE_QOS_THRESHOLD = int(_env("ADAPTIVE_QOS_THRESHOLD", "10485760"))
     ADAPTIVE_QOS_INTERVAL = int(_env("ADAPTIVE_QOS_INTERVAL", "2"))
@@ -152,7 +173,6 @@ class Cfg:
     ENABLE_CPU_GOVERNOR = _flag("ENABLE_CPU_GOVERNOR")
     ENABLE_XPS = _flag("ENABLE_XPS")
     ENABLE_IRQ_COALESCING = _flag("ENABLE_IRQ_COALESCING")
-    ENABLE_MPTCP = _flag("ENABLE_MPTCP")
     ENABLE_WG_OPT = _flag("ENABLE_WG_OPT")
     RAM_ADAPTIVE_BUFFERS = _flag("RAM_ADAPTIVE_BUFFERS")
 
@@ -160,7 +180,7 @@ class Cfg:
 # fixed_cake 模式：强制关闭自适应守护，走 setup_game_qos 固定 cake
 if Cfg.ADAPTIVE_QOS_MODE == "fixed_cake":
     Cfg.ADAPTIVE_QOS = False
-# fixed_burst 模式：纯暴力发包——固定 pfifo_fast 抢带宽，无智能算法（不切 cake、不起守护）
+# fixed_burst 模式：纯暴力发包——固定 fq + 激进参数抢带宽，不切 cake、不起守护（4.5.17 起底层由 pfifo_fast 换成 fq）
 elif Cfg.ADAPTIVE_QOS_MODE == "fixed_burst":
     Cfg.ADAPTIVE_QOS = False
     Cfg.AGGRESSIVE_MODE = True
@@ -843,8 +863,12 @@ def clean_old_config():
     except Exception:  # noqa
         pass
 
-    # 清理所有后端的 TCPMSS + DSCP 规则（IPv4 + IPv6）
+    # 清理所有后端的 TCPMSS + DSCP 规则（IPv4 + IPv6）——4.5.17 起 DSCP 不再打，正好清掉老版本残留
     ipt_clear(V4_CMDS + V6_CMDS, r"TCPMSS|DSCP")
+    try:
+        os.remove(MPTCP_SYSCTL_OLD)        # 4.5.17 起不再开 MPTCP，老版本写的持久化文件删掉
+    except Exception:  # noqa
+        pass
 
     os.makedirs(CONFIG_DIR, exist_ok=True)
     for f in (CONFIG_FILE, MODULES_FILE):
@@ -931,24 +955,21 @@ def setup_tcp_congestion():
     global FINAL_CC, FINAL_QDISC
     echo("📶 设置TCP拥塞算法和队列...")
 
+    # 【队列一律优先 fq】仓库主人 10/25 同意：
+    #   · 服务端出口网卡（1~10G 虚拟网卡）几乎不是瓶颈，排队发生在跨境段和用户那头，
+    #     本机的 AQM（fq_pie / cake）基本触发不了；
+    #   · BBR 靠按瓶颈速率均匀发包（pacing），fq 能把 pacing 交给队列层（EDT 时间戳）做，
+    #     最平滑最省 CPU；fq_pie / cake / pfifo_fast 都不认，BBR 只能退回每连接一个定时器；
+    #   · fq 按流公平，多人并发互不拖累；pfifo_fast 单条 FIFO，一个大下载能把别人的小包堵在后面。
+    # 所以「抢带宽」也换成 fq：吞吐由 BBR 和路径瓶颈决定，本机换 pfifo_fast 并不会更快。
+    # fq_pie 留作显式开关（ENABLE_FQ_PIE=1）；没有 fq 的老内核依次退 fq_pie / pie / pfifo_fast。
+    order = ["fq_pie", "fq", "pie"] if Cfg.ENABLE_FQ_PIE else ["fq", "fq_pie", "pie"]
     if Cfg.AGGRESSIVE_MODE:
-        # 激进模式：pfifo_fast 不限速，不做公平调度
-        if try_set_qdisc("pfifo_fast"):
-            FINAL_QDISC = "pfifo_fast"
-        elif try_set_qdisc("fq"):
-            FINAL_QDISC = "fq"
-        else:
-            FINAL_QDISC = get_sysctl("net.core.default_qdisc")
-        echo("  ⚡ 激进模式：队列算法 pfifo_fast（无限速）")
-    else:
-        if Cfg.ENABLE_FQ_PIE and try_set_qdisc("fq_pie"):
-            FINAL_QDISC = "fq_pie"
-        elif try_set_qdisc("fq"):
-            FINAL_QDISC = "fq"
-        elif try_set_qdisc("pie"):
-            FINAL_QDISC = "pie"
-        else:
-            FINAL_QDISC = get_sysctl("net.core.default_qdisc")
+        order = ["fq", "pfifo_fast"]
+    FINAL_QDISC = next((q for q in order if try_set_qdisc(q)), "") \
+        or get_sysctl("net.core.default_qdisc")
+    if Cfg.AGGRESSIVE_MODE:
+        echo(f"  ⚡ 激进模式：队列算法 {FINAL_QDISC}（激进参数 + 按流公平）")
 
     # 原厂内核（Debian / Ubuntu）的 bbr 是模块 tcp_bbr，没加载前 tcp_available_congestion_control
     # 里只有「reno cubic」。以前只看这张表：原厂内核上选成 cubic、写进 sysctl 文件，
@@ -1149,6 +1170,13 @@ def write_sysctl_conf():
     a("fs.protected_hardlinks = 1")
     a("fs.protected_regular = 2")
     a("fs.protected_symlinks = 1")
+    a("")
+    # 【be_liberal】开机恢复会无条件加 conntrack INVALID→DROP；而跨境链路乱序 / 重传多，conntrack 的
+    # TCP 窗口跟踪会把一部分合法的「窗口外」包判 INVALID 丢掉（规则插进去时中途接手的连接拿不到
+    # 窗口缩放信息，更容易误判）→ 偶发卡顿、掉速。be_liberal=1 只把窗口外的 RST 当无效、其余放行，
+    # 高带宽长链路的标准做法（Kubernetes kube-proxy 也这么设）。所以不跟 ENABLE_CONNTRACK_TUNE 走。
+    a("# === conntrack：窗口外的包别误丢（配合 INVALID→DROP）===")
+    a("net.netfilter.nf_conntrack_tcp_be_liberal = 1")
     a("")
     if Cfg.ENABLE_CONNTRACK_TUNE:
         a("# === 连接跟踪优化 ===")
@@ -1389,38 +1417,17 @@ def setup_rps_rfs():
     echo("  ✅ RPS/RFS 持久化：/etc/tmpfiles.d/net-optimize-rps.conf")
 
 
-# === QUIC/UDP DSCP 优先级标记（EF）===
-DSCP_EF_RULE = ["-p", "udp", "--dport", "443", "-j", "DSCP", "--set-dscp-class", "EF"]
-DSCP_AF41_RULE = ["-p", "udp", "!", "--dport", "443", "-m", "length",
-                  "--length", "0:200", "-j", "DSCP", "--set-dscp-class", "AF41"]
-DSCP_AF41_RULE_NOLEN = ["-p", "udp", "!", "--dport", "443",
-                        "-j", "DSCP", "--set-dscp-class", "AF41"]
-
-
-def setup_dscp_marking():
-    if not Cfg.ENABLE_DSCP:
-        echo("⏭️ 跳过 DSCP 标记")
-        return
-    echo("🏷️ QUIC/UDP DSCP 优先级标记...")
-
-    ipt = saved_ipt_backend()
-    if not ipt:
-        echo("  ⚠️ iptables 不可用，跳过")
-        return
-    iface = detect_outbound_iface()
-
-    # DSCP EF (46=0x2E)：UDP 443 (QUIC) 出口流量加速
-    ipt_clear(V4_CMDS, PAT_EF)
-    ipt_add(ipt, DSCP_EF_RULE, iface)
-    ipt_dedup(ipt, PAT_DSCP)
-
-    ip6 = ip6_cmd_for(ipt)
-    if ip6:
-        ipt_clear([ip6], PAT_EF)
-        ipt_add(ip6, DSCP_EF_RULE, iface)
-        ipt_dedup(ip6, PAT_DSCP)
-
-    echo(f"  ✅ UDP 443 (QUIC) DSCP=EF 已标记（{ipt}）")
+# === DSCP 打标：4.5.17 起去掉（仓库主人 10/25 同意）===
+# 原来 EF 按 `udp --dport 443` 打，标的是「节点替用户去外网的 QUIC」；AF41 只覆盖 ≤200B、目的端口
+# 非 443 的 UDP 小包；占大头的 TCP 协议（reality/vless/vmess/trojan）发给用户的包一个都没标。
+# 公网又会把 DSCP 清零，它只对本机 cake/prio 有用，而服务端队列基本不堆——换成 fq 后也没有认
+# DSCP 的队列了。老版本留下的规则：整套运行第一步 clean_old_config、开机恢复的 mangle flush、
+# 守护进程启动时都会清掉（clear_dscp_residue）。
+def clear_dscp_residue():
+    """清掉老版本打的 DSCP EF / AF41 规则（所有后端、v4+v6）。幂等，没有就什么都不做。"""
+    cmds = [c for c in V4_CMDS + V6_CMDS if c]
+    ipt_clear(cmds, PAT_EF)
+    ipt_clear(cmds, PAT_AF41)
 
 
 # === CPU 调频策略优化 ===
@@ -1451,21 +1458,11 @@ def setup_cpu_governor():
     echo("  ✅ CPU 调频持久化：/etc/tmpfiles.d/net-optimize-cpufreq.conf")
 
 
-# === MPTCP 多路径传输（内核 5.6+）===
-def setup_mptcp():
-    if not Cfg.ENABLE_MPTCP:
-        echo("⏭️ 跳过 MPTCP 配置")
-        return
-    echo("🔀 MPTCP 多路径传输检测...")
-    if not has_sysctl_key("net.mptcp.enabled"):
-        echo("  ℹ️ 内核不支持 MPTCP（需要 5.6+），已跳过")
-        return
-    set_sysctl("net.mptcp.enabled", 1)
-    if get_sysctl("net.mptcp.enabled") == "1":
-        echo("  ✅ MPTCP 已启用")
-        write_text("/etc/sysctl.d/98-net-optimize-mptcp.conf", "net.mptcp.enabled = 1\n")
-    else:
-        echo("  ⚠️ MPTCP 启用失败（可能被内核编译选项禁用）")
+# === MPTCP：4.5.17 起去掉（仓库主人 10/25 同意）===
+# 只在内核里打开开关没用——sing-box / xray 不建 MPTCP 套接字、手机端也基本不走，纯空转（谷歌机上
+# 还报「启用失败」）。老版本写的持久化文件由 clean_old_config / --reset 删掉；net.mptcp.enabled
+# 本身回到内核默认，不去碰它。
+MPTCP_SYSCTL_OLD = "/etc/sysctl.d/98-net-optimize-mptcp.conf"
 
 
 # === 自动检测线路质量 + initcwnd 调整 ===
@@ -1745,22 +1742,28 @@ def setup_aggressive_tc():
     if not iface:
         echo("  ⚠️ 无法检测出口网卡，跳过")
         return
-    if run(["tc", "qdisc", "replace", "dev", iface, "root", "pfifo_fast"],
-           timeout=5).returncode != 0:
-        run(["tc", "qdisc", "replace", "dev", iface, "root", "pfifo",
-             "limit", "10000"], timeout=5)
+    reset_root_qdisc(iface)        # 交还内核默认 = setup_tcp_congestion 设好的 default_qdisc（fq）
     out = run(["tc", "qdisc", "show", "dev", iface, "root"], timeout=5).stdout.split()
     echo(f"  ✅ {iface} qdisc 已设置为: {out[1] if len(out) > 1 else 'unknown'}")
-    echo("  ⚡ 无流量整形，发包不受 AQM 限制")
+    echo("  ⚡ 无流量整形、不跑 AQM；fq 按 BBR 的节奏发包、按流公平")
     if Cfg.ADAPTIVE_QOS_MODE == "fixed_burst":
         config_set("ADAPTIVE_QOS_MODE", "fixed_burst", only_if_exists=True)
         config_set("AGGRESSIVE_MODE", 1, only_if_exists=True)
-        echo("  ⚡ 纯暴力发包模式：固定 pfifo_fast 抢带宽，无智能算法（不切 cake）")
+        echo("  ⚡ 纯暴力发包模式：固定 fq + 激进参数抢带宽（不切 cake）")
 
 
 # === 游戏 QoS：cake / prio 双方案（tc 部分，--boot 与守护共用）===
 CAKE_ARGS = ["cake", "diffserv4", "nat", "nowash", "no-split-gso"]
 PRIO_MAP = "1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1".split()
+
+
+def reset_root_qdisc(iface):
+    """把网卡根队列交还内核默认（default_qdisc 已设成 fq：多队列网卡是 mq + 每队列 fq，单队列就是 fq）。
+       【先显式挂一个再删】根队列是内核自动挂的默认（比如 mq + 旧默认 fq_pie 子队列）时，直接 del
+       会报错、旧子队列也不会换；先 replace 成一个显式的再 del，内核才按新的 default_qdisc 重建。
+       换的那一下可能丢几个包，跟守护进程切模式一样。"""
+    run(["tc", "qdisc", "replace", "dev", iface, "root", "pfifo_fast"], timeout=5)
+    run(["tc", "qdisc", "del", "dev", iface, "root"], timeout=5)
 
 
 def tc_apply_cake(iface):
@@ -1776,29 +1779,11 @@ def tc_apply_prio(iface):
         run(["tc", "qdisc", "replace", "dev", iface, "parent", parent,
              "handle", handle, "fq_codel"], timeout=5)
     run(["tc", "filter", "del", "dev", iface, "parent", "1:"], timeout=5)
-    # DSCP EF(TOS 0xb8) / AF41(TOS 0x88) → band0；小 UDP 包(≤128B) → band0
-    run("tc filter add dev {i} parent 1: protocol ip prio 1 u32 "
-        "match ip tos 0xb8 0xfc flowid 1:1".format(i=iface), timeout=5)
-    run("tc filter add dev {i} parent 1: protocol ip prio 2 u32 "
-        "match ip tos 0x88 0xfc flowid 1:1".format(i=iface), timeout=5)
+    # 小 UDP 包(≤128B) → band0（4.5.17 起不再打 DSCP，按 TOS 分档的两条过滤去掉了）
     run("tc filter add dev {i} parent 1: protocol ip prio 3 u32 "
         "match ip protocol 17 0xff match u16 0x0000 0xff80 at 2 flowid 1:1"
         .format(i=iface), timeout=5)
     return True
-
-
-def apply_af41_marking(ipt, ip6, iface, has_length=True, has_length_ip6=True):
-    """AF41 游戏小包标记：清旧→写入（主流程/--boot/守护共用）。"""
-    ipt_clear([c for c in V4_CMDS + V6_CMDS if c], PAT_AF41)
-    for cmd, ok_len in ((ipt, has_length), (ip6, has_length_ip6)):
-        if not cmd or not have_cmd(cmd):
-            continue
-        if ok_len:
-            if not ipt_add(cmd, DSCP_AF41_RULE, iface):
-                ipt_add(cmd, DSCP_AF41_RULE_NOLEN, iface)  # -m length 不支持时降级
-        else:
-            ipt_add(cmd, DSCP_AF41_RULE_NOLEN, iface)
-        ipt_dedup(cmd, PAT_AF41)
 
 
 def ensure_cake_module():
@@ -1818,7 +1803,9 @@ def ensure_cake_module():
 
 
 def setup_game_qos():
-    if Cfg.ADAPTIVE_QOS:
+    # 只有「3 固定 cake」档才固定挂 cake/prio。4.5.17 起自适应守护默认关——1/2 档守护关着时出口用 fq
+    # （见 setup_adaptive_qos），这里要是照旧挂 cake 就把 fq 顶掉了。
+    if Cfg.ADAPTIVE_QOS or Cfg.ADAPTIVE_QOS_MODE != "fixed_cake":
         return
     if not Cfg.ENABLE_GAME_QOS:
         echo("⏭️ 跳过游戏 QoS 配置")
@@ -1836,33 +1823,21 @@ def setup_game_qos():
         echo("  ⚠️ 无法检测出口网卡，跳过")
         return
 
-    ipt = saved_ipt_backend()
-    ip6 = ip6_cmd_for(ipt) if ipt else ""
-
     qos_scheme = "none"
     if ensure_cake_module() and tc_apply_cake(iface):
         qos_scheme = "cake"
-        echo("  ✅ 方案 A：cake diffserv4 已启用")
-        echo("    → 4 档优先级自动分流（Bulk/Best Effort/Video/Voice）")
-        echo("    → 游戏小包自动归入高优先级队列")
-        echo("    → 视频大流归入 Bulk 队列，不挤压游戏包")
+        echo("  ✅ 方案 A：cake 已启用（按流隔离）")
+        echo("    → 低速稀疏流（游戏 / 交互小包）自动先走，大流量不挤压它们")
     else:
         if have_cmd("tc"):
             echo("  ⚠️ cake 不可用，回退方案 B")
         if tc_apply_prio(iface):
             qos_scheme = "prio"
             echo("  ✅ 方案 B：prio + fq_codel 已启用")
-            echo("    → band 0（高优先）：DSCP EF/AF41 + 小 UDP 包")
-            echo("    → band 1（普通）：一般流量")
-            echo("    → band 2（低优先）：Bulk 流量")
+            echo("    → band 0（高优先）：小 UDP 包；其余 fq_codel 按流公平")
         else:
             echo("  ⚠️ prio qdisc 设置失败，跳过游戏 QoS")
             return
-
-    # DSCP 标记：游戏流量打 AF41（UDP 小包 ≤200B 非 443）
-    if ipt and have_cmd(ipt):
-        apply_af41_marking(ipt, ip6, iface)
-        echo("  ✅ 游戏 DSCP 标记：UDP 小包(≤200B, 非443) → AF41")
 
     config_set("GAME_QOS_SCHEME", qos_scheme, only_if_exists=True)
     config_set("ADAPTIVE_QOS_MODE", Cfg.ADAPTIVE_QOS_MODE, only_if_exists=True)
@@ -1873,24 +1848,30 @@ def setup_game_qos():
 
 
 # === 自适应 QoS：配置 + systemd 服务（守护逻辑见 AdaptiveQoS / --daemon）===
-def ipt_m_length_ok(cmd):
-    """检测 -m length 模块可用性（写入测试规则后立即删除）。"""
-    if not cmd or not have_cmd(cmd):
-        return False
-    test = ["-p", "udp", "-m", "length", "--length", "0:200", "-j", "RETURN"]
-    if run([cmd, "-t", "mangle", "-A", "POSTROUTING"] + test, timeout=5).returncode == 0:
-        run([cmd, "-t", "mangle", "-D", "POSTROUTING"] + test, timeout=5)
-        return True
-    return False
+def _remember_adaptive():
+    """菜单开关 + 1/2 档阈值落进 config：整套运行第一步会删 config，这里写回；守护关着时阈值也得记住，
+       菜单要显示、以后打开开关也要用。"""
+    config_set("ADAPTIVE_DAEMON", 1 if Cfg.ADAPTIVE_PREF else 0)
+    if Cfg.ADAPTIVE_QOS_MODE == "adaptive":
+        config_set("ADAPTIVE_QOS_THRESHOLD", Cfg.ADAPTIVE_QOS_THRESHOLD)
 
 
 def setup_adaptive_qos():
     if not Cfg.ADAPTIVE_QOS:
-        # 清理：如果之前启用过，现在关闭
+        # 清理：之前启用过就停掉；停了也要 disable，免得开机又被拉起来
         if run(["systemctl", "is-active", ADAPTIVE_QOS_SERVICE], timeout=5).returncode == 0:
             run(["systemctl", "stop", ADAPTIVE_QOS_SERVICE], timeout=15)
-            run(["systemctl", "disable", ADAPTIVE_QOS_SERVICE], timeout=15)
             echo("🔄 自适应 QoS 已停止并关闭")
+        run(["systemctl", "disable", ADAPTIVE_QOS_SERVICE], timeout=15)
+        # 1/2 档守护关着（4.5.17 起的默认）：出口就用 fq——守护停在哪个模式（cake/prio）都换回来
+        if Cfg.ADAPTIVE_QOS_MODE == "adaptive":
+            iface = detect_outbound_iface()
+            if iface and have_cmd("tc"):
+                reset_root_qdisc(iface)
+                echo(f"  ✅ 出口 {iface} 用 fq（自适应切换：关，菜单 12 → 7 可开）")
+            config_set("GAME_QOS_SCHEME", "none", only_if_exists=True)
+            config_set("ADAPTIVE_QOS_MODE", "adaptive", only_if_exists=True)
+        _remember_adaptive()
         return
 
     echo("🔄 自适应 QoS 配置（流量自动切换）...")
@@ -1906,21 +1887,12 @@ def setup_adaptive_qos():
     ipt = saved_ipt_backend()
     ip6 = ip6_cmd_for(ipt) if ipt else ""
 
-    has_length = ipt_m_length_ok(ipt)
-    if not has_length:
-        echo("  ⚠️ iptables -m length 不可用，IPv4 AF41 标记将跳过")
-    has_length_ip6 = ipt_m_length_ok(ip6)
-    if not has_length_ip6 and ip6:
-        echo("  ⚠️ ip6tables -m length 不可用，IPv6 AF41 标记将跳过")
-
     write_text(ADAPTIVE_CONF, json.dumps({
         "iface": iface,
         "threshold": Cfg.ADAPTIVE_QOS_THRESHOLD,
         "interval": Cfg.ADAPTIVE_QOS_INTERVAL,
         "cooldown": Cfg.ADAPTIVE_QOS_COOLDOWN,
         "has_cake": has_cake,
-        "has_length": has_length,
-        "has_length_ip6": has_length_ip6,
         "ipt_backend": ipt,
         "ip6_cmd": ip6,
     }, indent=2, ensure_ascii=False) + "\n")
@@ -1947,19 +1919,44 @@ WantedBy=multi-user.target
     config_set("ADAPTIVE_QOS", 1, only_if_exists=True)
     config_set("ADAPTIVE_QOS_MODE", "adaptive", only_if_exists=True)
     config_set("ADAPTIVE_QOS_IFACE", iface, only_if_exists=True)
+    _remember_adaptive()
 
     echo("  ✅ 自适应 QoS 守护进程已启动")
     echo(f"    → 网卡: {iface}")
     echo(f"    → 阈值: {Cfg.ADAPTIVE_QOS_THRESHOLD // 1024} KB/s")
     echo(f"    → 采样: 每 {Cfg.ADAPTIVE_QOS_INTERVAL}s")
-    echo("    → 流量 ≥ 阈值 → pfifo_fast（抢带宽）")
+    echo("    → 流量 ≥ 阈值 → fq（抢带宽）")
     echo(f"    → 流量 < 阈值 → {'cake/prio' if has_cake else 'prio'}（游戏低延迟）")
     echo(f"    → 服务: systemctl status {ADAPTIVE_QOS_SERVICE}")
 
 
+def cmd_adaptive_toggle(on):
+    """菜单 12 → 7：只开 / 关自适应切换，不重跑整套优化（不动 sysctl、不碰 nginx / sing-box）。"""
+    if not os.path.isfile(CONFIG_FILE):
+        echo("⚠️ 还没跑过网络优化，先在菜单 12 选 1 / 2 / 3 跑一次")
+        return
+    self_install()          # 守护进程的 ExecStart 指向 SCRIPT_PATH，先把这一版落到那儿
+    cfg = config_read()
+    mode = cfg.get("ADAPTIVE_QOS_MODE", "adaptive")
+    Cfg.ADAPTIVE_PREF = bool(on)
+    Cfg.ADAPTIVE_QOS = bool(on) and mode == "adaptive"
+    Cfg.ADAPTIVE_QOS_MODE = mode
+    try:
+        Cfg.ADAPTIVE_QOS_THRESHOLD = int(cfg.get("ADAPTIVE_QOS_THRESHOLD",
+                                                 Cfg.ADAPTIVE_QOS_THRESHOLD))
+    except ValueError:
+        pass
+    if mode != "adaptive":
+        _remember_adaptive()
+        echo(f"✔ 已记下：自适应切换{'开' if on else '关'}（当前是固定档，切回 1 / 2 档后生效）")
+        return
+    setup_adaptive_qos()
+    echo(f"✔ 自适应切换已{'开' if on else '关'}")
+
+
 # === 自适应 QoS 守护（--daemon 入口）===
 class AdaptiveQoS:
-    """自动根据出口流量切换 抢带宽(pfifo_fast) ↔ 游戏低延迟(cake/prio)。"""
+    """自动根据出口流量切换 抢带宽(fq) ↔ 游戏低延迟(cake/prio)。可选，默认关（菜单 12 → 7）。"""
 
     def __init__(self, conf):
         self.iface = conf["iface"]
@@ -1967,8 +1964,6 @@ class AdaptiveQoS:
         self.interval = conf["interval"]
         self.cooldown_secs = conf.get("cooldown", 10)
         self.has_cake = conf.get("has_cake", False)
-        self.has_length = conf.get("has_length", False)
-        self.has_length_ip6 = conf.get("has_length_ip6", conf.get("has_length", False))
         self.ipt = conf.get("ipt_backend") or ""
         self.ip6 = conf.get("ip6_cmd") or ""
         if not self.ipt:
@@ -1994,28 +1989,18 @@ class AdaptiveQoS:
         except Exception:  # noqa
             return 0
 
-    def _apply_pfifo(self):
-        if run(["tc", "qdisc", "replace", "dev", self.iface, "root",
-                "pfifo_fast"], timeout=5).returncode != 0:
-            run(["tc", "qdisc", "replace", "dev", self.iface, "root",
-                 "pfifo", "limit", "10000"], timeout=5)
-
     def switch_to_game(self):
         if self.mode == "game":
             return
         if not (self.has_cake and tc_apply_cake(self.iface)):
             tc_apply_prio(self.iface)
-        apply_af41_marking(self.ipt, self.ip6, self.iface,
-                           self.has_length, self.has_length_ip6)
         self.mode = "game"
         self.log.info("切换 → 游戏低延迟 (rate < %d B/s)", self.threshold)
 
     def switch_to_aggressive(self):
         if self.mode == "aggressive":
             return
-        self._apply_pfifo()
-        apply_af41_marking(self.ipt, self.ip6, self.iface,
-                           self.has_length, self.has_length_ip6)
+        reset_root_qdisc(self.iface)      # 交还默认 fq（4.5.17 前是 pfifo_fast）
         self.mode = "aggressive"
         self.log.info("切换 → 抢带宽 (rate >= %d B/s)", self.threshold)
 
@@ -2024,6 +2009,7 @@ class AdaptiveQoS:
         self.log.info("启动: iface=%s threshold=%d interval=%d cooldown=%ds(%d ticks)",
                       self.iface, self.threshold, self.interval,
                       self.cooldown_secs, cooldown_max)
+        clear_dscp_residue()              # 老版本的守护一直在补 AF41，换成新版后清一次
         self.switch_to_game()
 
         prev_rx = self._read_stat(self.iface, "rx_bytes")
@@ -2720,14 +2706,8 @@ def cmd_boot_apply():
             if ip6 and have_cmd(ip6):
                 apply_one_tcpmss(ip6, iface, mss - 20)
 
-        # 第三步：写入 DSCP EF（QUIC UDP 443）
-        if have_cmd(ipt):
-            ipt_add(ipt, DSCP_EF_RULE, iface)
-        if ip6 and have_cmd(ip6):
-            ipt_add(ip6, DSCP_EF_RULE, iface)
-
-        logger_msg(f"BOOT: add后 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)} "
-                   f"DSCP={ipt_count('iptables-legacy', PAT_DSCP)}")
+        # （4.5.17 起不再写 DSCP EF：上面的 flush 已把老版本的清掉）
+        logger_msg(f"BOOT: add后 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
 
         # initcwnd（IPv6 RA 路由可能开机后几秒才到，等待最多 10 秒）
         cwnd = cfg.get("INITCWND", "20")
@@ -2748,24 +2728,19 @@ def cmd_boot_apply():
             run(["ip", "-6", "route", "change"] + parts6 +
                 ["initcwnd", cwnd, "initrwnd", cwnd], timeout=5)
 
-        # 游戏 QoS 恢复（cake / prio）+ AF41 标记恢复
+        # 游戏 QoS 恢复（只有「3 固定 cake」档会记 cake / prio；4.5.17 起不再恢复 AF41 标记）
         scheme = cfg.get("GAME_QOS_SCHEME", "none")
         if scheme == "cake" and iface and iface != "unknown":
             run(["modprobe", "sch_cake"], timeout=10)
             tc_apply_cake(iface)
         elif scheme == "prio" and iface and iface != "unknown":
             tc_apply_prio(iface)
-        if scheme != "none":
-            apply_af41_marking(ipt, ip6, iface)
 
-        # 最终去重（兜底：所有后端 TCPMSS / EF / AF41 各保留 1 条）
-        for pattern in (PAT_TCPMSS, PAT_EF, PAT_AF41):
-            for cmd in V4_CMDS + V6_CMDS:
-                ipt_dedup(cmd, pattern)
+        # 最终去重（兜底：所有后端 TCPMSS 只保留 1 条）
+        for cmd in V4_CMDS + V6_CMDS:
+            ipt_dedup(cmd, PAT_TCPMSS)
 
-    logger_msg(f"BOOT: 最终 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)} "
-               f"EF={ipt_count('iptables-legacy', PAT_EF)} "
-               f"AF41={ipt_count('iptables-legacy', PAT_AF41)}")
+    logger_msg(f"BOOT: 最终 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
     echo(f"[{datetime.now()}] Net-Optimize v{VERSION} 开机优化完成")
 
 
@@ -2849,33 +2824,20 @@ def print_status():
             out = run(["tc", "qdisc", "show", "dev", iface], timeout=5).stdout
             echo("\n".join(out.splitlines()[:8]))
     else:
-        echo("  ℹ️ 未启用（AGGRESSIVE_MODE=1 或 ENABLE_GAME_QOS=0）")
+        echo("  ℹ️ 未固定（出口用 fq；只有「3 固定 cake」档会固定挂 cake/prio）")
 
     aq_mode = cfg.get("ADAPTIVE_QOS_MODE", "adaptive")
     if aq_mode == "fixed_cake":
         echo("\n📌 QoS 模式：固定 cake（不自动切换，始终游戏低延迟）")
     elif aq_mode == "fixed_burst":
-        echo("\n📌 QoS 模式：纯暴力发包（固定 pfifo_fast 抢带宽，无智能算法）")
+        echo("\n📌 QoS 模式：纯暴力发包（固定 fq + 激进参数，不切换）")
     elif run(["systemctl", "is-active", ADAPTIVE_QOS_SERVICE], timeout=5).returncode == 0:
         echo("\n🔄 自适应 QoS：运行中")
         echo(f"  → 阈值: {Cfg.ADAPTIVE_QOS_THRESHOLD // 1024} KB/s  "
              f"采样: {Cfg.ADAPTIVE_QOS_INTERVAL}s")
-        echo("  → 高流量→pfifo_fast(抢带宽)  低流量→cake/prio(游戏低延迟)")
-
-    # DSCP 规则概览
-    dscp_v4 = dscp_v6 = 0
-    for cmd in V4_CMDS:
-        if have_cmd(cmd):
-            dscp_v4 = ipt_count(cmd, PAT_DSCP)
-            if dscp_v4 > 0:
-                break
-    for cmd in ("ip6tables", "ip6tables-legacy"):
-        if have_cmd(cmd):
-            dscp_v6 = ipt_count(cmd, PAT_DSCP)
-            if dscp_v6 > 0:
-                break
-    echo(f"  DSCP 规则: IPv4={dscp_v4}条 IPv6={dscp_v6}条 "
-         f"(EF=QUIC加速, AF41=游戏小包)")
+        echo("  → 高流量→fq(抢带宽)  低流量→cake/prio(游戏低延迟)")
+    else:
+        echo("\n📌 QoS 模式：fq 按流公平（自适应切换：关）")
     echo("")
 
     echo("📡 MSS Clamping 规则:")
@@ -3080,9 +3042,8 @@ def main_optimize(argv):
     setup_nic_offload()
     setup_rps_rfs()
     setup_cpu_governor()
-    setup_mptcp()
     setup_mss_clamping()
-    setup_dscp_marking()
+    clear_dscp_residue()        # DSCP 4.5.17 起不再打；clean_old_config 没触发时（新机器）也兜一下
     setup_initcwnd()
     setup_aggressive_tc()
     setup_game_qos()
@@ -3550,11 +3511,10 @@ def cmd_check():
     qdisc = get_sysctl("net.core.default_qdisc")
     # 优先读取出口网卡实际 qdisc，无法获取时回退 sysctl 默认值
     iface_qdisc = iface_root_qdisc(out_iface) if out_iface and have_cmd("tc") else ""
-    display_qdisc = iface_qdisc or qdisc
 
+    # 激进参数的标志值（netdev_max_backlog=1000000 只有激进档才写）；4.5.17 起激进档也用 fq
     aggressive = cfg.get("AGGRESSIVE_MODE", "") == "1" or \
-        (display_qdisc == "pfifo_fast" and
-         get_sysctl("net.core.netdev_max_backlog") == "1000000")
+        get_sysctl("net.core.netdev_max_backlog") == "1000000"
     if aggressive:
         green("⚡ 激进模式：已开启")
     if cc.startswith("bbr"):
@@ -3565,6 +3525,8 @@ def cmd_check():
         green(f"✅ 当前队列（{out_iface}）：{iface_qdisc}")
     else:
         green(f"✅ 默认队列：{qdisc}")
+    if qdisc != "fq" and not Cfg.ENABLE_FQ_PIE:
+        yellow(f"  提示：默认队列是 {qdisc}，新版默认 fq（BBR 标准搭档）——再跑一次「12 网络优化」就换上")
     if has_sysctl_key("net.ipv4.tcp_mtu_probing"):
         green(f"✅ TCP MTU 探测：{get_sysctl('net.ipv4.tcp_mtu_probing')}")
 
@@ -3737,21 +3699,7 @@ def cmd_check():
     else:
         echo("  ℹ️ CPU 调频: 不支持（容器/虚拟化环境）")
 
-    # === [2c] MPTCP ===
-    c_sep()
-    echo("🔀 [2c] MPTCP 多路径传输")
-    c_sep()
-    if has_sysctl_key("net.mptcp.enabled"):
-        if get_sysctl("net.mptcp.enabled") == "1":
-            green("  ✅ MPTCP: 已启用")
-        else:
-            yellow("  ⚠️ MPTCP: 已安装但未启用")
-        if os.path.isfile("/etc/sysctl.d/98-net-optimize-mptcp.conf"):
-            green("  ✅ MPTCP 持久化已配置")
-        else:
-            echo("  🔹 MPTCP 持久化未配置")
-    else:
-        echo("  ℹ️ MPTCP: 内核不支持（需要 5.6+）")
+    # （4.5.17 起去掉 MPTCP：节点不建 MPTCP 套接字、手机也基本不走，原来的 [2c] 一并删掉）
 
     # === [3] 游戏 QoS 状态 ===
     c_sep()
@@ -3771,14 +3719,12 @@ def cmd_check():
         itv = aq.get("interval", 2)
         cd = aq.get("cooldown", 10)
         echo(f"    → 阈值: {thr // 1024} KB/s  采样: {itv}s  冷却: {cd}s")
-        echo("    → 流量 ≥ 阈值（入站或出站）→ pfifo_fast（抢带宽）")
+        echo("    → 流量 ≥ 阈值（入站或出站）→ fq（抢带宽）")
         echo(f"    → 流量 < 阈值 持续 {cd}s → cake/prio（游戏低延迟）")
-        if aq.get("has_length") is False:
-            yellow("    → ⚠️ -m length 不可用，AF41 标记已跳过")
 
         if out_iface and have_cmd("tc"):
             cur = iface_root_qdisc(out_iface)
-            if cur in ("pfifo_fast", "pfifo"):
+            if cur in ("fq", "mq", "pfifo_fast", "pfifo"):
                 yellow(f"    → 当前状态: ⚡ 抢带宽模式 (qdisc={cur})")
             elif cur == "cake":
                 green("    → 当前状态: 🎮 游戏低延迟模式 (cake)")
@@ -3815,7 +3761,7 @@ def cmd_check():
                 yellow("    ⚠️ cake qdisc 未在网卡上生效（可能被其他服务覆盖）")
     elif qos_scheme == "prio":
         green("  ✅ QoS 方案: prio + fq_codel（3 档手动分流）")
-        echo("    → band 0（高优先）: DSCP EF/AF41 + UDP 小包")
+        echo("    → band 0（高优先）: UDP 小包")
         echo("    → band 1（普通）: 一般流量")
         echo("    → band 2（低优先）: Bulk 流量")
         if out_iface and have_cmd("tc"):
@@ -3836,26 +3782,13 @@ def cmd_check():
                 yellow("    ⚠️ prio qdisc 未在网卡上生效（可能被其他服务覆盖）")
     else:
         if aggressive:
-            echo("  ℹ️ 游戏 QoS 未启用（激进模式下互斥）")
+            echo("  ℹ️ 纯暴力发包：固定 fq + 激进参数，不切换")
         else:
-            echo("  ℹ️ 游戏 QoS 未启用（ENABLE_GAME_QOS=0 或未运行新版主脚本）")
+            green("  ✅ 出口用 fq 按流公平（自适应切换：关，菜单 12 → 7 可开）")
 
-    # DSCP 标记详情（区分 EF 和 AF41）
-    echo("")
-    echo("  DSCP 标记详情:")
-    ef4 = af414 = ef6 = af416 = 0
-    for cmd in V4_CMDS:
-        if have_cmd(cmd) and ipt_count(cmd, PAT_DSCP) > 0:
-            ef4, af414 = ipt_count(cmd, PAT_EF), ipt_count(cmd, PAT_AF41)
-            break
-    for cmd in V6_CMDS:
-        if have_cmd(cmd) and ipt_count(cmd, PAT_DSCP) > 0:
-            ef6, af416 = ipt_count(cmd, PAT_EF), ipt_count(cmd, PAT_AF41)
-            break
-    green(f"    ✅ IPv4 EF (QUIC 加速): {ef4} 条") if ef4 else echo("    🔹 IPv4 EF: 未发现")
-    green(f"    ✅ IPv4 AF41 (游戏小包): {af414} 条") if af414 else echo("    🔹 IPv4 AF41: 未发现")
-    green(f"    ✅ IPv6 EF (QUIC 加速): {ef6} 条") if ef6 else echo("    🔹 IPv6 EF: 未发现")
-    green(f"    ✅ IPv6 AF41 (游戏小包): {af416} 条") if af416 else echo("    🔹 IPv6 AF41: 未发现")
+    # 老版本 DSCP 残留（4.5.17 起不再打；再跑一次优化或重启就清掉）
+    if any(ipt_count(c, PAT_EF) + ipt_count(c, PAT_AF41) for c in V4_CMDS + V6_CMDS if have_cmd(c)):
+        yellow("  ⚠️ 还有老版本的 DSCP 标记规则（再跑一次优化或重启会清掉）")
 
     # === [4] conntrack ===
     c_sep()
@@ -3864,6 +3797,11 @@ def cmd_check():
     if conntrack_available():
         green("✅ nf_conntrack 可用")
         echo(f"  🔸 nf_conntrack_max = {get_sysctl('net.netfilter.nf_conntrack_max')}")
+        bl = get_sysctl("net.netfilter.nf_conntrack_tcp_be_liberal")
+        if bl == "1":
+            green("  ✅ tcp_be_liberal = 1（窗口外的包不误丢）")
+        else:
+            yellow(f"  ⚠️ tcp_be_liberal = {bl or '?'}（跨境乱序时可能误丢合法包，再跑一次优化即可）")
         echo(f"  🔸 udp_timeout = {get_sysctl('net.netfilter.nf_conntrack_udp_timeout')}")
         echo(f"  🔸 udp_timeout_stream = "
              f"{get_sysctl('net.netfilter.nf_conntrack_udp_timeout_stream')}")
@@ -4185,6 +4123,8 @@ def main():
                         help="配合 --xanmod：免掉安装前那一问（重启从不自动）")
     g.add_argument("--self-update", action="store_true",
                    help="只把脚本本体更到最新，不重跑优化、不碰服务（月度 cron 调）")
+    g.add_argument("--adaptive", choices=["on", "off"],
+                   help="自适应切换（守护进程）开关：只改这一项，不重跑整套优化（菜单 12 → 7 调）")
     g.add_argument("--version", action="store_true", help="打印版本号")
     args, argv = parser.parse_known_args()
 
@@ -4221,6 +4161,9 @@ def main():
         cmd_xanmod(assume_yes=args.yes)
     elif getattr(args, "self_update"):
         cmd_self_update()
+    elif getattr(args, "adaptive", None):
+        require_root()
+        cmd_adaptive_toggle(args.adaptive == "on")
     else:
         main_optimize(sys.argv[1:])
 
