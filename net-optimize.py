@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.18"
+VERSION = "4.5.19"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -85,6 +85,7 @@ SYSCTL_BACKUP_DIR = f"{CONFIG_DIR}/sysctl-backup"
 # 删的是一个我们可能压根没创建过的文件。其余所有落盘文件都带前缀，就它没带。
 CONNTRACK_MODULES_CONF = "/etc/modules-load.d/net-optimize-conntrack.conf"
 CONNTRACK_MODULES_CONF_OLD = "/etc/modules-load.d/conntrack.conf"  # 老装机遗留，迁移用
+QDISC_MODULES_CONF = "/etc/modules-load.d/net-optimize-qdisc.conf"   # 队列 / 拥塞算法模块开机就加载
 BOOT_SERVICE = "net-optimize"
 ADAPTIVE_QOS_SERVICE = "net-optimize-adaptive-qos"
 NGINX_LOG = "/var/log/nginx-auto-upgrade.log"
@@ -697,6 +698,50 @@ def check_dpkg_clean():
     echo("✅ dpkg 异常包已清理，环境恢复正常")
 
 
+# === 内核模块：编没编进去 / 加载 / 缺文件补装 ===
+def kernel_has(sym):
+    """这台内核编没编进某项：'y' 编进内核 / 'm' 是模块 / 'n' 没编 / '' 看不出来（读不到配置，容器里常见）。
+       读 /boot/config-<内核版本>（Debian / Ubuntu 装内核时带的）。配置里根本没出现的也是没编（依赖没开就不列）。"""
+    txt = read_text(f"/boot/config-{_uname().release}")
+    if not txt:
+        return ""
+    m = re.search(rf"^CONFIG_{sym}=([ym])$", txt, re.M)
+    return m.group(1) if m else "n"
+
+
+def ensure_kmod(mod, sym=""):
+    """加载内核模块 mod（编进内核的 modprobe 也返回成功）。编成了模块、文件却不在（Ubuntu 有的拆在
+       linux-modules-extra 里）就装一次再试——尊重 SKIP_APT，仓库里没这个包不白跑 apt。
+       内核压根没编进去（sym 查得出来）装什么都没用，直接 False。"""
+    if run(["modprobe", mod], timeout=10).returncode == 0:
+        return True
+    if (sym and kernel_has(sym) == "n") or Cfg.SKIP_APT or not have_cmd("apt-get"):
+        return False
+    pkg = f"linux-modules-extra-{_uname().release}"
+    if not _apt_candidate(pkg):
+        return False
+    echo(f"  ℹ️ {mod} 模块不在，装 {pkg} 再试...")
+    apt(["install", "-y", "-qq", pkg])
+    return run(["modprobe", mod], timeout=10).returncode == 0
+
+
+def persist_net_modules():
+    """选定的队列 / 拥塞算法模块开机就加载：systemd-modules-load 排在 systemd-sysctl 前面，
+       default_qdisc=fq 一设模块就在，不靠内核临场去找。只写内核里真有的（编进内核的也行）——
+       没有的写进去，systemd-modules-load 开机会报失败。"""
+    mods = []
+    if FINAL_QDISC in ("fq", "fq_pie", "pie", "fq_codel"):
+        mods.append(f"sch_{FINAL_QDISC}")
+    if FINAL_CC.startswith("bbr"):
+        mods.append(f"tcp_{FINAL_CC}")
+    mods = [m for m in mods if run(["modprobe", "-n", "-q", m], timeout=10).returncode == 0]
+    if mods:
+        write_text(QDISC_MODULES_CONF, "# Net-Optimize: 队列 / 拥塞算法模块\n" + "".join(f"{m}\n" for m in mods))
+        echo(f"  ✅ 开机自动加载：{' '.join(mods)}")
+    else:
+        _rm(QDISC_MODULES_CONF)
+
+
 # === conntrack / qdisc 可用性探测 ===
 def conntrack_available():
     if has_sysctl_key("net.netfilter.nf_conntrack_max"):
@@ -968,6 +1013,11 @@ def setup_tcp_congestion():
     order = ["fq_pie", "fq", "pie"] if Cfg.ENABLE_FQ_PIE else ["fq", "fq_pie", "pie"]
     if Cfg.AGGRESSIVE_MODE:
         order = ["fq", "pfifo_fast"]
+    # 【fq 模块先装上】以前只设 default_qdisc=fq、靠内核临场自己加载 sch_fq：模块在就没事，不在就一声不吭
+    # 退成 fq_pie / pie / 老默认，--check 还一直提示「再跑一次就换上」——跑多少次都一样。
+    # 10/25 查过 Ubuntu 24.04 各家云内核（通用 / 谷歌 / AWS / Azure / 甲骨文）和 22.04 的通用 / 谷歌 / AWS：
+    # sch_fq、tcp_bbr 都在基础模块包里；22.04 及以前的精简版 kvm 内核压根没编进 fq（BBR、cake 也没有），装什么都没用。
+    fq_ok = ensure_kmod("sch_fq", "NET_SCH_FQ")
     FINAL_QDISC = next((q for q in order if try_set_qdisc(q)), "") \
         or get_sysctl("net.core.default_qdisc")
     if Cfg.AGGRESSIVE_MODE:
@@ -994,6 +1044,11 @@ def setup_tcp_congestion():
     echo(f"✅ 最终生效队列算法: {FINAL_QDISC}")
     if target_cc.startswith("bbr") and FINAL_CC != target_cc:
         echo(f"⚠️ 提示: 尝试启用 {target_cc} 失败，系统自动回退到了 {FINAL_CC}")
+    lack = [x for x, miss in (("fq", FINAL_QDISC != "fq" and not fq_ok and not Cfg.ENABLE_FQ_PIE),
+                              ("BBR", not FINAL_CC.startswith("bbr") and kernel_has("TCP_CONG_BBR") == "n")) if miss]
+    if lack:
+        echo(f"⚠️ 这台内核（{_uname().release}）没有 {'、'.join(lack)}，只能用 {FINAL_QDISC} / {FINAL_CC}；要用得换内核")
+    persist_net_modules()
 
 
 # === 节点画像 → 保留端口（ip_local_reserved_ports）===
@@ -1968,19 +2023,11 @@ def tc_apply_prio(iface):
 
 
 def ensure_cake_module():
-    """加载 sch_cake，不可用时尝试装 linux-modules-extra（尊重 SKIP_APT）。"""
-    if run(["modprobe", "sch_cake"], timeout=10).returncode == 0:
+    """加载 sch_cake，不可用时尝试装 linux-modules-extra（尊重 SKIP_APT；跟 fq 走同一个 ensure_kmod）。"""
+    if ensure_kmod("sch_cake", "NET_SCH_CAKE"):
         return True
-    if not Cfg.SKIP_APT and have_cmd("apt-get"):
-        kern = run(["uname", "-r"], timeout=5).stdout.strip()
-        echo("  ℹ️ sch_cake 模块未加载，尝试安装 linux-modules-extra...")
-        if apt(["install", "-y", "-qq", f"linux-modules-extra-{kern}"]).returncode == 0:
-            echo(f"  ✅ linux-modules-extra-{kern} 安装成功，重新加载 sch_cake")
-        else:
-            echo(f"  ℹ️ linux-modules-extra-{kern} 不可用，跳过（将使用方案 B）")
-    else:
-        echo("  ℹ️ sch_cake 模块未加载且跳过 APT 安装（将使用方案 B）")
-    return run(["modprobe", "sch_cake"], timeout=10).returncode == 0
+    echo("  ℹ️ sch_cake 用不了（将使用方案 B）")
+    return False
 
 
 def setup_game_qos():
@@ -3144,7 +3191,8 @@ def cmd_reset():
     if "Net-Optimize" in read_text(CONNTRACK_MODULES_CONF_OLD):
         _rm(CONNTRACK_MODULES_CONF_OLD)
     _rm("/etc/modprobe.d/net-optimize-conntrack.conf")
-    echo("  ✅ 已删除 conntrack 开机加载 / hashsize 配置")
+    _rm(QDISC_MODULES_CONF)
+    echo("  ✅ 已删除 conntrack / 队列模块开机加载、hashsize 配置")
 
     # [7] NIC offload / RPS/RFS / CPU 调频 / initcwnd 钩子持久化
     echo("🔧 [7] 清理网卡/CPU 持久化配置...")
@@ -3703,12 +3751,17 @@ def cmd_check():
         green(f"✅ 拥塞算法：{cc_label(cc)}")
     else:
         yellow(f"⚠️ 拥塞算法：{cc}（非 BBR 系列）")
+        if kernel_has("TCP_CONG_BBR") == "n":
+            yellow(f"  提示：这台内核（{_uname().release}）没编进 BBR，装模块没用，要用得换内核")
     if iface_qdisc:
         green(f"✅ 当前队列（{out_iface}）：{iface_qdisc}")
     else:
         green(f"✅ 默认队列：{qdisc}")
     if qdisc != "fq" and not Cfg.ENABLE_FQ_PIE:
-        yellow(f"  提示：默认队列是 {qdisc}，新版默认 fq（BBR 标准搭档）——再跑一次「12 网络优化」就换上")
+        if kernel_has("NET_SCH_FQ") == "n":
+            yellow(f"  提示：这台内核（{_uname().release}）没编进 fq，装模块没用，要用得换内核")
+        else:
+            yellow(f"  提示：默认队列是 {qdisc}，新版默认 fq（BBR 标准搭档）——再跑一次「12 网络优化」就换上")
     if has_sysctl_key("net.ipv4.tcp_mtu_probing"):
         green(f"✅ TCP MTU 探测：{get_sysctl('net.ipv4.tcp_mtu_probing')}")
 
@@ -4191,6 +4244,9 @@ def cmd_check():
             echo(f"  ℹ️ 旧版 bash 遗留文件仍存在（已不被引用，可删除）：{old}")
     if os.path.isfile(CONNTRACK_MODULES_CONF):
         green("✅ conntrack 模块开机加载")
+    if os.path.isfile(QDISC_MODULES_CONF):
+        mods = [l.strip() for l in read_text(QDISC_MODULES_CONF).splitlines() if l.strip() and not l.startswith("#")]
+        green(f"✅ 队列 / 拥塞算法模块开机加载：{' '.join(mods)}")
 
     # === [11] Nginx ===
     c_sep()

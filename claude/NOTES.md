@@ -112,6 +112,10 @@
   出站连接可能正好占走。UDP 监听口不扫：sing-box 替用户发 QUIC / DNS 的客户端套接字在 /proc/net/udp 里跟服务端口一样。
 - 节点不开 TFO（内核 `tcp_fastopen=3` 只是允许，套接字不开就不生效）：reality 冒充别人家网站，别人不回 TFO、我们回了
   就露馅；国内运营商还常丢带数据的 SYN。UDP 大缓冲、网卡 UDP GRO 本来就对所有机器开着，不用按画像开关。
+- **fq / BBR 模块在哪**（10/25 从 Ubuntu 仓库拆包查的）：24.04 的通用 / 谷歌 / AWS / Azure / 甲骨文内核、22.04 的通用 / 谷歌 / AWS
+  内核，`sch_fq`、`tcp_bbr`、`sch_cake` 都在基础 `linux-modules` 包里；24.04 的 `linux-image-kvm` 只是指向通用内核的壳；
+  22.04 的 kvm 内核配置是 `# CONFIG_NET_SCH_FQ is not set`、`# CONFIG_TCP_CONG_ADVANCED is not set`（没 fq、没 BBR、没 cake），
+  装什么模块都没用。Debian 的仓库这个容器连不上，没拆包核对过。判断走 `kernel_has()` 读 `/boot/config-<内核>`。
 - 端到端测试 `test_netprofile_e2e.py` 在 `unshare --mount --net` 里跑真脚本、真内核参数（/etc 那几个目录盖 tmpfs），
   不碰本机；改保留端口相关的逻辑先跑它。
 
