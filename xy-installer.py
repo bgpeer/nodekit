@@ -6369,6 +6369,11 @@ def _script_ver(text):
 def _vt(v):
     return tuple(int(x) for x in re.findall(r"\d+", v or ""))
 
+def _remote_ver(text):
+    """脚本源码里的版本号：主体用 SCRIPT_VERSION，net-optimize 那种用 VERSION；没有返回 ''。"""
+    m = re.search(r'^(?:SCRIPT_VERSION|VERSION)\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else ""
+
 def _auto_self_update():
     """脚本本体更新到最新（每天 02:50 的 self-update 调；仓库主人 10/21：有的人不上服务器、不开面板，脚本就一直停在
        老版本，修的 bug、加的功能都用不上）。拉不到、版本没变新、新版连语法都过不了 → 什么都不动。换上了返回 True。"""
@@ -7071,6 +7076,15 @@ def ensure_remote_script(url, local):
             # 查出来就整个放弃，本地那份一个字节都不动，菜单照常能用旧版进去。
             # media-stack 自己的 selfupdate 早就是这么做的，这条路一直漏着。
             compile(body, local, "exec")
+            # 只升不降：raw 被限流(429)会回落 jsDelivr（@main 缓存约 12h、?_t= 破不掉），
+            # 可能拉到旧副本。拉到的带版本号且比本地那份旧，就别覆盖——否则每次进菜单都把
+            # 本地新版降级成镜像上的旧版（真机：curl 到 4.5.11，一进菜单又被盖回 4.5.9）。
+            newv = _remote_ver(body)
+            if newv:
+                try:    curv = _remote_ver(open(local, encoding="utf-8").read())
+                except OSError: curv = ""
+                if curv and _vt(newv) < _vt(curv):
+                    return os.path.exists(local) and os.path.getsize(local) > 0
             tmp = local + ".new"
             with open(tmp, "w") as f:
                 f.write(body)
