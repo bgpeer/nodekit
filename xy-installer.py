@@ -7577,6 +7577,11 @@ def _netopt_xanmod():
         print("  ⚠ 网络优化脚本没拉到新版，过会儿再试"); return
     _run_child(f"python3 {NETOPT_LOCAL} --xanmod")
 
+def _netopt_confirm():
+    """跑优化档位(1/2/3)前确认：会重应用内核参数、期间可能短暂重启服务，默认否，要明确 y 才跑。"""
+    print("  " + _hl("1;33", "提示：会重新应用内核参数/队列/防火墙标记，期间可能短暂重启 nginx/sing-box，完全生效需重启一次。"))
+    return _ask("  确认执行？y 确认 / n 返回: ").strip().lower() in ("y", "yes")
+
 def net_optimize_menu():
     """网络优化（本仓库 net-optimize.py：BBR/QoS/缓冲区等内核调优，依赖工具自动安装）。"""
     MARK = "  " + _hl("1;32", "← 当前")
@@ -7612,19 +7617,22 @@ def net_optimize_menu():
                   (6, "卸载网络优化（恢复系统默认）", None), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
-            _run_net_optimize()
+            if _netopt_confirm():
+                _run_net_optimize()
         elif c == "2":
             t = _ask("  激活阈值 MB/s（回车=20；输入 0 = 纯暴力发包，无智能算法）: ").strip() or "20"
             try:    mb = float(t)
             except ValueError: mb = -1
+            if mb < 0:
+                print("  无效数字，请输入 ≥0 的数字（如 20，或 0 = 纯暴力发包）。"); continue
+            if not _netopt_confirm(): continue
             if mb == 0:
                 _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_burst"})
-            elif mb < 0:
-                print("  无效数字，请输入 ≥0 的数字（如 20，或 0 = 纯暴力发包）。"); continue
             else:
                 _run_net_optimize(env_extra={"ADAPTIVE_QOS_THRESHOLD": str(int(mb * 1024 * 1024))})
         elif c == "3":
-            _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_cake"})
+            if _netopt_confirm():
+                _run_net_optimize(env_extra={"ADAPTIVE_QOS_MODE": "fixed_cake"})
         elif c == "4":
             _netopt_xanmod()
         elif c == "5":
