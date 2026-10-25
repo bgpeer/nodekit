@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.9"
+VERSION = "4.5.10"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -529,13 +529,43 @@ def self_install():
 
 
 # === 低内存环境保障：<2GB 且无 swap 自动建 512MB 临时 swap ===
+def _path_fstype(path):
+    """path 所在挂载点的文件系统类型（读 /proc/mounts 取最长前缀匹配）；读不到返回 ''。"""
+    try:
+        p, best, fstype = os.path.abspath(path), "", ""
+        for line in read_text("/proc/mounts").splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            mnt, typ = parts[1], parts[2]
+            pre = mnt if mnt.endswith("/") else mnt + "/"
+            if (p == mnt or p.startswith(pre)) and len(mnt) >= len(best):
+                best, fstype = mnt, typ
+        return fstype
+    except Exception:  # noqa
+        return ""
+
 def ensure_swap():
-    swap_file = "/tmp/.net-optimize-swap"
+    # swap 文件必须落在真磁盘上。/tmp 在新版系统（如 ubuntu resolute）常是 tmpfs（内存盘）：
+    # 往 tmpfs 写 512MB 只会把本就紧张的内存吃光、swapon 还会被拒，等于帮倒忙——真机 1G 谷歌机
+    # 装 nginx 时 OOM 卡死、reboot 都起不来，就栽在这。落 /var（根分区），先排除内存盘、
+    # 再确认磁盘够放，否则宁可不建（继续运行，不要把内存越兜越少）。
+    swap_file = "/var/.net-optimize-swap"
     total_kb = meminfo_kb("MemTotal") or 4194304
     swap_kb = meminfo_kb("SwapTotal")
     if total_kb >= 2097152 or swap_kb > 0:
         return
     echo(f"⚠️ 内存 {total_kb}KB 且无 swap，自动创建 512MB 临时 swap...")
+    if _path_fstype(swap_file) in ("tmpfs", "ramfs", "overlay", "overlayfs"):
+        echo("  ℹ️ 可用分区是内存盘，建 swap 反更吃内存，跳过（继续运行）")
+        return
+    try:
+        st = os.statvfs(os.path.dirname(swap_file))
+        if st.f_bavail * st.f_frsize < 720 * 1024 * 1024:   # 512MB swap + ~200MB 余量
+            echo("  ℹ️ 磁盘空间不足，跳过临时 swap（继续运行）")
+            return
+    except OSError:
+        pass
     ok = (run(["dd", "if=/dev/zero", f"of={swap_file}", "bs=1M", "count=512",
                "status=none"], timeout=120).returncode == 0)
     if ok:
@@ -2892,11 +2922,12 @@ def cmd_reset():
     echo("  ✅ 已删除 /etc/net-optimize 与脚本本体（含旧版 bash 遗留）")
 
     # [11] 临时 swap 残留（正常运行结束会自动清，异常中断可能留下）
-    swap_file = "/tmp/.net-optimize-swap"
-    if os.path.exists(swap_file):
-        run(["swapoff", swap_file], timeout=30)
-        _rm(swap_file)
-        echo("  ✅ 已清理临时 swap 残留")
+    #      新版落 /var，旧版落 /tmp —— 两处都清，免得老机器留着旧残留。
+    for swap_file in ("/var/.net-optimize-swap", "/tmp/.net-optimize-swap"):
+        if os.path.exists(swap_file):
+            run(["swapoff", swap_file], timeout=30)
+            _rm(swap_file)
+            echo("  ✅ 已清理临时 swap 残留")
 
     echo("")
     echo("=" * 60)
