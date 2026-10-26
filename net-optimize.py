@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.19"
+VERSION = "4.5.20"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -86,6 +86,13 @@ SYSCTL_BACKUP_DIR = f"{CONFIG_DIR}/sysctl-backup"
 CONNTRACK_MODULES_CONF = "/etc/modules-load.d/net-optimize-conntrack.conf"
 CONNTRACK_MODULES_CONF_OLD = "/etc/modules-load.d/conntrack.conf"  # 老装机遗留，迁移用
 QDISC_MODULES_CONF = "/etc/modules-load.d/net-optimize-qdisc.conf"   # 队列 / 拥塞算法模块开机就加载
+# 老 bash 版的三个脚本：Python 版早就不调它们了（开机恢复 / 守护 / 主脚本都是 SCRIPT_PATH）
+LEGACY_BASH = ("/usr/local/sbin/net-optimize-apply",
+               "/usr/local/sbin/net-optimize-adaptive-qos",
+               "/usr/local/sbin/net-optimize-ultimate.sh")
+# 删它们之前看这些地方有没有谁还写着它们的路径（systemd 单元 / drop-in、cron、网卡钩子、rc.local）
+LEGACY_REFS = ("/etc/systemd/system/*", "/etc/systemd/system/*/*", "/etc/cron.d/*", "/etc/crontab",
+               "/var/spool/cron/crontabs/*", "/etc/networkd-dispatcher/*/*", "/etc/rc.local")
 BOOT_SERVICE = "net-optimize"
 ADAPTIVE_QOS_SERVICE = "net-optimize-adaptive-qos"
 NGINX_LOG = "/var/log/nginx-auto-upgrade.log"
@@ -924,6 +931,21 @@ def clean_old_config():
         except Exception:  # noqa
             pass
     echo("✅ 旧配置清理完成")
+
+
+def clean_legacy_bash():
+    """老 bash 版留下的三个脚本（--check 一直提示「可删除」）：先看 systemd 单元、cron、网卡钩子里
+       还有没有谁写着它们的路径，没人调用才删；有人调用的一个不动。"""
+    refs = run(["crontab", "-l"], timeout=5).stdout
+    for pat in LEGACY_REFS:
+        for f in glob.glob(pat):
+            if os.path.isfile(f):
+                refs += read_text(f)
+    gone = [f for f in LEGACY_BASH if os.path.exists(f) and f not in refs]
+    for f in gone:
+        _rm(f)
+    if gone:
+        echo(f"🧹 已删除老 bash 版遗留：{'、'.join(os.path.basename(f) for f in gone)}")
 
 
 # === nginx 源自愈（Ubuntu/Debian 混源、noble 混淆检测）===
@@ -3225,11 +3247,7 @@ def cmd_reset():
     echo("🔧 [10] 删除脚本和配置...")
     shutil.rmtree(CONFIG_DIR, ignore_errors=True)
     shutil.rmtree("/etc/net-optimize-backup", ignore_errors=True)
-    for f in (SCRIPT_PATH,
-              "/usr/local/sbin/net-optimize-ultimate.sh",
-              "/usr/local/sbin/net-optimize-apply",
-              "/usr/local/sbin/net-optimize-adaptive-qos",
-              "/usr/local/sbin/net-optimize-nginx-upgrade"):
+    for f in (SCRIPT_PATH, "/usr/local/sbin/net-optimize-nginx-upgrade") + LEGACY_BASH:
         _rm(f)
     echo("  ✅ 已删除 /etc/net-optimize 与脚本本体（含旧版 bash 遗留）")
 
@@ -3261,6 +3279,7 @@ def main_optimize(argv):
     self_install()      # python3 <(curl ...) 时 /dev/fd 无法回读，允许失败
 
     clean_old_config()
+    clean_legacy_bash()
     maybe_install_tools()
     setup_ulimit()
     setup_tcp_congestion()
@@ -3711,6 +3730,39 @@ def iface_root_qdisc(iface):
     return out[1] if len(out) > 1 else ""
 
 
+def iface_qdiscs(iface):
+    """出口网卡的根队列和直接挂在它下面的 → (根, [子…])。多队列网卡的根是 mq，它只是个总管，
+       真干活的是每个发送队列下面挂的那个（default_qdisc=fq 时就是 fq）。ingress / clsact 不是它的子，不算。"""
+    lines = [l.split() for l in run(["tc", "qdisc", "show", "dev", iface], timeout=5).stdout.splitlines()
+             if l.startswith("qdisc ")]
+    root = next((l for l in lines if len(l) > 3 and l[3] == "root"), None)
+    if not root:
+        return "", []
+    h = root[2].rstrip(":")
+    mine = ("", "0") if h == "0" else (h,)
+    kids = [l[1] for l in lines if len(l) > 4 and l[3] == "parent" and l[4].split(":")[0] in mine]
+    return root[1], kids
+
+
+def iface_qdisc_label(iface):
+    """屏上显示用：「fq」/「mq（每个队列 fq，共 2 个）」/「cake」。"""
+    root, kids = iface_qdiscs(iface)
+    if root == "mq" and kids:
+        return f"mq（每个队列 {'/'.join(sorted(set(kids)))}，共 {len(kids)} 个）"
+    return root
+
+
+def _fq_fix():
+    """出口不是 fq 时怎么办：容器（LXC / OpenVZ…）跟宿主机共用内核，队列改不了；内核没编进 fq 的
+       说要换内核；其余的重跑一次就换上。"""
+    kind = container_kind()
+    if kind:
+        return f"这是容器（{kind}），跟宿主机共用内核，队列改不了"
+    if kernel_has("NET_SCH_FQ") == "n":
+        return f"这台内核（{_uname().release}）没编进 fq，装模块没用，要用得换内核"
+    return "再跑一次「12 网络优化」就换上"
+
+
 def probe_path_mtu_quick():
     """检测版快速探测：-W1 仅打 1.1.1.1（与 check.sh 一致）。
 
@@ -3739,8 +3791,8 @@ def cmd_check():
     c_sep()
     cc = get_sysctl("net.ipv4.tcp_congestion_control")
     qdisc = get_sysctl("net.core.default_qdisc")
-    # 优先读取出口网卡实际 qdisc，无法获取时回退 sysctl 默认值
-    iface_qdisc = iface_root_qdisc(out_iface) if out_iface and have_cmd("tc") else ""
+    # 优先读取出口网卡实际 qdisc（多队列网卡带上每个队列挂的），无法获取时回退 sysctl 默认值
+    iface_qdisc = iface_qdisc_label(out_iface) if out_iface and have_cmd("tc") else ""
 
     # 激进参数的标志值（netdev_max_backlog=1000000 只有激进档才写）；4.5.17 起激进档也用 fq
     aggressive = cfg.get("AGGRESSIVE_MODE", "") == "1" or \
@@ -3758,10 +3810,7 @@ def cmd_check():
     else:
         green(f"✅ 默认队列：{qdisc}")
     if qdisc != "fq" and not Cfg.ENABLE_FQ_PIE:
-        if kernel_has("NET_SCH_FQ") == "n":
-            yellow(f"  提示：这台内核（{_uname().release}）没编进 fq，装模块没用，要用得换内核")
-        else:
-            yellow(f"  提示：默认队列是 {qdisc}，新版默认 fq（BBR 标准搭档）——再跑一次「12 网络优化」就换上")
+        yellow(f"  提示：默认队列是 {qdisc}，新版默认 fq（BBR 标准搭档）——{_fq_fix()}")
     if has_sysctl_key("net.ipv4.tcp_mtu_probing"):
         green(f"✅ TCP MTU 探测：{get_sysctl('net.ipv4.tcp_mtu_probing')}")
 
@@ -3869,7 +3918,7 @@ def cmd_check():
         else:
             echo("  🔹 RFS: 未启用")
         if have_cmd("tc"):
-            tcq = iface_root_qdisc(out_iface)
+            tcq = iface_qdisc_label(out_iface)
             if tcq:
                 echo(f"  🔹 tc qdisc: {tcq}")
 
@@ -4017,7 +4066,10 @@ def cmd_check():
             else:
                 yellow("    ⚠️ prio qdisc 未在网卡上生效（可能被其他服务覆盖）")
     else:
-        if aggressive:
+        root, kids = iface_qdiscs(out_iface) if out_iface and have_cmd("tc") else ("", [])
+        if root and not (root == "fq" or (root == "mq" and kids and set(kids) == {"fq"})):
+            yellow(f"  ⚠️ 出口实际是 {iface_qdisc_label(out_iface)}，不是 fq——{_fq_fix()}")
+        elif aggressive:
             echo("  ℹ️ 纯暴力发包：固定 fq + 激进参数，不切换")
         else:
             green("  ✅ 出口用 fq 按流公平（自适应切换：关，菜单 12 → 7 可开）")
@@ -4237,11 +4289,9 @@ def cmd_check():
         yellow(f"⚠️ 主脚本缺失：{SCRIPT_PATH}")
     if os.access("/etc/networkd-dispatcher/routable.d/50-initcwnd", os.X_OK):
         green("✅ networkd-dispatcher initcwnd 钩子已安装")
-    for old in ("/usr/local/sbin/net-optimize-apply",
-                "/usr/local/sbin/net-optimize-adaptive-qos",
-                "/usr/local/sbin/net-optimize-ultimate.sh"):
+    for old in LEGACY_BASH:
         if os.path.exists(old):
-            echo(f"  ℹ️ 旧版 bash 遗留文件仍存在（已不被引用，可删除）：{old}")
+            echo(f"  ℹ️ 老 bash 版遗留还在：{old}（再跑一次优化会清；还有谁在调用的不删）")
     if os.path.isfile(CONNTRACK_MODULES_CONF):
         green("✅ conntrack 模块开机加载")
     if os.path.isfile(QDISC_MODULES_CONF):

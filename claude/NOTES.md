@@ -116,6 +116,8 @@
   内核，`sch_fq`、`tcp_bbr`、`sch_cake` 都在基础 `linux-modules` 包里；24.04 的 `linux-image-kvm` 只是指向通用内核的壳；
   22.04 的 kvm 内核配置是 `# CONFIG_NET_SCH_FQ is not set`、`# CONFIG_TCP_CONG_ADVANCED is not set`（没 fq、没 BBR、没 cake），
   装什么模块都没用。Debian 的仓库这个容器连不上，没拆包核对过。判断走 `kernel_has()` 读 `/boot/config-<内核>`。
+- `iface_root_qdisc` 只回网卡的根队列（自适应守护按它判断现在是哪种模式，别改它的返回）；屏上显示用 `iface_qdisc_label`：
+  多队列网卡的根是 mq（只是总管），要带上每个队列下面挂的才看得出 fq 在不在跑。
 - 端到端测试 `test_netprofile_e2e.py` 在 `unshare --mount --net` 里跑真脚本、真内核参数（/etc 那几个目录盖 tmpfs），
   不碰本机；改保留端口相关的逻辑先跑它。
 
