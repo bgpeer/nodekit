@@ -55,6 +55,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import termios
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -66,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.20"
+VERSION = "4.5.21"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -3313,19 +3314,27 @@ def main_optimize(argv):
     echo(f"  6. 完整检测: python3 {SCRIPT_PATH} --check")
     echo("")
 
-    if sys.stdin.isatty():
-        try:
-            answer = input("🔄 是否立即重启以生效所有优化？(y/N): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
-        if answer.lower() == "y":
-            echo("🌀 系统将在3秒后重启...")
-            time.sleep(3)
-            run(["reboot"], timeout=10)
-        else:
-            echo("📌 请稍后手动重启以应用所有优化")
-    else:
+    ask_reboot()
+
+
+def ask_reboot():
+    """跑完问要不要立即重启（默认否）。跑的那几分钟里误碰进去的键先丢掉、混进回答的按键码去掉（见 _clean_answer）：
+       10/26 DMIT 那台跑的时候碰了 Home 键（屏上那个 ^[[H），最后打 y 回车，读到的是「ESC[Hy」，没重启；
+       反过来跑的时候早按了 y 回车，问的时候只敲回车，老代码直接重启了——重启会断开所有连接，必须是问了以后答的 y。"""
+    if not sys.stdin.isatty():
         echo("📌 非交互模式，请手动重启以应用优化")
+        return
+    _flush_typeahead(sys.stdin)
+    try:
+        answer = _clean_answer(input("🔄 是否立即重启以生效所有优化？(y/N): "))
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.lower() in ("y", "yes"):
+        echo("🌀 系统将在3秒后重启...")
+        time.sleep(3)
+        run(["reboot"], timeout=10)
+    else:
+        echo("📌 请稍后手动重启以应用所有优化")
 
 
 # === 换 BBRv3 内核（XanMod，--xanmod）===
@@ -3355,16 +3364,35 @@ def _uname():
     return os.uname()
 
 
+# 混进回答里的按键码：手机终端误碰 Home / 方向键会把 ESC[H、ESC[A 这类序列塞进这一行（屏上显示成 ^[[H），
+# 跟打的 y 连在一起就认不出来了。CSI（ESC [ … 字母）、SS3（ESC O x）、ESC 加一个字符，再加其余控制字符。
+_KEYCODES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|.)|[\x00-\x1f\x7f]")
+
+
+def _clean_answer(s):
+    return _KEYCODES.sub("", s or "").strip()
+
+
+def _flush_typeahead(f):
+    """问要紧的事（重启、换内核）之前，把之前误碰进去还没读走的键丢掉——早按的 y 回车不能替人答。"""
+    try:
+        termios.tcflush(f, termios.TCIFLUSH)
+    except (termios.error, OSError, ValueError, AttributeError):
+        pass
+
+
 def _ask_tty(prompt):
-    """读一行回答：优先 /dev/tty（curl | python3 管道下 stdin 不是终端）；都读不到当回车（= 默认）。"""
+    """读一行回答：优先 /dev/tty（curl | python3 管道下 stdin 不是终端）；都读不到当回车（= 默认）。
+       这里问的都是换内核、重启这种要紧事：先丢掉之前误碰进去的键，再去掉混进来的按键码。"""
     try:
         with open("/dev/tty") as t:
+            _flush_typeahead(t)
             print(prompt, end="", flush=True)
-            return t.readline().strip()
+            return _clean_answer(t.readline())
     except OSError:
         pass
     try:
-        return input(prompt).strip()
+        return _clean_answer(input(prompt))
     except (OSError, EOFError):
         return ""
 
