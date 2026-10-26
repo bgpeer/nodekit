@@ -67,7 +67,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.21"
+VERSION = "4.5.22"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -3716,12 +3716,19 @@ def c_sep():
     echo("-" * 60)
 
 
-def svc_state(unit):
+def svc_state(unit, want_on=True):
+    """want_on=False：按设置就该关着（自适应切换默认关），关着是正常的，不标黄；该关却在跑才标黄。"""
     if run(["systemctl", "cat", unit], timeout=5).returncode != 0:
         echo(f"  - {unit}: (not installed)")
         return
     en = run(["systemctl", "is-enabled", unit], timeout=5).stdout.strip()
     act = run(["systemctl", "is-active", unit], timeout=5).stdout.strip()
+    if not want_on:
+        if act == "active":
+            yellow(f"  - {unit}: enabled={en}, active={act}（设置是关，却在跑）")
+        else:
+            echo(f"  - {unit}: 关（按设置，菜单 12 → 7 可开）")
+        return
     (green if act == "active" else yellow)(f"  - {unit}: enabled={en}, active={act}")
 
 
@@ -4310,7 +4317,8 @@ def cmd_check():
     echo("🛠 [10] 开机自启服务")
     c_sep()
     svc_state("net-optimize.service")
-    svc_state(f"{ADAPTIVE_QOS_SERVICE}.service")
+    svc_state(f"{ADAPTIVE_QOS_SERVICE}.service",
+              cfg.get("ADAPTIVE_DAEMON", "1") == "1" and cfg.get("ADAPTIVE_QOS_MODE", "adaptive") == "adaptive")
     if os.path.isfile(SCRIPT_PATH):
         green(f"✅ 主脚本已安装：{SCRIPT_PATH}（--boot/--daemon 共用）")
     else:
