@@ -132,9 +132,16 @@ check("cake 用不了：照旧退方案 B，不白跑 apt", r is False and "方�
 
 # ── 5. --check：内核没编进去的别再叫人「再跑一次」 ───────────────────────────────
 ck = body("cmd_check")
-check("--check：fq 没编进内核 → 说要换内核，编了才提示「再跑一次就换上」",
-      re.search(r'if kernel_has\("NET_SCH_FQ"\) == "n":\s*yellow\(f"  提示：这台内核（\{_uname\(\)\.release\}）没编进 fq', ck)
-      and "再跑一次「12 网络优化」就换上" in ck)
+nf = load("nfix")
+nf.container_kind = lambda: ""
+nf._uname = lambda: type("U", (), {"release": "5.15.0-1109-kvm"})()
+nf.read_text = lambda p, d="": KVM_CFG if p.startswith("/boot/config-") else d
+kvm_fix = nf._fq_fix()
+nf.read_text = lambda p, d="": GEN_CFG if p.startswith("/boot/config-") else d
+gen_fix = nf._fq_fix()
+check(f"--check：fq 没编进内核 → 说要换内核（{kvm_fix}），编了才提示「再跑一次就换上」",
+      "要用得换内核" in kvm_fix and "再跑一次" not in kvm_fix and "再跑一次「12 网络优化」就换上" in gen_fix)
+check("--check 第 [1] 段的提示走 _fq_fix", "_fq_fix()" in ck)
 check("--check：BBR 没编进内核也照实说", 'kernel_has("TCP_CONG_BBR") == "n"' in ck and "没编进 BBR" in ck)
 check("--check 列出开机加载的队列 / 拥塞算法模块", "QDISC_MODULES_CONF" in ck)
 
