@@ -11912,8 +11912,15 @@ def main_menu():
         _ask("\n按回车返回主菜单...")            # 停一下，别让菜单立刻盖住上面的输出
 
 # ============================================================================ 交互菜单
+# 混进回答里的按键码：手机终端误碰 Home / 方向键会把 ESC[H、ESC[A 这类序列塞进这一行（屏上显示成 ^[[H），
+# 跟打的 y、编号连在一起就认不出来了（10/26 DMIT：网络优化跑的时候碰了 Home，最后打 y 没重启）。
+_KEYCODES = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|O.|.)|[\x00-\x1f\x7f]")
+
+def _strip_keys(s):
+    return _KEYCODES.sub("", s or "").strip()
+
 def _ask(prompt=""):
-    """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。
+    """交互输入：优先读 /dev/tty，使 curl|python3 管道下仍可交互。回答里混进的按键码去掉（见 _KEYCODES）。
 
        两头都读不到就返回空串（= 回车）。转后台跑的那些活儿（见 _node_op_dispatch）
        没有控制终端、stdin 也被掐成 /dev/null，真有哪一步漏了个问题没在前台问掉，
@@ -11927,13 +11934,13 @@ def _ask(prompt=""):
             line = t.readline()
             if line == "":
                 raise EOFError
-            v = line.rstrip("\n").strip()
+            v = _strip_keys(line)
             _ask_paint(prompt, v, _seen)
             return v
     except (OSError, EOFError):
         pass
     try:
-        return input(prompt).strip()
+        return _strip_keys(input(prompt))
     except (OSError, EOFError):
         print(prompt + "(无终端，按默认继续)")
         return ""

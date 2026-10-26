@@ -118,6 +118,9 @@
   装什么模块都没用。Debian 的仓库这个容器连不上，没拆包核对过。判断走 `kernel_has()` 读 `/boot/config-<内核>`。
 - `iface_root_qdisc` 只回网卡的根队列（自适应守护按它判断现在是哪种模式，别改它的返回）；屏上显示用 `iface_qdisc_label`：
   多队列网卡的根是 mq（只是总管），要带上每个队列下面挂的才看得出 fq 在不在跑。
+- 要紧的 y/N（跑完问重启、换内核）先 `tcflush` 丢掉还没读的键，再去掉按键码（手机终端碰到 Home / 方向键会塞
+  `ESC[H` 这类序列，屏上显示 `^[[H`，跟 y 连成一行就认不出——10/26 DMIT 打了 y 没重启）。面板的 `_ask` 只去按键码、
+  不丢键（菜单里连着打编号要留着）。测这类问题用 `pty.fork()` 真往终端里按键，见 `test_netopt_reboot_prompt_4521.py`。
 - 端到端测试 `test_netprofile_e2e.py` 在 `unshare --mount --net` 里跑真脚本、真内核参数（/etc 那几个目录盖 tmpfs），
   不碰本机；改保留端口相关的逻辑先跑它。
 
