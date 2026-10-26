@@ -7605,6 +7605,15 @@ def _netopt_xanmod():
         print("  ⚠ 网络优化脚本没拉到新版，过会儿再试"); return
     _run_child(f"python3 {NETOPT_LOCAL} --xanmod")
 
+def _netopt_daemon_label(mode, on):
+    """菜单 12 第 7 项的「当前」：写清开 / 关各是什么效果（仓库主人 10/26：开 = 阈值生效，关 = 纯 fq）。
+       固定档（3 固定 cake / 纯暴力发包）不跑守护，开关只是记着，切回 1 / 2 档才生效。"""
+    if mode == "fixed_cake":
+        return f"{'开' if on else '关'}（固定 cake 下不生效）"
+    if mode == "fixed_burst":
+        return f"{'开' if on else '关'}（纯暴力发包下不生效）"
+    return "开 = 阈值生效（平时 cake，大流量 fq）" if on else "关 = 纯 fq 模式"
+
 def _netopt_adaptive(on):
     """菜单 12 → 7：自适应切换（守护进程）开 / 关。只改这一项，不重跑整套优化。"""
     if not ensure_remote_script(NETOPT_URL, NETOPT_LOCAL):
@@ -7780,7 +7789,7 @@ def net_optimize_menu():
         # 换内核排在 4（仓库主人 10/15「移到第 4 位去」），状况 / 卸载顺延到 5 / 6
         ui_items([(4, "换 BBRv3 内核（XanMod）", _bbr_kernel_cur()), (5, "网络优化状况", None),
                   (6, "卸载网络优化（恢复系统默认）", None),
-                  (7, "自适应切换（守护进程）", "开" if d_on else "关"), (0, "返回", None)])
+                  (7, "自适应切换（守护进程）", _netopt_daemon_label(mode, d_on)), (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             if _netopt_confirm():

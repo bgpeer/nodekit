@@ -199,8 +199,8 @@ x._netopt_adaptive = lambda on: ad.append(on)
 it = iter(["7", "0"]); x._ask = lambda q="": next(it)
 with contextlib.redirect_stdout(io.StringIO()):
     x.net_optimize_menu()
-check("菜单 12 有「7. 自适应切换（守护进程）　当前：关」",
-      (7, "自适应切换（守护进程）", "关") in items)
+check("菜单 12 有「7. 自适应切换（守护进程）　当前：关 = 纯 fq 模式」",
+      (7, "自适应切换（守护进程）", "关 = 纯 fq 模式") in items)
 check("1/2 档守护关时，当前档位后面标「· 切换关」", any("切换关" in str(v) for _, v in kvs))
 check("选 7（当前关）→ 打开", ad == [True])
 check("菜单 1~6 一项没少", {i[0] for i in items} >= {4, 5, 6, 7, 0})
