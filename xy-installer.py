@@ -5002,6 +5002,25 @@ def _sb_direct_ip(cfg, targets):
 _SB_DNS_ADDR_KEYS = ("type", "server", "server_port", "path", "tls", "headers",
                      "detour", "method", "interface_name", "inet4_range", "inet6_range")
 
+def _sb_dns_dial(cfg, servers, was=None):
+    """sing-box：我们写进 dns.servers 的 DoH（自建 DNS / 私有解析）怎么出门 → (detour, domain_resolver)，没有的那项是 ""。
+       · detour：模板里的【直连】出站（作者模板里是选择器 🎯直连）。它要是个什么都没配的 direct 出站就不写——
+         sing-box 1.12 起 DNS 服务器 detour 到空 direct 出站整份配置起不来（"detour to an empty direct outbound
+         makes no sense"，common/dialer/detour.go），而 DNS 服务器不写 detour 本来就是直连。
+       · domain_resolver：解析 DoH 的域名本身。模板里的 bootstrap → 原来那台的（was）→ route.default_domain_resolver。
+       两样都没有时 sing-box 同样起不来（"missing domain resolver for domain server address"，common/dialer/dialer.go），
+       调用方拿到 ("", "") 就别写、说一行。两条都是对着 sing-box 1.14.4 源码核的（10/28）。"""
+    stags = {o.get("tag") for o in servers if isinstance(o, dict)}
+    obs = [o for o in cfg.get("outbounds", []) if isinstance(o, dict) and o.get("tag")]
+    d = next((o for o in obs if o["tag"] == "🎯直连"), None) or next((o for o in obs if "直连" in str(o["tag"])), None)
+    detour = d["tag"] if d and not (d.get("type") == "direct" and set(d) <= {"type", "tag"}) else ""
+    route = cfg.get("route") if isinstance(cfg.get("route"), dict) else {}
+    for r in ("bootstrap", was, route.get("default_domain_resolver")):
+        t = r.get("server") if isinstance(r, dict) else r
+        if isinstance(t, str) and t in stags:
+            return detour, r
+    return detour, ""
+
 def _sb_selfdns(cfg, url):
     """sing-box：把自建 DoH 顶掉【配置自己声明的兜底 DNS】（就地改 cfg dict）。
 
@@ -5023,7 +5042,7 @@ def _sb_selfdns(cfg, url):
 
        detour 走【直连】：DoH 就架在自己节点域名上，走代理等于让解析依赖代理、
        代理又要先解析，套娃。domain_resolver 用模板里的 bootstrap(223.5.5.5 UDP)
-       解析这个域名本身，同理。
+       解析这个域名本身，同理。自定义模板里这两样怎么挑见 _sb_dns_dial。
 
        地址由 _selfdns_doh() 按本机域名动态生成，不写死在模板里。关掉开关时 url 为空、
        直接返回；模板每次都是实时重拉的，"不写入"本身就等于"已删除"。
@@ -5042,12 +5061,14 @@ def _sb_selfdns(cfg, url):
         return
     servers = dns["servers"]
     want = dns.get("final") or "final"            # 配置自己声明的兜底 tag
-    tags = {o.get("tag") for o in cfg.get("outbounds", []) if isinstance(o, dict)}
-    direct = "🎯直连" if "🎯直连" in tags else next((t for t in tags if t and "直连" in str(t)), "")
-    have_bootstrap = any(isinstance(o, dict) and o.get("tag") == "bootstrap" for o in servers)
     for i, o in enumerate(servers):
         if not isinstance(o, dict) or o.get("tag") != want:
             continue
+        # 走哪个直连出站、谁解析 DoH 域名：bootstrap 优先，模板没有就沿用原来那台的写法（_sb_dns_dial）
+        direct, dr = _sb_dns_dial(cfg, servers, o.get("domain_resolver"))
+        if not direct and not dr:
+            print("  ⚠ sing-box 模板里没有 bootstrap DNS 也没有直连出站，自建 DNS 未写入这一份。")
+            return
         # 按 tag → 寻址 → 其它 → 解析器/出口 的顺序拼，跟模板里手写的排法一致，
         # 别人对着 diff 看时不会觉得整条被搅乱了
         keep = {k: v for k, v in o.items()
@@ -5057,8 +5078,6 @@ def _sb_selfdns(cfg, url):
             new["server_port"] = int(port)
         new["path"] = path
         new.update(keep)                       # 别人自定义加的字段原样带过来
-        # 解析 DoH 域名本身：优先模板里的 bootstrap；模板没有就沿用原来那台的写法
-        dr = "bootstrap" if have_bootstrap else o.get("domain_resolver")
         if dr:
             new["domain_resolver"] = dr
         if direct:
@@ -5115,8 +5134,8 @@ def _mihomo_privdns(tpl, nodes):
 
 def _sb_privdns(cfg, nodes):
     """sing-box：每台 DNS 机加一个 DoH 服务器（写法同 _sb_selfdns：模板里的 bootstrap 解析它的域名、走直连——
-       走代理就成了「连节点要先解析、解析又要连节点」的套娃），被藏的节点各自用 domain_resolver 指过去
-       （sing-box 1.12 起的出站字段；不指的话走 route.default_domain_resolver 那台国内 DNS，私有名查不到）。"""
+       走代理就成了「连节点要先解析、解析又要连节点」的套娃；自定义模板怎么挑见 _sb_dns_dial），被藏的节点各自用
+       domain_resolver 指过去（sing-box 1.12 起的出站字段；不指的话走 route.default_domain_resolver 那台国内 DNS，私有名查不到）。"""
     used = _privdns_used(nodes)
     if not used:
         return
@@ -5125,9 +5144,11 @@ def _sb_privdns(cfg, nodes):
         print("  ⚠ sing-box 模板里没有 dns.servers，被藏的节点这份里连不上")
         return
     servers = dns["servers"]
+    direct, dr = _sb_dns_dial(cfg, servers)
+    if not direct and not dr:
+        print("  ⚠ sing-box 模板里没有 bootstrap DNS 也没有直连出站，被藏的节点这份里连不上")
+        return
     stags = {o.get("tag") for o in servers if isinstance(o, dict)}
-    otags = {o.get("tag") for o in cfg.get("outbounds", []) if isinstance(o, dict)}
-    direct = "🎯直连" if "🎯直连" in otags else next((t for t in otags if t and "直连" in str(t)), "")
     tag_of = {}
     for url in dict.fromkeys(used.values()):
         m = _PRIVDNS_DNS.match(url)
@@ -5138,8 +5159,8 @@ def _sb_privdns(cfg, nodes):
         if m.group(2) and m.group(2) != "443":
             srv["server_port"] = int(m.group(2))
         srv["path"] = m.group(3)
-        if "bootstrap" in stags:
-            srv["domain_resolver"] = "bootstrap"
+        if dr:
+            srv["domain_resolver"] = dr
         if direct:
             srv["detour"] = direct
         servers.append(srv)

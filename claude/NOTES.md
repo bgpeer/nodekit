@@ -146,6 +146,12 @@
   sing-box 用出站的 `domain_resolver`（1.12+）；不指的话走 `route.default_domain_resolver`（模板里是阿里 DoH），私有名查不到。
   小火箭：`proxy-dns-server` 是全局的（所有节点域名都去问它），`[Host]` 里 `server:` 后面能不能写 DoH 文档没说——
   **被藏的节点小火箭那份先不放**（仓库主人 10/28 同意），要加回来先拿 `srtest.py pdns A / B` 在手机上测写法。
+- **对着源码核过**（10/28，mihomo v1.19.33 / sing-box v1.14.4 / AdGuard v0.107.79；容器里不让跑下载来的二进制，只读了源码）：
+  mihomo 的 policy 按名字精确匹配，问它不走分流规则（`respect-rules` 管不到这段）；sing-box 出站指了 `domain_resolver`
+  就直接问那台、不过 DNS 规则（拿不到 fakeip），A / AAAA 并发问、AAAA 空答不碍事；AdGuard 的 `$dnsrewrite` 只写了 A 时，
+  AAAA 回 NOERROR 空答。AdGuard 网页里关了「保护」或「过滤」，`user_rules` 整段不生效，私有名就查不到。
+  sing-box 有两条会让**整份配置起不来**：DNS 服务器 detour 到空 direct 出站；域名地址的 DNS 服务器既没 detour 又没
+  `domain_resolver`。作者模板（🎯直连 是选择器、有 bootstrap）碰不上，自定义模板会——`_sb_dns_dial` 挡这两条（自建 DNS、私有解析共用）。
 - 被藏机器的管理直连规则（`IP-CIDR,真实IP`）去掉（仓库主人 10/28 同意）；测试 `test_privdns.py`（IP 装的）、
   `test_privdns_domain.py`（域名装的）共用 `_fakedoh.py` 起的 TLS 假 AdGuard（按写进 yaml 的规则答），`_doh_ask` 走真握手、真 POST。
 
