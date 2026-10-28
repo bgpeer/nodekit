@@ -131,8 +131,13 @@
   老版主机自动忽略。DNS 机汇总时把「私有名 → IP」写进 AdGuardHome.yaml 的 `user_rules`（`! xy-privdns begin / end` 圈住，
   `$dnsrewrite`），映射存 `privdns-map.json`；名字 / IP 变了才 `systemctl restart AdGuardHome`（没有 AdGuard 的 API 凭据）。
 - **AdGuard 重启不碍本机看片**：装 AdGuard 时 `_do_free53` 把本机 resolv.conf 指向公共 DNS，本机进程（含 Emby 容器）不经过它。
-- **只换别的机器的节点**：本机自己的订阅地址本身就是本机 IP 加端口、中转前缀也带本机地址，自己那份藏了也白藏。
-  用域名装的机器藏不了（节点地址就是域名）；DNS 机一定是域名装的（DoH 要证书），所以它自己的节点永远不动。
+- **用 IP 装的**：私有名 `xxx.internal`，只换别的机器汇总它的那份（它自己的订阅地址就是本机 IP，藏了也白藏）。
+- **用域名装的**（仓库主人 10/28：「主要的是公网查不出节点的信息」）：节点专用域名「随机.根域名」，公网不建记录；共用证书
+  多签 `*.根域名`（同一条 acme.sh 记录、主域名还是节点域名——单开一条 `*.根域名` 记录会撞上 media-stack 给 Emby 签的
+  `*.域名` 那条）。重签共用证书的五个地方都带着它：`cert_want_names`、`ensure_acme`、`cert_fix_run`、`cert_install_apply`
+  （有 `*.` 就走 DNS-01）、adguard-dns 的菜单 8 和 `_revert_wildcard`（有它就不清令牌）。漏了也不会断：证书盖不住
+  （`_privdns_local_meta`）就照用公网域名、`.links` 不报私有名，03:20 那轮顺手重写 `.links`。成员机报的名字必须在它
+  公网域名的根域名底下，DNS 机拿它的公网域名解析出 IP。开 / 签证书走 `_node_op_dispatch`（op `privdns-domain`）。
 - **先问再换**：谁汇总就由谁去 DNS 问一遍私有名，IP 一个不差才换；问不通这一轮照写真实地址。从关 / 本机切到外机会换新名字
   （整机克隆的机器私有名会重），旧名字在 DNS 机上留 7 天。
 - **客户端**：mihomo 的 `proxy-server-nameserver-policy` 从 **v1.19.20** 才有（v1.19.19 的 config.go 里没有）；老内核不认，
@@ -140,9 +145,9 @@
   公共 DNS 先回的「查无此名」照样算数 → 时通时不通。policy 不能单独出现（要有 `proxy-server-nameserver`）。
   sing-box 用出站的 `domain_resolver`（1.12+）；不指的话走 `route.default_domain_resolver`（模板里是阿里 DoH），私有名查不到。
   小火箭：`proxy-dns-server` 是全局的（所有节点域名都去问它），`[Host]` 里 `server:` 后面能不能写 DoH 文档没说——
-  **被藏的节点小火箭那份先不放**（仓库主人 10/28 同意），要加回来先拿 `srtest.py` 在手机上测写法。
-- 被藏机器的管理直连规则（`IP-CIDR,真实IP`）去掉（仓库主人 10/28 同意）；测试 `test_privdns.py` 起一个 TLS 的假 AdGuard
-  （按写进 yaml 的规则答），`_doh_ask` 走真握手、真 POST。
+  **被藏的节点小火箭那份先不放**（仓库主人 10/28 同意），要加回来先拿 `srtest.py pdns A / B` 在手机上测写法。
+- 被藏机器的管理直连规则（`IP-CIDR,真实IP`）去掉（仓库主人 10/28 同意）；测试 `test_privdns.py`（IP 装的）、
+  `test_privdns_domain.py`（域名装的）共用 `_fakedoh.py` 起的 TLS 假 AdGuard（按写进 yaml 的规则答），`_doh_ask` 走真握手、真 POST。
 
 ## 客户端的坑（真机踩过）
 

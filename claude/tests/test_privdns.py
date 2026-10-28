@@ -12,7 +12,7 @@
   · 三份配置里任何地方都不出现被藏机器的真实 IP
 真 DoH：本地起一个 TLS 的假 AdGuard（自签 CA，按写进 yaml 的规则答），_doh_ask 照真流程握手、POST、解析回复。
 """
-import os, re, sys, io, json, time, types, ssl, socket, struct, threading, subprocess, tempfile, contextlib, importlib.util
+import os, re, sys, io, json, time, types, ssl, socket, tempfile, contextlib, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 bad = 0
 def check(l, ok):
@@ -33,76 +33,13 @@ tmp = tempfile.mkdtemp()
 quiet = lambda: contextlib.redirect_stdout(io.StringIO())
 
 DOM = "dns.example"                # DNS 机（3）的域名
-# ── 假 AdGuard：TLS + DoH，按 AdGuardHome.yaml 里我们那段规则答 ─────────────────────────────
-D = f"{tmp}/pki"; os.makedirs(D)
-def ossl(*a):
-    subprocess.run(["openssl", *a], cwd=D, check=True, capture_output=True)
-ossl("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", "ca.key",
-     "-out", "ca.crt", "-subj", "/CN=test-ca", "-days", "2")
-ossl("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", "srv.key",
-     "-out", "srv.csr", "-subj", "/CN=dns.example")
-open(f"{D}/ext", "w").write("subjectAltName=DNS:dns.example\n")
-ossl("x509", "-req", "-in", "srv.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial", "-out", "srv.crt",
-     "-days", "2", "-extfile", "ext")
-sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); sctx.load_cert_chain(f"{D}/srv.crt", f"{D}/srv.key")
-cctx = ssl.create_default_context(cafile=f"{D}/ca.crt")
-ANS, STATUS, SEEN = {}, [200], []
-lsock = socket.socket(); lsock.bind(("127.0.0.1", 0)); lsock.listen(16)
-PORT = lsock.getsockname()[1]
-
-def dns_reply(q):
-    i, labels = 12, []
-    while q[i]:
-        labels.append(q[i + 1:i + 1 + q[i]].decode()); i += q[i] + 1
-    name, qt = ".".join(labels), struct.unpack(">H", q[i + 1:i + 3])[0]
-    rc, ips = ANS.get((name, qt), (0, []) if any(k[0] == name for k in ANS) else (3, []))
-    ans = b""
-    for ip in ips:
-        rd = socket.inet_pton(socket.AF_INET if qt == 1 else socket.AF_INET6, ip)
-        ans += struct.pack(">HHHIH", 0xC00C, qt, 1, 60, len(rd)) + rd      # 名字用压缩指针指回问题
-    return struct.pack(">HHHHHH", 0, 0x8180 | rc, 1, len(ips), 0, 0) + q[12:i + 5] + ans
-
-def serve():
-    while True:
-        try:
-            c, _ = lsock.accept()
-        except OSError:
-            return
-        try:
-            t = sctx.wrap_socket(c, server_side=True)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                d = t.recv(4096)
-                if not d:
-                    break
-                data += d
-            head, _, body = data.partition(b"\r\n\r\n")
-            n = int(re.search(rb"(?i)content-length: (\d+)", head).group(1))
-            while len(body) < n:
-                body += t.recv(4096)
-            SEEN.append(head.decode(errors="replace"))
-            if STATUS[0] != 200:
-                t.sendall(f"HTTP/1.0 {STATUS[0]} No\r\n\r\n".encode())
-            else:
-                msg = dns_reply(body)
-                t.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: %d\r\n\r\n"
-                          % len(msg) + msg)
-            t.close()
-        except Exception:
-            try: c.close()
-            except Exception: pass
-threading.Thread(target=serve, daemon=True).start()
-
+# ── 假 AdGuard：TLS + DoH，按 AdGuardHome.yaml 里我们那段规则答（_fakedoh.py，两个私有解析测试共用）───────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _fakedoh import FakeAGH
+AGH = FakeAGH(tmp, DOM)
+ANS, STATUS, SEEN, PORT, cctx = AGH.ANS, AGH.STATUS, AGH.SEEN, AGH.port, AGH.client_ctx
 def agh_reload():
-    """假 AdGuard「重启」：重新读 yaml 里 user_rules 的 $dnsrewrite 规则。"""
-    ANS.clear()
-    rules = yaml.safe_load(open(x.AGH_YAML)).get("user_rules") or [] if yaml else \
-        re.findall(r"- '([^']*)'", open(x.AGH_YAML).read())
-    for r in rules:
-        m_ = re.match(r"^\|\|(.+)\^\$dnsrewrite=NOERROR;(A|AAAA);(.+)$", str(r))
-        if m_:
-            k = (m_.group(1), 1 if m_.group(2) == "A" else 28)
-            ANS.setdefault(k, (0, []))[1].append(m_.group(3))
+    AGH.reload(x.AGH_YAML)
 
 class _Sock:                     # 连 DNS 机域名的都连到本机假 AdGuard；别的照真 socket
     def __getattr__(self, k):
@@ -114,7 +51,8 @@ x.ssl = types.SimpleNamespace(create_default_context=lambda: cctx, SSLError=ssl.
 
 # ── 路径 / 外部调用全换成临时的 ─────────────────────────────────────────────────────
 for k in ("PRIVDNS_FILE", "PRIVDNS_MAP_FILE", "LINKS_FILE", "CFG_FILE", "SBOX_FILE", "SR_FILE", "SR_NODES_FILE",
-          "HOST_FILE", "PEERS_FILE", "SELFDNS_FLAG", "SELFDNS_CID_FILE", "TOKENS_FILE", "HY2_BW_FILE", "AGH_YAML"):
+          "HOST_FILE", "PEERS_FILE", "SELFDNS_FLAG", "SELFDNS_CID_FILE", "TOKENS_FILE", "HY2_BW_FILE", "AGH_YAML",
+          "STATE_FILE"):
     setattr(x, k, f"{tmp}/{k.lower()}")
 for e, f in (("yaml", "CFG_FILE"), ("json", "SBOX_FILE"), ("conf", "SR_FILE")):
     x.FMT[e]["file"] = getattr(x, f)
@@ -458,15 +396,15 @@ def run_menu(*answers):
 
 HOST[0] = "agg1-ip-host"
 x._host = lambda: IP1
-LOCAL[:] = L3
+LOCAL[:] = []
 x.privdns_save({"mode": "off", "dns": "", "name": ""})
 out = run_menu("2")
-check("域名装的机器选 2：一行提示藏不了，不改设置", "藏不了" in out and x.privdns_conf()["mode"] == "off")
+check("还没装节点选 2：一行提示，不改设置", "还没装节点" in out and x.privdns_conf()["mode"] == "off")
 LOCAL[:] = M1
 out = run_menu("2", "http://bad.example")
 check("地址不对：不认", "不是外机的 DNS 地址" in out and x.privdns_conf()["mode"] == "off")
 out = run_menu("2", DOH, "")
-check(f"粘了地址、后果用红字一行说清，默认否 → 没改动", "小火箭那份不放本机节点" in out and "已取消" in out
+check("粘了地址、后果用红字一行说清，默认否 → 没改动", "小火箭那份不放本机节点" in out and "已取消" in out
       and x.privdns_conf()["mode"] == "off")
 ANS.clear()
 out = run_menu("2", DOH, "y")

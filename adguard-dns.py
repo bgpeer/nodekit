@@ -340,14 +340,18 @@ def _install_cert_guarded(acme, dom, reload_hook, what=""):
             shutil.copyfile(p, bak[p])
     sh(f"{acme} --install-cert -d {dom} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
-    if nd and not _name_covers(_cert_names(ACME_CRT), nd):
-        print(f"\n  {R}❌ 导出的证书盖不住节点正在用的域名 {nd}"
-              f"（它覆盖的是 {', '.join(_cert_names(ACME_CRT)) or '(读不出)'}）。{N}")
+    root = _privdns_root()                             # 节点专用域名（菜单 11）也是节点在用的，一样得盖住
+    have = _cert_names(ACME_CRT)
+    miss = nd if nd and not _name_covers(have, nd) else \
+        (f"*.{root}" if root and not _name_covers(have, "x." + root) else "")
+    if miss:
+        print(f"\n  {R}❌ 导出的证书盖不住节点正在用的域名 {miss}"
+              f"（它覆盖的是 {', '.join(have) or '(读不出)'}）。{N}")
         print(f"  {R}   装上去会让所有吃证书的节点被客户端拒绝（reality 不受影响），"
               f"已还原成原来那张。{N}")
         # 顺序不能反：先把 acme 记录改回节点域名（免得下次自动续期又来一遍），
         # 【最后】才还原文件——install-cert 本身也会写这两个文件，先还原就白还原了。
-        if nd != dom:
+        if nd and nd != dom:
             sh(f"{acme} --install-cert -d {nd} --ecc "
                f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
         for p, b in bak.items():                       # 文件还原，保证一个字节没动
@@ -653,13 +657,16 @@ def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
         print(f"  {R}找不到 acme.sh{N}，无法重签。"); return
-    http01 = not _port_busy(80)
+    root = _privdns_root()                        # 节点专用域名（菜单 11）还要 *.根域名：只能 DNS-01，令牌留着
+    http01 = not _port_busy(80) and not root
     if http01:
         issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256 --server letsencrypt --force"
         how = "HTTP-01（80 端口空闲，撤销后不再依赖 CF Token）"
     else:
-        issue = f"{acme} --issue -d {dom} --dns dns_cf --keylength ec-256 --server letsencrypt --force"
-        how = f"DNS-01（80 被占用，{Y}CF Token 仍需保留供续期{N}）"
+        issue = (f"{acme} --issue -d {dom}" + (f" -d '*.{root}'" if root else "") +
+                 " --dns dns_cf --keylength ec-256 --server letsencrypt --force")
+        how = (f"DNS-01（节点专用域名还要 *.{root}，{Y}CF Token 仍需保留供续期{N}）" if root else
+               f"DNS-01（80 被占用，{Y}CF Token 仍需保留供续期{N}）")
     print(f"\n  正在重签单域名证书，验证方式：{how} …")
     r = subprocess.run(issue, shell=True, text=True, capture_output=True)
     out = ((r.stdout or "") + (r.stderr or "")).strip()
@@ -696,8 +703,8 @@ def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
                 print(f"  {G}✓ 已清除 acme.sh 里的 CF Token{N}（备份 {conf}.bak）。"
                       f"{Y}记得回 CF 把该 Token 删掉。{N}")
     elif auto_token:
-        print(f"  {Y}⚠ 80 端口被占，只能走 DNS-01 重签 —— acme.sh 里的 CF Token 必须留着{N}"
-              f"（约 90 天后续期还要用它），所以没有清除。")
+        print(f"  {Y}⚠ {'节点专用域名还要 *.' + root if root else '80 端口被占'}，只能走 DNS-01 重签 —— "
+              f"acme.sh 里的 CF Token 必须留着{N}（约 90 天后续期还要用它），所以没有清除。")
     if ask and cid and _allowed_clients():
         print(f"  {R}⚠ 白名单还留着 {cid}{N} —— 现在安卓 DoT 带不了它了，会被挡。"
               f"要用 DoT 就去 AdGuard 把白名单清空。")
@@ -774,8 +781,10 @@ def dot_clientid():
         print("  找不到 acme.sh —— 你的证书可能不是本脚本签的，不便自动接管。"); return
 
     print(f"\n  正在签发（DNS-01 验证，需要等 CF 记录传播，约 1-2 分钟）…")
+    root = _privdns_root()                                # 节点专用域名（菜单 11）要的 *.根域名，一起签上
     issue = (f"CF_Token='{token}' {acme} --issue --dns dns_cf "
-             f"-d {dom} -d '*.{dom}' --keylength ec-256 --server letsencrypt")
+             f"-d {dom} -d '*.{dom}'" + (f" -d '*.{root}'" if root else "") +
+             " --keylength ec-256 --server letsencrypt")
     r = subprocess.run(issue, shell=True, text=True, capture_output=True)
     out = ((r.stdout or "") + (r.stderr or "")).strip()
     if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
@@ -1897,6 +1906,20 @@ def _selfdns_toggle():
     elif not was and not os.path.exists(SELFDNS_FLAG):
         print("  " + _hl("1;33", "⚠ 自建 DNS 没写进订阅（原因见上面；没有原因就再选一次 6）"))
     _ask("  按回车返回菜单…")
+
+def _privdns_root():
+    """主脚本菜单 11 开着「节点专用域名」（用域名装的机器，私有名是 随机.根域名）→ 根域名；没有返回 ''。
+       共用证书上多签着 *.根域名 盖住它：这边重签证书（菜单 8、撤销）一定要带上，丢了节点就握手失败。"""
+    try:
+        import json
+        c = json.load(open(PRIVDNS_FILE))
+    except Exception:
+        return ""
+    n = str(c.get("name") or "")
+    if c.get("mode") not in ("self", "remote") or not re.match(r"^[a-z0-9]{6,32}\.(?:[a-z0-9-]+\.)+[a-z]{2,}$", n) \
+            or n.endswith(".internal"):
+        return ""
+    return n.split(".", 1)[1]
 
 def _privdns_mode():
     """菜单 11 的「当前」：主脚本存在 privdns.json 里（off / self / remote）。"""
