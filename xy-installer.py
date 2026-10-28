@@ -3974,18 +3974,9 @@ def _cn_into_direct(members, cn):
         out.insert(i, CN_GROUP)
     return out + [n for n in cn if n not in out]
 
-def _local_xray_reality():
-    """本机 xray 内核开的 reality 入站 → {(对外地址, 链接里的端口, 借用域名)}。
-       挂在 nginx 443 分流后面的（监听 127.0.0.1）链接里报的是 443——sing-box 的 reality-vision 也是 443，
-       光看端口分不开，所以带上借用域名（两个核心的借用域名不一样才会挂进去，见 _xr_behind_split）。
-
-       sing-box 订阅要跳过它们：xray 新版的 REALITY 只收 ClientHello 里带 X25519MLKEM768 的客户端
-       （XTLS/REALITY tls.go：reject outdated/strange Client Hello that doesn't have X25519MLKEM768），
-       服务端没有开关能放宽；sing-box 的 reality 客户端不带这一项（新装模拟用 sing-box 1.12 / 1.14 对
-       xray 26.9 实测，换哪种 utls 指纹都一样被拒；Hiddify / NekoBox 用的也是 sing-box 内核），
-       握手直接被当成探测转去借用站，表现就是证书错 / 超时。
-       mihomo 带了，所以 mihomo / 小火箭订阅照常保留这些节点。sing-box 内核开的 reality 不受影响。
-       只认本机（地址 = 本机域名 / IP）：多机聚合进来的别人节点看不到人家的内核，不动。"""
+def _xray_reality_ports():
+    """本机 xray 内核开的 reality 入站 → {(链接里的端口, 借用域名)}。挂在 nginx 443 分流后面的（监听 127.0.0.1）
+       链接里报的是 443。"""
     try:
         cfg = json.load(open(f"{XRAY_DIR}/config.json"))
     except Exception:
@@ -4000,6 +3991,22 @@ def _local_xray_reality():
                 ports.add((443 if local else int(ib["port"]), sni))
             except (TypeError, ValueError):
                 pass
+    return ports
+
+def _local_xray_reality():
+    """本机 xray 内核开的 reality 入站 → {(对外地址, 链接里的端口, 借用域名)}。
+       挂在 nginx 443 分流后面的（监听 127.0.0.1）链接里报的是 443——sing-box 的 reality-vision 也是 443，
+       光看端口分不开，所以带上借用域名（两个核心的借用域名不一样才会挂进去，见 _xr_behind_split）。
+
+       sing-box 订阅要跳过它们：xray 新版的 REALITY 只收 ClientHello 里带 X25519MLKEM768 的客户端
+       （XTLS/REALITY tls.go：reject outdated/strange Client Hello that doesn't have X25519MLKEM768），
+       服务端没有开关能放宽；sing-box 的 reality 客户端不带这一项（新装模拟用 sing-box 1.12 / 1.14 对
+       xray 26.9 实测，换哪种 utls 指纹都一样被拒；Hiddify / NekoBox 用的也是 sing-box 内核），
+       握手直接被当成探测转去借用站，表现就是证书错 / 超时。
+       mihomo 带了，所以 mihomo / 小火箭订阅照常保留这些节点。sing-box 内核开的 reality 不受影响。
+       这里只认本机（地址 = 本机域名 / IP）；多机聚合进来的成员机看不到人家的内核，由成员机自己在 .links 末尾报
+       （#xray-reality 端口 借用域名，见 _write_links_file），主机汇总时认（_XR_PEER）。"""
+    ports = _xray_reality_ports()
     if not ports:
         return set()
     hosts = {h for h in (G.get("host"), G.get("domain"), _host()) if h}
@@ -4020,9 +4027,9 @@ def build_singbox_sub(nodes, tpl_url):
     objs, xr_skip = [], 0
     xr_reality = _local_xray_reality()
     for key, d in nodes:
-        if d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0),
-                                      str(d.get("servername", ""))) in xr_reality:
-            xr_skip += 1                                     # 见 _local_xray_reality：sing-box 客户端连不上
+        if d.get("_xr_reality") or (d.get("reality-opts") and (str(d.get("server", "")), int(d.get("port") or 0),
+                                                               str(d.get("servername", ""))) in xr_reality):
+            xr_skip += 1                                     # 见 _local_xray_reality：sing-box 客户端连不上（成员机的见 _XR_PEER）
             continue
         try:
             ob = mihomo_to_sb_outbound(key, d)
@@ -5600,13 +5607,47 @@ def _privdns_links_line():
     meta = _privdns_local_meta(quiet=True)
     return f"#privdns {meta[0]} {meta[1]}" if meta else ""
 
+# 成员机 xray 内核的 reality：sing-box 系客户端连不上（见 _local_xray_reality），主机看不到成员机的内核，
+# 由成员机在 .links 末尾一条一行报出来（端口 借用域名）；老版主机只认节点链接前缀，这几行自动忽略。
+_XR_META = re.compile(r"(?m)^#xray-reality[ \t]+(\d{1,5})[ \t]+([A-Za-z0-9.-]+)[ \t]*$")
+_XR_PEER = set()                 # 这一轮汇总里成员机报的 xray reality：{_xr_id}（aggregated_links 填，parse_nodes 标到节点上）
+
 def _write_links_file(local):
-    """.links 端点的内容：本机分享链接一行一条；选了外机DNS解析的末尾多一行 #privdns（见 _privdns_links_line）。
-       链接里照写真实 IP：替本机解析的那台要靠它知道本机的 IP。"""
+    """.links 端点的内容：本机分享链接一行一条，末尾几行说明（老版主机只认节点链接前缀，自动忽略）：
+       · xray 内核开了 reality 的，一条一行 #xray-reality 端口 借用域名（主机照它不写进 sing-box 订阅，见 _XR_PEER）；
+       · 选了外机DNS解析 / 开着节点专用域名的，最后一行 #privdns（见 _privdns_links_line）。
+       链接里照写真实 IP：替本机解析的那台要靠它知道本机的 IP。
+       内容没变不写；要写先写临时文件再换上——主机 03:20 正好来拉时拿不到半截。只给 root 看（同 harden_perms）。"""
     if not local:
         return
-    extra = _privdns_links_line()
-    open(LINKS_FILE, "w").write("\n".join(list(local) + ([extra] if extra else [])) + "\n")
+    extra = [f"#xray-reality {p} {s}" for p, s in sorted(_xray_reality_ports()) if s] + [_privdns_links_line()]
+    body = "\n".join(list(local) + [e for e in extra if e]) + "\n"
+    try:
+        if open(LINKS_FILE).read() == body:
+            return
+    except OSError:
+        pass
+    tmp = LINKS_FILE + ".new"
+    with open(tmp, "w") as f:
+        os.chmod(tmp, 0o600)
+        f.write(body)
+    os.replace(tmp, LINKS_FILE)
+
+def _xr_id(d):
+    """reality 节点汇总前后都不变的那几样：uuid、端口、借用域名（私有解析换地址、改名、撞名加上标都不碰它们）。"""
+    return (str(d.get("uuid", "")), int(d.get("port") or 0), str(d.get("servername", "")).lower())
+
+def _xr_ids(links, ports):
+    """成员机报的 xray reality（{(端口, 借用域名)}）→ 它这几条链接的 _xr_id。"""
+    out = set()
+    for u in links:
+        try:
+            d = link_to_proxy(u)
+        except Exception:
+            continue
+        if d and d.get("reality-opts") and _xr_id(d)[1:] in ports:
+            out.add(_xr_id(d))
+    return out
 
 def _privdns_meta(text):
     """成员机 .links 里的 `#privdns` 行 → (私有名, DNS 地址)；没有 / 写错返回 None。"""
@@ -6009,6 +6050,7 @@ def aggregated_links(local=None):
     links = list(local if local is not None else read_saved_links())
     seen = set(links)
     groups = [(links, None)]                            # 一台一组：私有解析按台换名（见 _privdns_apply）
+    _XR_PEER.clear()
     for u in load_peers():
         try:
             text = _fetch_text(u)
@@ -6019,6 +6061,9 @@ def aggregated_links(local=None):
             s = line.strip()
             if s.startswith(_NODE_SCHEMES) and s not in seen:
                 seen.add(s); got.append(s)
+        xr = {(int(p), s.lower()) for p, s in _XR_META.findall(text)}
+        if xr:
+            _XR_PEER.update(_xr_ids(got, xr))           # 成员机 xray 内核的 reality：sing-box 订阅不写
         groups.append((got, _privdns_meta(text)))
     links = _privdns_apply(groups)                      # 指定了私有解析的成员机：问过它的 DNS、对上了才换成私有名
     links = [_link_rename(u, _sep_name(_link_name(u))) for u in links]   # 统一补「前缀·协议」
@@ -6037,6 +6082,8 @@ def parse_nodes(all_links):
         d["_link"] = u                                   # 原始分享链接（名字已规范化），小火箭节点订阅照抄它
         if d.get("server") in _PRIVDNS_LIVE:
             d["_privdns"] = _PRIVDNS_LIVE[d["server"]]   # 被藏的节点：它的私有名该去问哪台 DNS（三个生成器看这个）
+        if _XR_PEER and d.get("reality-opts") and _xr_id(d) in _XR_PEER:
+            d["_xr_reality"] = True                      # 成员机报的 xray 内核 reality：sing-box 订阅不写（见 _XR_PEER）
         k = proto_key(d)
         if k:
             nodes.append((k, d))
@@ -6829,8 +6876,10 @@ def cfg_auto_run():
     n = _xray_pq_health()                       # 借用目标站换了短证书链：关掉抗量子签名，不然 xray 的 reality 全断
     if n:
         print(f"{time.strftime('%F %T')} 借用目标站证书链变短，{n} 个 xray reality 节点关掉了抗量子签名（订阅已重建）")
-    if privdns_conf()["mode"] != "off" and read_saved_links():
-        _write_links_file(read_saved_links())   # 私有解析：证书要是被重签丢了 *.根域名，.links 末尾那行跟着撤，别的主机就不换名了
+    if read_saved_links():
+        # .links 末尾的说明行跟着本机现状走（内容没变不写）：私有解析的证书要是被重签丢了 *.根域名，那行跟着撤，
+        # 别的主机就不换名了；xray reality 那几行让主机别把它们写进 sing-box 订阅（脚本自更新后当晚就补上）
+        _write_links_file(read_saved_links())
     day = _cfg_auto_due()
     if not day:
         return                                  # 今天已跑过：安静退出

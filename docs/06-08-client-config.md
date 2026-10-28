@@ -101,10 +101,10 @@
   以前写的是 Surge / mihomo 的叫法（`username` / `sni` / `skip-cert-verify` / `public-key`…），
   10/11 实测配置里的节点有的出不来、有的超时，多半栽在这。
 - **小火箭里没有的几类**（单条链接照样在「2 节点链接」里）：
-  - **xray 内核的 reality**（名字带 ²）：xray 26.9.8+ 只收握手里带 X25519MLKEM768 的客户端，小火箭 2.2.92 没带，
-    连上去会被当成探测转给借用站（[小火箭官方 issue](https://github.com/Shadowrocket/config/issues/4)，9 月底还开着）。
-    跟 sing-box 订阅一样不写；sing-box 内核的 reality（¹）不受影响。
   - xhttp（小火箭不支持）、httpupgrade（小火箭会当成 websocket 连，必断）、量子加密 VLESS（配置里的写法查不到）。
+- **xray 内核的 reality**（名字带 ²）：xray 26.9.8+ 只收握手里带 X25519MLKEM768 的客户端。小火箭带了（10/20 苹果实测
+  vision² 能连），配置里照写；**sing-box 订阅不写**——sing-box 系客户端（sing-box App / Hiddify / NekoBox）不带这一项，
+  握手会被当成探测转给借用站。[聚合](03-merge.md)进来的成员机也一样不写；sing-box 内核的 reality（¹）不受影响。
   - hy2 端口跳跃小火箭配置里的写法查不到，没写：连跳跃段的起点端口，服务端转到真端口，照样通。
 
 **节点订阅（两个链接）还留着**：「8 小火箭配置 → 6 小火箭节点」可以改成节点走单独的 `.txt` 订阅
