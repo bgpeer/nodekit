@@ -556,13 +556,20 @@ def ensure_acme():
         sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
         Y_, R_, N_ = "\033[1;33m", "\033[1;31m", "\033[0m"
         wild, why = _wildcard_wanted()
-        if wild and _acme_has_cf():
+        root = _privdns_root()                   # 节点专用域名（13 → 11）要的 *.根域名，同样只能 DNS-01
+        if root and _root_domain(G["domain"]) != root:
+            root = ""                            # 这次装的域名换了根域名：旧的不带（令牌多半管不着那个区域）
+        if root and not _acme_has_cf():
+            print(f"{Y_}  ⚠ 节点专用域名要 *.{root}，acme.sh 里没有 Cloudflare 凭据签不出来，"
+                  f"这次节点照用公网域名（13 → 11 再选一次就补签）{N_}")
+            root = ""
+        if (wild or root) and _acme_has_cf():
             # 泛域名只能走 DNS-01。acme.sh 里存着 CF 凭据，那就照着原样签回来，
             # 而不是降级——Emby 的共用关系靠软链指向这个文件，泛域名保住就不会断。
-            print(f"  这台机该用泛域名证书（{why}），改走 DNS-01 签 "
-                  f"{G['domain']} + *.{G['domain']}")
-            issue = (f"{acme} --issue --dns dns_cf -d {G['domain']} -d '*.{G['domain']}' "
-                     f"--keylength ec-256 --server letsencrypt")
+            names = [G["domain"]] + ([f"*.{G['domain']}"] if wild else []) + ([f"*.{root}"] if root else [])
+            print(f"  这台机该用泛域名证书（{why or '节点专用域名'}），改走 DNS-01 签 " + " + ".join(names))
+            issue = (f"{acme} --issue --dns dns_cf " + " ".join(f"-d '{n}'" for n in names) +
+                     f" --keylength ec-256 --server letsencrypt")
         elif wild:
             # 只能降级了，但绝不静默：说清楚丢了什么、会坏什么、装完去哪儿补。
             print(f"{Y_}  ⚠ 这台机该用泛域名证书（{why}），{N_}")
@@ -573,15 +580,16 @@ def ensure_acme():
             print(f"{Y_}    装完回面板『15 域名证书管理 → 1 安装证书』用 DNS-01 重签一张"
                   f"泛域名的，再『4 Emby 证书』合并回去。{N_}")
             wild = False
-        if not wild and G.get("nginx"):
+        dns01 = bool(wild or root)
+        if not dns01 and G.get("nginx"):
             issue = f"{acme} --issue -d {G['domain']} --webroot {WEBROOT} --keylength ec-256"
-        elif not wild:
+        elif not dns01:
             if not port_free(80):
                 raise RuntimeError(
                     "80 端口被占用，acme.sh --standalone 无法验证。"
                     "先停掉占用 80 的服务(nginx/caddy 等)，或改用自签(回车跳过域名)。")
             issue = f"{acme} --issue -d {G['domain']} --standalone --keylength ec-256"
-        if not wild:
+        if not dns01:
             fw_allow({(80, "tcp")})                  # HTTP-01 要从外面连 80：开着防火墙先放行（mack-a 同做法）
         # acme.sh 在证书仍有效时会以退出码 2 “跳过续期”，这不是错误；
         # 只要最终能 install-cert 导出证书就算成功，否则才把真实报错抛出来。
@@ -596,7 +604,7 @@ def ensure_acme():
         # 记下这次签的是什么，下次重装才知道该不该保泛域名
         try:
             save_cert_meta(domain=G["domain"], wildcard=bool(wild),
-                           mode="dns-cf" if wild else
+                           mode="dns-cf" if dns01 else
                                 ("webroot" if G.get("nginx") else "standalone"))
         except Exception:
             pass
@@ -1362,8 +1370,9 @@ def _nginx_80_server():
 
 def _nginx_https_server(listen):
     """https 伪装站 + ws 反代；listen 为监听指令（公网 443 或本地 127.0.0.1:8443）。"""
+    pn = _privdns_nginx_name()                        # 节点专用域名（13 → 11）：证书盖得住就一起认
     return (f"server {{\n{listen}"
-            f"  server_name {G['domain']};\n"
+            f"  server_name {G['domain']}{' ' + pn if pn else ''};\n"
             f"  server_tokens off;\n"                 # 同上：伪装站也别把版本号摆出来
             f"  ssl_certificate {ACME_CRT};\n  ssl_certificate_key {ACME_KEY};\n"
             f"  ssl_protocols TLSv1.2 TLSv1.3;\n"
@@ -3999,6 +4008,9 @@ def _local_xray_reality():
         hosts |= {h for h in (st.get("host"), st.get("domain")) if h}
     except Exception:
         pass
+    pn = privdns_conf()["name"]                          # 节点专用域名（13 → 11）：本机节点地址换成它以后也得认出来
+    if _privdns_is_domain_name(pn):
+        hosts.add(pn)
     return {(h, p, sni) for h in hosts for p, sni in ports}
 
 def build_singbox_sub(nodes, tpl_url):
@@ -5483,16 +5495,19 @@ def _group_by_prefix(links):
 #     本机 AdGuard 的自定义规则。「主机把 IP 带过去」走的就是现成的聚合通道，不另开口子。
 #   · 谁汇总 1，就把 1 的节点地址换成私有名，配置里再写一句「这个名字只去问 3」。换之前先去 3 问一遍：答出来的
 #     IP 跟 1 的链接对得上才换；答不对、问不到，这一轮照写真实地址，保证能连。
-# 只换别的机器的节点：本机自己的订阅地址就是 http://本机IP:端口/…，自己那份藏了也白藏。
-# 用域名装的机器藏不了（节点地址就是域名，公网一查就是 IP），所以 3 自己的节点不动、1 / 2 得是用 IP 装的。
-# .internal 是 ICANN 2024 年留给内网的后缀：公网 DNS 永远查不到，也没人能注册。
+# 用 IP 装的机器：私有名是 xxxx.internal（.internal 是 ICANN 2024 年留给内网的后缀：公网 DNS 永远查不到，也没人能注册）；
+# 只换别的机器汇总它的那份——它自己的订阅地址就是 http://本机IP:端口/…，自己那份藏了也白藏。
+# 用域名装的机器（仓库主人 10/28：「节点用这个令牌的另外DNS来建，主要的是公网查不出节点的信息」）：节点改用
+# 「随机.根域名」这个节点专用域名，公网不建任何记录；共用证书多签一个 *.根域名 盖住它（Cloudflare 令牌、DNS 验证，
+# 不用公网记录），所有重签证书的地方都带着它（cert_want_names / ensure_acme / cert_fix_run，adguard-dns.py 菜单 8 和撤销）。
+# 公网那条记录照留：订阅、面板、伪装站、Emby 照用。它自己的订阅也换（证书盖得住、DNS 答对了才换，见 _privdns_local_meta）。
 # 客户端：mihomo 要 1.19.20+（proxy-server-nameserver-policy；老内核不认这一项，名字会去问公共 DNS，公共 DNS 回
 # 「查无此名」它也当有效答案——dns/util.go 的 batchExchange 只把 SERVFAIL / REFUSED 当失败——时通时不通）；
 # sing-box 1.12+（出站的 domain_resolver）；小火箭还没在手机上测出写法，被藏的节点小火箭那份先不放（仓库主人 10/28 同意）。
 PRIVDNS_ZONE  = "internal"
 PRIVDNS_GRACE = 7 * 86400        # 外机关掉 / 删掉 / 拉不到以后，映射再留 7 天：没刷新订阅的客户端不会马上断
 _PRIVDNS_MODES = {"off": "关", "self": "本机", "remote": "外机"}
-_PRIVDNS_NAME = re.compile(r"^[a-z0-9]{6,32}\.internal$")
+_PRIVDNS_NAME = re.compile(r"^[a-z0-9]{6,32}\.(?:internal|(?:[a-z0-9-]+\.)+[a-z]{2,})$")   # xxx.internal 或 随机.根域名
 _PRIVDNS_DNS  = re.compile(r"^https://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?::(\d{1,5}))?(/dns-query(?:/[A-Za-z0-9-]+)?)$")
 _PRIVDNS_META = re.compile(r"(?m)^#privdns[ \t]+(\S+)[ \t]+(\S+)[ \t]*$")
 _PRIVDNS_BEGIN, _PRIVDNS_END = "! xy-privdns begin", "! xy-privdns end"     # AdGuard 规则里圈住我们那一段
@@ -5514,18 +5529,55 @@ def privdns_save(c):
     json.dump({k: c.get(k, "") for k in ("mode", "dns", "name")}, open(PRIVDNS_FILE, "w"))
     harden_perms()                # 刚落地是 0644，当场收紧
 
-def _privdns_new_name():
-    """本机私有名：10 位小写字母数字 + .internal。从关 / 本机切到「外机DNS解析」时起一个，之后一直用它——
-       客户端配置里写的就是它，换 IP、换外机地址都不变（关了再开会换新的，见 _privdns_set_remote）。"""
+def _privdns_new_name(root=""):
+    """本机私有名：10 位小写字母数字 + .internal（用 IP 装的）或 + .根域名（用域名装的，节点专用域名）。
+       从关切到开时起一个，之后一直用它——客户端配置里写的就是它，换 IP、换外机地址、本机 / 外机互换都不变
+       （关了再开会换新的：整机克隆来的机器私有名会重，这样就分开了）。"""
     abc = "abcdefghijklmnopqrstuvwxyz0123456789"
-    return "".join(secrets.choice(abc) for _ in range(10)) + "." + PRIVDNS_ZONE
+    return "".join(secrets.choice(abc) for _ in range(10)) + "." + (root or PRIVDNS_ZONE)
+
+def _privdns_is_domain_name(n):
+    """是不是节点专用域名（随机.根域名，用域名装的机器）——不是 xxx.internal。"""
+    return bool(_PRIVDNS_NAME.match(n or "")) and not n.endswith("." + PRIVDNS_ZONE)
+
+def _privdns_root():
+    """证书要多签的 *.根域名 的那个根域名：本机开着私有解析、用的是节点专用域名才有；没有返回 ''。
+       重签共用证书的地方都靠它带上 *.根域名（漏一处，节点专用域名就握手失败——见 _privdns_local_meta 的兜底）。"""
+    c = privdns_conf()
+    if c["mode"] == "off" or not _privdns_is_domain_name(c["name"]):
+        return ""
+    root = c["name"].split(".", 1)[1]
+    nd = node_domain()
+    return root if not nd or _root_domain(nd) == root else ""      # 换过节点域名（根域名变了）：旧的不再带
+
+def _privdns_nginx_name():
+    """nginx 443 那个 server_name 要不要带上节点专用域名：证书盖得住就带（关掉以后也带着——还没刷新订阅的
+       客户端照样用它连，带着不碍事）。"""
+    n = privdns_conf()["name"]
+    return n if _privdns_is_domain_name(n) and _name_covers(cert_names(), n) else ""
+
+def _privdns_local_meta(quiet=False):
+    """本机自己的节点要不要换成节点专用域名（用域名装的机器开了私有解析才换）→ (私有名, DNS 地址) 或 None。
+       证书没盖住这个名字（重签时 *.根域名 被弄丢了）就不换、说一行：节点照用公网域名，照样能连。"""
+    c = privdns_conf()
+    n = c["name"]
+    if c["mode"] == "off" or not _privdns_is_domain_name(n):
+        return None
+    if not _name_covers(cert_names(), n):
+        if not quiet:
+            print(f"  ⚠ 证书里没有 *.{n.split('.', 1)[1]}，本机节点这次照用公网域名（13 → 11 再选一次就补签）")
+        return None
+    dns = c["dns"] if c["mode"] == "remote" else _agh_doh_url()
+    return (n, dns) if _PRIVDNS_DNS.match(dns or "") else None
 
 def _privdns_links_line():
-    """本机 .links 末尾那一行：选了外机DNS解析才有（`#privdns 私有名 外机DoH`），汇总本机的主机照它换名。"""
+    """本机 .links 末尾那一行（`#privdns 私有名 DNS地址`），汇总本机的主机照它换名：
+       用 IP 装的选了外机DNS解析才有；用域名装的开着（本机 / 外机）、证书盖得住节点专用域名才有。"""
     c = privdns_conf()
-    if c["mode"] != "remote" or not _PRIVDNS_NAME.match(c["name"]) or not _PRIVDNS_DNS.match(c["dns"]):
-        return ""
-    return f"#privdns {c['name']} {c['dns']}"
+    if c["mode"] == "remote" and c["name"].endswith("." + PRIVDNS_ZONE) and _PRIVDNS_DNS.match(c["dns"]):
+        return f"#privdns {c['name']} {c['dns']}"
+    meta = _privdns_local_meta(quiet=True)
+    return f"#privdns {meta[0]} {meta[1]}" if meta else ""
 
 def _write_links_file(local):
     """.links 端点的内容：本机分享链接一行一条；选了外机DNS解析的末尾多一行 #privdns（见 _privdns_links_line）。
@@ -5575,25 +5627,62 @@ def _privdns_ok_link(u):
         return False                                     # 这几种 link_to_proxy 都只认 sni=（vless 一律按 TLS 写）
     return not (q.get("type") in ("ws", "httpupgrade") and not q.get("host"))
 
-def _privdns_ips(links):
-    """一台机器的节点能不能藏 → 它的 IP 列表；不能藏返回 []。
-       能藏 = 除 CDN 节点外，地址全是 IP、每条都能放心换名（_privdns_ok_link）。用域名装的机器节点地址就是域名，
-       藏不了；CDN 节点连的是 Cloudflare，本来就不露 IP，照旧不动。"""
-    ips = []
+def _link_rehost(u, old, new):
+    """节点链接换地址：服务器地址换成 new；SNI / Host 原来就是这个地址的（用域名装的机器）一起换成 new，
+       借来的伪装域名（reality、自签那个 SNI）不动。节点名（# 后面）不碰。"""
+    if u.startswith("vmess://"):
+        b = u[8:]
+        j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        j["add"] = new
+        for k in ("sni", "host"):
+            if old and str(j.get(k) or "").lower() == old.lower():
+                j[k] = new
+        return vmess_link(j)
+    v = _link_set_server(u, new)
+    if old and not _is_ip(old):
+        head, sep, frag = v.partition("#")
+        head = re.sub(r"(?i)([?&](?:sni|host|peer)=)" + re.escape(old) + r"(?=&|$)",
+                      lambda m_: m_.group(1) + new, head)
+        v = head + sep + frag
+    return v
+
+def _privdns_addrs(links, name=""):
+    """一台机器的节点能不能藏 → (节点链接里现在写的地址, [IP])；不能藏返回 ("", [])。
+       · 用 IP 装的：地址全是 IP，私有名得是 xxx.internal。
+       · 用域名装的：地址都是同一个域名，私有名得是这个域名的根域名底下的「随机.根域名」；IP 从公网解析这个域名拿
+         （公网那条记录照留）。核对根域名是防成员机报个 xxx.别人家.com 过来，把 AdGuard 变成劫持别人域名的。
+       每条都得能放心换名（_privdns_ok_link）；CDN 节点连的是 Cloudflare，本来就不露 IP，照旧不动。"""
+    srv = []
     for u in links:
         if "CDN·" in _link_name(u):
             continue
         a = _link_addr(u)
-        s = a[0] if a else ""
-        if not s or not _is_ip(s) or not _privdns_ok_link(u):
-            return []
+        s = (a[0] if a else "").lower()
+        if not s or not _privdns_ok_link(u):
+            return "", []
+        if s not in srv:
+            srv.append(s)
+    if not srv:
+        return "", []
+    if all(_is_ip(s) for s in srv):
+        if name and not name.endswith("." + PRIVDNS_ZONE):
+            return "", []
         try:
-            s = str(ipaddress.ip_address(s))
+            return srv[0], list(dict.fromkeys(str(ipaddress.ip_address(s)) for s in srv))
         except ValueError:
-            return []
-        if s not in ips:
-            ips.append(s)
-    return ips
+            return "", []
+    dom = srv[0]
+    if len(srv) != 1 or (name and (not name.endswith("." + _root_domain(dom)) or name == dom)):
+        return "", []
+    try:
+        ips = sorted({str(ipaddress.ip_address(x[4][0].split("%")[0])) for x in socket.getaddrinfo(dom, None)})
+    except Exception:
+        return "", []
+    return dom, ips
+
+def _privdns_ips(links):
+    """_privdns_addrs 只要 IP 那一半。"""
+    return _privdns_addrs(links)[1]
 
 def _privdns_label(links):
     """屏上 / 日志里怎么叫这台：节点名前缀（🇺🇸1 这种）；拆不出来就叫「成员机」。"""
@@ -5703,7 +5792,7 @@ def _privdns_is_own(dns):
 def _privdns_check(name, dns, ips):
     """去 DNS 问一遍私有名：答出来的 IP 跟 ips 一个不差返回 ""，否则返回原因（一句话）。"""
     if not ips:
-        return "节点地址不是 IP（用域名装的藏不了）"
+        return "节点地址认不准（还没装节点，或者 SNI / Host 没写明）"
     local = _agh_local_addr() if _privdns_is_own(dns) else None
     try:
         for qt in (1, 28):
@@ -5826,19 +5915,20 @@ def _agh_wait(m, secs=20):
             pass
         time.sleep(1)
 
-def _privdns_sync(members):
-    """本机当 DNS 机（13 → 11 选 1）：把指定了本机的外机写进 PRIVDNS_MAP_FILE 和 AdGuard 规则。
-       外机关掉 / 删掉 / 拉不到的，过了 PRIVDNS_GRACE 才删。映射里的名字或 IP 变了才重启 AdGuard。
-       重启不碍本机看片：装 AdGuard 时本机解析改走公共 DNS（adguard-dns.py 的 _do_free53），本机进程都不经过它，
-       断的只是外面来问的那一两秒。members = [(这台的新链接, meta)]。"""
+def _privdns_sync(groups):
+    """本机当 DNS 机（13 → 11 选 1）：把指定了本机的机器（外机，还有用节点专用域名的本机自己）写进
+       PRIVDNS_MAP_FILE 和 AdGuard 规则。外机关掉 / 删掉 / 拉不到的，过了 PRIVDNS_GRACE 才删。
+       映射里的名字或 IP 变了才重启 AdGuard。重启不碍本机看片：装 AdGuard 时本机解析改走公共 DNS
+       （adguard-dns.py 的 _do_free53），本机进程都不经过它，断的只是外面来问的那一两秒。
+       groups = [(这台的新链接, meta)]。"""
     old = _privdns_map()
     now = int(time.time())
     m = {k: v for k, v in old.items() if now - int(v.get("seen") or 0) <= PRIVDNS_GRACE}
     if privdns_conf()["mode"] == "self" and _agh_doh_url():
         took = set()
-        for links, meta in members:
-            if meta and _privdns_is_own(meta[1]):
-                ips = _privdns_ips(links)
+        for links, meta in groups:
+            if meta and links and _privdns_is_own(meta[1]):
+                ips = _privdns_addrs(links, meta[0])[1]
                 if ips and meta[0] in took:
                     # 两台报的私有名一样：多半是整机克隆过来的（privdns.json 跟着拷了）。先到先得，后一台不藏
                     print(f"  ⚠ {_privdns_label(links)} 跟别的机器私有名一样（克隆来的？）：到它的 13 → 11 关了再开一次")
@@ -5858,25 +5948,32 @@ def _privdns_sync(members):
     return m
 
 def _privdns_apply(groups):
-    """汇总时把指定了私有解析的成员机节点换成私有名。groups = [(这台的新链接, meta)]，第一组是本机（不换）。
-       先当 DNS 机把映射对好，再逐台去它的 DNS 问：对上了才换，问不通照写真实地址（屏上 / 日志一行 ⚠）。"""
+    """汇总时把指定了私有解析的机器的节点换成私有名。groups = [(这台的新链接, meta)]，第一组是本机：
+       本机用 IP 装的不换（订阅地址就是本机 IP）；用域名装的开着私有解析就换成节点专用域名（_privdns_local_meta）。
+       先当 DNS 机把映射对好，再逐台去它的 DNS 问：对上了才换，问不通照写原来的地址（屏上 / 日志一行 ⚠）。"""
     _PRIVDNS_LIVE.clear()
+    if not groups:
+        return []
+    groups = [(groups[0][0], _privdns_local_meta())] + list(groups[1:])
     mode = privdns_conf()["mode"]
     if mode == "self" or os.path.exists(PRIVDNS_MAP_FILE):
-        _privdns_sync(groups[1:])
-    out = list(groups[0][0]) if groups else []
-    for links, meta in groups[1:]:
+        _privdns_sync(groups)
+    out = []
+    for links, meta in groups:
         if meta and links:
             name, dns = meta
+            old, ips = _privdns_addrs(links, name)
             if _privdns_is_own(dns) and mode != "self":
                 why = "本机没开「本机DNS解析」"
+            elif not ips:
+                why = "节点地址认不准（地址不是同一个、SNI / Host 没写明，或者域名解析不出来）"
             else:
-                why = _privdns_check(name, dns, _privdns_ips(links))
+                why = _privdns_check(name, dns, ips)
             if not why:
-                links = [u if "CDN·" in _link_name(u) else _link_set_server(u, name) for u in links]
+                links = [u if "CDN·" in _link_name(u) else _link_rehost(u, old, name) for u in links]
                 _PRIVDNS_LIVE[name] = dns
             else:
-                print(f"  ⚠ {_privdns_label(links)} 私有解析没对上：{why}，这次照写真实地址")
+                print(f"  ⚠ {_privdns_label(links)} 私有解析没对上：{why}，这次照写原来的地址")
         out += links
     return out
 
@@ -6711,6 +6808,8 @@ def cfg_auto_run():
     n = _xray_pq_health()                       # 借用目标站换了短证书链：关掉抗量子签名，不然 xray 的 reality 全断
     if n:
         print(f"{time.strftime('%F %T')} 借用目标站证书链变短，{n} 个 xray reality 节点关掉了抗量子签名（订阅已重建）")
+    if privdns_conf()["mode"] != "off" and read_saved_links():
+        _write_links_file(read_saved_links())   # 私有解析：证书要是被重签丢了 *.根域名，.links 末尾那行跟着撤，别的主机就不换名了
     day = _cfg_auto_due()
     if not day:
         return                                  # 今天已跑过：安静退出
@@ -7959,10 +8058,105 @@ def _privdns_served():
         return "还没有"
     return f"{len(m)} 台（" + "、".join(v.get("label") or "成员机" for _, v in sorted(m.items())) + "）"
 
+def _privdns_own_switched(name):
+    """本机订阅已经用上节点专用域名了吗（看三份配置里有没有这个名字）。"""
+    for f in (CFG_FILE, SBOX_FILE):
+        try:
+            if name in open(f).read():
+                return True
+        except OSError:
+            continue
+    return False
+
+def _privdns_domain_ready():
+    """本机是不是用域名装的、节点链接都写这个域名（CDN 节点不算）→ 域名；不是返回 ''。"""
+    dom = node_domain().lower()
+    if not dom:
+        return ""
+    srv = {((_link_addr(u) or ("",))[0] or "").lower() for u in read_saved_links() if "CDN·" not in _link_name(u)}
+    return dom if srv == {dom} else ""
+
+def _privdns_public_free(root):
+    """根域名上有没有 *.根域名 泛解析：有的话节点专用域名起什么都被公网查得到，藏不住。
+       拿一个用完就扔的随机名去问，不拿真要用的那个——真名字一个字都不往公网 DNS 送。"""
+    try:
+        socket.getaddrinfo(_privdns_new_name(root), None)
+        return False
+    except OSError:
+        return True
+
+def _privdns_domain_enable(c, mode, dns=""):
+    """用域名装的机器开私有解析（选 1 / 2）：节点改用公网查不到的节点专用域名「随机.根域名」。
+       前台问完（令牌、确认），证书 / nginx / 订阅转后台做——重签证书要重启核心，挂着本机代理连的 SSH 会断。"""
+    dom = _privdns_domain_ready()
+    root = _root_domain(dom)
+    keep = c["mode"] != "off" and c["name"].endswith("." + root) and _privdns_is_domain_name(c["name"])
+    name = c["name"] if keep else _privdns_new_name(root)
+    if not keep and not _privdns_public_free(root):
+        ui_warn(f"公网查得到 *.{root} 底下随便起的名字：Cloudflare 里多半有 *.{root} 泛解析，节点专用域名藏不住，没开")
+        return
+    covered = _name_covers(cert_names(), name)
+    cf = ""
+    if not covered and not _acme_has_cf():
+        _cf_token_steps(dom)
+        cf = _ask("  粘贴 Token: ").strip()
+        if not cf:
+            print("  没填 Token，已取消，没改动")
+            return
+    ui_warn("开了以后：节点改用公网查不到的专用域名，小火箭那份不放本机节点"
+            + ("" if covered else f"；证书要重签（多签 *.{root}），节点"
+               + ("和 nginx 后面的网站 / Emby" if "nginx" in _cert_consumers() else "") + "断几秒"))
+    if _ask("  确认开启? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("  已取消，没改动")
+        return
+    plan = {"op": "privdns-domain", "mode": mode, "dns": dns, "name": name, "cf_token": cf, "G": dict(G)}
+    _node_op_dispatch(plan, lambda: privdns_domain_apply(plan))
+
+def privdns_domain_apply(plan):
+    """后台跑（node-op 的 privdns-domain）：证书盖住节点专用域名 → 存设置 → nginx 认这个名字 → .links、订阅换过去。
+       证书签不出来就什么都不改，节点照用公网域名。返回开没开成。"""
+    dom, name = node_domain(), plan["name"]
+    root = name.split(".", 1)[1]
+    if not _name_covers(cert_names(), name):
+        # 现有证书上的名字（节点域名、*.域名、Emby 的）一个不丢，再多签一个 *.根域名
+        want = list(dict.fromkeys((cert_names() or [dom]) + [f"*.{root}"]))
+        print(f"  证书多签一个 *.{root}（Cloudflare DNS 验证，不用公网记录）")
+        if not cert_install_apply(dom, f"*.{dom}" in want, plan.get("cf_token", ""), want):
+            print("  ✗ 证书没签成，私有解析没开：节点照用公网域名")
+            return False
+    c = privdns_conf()
+    c.update(mode=plan["mode"], name=name, dns=plan.get("dns") or "")
+    privdns_save(c)
+    saved = dict(G)
+    try:
+        _restore_state_to_G(json.load(open(STATE_FILE)))
+        msg = _nginx_sync_from_cfg()                   # 443 那个 server_name 带上节点专用域名
+        if msg:
+            print("  " + msg)
+    except Exception as e:
+        print(f"  ⚠ nginx 没重建成（{e}），挂在 nginx 后面的节点先照用公网域名")
+    finally:
+        G.clear()
+        G.update(saved)
+    _write_links_file(read_saved_links())
+    _privdns_regen()
+    if name in _PRIVDNS_LIVE:
+        print("  " + _hl("1;32", f"✔ 已开：本机节点改用 {name}，客户端刷新订阅后生效"))
+    elif plan["mode"] == "remote":
+        print("  " + _hl("1;33", "⚠ 已开，外机还没对上：外机的「聚合节点链接」里要有本机，在外机点「更新配置」，"
+                                 "回来再进本菜单"))
+    else:
+        print("  " + _hl("1;33", "⚠ 已开，本机 AdGuard 还没答对这个名字（本菜单 7 自检）"))
+    return True
+
 def _privdns_set_self(c):
-    """选 1：本机当 DNS 机。要装好 AdGuard、开了加密（DoH 靠域名证书）。"""
+    """选 1：本机当 DNS 机。要装好 AdGuard、开了加密（DoH 靠域名证书）。
+       用域名装的（DNS 机都是）：本机节点也换成节点专用域名，由本机 AdGuard 解析。"""
     if not _agh_doh_url():
         ui_tip("本机要先装好 AdGuard、开加密（本菜单 1 装，3 看怎么开）")
+        return
+    if _privdns_domain_ready():
+        _privdns_domain_enable(c, "self")
         return
     was = c["mode"]
     c["mode"] = "self"
@@ -7973,10 +8167,11 @@ def _privdns_set_self(c):
     print("  " + _hl("1;32", "✔ 已开：把本机 DNS 地址粘到外机的「2 外机DNS解析」"))
 
 def _privdns_set_remote(c):
-    """选 2：本机节点交给外机解析。本机得是用 IP 装的（域名装的节点地址就是域名，藏不了）。"""
-    ips = _privdns_ips(read_saved_links())
-    if not ips:
-        ui_tip("本机节点用的是域名（或还没装节点），藏不了 IP，不用开")
+    """选 2：本机节点交给外机解析。用 IP 装的：私有名 xxx.internal；用域名装的：节点专用域名（_privdns_domain_enable）。"""
+    dom = _privdns_domain_ready()
+    ips = [] if dom else _privdns_ips(read_saved_links())
+    if not dom and not ips:
+        ui_tip("本机还没装节点（或节点链接没写明 SNI / Host），没法开")
         return
     url = _ask("  粘贴外机的 DNS 地址: ").strip()
     if not url:
@@ -7984,11 +8179,14 @@ def _privdns_set_remote(c):
     if not _PRIVDNS_DNS.match(url):
         print("  ✗ 不是外机的 DNS 地址（外机 13 → 11 选 1 后屏上那一行），已忽略")
         return
+    if dom:
+        _privdns_domain_enable(c, "remote", url)
+        return
     ui_warn("开了以后：汇总本机的订阅里，小火箭那份不放本机节点，本机的直连规则去掉")
     if _ask("  确认开启? [y/N]: ").strip().lower() not in ("y", "yes"):
         print("  已取消，没改动")
         return
-    if c["mode"] != "remote" or not _PRIVDNS_NAME.match(c["name"]):
+    if c["mode"] != "remote" or not c["name"].endswith("." + PRIVDNS_ZONE):
         # 每次从关 / 本机切过来都起个新名字：整机克隆来的机器私有名会重，关了再开就分开了。
         # 旧名字在外机那边还留 7 天（PRIVDNS_GRACE），没刷新订阅的客户端照样能解析
         c["name"] = _privdns_new_name()
@@ -8002,7 +8200,8 @@ def _privdns_set_remote(c):
         print("  " + _hl("1;33", f"⚠ 已开，外机还没对上：{why}"))
 
 def _privdns_set_off(c):
-    """选 3：关。当 DNS 机时关掉会让外机的节点改回真实地址——醒目一行 + 默认否（CLAUDE.md 第四节）。"""
+    """选 3：关。当 DNS 机时关掉会让外机的节点改回真实地址——醒目一行 + 默认否（CLAUDE.md 第四节）。
+       证书上的 *.根域名、nginx 认的节点专用域名都留着：还没刷新订阅的客户端照样连得上。"""
     if c["mode"] == "off":
         return
     if c["mode"] == "self" and _privdns_map():
@@ -8010,26 +8209,25 @@ def _privdns_set_off(c):
         if _ask("  确认关掉? [y/N]: ").strip().lower() not in ("y", "yes"):
             print("  已取消，没改动")
             return
-    was = c["mode"]
+    was, local = c["mode"], _privdns_is_domain_name(c["name"])
     c["mode"] = "off"
     privdns_save(c)
-    if was == "remote":
-        _write_links_file(read_saved_links())
-        print("  " + _hl("1;32", "✔ 已关：主机下次汇总改回真实地址"))
-    else:
-        _privdns_regen()
-        print("  " + _hl("1;32", "✔ 已关"))
+    _write_links_file(read_saved_links())              # .links 末尾那行撤掉
+    if was == "self" or local:
+        _privdns_regen()                               # 本机节点换回公网域名 / 外机节点改回原来的地址
+    print("  " + _hl("1;32", "✔ 已关" + ("：主机下次汇总改回原来的地址" if was == "remote" else "")))
 
 def privdns_menu():
     """13 → 11「节点使用私有DNS解析」（adguard-dns.py 调 privdns）。仓库主人 10/28 定的菜单：
-         1 本机DNS解析 —— 本机当 DNS 机：替指定了本机的外机解析（本机节点用的是域名，不用藏）
-         2 外机DNS解析 —— 本机节点交给外机解析：粘贴外机的 DNS 地址，汇总本机的主机把本机节点换成私有名
-         3 关          —— 跟原来一样，节点写真实地址，公网 DNS 都能解析
+         1 本机DNS解析 —— 本机当 DNS 机：替指定了本机的外机解析；本机节点也换成节点专用域名
+         2 外机DNS解析 —— 本机节点交给外机解析：粘贴外机的 DNS 地址
+         3 关          —— 跟原来一样，节点写原来的地址，公网 DNS 都能解析
        来龙去脉见 aggregated_links 上面那段注释。"""
     while True:
         c = privdns_conf()
         ui_title(f"节点使用私有DNS解析　当前：{_PRIVDNS_MODES[c['mode']]}")
         tip = ""
+        dom_name = c["mode"] != "off" and _privdns_is_domain_name(c["name"])
         if c["mode"] == "self":
             url = _agh_doh_url()
             ui_url("本机 DNS 地址（给外机粘贴）", url)
@@ -8040,12 +8238,20 @@ def privdns_menu():
         elif c["mode"] == "remote":
             ui_url("外机 DNS 地址", c["dns"], code="36")
             print()
-            why = _privdns_check(c["name"], c["dns"], _privdns_ips(read_saved_links()))
+            why = _privdns_check(c["name"], c["dns"], _privdns_addrs(read_saved_links(), c["name"])[1])
             print("  " + (_hl("1;32", "✔ 外机已对上") if not why else _hl("1;33", f"⚠ 外机还没对上：{why}")))
             if why.startswith(("DNS 里还没有", "DNS 答的 IP")):
                 tip = "外机的「聚合节点链接」里加上本机 links 链接，再点「更新配置」"
             elif why.startswith("DNS 拒绝"):
                 tip = "外机换过 ClientID：到外机 13 → 11 重新复制地址，本机选 2 再粘一次"
+            elif not why and dom_name and not _privdns_own_switched(c["name"]):
+                _privdns_regen()                       # 外机刚对上：本机自己的订阅也换过去
+                print("  " + _hl("1;32", "✔ 本机订阅已换成节点专用域名，客户端刷新订阅后生效"))
+        if dom_name:
+            ok = _name_covers(cert_names(), c["name"])
+            ui_kv("节点专用域名", c["name"] + ("" if ok else _hl("1;31", "（证书没盖住，节点照用公网域名）")))
+            if not ok:
+                tip = "再选一次 " + ("1" if c["mode"] == "self" else "2") + " 就补签证书"
         ui_line()
         ui_items([(1, "本机DNS解析", None), (2, "外机DNS解析", None), (3, "关", None), (0, "返回", None)])
         if tip:
@@ -11143,6 +11349,9 @@ def cert_want_names(dom, wildcard, emby_dom=""):
     nd = node_domain()
     if nd and not _name_covers(names, nd):
         names.append(nd)
+    root = _privdns_root()                       # 节点专用域名（13 → 11）：*.根域名 要一直带着，丢了它节点握手失败
+    if root and _root_domain(dom) == root:
+        names.append(f"*.{root}")
     return list(dict.fromkeys(names))
 
 def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
@@ -11169,7 +11378,17 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
     if cf_token:
         env["CF_Token"] = cf_token
     want = names or cert_want_names(dom, wildcard)
-    if wildcard:
+    if any(n.startswith("*.") for n in want):
+        # 要签的里有泛域名（*.域名，或者节点专用域名要的 *.根域名）：HTTP-01 签不出来，只能 DNS-01。
+        # wildcard 本身不改——它记的是「要不要 *.域名」，存进 cert.json 给下次重签判断用
+        if not wildcard and not cf_token and not _acme_has_cf():
+            print(f"{R}  ✗ 要签 {', '.join(n for n in want if n.startswith('*.'))}，得用 Cloudflare 令牌（DNS 验证），"
+                  f"acme.sh 里没存过，现有证书没动。{N}")
+            return False
+        dns01 = True
+    else:
+        dns01 = False
+    if dns01:
         ds = " ".join(f"-d '{n}'" for n in want)
         print(f"  要签的域名：{', '.join(want)}")
         issue = f"{acme} --issue --dns dns_cf --keylength ec-256 {ds} --server letsencrypt"
@@ -12238,9 +12457,11 @@ def cert_fix_run():
     # 有 Cloudflare 凭据就照原样签回来；没有就不修——宁可不动，也不静默降级。
     G["domain"] = dom
     wild, why = _wildcard_wanted()
-    if wild and not _acme_has_cf():
+    root = _privdns_root()                       # 节点专用域名（13 → 11）要的 *.根域名：修证书不能把它修丢
+    if (wild or root) and not _acme_has_cf():
         R, N = "\033[1;31m", "\033[0m"
-        print(f"{R}  ✗ 这张是泛域名证书（{why}），可 acme.sh 里没存 Cloudflare 凭据，修复只签得出单域名，没动。{N}")
+        print(f"{R}  ✗ 这张是泛域名证书（{why or '节点专用域名要 *.' + root}），可 acme.sh 里没存 Cloudflare 凭据，"
+              f"修复只签得出单域名，没动。{N}")
         print("    要修：『15 域名证书管理 → 1 安装证书』选泛域名、填 Cloudflare 令牌重签")
         return
     # 续期方式必须跟【现在】的 80 端口状况对上。
@@ -12248,6 +12469,7 @@ def cert_fix_run():
     # （443 伪装站 / 自建 Emby / AdGuard）把 nginx 拉起来占了 80，standalone 从此永远
     # 验证失败——而且失败只写在 acme 自己的日志里，面板上一个字都看不到。
     # 这次翻车就是这么来的：cron 补上了也没用，续期照样跑不过。
+    wild = wild or bool(root)                        # 有 *.根域名 也只能 DNS-01
     owner = "" if wild else _port80_owner()          # DNS-01 不走 80，谁占着都无所谓
     hooks = ""
     if owner:
@@ -12280,8 +12502,9 @@ def cert_fix_run():
     # 验证方式，--issue 则把这次用的方式写回记录，往后自动续期就跟着走对的路。
     if wild:
         print("  泛域名证书 → 走 Cloudflare DNS 验证重签（不用 80 端口），可能要一两分钟")
-        issue = (f"{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' --keylength ec-256 "
-                 f"--server letsencrypt --force")
+        names = [dom] + ([f"*.{dom}"] if _wildcard_wanted()[0] else []) + ([f"*.{root}"] if root else [])
+        issue = (f"{acme} --issue --dns dns_cf " + " ".join(f"-d '{n}'" for n in names) +
+                 f" --keylength ec-256 --server letsencrypt --force")
     else:
         fw_allow({(80, "tcp")})                      # standalone 验证要从外面连 80：开着防火墙先放行
         print("  正在续期…（走 acme.sh，可能要十几秒）")
@@ -12405,7 +12628,7 @@ def _node_op_dispatch(plan, fallback):
 def node_op_run():
     """CLI 子命令 node-op：读出落盘的方案，真正执行装/加/删。见 _node_op_dispatch。"""
     _TITLE = {"install": "全新安装", "add": "添加协议", "del": "删除协议",
-              "cert-install": "安装证书", "cert-domain": "更换域名"}
+              "cert-install": "安装证书", "cert-domain": "更换域名", "privdns-domain": "节点专用域名"}
     try:
         plan = json.load(open(NODE_OP_PLAN))
     except Exception as e:
@@ -12423,6 +12646,8 @@ def node_op_run():
         elif plan["op"] == "cert-domain":
             cert_change_domain_apply(plan["domain"], plan.get("cf_token", ""),
                                      plan.get("emby_new", ""))
+        elif plan["op"] == "privdns-domain":
+            privdns_domain_apply(plan)
         elif plan["op"] == "install":
             run(plan["sb"], plan["xray"])
         else:
