@@ -39,7 +39,7 @@
 | 每天 03:00 | whitelist-inject（mack-a 共存用，没装就没有；不进队） | vps-net | 规则变了才重启 mack-a 的 xray |
 | 每月 1 日 03:05 | 网络优化脚本自更新【队】（排在 nginx 升级前；新调优参数要手动重跑优化） | net-optimize | 自适应 QoS（出口闲着时） |
 | 每月 1 日 03:10 | nginx 升级【队】 | net-optimize | nginx |
-| 每天 03:20 | 三大配置重生成【队】 | xy-installer | 无 |
+| 每天 03:20 | 三大配置重生成【队】 | xy-installer | 无（当 DNS 机、私有解析映射变了时 AdGuard 一两秒，本机解析不走它） |
 | 每天 03:30 | 刷新元数据（按盘，默认关）【队】 | media-stack | 无（Emby 后台忙） |
 | 每月 2 日 04:00 | 内核更新【队】 | xy-installer | sing-box / xray |
 | 每天 04:10 | Emby 脚本自更新【队】 | media-stack | 开播门（没人播时） |
@@ -123,6 +123,26 @@
   不丢键（菜单里连着打编号要留着）。测这类问题用 `pty.fork()` 真往终端里按键，见 `test_netopt_reboot_prompt_4521.py`。
 - 端到端测试 `test_netprofile_e2e.py` 在 `unshare --mount --net` 里跑真脚本、真内核参数（/etc 那几个目录盖 tmpfs），
   不碰本机；改保留端口相关的逻辑先跑它。
+
+## 节点私有解析（13 → 11，10/28 起）
+
+- 三选一存在 `/etc/bgpeer/privdns.json`（0600）：`self`（本机当 DNS 机）/ `remote`（本机节点交给外机解析）/ `off`。
+  remote 的机器在 `.links` 末尾多一行 `#privdns 私有名 外机DoH`；主机只认节点链接前缀（`aggregated_links`、`cloud_ports`），
+  老版主机自动忽略。DNS 机汇总时把「私有名 → IP」写进 AdGuardHome.yaml 的 `user_rules`（`! xy-privdns begin / end` 圈住，
+  `$dnsrewrite`），映射存 `privdns-map.json`；名字 / IP 变了才 `systemctl restart AdGuardHome`（没有 AdGuard 的 API 凭据）。
+- **AdGuard 重启不碍本机看片**：装 AdGuard 时 `_do_free53` 把本机 resolv.conf 指向公共 DNS，本机进程（含 Emby 容器）不经过它。
+- **只换别的机器的节点**：本机自己的订阅地址本身就是本机 IP 加端口、中转前缀也带本机地址，自己那份藏了也白藏。
+  用域名装的机器藏不了（节点地址就是域名）；DNS 机一定是域名装的（DoH 要证书），所以它自己的节点永远不动。
+- **先问再换**：谁汇总就由谁去 DNS 问一遍私有名，IP 一个不差才换；问不通这一轮照写真实地址。从关 / 本机切到外机会换新名字
+  （整机克隆的机器私有名会重），旧名字在 DNS 机上留 7 天。
+- **客户端**：mihomo 的 `proxy-server-nameserver-policy` 从 **v1.19.20** 才有（v1.19.19 的 config.go 里没有）；老内核不认，
+  名字混进 `proxy-server-nameserver` 去问公共 DNS，`dns/util.go` 的 `batchExchange` 只把 SERVFAIL / REFUSED 当失败，
+  公共 DNS 先回的「查无此名」照样算数 → 时通时不通。policy 不能单独出现（要有 `proxy-server-nameserver`）。
+  sing-box 用出站的 `domain_resolver`（1.12+）；不指的话走 `route.default_domain_resolver`（模板里是阿里 DoH），私有名查不到。
+  小火箭：`proxy-dns-server` 是全局的（所有节点域名都去问它），`[Host]` 里 `server:` 后面能不能写 DoH 文档没说——
+  **被藏的节点小火箭那份先不放**（仓库主人 10/28 同意），要加回来先拿 `srtest.py` 在手机上测写法。
+- 被藏机器的管理直连规则（`IP-CIDR,真实IP`）去掉（仓库主人 10/28 同意）；测试 `test_privdns.py` 起一个 TLS 的假 AdGuard
+  （按写进 yaml 的规则答），`_doh_ask` 走真握手、真 POST。
 
 ## 客户端的坑（真机踩过）
 

@@ -255,6 +255,7 @@ def _first_setup():
 
 SELFDNS_FLAG     = BGP_DIR + "/selfdns.on"        # 主脚本：自建 DNS 是否已写进订阅
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid"  # 主脚本生成的 AdGuard ClientID
+PRIVDNS_FILE     = BGP_DIR + "/privdns.json"      # 主脚本：节点使用私有DNS解析（菜单 11；关 / 本机 / 外机）
 
 def _selfdns_clientid():
     """AdGuard ClientID（DoH 网址末段 / DoT 主机名最前一段 / 「允许的客户端」里填的那串）。没有就生成一个存下来：
@@ -1012,6 +1013,7 @@ def uninstall(refresh_sub=True):
     cid  = _selfdns_clientid()
     wild = refresh_sub and dom and _cert_wildcard_ok(dom)
     subw = os.path.exists(SELFDNS_FLAG)
+    prv  = refresh_sub and _privdns_mode() == "self"
     res  = os.path.exists(RESOLVED_DROPIN)
     allow = _allowed_clients()
 
@@ -1019,6 +1021,7 @@ def uninstall(refresh_sub=True):
     print("    · AdGuard Home 服务 + /opt/AdGuardHome")
     print(f"      （{Y}后台设置、允许的客户端、过滤规则、查询日志全部删除，不可恢复{N}）")
     if subw: print("    · 订阅里写入的自建 DoH —— 移除并刷新订阅")
+    if prv:  print("    · 节点私有解析（菜单 11 选了「本机DNS解析」）—— 关掉，外机节点改回真实地址")
     if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
                    f"顺带清掉 acme.sh 存的 CF Token\n"
                    f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
@@ -1035,6 +1038,7 @@ def uninstall(refresh_sub=True):
 
     if refresh_sub:                                  # 先撤订阅：客户端别再往这台已死的 DoH 打
         _selfdns_remove()                            # （全量卸载时订阅整个删掉，不必刷新，refresh_sub=False）
+        _privdns_remove()                            # 当 DNS 机替外机解析的：外机节点改回真实地址
     if os.path.exists(AGH_BIN):
         sh(f"{AGH_BIN} -s uninstall")                # 官方卸载（停服务 + 注销 systemd）
     sh("systemctl stop AdGuardHome")
@@ -1894,6 +1898,37 @@ def _selfdns_toggle():
         print("  " + _hl("1;33", "⚠ 自建 DNS 没写进订阅（原因见上面；没有原因就再选一次 6）"))
     _ask("  按回车返回菜单…")
 
+def _privdns_mode():
+    """菜单 11 的「当前」：主脚本存在 privdns.json 里（off / self / remote）。"""
+    try:
+        import json
+        m = json.load(open(PRIVDNS_FILE)).get("mode")
+    except Exception:
+        m = ""
+    return m if m in ("self", "remote") else "off"
+
+def _privdns_menu():
+    """菜单 11「节点使用私有DNS解析」：交给主脚本（订阅生成、.links 都在主脚本里），跟 6 一个路子。
+       主脚本是老版本就不叫——不认的子命令会掉进 argparse 报错退出，屏上一句话说清先更新。"""
+    xy = BGP_DIR + "/xy-installer.py"
+    try:
+        src = open(xy).read()
+    except OSError:
+        print("  没找到主脚本(xy-installer.py)，请从主面板进入本菜单。"); return
+    if '"privdns"' not in src:
+        print("  " + _hl("1;33", "⚠ 主脚本是老版本：先到主面板「更新脚本」→ 1 立即更新，再来"))
+        _ask("  按回车返回菜单…"); return
+    rc = subprocess.run(f"python3 {xy} privdns", shell=True).returncode
+    if rc:
+        print("  " + _hl("1;31", f"⚠ 主脚本出错退出（退出码 {rc}）；直接跑看原因：python3 {xy} privdns"))
+        _ask("  按回车返回菜单…")
+
+def _privdns_remove():
+    """卸载 AdGuard 时：本机在当 DNS 机（菜单 11 选了 1），交给主脚本关掉、外机节点改回真实地址。"""
+    xy = BGP_DIR + "/xy-installer.py"
+    if os.path.exists(xy) and '"privdns-off"' in open(xy).read():
+        subprocess.run(f"python3 {xy} privdns-off", shell=True)
+
 def _ios_fetch(dom, port, path):
     """从本机拉一遍描述文件（SNI 用域名，连本机，不出网）：→ (ServerName 或 '', 出错原因)。
        AdGuard 的 HTTPS 后台跟 http.address 绑同一个地址，0.0.0.0 / 空 就连 127.0.0.1。"""
@@ -1966,6 +2001,7 @@ def menu():
         # 2 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
         # 5 改后台端口：随机 2000-5000 / 自定义，防扫描，带回滚。7 自检：只读不改。
         # 8 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。
+        # 11 节点使用私有DNS解析：1 本机当 DNS 机 / 2 本机节点交给外机解析 / 3 关（交给主脚本，见 _privdns_menu）。
         ui_title("自建 DNS · AdGuard Home（兼带广告过滤）")
         if _installed():
             st = "已安装 · " + (_hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
@@ -1983,6 +2019,7 @@ def menu():
                   (8, "DoT 带 ClientID（签泛域名证书）", None),
                   (9, "手机实测（开私人 DNS，看它连没连进来）", None),
                   (10, "苹果手机描述文件（iOS 一键装 DNS）", None),
+                  (11, "节点使用私有DNS解析", {"self": "本机", "remote": "外机"}.get(_privdns_mode(), "关")),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -1995,6 +2032,7 @@ def menu():
         elif c == "8": dot_clientid()
         elif c == "9": phone_probe()
         elif c == "10": ios_profile()
+        elif c == "11": _privdns_menu()
         elif c in ("0", ""):
             return
 

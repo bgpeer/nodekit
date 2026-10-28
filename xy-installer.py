@@ -18,7 +18,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicodedata, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress
+import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicodedata, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress, ssl, struct
 
 # 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
 # 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
@@ -190,6 +190,8 @@ MEDIA_LOCAL    = BGP_DIR + "/media-stack.py"     # 本地缓存的 media-stack.p
 MEDIA_URL      = _RAW + "media-stack.py"         # 仓库里的 media-stack.py（自建 Emby·网盘直链）
 SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid" # AdGuard ClientID（DoH 地址末段；填进「允许的客户端」即可只放行自己）
+PRIVDNS_FILE   = BGP_DIR + "/privdns.json"       # 节点私有解析（13 → 11）：本机选的模式 / 外机 DNS 地址 / 本机私有名
+PRIVDNS_MAP_FILE = BGP_DIR + "/privdns-map.json" # 本机当 DNS 机时替哪些外机解析：私有名 → IP（AdGuard 规则照它写）
 GHRELAY_OFF    = BGP_DIR + "/ghrelay.off"        # 开关：规则/图标走本机 GitHub 中转（默认开；存在此文件=用户手动关了）
 GHRELAY_TOKEN_FILE = BGP_DIR + "/ghrelay.token"  # 本机中转的 token（防别人蹭；在 BGP_DIR 不在 SUB_DIR，不会被下载）
 GHDL_RELAYS  = BGP_DIR + "/gh-relays.json"   # 取件用的【自己人】中转前缀（从别的机器菜单 14 复制来的）
@@ -3308,7 +3310,7 @@ _PRIV_DIRS  = lambda: (BGP_DIR, SUB_DIR, "/etc/ssl/sb")
 _PRIV_FILES = lambda: (TOKENS_FILE, GHRELAY_TOKEN_FILE, STATE_FILE, PEERS_FILE,
                        GHDL_RELAYS, CUSTPL_FILE, TPLSRC_FILE, SUBPORT_FILE,
                        HOST_FILE, NODE_FILE, CFG_FILE, SBOX_FILE, SR_FILE, SR_NODES_FILE, SR_MODE_FILE,
-                       NETPROFILE, ACME_KEY, KEY)
+                       NETPROFILE, PRIVDNS_FILE, PRIVDNS_MAP_FILE, ACME_KEY, KEY)
 
 def harden_perms():
     """把只该 root 看的目录/文件收成 root-only。幂等、极快，每次入口都过一遍。
@@ -3661,7 +3663,7 @@ def serve_sub(reset=False, renew_port=True):
     # 重装换节点(reset)时和订阅一样换 .links token，旧地址失效（防泄露）；平时保持不变。
     local = read_saved_links()
     if local:
-        open(LINKS_FILE, "w").write("\n".join(local) + "\n")
+        _write_links_file(local)                        # 选了外机DNS解析的，末尾多一行 #privdns
         if reset:
             lt = secrets.token_urlsafe(12)
         else:
@@ -4091,6 +4093,7 @@ def build_singbox_sub(nodes, tpl_url):
     cfg["outbounds"] = new_ob
     _sb_direct_ip(cfg, _direct_targets(nodes))                    # 各 VPS IP 直连（走紧凑序列化，不破坏格式）
     _sb_selfdns(cfg, _selfdns_doh())                              # 开关开启：dns.final 换成本机自建 DoH
+    _sb_privdns(cfg, nodes)                                       # 被藏的节点：domain_resolver 指向它的 DNS
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
@@ -4411,8 +4414,14 @@ def sr_onelink_heal():
 def build_shadowrocket_sub(nodes, tpl_url):
     sub = sr_sub_mode()
     lines, names_list, links = [], [], []
+    hidden = 0
     for key, d in nodes:
         name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
+        if d.get("_privdns"):
+            # 被藏的节点（私有解析）：小火箭怎么指定 DNS 解析节点地址还没在手机上测出来，写进去也连不上；
+            # 照写真实 IP 又白藏了。仓库主人 10/28：「小火箭的也删掉」——这份先不放，测通了再加回来
+            hidden += 1
+            continue
         # 本机 xray 内核的 reality 照写：原先以为小火箭不带 X25519MLKEM768、连不上 xray 26.9.8+ 而跳过，
         # 10/20 仓库主人苹果实测小火箭配置里的 vision² 通了（指纹 Safari26_3），不再跳过（xhttp 照旧不写，见 shadowrocket_line）
         if sub:
@@ -4426,8 +4435,10 @@ def build_shadowrocket_sub(nodes, tpl_url):
             if s: lines.append(s); names_list.append(name)
         except Exception:
             pass
-    if not lines and not links:
-        return
+    if hidden:
+        print(f"  小火箭这份不放 {hidden} 个被藏的节点（私有解析，小火箭还没测通）")
+    if not lines and not links and not hidden:
+        return                                           # 全藏了也照样往下生成：不然上一份写着真实 IP 的配置还挂在订阅上
     tpl = fetch_tpl(tpl_url)                                 # 中转改写 + 老锚点名归一
     # 国家检测/成员池 = 注入节点 + 用户手写进模板 [Proxy] 段的静态节点（"名 = 协议,..." 行）
     static = _sr_static_names(tpl)
@@ -4659,6 +4670,8 @@ def _direct_targets(nodes):
     else:
         add("ip", _self_ip())                               # 兜底：拿不到合法域名/IP 就用探测的公网 IP
     for _, d in nodes:                                       # 各节点服务器：域名或 IP 字面量都收
+        if d.get("_privdns"):
+            continue                                         # 被藏的成员机：这条写的就是真实 IP，留着等于白藏（仓库主人 10/28 同意删）
         s = _direct_server_of(d)
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", s):
             add("ip", s)
@@ -5043,6 +5056,87 @@ def _sb_selfdns(cfg, url):
     print(f"  ⚠ sing-box 模板的 dns.servers 里没有 tag=\"{want}\" 这台（dns.final 指向它），"
           f"自建 DNS 未写入这一份。")
 
+def _privdns_used(nodes):
+    """这份配置里真用到的私有名 → 它的 DNS 地址（按名字排好，生成结果稳定）。"""
+    return dict(sorted({str(d.get("server")): d["_privdns"] for _, d in nodes if d.get("_privdns")}.items()))
+
+def _yaml_block_end(tpl, m, ind):
+    """YAML 里 m 那一行的值到哪结束：后面缩进更深的行、或同缩进的 `- ` 列表项都算它的（空行 / 注释不算终点）。"""
+    end, pos = m.end(), m.end()
+    for line in tpl[m.end():].split("\n")[1:]:
+        pos += 1 + len(line)
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        lead = len(line) - len(line.lstrip())
+        if lead > len(ind) or line.startswith(ind + "-"):
+            end = pos
+            continue
+        break
+    return end
+
+def _mihomo_privdns(tpl, nodes):
+    """mihomo：被藏节点的私有名只去问它的 DNS —— proxy-server-nameserver-policy（mihomo 1.19.20 起才有）。
+       模板写了 proxy-server-nameserver 才写这一项（mihomo 规定 policy 不能单独出现，见 config.go）；
+       自定义模板没写的，写进 nameserver-policy（没有 proxy-server-nameserver 时，mihomo 解析节点地址走默认那套，
+       带 nameserver-policy）。两样都没有就说一行：这份里被藏的节点连不上。"""
+    used = _privdns_used(nodes)
+    if not used:
+        return tpl
+    def entries(ind):
+        return "".join(f'\n{ind}"{n}": ["{u}"]' for n, u in used.items())
+    for key in ("proxy-server-nameserver-policy", None, "nameserver-policy"):
+        if key is None:                                   # 模板没有这一段：跟在 proxy-server-nameserver 那一项后面新开
+            m = re.search(r"(?m)^([ \t]*)proxy-server-nameserver:.*$", tpl)
+            if m:
+                ind = m.group(1)
+                end = _yaml_block_end(tpl, m, ind)
+                return tpl[:end] + f"\n{ind}proxy-server-nameserver-policy:" + entries(ind + "  ") + tpl[end:]
+            continue
+        m = re.search(rf"(?m)^([ \t]*){key}:[ \t]*$", tpl)
+        if m:
+            nxt = re.match(r"\n([ \t]+)\S", tpl[m.end():])   # 跟着下一条的缩进走
+            ind = nxt.group(1) if nxt and len(nxt.group(1)) > len(m.group(1)) else m.group(1) + "  "
+            return tpl[:m.end()] + entries(ind) + tpl[m.end():]
+    print("  ⚠ mihomo 模板里没有 proxy-server-nameserver / nameserver-policy，被藏的节点这份里连不上")
+    return tpl
+
+def _sb_privdns(cfg, nodes):
+    """sing-box：每台 DNS 机加一个 DoH 服务器（写法同 _sb_selfdns：模板里的 bootstrap 解析它的域名、走直连——
+       走代理就成了「连节点要先解析、解析又要连节点」的套娃），被藏的节点各自用 domain_resolver 指过去
+       （sing-box 1.12 起的出站字段；不指的话走 route.default_domain_resolver 那台国内 DNS，私有名查不到）。"""
+    used = _privdns_used(nodes)
+    if not used:
+        return
+    dns = cfg.get("dns")
+    if not isinstance(dns, dict) or not isinstance(dns.get("servers"), list):
+        print("  ⚠ sing-box 模板里没有 dns.servers，被藏的节点这份里连不上")
+        return
+    servers = dns["servers"]
+    stags = {o.get("tag") for o in servers if isinstance(o, dict)}
+    otags = {o.get("tag") for o in cfg.get("outbounds", []) if isinstance(o, dict)}
+    direct = "🎯直连" if "🎯直连" in otags else next((t for t in otags if t and "直连" in str(t)), "")
+    tag_of = {}
+    for url in dict.fromkeys(used.values()):
+        m = _PRIVDNS_DNS.match(url)
+        n, tag = 1, "privdns"
+        while tag in stags:
+            n += 1; tag = f"privdns{n}"
+        srv = {"tag": tag, "type": "https", "server": m.group(1)}
+        if m.group(2) and m.group(2) != "443":
+            srv["server_port"] = int(m.group(2))
+        srv["path"] = m.group(3)
+        if "bootstrap" in stags:
+            srv["domain_resolver"] = "bootstrap"
+        if direct:
+            srv["detour"] = direct
+        servers.append(srv)
+        stags.add(tag)
+        tag_of[url] = tag
+    for o in cfg.get("outbounds", []):
+        if isinstance(o, dict) and o.get("server") in used:
+            o["domain_resolver"] = tag_of[used[o["server"]]]
+
 def _sr_direct_ip(path, targets):
     """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。
        没有 FINAL 就退回插在 [Rule] 顶部。"""
@@ -5093,6 +5187,7 @@ def gen_mihomo(ylines, nodes, tpl_url):
     tpl = _mihomo_direct_ip(tpl, _direct_targets(nodes))       # 各 VPS IP 直连（防管理时 SSH 走代理）
     tpl = _mihomo_direct_dns(tpl, _direct_targets(nodes))      # 自己的域名直连时用国内 DoH 解析（别走 system）
     tpl = _mihomo_selfdns(tpl, _selfdns_doh())                 # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
+    tpl = _mihomo_privdns(tpl, nodes)                          # 被藏节点的私有名只去问它的 DNS
     open(CFG_FILE, "w").write(tpl)
 def gen_singbox(ylines, nodes, tpl_url):
     build_singbox_sub(nodes, tpl_url)                        # 直连规则已在内部注入并紧凑序列化
@@ -5379,6 +5474,412 @@ def _group_by_prefix(links):
         keyed.append((first[grp], 1 if (seg or "").startswith("CDN·") else 0, i, u))
     return [k[-1] for k in sorted(keyed, key=lambda k: k[:3])]
 
+# ---------------------------------------------------------------------------- 节点私有解析（13 → 11）
+# 仓库主人 10/28：「有些机场他建的节点必须要用他自己对应的私有dns解析才可以解析」，想让没建 DNS 的机器（1、2）
+# 的节点交给建了 DNS 的机器（3）解析。13 → 11 三选一：1 本机DNS解析 / 2 外机DNS解析 / 3 关。
+#   · 1、2 选「外机DNS解析」、粘贴 3 的 DoH 地址：本机起一个固定私有名（xxxx.internal），连同 3 的地址写进
+#     本机 .links 末尾一行 `#privdns 名字 地址`（主机只认节点链接前缀，老版主机自动忽略这一行）。
+#   · 3 选「本机DNS解析」：汇总时拉到 1 的 .links（1 的真实 IP 本来就在里面），把「1 的私有名 → 1 的 IP」写进
+#     本机 AdGuard 的自定义规则。「主机把 IP 带过去」走的就是现成的聚合通道，不另开口子。
+#   · 谁汇总 1，就把 1 的节点地址换成私有名，配置里再写一句「这个名字只去问 3」。换之前先去 3 问一遍：答出来的
+#     IP 跟 1 的链接对得上才换；答不对、问不到，这一轮照写真实地址，保证能连。
+# 只换别的机器的节点：本机自己的订阅地址就是 http://本机IP:端口/…，自己那份藏了也白藏。
+# 用域名装的机器藏不了（节点地址就是域名，公网一查就是 IP），所以 3 自己的节点不动、1 / 2 得是用 IP 装的。
+# .internal 是 ICANN 2024 年留给内网的后缀：公网 DNS 永远查不到，也没人能注册。
+# 客户端：mihomo 要 1.19.20+（proxy-server-nameserver-policy；老内核不认这一项，名字会去问公共 DNS，公共 DNS 回
+# 「查无此名」它也当有效答案——dns/util.go 的 batchExchange 只把 SERVFAIL / REFUSED 当失败——时通时不通）；
+# sing-box 1.12+（出站的 domain_resolver）；小火箭还没在手机上测出写法，被藏的节点小火箭那份先不放（仓库主人 10/28 同意）。
+PRIVDNS_ZONE  = "internal"
+PRIVDNS_GRACE = 7 * 86400        # 外机关掉 / 删掉 / 拉不到以后，映射再留 7 天：没刷新订阅的客户端不会马上断
+_PRIVDNS_MODES = {"off": "关", "self": "本机", "remote": "外机"}
+_PRIVDNS_NAME = re.compile(r"^[a-z0-9]{6,32}\.internal$")
+_PRIVDNS_DNS  = re.compile(r"^https://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(?::(\d{1,5}))?(/dns-query(?:/[A-Za-z0-9-]+)?)$")
+_PRIVDNS_META = re.compile(r"(?m)^#privdns[ \t]+(\S+)[ \t]+(\S+)[ \t]*$")
+_PRIVDNS_BEGIN, _PRIVDNS_END = "! xy-privdns begin", "! xy-privdns end"     # AdGuard 规则里圈住我们那一段
+_PRIVDNS_LIVE = {}               # 这一轮汇总里真换成私有名的：{私有名: DNS 地址}（aggregated_links 填，parse_nodes 标到节点上）
+
+def privdns_conf():
+    """13 → 11 的设置：{"mode": off / self（本机DNS解析）/ remote（外机DNS解析）, "dns": 外机 DoH 地址, "name": 本机私有名}。"""
+    try:
+        c = json.load(open(PRIVDNS_FILE))
+    except Exception:
+        c = {}
+    if not isinstance(c, dict):
+        c = {}
+    return {"mode": c.get("mode") if c.get("mode") in ("self", "remote") else "off",
+            "dns": str(c.get("dns") or ""), "name": str(c.get("name") or "")}
+
+def privdns_save(c):
+    os.makedirs(BGP_DIR, exist_ok=True)
+    json.dump({k: c.get(k, "") for k in ("mode", "dns", "name")}, open(PRIVDNS_FILE, "w"))
+    harden_perms()                # 刚落地是 0644，当场收紧
+
+def _privdns_new_name():
+    """本机私有名：10 位小写字母数字 + .internal。从关 / 本机切到「外机DNS解析」时起一个，之后一直用它——
+       客户端配置里写的就是它，换 IP、换外机地址都不变（关了再开会换新的，见 _privdns_set_remote）。"""
+    abc = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(secrets.choice(abc) for _ in range(10)) + "." + PRIVDNS_ZONE
+
+def _privdns_links_line():
+    """本机 .links 末尾那一行：选了外机DNS解析才有（`#privdns 私有名 外机DoH`），汇总本机的主机照它换名。"""
+    c = privdns_conf()
+    if c["mode"] != "remote" or not _PRIVDNS_NAME.match(c["name"]) or not _PRIVDNS_DNS.match(c["dns"]):
+        return ""
+    return f"#privdns {c['name']} {c['dns']}"
+
+def _write_links_file(local):
+    """.links 端点的内容：本机分享链接一行一条；选了外机DNS解析的末尾多一行 #privdns（见 _privdns_links_line）。
+       链接里照写真实 IP：替本机解析的那台要靠它知道本机的 IP。"""
+    if not local:
+        return
+    extra = _privdns_links_line()
+    open(LINKS_FILE, "w").write("\n".join(list(local) + ([extra] if extra else [])) + "\n")
+
+def _privdns_meta(text):
+    """成员机 .links 里的 `#privdns` 行 → (私有名, DNS 地址)；没有 / 写错返回 None。"""
+    m = _PRIVDNS_META.search(text or "")
+    if not m or not _PRIVDNS_NAME.match(m.group(1)) or not _PRIVDNS_DNS.match(m.group(2)):
+        return None
+    return m.group(1), m.group(2)
+
+def _link_set_server(u, host):
+    """把分享链接里的服务器地址换成 host，别的一个字节不动（vmess 改 base64 JSON 里的 add）。"""
+    if u.startswith("vmess://"):
+        b = u[8:]
+        j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        j["add"] = host
+        return vmess_link(j)
+    m = re.match(r"^([A-Za-z0-9+.-]+://)([^/?#]*)(.*)$", u, re.S)
+    ui, at, hp = m.group(2).rpartition("@")
+    port = re.match(r"^(?:\[[^\]]*\]|[^:]*)(:\d+)?$", hp)
+    return m.group(1) + ui + at + host + ((port.group(1) or "") if port else "") + m.group(3)
+
+def _privdns_ok_link(u):
+    """换了地址也不露馅：要加密的都写明了 SNI、ws 类都写明了 Host。没写的话客户端拿地址顶上，私有名就明文
+       出现在握手里（链路上一眼就是 xxx.internal），还连不上——这种机器整台不藏。
+       本脚本生成的链接都写明了（见 tls_host）；防的是成员机跑着老脚本、或者链接是手抄进去的。"""
+    if u.startswith("vmess://"):
+        try:
+            b = u[8:]
+            j = json.loads(base64.b64decode(b + "=" * (-len(b) % 4)))
+        except Exception:
+            return False
+        if j.get("tls") == "tls" and not (j.get("sni") or j.get("host")):
+            return False
+        return not (j.get("net") in ("ws", "httpupgrade") and not j.get("host"))
+    P = urllib.parse.urlsplit(u)
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(P.query).items()}
+    if P.scheme == "ss":
+        return "@" in P.netloc                           # SIP002；老式整串 base64 的认不准，不藏
+    if P.scheme not in ("vless", "trojan", "hysteria2", "hy2", "tuic", "anytls") or not q.get("sni"):
+        return False                                     # 这几种 link_to_proxy 都只认 sni=（vless 一律按 TLS 写）
+    return not (q.get("type") in ("ws", "httpupgrade") and not q.get("host"))
+
+def _privdns_ips(links):
+    """一台机器的节点能不能藏 → 它的 IP 列表；不能藏返回 []。
+       能藏 = 除 CDN 节点外，地址全是 IP、每条都能放心换名（_privdns_ok_link）。用域名装的机器节点地址就是域名，
+       藏不了；CDN 节点连的是 Cloudflare，本来就不露 IP，照旧不动。"""
+    ips = []
+    for u in links:
+        if "CDN·" in _link_name(u):
+            continue
+        a = _link_addr(u)
+        s = a[0] if a else ""
+        if not s or not _is_ip(s) or not _privdns_ok_link(u):
+            return []
+        try:
+            s = str(ipaddress.ip_address(s))
+        except ValueError:
+            return []
+        if s not in ips:
+            ips.append(s)
+    return ips
+
+def _privdns_label(links):
+    """屏上 / 日志里怎么叫这台：节点名前缀（🇺🇸1 这种）；拆不出来就叫「成员机」。"""
+    for u in links:
+        pre = _split_tag(_link_name(u))[0]
+        if pre:
+            return pre
+    return "成员机"
+
+def _dns_wire(name, qtype):
+    """最小的 DNS 查询报文：ID 0、要递归、一个问题（DoH 规定 ID 用 0，方便缓存）。"""
+    q = b"".join(bytes([len(p)]) + p.encode() for p in name.strip(".").split("."))
+    return struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0) + q + b"\0" + struct.pack(">HH", qtype, 1)
+
+def _dns_answer_ips(msg, qtype):
+    """DNS 回复报文 → (rcode, [答案里 qtype 那一类的 IP])。A = 1，AAAA = 28。"""
+    if len(msg) < 12:
+        raise ValueError("不是 DNS 回复")
+    rcode = msg[3] & 0x0F
+    qd, an = struct.unpack(">HH", msg[4:8])
+    i = 12
+    def skip(i):
+        while True:
+            n = msg[i]
+            if n == 0:
+                return i + 1
+            if n & 0xC0 == 0xC0:
+                return i + 2
+            i += n + 1
+    for _ in range(qd):
+        i = skip(i) + 4
+    ips = []
+    for _ in range(an):
+        i = skip(i)
+        t, _c, _ttl, ln = struct.unpack(">HHIH", msg[i:i + 10])
+        i += 10
+        rd = msg[i:i + ln]
+        i += ln
+        if t == qtype == 1 and ln == 4:
+            ips.append(socket.inet_ntop(socket.AF_INET, rd))
+        elif t == qtype == 28 and ln == 16:
+            ips.append(socket.inet_ntop(socket.AF_INET6, rd))
+    return rcode, ips
+
+def _doh_ask(url, name, qtype=1, local=None, timeout=6):
+    """向 DoH 地址问一次 name → (rcode, [IP])。连不上、证书不对、不回 200 都抛异常。
+       local：问的是本机 AdGuard 时直接连本机地址（照样按域名握手、验证书），不绕公网转一圈。
+       HTTP/1.0 发出去：对面回完就关连接，不用管分块传输。出网用中性 UA。"""
+    m = _PRIVDNS_DNS.match(url)
+    if not m:
+        raise ValueError("不是 DNS 地址")
+    host, port, path = m.group(1), int(m.group(2) or 443), m.group(3)
+    q = _dns_wire(name, qtype)
+    req = (f"POST {path} HTTP/1.0\r\nHost: {host}:{port}\r\nUser-Agent: {HTTP_UA}\r\n"
+           f"Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n"
+           f"Content-Length: {len(q)}\r\n\r\n").encode() + q
+    ctx = ssl.create_default_context()
+    buf = b""
+    with socket.create_connection((local or host, port), timeout=timeout) as raw, \
+         ctx.wrap_socket(raw, server_hostname=host) as t:
+        t.sendall(req)
+        while True:
+            try:
+                d = t.recv(65536)
+            except (ssl.SSLError, OSError):
+                if buf:
+                    break                                # 对面没发 close_notify 就关了：数据已经收全
+                raise
+            if not d:
+                break
+            buf += d
+    head, _, body = buf.partition(b"\r\n\r\n")
+    status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+    if not re.match(r"^HTTP/\S+ 200\b", status):
+        raise OSError(f"DNS 回 {status[9:12] or '空'}")
+    return _dns_answer_ips(body, qtype)
+
+def _agh_doh_url():
+    """本机 AdGuard 的 DoH 地址（选「本机DNS解析」后给外机粘贴的那一行）：装了 AdGuard、开了加密、本机是域名才有，
+       否则 ''。末段带 ClientID，跟「自建 DNS 写入订阅」同一个（见 selfdns_clientid）。"""
+    dom = _host()
+    if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or "") or not os.path.exists("/opt/AdGuardHome/AdGuardHome"):
+        return ""
+    t = _agh_tls()
+    if t.get("enabled") != "true" or (t.get("server_name") and t["server_name"] != dom):
+        return ""
+    try:
+        port = int(t.get("port_https") or 0)
+    except ValueError:
+        port = 0
+    return f"https://{dom}:{port}/dns-query/{selfdns_clientid()}" if port else ""
+
+def _agh_local_addr():
+    """本机 AdGuard 的 HTTPS（DoH）挂在哪个地址：跟 http.address 同一个，0.0.0.0 / :: / 空 → 127.0.0.1。"""
+    try:
+        m = re.search(r"(?m)^\s*address:\s+(\S+):(\d+)\s*$", open(AGH_YAML).read())
+    except OSError:
+        m = None
+    h = m.group(1).strip("[]\"'") if m else ""
+    return "127.0.0.1" if h in ("", "0.0.0.0", "::") else h
+
+def _privdns_is_own(dns):
+    """这个 DNS 地址是不是本机的（按域名认；端口、ClientID 对不对交给去问那一步）。"""
+    m = _PRIVDNS_DNS.match(dns or "")
+    return bool(m) and m.group(1).lower() == (_host() or "").lower()
+
+def _privdns_check(name, dns, ips):
+    """去 DNS 问一遍私有名：答出来的 IP 跟 ips 一个不差返回 ""，否则返回原因（一句话）。"""
+    if not ips:
+        return "节点地址不是 IP（用域名装的藏不了）"
+    local = _agh_local_addr() if _privdns_is_own(dns) else None
+    try:
+        for qt in (1, 28):
+            want = sorted(i for i in ips if (":" in i) == (qt == 28))
+            if not want:
+                continue
+            rc, got = _doh_ask(dns, name, qt, local=local)
+            if rc == 5:
+                return "DNS 拒绝了（ClientID 不对？）"
+            if rc == 3 or not got:
+                return "DNS 里还没有这个名字"
+            if sorted(str(ipaddress.ip_address(g)) for g in got) != want:
+                return "DNS 答的 IP 对不上（还没重新汇总？）"
+    except Exception as e:
+        return f"问不到 DNS（{str(e)[:40] or e.__class__.__name__}）"
+    return ""
+
+def _privdns_map():
+    try:
+        m = json.load(open(PRIVDNS_MAP_FILE))
+    except Exception:
+        return {}
+    return {k: v for k, v in m.items() if _PRIVDNS_NAME.match(k) and isinstance(v, dict) and v.get("ips")} \
+        if isinstance(m, dict) else {}
+
+def _yaml_scalar(s):
+    """YAML 单行标量去引号（AdGuard 写 user_rules 时单引号、双引号、不加引号都可能）。"""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    if len(s) >= 2 and s[0] == s[-1] == '"':
+        try:
+            return json.loads(s)
+        except ValueError:
+            return s[1:-1]
+    return s
+
+def _agh_user_rules_put(txt, rules):
+    """AdGuardHome.yaml 的 user_rules 里，把我们那一段（_PRIVDNS_BEGIN … _PRIVDNS_END）换成 rules；
+       用户自己的规则原样一行不动。认不准写法（一行写完的 [a, b]、跨行的长规则）返回 None，不动它。"""
+    lines = txt.split("\n")
+    k = next((i for i, l in enumerate(lines) if re.match(r"^user_rules:", l)), None)
+    if k is None:
+        return None
+    rest = lines[k][len("user_rules:"):].strip()
+    items, j = [], k + 1
+    if rest not in ("", "[]"):
+        return None
+    if rest == "":
+        while j < len(lines):
+            mm = re.match(r"^([ \t]*)-(?:[ \t]+(.*))?$", lines[j])
+            if not mm:
+                break
+            items.append((lines[j], len(mm.group(1)), _yaml_scalar(mm.group(2) or "")))
+            j += 1
+        if items and j < len(lines) and lines[j].strip() and \
+                len(lines[j]) - len(lines[j].lstrip()) > items[0][1]:
+            return None                                  # 跨行的规则：认不准，宁可不动
+    keep, ours, inside = [], [], False
+    for raw, _ind, v in items:
+        if v == _PRIVDNS_BEGIN:
+            inside = True
+        elif v == _PRIVDNS_END:
+            inside = False
+        elif inside:
+            ours.append(v)
+        else:
+            keep.append(raw)
+    if inside:
+        return None                                      # 只有开头没有结尾（被人手改坏了）：往下全算我们的会删掉用户规则
+    if ours == list(rules) and (bool(rules) == (len(keep) < len(items))):
+        return txt                                       # 规则没变（AdGuard 换过引号也算没变）：不写、不重启
+    ind = " " * (items[0][1] if items else 2)
+    add = [f"{ind}- '{r}'" for r in [_PRIVDNS_BEGIN] + list(rules) + [_PRIVDNS_END]] if rules else []
+    body = keep + add
+    return "\n".join(lines[:k] + ["user_rules:" + ("" if body else " []")] + body + lines[j:])
+
+def _agh_rules_sync(m):
+    """映射 → AdGuard 自定义规则（||私有名^$dnsrewrite=NOERROR;A;IP）。改了文件返回 True（要重启 AdGuard 才生效）；
+       没装 / 没变 / 认不准 user_rules 写法 → False。"""
+    try:
+        txt = open(AGH_YAML).read()
+    except OSError:
+        return False
+    rules = [f"||{n}^$dnsrewrite=NOERROR;{'AAAA' if ':' in ip else 'A'};{ip}"
+             for n in sorted(m) for ip in m[n]["ips"]]
+    new = _agh_user_rules_put(txt, rules)
+    if new is None:
+        if rules:
+            print("  ⚠ AdGuard 的自定义规则写法认不准，私有名没写进去")
+        return False
+    if new == txt:
+        return False
+    tmp = AGH_YAML + ".xy-new"
+    with open(tmp, "w") as f:
+        f.write(new)
+    os.chmod(tmp, 0o600)          # 里面现在有别的机器的 IP：只给 root 看（AdGuard 新版自己也是 0600）
+    os.replace(tmp, AGH_YAML)
+    return True
+
+def _agh_wait(m, secs=20):
+    """重启 AdGuard 后等它真开始答（要先加载过滤列表，几秒），最多 secs 秒。没有私有名就只等端口开。"""
+    url, local = _agh_doh_url(), _agh_local_addr()
+    name = next(iter(sorted(m)), "")
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        try:
+            if url and name:
+                ip = m[name]["ips"][0]
+                rc, got = _doh_ask(url, name, 28 if ":" in ip else 1, local=local, timeout=3)
+                if rc == 0 and got:
+                    return
+            else:
+                port = int(_agh_tls().get("port_https") or 0)
+                if not port:
+                    return
+                socket.create_connection((local, port), timeout=2).close()
+                return
+        except Exception:
+            pass
+        time.sleep(1)
+
+def _privdns_sync(members):
+    """本机当 DNS 机（13 → 11 选 1）：把指定了本机的外机写进 PRIVDNS_MAP_FILE 和 AdGuard 规则。
+       外机关掉 / 删掉 / 拉不到的，过了 PRIVDNS_GRACE 才删。映射里的名字或 IP 变了才重启 AdGuard。
+       重启不碍本机看片：装 AdGuard 时本机解析改走公共 DNS（adguard-dns.py 的 _do_free53），本机进程都不经过它，
+       断的只是外面来问的那一两秒。members = [(这台的新链接, meta)]。"""
+    old = _privdns_map()
+    now = int(time.time())
+    m = {k: v for k, v in old.items() if now - int(v.get("seen") or 0) <= PRIVDNS_GRACE}
+    if privdns_conf()["mode"] == "self" and _agh_doh_url():
+        took = set()
+        for links, meta in members:
+            if meta and _privdns_is_own(meta[1]):
+                ips = _privdns_ips(links)
+                if ips and meta[0] in took:
+                    # 两台报的私有名一样：多半是整机克隆过来的（privdns.json 跟着拷了）。先到先得，后一台不藏
+                    print(f"  ⚠ {_privdns_label(links)} 跟别的机器私有名一样（克隆来的？）：到它的 13 → 11 关了再开一次")
+                elif ips:
+                    m[meta[0]] = {"ips": ips, "seen": now, "label": _privdns_label(links)}
+                    took.add(meta[0])
+    changed = _agh_rules_sync(m)
+    if m:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        json.dump(m, open(PRIVDNS_MAP_FILE, "w"), ensure_ascii=False)
+        harden_perms()
+    elif os.path.exists(PRIVDNS_MAP_FILE):
+        os.remove(PRIVDNS_MAP_FILE)                      # 全过期了：规则已撤，以后不用再对
+    if changed:
+        sh("systemctl restart AdGuardHome", check=False)
+        _agh_wait(m)
+    return m
+
+def _privdns_apply(groups):
+    """汇总时把指定了私有解析的成员机节点换成私有名。groups = [(这台的新链接, meta)]，第一组是本机（不换）。
+       先当 DNS 机把映射对好，再逐台去它的 DNS 问：对上了才换，问不通照写真实地址（屏上 / 日志一行 ⚠）。"""
+    _PRIVDNS_LIVE.clear()
+    mode = privdns_conf()["mode"]
+    if mode == "self" or os.path.exists(PRIVDNS_MAP_FILE):
+        _privdns_sync(groups[1:])
+    out = list(groups[0][0]) if groups else []
+    for links, meta in groups[1:]:
+        if meta and links:
+            name, dns = meta
+            if _privdns_is_own(dns) and mode != "self":
+                why = "本机没开「本机DNS解析」"
+            else:
+                why = _privdns_check(name, dns, _privdns_ips(links))
+            if not why:
+                links = [u if "CDN·" in _link_name(u) else _link_set_server(u, name) for u in links]
+                _PRIVDNS_LIVE[name] = dns
+            else:
+                print(f"  ⚠ {_privdns_label(links)} 私有解析没对上：{why}，这次照写真实地址")
+        out += links
+    return out
+
 def aggregated_links(local=None):
     """本机链接 + 各成员机 .links（去重；拉不到的成员直接跳过）。
        只认真正的节点分享链接前缀，绝不把订阅 URL/注释误当节点。撞名的自动加 ¹²³ 区分。
@@ -5389,15 +5890,19 @@ def aggregated_links(local=None):
        ——主机渲染时一并规范化。不回写 NODE_FILE：那是原始凭据，能不动就不动。"""
     links = list(local if local is not None else read_saved_links())
     seen = set(links)
+    groups = [(links, None)]                            # 一台一组：私有解析按台换名（见 _privdns_apply）
     for u in load_peers():
         try:
             text = _fetch_text(u)
         except Exception:
             continue                                    # 不通就忽略这台
+        got = []
         for line in text.splitlines():
             s = line.strip()
             if s.startswith(_NODE_SCHEMES) and s not in seen:
-                seen.add(s); links.append(s)
+                seen.add(s); got.append(s)
+        groups.append((got, _privdns_meta(text)))
+    links = _privdns_apply(groups)                      # 指定了私有解析的成员机：问过它的 DNS、对上了才换成私有名
     links = [_link_rename(u, _sep_name(_link_name(u))) for u in links]   # 统一补「前缀·协议」
     return _dedup_names(_group_by_prefix(links))                        # 同前缀排一起；撞名的再加 ¹²
 
@@ -5412,6 +5917,8 @@ def parse_nodes(all_links):
             continue
         ylines.append("  - {" + ", ".join(f"{k}: {_yfmt(v)}" for k, v in d.items()) + "}")
         d["_link"] = u                                   # 原始分享链接（名字已规范化），小火箭节点订阅照抄它
+        if d.get("server") in _PRIVDNS_LIVE:
+            d["_privdns"] = _PRIVDNS_LIVE[d["server"]]   # 被藏的节点：它的私有名该去问哪台 DNS（三个生成器看这个）
         k = proto_key(d)
         if k:
             nodes.append((k, d))
@@ -6213,6 +6720,9 @@ def cfg_auto_run():
         print(f"{ts} {FMT[e]['label']} 手改过，跳过（进菜单「自动更新」可恢复）")
     todo = [e for e in todo if not cfg_auto_paused(e)]
     if not todo or not read_saved_links():
+        if privdns_conf()["mode"] == "self" or os.path.exists(PRIVDNS_MAP_FILE):
+            G["host"] = _host()
+            aggregated_links()                  # 三大配置都没在自动更新：当 DNS 机的映射照样每天对一遍（外机换 IP、到期清理）
         return
     G["host"] = _host()
     ylines, nodes = parse_nodes(aggregated_links())
@@ -7422,6 +7932,152 @@ def selfdns_off():
             print("  ✓ 已从订阅移除自建 DNS 并刷新（客户端重拉订阅即恢复原 DNS）。")
     except Exception as e:
         print("  订阅刷新跳过（不影响卸载）:", e)
+
+def _privdns_regen():
+    """改完私有解析重生成三大配置：跟「刷新三大配置」同一套 _regen_fmt（不动节点、不换 token、不重启服务）；
+       汇总、当 DNS 机对映射、去 DNS 问一遍都在 aggregated_links 里。手改过的格式不动，屏上一行说明。"""
+    todo = [e for e in FMT if os.path.exists(FMT[e]["file"])]
+    G["host"] = _host()
+    links = aggregated_links()
+    if not todo:
+        return
+    ylines, nodes = parse_nodes(links)
+    if not ylines:
+        return
+    for e in todo:
+        if cfg_auto_paused(e):
+            print(f"  ⚠ {FMT[e]['label']} 手改过，没刷新（要刷到「刷新三大配置」里点）")
+            continue
+        st, _which, err = _regen_fmt(e, ylines, nodes)
+        if st == "failed":
+            print(f"  ⚠ {FMT[e]['label']} 生成失败，保留原配置：{str(err).splitlines()[0] if str(err) else err}")
+
+def _privdns_served():
+    """本机替哪些外机解析 → 「2 台（🇺🇸1、🇯🇵2）」；一台没有返回「还没有」。"""
+    m = _privdns_map()
+    if not m:
+        return "还没有"
+    return f"{len(m)} 台（" + "、".join(v.get("label") or "成员机" for _, v in sorted(m.items())) + "）"
+
+def _privdns_set_self(c):
+    """选 1：本机当 DNS 机。要装好 AdGuard、开了加密（DoH 靠域名证书）。"""
+    if not _agh_doh_url():
+        ui_tip("本机要先装好 AdGuard、开加密（本菜单 1 装，3 看怎么开）")
+        return
+    was = c["mode"]
+    c["mode"] = "self"
+    privdns_save(c)
+    if was == "remote":
+        _write_links_file(read_saved_links())          # 不再请外机替本机解析：.links 末尾那行撤掉
+    _privdns_regen()
+    print("  " + _hl("1;32", "✔ 已开：把本机 DNS 地址粘到外机的「2 外机DNS解析」"))
+
+def _privdns_set_remote(c):
+    """选 2：本机节点交给外机解析。本机得是用 IP 装的（域名装的节点地址就是域名，藏不了）。"""
+    ips = _privdns_ips(read_saved_links())
+    if not ips:
+        ui_tip("本机节点用的是域名（或还没装节点），藏不了 IP，不用开")
+        return
+    url = _ask("  粘贴外机的 DNS 地址: ").strip()
+    if not url:
+        return
+    if not _PRIVDNS_DNS.match(url):
+        print("  ✗ 不是外机的 DNS 地址（外机 13 → 11 选 1 后屏上那一行），已忽略")
+        return
+    ui_warn("开了以后：汇总本机的订阅里，小火箭那份不放本机节点，本机的直连规则去掉")
+    if _ask("  确认开启? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("  已取消，没改动")
+        return
+    if c["mode"] != "remote" or not _PRIVDNS_NAME.match(c["name"]):
+        # 每次从关 / 本机切过来都起个新名字：整机克隆来的机器私有名会重，关了再开就分开了。
+        # 旧名字在外机那边还留 7 天（PRIVDNS_GRACE），没刷新订阅的客户端照样能解析
+        c["name"] = _privdns_new_name()
+    c.update(mode="remote", dns=url)
+    privdns_save(c)
+    _write_links_file(read_saved_links())              # 主机下次来拉 .links 就看到末尾那行
+    why = _privdns_check(c["name"], url, ips)
+    if not why:
+        print("  " + _hl("1;32", "✔ 外机已对上：主机下次汇总（「更新配置」或每天 03:20）就换成私有名"))
+    else:
+        print("  " + _hl("1;33", f"⚠ 已开，外机还没对上：{why}"))
+
+def _privdns_set_off(c):
+    """选 3：关。当 DNS 机时关掉会让外机的节点改回真实地址——醒目一行 + 默认否（CLAUDE.md 第四节）。"""
+    if c["mode"] == "off":
+        return
+    if c["mode"] == "self" and _privdns_map():
+        ui_warn("关掉后外机的节点改回真实地址（映射再留 7 天，客户端来得及刷新订阅）")
+        if _ask("  确认关掉? [y/N]: ").strip().lower() not in ("y", "yes"):
+            print("  已取消，没改动")
+            return
+    was = c["mode"]
+    c["mode"] = "off"
+    privdns_save(c)
+    if was == "remote":
+        _write_links_file(read_saved_links())
+        print("  " + _hl("1;32", "✔ 已关：主机下次汇总改回真实地址"))
+    else:
+        _privdns_regen()
+        print("  " + _hl("1;32", "✔ 已关"))
+
+def privdns_menu():
+    """13 → 11「节点使用私有DNS解析」（adguard-dns.py 调 privdns）。仓库主人 10/28 定的菜单：
+         1 本机DNS解析 —— 本机当 DNS 机：替指定了本机的外机解析（本机节点用的是域名，不用藏）
+         2 外机DNS解析 —— 本机节点交给外机解析：粘贴外机的 DNS 地址，汇总本机的主机把本机节点换成私有名
+         3 关          —— 跟原来一样，节点写真实地址，公网 DNS 都能解析
+       来龙去脉见 aggregated_links 上面那段注释。"""
+    while True:
+        c = privdns_conf()
+        ui_title(f"节点使用私有DNS解析　当前：{_PRIVDNS_MODES[c['mode']]}")
+        tip = ""
+        if c["mode"] == "self":
+            url = _agh_doh_url()
+            ui_url("本机 DNS 地址（给外机粘贴）", url)
+            print()
+            ui_kv("替外机解析", _privdns_served())
+            if not url:
+                tip = "本机 AdGuard 没开加密或没装好，外机连不上（本菜单 7 自检）"
+        elif c["mode"] == "remote":
+            ui_url("外机 DNS 地址", c["dns"], code="36")
+            print()
+            why = _privdns_check(c["name"], c["dns"], _privdns_ips(read_saved_links()))
+            print("  " + (_hl("1;32", "✔ 外机已对上") if not why else _hl("1;33", f"⚠ 外机还没对上：{why}")))
+            if why.startswith(("DNS 里还没有", "DNS 答的 IP")):
+                tip = "外机的「聚合节点链接」里加上本机 links 链接，再点「更新配置」"
+            elif why.startswith("DNS 拒绝"):
+                tip = "外机换过 ClientID：到外机 13 → 11 重新复制地址，本机选 2 再粘一次"
+        ui_line()
+        ui_items([(1, "本机DNS解析", None), (2, "外机DNS解析", None), (3, "关", None), (0, "返回", None)])
+        if tip:
+            ui_tip(tip)
+        ch = _ask("选择: ").strip()
+        if ch == "1":
+            _privdns_set_self(c)
+        elif ch == "2":
+            _privdns_set_remote(c)
+        elif ch == "3":
+            _privdns_set_off(c)
+        elif ch in ("0", ""):
+            return
+
+def privdns_off():
+    """卸载 AdGuard 时调用（privdns-off）：本机在当 DNS 机就关掉、清映射，重生成配置（外机节点改回真实地址）。
+       别的情况静默返回。"""
+    c = privdns_conf()
+    if c["mode"] != "self" and not os.path.exists(PRIVDNS_MAP_FILE):
+        return
+    if c["mode"] == "self":
+        c["mode"] = "off"
+        privdns_save(c)
+    try:
+        os.remove(PRIVDNS_MAP_FILE)                     # AdGuard 整个要删，规则跟着没了，映射不用再留
+    except OSError:
+        pass
+    try:
+        _privdns_regen()
+    except Exception as e:
+        print("  订阅刷新跳过（不影响卸载）:", e)
+    print("  ✓ 已关掉节点私有解析（外机节点改回真实地址）")
 
 def cn_block_reapply():
     """重装后调用：若之前开启过屏蔽，用 cn-block.py 重新注入（未开启则内部直接跳过）。"""
@@ -12945,6 +13601,12 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "selfdns-off":     # adguard 卸载调用：若已写入则从订阅移除并刷新
         selfdns_off()
+        sys.exit(0)
+    if sys.argv[1] == "privdns":         # adguard 菜单 11 调用：节点使用私有DNS解析
+        privdns_menu()
+        sys.exit(0)
+    if sys.argv[1] == "privdns-off":     # adguard 卸载调用：本机在当 DNS 机就关掉，外机节点改回真实地址
+        privdns_off()
         sys.exit(0)
     ap = argparse.ArgumentParser(
         description="sing-box + xray 双核心多协议安装器",
