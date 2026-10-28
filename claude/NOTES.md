@@ -81,6 +81,9 @@
   请求打到伪装站首页，nginx 日志 200 不是 101）。ws：`obfs=websocket`；httpupgrade：`obfs=httpupgrade`；
   grpc：`obfs=grpc,obfs-uri=服务名`（不带 /）；xhttp：`obfs=xhttp,obfs-uri,obfs-host`。`alpn=http/1.1` 不是解药，别加回去。
 - 小火箭握手带 X25519MLKEM768（指纹 Safari26_3）：xray 26.9.8+ 的 reality（²）小火箭能连，不再跳过。
+  sing-box 系客户端不带，sing-box 订阅照旧不写：本机的看 `_local_xray_reality`；聚合的成员机由它在 `.links` 末尾报
+  `#xray-reality 端口 借用域名`，主机按 (uuid, 端口, 借用域名) 认（`_XR_PEER`，私有解析换地址、改名都不碰这三样）。
+  10/29 仓库主人发现成员机的 reality-vision² / reality-grpc 被写进了 sing-box 才补上。
 - 还没测出来：VLESS Encryption（量子加密）在配置行里的参数名，目前跳过；单条链接导入实测能连。
 - 测写法用 `claude/tools/srtest.py`：同一节点放几种写法生成测试订阅，手机 C 测试一轮就定，别一次猜一种。
 - 订阅 .conf 加到小火箭首页刷新报「不能获取订阅节点」：小火箭没连接时直连订阅端口，可能被干扰；先连节点再刷新。
