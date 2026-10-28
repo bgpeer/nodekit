@@ -165,6 +165,11 @@
 - **封 IP 看客户端里节点通不通，别信 nmap 裸扫**：nmap `-Pn -p 443` 回 `filtered` 不代表节点不通——GFW / 运营商会丢掉
   裸 SYN 扫描，而 reality / 真实代理流量照过（伪装起作用）。同一台日本机，nmap 443 filtered、ClashMi 里全节点却 110~170ms 全通。
   判「是不是封 IP」以客户端实连为准；真要用 nmap，先把手机代理彻底关掉（开着的话 TUN 本地答 SYN，延迟 0.4ms 是假 open）。
+- **IP 被封 TCP、UDP 照通**（10/29，美国 CN2 GIA 那台 DMIT）：客户端里这台的 TCP 协议全挂（reality / vision / ws / trojan /
+  anytls / grpc，端口各不相同），hy2 / tuic 照通。判法：anytls 和 hy2 / tuic 是同一个 sing-box，UDP 通、TCP 断 = 服务没挂、
+  是路上拦了 TCP；再从**境外另一台**机器 `timeout 5 bash -c '</dev/tcp/域名/443'` 测，通 = 机器没事、国内到它的 TCP 被封
+  （在这台自己身上测自己不算数，自己连自己永远通）。这几天的改动（网络优化换队列 / 保留端口、私有解析）都不碰入站 TCP。
+  处理：换 IP 后改 Cloudflare 里的记录（用域名装的，链接 / 订阅都按域名，不用动）；CDN 能救急，但走 Cloudflare 就用不上 CN2 GIA。
 
 ## 仓库主人的偏好
 
