@@ -11617,6 +11617,9 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
                                      "Cert success"))
     if r.returncode and not skipped:
         print(f"{R}  ✗ 签发失败，现有证书没动：{N}\n" + out[-1200:])
+        if dns01 and "invalid domain" in out:
+            # acme.sh 的 dns_cf 拿令牌找不到这个区域（10/30 日本机：存的是只管别的根域名的旧令牌）
+            ui_tip(f"Cloudflare 令牌管不到 {_root_domain(dom)}：CF → API 令牌 → 编辑它 → 区域资源加上这个域名（或选所有区域），别新建一个顶掉")
         return False
 
     # 先导到临时路径验一遍，验过了才动真的——这一步是「不可用就回退」的关键
