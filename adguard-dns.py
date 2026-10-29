@@ -10,18 +10,23 @@
 #   - 挂代理的设备本来就靠订阅里的 reject 规则集拦广告，这个是补「没挂代理」的场景。
 #   - AdGuard Home 是网页后台管理的软件：这里做「一键装好起服务 + 一键干净卸载」，
 #     设管理密码、微调过滤名单在它的网页后台点几下完成（广告过滤默认即开）。
-#   - 加密走 DoT(853，复用 acme 证书)：安卓「专用 DNS」填域名即可全系统生效；
+#   - 加密走 DoT(853，自建 DNS 自己的域名和证书，10/29 起跟节点分开；老装法复用节点的 acme 证书)：安卓「专用 DNS」填域名即可全系统生效；
 #     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
 #   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
 #   - 卸载(菜单2)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
 #     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 8 里的「删除 DoT」
 #     只撤泛域名证书这一项，AdGuard 本体继续跑。
-import os, re, sys, time, json, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
+import os, re, sys, time, json, shlex, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
 ACME_CRT, ACME_KEY = "/etc/ssl/sb/acme.crt", "/etc/ssl/sb/acme.key"   # 主脚本 acme 证书
 CERT_META = BGP_DIR + "/cert.json"                # 主脚本记的「这张证书该是什么样」（见 _cert_meta_set）
+# 自建 DNS 自己的域名和证书（仓库主人 10/29「各个域名分开互不干预」）：新装起跟节点 / Emby 分开，
+# 节点证书不再替它背 *.节点域名。老装法没有 AGH_DOMAIN_FILE，照旧共用 ACME_CRT（_domain / _crt 自动退回）。
+AGH_DOMAIN_FILE = BGP_DIR + "/agh.domain"
+AGH_CERT_DIR = "/etc/ssl/agh"
+AGH_CRT, AGH_KEY = AGH_CERT_DIR + "/agh.crt", AGH_CERT_DIR + "/agh.key"
 AGH_DIR = "/opt/AdGuardHome"
 AGH_BIN = AGH_DIR + "/AdGuardHome"
 RESOLVED_DIR    = "/etc/systemd/resolved.conf.d"
@@ -149,10 +154,28 @@ def _host():
     try: return open(HOST_FILE).read().strip()
     except OSError: return ""
 
+def _own_domain():
+    """自建 DNS 自己的域名（新装法）；老装法 / 没设返回 ''。"""
+    try:
+        d = open(AGH_DOMAIN_FILE).read().strip().lower()
+    except OSError:
+        return ""
+    return d if re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", d) else ""
+
 def _domain():
-    """有域名才返回域名（DoT 需要证书 + 域名）；没域名返回 ''。"""
+    """自建 DNS 对外的域名（DoT 需要证书 + 域名）：有自己的用自己的，老装法跟节点共用；都没有返回 ''。"""
+    own = _own_domain()
+    if own:
+        return own
     h = _host()
     return h if re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", h or "") else ""
+
+def _crt():
+    """AdGuard 用的证书：有自己的域名就是自己那张，老装法是跟节点共用的 ACME_CRT。"""
+    return AGH_CRT if _own_domain() else ACME_CRT
+
+def _key():
+    return AGH_KEY if _own_domain() else ACME_KEY
 
 # 出网一律用中性 UA：默认的 Python-urllib/3.x 等于告诉沿途每一跳「这是个脚本」。
 # 仓库里别的脚本早就统一过，这一份当时漏了。
@@ -198,7 +221,7 @@ def _port_busy(port):
         s.close()
 
 def _cert_ready():
-    return os.path.exists(ACME_CRT) and os.path.exists(ACME_KEY)
+    return os.path.exists(_crt()) and os.path.exists(_key())
 
 def install():
     if os.geteuid() != 0:
@@ -206,18 +229,10 @@ def install():
     if _installed():
         print("  AdGuard Home 已经装过了。要重装请先『2 卸载』再装。")
         _usage(); return
-    dom = _domain()
-    print("\n  === 安装前检查 ===")
-    print(f"  域名: {dom or '（未用域名，装脚本时没填域名）'}")
+    dom = _setup_own_domain()
     if not dom:
-        print("  ⚠ 没有域名：安卓「专用 DNS」(加密 DoT) 用不了，只能给设备填本机 IP 走明文 53。")
-        print("    想要安卓全系统走加密 DNS，得先用域名重装主节点。")
+        ui_tip("没有域名：安卓专用 DNS（加密 DoT）用不了，设备只能填本机 IP 走明文 53")
         if _ask("  仍然继续安装（只用明文 53）? [y/N]: ").lower() not in ("y", "yes"):
-            return
-    elif not _cert_ready():
-        print(f"  ⚠ 有域名但没找到 acme 证书（{ACME_CRT}）：多半是装节点时用的是自签。")
-        print("    没有真证书 DoT 客户端会拒连。可继续装，但建议先给节点配好域名真证书。")
-        if _ask("  仍然继续? [y/N]: ").lower() not in ("y", "yes"):
             return
     # 53 常被 systemd-resolved 占用，会让向导里 DNS 端口报红过不去——装前先帮忙腾好
     b53 = _port_busy(53)
@@ -241,6 +256,76 @@ def install():
     else:
         print("\n  已安装，但服务暂未在运行——稍等或看 `systemctl status AdGuardHome`。")
     _first_setup()          # 初装向导统一走默认 3000（先保证进得去），装好后再用菜单 5 改端口（带回滚，锁不死）
+
+def _setup_own_domain():
+    """装之前给自建 DNS 一个它自己的域名、签一张它自己的证书（域名 + *.域名，DoT 带 ClientID 要泛域名），
+       跟节点 / Emby 完全分开（仓库主人 10/29：「各个域名分开互不干预，好操作」）。返回域名；回车 / 没弄成返回 ''。
+       换域名 = 卸了重装（仓库主人：「大不了重做」），所以不另设菜单项。
+       两条 A 记录先查、签之前就查，省得签完才发现手机找不到这台。令牌：acme.sh 里存着就用它（续期也靠它），
+       签不出来多半是那个令牌没管到这个域名的区域——让去 CF 编辑令牌把区域加上，不另贴一个顶掉（acme.sh 只存一个，
+       顶掉以后节点 / Emby 那几张的续期就签不出来了）。"""
+    R, G_, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
+    ui_title("自建 DNS 的域名（跟节点分开）")
+    ui_tip("用一个只给 DNS 用的域名，比如 dns.你的域名；回车 = 不用加密")
+    dom = _ask("  域名: ").strip().lower().rstrip(".")
+    if not dom:
+        return ""
+    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
+        print(f"  {R}✗ 域名格式不对{N}"); return ""
+    ip = _public_ip()
+    print(_hl("1;36", f"[Cloudflare 里两条 A 记录 → {ip}，仅 DNS（灰云）]"))
+    print(dom)
+    print("*." + dom)
+    base = _resolve4(dom)
+    if ip not in base:
+        print(f"  {R}✗ {dom} 解析到 {', '.join(base) or '（查不到）'}，不是本机{N}")
+        ui_tip("建好、等生效（几分钟）再来装"); return ""
+    okw, why = _wildcard_dns_check(dom)
+    if not okw:
+        print(f"  {Y}⚠ {why}：安卓专用 DNS 带不了 ClientID，先装着，建好就能用{N}")
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print(f"  {R}✗ 没有 acme.sh（节点脚本装证书时会装上）{N}"); return ""
+    conf = os.path.expanduser("~/.acme.sh/account.conf")
+    have_tok = os.path.exists(conf) and re.search(r"(?m)^SAVED_CF_Token=", open(conf).read())
+    env = ""
+    if not have_tok:
+        _cf_token_steps(dom)
+        tok = _ask("  粘贴 Cloudflare API Token（粘完回车）: ").strip()
+        if not tok:
+            print("  没填令牌，这次只用明文 53"); return ""
+        env = f"CF_Token={shlex.quote(tok)} "
+    print(f"  签 {dom} + *.{dom}（DNS 验证，约 1-2 分钟）…")
+    r = subprocess.run(f"{env}{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' "
+                       f"--keylength ec-256 --server letsencrypt", shell=True, text=True, capture_output=True)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
+        print(f"  {R}✗ 证书没签下来{N}")
+        for ln in out.splitlines()[-4:]:
+            print("     " + ln)
+        if have_tok and "invalid domain" in out:
+            ui_tip(f"acme.sh 存的令牌管不到 {_root_of(dom)}：CF → API 令牌 → 编辑它 → 区域资源加上这个域名，别新建一个顶掉")
+        return ""
+    os.makedirs(AGH_CERT_DIR, exist_ok=True)
+    os.chmod(AGH_CERT_DIR, 0o700)                        # 私钥：只给 root
+    sh(f"{acme} --install-cert -d {dom} --ecc --fullchain-file {AGH_CRT} --key-file {AGH_KEY} "
+       f"--reloadcmd 'systemctl try-restart AdGuardHome 2>/dev/null; true'")
+    if not os.path.exists(AGH_CRT):
+        print(f"  {R}✗ 证书没装上（{AGH_CRT}）{N}"); return ""
+    os.makedirs(BGP_DIR, exist_ok=True)
+    open(AGH_DOMAIN_FILE, "w").write(dom + "\n")
+    print(f"  {G_}✔ 自建 DNS 的证书签好了：{dom} + *.{dom}（自己续期，不碰节点证书）{N}")
+    return dom
+
+def _own_cert_remove(dom):
+    """卸载时撤掉自建 DNS 自己那张证书：acme.sh 不再续期它，文件和域名记录删掉。节点证书一个字节不动。"""
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if os.path.exists(acme):
+        sh(f"{acme} --remove -d {dom} --ecc")
+        shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{dom}_ecc"), ignore_errors=True)
+    shutil.rmtree(AGH_CERT_DIR, ignore_errors=True)
+    try: os.remove(AGH_DOMAIN_FILE)
+    except OSError: pass
 
 def _first_setup():
     ip = _public_ip()
@@ -376,9 +461,9 @@ def _cert_wildcard_ok(dom):
     """本机 acme 证书是否覆盖 *.dom —— 这决定 DoT 能不能带 ClientID。
        DoT 的 ClientID 是塞在 SNI 第一段(tls://<ID>.域名)传过去的，证书里没有
        *.域名 这个 SAN，客户端握手就会因证书名不匹配而拒连。"""
-    if not (dom and os.path.exists(ACME_CRT)):
+    if not (dom and os.path.exists(_crt())):
         return False
-    return f"DNS:*.{dom}" in sh(f"openssl x509 -in {ACME_CRT} -noout -text 2>/dev/null")
+    return f"DNS:*.{dom}" in sh(f"openssl x509 -in {_crt()} -noout -text 2>/dev/null")
 
 def _resolve4(name):
     """name 的 IPv4 地址（走本机的解析器，查的是公网上的记录）；查不到返回 []。"""
@@ -488,15 +573,15 @@ def _usage(port=None):
         print("    后台里点：设置 → 加密设置(Encryption)，然后：")
         print(f"      · 勾选「启用加密」")
         print(f"      · 服务器名称        填：{G}{dom}{N}")
-        print(f"      · 证书（选『文件路径』）填：{G}{ACME_CRT}{N}")
-        print(f"      · 私钥（选『文件路径』）填：{G}{ACME_KEY}{N}")
+        print(f"      · 证书（选『文件路径』）填：{G}{_crt()}{N}")
+        print(f"      · 私钥（选『文件路径』）填：{G}{_key()}{N}")
         print(f"      · HTTPS 端口         填：{G}10443{N}   （不要填 0，也别填 443）")
         print(f"      · DNS-over-TLS 端口  填：{G}853{N}")
         print(f"      · 「HTTPS 自动重定向」{Y}不要勾{N}（勾了进后台会强制跳 HTTPS，用 IP 访问会证书报错、进不去）")
         print(f"      · 点『保存』（若提示 {Y}no IP addresses{N} 的黄字，无害，忽略）")
     else:
-        print(f"    {Y}你装节点时没用域名 → 加密(DoT/DoH)用不了，只能用下面①明文 DNS。{N}")
-        print("    想要手机全系统走加密 DNS，得先用域名重装节点。")
+        print(f"    {Y}自建 DNS 没设域名 → 加密(DoT/DoH)用不了，只能用下面①明文 DNS。{N}")
+        print("    想要手机全系统走加密 DNS：卸了重装，装的时候填一个域名。")
 
     print("\n  【第三步 · 把设备的 DNS 指到这台服务器】下面三种，按设备挑一种：")
     print(f"    ① 明文 DNS —— 电视/盒子/IoT/路由器/电脑，最通用")
@@ -751,9 +836,15 @@ def dot_clientid():
         c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
+        elif c == "2" and _own_domain():
+            # 自己的证书本来就是泛域名、只给 DNS 用，撤了也不省什么；不想要 ClientID，后台清空「允许的客户端」就行
+            ui_tip("自建 DNS 用的是自己的证书，不用撤；不想用 ClientID，后台清空「允许的客户端」即可")
         elif c == "2":
             _revert_wildcard(dom, cid)
         return
+    if _own_domain():                                     # 自己那张装的时候就带 *.域名；没有说明证书出了岔子
+        print(f"  {R}⚠ 自建 DNS 自己的证书里没有 *.{dom}{N}")
+        ui_tip("卸了重装自建 DNS（菜单 2 → 1），装的时候会重签"); return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
     print(f"\n  {Y}需要你先准备两样：{N}")
@@ -1019,8 +1110,9 @@ def uninstall(refresh_sub=True):
     if not _installed():
         print("  没检测到 AdGuard Home，无需卸载。"); return
     dom  = _domain()                                 # 这些状态要趁 AGH 目录还在先读出来
+    own  = _own_domain()                             # 新装法：自己的域名、自己的证书，整张撤掉，节点证书不碰
     cid  = _selfdns_clientid()
-    wild = refresh_sub and dom and _cert_wildcard_ok(dom)
+    wild = refresh_sub and dom and not own and _cert_wildcard_ok(dom)
     subw = os.path.exists(SELFDNS_FLAG)
     prv  = refresh_sub and _privdns_mode() == "self"
     res  = os.path.exists(RESOLVED_DROPIN)
@@ -1034,6 +1126,7 @@ def uninstall(refresh_sub=True):
     if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
                    f"顺带清掉 acme.sh 存的 CF Token\n"
                    f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
+    if own:  print(f"    · 自建 DNS 自己的证书（{own} + *.{own}）—— 删掉，acme.sh 不再续期它")
     if res:  print("    · 腾 53 时改的本机解析 —— 交回 systemd-resolved")
     if cid:  print(f"    · ClientID 记录（{cid}）")
     print(f"\n  {G}不会动{N}：sing-box / xray / 节点 / 订阅本身"
@@ -1057,6 +1150,9 @@ def uninstall(refresh_sub=True):
     print("  ✓ 已卸载 AdGuard Home（sing-box/xray/节点不受影响）")
     if wild:
         _revert_wildcard(dom, cid, ask=False, auto_token=True)
+    if own:
+        _own_cert_remove(own)
+        print(f"  {G}✓ 已撤掉自建 DNS 自己的证书{N}（节点证书没动）")
     _restore_resolved()
     if cid:
         try:
@@ -1253,8 +1349,8 @@ def _cert_days_left(peercert):
     exp = ""
     if peercert and peercert.get("notAfter"):
         exp = peercert["notAfter"]
-    elif os.path.exists(ACME_CRT):
-        out = sh(f"openssl x509 -enddate -noout -in {ACME_CRT} 2>/dev/null")
+    elif os.path.exists(_crt()):
+        out = sh(f"openssl x509 -enddate -noout -in {_crt()} 2>/dev/null")
         exp = out.split("=", 1)[1].strip() if "=" in out else ""
     if not exp:
         return None, ""
@@ -1378,7 +1474,7 @@ def selfcheck():
             print(f"       {Y}这一条挂掉 = 填了私人DNS 的安卓机会整机断网{N}")
             if "CERTIFICATE" in err.upper() or "SSLCert" in err:
                 fix.append("DoT 证书校验没过：证书过期或填的不是 acme 真证书，去加密设置重填 "
-                           f"{ACME_CRT} / {ACME_KEY}")
+                           f"{_crt()} / {_key()}")
             else:
                 fix.append("DoT 连不上：确认加密设置里 DoT 端口填了、服务已重启")
     if enc_on and dom and p_dot and wild_p:

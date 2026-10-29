@@ -510,23 +510,21 @@ def _ensure_acme_reload_hook():
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
 
 def _wildcard_wanted():
-    """这台机是不是【本来就该有】一张泛域名证书 → (要不要, 为什么)。
+    """这台机的节点证书是不是【还得】带 *.节点域名 → (要不要, 为什么)。
 
-       重签之前必须问一次这个。HTTP-01 签不出泛域名（Let's Encrypt 的硬规定，
-       泛域名只能走 DNS-01），而下面那条常规路径就是 HTTP-01 —— 所以什么都不问
-       直接重签，等于每重装一次就把泛域名【静默】降级成单域名。
-
-       后果不是「证书差一点」，是 Emby 当场被拆：它对外是 <子域>.<域名>，
-       只有 *.<域名> 顶得住。合并好的共用关系会退回两张证书、两条续期链，
-       而且全程不吭一声，等你发现时已经是几周之后。"""
-    try:
-        if cert_meta().get("wildcard"):
-            return True, "上次装的就是泛域名证书"
-    except Exception:
-        pass
-    _d = G.get("domain") or ""
-    if _d and _name_covers(cert_names(), "x." + _d):
-        return True, "磁盘上现有的这张就是泛域名"
+       重签之前必须问一次这个。HTTP-01 签不出泛域名（Let's Encrypt 的硬规定，泛域名只能走 DNS-01，要 CF 令牌），
+       所以只在真有人靠它的时候才要：
+         · 自建 DNS 还跟节点共用这张证书（老装法）：安卓专用 DNS 的主机名是 ClientID.节点域名；
+         · Emby 正跟节点共用这张证书：它对外是 <子域>.<域名>。
+       仓库主人 10/29「各个域名分开互不干预」：自建 DNS 新装起就是自己的域名、自己的证书（adguard-dns 的
+       AGH_DOMAIN_FILE），Emby 本来就能分开——节点证书不再替别人背泛域名，只签节点域名、HTTP-01、不要令牌。
+       以前还按「上次装的是泛域名」「磁盘上那张是泛域名」接着要，那两条其实就是在替上面两种情况兜底；
+       DMIT 卸了 / 分开了自建 DNS 以后照样要令牌重签（10/29），去掉。"""
+    if os.path.exists(AGH_BIN_PATH) and not os.path.exists(AGH_DOMAIN_FILE):
+        t = _agh_tls()
+        nd = (G.get("domain") or node_domain() or "").lower()
+        if t.get("enabled") == "true" and (t.get("server_name") or "").lower() in ("", nd):
+            return True, "自建 DNS 跟节点共用这张证书（安卓专用 DNS 要 *.域名）"
     try:
         ed = _emby_cert()[0]
         if ed and _emby_shared(ed):
@@ -4869,6 +4867,14 @@ def selfdns_clientid():
     open(SELFDNS_CID_FILE, "w").write(t)
     return t
 
+def _agh_domain():
+    """自建 DNS 对外的域名：新装的有它自己的（AGH_DOMAIN_FILE，跟节点分开）；老装法跟节点共用，就是本机 host。"""
+    try:
+        d = open(AGH_DOMAIN_FILE).read().strip().lower()
+    except OSError:
+        d = ""
+    return d if re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", d) else _host()
+
 def _selfdns_doh():
     """开关开启且本机是域名时，返回本机 AdGuard 的 DoH 地址
        https://域名:端口/dns-query/<ClientID>，否则返回 ''。
@@ -4880,7 +4886,7 @@ def _selfdns_doh():
        不会让原本能用的配置失效——它只是把「可以收紧」这个选项交到你手里。"""
     if not os.path.exists(SELFDNS_FLAG):
         return ""
-    dom = _host()
+    dom = _agh_domain()
     if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or ""):
         return ""
     port = 10443
@@ -5834,7 +5840,7 @@ def _doh_ask(url, name, qtype=1, local=None, timeout=6):
 def _agh_doh_url():
     """本机 AdGuard 的 DoH 地址（选「本机DNS解析」后给外机粘贴的那一行）：装了 AdGuard、开了加密、本机是域名才有，
        否则 ''。末段带 ClientID，跟「自建 DNS 写入订阅」同一个（见 selfdns_clientid）。"""
-    dom = _host()
+    dom = _agh_domain()
     if not re.match(r"^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", dom or "") or not os.path.exists("/opt/AdGuardHome/AdGuardHome"):
         return ""
     t = _agh_tls()
@@ -5858,7 +5864,7 @@ def _agh_local_addr():
 def _privdns_is_own(dns):
     """这个 DNS 地址是不是本机的（按域名认；端口、ClientID 对不对交给去问那一步）。"""
     m = _PRIVDNS_DNS.match(dns or "")
-    return bool(m) and m.group(1).lower() == (_host() or "").lower()
+    return bool(m) and m.group(1).lower() in {(_host() or "").lower(), _agh_domain().lower()}
 
 def _privdns_check(name, dns, ips):
     """去 DNS 问一遍私有名：答出来的 IP 跟 ips 一个不差返回 ""，否则返回原因（一句话）。"""
@@ -11033,6 +11039,8 @@ def _left_color(secs):
 # media-stack 的子域 → 用途（跟 media-stack.py 的 SUBDOMAINS 对齐；那边新加的子域认不出，就写「媒体服务」）
 _MS_SUB_USE = {"home": "Emby 首页入口", "emby": "Emby", "list": "OpenList（网盘）"}
 AGH_YAML = "/opt/AdGuardHome/AdGuardHome.yaml"
+AGH_BIN_PATH = "/opt/AdGuardHome/AdGuardHome"
+AGH_DOMAIN_FILE = BGP_DIR + "/agh.domain"   # 自建 DNS 自己的域名（adguard-dns 新装起写；有它 = 跟节点证书分开了）
 
 def _link_addr(u):
     """分享链接 → (地址, sni, 是不是 reality, 是不是跳过证书校验)。认不出返回 None。"""
@@ -11144,9 +11152,12 @@ def domain_uses(i=None):
                     add(w, "Emby 那几个子域", _DU_WILD)
 
     secs, es = i.get("secs"), i.get("emby_secs")
+    agh_own = os.path.exists(AGH_DOMAIN_FILE) and _agh_domain()
     def cert_of(d, k):
         if k == _DU_CDN:
             return "Cloudflare 的证书", ""
+        if agh_own and d in (agh_own, "*." + agh_own):
+            return "自建 DNS 自己的证书", "ok"                # 跟节点分开了（13 自建DNS 装的时候签的）
         if k == _DU_EMBY and ed and d.endswith("." + ed) and not i.get("emby_shared"):
             if es is None:
                 return "没有 Emby 证书", "bad"
@@ -12099,13 +12110,13 @@ def _domain_switch_notice(new, emby_new=""):
         out.append(("订阅地址", "(读不出)", "面板 2　⚠ host 变了，客户端要重新导入"))
     out.append(("节点链接", f"@{new}:端口", "面板 2　单条分享链接发给别人过的，要重发"))
     try:
-        doh = _selfdns_doh()
+        doh = "" if os.path.exists(AGH_DOMAIN_FILE) else _selfdns_doh()     # 自建 DNS 有自己的域名：换节点域名不碰它
         if doh:
             out.append(("自建 DNS 的 DoH", doh,
                         "面板 13　手机「专用DNS」/ 路由器里填的那个要改"))
     except Exception:
         pass
-    if _agh_tls().get("enabled") == "true":
+    if _agh_tls().get("enabled") == "true" and not os.path.exists(AGH_DOMAIN_FILE):   # 自建 DNS 有自己的域名就不跟着换
         try: cid = open(SELFDNS_CID_FILE).read().strip()      # 只读，没有就不生成
         except OSError: cid = ""
         out.append(("安卓专用 DNS", f"{cid}.{new}" if cid else new,
@@ -12356,7 +12367,7 @@ def cert_change_domain_flow(i):
     print(f"{Y}     ② 这个域名要在 Cloudflare 的区域里（DNS 托管在 CF）{N}")
     print(f"       泛域名证书走 DNS-01，acme 要用 CF 的 API 往区域里写一条 TXT 验证记录。")
     print(f"       域名不在 CF 名下，Token 权限再对也签不出来。")
-    if _agh_tls().get("enabled") == "true":
+    if _agh_tls().get("enabled") == "true" and not os.path.exists(AGH_DOMAIN_FILE):   # 自建 DNS 有自己的域名就不跟着换
         print(f"{Y}     ③ 装了自建 DNS：再加一条 *.新域名 的 A 记录（灰云），安卓专用 DNS 要用{N}")
     print(f"     解析改完【等生效】再来——DNS 有缓存，改完立刻查多半还是旧值。")
     print("-" * 60)
