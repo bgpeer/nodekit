@@ -31,8 +31,10 @@
 
 | 核心 | 协议 |
 |------|------|
-| **sing-box** | vless-vision、vless-ws、vmess-ws、trojan、hy2(端口跳跃+salamander混淆)、reality-vision、tuic（有域名时 UDP 443）、vmess-httpupgrade、anytls、grpc-tls（nginx 前置时挂 443） |
+| **sing-box** | vless-ws、vmess-ws、hy2(端口跳跃+salamander混淆)、reality-vision、tuic（有域名时 UDP 443）、vmess-httpupgrade、anytls、grpc-tls（nginx 前置时挂 443） |
 | **xray** | reality-xhttp（sing-box 不支持 xhttp，由 xray 承载）、xhttp-tls、reality-vision、reality-grpc、vless-ws、vmess-ws、trojan |
+
+> **sing-box 的 vless-vision、trojan 10/29 停用**（仓库主人点头）：两台机器上这几个先被单独封端口，其中一台后来整个 IP 的 TCP 被封。vless-vision 用 reality-vision 代替（同样是 VLESS+Vision，冒充大站、不用自己的证书）；trojan 只留 xray 的那个。已经装了的机器照常跑，「删除协议」里照样能删。
 
 > sing-box 的 reality-grpc 已停用（2026-10-23）：随机端口的 grpc 容易被阻断。要 grpc 用 sing-box 的 `grpc-tls`，
 > 或 xray 的 `reality-grpc`（SNI 分流时挂 reality 入口走 443）。已经装了的机器照常跑，「删除协议」里照样能删。
@@ -56,9 +58,9 @@
 > ⚠ xhttp 是 xray 专属传输：`sing-box` 和 `小火箭` 都不支持，这两种格式的订阅会自动跳过它
 > （跟 `reality-xhttp` 一样），mihomo 订阅和单条分享链接照常可用。
 
-> 两核心有几个同名协议（`vless-ws`/`vmess-ws`/`trojan`），sing-box 已能做且做得一样，xray 独有价值的只有 `reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
+> 两核心有几个同名协议（`vless-ws`/`vmess-ws`），sing-box 已能做且做得一样，xray 独有价值的只有 `reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
 >
-> 万一你让两核心装了同名协议（`vless-ws`/`vmess-ws`/`trojan`），为避免客户端订阅**重名报错**，会给它们**尾部各加一个小上标区分**：sing-box 那份加 `¹`、xray 那份加 `²`（如 `trojan¹` / `trojan²`）。只标撞名的这几个，其余不动；上标短，手机上也显示得下。端口/服务/配置本来就互不冲突。
+> 万一你让两核心装了同名协议（`vless-ws`/`vmess-ws`；老机器上还可能有 `trojan`），为避免客户端订阅**重名报错**，会给它们**尾部各加一个小上标区分**：sing-box 那份加 `¹`、xray 那份加 `²`（如 `vless-ws¹` / `vless-ws²`）。只标撞名的这几个，其余不动；上标短，手机上也显示得下。端口/服务/配置本来就互不冲突。
 
 > **已经装过了，只想再加一个协议？** 再跑一次安装会先把已装的协议列出来，然后给两条路：
 >
