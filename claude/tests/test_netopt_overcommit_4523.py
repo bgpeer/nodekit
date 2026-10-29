@@ -13,7 +13,7 @@ def check(l, ok):
 spec = importlib.util.spec_from_file_location("netopt", os.path.join(ROOT, "net-optimize.py"))
 n = importlib.util.module_from_spec(spec); spec.loader.exec_module(n)
 src = open(os.path.join(ROOT, "net-optimize.py"), encoding="utf-8").read()
-check(f"版本号 4.5.23（{n.VERSION}）", n.VERSION == "4.5.23")
+check(f"版本号 ≥ 4.5.23（{n.VERSION}）", tuple(map(int, n.VERSION.split("."))) >= (4, 5, 23))
 
 out = {}
 n.meminfo_kb = lambda k: 974092
