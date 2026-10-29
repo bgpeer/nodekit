@@ -185,6 +185,12 @@
   10/29 实测走通：DMIT 加 AAAA 后 TCP 节点全绿。卡过的一步是**手机没 IPv6**（Termux 关代理后 `curl -6` 查本机地址的国内站没结果）——
   手机 APN 协议改 IPv4/IPv6、开关一次飞行模式就有了；FlClash 设置里也有个 IPv6 开关会盖掉订阅里的 `ipv6: true`。
   17 有 IPv6 回程了（v1.1.165）：DMIT 实测 IPv6 去联通 / 移动走 CMIN2(AS58807)、去电信走 163。我先凭前缀说成 CMI，错了——线路判定只信逐跳 ASN。
+- **节点专用域名（13 → 11）真机第一次走通**（10/29 DMIT）：一路踩了三个坑，都已修——
+  1. 节点域名是根域名的子域时，`*.根域名` 盖住它，Let's Encrypt 拒签「redundant with a wildcard」→ 名字改成 `随机.随机段.根域名`、证书签 `*.随机段.根域名`；
+  2. 传给 acme.sh 的名字按现有证书顺序（`*.dom` 在前），新证书进了 `*.dom_ecc`，`install-cert -d dom` 导出老证书 → 签发时 dom 排第一；
+  3. 服务端 httpupgrade / xhttp 写了 host 就校验 Host，节点专用域名被拒「bad host」→ 服务端不写 host，老配置开的时候去掉。
+  名字只在证书里，Cloudflare 里**不要**给它建记录（仓库主人建过一条 `*.rmctb1`，让他删了）。客户端查 IP 走 DNS 机的 DoH（TCP）：
+  DMIT IPv4 TCP 被封，只有有 IPv6 的网络查得到——DNS 机最好放 IPv4 好的机器。
 
 ## 仓库主人的偏好
 
