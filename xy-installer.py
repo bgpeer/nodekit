@@ -3579,7 +3579,7 @@ def rotate_links_token():
 # 订阅托管小服务：静态发订阅文件；另带一个 /gh/ GitHub 中转（规则/图标走本机、不依赖外部 CDN / 反代）。
 # 中转和订阅共用同一端口（客户端本就从这端口拉订阅，无需额外放行）。多线程，中转不卡订阅。
 # 安全：中转只白名单 GitHub 几个主机——绝不做成"谁都能拿它转发任意网址"的开放代理。
-_SUB_SERVER_PY = r'''import http.server, ssl, sys, re, urllib.request, urllib.parse
+_SUB_SERVER_PY = r'''import http.server, ssl, sys, re, socket, urllib.request, urllib.parse
 port = int(sys.argv[1]); directory = sys.argv[2]
 tokenfile = sys.argv[3]
 cert = sys.argv[4] if len(sys.argv) > 4 else ''
@@ -3661,7 +3661,19 @@ class S(http.server.ThreadingHTTPServer):
                 except Exception: pass
                 return
         super().process_request_thread(request, client_address)
-httpd = S(('0.0.0.0', port), H)
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:          # 双栈：一个套接字同时收 IPv4 和 IPv6
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+# 同时听 IPv4 和 IPv6：IPv4 的 TCP 被墙封了、IPv6 还通的机器，节点域名加一条 AAAA 订阅照样拉得到
+# （节点本身 sing-box 听 "::"、xray 听 0.0.0.0 在 Go 里本来就是双栈、nginx 443 有 [::]:443）。
+# 机器没有 IPv6（内核关了）就退回只听 IPv4。
+try:
+    S.address_family = socket.AF_INET6
+    httpd = S(('::', port), H)
+except OSError:
+    S.address_family = socket.AF_INET
+    httpd = S(('0.0.0.0', port), H)
 if cert and key:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
