@@ -2365,7 +2365,7 @@ def sb_vless_vision(port, tag):
           f"&allowInsecure={1 if insec else 0}#{tag}")
     return ib, lk
 
-# 前 10 个对齐 mack-a 的输出，顺序也一致；grpc-tls 是 10/23 加的（grpc 挂 nginx 443、用自己的域名）。
+# 最早对齐 mack-a 的输出顺序；grpc-tls 是 10/23 加的（grpc 挂 nginx 443、用自己的域名），vless-vision、trojan 10/29 挪去备用。
 # 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
 # ═══════════════════════════════════════════════════════════════════════════════
 # 协议注册表
@@ -2547,15 +2547,13 @@ def _recap_reality_xr():
     return ("xray 伪装域名", _xr_sni())
 
 # ── 表本体 ───────────────────────────────────────────────────────────────
-# 前 10 个对齐 mack-a 的输出，顺序也一致；grpc-tls 是 10/23 加的（grpc 挂 nginx 443、用自己的域名）。
+# 最早对齐 mack-a 的输出顺序；grpc-tls 是 10/23 加的（grpc 挂 nginx 443、用自己的域名），vless-vision、trojan 10/29 挪去备用。
 # 想加回其它协议：把下面「备用」块里对应行搬进 SB 即可——builder 都还在，没删。
 SB = {
-    "vless-vision":      PROTO(sb_vless_vision, cert=True),
     "vless-ws":          PROTO(make_sb_vless("ws"), cert=True, ws_front=True,
                                asks=_asks_smux, recap=_recap_smux),
     "vmess-ws":          PROTO(make_sb_vmess("ws"), cert=True, ws_front=True,
                                asks=_asks_smux, recap=_recap_smux),
-    "trojan":            PROTO(sb_trojan, cert=True),
     "hy2":               PROTO(sb_hysteria2, udp=True,
                                teardown=_td_hy2, asks=_asks_hy2, recap=_recap_hy2),
     "reality-vision":    PROTO(sb_reality_vision, reality=True,
@@ -2567,6 +2565,12 @@ SB = {
     "grpc-tls":          PROTO(sb_vless_grpc_tls, cert=True, ws_front=True),
 }
 # 备用（以后想加回，取消注释挪进上面的 SB，按上面的清单据实填标志位）：
+#   vless-vision、trojan：仓库主人 10/29 点头停用——两台机器上这几个先被单独封端口（DMIT 后来整个 IP 的 TCP 被封）。
+#   vless-vision 跟 reality-vision 都是 VLESS+Vision，后者冒充大站、前者用自己的证书又没回落（sing-box 的 vless 做不了），
+#   探测时一句话不回；trojan 只留 xray 那个（回落链以后要做 mack-a 那种 443 一路回落只有 xray 行）。
+#   已经装了的机器照常跑、「删除协议」里照样能删，只是新装 / 添加不再列。
+#   "vless-vision":      PROTO(sb_vless_vision, cert=True),
+#   "trojan":            PROTO(sb_trojan, cert=True),
 #   reality-grpc：仓库主人 10/23 点头停用——随机端口的 grpc 两台机器都被阻断（Timeout）；grpc 有 grpc-tls（挂 nginx 443）
 #   和 xray 的 reality-grpc（挂 reality 入口 443）。已经装了的机器照常跑、「删除协议」里照样能删，只是新装 / 添加不再列。
 #   "reality-grpc":      PROTO(sb_reality_grpc, reality=True,
@@ -13956,6 +13960,10 @@ if __name__ == "__main__":
     if bad_sb or bad_xr:
         if "reality-grpc" in bad_sb:
             ap.error("sing-box 的 reality-grpc 已停用（随机端口容易被阻断），grpc 请用 --sb grpc-tls 或 --xray reality-grpc")
+        if "vless-vision" in bad_sb:
+            ap.error("sing-box 的 vless-vision 已停用（容易被封端口），请用 --sb reality-vision")
+        if "trojan" in bad_sb:
+            ap.error("sing-box 的 trojan 已停用（只留 xray 的），请用 --xray trojan")
         if bad_sb: ap.error(f"未知的 sing-box 协议: {','.join(bad_sb)}\n  可选: {','.join(SB)}")
         ap.error(f"未知的 xray 协议: {','.join(bad_xr)}\n  可选: {','.join(XRAY)}")
     # 两个核心都装 reality：xray 用自己的伪装域名，跟 sing-box 的不能一样（见 ask_reality_sni）
