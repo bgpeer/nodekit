@@ -6344,36 +6344,18 @@ def _port_csv(ports):
 
 def cloud_ports():
     """云厂商防火墙（GCP / AWS 安全组这类，本机管不到）要放行的端口：[(标题, 「443,…」)]。
-       本机：_fw_wanted 收的（节点 / 订阅 / 伪装站 / CDN 回源）+ hy2 跳跃段；
-       聚合的成员机：拉它的 .links，按链接收端口（CDN 节点的端口在 Cloudflare 上，不算）+ 它的订阅端口（主机要从这拉）。
-       仓库主人 10/23：GCP 少放行一个端口，trojan² 一直不通，自己从订阅里摘端口漏了。"""
-    def label(links, fallback):
-        for u in links:
-            pre = _split_tag(_link_name(u))[0]
-            if pre:
-                return pre
-        return fallback
+       _fw_wanted 收的（节点 / 订阅 / 伪装站 / CDN 回源）+ hy2 跳跃段。
+       仓库主人 10/23：GCP 少放行一个端口，trojan² 一直不通，自己从订阅里摘端口漏了。
+       只列本机（仓库主人 10/29 定）：以前主机还把聚合的成员机各列一行，那几台的端口到那台自己的面板上看。"""
     local = read_saved_links()
     mine = {str(p) for p, _ in _fw_wanted()}
     for u in local:
         if "CDN·" not in _link_name(u):
             mine |= {p for p in _link_ports(u) if "-" in p}
-    out = [(f"本机 {label(local, '')}".strip(), _port_csv(mine))] if mine else []
-    for i, url in enumerate(load_peers(), 1):
-        try:
-            links = [l.strip() for l in _fetch_text(url, timeout=6).splitlines() if l.strip().startswith(_NODE_SCHEMES)]
-        except Exception:
-            out.append((f"成员 {i}", "拉不到它的节点链接，到那台机器上看"))
-            continue
-        ports = set()
-        for u in links:
-            if "CDN·" not in _link_name(u):
-                ports |= _link_ports(u)
-        sp = urllib.parse.urlsplit(url).port
-        if sp:
-            ports.add(str(sp))
-        out.append((f"成员 {label(links, str(i))}", _port_csv(ports) if ports else "没有节点"))
-    return out
+    if not mine:
+        return []
+    pre = next((_split_tag(_link_name(u))[0] for u in local if _split_tag(_link_name(u))[0]), "")
+    return [(f"本机 {pre}".strip(), _port_csv(mine))]
 
 def print_cloud_ports():
     """「云防火墙要放行的端口」那一屏：每台一行高亮标题 + 端口顶格一行（长按复制），台与台之间空一行。"""

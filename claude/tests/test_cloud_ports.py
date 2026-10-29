@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """「云防火墙要放行的端口」—— 仓库主人 10/23：GCP 防火墙少放行一个端口，trojan² 一直不通，让 GPT 从订阅里摘端口漏了最后一个。
-  放在单节点链接和订阅之间；本机 + 聚合的成员机各一行（成员机按它的 .links 收端口，加上它的订阅端口；CDN 节点的端口在
-  Cloudflare 上不算）；hy2 跳跃段带上（落在段里的单端口不重复列）；127.0.0.1 的不列。
+  放在单节点链接和订阅之间；只列本机（10/29 仓库主人定：成员机的端口到那台自己的面板上看，主机不再去拉）；
+  hy2 跳跃段带上（落在段里的单端口不重复列）；127.0.0.1 的不列；CDN 节点的端口在 Cloudflare 上不算。
 """
 import os, sys, io, json, base64, tempfile, contextlib, threading, http.server, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,9 +43,11 @@ json.dump([f"http://127.0.0.1:{port}/t.links", "http://127.0.0.1:1/dead.links"],
 rows = m.cloud_ports()
 check(f"本机：节点 + 订阅 + 80/443 + CDN 回源 + hy2 跳跃段，127.0.0.1 的不列（{rows[0]}）",
       rows[0] == ("本机 🇺🇸OR", "80,443,2087,18047,29235,31000-32000,36844"))
-check(f"成员机：按链接收端口 + 它的订阅端口，CDN 的不算（{rows[1]}）",
-      rows[1] == ("成员 🇯🇵JP", ",".join(sorted([str(port), "22784", "44489"], key=int))))
-check(f"拉不到的成员机：说清楚，不崩（{rows[2]}）", rows[2][0] == "成员 2" and "拉不到" in rows[2][1])
+check(f"只列本机，聚合了成员机也不列它们（{len(rows)} 行）", len(rows) == 1)
+fetched = []
+m._fetch_text = lambda u, timeout=15: fetched.append(u) or ""
+m.cloud_ports()
+check("不再去拉成员机的 .links（进「2 节点链接」不用等它们）", not fetched)
 
 # 屏上：在单节点链接和订阅之间；标题一行、端口顶格一行、台与台空一行
 m._sub_items = lambda: True
@@ -60,8 +62,8 @@ o = buf.getvalue()
 i_link, i_fw, i_sub = o.index("OR·trojan¹"), o.index("云防火墙要放行的端口"), o.index("SUBURLS")
 check("「2 节点链接」：单节点链接 → 云防火墙端口 → 订阅", i_link < i_fw < i_sub)
 seg = o[i_fw:i_sub].splitlines()
-check("端口顶格一行、台与台之间空一行", "80,443,2087,18047,29235,31000-32000,36844" in seg
-      and seg[seg.index("[成员 🇯🇵JP]") - 1] == "")
+check("标题一行、端口顶格一行", "[本机 🇺🇸OR]" in seg and seg[seg.index("[本机 🇺🇸OR]") + 1] == "80,443,2087,18047,29235,31000-32000,36844")
+check("屏上没有成员机", "成员" not in o[i_fw:i_sub])
 src = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
 body = lambda n: src[src.index(f"def {n}("):src.index("\ndef ", src.index(f"def {n}(") + 5)]
 check("装完、只添加新协议两屏也在链接和订阅之间", body("run").index("print_cloud_ports()") < body("run").index('ui_title("订阅链接')
