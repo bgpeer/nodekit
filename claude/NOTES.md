@@ -52,6 +52,11 @@
 
 ## 真机结论（踩过的坑）
 
+- **net-optimize 别再写 `vm.overcommit_memory = 2`**（10/29 GCP e2-micro 1G 跑完「1 档」整台卡死，4.5.23 起一律 0）：严格提交记账把
+  sing-box / xray / AdGuard 这些 Go 进程预留的虚拟内存全算进 commit，1G 机一下顶满，fork 全报 `[Errno 12] Cannot allocate memory`
+  （报告全 N/A、MSS 写不进、nginx -v 起不来、reboot 都起不来）。以前只给有容器的机器退回 0，节点自己的 Go 进程没算进去。
+  开机恢复 `heal_overcommit` 先把老版本写的 2 改掉。看到一堆 N/A + Errno 12，先查这个。
+
 - **Emby 扫整个库会清掉 strm 条目的音视频轨**（strm 里是网盘路径，重读读不出）。能只报变动就只报变动；
   没人在终端前一律不扫整个库（`emby_scan_wait` 里拦）。
 - **Emby 收到「已删除」通知不一定认**：整个主目录都没了时找不到上级去刷，等多久都不删。要删就按条目 id 删

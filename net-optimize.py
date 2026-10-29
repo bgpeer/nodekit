@@ -7,6 +7,7 @@
 #      严格提交记账会把 Go 写的容器工具链预留的虚拟地址计入 commit，十几个容器
 #      即顶满 CommitLimit，导致物理内存充足却起不来容器、报
 #      "write init-p: broken pipe"，且 dmesg 无 OOM 记录，极难排查。
+#   （4.5.23 起一律 0：节点自己的 sing-box / xray / AdGuard 也是 Go，1G 机照样顶满、整台卡死。）
 # 功能对齐 bash v3.8.1，所有功能 1:1 保留：
 #   自动更新(SHA256SUMS 校验) / 低内存临时 swap / dpkg 自愈 / ulimit /
 #   BBRv3→BBRv2→bbrplus→BBR 拥塞算法 / fq 队列（BBR 标准搭档）/ RAM 自适应缓冲区 /
@@ -67,7 +68,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.22"
+VERSION = "4.5.23"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -241,22 +242,6 @@ def apt(args, timeout=900):
 
 def have_cmd(name):
     return shutil.which(name) is not None
-
-
-def container_runtime_present():
-    """本机是否存在容器运行时（Docker / containerd / podman / k8s）。
-
-    用于决定 vm.overcommit_memory 取值：容器工具链是 Go 写的，Go 运行时启动时
-    会预留大片虚拟地址空间，与严格提交记账（=2）冲突。详见写入 sysctl 处的注释。
-    """
-    for c in ("docker", "containerd", "podman", "runc", "k3s", "kubelet"):
-        if have_cmd(c):
-            return True
-    for p in ("/var/run/docker.sock", "/run/docker.sock",
-              "/run/containerd/containerd.sock"):
-        if os.path.exists(p):
-            return True
-    return False
 
 
 def echo(msg=""):
@@ -1408,21 +1393,14 @@ def write_sysctl_conf():
     a("vm.mmap_min_addr = 65536")
     a("vm.max_map_count = 1048576")
     a("vm.swappiness = 1")
-    # overcommit_memory=2 是严格提交记账：所有进程申请的虚拟内存总和不得超过
-    # CommitLimit(= swap + RAM*ratio%)。纯代理节点上没问题，但容器工具链
-    # (dockerd/containerd/containerd-shim/runc) 全是 Go 写的，Go 运行时启动时
-    # 会预留大片虚拟地址空间——预留不等于占用物理内存，可严格模式照样计入 commit。
-    # 每起一个容器要拉起 shim + runc 两个 Go 进程，十几个容器就能顶满 CommitLimit，
-    # 表现为：物理内存明明充足、swap 没动、dmesg 里没有任何 OOM kill，
-    # 只有 __vm_enough_memory 报错，容器随机起不来并崩在
-    # "write init-p: broken pipe"。这种症状极难联想到 sysctl，排查成本很高。
-    # 所以检测到容器运行时就退回内核默认的启发式模式 0。
-    # 注意 0 并不会关闭 OOM killer（那是另一套机制），只是不再做严格准入。
-    if container_runtime_present():
-        a("vm.overcommit_memory = 0")   # 检测到容器运行时 → 内核默认启发式
-    else:
-        a("vm.overcommit_memory = 2")   # 严格提交记账，避免 =1 完全不设防
-        a("vm.overcommit_ratio = 100")  # 无 swap 小内存机 commit 上限修复
+    # overcommit 一律用内核默认的启发式 0，不再设 2（4.5.23，10/29 GCP e2-micro 1G 内存跑完「1 档」整台卡死）。
+    # 2 是严格提交记账：所有进程申请的虚拟内存总和不得超过 CommitLimit(= swap + RAM*ratio%)。
+    # sing-box / xray / AdGuard 跟 Docker 工具链一样全是 Go 写的，Go 运行时一启动就预留大片虚拟地址空间——
+    # 预留不等于占用物理内存，可严格模式照样计入 commit。1G 机上节点几个 Go 进程一起就顶满了：
+    # 物理内存明明还有，fork / exec 全报 [Errno 12] Cannot allocate memory，脚本里的 iptables、nginx -v、
+    # 报告里的 sysctl 全变 N/A，连 reboot 都起不来；重启后临时 swap 没了，CommitLimit 更小，开机就卡死。
+    # 以前只在检测到容器运行时退回 0，节点自己的 Go 进程没算进去。0 不会关掉 OOM killer，只是不做严格准入。
+    a("vm.overcommit_memory = 0")
     a("kernel.pid_max = 4194304")
     a("")
     a("fs.protected_fifos = 1")
@@ -2882,6 +2860,20 @@ def restart_qos_if_idle(tries=10, gap=60):
     return False
 
 
+def heal_overcommit():
+    """老版本（≤4.5.22）没装容器的机器写的是 vm.overcommit_memory = 2：Go 写的节点进程一多就 fork 不出来、
+       整台卡死（见 write_sysctl_conf 里的注释）。sysctl 文件里改回 0、去掉 ratio，当场也写 0。幂等。"""
+    txt = read_text(SYSCTL_AUTH_FILE)
+    if re.search(r"(?m)^[ \t]*vm\.overcommit_memory[ \t]*=[ \t]*2[ \t]*$", txt):
+        txt = re.sub(r"(?m)^[ \t]*vm\.overcommit_memory[ \t]*=.*$", "vm.overcommit_memory = 0", txt)
+        txt = re.sub(r"(?m)^[ \t]*vm\.overcommit_ratio[ \t]*=.*\n?", "", txt)
+        write_text(SYSCTL_AUTH_FILE, txt)
+    if read_text("/proc/sys/vm/overcommit_memory").strip() == "2":
+        write_proc("/proc/sys/vm/overcommit_memory", 0)
+        return True
+    return False
+
+
 def cmd_boot_apply():
     """开机恢复（原 net-optimize-apply）：不因单步失败中断。"""
     lock = open("/var/run/net-optimize-apply.lock", "w")
@@ -2907,6 +2899,7 @@ def cmd_boot_apply():
     # 模块 + sysctl
     for module in read_text(MODULES_FILE).split():
         run(["modprobe", module], timeout=10)
+    heal_overcommit()                       # 老版本写的 overcommit=2 先改掉，再让 sysctl --system 读
     run(["sysctl", "-e", "--system"], timeout=60)
 
     # 强制覆盖 rp_filter（防止 cloud-init/systemd-networkd 按接口覆盖）
@@ -3879,15 +3872,14 @@ def cmd_check():
         echo(f"   🔹 rmem_max = {rmem_max}")
     echo(f"   🔹 wmem_max = {get_sysctl('net.core.wmem_max')}")
     echo(f"   🔹 netdev_max_backlog = {get_sysctl('net.core.netdev_max_backlog')}")
-    echo("✅ 内存提交策略（ratio=100 防无 swap 小内存机大分配失败）：")
+    echo("✅ 内存提交策略（应为 0 = 内核默认）：")
     _oc = get_sysctl("vm.overcommit_memory")
     echo(f"   🔹 vm.overcommit_memory = {_oc}  "
          f"vm.overcommit_ratio = {get_sysctl('vm.overcommit_ratio')}")
-    if _oc == "2" and container_runtime_present():
-        yellow("   ⚠️ 本机有容器运行时，但仍是严格提交记账(=2)，两者不兼容：")
-        yellow("      容器会随机起不来，报 write init-p: broken pipe，")
-        yellow("      而 dmesg 里只有 __vm_enough_memory、没有 OOM，极易误判为内存不足。")
-        yellow("      修复：sysctl -w vm.overcommit_memory=0（重跑本工具也会自动改）")
+    if _oc == "2":
+        yellow("   ⚠️ 严格提交记账(=2)：sing-box / xray / AdGuard / 容器这些 Go 程序会把虚拟内存顶满，")
+        yellow("      小内存机 fork 不出新进程（Cannot allocate memory），严重时整台卡死。")
+        yellow("      修复：sysctl -w vm.overcommit_memory=0（重跑本工具、重启都会自动改）")
 
     rp = get_sysctl("net.ipv4.conf.all.rp_filter")
     rp_msg = {"0": (yellow, "⚠️ rp_filter = 0（关闭）"),
