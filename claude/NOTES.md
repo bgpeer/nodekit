@@ -182,6 +182,8 @@
   国内通不通用 itdog 的 IPv6 Tcping（普通 Tcping 只收 IPv4），填 `[地址]:443`。DMIT 那台 IPv6 全国通（10/29）。
   节点都听双栈（sing-box `::`、xray 0.0.0.0 在 Go 里本来就是双栈、nginx 有 `[::]:443`）；订阅小服务以前只听 0.0.0.0，
   1.1.164 起双栈。用法：节点域名 A + AAAA 都留，客户端 IPv4 连不上自己换 IPv6；地址带 `ff:fe` 的是按网卡算的，重启不变。
+  10/29 实测走通：DMIT 加 AAAA 后 TCP 节点全绿。卡过的一步是**手机没 IPv6**（Termux 关代理后 `curl -6 -sS https://6.ipw.cn` 没地址）——
+  手机 APN 协议改 IPv4/IPv6、开关一次飞行模式就有了；FlClash 设置里也有个 IPv6 开关会盖掉订阅里的 `ipv6: true`。
 
 ## 仓库主人的偏好
 
