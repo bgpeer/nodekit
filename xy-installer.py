@@ -13778,12 +13778,15 @@ def install_flow():
     core = _ask("选择核心（回车 = 1）: ") or "1"
 
     sb_names, xr_names = [], []
+    # 两个都装时的回车默认（仓库主人 10/29）：xray 装全部、只是 trojan 不默认（最早被封端口的就是它，要的手动勾）；
+    # sing-box 只装 xray 没有的，再加 reality-vision——xray 的 reality 只收带 X25519MLKEM768 的客户端，
+    # sing-box App / Hiddify / NekoBox 连不上（见 _local_xray_reality），不留 sing-box 这个，用它们的人就一个 reality 都没有。
+    # 两边的 reality-vision 各借一个大站（见 _xr_sni）。只装一个核心时回车照旧全装；0/all 永远全装。
+    sb_default = [n for n in SB if n not in XRAY or n == "reality-vision"] if core == "3" else None
+    xr_default = [n for n in XRAY if n != "trojan"] if core == "3" else None
     if core in ("1", "3"):
-        sb_names = _pick("【sing-box 协议】", list(SB))
+        sb_names = _pick("【sing-box 协议】", list(SB), default=sb_default)
     if core in ("2", "3"):
-        # 两个都装时，xray 默认只装它独有的 reality-xhttp（其余协议 sing-box 已有，避免重复）；
-        # 只装 xray(core=2) 时回车仍全装。想全装 xray 就输 0/all 或点编号。
-        xr_default = ["reality-xhttp"] if core == "3" else None
         xr_names = _pick("【xray 协议】", list(XRAY), default=xr_default)
     if not sb_names and not xr_names:
         print("没选任何协议，退出。"); return
