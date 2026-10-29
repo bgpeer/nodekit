@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """17 线路检测加 IPv6（仓库主人 10/29：「应该增加IPv6检测，同时把ipv4和IPv6的本机IP都显示出来，不然找自己的IPv6地址都找不到」）。
-  DMIT 那台 IPv4 被墙封了 TCP，改走 IPv6；手动 traceroute -6 才看出 IPv6 回国走移动 CMI、不是 CN2 GIA。
+  DMIT 那台 IPv4 被墙封了 TCP，改走 IPv6；手动 traceroute -6 才看出 IPv6 回国不是 CN2 GIA（17 实测：联通 / 移动走 CMIN2、电信走 163）。
   - vps-check.py：本机检测多一节「IPv6 回程」（三网各一个点，逐跳查 ASN，跟 IPv4 同一套判定）；没有 IPv6 就一行跳过。
     逐跳 ASN 走 Cymru origin6 区（半字节倒序）；traceroute 加 -6，解析认 IPv6 地址。外部检测收 IPv6（黑名单只收 IPv4，不查）。
   - xy-installer 菜单 17：最上面两个地址，标题上色、地址顶格单独一行；上次结果也显示 IPv6 回程。
