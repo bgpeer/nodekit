@@ -194,6 +194,14 @@ with quiet():
     x.cert_install_apply(DOM3, True, "", ["*." + DOM3, DOM3, W3])     # 现有证书的顺序：*.dom 在前（10/29 真机）
 check(f"节点域名排第一个 -d（acme.sh 的主域名，install-cert -d 它才导得出新证书）（{RUNS[-1][:90] if RUNS else ''}）",
       RUNS and re.search(r"--dns dns_cf --keylength ec-256 -d '([^']+)'", RUNS[-1]).group(1) == DOM3)
+_run0 = x.subprocess.run
+x.subprocess.run = lambda cmd, *a, **kw: (RUNS.append(cmd), types.SimpleNamespace(
+    returncode=1, stdout="Adding TXT value: x for domain: _acme-challenge.q.zone.example\ninvalid domain", stderr=""))[1]
+with quiet() as buf:
+    r = x.cert_install_apply(DOM3, False, "", [DOM3, W3])
+check("令牌管不到这个区域（invalid domain）：失败、一行提示去 CF 改令牌的区域资源",
+      r is False and "区域资源加上这个域名" in buf.getvalue())
+x.subprocess.run = _run0
 x.cert_covers = lambda p, d: False
 x.have = lambda b: True
 x._wildcard_wanted = lambda: (False, "")
