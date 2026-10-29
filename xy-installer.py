@@ -570,7 +570,7 @@ def ensure_acme():
         Y_, R_, N_ = "\033[1;33m", "\033[1;31m", "\033[0m"
         wild, why = _wildcard_wanted()
         root = _privdns_root()                   # 节点专用域名（13 → 11）要的 *.根域名，同样只能 DNS-01
-        if root and _root_domain(G["domain"]) != root:
+        if root and _root_domain(G["domain"]) != _root_domain(root):
             root = ""                            # 这次装的域名换了根域名：旧的不带（令牌多半管不着那个区域）
         if root and not _acme_has_cf():
             print(f"{Y_}  ⚠ 节点专用域名要 *.{root}，acme.sh 里没有 Cloudflare 凭据签不出来，"
@@ -5625,25 +5625,29 @@ def privdns_save(c):
     harden_perms()                # 刚落地是 0644，当场收紧
 
 def _privdns_new_name(root=""):
-    """本机私有名：10 位小写字母数字 + .internal（用 IP 装的）或 + .根域名（用域名装的，节点专用域名）。
+    """本机私有名：10 位小写字母数字 + .internal（用 IP 装的）或 + .6 位随机.根域名（用域名装的，节点专用域名）。
+       用域名装的要隔一层随机段、证书签 *.随机段.根域名：以前直接挂在根域名下签 *.根域名，节点域名
+       （dmcn2.根域名 这种）正好被它盖住，Let's Encrypt 拒签「redundant with a wildcard domain」（10/29 实测）。
        从关切到开时起一个，之后一直用它——客户端配置里写的就是它，换 IP、换外机地址、本机 / 外机互换都不变
        （关了再开会换新的：整机克隆来的机器私有名会重，这样就分开了）。"""
     abc = "abcdefghijklmnopqrstuvwxyz0123456789"
-    return "".join(secrets.choice(abc) for _ in range(10)) + "." + (root or PRIVDNS_ZONE)
+    rnd = lambda n: "".join(secrets.choice(abc) for _ in range(n))
+    return rnd(10) + "." + (rnd(6) + "." + root if root else PRIVDNS_ZONE)
 
 def _privdns_is_domain_name(n):
     """是不是节点专用域名（随机.根域名，用域名装的机器）——不是 xxx.internal。"""
     return bool(_PRIVDNS_NAME.match(n or "")) and not n.endswith("." + PRIVDNS_ZONE)
 
 def _privdns_root():
-    """证书要多签的 *.根域名 的那个根域名：本机开着私有解析、用的是节点专用域名才有；没有返回 ''。
+    """证书要多签的 *.X 的那个 X（节点专用域名去掉第一段：新的是 随机段.根域名，老的是根域名）：
+       本机开着私有解析、用的是节点专用域名才有；没有返回 ''。
        重签共用证书的地方都靠它带上 *.根域名（漏一处，节点专用域名就握手失败——见 _privdns_local_meta 的兜底）。"""
     c = privdns_conf()
     if c["mode"] == "off" or not _privdns_is_domain_name(c["name"]):
         return ""
     root = c["name"].split(".", 1)[1]
     nd = node_domain()
-    return root if not nd or _root_domain(nd) == root else ""      # 换过节点域名（根域名变了）：旧的不再带
+    return root if not nd or _root_domain(nd) == _root_domain(root) else ""   # 换过节点域名（根域名变了）：旧的不再带
 
 def _privdns_nginx_name():
     """nginx 443 那个 server_name 要不要带上节点专用域名：证书盖得住就带（关掉以后也带着——还没刷新订阅的
@@ -8213,8 +8217,11 @@ def _privdns_domain_enable(c, mode, dns=""):
        前台问完（令牌、确认），证书 / nginx / 订阅转后台做——重签证书要重启核心，挂着本机代理连的 SSH 会断。"""
     dom = _privdns_domain_ready()
     root = _root_domain(dom)
-    keep = c["mode"] != "off" and c["name"].endswith("." + root) and _privdns_is_domain_name(c["name"])
+    # 老的「随机.根域名」只有证书已经盖住了才接着用（节点域名是根域名的子域时它签不出来，换新的两段式）
+    keep = c["mode"] != "off" and c["name"].endswith("." + root) and _privdns_is_domain_name(c["name"]) \
+        and (c["name"].count(".") >= root.count(".") + 2 or _name_covers(cert_names(), c["name"]))
     name = c["name"] if keep else _privdns_new_name(root)
+    wild = "*." + name.split(".", 1)[1]
     if not keep and not _privdns_public_free(root):
         ui_warn(f"公网查得到 *.{root} 底下随便起的名字：Cloudflare 里多半有 *.{root} 泛解析，节点专用域名藏不住，没开")
         return
@@ -8227,7 +8234,7 @@ def _privdns_domain_enable(c, mode, dns=""):
             print("  没填 Token，已取消，没改动")
             return
     ui_warn("开了以后：节点改用公网查不到的专用域名，小火箭那份不放本机节点"
-            + ("" if covered else f"；证书要重签（多签 *.{root}），节点"
+            + ("" if covered else f"；证书要重签（多签 {wild}），节点"
                + ("和 nginx 后面的网站 / Emby" if "nginx" in _cert_consumers() else "") + "断几秒"))
     if _ask("  确认开启? [y/N]: ").strip().lower() not in ("y", "yes"):
         print("  已取消，没改动")
@@ -11498,7 +11505,7 @@ def cert_want_names(dom, wildcard, emby_dom=""):
     if nd and not _name_covers(names, nd):
         names.append(nd)
     root = _privdns_root()                       # 节点专用域名（13 → 11）：*.根域名 要一直带着，丢了它节点握手失败
-    if root and _root_domain(dom) == root:
+    if root and _root_domain(dom) == _root_domain(root):
         names.append(f"*.{root}")
     return list(dict.fromkeys(names))
 
