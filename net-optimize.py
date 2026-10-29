@@ -68,7 +68,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.23"
+VERSION = "4.5.24"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -236,8 +236,10 @@ def sh(cmdline, timeout=30, env_extra=None):
 
 
 def apt(args, timeout=900):
-    return run(["apt-get"] + args, timeout=timeout,
-               env_extra={"DEBIAN_FRONTEND": "noninteractive"})
+    # 配置文件被改过、包里又带了新版（nginx.conf 是节点脚本改过的，换源装 nginx 时必遇）：dpkg 会停下来问
+    # Y/N 等人回答（10/29 GCP 手动换主线版就卡在这）。没人答的时候一律保留现有的——选新版的话 443 分流那段没了。
+    return run(["apt-get", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold"] + args,
+               timeout=timeout, env_extra={"DEBIAN_FRONTEND": "noninteractive"})
 
 
 def have_cmd(name):
@@ -2660,14 +2662,24 @@ def fix_nginx_repo(install_if_missing=False):
         else:
             echo("ℹ️ nginx.org keyring 已存在")
 
-        if os.path.isfile(NGINX_KEYRING) and os.path.getsize(NGINX_KEYRING) > 0:
+        repo_cn = nginx_repo_codename(base, codename, distro) \
+            if os.path.isfile(NGINX_KEYRING) and os.path.getsize(NGINX_KEYRING) > 0 else ""
+        if repo_cn:
             write_text(NGINX_OFFICIAL_LIST,
                        "# Net-Optimize: nginx.org official mainline repo\n"
-                       f"deb [signed-by={NGINX_KEYRING}] {base} {codename} nginx\n")
-            echo(f"✅ 已配置 nginx.org 官方源：{base} {codename}")
+                       f"deb [signed-by={NGINX_KEYRING}] {base} {repo_cn} nginx\n")
             write_text(NGINX_PIN,
                        "Package: nginx*\nPin: origin nginx.org\nPin-Priority: 1001\n")
-            echo("✅ 已设置 nginx.org Pin=1001，官方源优先")
+            if repo_cn == codename:
+                echo(f"✅ 已配置 nginx.org 官方源：{base} {codename}")
+            elif nginx_borrow_ok():
+                echo(f"✅ nginx.org 还没出 {codename} 的包，借用 {repo_cn} 的（新系统装得上，已模拟安装确认）")
+            else:
+                _rm(NGINX_OFFICIAL_LIST); _rm(NGINX_PIN)
+                apt(["update", "-y"])
+                echo(f"ℹ️ nginx.org 还没出 {codename} 的包，借 {repo_cn} 的也装不上：先用系统自带的 nginx")
+            if os.path.isfile(NGINX_PIN):
+                echo("✅ 已设置 nginx.org Pin=1001，官方源优先")
 
     # 3) ondrej/nginx PPA：可用保留，失效禁用（仅 Ubuntu）
     # 【整段包起来】这一步纯属给 apt 清场，出什么岔子都不该把整个内核调优打断 ——
@@ -2721,6 +2733,33 @@ def fix_nginx_repo(install_if_missing=False):
 
 
 # === DHCP 续约后恢复 initcwnd（--reapply-initcwnd，由 networkd-dispatcher 调）===
+# nginx.org 还没出包的新系统（刚发布的 Ubuntu 非 LTS，如 26.10 stonking）借这些代号的包：新的在前。
+# 10/29 GCP 上 Ubuntu 26.10 借 noble 的 1.31.8 实测装得上、nginx -t 通过。
+NGINX_BORROW_CODENAMES = {"ubuntu": ["noble", "jammy"], "debian": ["trixie", "bookworm"]}
+
+
+def nginx_repo_codename(base, codename, distro):
+    """nginx.org 官方源该写哪个发行版代号：有这个系统自己的就用它；没有（以前照写，apt update 每次都报错、
+       退回装系统自带的稳定版）就借最近的长期支持版；都探不到（多半是连不上 nginx.org）返回 ""、不动现有的源。"""
+    def has(c):
+        url = f"{base}/dists/{c}/Release"
+        return sh(f"curl -fsSI --max-time 8 {shlex.quote(url)} >/dev/null", timeout=15).returncode == 0
+    if has(codename):
+        return codename
+    for c in NGINX_BORROW_CODENAMES.get(distro, []):
+        if c != codename and has(c):
+            return c
+    echo("⚠️ 连不上 nginx.org，官方源这次不动")
+    return ""
+
+
+def nginx_borrow_ok():
+    """借来的源真装得上吗：apt update 后模拟安装 nginx（-s 什么都不改）。老系统借新版本的包，依赖（glibc 等）对不上会在这里失败。"""
+    if apt(["update", "-y"]).returncode != 0:
+        return False
+    return apt(["install", "-s", "nginx"], timeout=120).returncode == 0
+
+
 def cmd_reapply_initcwnd():
     cfg = config_read()
     if cfg.get("ENABLE_INITCWND", "1") != "1":
