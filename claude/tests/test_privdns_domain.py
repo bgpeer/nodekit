@@ -117,8 +117,8 @@ M1, L3 = node_links(DOM1, "🇯🇵1"), node_links(DOM3, "🇭🇰3")
 
 # ── 1. 节点专用域名的名字、换地址 ────────────────────────────────────────────────────────
 N1 = x._privdns_new_name(ROOTD)
-check(f"起的名字是「10 位随机.根域名」（{N1}）",
-      re.match(r"^[a-z0-9]{10}\.zone\.example$", N1) and x._privdns_is_domain_name(N1)
+check(f"起的名字是「10 位随机.6 位随机.根域名」（{N1}）",
+      re.match(r"^[a-z0-9]{10}\.[a-z0-9]{6}\.zone\.example$", N1) and x._privdns_is_domain_name(N1)
       and not x._privdns_is_domain_name("k7xq2m4p9z.internal"))
 ok_all = True
 for u in M1[:-1]:
@@ -154,14 +154,20 @@ check("查泛解析拿的是用完就扔的随机名，不是真要用的节点�
 
 # ── 3. 证书：*.根域名 处处带着 ───────────────────────────────────────────────────────────
 N3 = x._privdns_new_name(ROOTD)
+P3 = N3.split(".", 1)[1]                    # 随机段.根域名
+W3 = "*." + P3                              # 证书多签的就是它
 state(DOM3)
 x.privdns_save({"mode": "off", "dns": "", "name": N3})
-check("关着：不多签", x._privdns_root() == "" and "*." + ROOTD not in x.cert_want_names(DOM3, False))
+check("关着：不多签", x._privdns_root() == "" and W3 not in x.cert_want_names(DOM3, False))
 x.privdns_save({"mode": "self", "dns": "", "name": N3})
 check(f"开着：cert_want_names 带上 *.{ROOTD}（{x.cert_want_names(DOM3, False)}）",
-      x._privdns_root() == ROOTD and x.cert_want_names(DOM3, False)[-1] == "*." + ROOTD)
+      x._privdns_root() == P3 and x.cert_want_names(DOM3, False)[-1] == W3)
 state("node.another.example")
 check("换过节点域名（根域名变了）：旧的 *.根域名 不再带", x._privdns_root() == "")
+state(DOM3)
+want = x.cert_want_names(DOM3, True)
+check(f"节点域名是根域名的子域：要签的泛域名盖不住它（Let's Encrypt 不收「redundant with a wildcard」，10/29 真机）（{want}）",
+      not [n for n in want if n.startswith("*.") and n != "*." + DOM3 and x._name_covers([n], DOM3)])
 state(DOM3)
 RUNS = []
 class Stop(Exception):
@@ -175,14 +181,14 @@ def acct(token):
 acct(False)
 RUNS.clear()
 with quiet() as _:
-    r = x.cert_install_apply(DOM3, False, "", [DOM3, "*." + ROOTD])
+    r = x.cert_install_apply(DOM3, False, "", [DOM3, W3])
 check("要签 *.根域名、没令牌：说清楚、不碰现有证书（不去签）", r is False and not RUNS)
 acct(True)
 RUNS.clear()
 with quiet():
-    x.cert_install_apply(DOM3, False, "", [DOM3, "*." + ROOTD])
+    x.cert_install_apply(DOM3, False, "", [DOM3, W3])
 check(f"有令牌：走 DNS 验证、两个名字都签（{RUNS[-1][:90] if RUNS else ''}）",
-      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '*.{ROOTD}'" in RUNS[-1] and f"-d '{DOM3}'" in RUNS[-1])
+      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '{W3}'" in RUNS[-1] and f"-d '{DOM3}'" in RUNS[-1])
 x.cert_covers = lambda p, d: False
 x.have = lambda b: True
 x._wildcard_wanted = lambda: (False, "")
@@ -194,14 +200,14 @@ try:
 except Exception:
     pass
 check(f"重装时 ensure_acme 重签：DNS 验证、带着 *.{ROOTD}（{RUNS[-1][:90] if RUNS else ''}）",
-      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '*.{ROOTD}'" in RUNS[-1] and "--webroot" not in RUNS[-1])
+      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '{W3}'" in RUNS[-1] and "--webroot" not in RUNS[-1])
 x._ensure_cron_running = lambda: None
 x.acme_hijackers = lambda keep="": []
 RUNS.clear()
 with quiet():
     x.cert_fix_run()
 check(f"「15 → 修复证书」重签：DNS 验证、带着 *.{ROOTD}（{RUNS[-1][:90] if RUNS else ''}）",
-      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '*.{ROOTD}'" in RUNS[-1] and "--standalone" not in RUNS[-1])
+      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '{W3}'" in RUNS[-1] and "--standalone" not in RUNS[-1])
 acct(False)
 RUNS.clear()
 with quiet() as buf:
@@ -211,7 +217,7 @@ check("修复证书时没令牌：不降级成单域名、不动（*.根域名 �
 acct(True)
 x.privdns_save({"mode": "self", "dns": "", "name": N3})
 check("要签的是别的根域名底下的域名：不带这个 *.根域名（令牌多半管不着那个区域，带上反而签不出来）",
-      "*." + ROOTD not in x.cert_want_names("node.another.example", False))
+      W3 not in x.cert_want_names("node.another.example", False))
 x.G["domain"] = "node.another.example"
 RUNS.clear()
 try:
@@ -219,7 +225,7 @@ try:
         x.ensure_acme()
 except Exception:
     pass
-check("用别的根域名重装：ensure_acme 不带旧的 *.根域名（单域名照常签）", RUNS and f"*.{ROOTD}" not in RUNS[-1])
+check("用别的根域名重装：ensure_acme 不带旧的 *.根域名（单域名照常签）", RUNS and W3 not in RUNS[-1])
 x.G["domain"] = DOM3
 os.makedirs(x.XRAY_DIR, exist_ok=True)
 json.dump({"inbounds": [{"port": 23456, "streamSettings": {"security": "reality",
@@ -232,7 +238,7 @@ check("本机 xray 的 reality 换成节点专用域名以后，sing-box 那份�
 x.G["domain"] = DOM3
 CERT[:] = [DOM3]
 check("证书没盖住：443 只认公网域名", f"server_name {DOM3};" in x._nginx_https_server("  listen 443 ssl;\n"))
-CERT[:] = [DOM3, "*." + ROOTD]
+CERT[:] = [DOM3, W3]
 check("证书盖住了：443 两个名字都认", f"server_name {DOM3} {N3};" in x._nginx_https_server("  listen 443 ssl;\n"))
 
 # ── 5. DNS 机（3）：本机节点也换、替 1 解析 ──────────────────────────────────────────────
@@ -281,7 +287,7 @@ with contextlib.redirect_stdout(buf):
 check("证书没盖住：3 自己的节点照用公网域名、说一行；.links 也不再报私有名",
       [x._link_addr(u)[0] for u in links_nc if "🇭🇰3·reality" in x._link_name(u)] == [DOM3]
       and "证书里没有" in buf.getvalue() and x._privdns_links_line() == "")
-CERT[:] = [DOM3, "*." + ROOTD]
+CERT[:] = [DOM3, W3]
 
 # ── 7. 成员机报了个别人家的名字 ───────────────────────────────────────────────────────
 PEER_TEXT["https://m1.example/x.links"] = "\n".join(M1) + f"\n#privdns k7xq2m4p9z.other.example {DOH3}\n"
@@ -321,12 +327,13 @@ check("没存令牌：先列出 Cloudflare 令牌怎么做、要粘令牌；没�
       "Cloudflare 令牌怎么做" in out and "已取消" in out and not DISPATCH and x.privdns_conf()["mode"] == "off")
 out = run_menu("2", DOH3, "tok-1", "")
 check("粘了令牌、后果红字一行（证书要重签、小火箭不放），默认否 → 没动",
-      "小火箭那份不放本机节点" in out and f"多签 *.{ROOTD}" in out and not DISPATCH)
+      "小火箭那份不放本机节点" in out and re.search(r"多签 \*\.[a-z0-9]{6}\.zone\.example", out) and not DISPATCH)
 out = run_menu("2", DOH3, "tok-1", "y")
 c = x.privdns_conf()
-check(f"确认：转后台做，证书多签 *.{ROOTD}、原来的名字一个不丢、带着令牌（{APPLY[-1] if APPLY else ''}）",
+check(f"确认：转后台做，证书多签 *.随机段.根域名、原来的名字一个不丢、带着令牌（{APPLY[-1] if APPLY else ''}）",
       DISPATCH and DISPATCH[-1]["op"] == "privdns-domain" and APPLY
-      and APPLY[-1][0] == DOM1 and APPLY[-1][2] == "tok-1" and APPLY[-1][3] == [DOM1, "*." + ROOTD])
+      and APPLY[-1][0] == DOM1 and APPLY[-1][2] == "tok-1"
+      and APPLY[-1][3] == [DOM1, "*." + c["name"].split(".", 1)[1]])
 check(f"存下：外机DNS解析、外机地址、节点专用域名在根域名底下（{c['name']}）",
       c["mode"] == "remote" and c["dns"] == DOH3 and c["name"].endswith("." + ROOTD))
 check("nginx 按新设置重建、.links 末尾报节点专用域名 + 外机地址、重生成了配置",
@@ -340,7 +347,7 @@ REGEN.clear()
 out = run_menu("3")
 check("关：.links 末尾那行撤掉、本机配置重生成（节点换回公网域名），证书和 nginx 留着",
       x.privdns_conf()["mode"] == "off" and "#privdns" not in open(x.LINKS_FILE).read() and REGEN
-      and "*." + ROOTD in CERT)
+      and "*." + first.split(".", 1)[1] in CERT)
 x._privdns_new_name = lambda root="": "k7xq2m4p9z." + (root or "internal")
 LOCAL[:] = node_links("jp9.wild.example", "🇯🇵9")      # vmess 是 base64，不能字符串替换
 state("jp9.wild.example")
@@ -354,7 +361,10 @@ check(f"整个过程没把哪个真要用的节点专用域名送去公网 DNS �
 a = load("agh", "adguard-dns.py")
 a.BGP_DIR, a.PRIVDNS_FILE, a.ACME_CRT = tmp, x.PRIVDNS_FILE, f"{tmp}/acme.crt"
 json.dump({"mode": "remote", "dns": DOH3, "name": "k7xq2m4p9z." + ROOTD}, open(x.PRIVDNS_FILE, "w"))
-check("adguard-dns 认得节点专用域名的根域名", a._privdns_root() == ROOTD)
+json.dump({"mode": "remote", "dns": DOH3, "name": N3}, open(x.PRIVDNS_FILE, "w"))
+check("adguard-dns 认得新的两段式节点专用域名（证书要的是 *.随机段.根域名）", a._privdns_root() == P3)
+json.dump({"mode": "remote", "dns": DOH3, "name": "k7xq2m4p9z." + ROOTD}, open(x.PRIVDNS_FILE, "w"))
+check("老的「随机.根域名」照样认（已经开着的机器不受影响）", a._privdns_root() == ROOTD)
 ARUNS, ASH = [], []
 a.subprocess = types.SimpleNamespace(run=lambda cmd, **kw: ARUNS.append(cmd) or
                                      types.SimpleNamespace(returncode=0, stdout="Cert success", stderr=""))
