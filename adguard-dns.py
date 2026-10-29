@@ -266,12 +266,21 @@ def _setup_own_domain():
        顶掉以后节点 / Emby 那几张的续期就签不出来了）。"""
     R, G_, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
     ui_title("自建 DNS 的域名（跟节点分开）")
-    ui_tip("用一个只给 DNS 用的域名，比如 dns.你的域名；回车 = 不用加密")
-    dom = _ask("  域名: ").strip().lower().rstrip(".")
-    if not dom:
+    nd = (_node_domain() or "").lower()
+    # 像 Emby 那样先认出节点域名（仓库主人 10/29）：默认给 dns.节点的根域名——同一个令牌管得到，回车就行
+    dft = f"dns.{_root_of(nd)}" if nd else ""
+    if nd:
+        ui_kv("节点域名", nd)
+    raw = _ask(f"  域名（回车 = {dft}，输 n = 不用加密）: " if dft else "  域名（回车 = 不用加密）: ")
+    raw = raw.strip().lower().rstrip(".")
+    if raw in ("n", "no") or not (raw or dft):
         return ""
+    dom = raw or dft
     if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
         print(f"  {R}✗ 域名格式不对{N}"); return ""
+    # 跟节点同一个名字：acme.sh 按主域名存记录，会把节点那条（续期装到节点证书）顶掉——换个子域名
+    if dom == nd or os.path.isdir(os.path.expanduser(f"~/.acme.sh/{dom}_ecc")):
+        print(f"  {R}✗ {dom} 已经有一张证书在用（节点 / 别的服务的），换一个只给 DNS 用的子域名{N}"); return ""
     ip = _public_ip()
     print(_hl("1;36", f"[Cloudflare 里两条 A 记录 → {ip}，仅 DNS（灰云）]"))
     print(dom)

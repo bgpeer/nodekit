@@ -84,10 +84,32 @@ ASK[:] = [DOM, "tok new"]; RUN.clear()
 with contextlib.redirect_stdout(io.StringIO()):
     got = a._setup_own_domain()
 check(f"acme.sh 里没存令牌：问一个，命令行里转义好（{RUN[-1][:40]}）", got == DOM and RUN[-1].startswith("CF_Token='tok new' "))
-ASK[:] = [""]
+ASK[:] = ["n"]
 with contextlib.redirect_stdout(io.StringIO()):
     got = a._setup_own_domain()
-check("回车：不用加密", got == "")
+check("输 n：不用加密", got == "")
+
+print("二b、像 Emby 那样先认节点域名")
+a._node_domain = lambda: "us.node.example"
+for f in (a.AGH_DOMAIN_FILE,):
+    if os.path.exists(f): os.remove(f)
+RES["dns.node.example"] = [IP]; ASK[:] = ["", "tok"]; RUN.clear()
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    got = a._setup_own_domain()
+check(f"回车 = dns.节点根域名（{got}），屏上列出节点域名", got == "dns.node.example" and "us.node.example" in buf.getvalue())
+ASK[:] = ["us.node.example"]; RUN.clear()
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    got = a._setup_own_domain()
+check("填节点域名本身：不签（会把节点那条 acme 记录顶掉）", got == "" and not RUN and "换一个" in buf.getvalue())
+os.makedirs(f"{tmp}/.acme.sh/media.example_ecc")
+ASK[:] = ["media.example"]; RUN.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    got = a._setup_own_domain()
+check("acme.sh 里已有同名记录（别的服务的）：不签", got == "" and not RUN)
+a._node_domain = lambda: ""
+open(a.AGH_DOMAIN_FILE, "w").write(DOM + "\n")
 
 print("三、卸载：撤掉自己那张，不重签节点证书")
 open(a.AGH_DOMAIN_FILE, "w").write(DOM + "\n")
