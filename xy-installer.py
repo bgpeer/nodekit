@@ -430,13 +430,28 @@ def public_ip():
        别再 .split()[0] 直接取——出网被墙 + hostname -I 是空的时候那是 IndexError，
        崩在调用方一脸茫然，而真实原因只是「这台机现在查不到自己的 IP」。"""
     try:
-        ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
+        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": HTTP_UA})   # 不报 Python-urllib
+        ip = urllib.request.urlopen(req, timeout=8).read().decode().strip()
         if ip:
             return ip
     except Exception:
         pass
     local = (sh("hostname -I", check=False) or "").split()
     return local[0] if local else ""
+
+def public_ip6():
+    """本机的公网 IPv6，没有返回 ''。UDP connect 不发包，只让内核按路由表挑源地址；
+       面板上 VPS 后台只给 /64 前缀（2605:…::），机器自己挑的那个完整地址在这儿才看得到。"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2001:4860:4860::8888", 53))
+        ip = s.getsockname()[0].split("%")[0]
+        return ip if ipaddress.ip_address(ip).is_global else ""
+    except (OSError, ValueError):
+        return ""
+    finally:
+        if s: s.close()
 
 def new_uuid():   return str(uuid.uuid4())          # RFC4122 v4，两核心都接受
 def new_pw(n=16): return secrets.token_urlsafe(n)
@@ -8453,20 +8468,26 @@ def _vpschk_last():
         print(f"  上次检测：{Y}还未检测过{N}")
         return
     ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.get("ts", 0)))
-    print(f"  上次检测：{ts}（{_ago(d.get('ts', 0))}）　IP {G}{d.get('ip', '-')}{N}")
+    print(f"  上次检测：{ts}（{_ago(d.get('ts', 0))}）")
+    def rows(routes):
+        for car in ("电信", "联通", "移动"):
+            r = routes.get(car)
+            if not r:
+                continue
+            col, sym = (G, "●") if r.get("prem") else ((Y, "○") if r.get("norm") else (D, "·"))
+            tail = f"优质 {r.get('prem', 0)} / 普通 {r.get('norm', 0)}"
+            if r.get("unk"):  tail += f" / 未探到 {r['unk']}"
+            if r.get("miss"): tail += f" / 没测到 {r['miss']}"
+            labs = "、".join(r.get("labs") or []) or "未识别"
+            print(f"    {col}{sym} {car}{N}  {col}{labs}{N}　{D}{tail}（共 {r.get('total', 0)} 点）{N}")
     routes = d.get("routes") or {}
-    for car in ("电信", "联通", "移动"):
-        r = routes.get(car)
-        if not r:
-            continue
-        col, sym = (G, "●") if r.get("prem") else ((Y, "○") if r.get("norm") else (D, "·"))
-        tail = f"优质 {r.get('prem', 0)} / 普通 {r.get('norm', 0)}"
-        if r.get("unk"):  tail += f" / 未探到 {r['unk']}"
-        if r.get("miss"): tail += f" / 没测到 {r['miss']}"
-        labs = "、".join(r.get("labs") or []) or "未识别"
-        print(f"    {col}{sym} {car}{N}  {col}{labs}{N}　{D}{tail}（共 {r.get('total', 0)} 点）{N}")
+    print("  IPv4 回程")
+    rows(routes)
     if not routes:
         print(f"    {D}（上次没测到路由）{N}")
+    if d.get("routes6"):
+        print("  IPv6 回程")
+        rows(d["routes6"])
     flag = d.get("flag")
     fl = ("画像未取到" if flag is None else
           f"{R}有 proxy 标记{N}" if flag == 2 else
@@ -8481,6 +8502,13 @@ def vps_check_menu():
     """VPS 线路检测：三网回程走哪条骨干 + IP 纯净度。脚本在本仓库 vps-check.py。
        纯 stdlib、无第三方依赖；traceroute 缺了它自己 apt/yum/apk 装。"""
     ui_title("VPS 线路检测（三网回程 + IP 纯净度）")
+    # 本机两个地址：标题上色、地址顶格单独一行（长按复制干净）。IPv6 的完整地址 VPS 后台常常只给 /64 前缀，在这儿找
+    v4, v6 = public_ip(), public_ip6()
+    print(_hl("1;33", "▸ 本机 IPv4"))
+    print(v4 or "（查不到）")
+    print(_hl("1;33", "▸ 本机 IPv6"))
+    print(v6 or "（没有）")
+    print()
     _vpschk_last()
     ui_line()
     # 外部 IP 检测：输入任意 IP，查画像 + 本机到它的链路 + 黑名单
@@ -8490,9 +8518,11 @@ def vps_check_menu():
         return
     arg = ""
     if c == "2":
-        ip = _ask("要检测的 IP: ").strip()
-        if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip) or any(int(x) > 255 for x in ip.split(".")):
-            print("  不是合法的 IPv4 地址。"); return
+        ip = _ask("要检测的 IP（IPv4 / IPv6）: ").strip()
+        try:
+            ip = str(ipaddress.ip_address(ip))
+        except ValueError:
+            print("  不是合法的 IP 地址。"); return
         arg = " " + ip
     if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
         print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); return

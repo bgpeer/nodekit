@@ -8,7 +8,7 @@
 #   2. 查不准就明说，不给"自信但错误"的结论。GIA/GT 的细分本脚本【不下结论】，
 #      只把证据（59.43 跳、跳数、延迟）摆出来——理由见文件末尾「局限」。
 # ============================================================================
-import json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, concurrent.futures as cf
+import ipaddress, json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, concurrent.futures as cf
 
 # 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
 # vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
@@ -85,6 +85,10 @@ def _dns(name, qtype, server, timeout=3.0):
 def dns_txt(n, server="1.1.1.1"): return _dns(n, 16, server)
 def dns_a(n, server):             return _dns(n, 1, server)
 def _rev(ip):                     return ".".join(reversed(ip.split(".")))
+def _rev6(ip):
+    """IPv6 → Cymru 要的半字节倒序：2605:52c0::1 → 1.0.0.0.….c.2.5.0.6.2"""
+    return ".".join(reversed(ipaddress.ip_address(ip).exploded.replace(":", "")))
+def is_v6(ip):                    return ":" in (ip or "")
 
 _ASN_CACHE = {}
 def asn_of(ip):
@@ -95,7 +99,9 @@ def asn_of(ip):
        结果（实测 202.103.24.68 一会儿 AS4134/18、一会儿 AS137266/20）。
        按 BGP 语义取【最长前缀】那条：最具体的宣告才是实际生效的。"""
     if ip in _ASN_CACHE: return _ASN_CACHE[ip]
-    recs = dns_txt(f"{_rev(ip)}.origin.asn.cymru.com") or []
+    # IPv6 走 origin6 区，地址按半字节倒序（Cymru 官方用法），返回格式跟 IPv4 一样
+    q = f"{_rev6(ip)}.origin6.asn.cymru.com" if is_v6(ip) else f"{_rev(ip)}.origin.asn.cymru.com"
+    recs = dns_txt(q) or []
     best, best_len = None, -1
     for rec in recs:
         f = [x.strip() for x in rec.split("|")]
@@ -136,7 +142,10 @@ def peers_of(ip, cap=4):
        （69.63.210.0/24），邻居只有 AS2914(NTT) / AS3257(GTT) / AS137409，
        没有 4809 也没有 4134。原因是 CN2 是私有电路、59.43 根本不在 BGP
        全局表里，商家把出境流量交给哪条电路是转发决策，全局路由表看不见。
-       所以这行只当【上游构成】看（NTT/GTT/Cogent/HE 之类），不能拿来判线路。"""
+       所以这行只当【上游构成】看（NTT/GTT/Cogent/HE 之类），不能拿来判线路。
+       Cymru 的 peer 区只有 IPv4，IPv6 不查。"""
+    if is_v6(ip):
+        return []
     recs = dns_txt(f"{_rev(ip)}.peer.asn.cymru.com") or []
     best, best_len = None, -1
     for rec in recs:
@@ -216,6 +225,14 @@ TARGETS = [
     ("移动", "南宁", "211.138.245.180"), ("移动", "成都", "211.137.96.205"),
     ("移动", "西安", "211.137.130.3"),   ("移动", "武汉", "211.137.58.20"),
 ]
+# IPv6 三网测试点：常见回程测试脚本里的那几个，没法在这里逐个实测，跑的时候照样先验归属
+# （CN + AS 名字对得上），对不上标「目标存疑」跳过。每家一个点，只看这台 IPv6 回国交给谁。
+# 10/29 DMIT LA 实测：去移动的路径 DMIT 本网 → 移动 CMI → CMNET，IPv4 走 CN2 GIA、IPv6 走 CMI。
+TARGETS6 = [
+    ("电信", "", "240e:928:1400:105::b"),
+    ("联通", "", "2408:8756:c52:1aec:0:ff:b013:5a11"),
+    ("移动", "", "2409:8c54:871:1001::12"),
+]
 CITIES   = ["北京", "上海", "莆田", "深圳", "南宁", "成都", "西安", "武汉"]
 CARRIERS = ["电信", "联通", "移动"]
 
@@ -239,10 +256,11 @@ def traceroute(ip, maxhop=30, timeout=120):
          mtr -r -c1:  `  3.|-- 59.43.186.1  0.0%  1  142.3 142.3 ...`
                       跳号后是 `.|--`，且【没有 ms 后缀】，
                       IP 之后依次是 Loss% / Snt / Last…，Last 才是本跳延迟。"""
+    fam = " -6" if is_v6(ip) else ""
     if have("traceroute"):
-        cmd, tool = f"traceroute -n -q 1 -w 1 -m {maxhop} {ip}", "traceroute"
+        cmd, tool = f"traceroute{fam} -n -q 1 -w 1 -m {maxhop} {ip}", "traceroute"
     elif have("mtr"):
-        cmd, tool = f"mtr -n -r -c 1 -m {maxhop} {ip}", "mtr"
+        cmd, tool = f"mtr{fam} -n -r -c 1 -m {maxhop} {ip}", "mtr"
     else:
         return []
     try:
@@ -254,8 +272,14 @@ def traceroute(ip, maxhop=30, timeout=120):
         m = re.match(r"\s*(\d+)[.|\s-]+(.*)", line)          # 同时吃 `1  ` 和 `1.|-- `
         if not m: continue
         n, rest = int(m.group(1)), m.group(2)
-        ipm = re.search(r"(\d+\.\d+\.\d+\.\d+)", rest)
-        hip = ipm.group(1) if ipm else None
+        hip = None
+        for tok in re.findall(r"[0-9A-Fa-f:.]+", rest):     # IPv4 或 IPv6，用 ipaddress 认，别被延迟数字骗了
+            if "." not in tok and ":" not in tok:
+                continue
+            try:
+                hip = str(ipaddress.ip_address(tok)); break
+            except ValueError:
+                continue
         ms = None
         if hip:
             if tool == "traceroute":
@@ -286,6 +310,20 @@ def my_ip():
         except Exception:
             continue
     return None
+
+def my_ip6():
+    """本机的公网 IPv6。UDP connect 不发包，只让内核按路由表挑出网用的源地址；
+       没有 IPv6 路由就 OSError → None。链路本地 / 内网段不算。"""
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2001:4860:4860::8888", 53))
+        ip = s.getsockname()[0].split("%")[0]
+        return ip if ipaddress.ip_address(ip).is_global else None
+    except (OSError, ValueError):
+        return None
+    finally:
+        if s: s.close()
 
 def ip_profile(ip):
     """ip-api.com 免密钥，直接给 hosting/proxy/mobile 三个标记——
@@ -344,10 +382,12 @@ def reach(host, port=443, timeout=5):
         return None
 
 # ---------------------------------------------------------------- 报告
-def report_ip(ip, num="一", local=True):
+def report_ip(ip, num="一", local=True, ip6=None):
     title(f"{num}、{'本机' if local else '目标'} IP 画像")
     asn, pfx, cc, name = asn_of(ip)
     print(f"  IP        : {C['b']}{ip}{C['n']}")
+    if local:
+        print(f"  IPv6      : {C['b'] + ip6 if ip6 else C['d'] + '没有'}{C['n']}")
     print(f"  ASN       : {'AS'+asn if asn else '查不到'}  {name}")
     print(f"  宣告前缀   : {pfx or '-'}    注册地: {cc or '-'}")
     peers = peers_of(ip)
@@ -517,6 +557,31 @@ def report_routes(num="二"):
             verdicts.setdefault(car, []).append((city, lab, lvl))
     return verdicts
 
+def report_routes6(ip6, num="三"):
+    """IPv6 回程：每家一个点，判定跟 IPv4 同一套（逐跳查 ASN → 骨干表）。
+       IPv4 被封 TCP、改走 IPv6 的机器（10/29 DMIT）要看这个：两条路回国可能完全不是一家。"""
+    title(f"{num}、IPv6 回程路由（本机 → 中国）")
+    if not ip6:
+        print(f"  {C['d']}本机没有 IPv6，跳过{C['n']}"); return None
+    if not ensure_traceroute():
+        print(f"  {C['r']}没有 traceroute/mtr 且装不上，跳过本节{C['n']}"); return None
+    res = run_targets(TARGETS6, workers=3)
+    verdicts = {}
+    for car, city, ip in TARGETS6:
+        r = res[(car, city, ip)]
+        if r[0] == "suspect":
+            print(f"  {C['y']}? {car}  目标存疑（AS{r[1] or '?'} {(r[2] or '')[:24]}），已跳过{C['n']}")
+            verdicts.setdefault(car, []).append((car, "目标存疑", "skip")); continue
+        if not r[1]:
+            print(f"  {C['r']}✗ {car}  无响应{C['n']}")
+            verdicts.setdefault(car, []).append((car, "无响应", "fail")); continue
+        lab, lvl, ms, land = route_verdict(r[1], car)
+        col, sym = _mark(lvl)
+        lat = f"{ms:.0f} ms" if ms else ""
+        print(f"  {col}{sym} {car}  {lab:<22}{C['n']}{C['d']}{('→ ' + land) if land else '':<16}{lat:>9}{C['n']}")
+        verdicts.setdefault(car, []).append((car, lab, lvl))
+    return verdicts
+
 def report_bl(ip, num="三"):
     title(f"{num}、IP 黑名单（DNSBL）")
     resolver = _sys_resolvers()[0]
@@ -575,9 +640,7 @@ def _flag_line(flag):
     return ("有 proxy 标记，纯净度差" if flag == 2 else
             "机房 IP（正常现象，流媒体可能受限）" if flag == 1 else "无异常标记")
 
-def save_last(ip, flag, v, listed, unknown):
-    """把这次本机检测压成一份小 JSON 落盘，菜单里直接显示，省得每次都要重跑。
-       只落本机结果——外部 IP 检测查的是别人的 IP，跟这台机的线路无关。"""
+def _route_summary(v):
     routes = {}
     for car in CARRIERS:
         rows = v.get(car) if v else None
@@ -590,7 +653,13 @@ def save_last(ip, flag, v, listed, unknown):
                        "unk": len([1 for _, _, lv in rows if lv == ""]),
                        "miss": len([1 for _, _, lv in rows if lv in ("fail", "skip")]),
                        "total": len(rows)}
-    data = {"ts": int(time.time()), "ip": ip, "flag": flag, "routes": routes,
+    return routes
+
+def save_last(ip, flag, v, listed, unknown, ip6=None, v6=None):
+    """把这次本机检测压成一份小 JSON 落盘，菜单里直接显示，省得每次都要重跑。
+       只落本机结果——外部 IP 检测查的是别人的 IP，跟这台机的线路无关。"""
+    data = {"ts": int(time.time()), "ip": ip, "flag": flag, "routes": _route_summary(v),
+            "ip6": ip6 or "", "routes6": _route_summary(v6),
             "bl_listed": listed, "bl_unknown": len(unknown), "bl_total": len(DNSBLS)}
     try:
         os.makedirs(os.path.dirname(LAST_FILE), exist_ok=True)
@@ -605,17 +674,22 @@ def check_local():
     ip = my_ip()
     if not ip:
         print(f"{C['r']}拿不到公网 IP，检查外网连通性。{C['n']}"); return 1
-    flag = report_ip(ip, "一", local=True)
+    ip6 = my_ip6()
+    flag = report_ip(ip, "一", local=True, ip6=ip6)
     v = report_routes("二")
-    listed, unknown = report_bl(ip, "三")
-    report_reach("四")
+    v6 = report_routes6(ip6, "三")
+    listed, unknown = report_bl(ip, "四")
+    report_reach("五")
 
-    title("五、结论")
+    title("六、结论")
     if v: _conclude_routes(v)
+    if v6:
+        print(f"  {C['b']}IPv6{C['n']}")
+        _conclude_routes(v6)
     print()
     print(f"  IP 标记   : {_flag_line(flag)}")
     print(f"  黑名单     : " + (f"命中 {len(listed)} 个：{', '.join(listed)}" if listed else "未命中"))
-    save_last(ip, flag, v, listed, unknown)
+    save_last(ip, flag, v, listed, unknown, ip6, v6)
     hr()
     print(f"{C['b']}局限（必须知道，否则会误判）{C['n']}")
     print(f"  1. {C['y']}本脚本不区分 CN2 GIA 和 CN2 GT{C['n']}——两者都走 59.43 段，"
@@ -679,7 +753,12 @@ def check_external(ip):
           f"本机探不到。命令见结论。{C['n']}")
     flag = report_ip(ip, "一", local=False)
     report_link(ip, "二")
-    listed, _ = report_bl(ip, "三")
+    if is_v6(ip):                                    # 这几张黑名单都只收 IPv4
+        title("三、IP 黑名单（DNSBL）")
+        print(f"  {C['d']}IPv6 不查（这几张黑名单只收 IPv4）{C['n']}")
+        listed = []
+    else:
+        listed, _ = report_bl(ip, "三")
 
     title("四、结论")
     print(f"  IP 标记   : {_flag_line(flag)}")
@@ -777,9 +856,10 @@ def main():
     if not args:
         return check_local()
     ip = args[0]
-    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip) or \
-       any(int(x) > 255 for x in ip.split(".")):
-        print(f"{C['r']}不是合法的 IPv4 地址：{ip}{C['n']}"); return 1
+    try:
+        ip = str(ipaddress.ip_address(ip))
+    except ValueError:
+        print(f"{C['r']}不是合法的 IP 地址：{ip}{C['n']}"); return 1
     return check_external(ip)
 
 if __name__ == "__main__":
