@@ -1464,7 +1464,8 @@ def _stream_conf_text():
     m = "map $ssl_preread_server_name $bgpeer_upstream {\n"
     for b in NGINX_STREAM:                              # reality 后端（借用 SNI → 本地端口）
         m += f"    {b['sni']}  127.0.0.1:{b['port']};\n"
-    m += f"    {G['domain']}  127.0.0.1:{SNI_HTTPS_PORT};\n"
+    if G["domain"] not in {b["sni"] for b in NGINX_STREAM}:     # 偷自己：域名归 reality，它再把非 reality 的转给网站
+        m += f"    {G['domain']}  127.0.0.1:{SNI_HTTPS_PORT};\n"
     m += f"    default  127.0.0.1:{SNI_HTTPS_PORT};\n}}\n"
     srv = ("server {\n  listen 443 reuseport;\n" + _v6("  listen [::]:443 reuseport;\n") +
            "  ssl_preread on;\n  proxy_pass $bgpeer_upstream;\n}\n")
@@ -1641,6 +1642,9 @@ def _sni_precheck_one(key="sni", avoid=""):
        TLS1.3 握手不成功，旧版照装还说「按你填的继续装」）。池里同一个站在不同地区的机房表现不一，探过才算数。
        自己填的不替人换，一行提示；装好后可在「4 更换伪装域名」里换。"""
     if not G.get(key):
+        return
+    if _sni_is_self(G[key]):
+        print(f"  reality 借用目标 {G[key]}：偷自己（本机网站，装好就有）")
         return
     ok, detail = _reality_sni_ok(G[key])
     if ok:
@@ -1910,6 +1914,19 @@ def write_service(name, binpath, cfg):
 # ============================================================================
 # sing-box 协议表 —— 每个 builder 返回 (inbound_dict, share_link)
 # ============================================================================
+def _sni_is_self(sni):
+    """reality 「偷自己」：借用的就是本机自己的域名（仓库主人 10/29：输 a 或者输自己的域名都算）。
+       为什么：借大厂时墙看到 SNI 写着 www.boeing.com、连的却是一台 VPS 的 IP（波音真服务器在 Akamai），对得上对不上
+       查得出来；偷自己是域名解析到这台、这台上真有这个网站、证书也是这个域名的，扫过来看到的就是这个网站。
+       只在 nginx 443 分流（sni_split）下做：不是 reality 客户端的连接要转给本机 127.0.0.1:SNI_HTTPS_PORT 上的真网站，
+       别的布局本机没有 https 网站可转（转回 域名:443 自己转自己，死循环）。"""
+    d = (G.get("domain") or "").lower()
+    return bool(d and sni and sni.lower() == d)
+
+def _reality_dest(sni):
+    """reality 的握手目标 (主机, 端口)：偷自己是本机 nginx 上的网站，借大厂是 大厂:443。"""
+    return ("127.0.0.1", SNI_HTTPS_PORT) if _sni_is_self(sni) else (sni, 443)
+
 def sb_reality_vision(port, tag):
     uid = new_uuid(); sid = short_id()
     priv, pub = reality_keys(SB_BIN, "generate reality-keypair")
@@ -1921,7 +1938,7 @@ def sb_reality_vision(port, tag):
           "users": [{"uuid": uid, "flow": "xtls-rprx-vision"}],
           "tls": {"enabled": True, "server_name": G["sni"],
                   "reality": {"enabled": True,
-                              "handshake": {"server": G["sni"], "server_port": 443},
+                              "handshake": dict(zip(("server", "server_port"), _reality_dest(G["sni"]))),
                               "private_key": priv, "short_id": [sid]}}}
     link_port = 443 if split else port
     if split:
@@ -2492,15 +2509,21 @@ def _recap_smux():
 
 _SNI_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
 
-def ask_reality_sni(label, default="", avoid=""):
+def ask_reality_sni(label, default="", avoid="", own=""):
     """问一个 reality 伪装域名 → (域名, 是不是随机挑的)。
        default 给了：回车沿用它；没给：回车从池里随机挑一个（避开 avoid）。
        填的跟 avoid（另一个核心的伪装域名）一样 → 红字说重复、回到这一问重填（仓库主人 10/22：sing-box、xray 各一个，
        sni-split 下 nginx 按伪装域名分流，同一个分不开）；格式不对也回来重填。"""
     rand = secrets.choice([x for x in REALITY_SNI_POOL if x != avoid] or REALITY_SNI_POOL)
     hint = f"回车沿用当前的 {default}" if default else f"回车=随机挑，本次随机到 {rand}"
+    if own:
+        hint += "，a=偷自己"
     while True:
         v = _ask(f"{label}（{hint}）: ").strip().lower().rstrip(".")
+        if v == "a":                             # 偷自己（见 _sni_is_self）：输 a 跟输自己的域名一样
+            if not own:
+                print(_hl("1;31", "  ✗ 偷自己要有域名、走 nginx 443 分流，这台用不了，重填")); continue
+            v = own
         if v and not _SNI_RE.match(v):
             print(_hl("1;31", f"  ✗ {v} 不是域名格式，重填")); continue
         sni = v or default or rand
@@ -2521,7 +2544,8 @@ def _asks_reality(mode):
         print(f"  sing-box 的 reality 伪装域名沿用 {have}")
         return
     cur = G["sni"] if G["sni"] != other else ""
-    G["sni"], G["sni_auto"] = ask_reality_sni("\n  sing-box 的 reality 伪装域名", cur, other)
+    own = (G.get("domain") or "") if G.get("sni_split") else ""
+    G["sni"], G["sni_auto"] = ask_reality_sni("\n  sing-box 的 reality 伪装域名", cur, other, own=own)
     _sni_precheck_one("sni", avoid=other)
 
 def _asks_reality_xr(mode):
@@ -2535,7 +2559,8 @@ def _asks_reality_xr(mode):
         return
     cur = have or G.get("sni_xr", "")
     cur = cur if cur != other else ""
-    G["sni_xr"], G["sni_xr_auto"] = ask_reality_sni("\n  xray 的 reality 伪装域名", cur, other)
+    own = (G.get("domain") or "") if G.get("sni_split") else ""
+    G["sni_xr"], G["sni_xr_auto"] = ask_reality_sni("\n  xray 的 reality 伪装域名", cur, other, own=own)
     _sni_precheck_one("sni_xr", avoid=other)
 
 def _recap_reality():
@@ -2615,7 +2640,7 @@ def _xr_behind_split():
 
 def _xr_reality_stream(priv, sid, network, extra=None, seed=""):
     st = {"network": network, "security": "reality",
-          "realitySettings": {"show": False, "dest": f"{_xr_sni()}:443",
+          "realitySettings": {"show": False, "dest": "%s:%d" % _reality_dest(_xr_sni()),
                               "xver": 0, "serverNames": [_xr_sni()],
                               "privateKey": priv, "shortIds": [sid],
                               "minClientVer": XR_MIN_CLIENT_VER,
@@ -5716,7 +5741,7 @@ def _link_rehost(u, old, new):
                 j[k] = new
         return vmess_link(j)
     v = _link_set_server(u, new)
-    if old and not _is_ip(old):
+    if old and not _is_ip(old) and "security=reality" not in v:   # 偷自己的 reality：SNI 是本机域名，可 443 分流只认它，不换
         head, sep, frag = v.partition("#")
         head = re.sub(r"(?i)([?&](?:sni|host|peer)=)" + re.escape(old) + r"(?=&|$)",
                       lambda m_: m_.group(1) + new, head)
@@ -6415,6 +6440,10 @@ def run(sb_names, xr_names):
             G["sni_split"] = ""
         elif not sni_split_preflight():
             G["sni_split"] = ""; G["reality443"] = "1"    # 退回 reality-443 直连
+            for k in ("sni", "sni_xr"):                   # 偷自己离不开分流：换回大站
+                if _sni_is_self(G.get(k)):
+                    G[k] = secrets.choice([x for x in REALITY_SNI_POOL if x not in (G.get("sni"), G.get("sni_xr"))])
+                    ui_warn(f"443 分流装不上，偷自己做不了，reality 伪装域名改成 {G[k]}（菜单 4 可换）")
         else:
             G["reality443"] = ""                          # sni-split 下 reality 走本地口，不直绑 443
 
@@ -8996,7 +9025,7 @@ def _set_sni_singbox(data, new):
             tls["server_name"] = new
             hs = tls["reality"].get("handshake")
             if isinstance(hs, dict):
-                hs["server"] = new
+                hs["server"], hs["server_port"] = _reality_dest(new)     # 偷自己：转给本机网站
             n += 1
         if ib.get("type") == "shadowtls" and isinstance(ib.get("handshake"), dict):
             ib["handshake"]["server"] = new
@@ -9009,7 +9038,7 @@ def _set_sni_xray(data, new):
     for ib in data.get("inbounds", []):
         rs = (ib.get("streamSettings") or {}).get("realitySettings")
         if isinstance(rs, dict):
-            rs["dest"] = f"{new}:443"
+            rs["dest"] = "%s:%d" % _reality_dest(new)
             rs["serverNames"] = [new]
             n += 1
     return n
@@ -9222,7 +9251,12 @@ def _choose_new_sni(cur, avoid=""):
             pool = [x for x in REALITY_SNI_POOL if x not in skip]
             return new or (secrets.choice(pool) if pool else None)
         if c == "2":
-            v = _ask("  输入域名（如 www.microsoft.com）: ").strip().lower().rstrip(".")
+            own = (G.get("domain") or "").lower() if G.get("sni_split") else ""
+            v = _ask("  输入域名（如 www.microsoft.com" + ("；a = 偷自己" if own else "") + "）: ").strip().lower().rstrip(".")
+            if v == "a" or (v and v == (G.get("domain") or "").lower()):
+                if not own:
+                    print(_hl("1;31", "  ✗ 偷自己要有域名、走 nginx 443 分流，这台用不了，重选")); continue
+                v = own
             if not _SNI_RE.match(v):
                 print(_hl("1;31", "  ✗ 域名格式不对，重选")); continue
             if avoid and v == avoid:
@@ -13837,13 +13871,16 @@ def install_flow():
     # 分流，xray 的 reality-vision 也挂 443 后面，同一个域名分不出该给谁）。回车随机挑（不同机器各不同，不扎堆）；
     # 随机挑的探不过，装的时候自己换一个（见 _sni_precheck_one）。没选 reality 也问第一个：无域名时 ws/trojan 拿它当伪装 Host。
     r_sb, r_xr = proto_flag("reality", sb_names), proto_flag("reality", (), xr_names)
+    own = domain.lower() if domain and SNI_SPLIT_BACKEND in sb_names else ""   # 偷自己只在 443 分流下做（见 _sni_is_self）
     sni, sni_auto = ask_reality_sni("sing-box 的 reality 伪装域名" if r_sb and r_xr else
-                                    "xray 的 reality 伪装域名" if r_xr else "reality 伪装域名（借用目标站 SNI）")
+                                    "xray 的 reality 伪装域名" if r_xr else "reality 伪装域名（借用目标站 SNI）",
+                                    own=own if (r_sb or r_xr) else "")
     G["sni_auto"] = "1" if sni_auto else ""
     sni_xr = ""
     if r_sb and r_xr:
-        sni_xr, xr_auto = ask_reality_sni("xray 的 reality 伪装域名", avoid=sni)
+        sni_xr, xr_auto = ask_reality_sni("xray 的 reality 伪装域名", avoid=sni, own=own)
         G["sni_xr_auto"] = "1" if xr_auto else ""
+    steal_self = bool(own) and own in (sni, sni_xr)
     G["sni_xr"] = sni_xr
     prefix = _ask_free("节点名称前缀（如 🇺🇸/🇯🇵/家宽，回车=无前缀）：")
     # 各协议自己的设置（hy2 跳跃范围、ws 的 smux …）交给注册表的 asks 去问：
@@ -13856,7 +13893,9 @@ def install_flow():
     #  sni-split（最强，需域名+reality-vision）：nginx SNI 分流，reality+网站/ws 全在 443；
     #  reality-443 直连（次之）：主力 reality 独占 443，nginx 仅留 :80 续期。
     r443 = ""; split = ""
-    if domain and SNI_SPLIT_BACKEND in sb_names:
+    if steal_self:
+        split = "1"                                  # 偷自己离不开 443 分流（非 reality 的连接要转给本机网站），不再问
+    elif domain and SNI_SPLIT_BACKEND in sb_names:
         ans = _ask("用 nginx SNI 分流把 reality+网站全放到 443?(最强抗封锁, 会装 stream 模块) [Y/n]: ")
         split = "" if ans.lower() in ("n", "no") else "1"
     if not split and pick_reality_443(sb_names, xr_names)[0]:
