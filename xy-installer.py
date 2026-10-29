@@ -11533,6 +11533,11 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
     if cf_token:
         env["CF_Token"] = cf_token
     want = names or cert_want_names(dom, wildcard)
+    if dom in want:
+        # dom 排第一：acme.sh 拿第一个 -d 当主域名、记录放 ~/.acme.sh/<主域名>_ecc，下面 install-cert、续期、
+        # acme_hijackers 全按 dom 找。传进来的 names 按现有证书的顺序排（*.dom 可能在前），不挪的话新证书落进
+        # *.dom_ecc，install-cert -d dom 导出的还是老的那张，校验不过（10/29 真机：开节点专用域名卡在这）
+        want = [dom] + [x for x in want if x != dom]
     if any(n.startswith("*.") for n in want):
         # 要签的里有泛域名（*.域名，或者节点专用域名要的 *.根域名）：HTTP-01 签不出来，只能 DNS-01。
         # wildcard 本身不改——它记的是「要不要 *.域名」，存进 cert.json 给下次重签判断用
