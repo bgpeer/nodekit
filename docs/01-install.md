@@ -58,7 +58,7 @@
 > ⚠ xhttp 是 xray 专属传输：`sing-box` 和 `小火箭` 都不支持，这两种格式的订阅会自动跳过它
 > （跟 `reality-xhttp` 一样），mihomo 订阅和单条分享链接照常可用。
 
-> 两核心有几个同名协议（`vless-ws`/`vmess-ws`），sing-box 已能做且做得一样，xray 独有价值的只有 `reality-xhttp`。所以**交互安装选「两个都装」时，xray 回车默认只装 `reality-xhttp`**（sing-box 回车仍全装）；想让 xray 也全装,输 `0`/`all` 或点编号即可。只装 xray（选 2）时回车照常全装。
+> **交互安装选「两个都装」时回车的默认**（10/29 起）：xray 装全部，只是 `trojan` 不默认（最早被封端口的就是它，要的手动勾）；sing-box 只装 xray 没有的（hy2、tuic、vmess-httpupgrade、anytls、grpc-tls），再加 `reality-vision`——xray 的 reality 只收带 X25519MLKEM768 的客户端，sing-box App / Hiddify / NekoBox 连不上，不留 sing-box 这个，用它们的人就没有 reality 可用。两边的 reality-vision 各借一个大站。想全装输 `0`/`all` 或点编号；只装一个核心时回车照常全装。
 >
 > 万一你让两核心装了同名协议（`vless-ws`/`vmess-ws`；老机器上还可能有 `trojan`），为避免客户端订阅**重名报错**，会给它们**尾部各加一个小上标区分**：sing-box 那份加 `¹`、xray 那份加 `²`（如 `vless-ws¹` / `vless-ws²`）。只标撞名的这几个，其余不动；上标短，手机上也显示得下。端口/服务/配置本来就互不冲突。
 
