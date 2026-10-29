@@ -2228,10 +2228,13 @@ def sb_ss2022(port, tag):
     return ib, lk
 
 # --- ws / h2 / httpupgrade 传输参数化：加一种传输 = 加一行映射 ---
+# 服务端一律不写 host：写了 sing-box / xray 就逐个校验客户端的 Host，只认这一个名字——节点专用域名（13 → 11）
+# 换了 Host 就被拒「bad host」（10/29 真机 vmess-httpupgrade、xhttp-tls 两条超时）。路径本来就是暗号，不靠 Host。
+# host 参数留着只为调用处不用改；链接里给客户端的 Host 照写。见 _core_host_heal（老机器的配置去掉）。
 def _sb_transport(transport, path, host):
     if transport == "ws":          return {"type": "ws", "path": path}
-    if transport == "h2":          return {"type": "http", "path": path, "host": [host]}
-    if transport == "httpupgrade": return {"type": "httpupgrade", "path": path, "host": host}
+    if transport == "h2":          return {"type": "http", "path": path}
+    if transport == "httpupgrade": return {"type": "httpupgrade", "path": path}
     raise ValueError(transport)
 
 _LINK_NET = {"ws": "ws", "h2": "http", "httpupgrade": "httpupgrade"}      # vless URI
@@ -2999,7 +3002,7 @@ def xr_vless_xhttp_tls(port, tag):
         ib = {"listen": "127.0.0.1", "port": port, "protocol": "vless", "tag": tag,
               "settings": {"clients": [{"id": uid}], "decryption": "none"},
               "streamSettings": {"network": "xhttp",
-                                 "xhttpSettings": {"host": tls_host(), "path": path, "mode": "auto"}}}
+                                 "xhttpSettings": {"path": path, "mode": "auto"}}}
         NGINX_WS.append({"path": path, "port": port, "kind": "xhttp"})
         lk = (f"vless://{uid}@{G['host']}:443?encryption=none&security=tls"
               f"&sni={tls_host()}&fp=chrome&type=xhttp&host={tls_host()}&path={path}"
@@ -3012,8 +3015,7 @@ def xr_vless_xhttp_tls(port, tag):
     ib = {"listen": "0.0.0.0", "port": port, "protocol": "vless", "tag": tag,
           "settings": {"clients": [{"id": uid}], "decryption": "none"},
           "streamSettings": {"network": "xhttp", "security": "tls",
-                             "xhttpSettings": {"host": tls_host(), "path": path,
-                                               "mode": "auto"},
+                             "xhttpSettings": {"path": path, "mode": "auto"},
                              "tlsSettings": tls}}
     lk = (f"vless://{uid}@{G['host']}:{port}?encryption=none&security=tls"
           f"&sni={tls_host()}&fp=chrome&type=xhttp&host={tls_host()}&path={path}"
@@ -8242,6 +8244,45 @@ def _privdns_domain_enable(c, mode, dns=""):
     plan = {"op": "privdns-domain", "mode": mode, "dns": dns, "name": name, "cf_token": cf, "G": dict(G)}
     _node_op_dispatch(plan, lambda: privdns_domain_apply(plan))
 
+def _strip_inbound_hosts(data):
+    """两个核心的入站去掉服务端的 Host 校验（sing-box httpupgrade / http 的 transport.host，xray 各传输的 host）。
+       返回去掉了几处。reality 入站不碰。为什么去：见 _sb_transport 上面那段。"""
+    n = 0
+    for ib in data.get("inbounds", []):
+        tr = ib.get("transport") or {}
+        if tr.get("type") in ("httpupgrade", "http") and "host" in tr:
+            tr.pop("host"); n += 1
+        st = ib.get("streamSettings") or {}
+        if st.get("security") == "reality":
+            continue
+        for key in ("xhttpSettings", "httpupgradeSettings", "wsSettings", "httpSettings"):
+            if "host" in (st.get(key) or {}):
+                st[key].pop("host"); n += 1
+    return n
+
+def _core_host_heal():
+    """老机器的核心配置里还写着服务端 Host 校验 → 去掉、校验过了重启那个核心；没过就原样放回、不重启。
+       只在开节点专用域名时跑（node-op 后台，本来就要重启核心）。返回去掉了几处。"""
+    total = 0
+    for cfg, binp, svc in ((f"{SB_DIR}/config.json", SB_BIN, "sing-box"), (f"{XRAY_DIR}/config.json", XRAY_BIN, "xray")):
+        try:
+            raw = open(cfg).read()
+            data = json.loads(raw)
+        except (OSError, ValueError):
+            continue
+        n = _strip_inbound_hosts(data)
+        if not n:
+            continue
+        open(cfg, "w").write(json.dumps(data, indent=2))
+        ok, msg = core_check(binp, cfg) if os.path.exists(binp) else (True, "")
+        if not ok:
+            open(cfg, "w").write(raw)
+            print(f"  ⚠ {svc} 去掉 Host 校验后配置校验没过，原样放回（这个核心的 httpupgrade / xhttp 节点走节点专用域名会被拒）")
+            continue
+        sh(f"systemctl restart {svc}", check=False)
+        total += n
+    return total
+
 def privdns_domain_apply(plan):
     """后台跑（node-op 的 privdns-domain）：证书盖住节点专用域名 → 存设置 → nginx 认这个名字 → .links、订阅换过去。
        证书签不出来就什么都不改，节点照用公网域名。返回开没开成。"""
@@ -8268,6 +8309,8 @@ def privdns_domain_apply(plan):
     finally:
         G.clear()
         G.update(saved)
+    if _core_host_heal():
+        print("  ✔ 两个核心去掉了服务端 Host 校验（httpupgrade / xhttp 认节点专用域名）")
     _write_links_file(read_saved_links())
     _privdns_regen()
     if name in _PRIVDNS_LIVE:
