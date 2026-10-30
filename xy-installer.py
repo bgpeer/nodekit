@@ -5632,7 +5632,7 @@ def privdns_save(c):
 def _privdns_new_name(root=""):
     """本机私有名：10 位小写字母数字 + .internal（用 IP 装的）或 + .6 位随机.根域名（用域名装的，节点专用域名）。
        用域名装的要隔一层随机段、证书签 *.随机段.根域名：以前直接挂在根域名下签 *.根域名，节点域名
-       （dmcn2.根域名 这种）正好被它盖住，Let's Encrypt 拒签「redundant with a wildcard domain」（10/29 实测）。
+       （node.根域名 这种）正好被它盖住，Let's Encrypt 拒签「redundant with a wildcard domain」（10/29 实测）。
        从关切到开时起一个，之后一直用它——客户端配置里写的就是它，换 IP、换外机地址、本机 / 外机互换都不变
        （关了再开会换新的：整机克隆来的机器私有名会重，这样就分开了）。"""
     abc = "abcdefghijklmnopqrstuvwxyz0123456789"
