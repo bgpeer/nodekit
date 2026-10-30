@@ -227,6 +227,11 @@ def install():
     if os.geteuid() != 0:
         print("  需要 root 运行。"); return
     if _installed():
+        if not os.path.exists(_agh_yaml()):           # 装好了、向导还没走完（10/30 GCP：两问被缓冲的回车顶掉了）
+            print("  AdGuard Home 装好了，后台账号还没设：现在替你设")
+            if not _auto_setup():
+                _first_setup()
+            return
         print("  AdGuard Home 已经装过了。要重装请先『2 卸载』再装。")
         _usage(); return
     dom = _setup_own_domain()
@@ -350,6 +355,15 @@ def _agh_api(path, body=None, port=None, timeout=5):
     except Exception as e:
         return 0, str(e)
 
+def _flush_typeahead():
+    """丢掉装的那一两分钟里误按、还没读走的回车（10/30 GCP：用户名、密码两问被它们当场顶掉，直接退回了网页向导）。"""
+    try:
+        import termios
+        with open("/dev/tty") as t:
+            termios.tcflush(t, termios.TCIFLUSH)
+    except Exception:
+        pass
+
 def _auto_setup():
     """替你走完网页向导（仓库主人 10/30：「要是直接能改好随机端口最好」）：问用户名、密码，挑一个随机后台端口，
        调向导背后的接口 /control/install/configure 一次交过去——跟在浏览器里点完向导一样（AdGuard 自己 bcrypt 存密码、
@@ -370,14 +384,16 @@ def _auto_setup():
     # 登得进去）；没域名才默认 admin。密码明着输（「建议显示，不然新手不知道有没有输入成功，DNS而已又不是什么重要网站」），
     # 看得见就不用再输一遍
     dft = _own_domain() or "admin"
+    _flush_typeahead()
     user = _ask(f"  后台用户名（回车 = {dft}）: ").strip() or dft
+    # 空回车不当「不要了」：装的时候误按的回车会把这问顶掉。要退回网页向导得明着输 n
     while True:
-        pw = _ask("  后台密码（至少 8 位；直接回车 = 改用网页向导）: ").strip()
-        if not pw:
+        pw = _ask("  后台密码（至少 8 位；输 n = 改用网页向导）: ").strip()
+        if pw.lower() == "n":
             return False
         if len(pw) >= 8:
             break
-        print(f"  {Y}✗ 至少 8 位{N}")
+        print(f"  {Y}✗ {'没输' if not pw else '至少 8 位'}，再输一次{N}")
     port = _pick_web_port(WEB_PORT)
     if not port:
         return False
