@@ -71,7 +71,7 @@ check(f"交过去的：随机后台端口、DNS 53、用户名、密码（{ {k: 
       and GOT[0]["password"] == "Passw0rd!x")
 check("屏上一行 ✔ + 后台地址顶格单独一行", "✔ 后台设好了" in out and "http" + f"://{IP}:{NEWP[0]}" in out.splitlines())
 check("随后给使用方法（按新端口）", USAGE == [NEWP[0]])
-check("密码明着输、只问一遍（没有「再输一次」）", not [p for p in PROMPTS if "再输一次" in p]
+check("密码明着输、只问一遍（没有「再输一次」的确认问）", not [p for p in PROMPTS if p.strip().startswith("再输一次")]
       and [p for p in PROMPTS if "后台密码" in p] and "不显示" not in "".join(PROMPTS))
 
 NEWP[0] = free()
@@ -82,8 +82,17 @@ OWN[0] = "dns.example.com"
 r, out = run([""], ["Passw0rd!x"])
 check("有自建 DNS 域名：用户名回车 = 这个域名（提示里写着）", r and GOT[0]["username"] == "dns.example.com"
       and "回车 = dns.example.com" in PROMPTS[0])
-r, out = run([""], [""])
-check("密码直接回车：改用网页向导（返回 False、什么都没交）", r is False and not GOT)
+NEWP[0] = free()
+r, out = run([""], ["", "Passw0rd!x"])
+check("密码空回车不算放弃（装的时候误按的回车）：再问一次", r is True and "没输，再输一次" in out and len(GOT) == 1)
+r, out = run([""], ["n"])
+check("明着输 n：改用网页向导（返回 False、什么都没交）", r is False and not GOT)
+src0 = open(os.path.join(ROOT, "adguard-dns.py"), encoding="utf-8").read()
+body = src0[src0.index("def _auto_setup("):src0.index("\ndef ", src0.index("def _auto_setup(") + 5)]
+check("问之前先丢掉装的时候误按的键", body.index("_flush_typeahead()") < body.index("后台用户名"))
+ins = src0[src0.index("def install("):src0.index("\ndef ", src0.index("def install(") + 5)]
+check("装好了、向导没走完：再选 1 替你设（不用卸了重装）", "if not os.path.exists(_agh_yaml()):" in ins
+      and ins.index("_auto_setup()") < ins.index("已经装过了"))
 a._agh_api = (lambda orig: (lambda path, body=None, port=None, timeout=5:
               (500, "boom") if path == "/control/install/configure" else orig(path, body, port, timeout)))(a._agh_api)
 r, out = run(["x"], ["Passw0rd!x"])
