@@ -2211,7 +2211,7 @@ def _bcrypt(pw):
     return h if r.returncode == 0 and h.startswith("$2") else ""
 
 def change_admin_password():
-    """菜单 12 改后台密码（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
+    """菜单 12 → 2 修改后台密码（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
        AdGuard 没有改密码的命令也没有接口，密码就是 AdGuardHome.yaml 里 users 那段的 bcrypt 哈希：
        停服务 → 换掉那一行 → 起服务 → 拿新密码登一次接口验证；登不进去就把原配置放回去、再起一次，绝不把人锁在外面。"""
     G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
@@ -2259,6 +2259,64 @@ def change_admin_password():
     sh("systemctl start AdGuardHome")
     print(f"  {R}⚠ 新密码登不进去，已改回原来的密码{N}")
 
+def change_admin_name():
+    """改后台用户名：换掉 AdGuardHome.yaml 里 users 段第一个 - name:。密码不动（哈希跟用户名无关）。
+       停服务 → 写 → 起服务，15 秒内没起来就放回原配置。"""
+    G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    users = _agh_users()
+    if not _installed() or not users:
+        ui_tip("后台账号还没设：先选 1"); return
+    path = _agh_yaml()
+    try:
+        txt = open(path).read()
+    except OSError:
+        print("  读不到 AdGuard 配置文件。"); return
+    m = re.search(r"(?m)^users:\s*\n(?:[ \t]+.*\n)*?([ \t]*-[ \t]*name:[ \t]*)(\S.*)$", txt)
+    if not m:
+        print("  配置里没找到用户名那一行，保险起见不改。"); return
+    while True:
+        name = _ask_fresh("  新用户名（回车 = 取消）: ").strip()
+        if not name:
+            print("  已取消，没改"); return
+        if name == users[0]:
+            print("  跟现在一样，没改"); return
+        # 登录用的是 HTTP 基本认证（用户名:密码），冒号、空白、引号会出岔子
+        if re.fullmatch(r"[^\s:'\"#]{1,64}", name):
+            break
+        print(f"  {Y}✗ 别带空格、冒号、引号、#，再输一次{N}")
+    new = txt[:m.start(2)] + name + txt[m.end(2):]
+    sh("systemctl stop AdGuardHome")
+    open(path, "w").write(new)
+    sh("systemctl start AdGuardHome")
+    port = _current_web_port()
+    for _ in range(15):
+        time.sleep(1)
+        if _agh_api("/control/status", port=port)[0] in (401, 403, 200, 302):
+            print(f"  {G}✔ 后台用户名改成 {name}，密码不变{N}")
+            return
+    sh("systemctl stop AdGuardHome")
+    open(path, "w").write(txt)
+    sh("systemctl start AdGuardHome")
+    print(f"  {R}⚠ 改完后台没起来，已改回原来的用户名{N}")
+
+def change_admin_account():
+    """菜单 12「修改用户名和密码」（仓库主人 10/31 定的样子：1 修改后台用户名　当前：… / 2 修改后台密码 / 0 返回）。"""
+    while True:
+        users = _agh_users()
+        print()
+        ui_items([(1, "修改后台用户名", users[0] if users else "还没设"),
+                  (2, "修改后台密码", None),
+                  (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c == "1":
+            change_admin_name()
+        elif c == "2":
+            change_admin_password()
+        else:
+            return
+
 def menu():
     while True:
         # 2 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
@@ -2283,7 +2341,7 @@ def menu():
                   (9, "手机实测（开私人 DNS，看它连没连进来）", None),
                   (10, "苹果手机描述文件（iOS 一键装 DNS）", None),
                   (11, "节点使用私有DNS解析", {"self": "本机", "remote": "外机"}.get(_privdns_mode(), "关")),
-                  (12, "改后台密码", None),
+                  (12, "修改用户名和密码", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -2297,7 +2355,7 @@ def menu():
         elif c == "9": phone_probe()
         elif c == "10": ios_profile()
         elif c == "11": _privdns_menu()
-        elif c == "12": change_admin_password()
+        elif c == "12": change_admin_account()
         elif c in ("0", ""):
             return
 
