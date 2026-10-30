@@ -342,11 +342,14 @@ def _own_cert_remove(dom):
     try: os.remove(AGH_DOMAIN_FILE)
     except OSError: pass
 
-def _agh_api(path, body=None, port=None, timeout=5):
-    """本机 AdGuard 的接口（127.0.0.1，不出网）→ (状态码, 回包文字)；连不上返回 (0, 原因)。port 不给 = 向导的 WEB_PORT。"""
+def _agh_api(path, body=None, port=None, timeout=5, auth=None):
+    """本机 AdGuard 的接口（127.0.0.1，不出网）→ (状态码, 回包文字)；连不上返回 (0, 原因)。port 不给 = 向导的 WEB_PORT。
+       auth=(用户名, 密码)：带上基本认证（装好以后的接口要登录）。"""
+    hdr = {"Content-Type": "application/json"} if body is not None else {}
+    if auth:
+        hdr["Authorization"] = "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
     req = urllib.request.Request(f"http://127.0.0.1:{port or WEB_PORT}{path}",
-                                 data=None if body is None else json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"} if body is not None else {})
+                                 data=None if body is None else json.dumps(body).encode(), headers=hdr)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read().decode("utf-8", "replace")
@@ -2194,6 +2197,68 @@ def ios_profile():
         print("  " + _hl("1;33", "⚠ " + (why or f"描述文件里的主机名是 {got}，应为 {want}")))
     ui_tip("装法：设置 → 已下载描述文件 → 安装；开着小火箭时 DNS 由小火箭接管，订阅里已带自建 DNS")
 
+def _bcrypt(pw):
+    """AdGuard 认的密码哈希（bcrypt）；做不出来返回 ''。
+       Python 标准库没有 bcrypt，用 apache2-utils 的 htpasswd（AdGuard 官方 FAQ 也是这么教的）；没装就装上。
+       密码从标准输入喂进去（-i），不放在命令行上（ps 看得见）。10/31 真 AdGuard Home v0.107.79 实测认 $2y$ 开头的。"""
+    if not shutil.which("htpasswd"):
+        subprocess.run("apt-get install -y apache2-utils >/dev/null 2>&1", shell=True,
+                       env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+    if not shutil.which("htpasswd"):
+        return ""
+    r = subprocess.run(["htpasswd", "-niBC", "10", ""], input=pw, text=True, capture_output=True)
+    h = (r.stdout or "").strip().lstrip(":")
+    return h if r.returncode == 0 and h.startswith("$2") else ""
+
+def change_admin_password():
+    """菜单 12 改后台密码（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
+       AdGuard 没有改密码的命令也没有接口，密码就是 AdGuardHome.yaml 里 users 那段的 bcrypt 哈希：
+       停服务 → 换掉那一行 → 起服务 → 拿新密码登一次接口验证；登不进去就把原配置放回去、再起一次，绝不把人锁在外面。"""
+    G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    users = _agh_users()
+    if not _installed() or not users:
+        ui_tip("后台账号还没设：先选 1"); return
+    user = users[0]
+    path = _agh_yaml()
+    try:
+        txt = open(path).read()
+    except OSError:
+        print("  读不到 AdGuard 配置文件。"); return
+    m = re.search(r"(?m)^users:\s*\n(?:[ \t]+.*\n)*?([ \t]+password:[ \t]*)(\S.*)$", txt)
+    if not m:
+        print("  配置里没找到密码那一行，保险起见不改。"); return
+    print()
+    ui_kv("后台用户名", user)
+    while True:
+        pw = _ask_fresh("  新密码（至少 8 位；回车 = 取消）: ").strip()
+        if not pw:
+            print("  已取消，没改"); return
+        if len(pw) >= 8 and pw.lower() not in (user.lower(), (_own_domain() or "").lower()):
+            break
+        print(f"  {Y}✗ {'至少 8 位' if len(pw) < 8 else '别跟用户名 / 域名一样'}，再输一次{N}")
+    h = _bcrypt(pw)
+    if not h:
+        print(f"  {R}✗ 生成不了密码哈希（htpasswd 装不上），没改{N}"); return
+    new = txt[:m.start(2)] + h + txt[m.end(2):]
+    sh("systemctl stop AdGuardHome")
+    open(path, "w").write(new)
+    sh("systemctl start AdGuardHome")
+    port = _current_web_port()
+    ok = False
+    for _ in range(15):
+        time.sleep(1)
+        if _agh_api("/control/status", port=port, auth=(user, pw))[0] == 200:
+            ok = True; break
+    if ok:
+        print(f"  {G}✔ 后台密码改好了，用新密码登录（用户名 {user}）{N}")
+        return
+    sh("systemctl stop AdGuardHome")
+    open(path, "w").write(txt)                       # 放回原配置：旧密码照旧能用
+    sh("systemctl start AdGuardHome")
+    print(f"  {R}⚠ 新密码登不进去，已改回原来的密码{N}")
+
 def menu():
     while True:
         # 2 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
@@ -2218,6 +2283,7 @@ def menu():
                   (9, "手机实测（开私人 DNS，看它连没连进来）", None),
                   (10, "苹果手机描述文件（iOS 一键装 DNS）", None),
                   (11, "节点使用私有DNS解析", {"self": "本机", "remote": "外机"}.get(_privdns_mode(), "关")),
+                  (12, "改后台密码", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -2231,6 +2297,7 @@ def menu():
         elif c == "9": phone_probe()
         elif c == "10": ios_profile()
         elif c == "11": _privdns_menu()
+        elif c == "12": change_admin_password()
         elif c in ("0", ""):
             return
 
