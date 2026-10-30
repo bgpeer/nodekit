@@ -5253,48 +5253,56 @@ def _sb_privdns(cfg, nodes):
 SB_NODE_DNS = "nodedns"
 
 def _sb_node_dns(cfg, url=""):
-    """sing-box：用公网域名的节点不交给国内 DNS 解析（仓库主人 10/30：「就算没建私有DNS也不应该让国内的解析」）。
-       没指 domain_resolver 的出站走 route.default_domain_resolver——作者模板里是阿里（local），每连一次节点就把
-       节点域名报给国内 DNS 一次。交给谁，按顺序挑：
-       ① 模板里有 tag 为 nodedns 的 DNS 服务器 → 用模板的（想用哪家自己写，这就是给节点解析留的口子）；
-       ② 本机自建 DNS 写进了订阅（url = _selfdns_doh()）→ 加一台 nodedns 指向它；
-       ③ 配置里已经有私有解析那台（privdns*）→ 指它；
-       ④ 都没有 → 不动，照旧走默认（能用比藏重要）。
-       不直连境外公共 DoH：10/30 仓库主人手机 4G 实测，sing-box 直连 1.1.1.1 的 DoH 带不带 cloudflare-dns.com 都不通，
-       而 sing-box 一个出站只能指一台、不像 mihomo 几台一起抢，那台不通节点就全挂；指自建 DNS 一试就通。
-       · 只给还没指 domain_resolver、server 是域名的出站加（被藏的节点 _sb_privdns 已经指好，不碰）；
+    """sing-box：解析节点域名的那台 DNS（仓库主人 10/30：「就算没建私有DNS也不应该让国内的解析」）。
+       没指 domain_resolver 的出站走 route.default_domain_resolver——模板里是阿里（local），每连一次节点就把
+       节点域名报给国内 DNS 一次。作者模板 dns.servers 第二行留了个口子 tag=nodedns（仓库主人要的「专门解析节点的口子」），
+       跟 final 一个路数：模板里写默认值，脚本按情况换掉里面的地址，tag 不变——
+       · 本机自建 DNS 写进了订阅（url = _selfdns_doh()）→ 换成自建 DoH；
+       · 否则配置里有私有解析那台（privdns*）→ 换成跟它一样；
+       · 都没有 → 模板里写的是什么就用什么（作者模板默认跟 local 一样是阿里：能用比藏重要）。
+       模板里没这一行（老的自定义模板）：有自建 DNS 就加一台，有私有解析就指它，都没有不动。
+       默认值不写境外公共 DoH：10/30 仓库主人手机 4G 实测 sing-box 直连 1.1.1.1 的 DoH 带不带 SNI 都不通，
+       而 sing-box 一个出站只能指一台、不像 mihomo 几台一起抢，那台不通节点就全挂；也不能走代理（解析节点要先连节点）。
+       · 只给还没指 domain_resolver、server 是域名的出站指过去（被藏的节点 _sb_privdns 已经指好，不碰）；
          default_domain_resolver 不动——直连出站解析网站也用它，国内网站还得用国内 DNS 拿就近 CDN。
        · 写对象 {"server": ...}：SFA 1.15 不认简写（见 _sb_privdns）。"""
     dns = cfg.get("dns")
     if not isinstance(dns, dict) or not isinstance(dns.get("servers"), list):
         return
-    obs = [o for o in cfg.get("outbounds", []) if isinstance(o, dict) and isinstance(o.get("server"), str)
-           and o["server"] and not _is_ip(o["server"]) and not o.get("domain_resolver")]
-    if not obs:
-        return
     servers = dns["servers"]
-    stags = [o.get("tag") for o in servers if isinstance(o, dict)]
-    tag = SB_NODE_DNS if SB_NODE_DNS in stags else ""
+    slot = next((o for o in servers if isinstance(o, dict) and o.get("tag") == SB_NODE_DNS), None)
+    priv = next((o for o in servers if isinstance(o, dict) and str(o.get("tag", "")).startswith("privdns")), None)
+    want = None                                    # 要换成的内容（不带 tag）
     m = _PRIVDNS_DNS.match(url or "")
-    if not tag and m:
-        detour, dr = _sb_dns_dial(cfg, servers)
+    if m:
+        detour, dr = _sb_dns_dial(cfg, servers, (slot or {}).get("domain_resolver"))
         if detour or dr:
-            srv = {"tag": SB_NODE_DNS, "type": "https", "server": m.group(1)}
+            want = {"type": "https", "server": m.group(1)}
             if m.group(2) and m.group(2) != "443":
-                srv["server_port"] = int(m.group(2))
-            srv["path"] = m.group(3)
+                want["server_port"] = int(m.group(2))
+            want["path"] = m.group(3)
             if dr:
-                srv["domain_resolver"] = dr
+                want["domain_resolver"] = dr
             if detour:
-                srv["detour"] = detour
-            servers.append(srv)
-            tag = SB_NODE_DNS
-    if not tag:
-        tag = next((t for t in stags if isinstance(t, str) and t.startswith("privdns")), "")
+                want["detour"] = detour
+    if want is None and priv:
+        want = {k: v for k, v in priv.items() if k != "tag"}
+    if slot is not None:
+        if want is not None:
+            slot.clear()
+            slot.update({"tag": SB_NODE_DNS, **want})
+        tag = SB_NODE_DNS
+    elif m and want is not None:
+        servers.append({"tag": SB_NODE_DNS, **want})
+        tag = SB_NODE_DNS
+    else:
+        tag = priv.get("tag") if priv else ""
     if not tag:
         return
-    for o in obs:
-        o["domain_resolver"] = {"server": tag}
+    for o in cfg.get("outbounds", []):
+        if isinstance(o, dict) and isinstance(o.get("server"), str) and o["server"] \
+                and not _is_ip(o["server"]) and not o.get("domain_resolver"):
+            o["domain_resolver"] = {"server": tag}
 
 def _sr_direct_ip(path, targets):
     """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。
