@@ -164,13 +164,10 @@
   `test_privdns_domain.py`（域名装的）共用 `_fakedoh.py` 起的 TLS 假 AdGuard（按写进 yaml 的规则答），`_doh_ask` 走真握手、真 POST。
 
 ## 客户端的坑（真机踩过）
-- **【待办，仓库主人说了再做】sing-box 客户端连不上被藏的节点**（10/30）：DMIT 当 DNS 机，Bettbox（mihomo）三台全通；
-  sing-box（SFA，核心 1.15.0-alpha.13，仓库主人用**自定义模板**，dns.strategy=prefer_ipv4）被藏的节点全测不出延迟，CDN 照通。
-  已查：DMIT 上 singbox.json 里 `privdns` 那台 DoH 和各节点的 `domain_resolver: privdns` 都写进去了。
-  最怀疑：privdns 的 `domain_resolver: "bootstrap"` 跟着 prefer_ipv4，先拿 IPv4 连 dmcn2:10443（DMIT 的 IPv4 TCP 被墙封），
-  卡到超时还没轮到 IPv6；mihomo 双栈并发所以通。没证实——要 SFA「日志」页对着被藏节点测一次延迟的报错。
-  仓库主人交代：**不改模板**；要改先做一份只改 privdns 那条（domain_resolver 带 strategy: prefer_ipv6）的测试配置发给他实测，
-  别人不一定有 IPv6，没 IPv6 的网络要秒退 IPv4。他先稳定用一天，想用 sing-box 时再来找。
+- **sing-box 客户端连不上被藏的节点（10/30 已解决）**：SFA（核心 1.15.0-alpha.13，自定义模板）出站上的简写
+  `"domain_resolver": "privdns"` 不认，照样拿 route.default_domain_resolver（阿里）解析，私有名查不到；
+  改成对象 `{"server": "privdns"}` 就通（仓库主人拿三份测试配置逐个试出来的）。我先猜是 IPv4 被封卡超时，错了。
+  模板不用动，_sb_privdns 生成时写对象；没开私有解析什么都不加。
 
 
 - **Bettbox 推荐换成 ClashMi**（仓库主人 10/24）：Bettbox 用自己一套 DNS / 规则 / TUN 复写盖掉订阅里的原生配置

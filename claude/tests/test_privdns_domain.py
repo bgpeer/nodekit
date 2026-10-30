@@ -288,7 +288,7 @@ if yaml:
     check(f"mihomo：两个节点专用域名只去问 3（{sorted(pol)}）", pol == {N3: [DOH3], N1R: [DOH3]})
 cj = json.loads(sb)
 check("sing-box：两台的出站都指向 3 的 DoH",
-      {o["server"] for o in cj["outbounds"] if isinstance(o, dict) and o.get("domain_resolver") == "privdns"} == {N3, N1R})
+      {o["server"] for o in cj["outbounds"] if isinstance(o, dict) and o.get("domain_resolver") == {"server": "privdns"}} == {N3, N1R})
 check("小火箭：被藏的两台都不放（CDN 那两条照放）",
       not re.search(r"(?m)^(🇭🇰3|🇯🇵1)·(?!CDN)", sr) and len(re.findall(r"(?m)^(🇭🇰3|🇯🇵1)·CDN·", sr)) == 2)
 

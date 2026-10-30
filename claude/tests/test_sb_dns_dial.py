@@ -75,7 +75,7 @@ check(f"兜底那台换成自建 DoH，bootstrap 解析、走 🎯直连（{srv(
 check(f"私有解析加的那台同样写法（{srv(c, 'privdns')}）",
       srv(c, "privdns") == {"tag": "privdns", "type": "https", "server": "dns.example", "path": "/dns-query/xyabc123",
                             "domain_resolver": "bootstrap", "detour": "🎯直连"})
-check("被藏节点的出站指向它", [o.get("domain_resolver") for o in dobs(c) if o.get("server") == NAME] == ["privdns"])
+check("被藏节点的出站指向它", [o.get("domain_resolver") for o in dobs(c) if o.get("server") == NAME] == [{"server": "privdns"}])
 check(f"能起（{would_start(c) or 'ok'}）、屏上没有 ⚠", not would_start(c) and "⚠" not in out)
 
 def custom(direct=None, bootstrap=True, route_dr=None, final_dr=None):
@@ -101,7 +101,7 @@ check(f"能起（{would_start(c) or 'ok'}）", not would_start(c))
 check("两台都不写 detour（不写就是直连，写了 sing-box 拒绝启动），bootstrap 解析",
       all("detour" not in srv(c, t) and srv(c, t).get("domain_resolver") == "bootstrap" for t in ("final", "privdns")))
 check("被藏节点照样指过去、屏上没有 ⚠",
-      [o.get("domain_resolver") for o in dobs(c) if o.get("server") == NAME] == ["privdns"] and "⚠" not in out)
+      [o.get("domain_resolver") for o in dobs(c) if o.get("server") == NAME] == [{"server": "privdns"}] and "⚠" not in out)
 
 print("三、自定义模板：direct 出站配了东西（绑网卡之类）就不算空，照样当 detour")
 c, out = run(custom(direct={"tag": "直连", "type": "direct", "bind_interface": "eth0"}))
