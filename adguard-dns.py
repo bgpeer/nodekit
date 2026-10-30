@@ -565,6 +565,17 @@ def _wildcard_dns_check(dom):
 def _wildcard_dns_ok(dom):
     return _wildcard_dns_check(dom)[0]
 
+def _agh_users():
+    """AdGuardHome.yaml 里 users 段的用户名（只读名字，密码那行是 bcrypt 哈希，不碰）；读不到返回 []。"""
+    try:
+        txt = open(_agh_yaml()).read()
+    except OSError:
+        return []
+    m = re.search(r"(?m)^users:\s*\n((?:[ \t]+.*\n?)*)", txt)
+    if not m:
+        return []
+    return [n.strip().strip("'\"") for n in re.findall(r"(?m)^[ \t]*-[ \t]*name:[ \t]*(.+?)[ \t]*$", m.group(1))]
+
 def _allowed_clients():
     """AdGuardHome.yaml 里的访问白名单 allowed_clients；没这个键返回 None，空列表返回 []。"""
     try:
@@ -656,6 +667,8 @@ def _usage(port=None, head=None):
     print(f"    域名          : {G}{dom or '（无，只能用明文 53）'}{N}")
     print(f"    公网 IP       : {G}{ip}{N}")
     print(f"    后台端口      : {G}{port}{N}")
+    users = _agh_users()                           # 仓库主人 10/30：忘了用户名能在这查到；密码不显示（只存了哈希）
+    print(f"    后台用户名    : {(G + '、'.join(users) + N) if users else (Y + '还没设（第一步）' + N)}")
     print(f"    加密(DoT/DoH) : {(G+'已开启'+N) if enc else (Y+'未开启（第二步）'+N)}")
     print(f"    DoH 端口      : {G}{dohp}{N}        DoT 端口: {G}853{N}       明文: {G}53{N}")
     if cid:

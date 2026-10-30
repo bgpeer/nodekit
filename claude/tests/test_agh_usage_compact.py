@@ -26,6 +26,7 @@ a._installed = lambda: True
 a._running = lambda: True
 a._port_busy = lambda p: "AdGuardHome"
 ALLOW = [None]
+a._agh_users = lambda: [DOM]
 a._allowed_clients = lambda: ALLOW[0]
 def show():
     b = io.StringIO()
@@ -50,7 +51,9 @@ check("使用场景：DoH 地址、DoT 主机名、明文 IP 各顶格一行",
 check("状态参数在后面：已安装 / 运行 / 53 端口 / 域名 / ClientID",
       out.index("已安装") > out.index("【DNS 使用场景】") and "53 端口" in out and "ClientID" in out)
 check("不再上屏的长篇：三种 DNS 怎么选、广告过滤那一大段", "三种 DNS 怎么选" not in out and "拦不掉" not in out)
-check(f"比原来短（{len(lines)} 行）", len(lines) < 75)
+check("状态参数里有后台用户名（仓库主人 10/30：忘了能查到）", f"后台用户名    : {DOM}" in out)
+check("密码哪儿都不显示", "password" not in out.lower() and "密码" not in out.split("AdGuard Home 状态参数")[1])
+check(f"比原来短（{len(lines)} 行）", len(lines) < 76)
 ALLOW[0] = [CID]
 out = show()
 check("白名单已设：第三步一行 ✓、明文 53 会被挡一行提示", "✓ 已设好" in out and "明文 53 没法带 ID" in out)
@@ -58,4 +61,15 @@ a._cert_wildcard_ok = lambda d: False
 out = show()
 check("白名单已设、没签泛域名：红字一行说安卓会被挡", "安卓专用 DNS 会被挡" in out)
 
+import tempfile
+spec2 = importlib.util.spec_from_file_location("a2", os.path.join(ROOT, "adguard-dns.py"))
+a2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(a2)
+a2.AGH_DIR = tempfile.mkdtemp()
+open(a2.AGH_DIR + "/AdGuardHome.yaml", "w").write(
+    "http:\n  address: 0.0.0.0:3035\nusers:\n  - name: " + DOM + "\n    password: $2a$10$hash\nauth_attempts: 5\n")
+check("从 AdGuardHome.yaml 读得出用户名（密码那行不碰）", a2._agh_users() == [DOM])
+os.remove(a2.AGH_DIR + "/AdGuardHome.yaml")
+check("没装 / 读不到：空", a2._agh_users() == [])
+
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
+
