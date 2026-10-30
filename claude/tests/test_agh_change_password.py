@@ -19,6 +19,7 @@ OLD = "$2a$10$oldoldoldoldoldoldoldoldoldoldoldoldoldoldoldoldoldo"
 YAML = ("http:\n  address: 0.0.0.0:2646\nusers:\n  - name: dns.example.com\n    password: " + OLD + "\n"
         "auth_attempts: 5\ntls:\n  enabled: false\n  password: keepme\n")
 a._installed = lambda: True
+SDB = a.AGH_DIR + "/data/sessions.db"; os.makedirs(a.AGH_DIR + "/data")
 a._own_domain = lambda: "dns.example.com"
 a._bcrypt = lambda pw: "$2y$10$NEWHASH" + str(len(pw))
 a.time.sleep = lambda s: None
@@ -26,7 +27,7 @@ CMDS, LOGIN, ANS = [], [], []
 a.sh = lambda c, *x, **k: CMDS.append(c) or ""
 a._ask_fresh = lambda p="": ANS.pop(0) if ANS else ""
 def go(answers, login_ok=True):
-    open(Y, "w").write(YAML); CMDS.clear(); LOGIN.clear(); ANS[:] = answers
+    open(Y, "w").write(YAML); open(SDB, "w").write("s"); CMDS.clear(); LOGIN.clear(); ANS[:] = answers
     a._agh_api = lambda path, body=None, port=None, timeout=5, auth=None: (LOGIN.append((port, auth)),
                                                                           (200 if login_ok else 401, ""))[1]
     b = io.StringIO()
@@ -40,15 +41,16 @@ check("只换 users 段那一行哈希，别处（tls 里的 password）不动",
       "    password: $2y$10$NEWHASH12\n" in y and OLD not in y and "  password: keepme" in y)
 check("停服务 → 写 → 起服务", CMDS == ["systemctl stop AdGuardHome", "systemctl start AdGuardHome"])
 check("拿新密码登一次接口验证（当前后台端口）", LOGIN and LOGIN[0] == (2646, ("dns.example.com", "NewPassw0rd!")))
-check("✔ 一行、密码不上屏", "✔ 后台密码改好了" in out and "NewPassw0rd!" not in out)
+check("✔ 一行、密码不上屏", "✔ 后台密码改好了，网页已登出" in out and "NewPassw0rd!" not in out)
+check("改完密码：删掉 sessions.db，网页上已登录的被踢出（10/31 实测删前旧 cookie 200、删后 401）", not os.path.exists(SDB))
 out, y = go(["NewPassw0rd!"], login_ok=False)
 check("新密码登不进去：放回原配置（旧密码照旧能用）、说一行", y == YAML and "已改回原来的密码" in out
       and CMDS.count("systemctl start AdGuardHome") == 2)
 out, y = go([""])
-check("回车：取消、什么都没动", "已取消" in out and y == YAML and not CMDS)
+check("回车：取消、什么都没动", "已取消" in out and y == YAML and not CMDS and os.path.exists(SDB))
 print("改用户名")
 def goname(answers, up=True):
-    open(Y, "w").write(YAML); CMDS.clear(); ANS[:] = answers
+    open(Y, "w").write(YAML); open(SDB, "w").write("s"); CMDS.clear(); ANS[:] = answers
     a._agh_api = lambda path, body=None, port=None, timeout=5, auth=None: (401 if up else 0, "")
     b = io.StringIO()
     with contextlib.redirect_stdout(b):
@@ -58,7 +60,8 @@ out, y = goname(["bad name", "a:b", "myboss"])
 check("带空格 / 冒号的不收、再问", out.count("别带空格") == 2)
 check("只换 users 段那个 name，密码那行不动", "  - name: myboss\n    password: " + OLD in y and "dns.example.com" not in y)
 check("停服务 → 写 → 起服务、✔ 一行", CMDS == ["systemctl stop AdGuardHome", "systemctl start AdGuardHome"]
-      and "✔ 后台用户名改成 myboss，密码不变" in out)
+      and "✔ 后台用户名改成 myboss，密码不变，网页已登出" in out)
+check("改完用户名：也踢掉已登录的网页", not os.path.exists(SDB))
 out, y = goname(["myboss"], up=False)
 check("改完后台没起来：放回原配置、说一行", y == YAML and "已改回原来的用户名" in out)
 out, y = goname([""])

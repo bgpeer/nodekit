@@ -2210,6 +2210,13 @@ def _bcrypt(pw):
     h = (r.stdout or "").strip().lstrip(":")
     return h if r.returncode == 0 and h.startswith("$2") else ""
 
+def _drop_sessions():
+    """改了用户名 / 密码，把网页上已登录的会话全踢掉（仓库主人 10/31：「修改了密码网页端竟然没有断开」）。
+       AdGuard 的登录会话存在 data/sessions.db，换密码不碰它，旧 cookie 照样能用；
+       服务停着时删掉这个文件，起来后自己重建、所有人都得用新账号重登。10/31 真 v0.107.79 实测：删前旧 cookie 200，删后 401。"""
+    try: os.remove(AGH_DIR + "/data/sessions.db")
+    except OSError: pass
+
 def change_admin_password():
     """菜单 12 → 2 修改后台密码（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
        AdGuard 没有改密码的命令也没有接口，密码就是 AdGuardHome.yaml 里 users 那段的 bcrypt 哈希：
@@ -2244,6 +2251,7 @@ def change_admin_password():
     new = txt[:m.start(2)] + h + txt[m.end(2):]
     sh("systemctl stop AdGuardHome")
     open(path, "w").write(new)
+    _drop_sessions()                                 # 网页上已登录的都踢掉，得用新密码重登
     sh("systemctl start AdGuardHome")
     port = _current_web_port()
     ok = False
@@ -2252,7 +2260,7 @@ def change_admin_password():
         if _agh_api("/control/status", port=port, auth=(user, pw))[0] == 200:
             ok = True; break
     if ok:
-        print(f"  {G}✔ 后台密码改好了，用新密码登录（用户名 {user}）{N}")
+        print(f"  {G}✔ 后台密码改好了，网页已登出，用新密码登录（用户名 {user}）{N}")
         return
     sh("systemctl stop AdGuardHome")
     open(path, "w").write(txt)                       # 放回原配置：旧密码照旧能用
@@ -2289,12 +2297,13 @@ def change_admin_name():
     new = txt[:m.start(2)] + name + txt[m.end(2):]
     sh("systemctl stop AdGuardHome")
     open(path, "w").write(new)
+    _drop_sessions()
     sh("systemctl start AdGuardHome")
     port = _current_web_port()
     for _ in range(15):
         time.sleep(1)
         if _agh_api("/control/status", port=port)[0] in (401, 403, 200, 302):
-            print(f"  {G}✔ 后台用户名改成 {name}，密码不变{N}")
+            print(f"  {G}✔ 后台用户名改成 {name}，密码不变，网页已登出{N}")
             return
     sh("systemctl stop AdGuardHome")
     open(path, "w").write(txt)
