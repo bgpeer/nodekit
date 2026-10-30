@@ -508,8 +508,11 @@ def _allowed_clients():
     except OSError:
         return None
 
-def _usage(port=None):
-    """一步步的使用说明：当前配置一览 → 登录后台 → 开加密 → 设备指过来。写给不懂的人看。"""
+def _usage(port=None, head=None):
+    """使用方法（菜单 3）：三步设置 → 三种用法 → 状态 / 当前配置 / 要填的几行。
+       仓库主人 10/30 照着自己的写法重排：「啰嗦的写一堆眼都看花了」——步骤只留要点的那一行，值从这台机实时读、高亮；
+       原委（白名单为什么挡安卓、DoH 为什么带端口、广告拦得到哪一步）留在注释和文档里，不上屏。
+       head：状态那几行（status() 传进来），放在当前配置前面。"""
     ip = _public_ip(); dom = _domain()
     port = port or _current_web_port() or WEB_PORT
     G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; C = "\033[1;36m"; N = "\033[0m"
@@ -517,148 +520,108 @@ def _usage(port=None):
     enc = _https_panel() is not None
     allow = _allowed_clients()
     doh_url = f"https://{dom}:{dohp}/dns-query" + (f"/{cid}" if cid else "")
-    wild = _cert_wildcard_ok(dom)                     # 证书覆盖 *.域名 → DoT 可带 ClientID
+    # 证书覆盖 *.域名 → DoT 才能把 ClientID 放在主机名最前面；没签就带不上，白名单一设安卓专用 DNS 当场断（10/14 真机）
+    wild = _cert_wildcard_ok(dom)
     dot_host = f"{cid}.{dom}" if (wild and cid) else dom
+    hp = _https_panel()
 
-    print("\n" + "  " + "=" * 56)
-    print(f"  {C}当前配置信息{N}（下面的值都是从你这台机实时读出来的）")
+    print(f"\n  {C}【第一步 · 登录网页后台】{N}")
+    if hp:
+        print(f"    浏览器打开（推荐·加密）：{G}https://{hp[0]}:{hp[1]}{N}")
+        print(f"    应急 / 本机用明文：http://{ip}:{port}")
+    else:
+        print(f"    浏览器打开：{G}http://{ip}:{port}{N}")
+    print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 5 可改）")
+
+    print(f"\n  {C}【第二步 · 设置加密】{N}")
+    if dom:
+        print("    后台 → 设置 → 加密设置：")
+        print("      · 勾选「启用加密」")
+        print(f"      · 服务器名称：{G}{dom}{N}")
+        print(f"      · 证书（文件路径）：{G}{_crt()}{N}")
+        print(f"      · 私钥（文件路径）：{G}{_key()}{N}")
+        print(f"      · HTTPS 端口：{G}{dohp}{N}（别填 0 / 443）　DNS-over-TLS 端口：{G}853{N}")
+        print(f"      · 「HTTPS 自动重定向」{Y}不要勾{N}")
+        print(f"      · 保存（提示 no IP addresses 的黄字忽略）")
+    else:
+        print(f"    {Y}没设域名，加密用不了，只能用明文 DNS{N}（要加密：卸了重装，装的时候填域名）")
+
+    print(f"\n  {C}【第三步 · DNS 设置】{N}")
+    print("    后台 → 设置 → DNS 设置 → 上游 DNS 服务器填这 3 行：")
+    for u in ("https://dns10.quad9.net/dns-query", "https://dns.cloudflare.com/dns-query",
+              "https://dns.google/dns-query"):
+        print(u)
+    print(f"    选 {G}并行请求{N} → 应用")
+    print("    下滑到 DNS 缓存配置：")
+    print(f"      ✓ 启用缓存")
+    print(f"      缓存大小：{G}67108864{N}")
+    print(f"      覆盖最小 TTL 值：{G}60{N}")
+    print(f"      覆盖最大 TTL 值：{G}86400{N}")
+    print(f"      ✓ 乐观缓存 → 保存")
+    if not cid:
+        print(f"    {Y}ClientID 没生成出来（{BGP_DIR} 写不进去？），允许的客户端先不设{N}")
+    elif allow and dom and not wild:
+        print(f"    {R}⚠ 允许的客户端已设、没签泛域名证书：安卓专用 DNS 会被挡{N}（菜单 8 签证书，或清空允许的客户端）")
+    elif allow:
+        print(f"    允许的客户端：{G}✓ 已设好{N}（{', '.join(allow)}）")
+    elif dom and not wild:
+        print(f"    允许的客户端：{Y}先做菜单 8 签泛域名证书再填{N}（不然安卓专用 DNS 会被挡）")
+    else:
+        print("    下滑到 允许的客户端，框里只填这个 ID → 保存配置：")
+        print(cid)
+
+    print(f"\n  {C}【DNS 使用场景】{N}")
+    if dom:
+        print(f"    ① DoH 加密 —— 电脑浏览器 / 支持 DoH 的 App（VPS 防火墙放行 {dohp}/TCP）")
+        print(doh_url)
+        print(f"    ② DoT 加密 —— 安卓「专用DNS」，全系统生效，{Y}最推荐{N}（放行 853/TCP）")
+        print("       设置 → 网络 → 专用DNS → 私人DNS提供商主机名：")
+        print(dot_host)
+    print(f"    ③ 明文 DNS —— 电视 / 盒子 / IoT / 路由器（放行 53/UDP+TCP；53 被占选菜单 4）")
+    print(ip)
+    if allow:
+        ui_tip("设了允许的客户端，明文 53 没法带 ID，会被挡")
+    ui_tip("想多拦广告：后台 → 过滤器 → DNS 拦截列表 → 添加 https://anti-ad.net/easylist.txt")
+
+    print("\n  " + "=" * 56)
+    print(f"  {C}AdGuard Home 状态参数{N}")
     print("  " + "=" * 56)
+    for ln in head or []:
+        print(ln)
     print(f"    域名          : {G}{dom or '（无，只能用明文 53）'}{N}")
     print(f"    公网 IP       : {G}{ip}{N}")
     print(f"    后台端口      : {G}{port}{N}")
-    print(f"    加密(DoT/DoH) : {(G+'已开启'+N) if enc else (Y+'未开启 —— 第二步去开'+N)}")
+    print(f"    加密(DoT/DoH) : {(G+'已开启'+N) if enc else (Y+'未开启（第二步）'+N)}")
     print(f"    DoH 端口      : {G}{dohp}{N}        DoT 端口: {G}853{N}       明文: {G}53{N}")
     if cid:
         print(f"    {C}ClientID{N}      : {G}{cid}{N}")
     else:
-        print(f"    ClientID      : {Y}没生成出来（{BGP_DIR} 写不进去？）{N}")
+        print(f"    ClientID      : {Y}没生成出来{N}")
     if allow:
-        print(f"    访问白名单    : {G}已设置{N} {allow}   （只放行名单内，见第四步）")
+        print(f"    访问白名单    : {G}已设置{N} {allow}")
     else:
-        print(f"    访问白名单    : {R}未设置 —— 对全公网开放{N}"
-              + ("（第四步教你关掉）" if cid else ""))
+        print(f"    访问白名单    : {R}未设置 —— 对全公网开放（第三步）{N}")
     # 三个订阅都写：mihomo / 小火箭放 DNS 列表最前，sing-box 换掉 dns.final（见主脚本 _*_selfdns）
     print(f"    写入订阅      : {(G+'已写入 mihomo/sing-box/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
 
-    # 要填的就这几行：放在一大段说明前面，标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）
-    # 【列出来的几行不能互相打架】仓库主人 10/14：照着这里把 ClientID 填进了「允许的客户端」，安卓专用 DNS 当场断了——
-    # 没签泛域名证书时安卓主机名带不上 ClientID，白名单一设就被挡。所以白名单那行只在签了泛域名之后才列；
-    # 已经设了白名单、又没签泛域名的，最上面直说用不了、二选一怎么办。
+    # 要填的就这几行：标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）。
+    # 【列出来的几行不能互相打架】10/14：照着把 ClientID 填进「允许的客户端」，安卓专用 DNS 当场断了——
+    # 没签泛域名证书时安卓主机名带不上 ClientID。所以白名单那行只在签了泛域名之后才列。
     print("\n  " + "=" * 56)
     print(f"  {C}要填的就这几行{N}")
     print("  " + "=" * 56)
-    if dom and allow and not wild:
-        print(f"  {R}⚠ 安卓专用 DNS 现在用不了：白名单已设，没签泛域名证书，主机名带不上 ClientID{N}")
-        ui_tip("二选一：菜单 8 签泛域名证书（之后安卓填 ID.域名）；或后台清空「允许的客户端」，安卓填下面这行")
-        print()
+    items = []
     if dom:
-        ui_url("安卓「专用DNS」主机名", dot_host)
-        print()
+        items.append(("安卓「专用DNS」主机名", dot_host))
     if dom and wild and cid:
-        ui_url("AdGuard 后台 → DNS 设置 → 允许的客户端", cid)
-        print()
+        items.append(("AdGuard 后台 → DNS 设置 → 允许的客户端", cid))
     if dom:
-        ui_url("DoH 地址（浏览器 / App）", doh_url)
-        print()
-    ui_url("明文 DNS（电视 / 盒子 / 路由器）", ip)
-    if dom and cid and not wild and not allow:
-        ui_tip("想只放行自己（白名单）：先做菜单 8，不然安卓专用 DNS 会被挡")
-
-    print("\n  " + "=" * 56)
-    print("  怎么让设备用上它 —— 照着下面三步做")
-    print("  " + "=" * 56)
-
-    print("\n  【第一步 · 登录网页后台】")
-    hp = _https_panel()
-    if hp:
-        print(f"    浏览器打开(推荐·加密)：  {G}https://{hp[0]}:{hp[1]}{N}")
-        print(f"    {Y}走域名 HTTPS，登录密码不会明文过网{N}；应急/本机可用明文 http://{ip}:{port}")
-    else:
-        print(f"    浏览器打开：  {G}http://{ip}:{port}{N}")
-    print("    ↑ 这就是你的管理后台，首次打开设个账号密码；以后看拦截统计、加名单都进这里。")
-
-    print("\n  【第二步 · 开加密】（给手机全系统用；没域名可跳过，只用第三步①明文）")
-    if dom:
-        print("    后台里点：设置 → 加密设置(Encryption)，然后：")
-        print(f"      · 勾选「启用加密」")
-        print(f"      · 服务器名称        填：{G}{dom}{N}")
-        print(f"      · 证书（选『文件路径』）填：{G}{_crt()}{N}")
-        print(f"      · 私钥（选『文件路径』）填：{G}{_key()}{N}")
-        print(f"      · HTTPS 端口         填：{G}10443{N}   （不要填 0，也别填 443）")
-        print(f"      · DNS-over-TLS 端口  填：{G}853{N}")
-        print(f"      · 「HTTPS 自动重定向」{Y}不要勾{N}（勾了进后台会强制跳 HTTPS，用 IP 访问会证书报错、进不去）")
-        print(f"      · 点『保存』（若提示 {Y}no IP addresses{N} 的黄字，无害，忽略）")
-    else:
-        print(f"    {Y}自建 DNS 没设域名 → 加密(DoT/DoH)用不了，只能用下面①明文 DNS。{N}")
-        print("    想要手机全系统走加密 DNS：卸了重装，装的时候填一个域名。")
-
-    print("\n  【第三步 · 把设备的 DNS 指到这台服务器】下面三种，按设备挑一种：")
-    print(f"    ① 明文 DNS —— 电视/盒子/IoT/路由器/电脑，最通用")
-    print(f"        把设备的 DNS 填成：  {G}{ip}{N}")
-    print(f"        需要：VPS 防火墙放行 {G}53{N}(UDP+TCP)；若 53 被占，回菜单选『4 腾出53端口』")
-    if dom:
-        print(f"    ② DoT 加密 —— 安卓手机「专用DNS」，全系统生效，{Y}最推荐{N}")
-        print(f"        手机：设置 → 网络 → 专用DNS → 选『私人DNS提供商主机名』→ 填：{G}{dot_host}{N}")
-        if wild and cid:
-            print(f"        {Y}↑ 前面那段就是 ClientID{N}（已签泛域名证书，所以 DoT 也能带上它、白名单放行）")
-        print(f"        需要：先做完第二步开加密；VPS 防火墙放行 {G}853{N}(TCP)")
-        print(f"    ③ DoH 加密 —— 电脑浏览器 / 支持 DoH 的 App")
-        print(f"        DoH 地址：  {G}{doh_url}{N}")
-        if cid:
-            print(f"        {Y}↑ 末段那串就是 ClientID，必须带上{N}（设了白名单之后不带会被拒）")
-        print(f"        需要：VPS 防火墙放行 {G}{dohp}{N}(TCP)")
-
-    # 第四步：关开放解析器。写成能照做的步骤（完整路径 + ID 单独一行方便复制），
-    # 不能只在菜单 6 打开开关的那一瞬间提示一次——用户回头再看时是进这个页面找的。
-    print(f"\n  【第四步 · 关掉「开放解析器」{Y}强烈建议{N}】")
-    if not cid:
-        print(f"    {Y}ClientID 没生成出来{N}（{BGP_DIR} 写不进去？），这一步先跳过。")
-    elif allow and dom and not wild:
-        print(f"    {Y}白名单已设{N}（{allow}），可没签泛域名证书：{R}安卓专用 DNS 会被挡{N}——做菜单 8，或清空白名单。")
-    elif allow:
-        print(f"    {G}✓ 已经设好了{N}（当前白名单：{allow}），不用再动。")
-    else:
-        print(f"    你的 DoH 挂在公网上，{R}不设白名单谁扫到都能拿去当免费解析器用{N}"
-              f"（烧你的 CPU 和流量，查询日志里还会混进陌生人的记录）。")
-        if dom and not wild:
-            print(f"    {R}⚠ 先做菜单 8 再设：没签泛域名证书，安卓专用 DNS 会被白名单挡掉{N}")
-        print(f"    AdGuard 后台 → 设置 → DNS设置 → {C}访问设置{N} → {C}允许的客户端{N}，填入这一行：")
-        print(f"\n        {G}{cid}{N}\n")
-        print(f"    手机流量 IP 天天变、没法按 IP 做白名单，这个 ClientID 与 IP 无关，换网络也不影响。")
-        print(f"    保存后客户端重新拉一次订阅即生效。")
-    if cid and wild:
-        print(f"    {G}✓ 已签泛域名证书{N}：DoH 和 DoT 都能带 ClientID，白名单都放行——")
-        print(f"        · DoH（上面③）  {G}正常{N}，ID 在网址末段")
-        print(f"        · DoT（上面②）  {G}正常{N}，ID 在主机名最前面 → {G}{dot_host}{N}")
-        print(f"        · 明文53（上面①）  {R}仍会被挡{N} —— 这个协议根本没有 ID 机制，")
-        print(f"          电视/IoT 要么把它们的固定 IP 也填进白名单，要么别用这台 DNS。")
-    elif cid:
-        print(f"    {R}⚠ 代价要先知道{N}：白名单一设，只有能带上 ClientID 的方式进得来——")
-        print(f"        · DoH（上面③）  {G}正常{N}，ID 就在网址末段")
-        print(f"        · DoT（上面②，安卓专用DNS）/ 明文53（上面①）  {R}会被挡掉{N}")
-        print(f"          DoT 传 ID 要靠 tls://<ID>.域名 的 SNI，{R}需要泛域名证书{N}(*.域名)，")
-        print(f"          而本机 acme 只签了单域名；明文 53 根本没有 ID 机制。")
-        print(f"        {C}→ 想让安卓 DoT 也能用：回菜单选『8 让 DoT 也能带 ClientID』{N}（签泛域名证书）")
-        print(f"        {Y}不想折腾就别设白名单{N}——或者把设备固定 IP 填进去（家宽/流量 IP 会变，多半不好使）。")
-
-    print("\n  " + "-" * 56)
-    print("  三种 DNS 怎么选（一句话）：")
-    print(f"    · 明文 53     简单通用、不加密 —— 电视/IoT/内网设备")
-    print(f"    · DoT 853     加密、安卓系统原生支持、一次设置管全系统 {Y}【首选】{N}")
-    print(f"    · DoH {dohp}   加密、浏览器/App 用；因本机 443 被节点占，所以带端口")
-    # 【先说清能耐，再说怎么加名单】DNS 只能按【域名】拦：整个域名解析不出来，
-    # 请求就发不出去。广告跟正文同一个域名的，拦了域名正文也一起没了 —— 这类
-    # 根本不是加名单能解决的，先讲明白，省得以为「装了还有广告 = 没装对」。
-    print("\n  " + "-" * 56)
-    print("  广告过滤能做到哪一步（它是附带的一层，不是这东西的全部）：")
-    print("    · 拦得掉：广告和统计放在【独立域名】上的那种 —— App 弹窗、网页横幅、")
-    print("             各家 SDK 的打点域名。整个域名解析不出来，请求发不出去。")
-    print("    · 拦不掉：广告跟正文【同一个域名】的 —— 视频站贴片、信息流里的推广。")
-    print("             拦了那个域名，正文也一起没了，DNS 这一层做不到只挑广告。")
-    print(f"    {Y}所以别指望清零{N}；它真正换掉的是「解析交给运营商」这件事。")
-    print("\n  想拦更多广告：")
-    print("    · 后台 → 过滤器 → DNS 拦截列表 → 添加名单（推荐 anti-AD：https://anti-ad.net/easylist.txt）")
-    print("    · 后台 → 查询日志 → 找到广告域名 → 点『屏蔽』")
+        items.append(("DoH 地址（浏览器 / App）", doh_url))
+    items.append(("明文 DNS（电视 / 盒子 / 路由器）", ip))
+    for i, (label, val) in enumerate(items):         # 条与条之间空一行（CLAUDE.md 第五节）
+        ui_url(label, val)
+        if i < len(items) - 1:
+            print()
 
 def _root_of(dom):
     """可注册的主域名：dns.example.com → example.com（常见 com.cn 这类二级后缀多留一段）。"""
@@ -1039,17 +1002,14 @@ def change_web_port():
         print(f"\n  ❌ 改到 {new} 后 AGH 没在新端口正常起来，已回滚回 {cur}（后台仍可用）。稍后再试或换个端口。")
 
 def status():
-    print("\n  === AdGuard Home 状态 ===")
     if not _installed():
-        print("  未安装。选『1 安装』先装上。"); return
-    print("  已安装:", AGH_BIN)
-    print("  运行中 ✓" if _running() else "  未运行 ✗（systemctl status AdGuardHome 看原因）")
+        print("\n  未安装。选『1 安装』先装上。"); return
     port = _current_web_port()
-    if port:
-        print(f"  后台端口: {port}    （登录地址见下方第一步）")
     b53 = _port_busy(53)
-    print("  53 端口:", "空闲" if not b53 else f"被 {b53} 占用")
-    _usage(port)
+    head = [f"    已安装        : {AGH_BIN}",
+            "    运行          : " + ("✓ 运行中" if _running() else "✗ 没在跑（systemctl status AdGuardHome 看原因）"),
+            "    53 端口       : " + ("空闲" if not b53 else f"被 {b53} 占用")]
+    _usage(port, head)
 
 def _selfdns_remove():
     """卸载 AdGuard 时：若之前用菜单 6 把自建 DNS 写进过订阅，就交给主脚本从订阅移除并刷新
