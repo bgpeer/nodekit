@@ -168,6 +168,9 @@
   `"domain_resolver": "privdns"` 不认，照样拿 route.default_domain_resolver（阿里）解析，私有名查不到；
   改成对象 `{"server": "privdns"}` 就通（仓库主人拿三份测试配置逐个试出来的）。我先猜是 IPv4 被封卡超时，错了。
   模板不用动，_sb_privdns 生成时写对象；没开私有解析什么都不加。
+- **sing-box 节点域名不走国内 DNS**（10/30）：直连 1.1.1.1 DoH 在仓库主人手机 4G 上带不带 SNI 都不通，指自建 DNS 才通 →
+  `_sb_node_dns`：模板 nodedns → 自建 DNS → 私有解析那台 → 都没有不动。小火箭也是阿里解析节点，`[Host] 域名 = server:DoH`
+  能不能用还没在苹果上测（srtest.py pdns B 就是这个写法），没测前不改。
 
 
 - **Bettbox 推荐换成 ClashMi**（仓库主人 10/24）：Bettbox 用自己一套 DNS / 规则 / TUN 复写盖掉订阅里的原生配置
