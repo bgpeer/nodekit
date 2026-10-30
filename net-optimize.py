@@ -68,7 +68,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.24"
+VERSION = "4.5.25"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -3634,15 +3634,20 @@ def cmd_xanmod(assume_yes=False):
     """菜单 12 → 4「换 BBRv3 内核（XanMod）」。每种结果屏上一行 ✔ / ⚠。"""
     cc_key = "net.ipv4.tcp_congestion_control"
     rel = _uname().release
+    done = sorted((k for k in _boot_kernels() if "xanmod" in k), key=_kver)
     if "xanmod" in rel or read_text(BBR_VERSION_FILE).strip() == "3":   # 别家 BBRv3 内核也算，不再装 XanMod
         _xanmod_fix_cc()                       # 已经在跑：顺手把拥塞算法对上（装了 v3 却跑着 cubic 就是这样）
         if not get_sysctl(cc_key).startswith("bbr"):
             set_sysctl(cc_key, "bbr")
         green(f"  ✔ 已经换好了（{rel}），拥塞算法：{cc_label(get_sysctl(cc_key))}")
+        if done and not assume_yes:
+            _xanmod_menu()
         return
-    done = sorted((k for k in _boot_kernels() if "xanmod" in k), key=_kver)
     if done:
         _xanmod_fix_cc()
+        if not assume_yes:
+            echo(f"  XanMod 内核已装好（{done[-1]}），还没重启换上")
+            return _xanmod_menu()
         return _xanmod_finish(f"XanMod 内核已装好（{done[-1]}）", assume_yes)
 
     why, pkgs, codename = xanmod_precheck()
@@ -3721,6 +3726,90 @@ def cmd_xanmod(assume_yes=False):
         return
     _xanmod_fix_cc()
     _xanmod_finish(f"装好了：{pkg}（{ks[-1]}）", assume_yes)
+
+
+# === 装好以后：更新 / 卸载（仓库主人 10/30：「bbr v3里面要不要做几个按钮…不过卸载一定要输yes」）===
+# 平时不自动升：升内核要重启，自动重启会断开正在看的片（CLAUDE.md 第六节）。在这里手动点，重启照样问、默认否。
+def _xanmod_installed_pkgs():
+    """装着的 XanMod 包（元包 linux-xanmod-* 和带 xanmod 的 linux-image / linux-headers）。"""
+    out = run(["dpkg-query", "-W", "-f", "${Package} ${db:Status-Abbrev}\n"], timeout=60,
+              env_extra={"LC_ALL": "C"}).stdout
+    pk = []
+    for ln in out.splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[1][:2] == "ii" and "xanmod" in parts[0]:
+            pk.append(parts[0])
+    return pk
+
+
+def _xanmod_menu():
+    echo("  1. 更新 BBRv3 内核")
+    echo("  2. 卸载 BBRv3，回到系统内核")
+    echo("  0. 返回")
+    c = _ask_tty("  选择: ")
+    if c == "1":
+        xanmod_update()
+    elif c == "2":
+        xanmod_remove()
+
+
+def xanmod_update():
+    """更新到 XanMod 源里的最新版：只升装着的那几个 xanmod 包，别的包不动；有新内核才问重启。"""
+    pk = [p for p in _xanmod_installed_pkgs() if p.startswith("linux-xanmod")] or _xanmod_installed_pkgs()
+    if not pk:
+        yellow("  ⚠ 没找到装着的 XanMod 包，没法更新")
+        return
+    check_dpkg_clean()
+    echo("  检查更新（几分钟，别关窗口）…")
+    before = set(_boot_kernels())
+    apt(["-o", APT_LOCK_WAIT, "update"], timeout=600)
+    # needrestart 歇着：依赖顺带升了 libc / libssl 也不重启 sing-box / nginx（同安装那段）
+    r = run(["apt-get", "-o", APT_LOCK_WAIT, "install", "-y", "--only-upgrade", "--no-install-recommends"] + pk,
+            timeout=1800, env_extra={"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_SUSPEND": "1",
+                                     "NEEDRESTART_MODE": "l"})
+    if r.returncode != 0:
+        last = next((ln for ln in reversed((r.stderr or r.stdout).strip().splitlines()) if ln.strip()), "")
+        yellow(f"  ⚠ 没更新成{('：' + last.strip()) if last else ''}；再选一次重试")
+        return
+    new = sorted((k for k in set(_boot_kernels()) - before if "xanmod" in k), key=_kver)
+    if not new:
+        cur = sorted((k for k in _boot_kernels() if "xanmod" in k), key=_kver)
+        green(f"  ✔ 已经是最新（{cur[-1] if cur else _uname().release}）")
+        return
+    _xanmod_finish(f"更新到 {new[-1]}", False)
+
+
+def xanmod_remove():
+    """卸载 XanMod、回到系统内核。没有别的内核可回就不卸（卸了开不了机）。要输 yes。"""
+    stock = sorted((k for k in _boot_kernels() if "xanmod" not in k), key=_kver)
+    if not stock:
+        yellow("  ⚠ /boot 里没有系统内核可回，卸了就开不了机，没卸")
+        return
+    pk = _xanmod_installed_pkgs()
+    if not pk:
+        yellow("  ⚠ 没找到装着的 XanMod 包")
+        return
+    _color("1;31", f"  ⚠ 卸载后回到系统内核（{stock[-1]}），BBRv3 换回 BBRv1，要重启才生效；系统内核起不来只能后台 VNC 救")
+    if _ask_tty("  确认卸载就输入 yes（其他一律取消）: ").strip().lower() != "yes":
+        echo("  已取消，什么都没改")
+        return
+    check_dpkg_clean()
+    # 卸正在跑的内核时，Debian / Ubuntu 的内核包会用 debconf 问「真要删正在用的内核？」，没人答默认中止 → 先答好
+    run(["debconf-set-selections"], timeout=30,
+        text_input="linux-base linux-base/removing-running-kernel boolean false\n")
+    r = run(["apt-get", "-o", APT_LOCK_WAIT, "purge", "-y"] + pk, timeout=1800,
+            env_extra={"DEBIAN_FRONTEND": "noninteractive", "NEEDRESTART_SUSPEND": "1", "NEEDRESTART_MODE": "l"})
+    left = [k for k in _boot_kernels() if "xanmod" in k]
+    if r.returncode != 0 or left:
+        last = next((ln for ln in reversed((r.stderr or r.stdout).strip().splitlines()) if ln.strip()), "")
+        yellow(f"  ⚠ 没卸干净{('：' + last.strip()) if last else ''}；再选一次重试")
+        return
+    if have_cmd("update-grub"):
+        run(["update-grub"], timeout=300)
+    if not _xanmod_other_sources():              # 我们加的源一起撤（别处手动配的不碰）
+        _rm(XANMOD_LIST); _rm(XANMOD_KEYRING)
+    green(f"  ✔ 已卸载，重启后回到系统内核（{stock[-1]}）")
+    _xanmod_reboot_prompt(False)
 
 
 # === 状态检测（--check，原 net-optimize-check.sh v1.11 完整移植）===

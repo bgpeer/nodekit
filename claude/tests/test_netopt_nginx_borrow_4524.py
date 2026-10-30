@@ -12,7 +12,7 @@ def check(l, ok):
     global bad; bad += not ok; print(("  ✔ " if ok else "  ✖ ") + l)
 spec = importlib.util.spec_from_file_location("netopt", os.path.join(ROOT, "net-optimize.py"))
 n = importlib.util.module_from_spec(spec); spec.loader.exec_module(n)
-check(f"版本号 4.5.24（{n.VERSION}）", n.VERSION == "4.5.24")
+check(f"版本号 ≥ 4.5.24（{n.VERSION}）", tuple(map(int, n.VERSION.split("."))) >= (4, 5, 24))
 R = type("R", (), {})
 def res(rc):
     r = R(); r.returncode = rc; r.stdout = r.stderr = ""; return r
