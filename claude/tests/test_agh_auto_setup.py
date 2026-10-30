@@ -94,6 +94,18 @@ check("有自建 DNS 域名：用户名回车 = 这个域名（提示里写着�
 NEWP[0] = free()
 r, out = run([""], ["", "Passw0rd!x"])
 check("密码空回车不算放弃（装的时候误按的回车）：再问一次", r is True and "没输，再输一次" in out and len(GOT) == 1)
+NEWP[0] = free()
+r, out = run([""], ["dns.example.com", "Passw0rd!x"])
+check("密码跟用户名 / 域名一样：不收、再问一次（域名公网查得到，等于没设）",
+      r is True and "别跟用户名 / 域名一样" in out and GOT[-1]["password"] == "Passw0rd!x")
+import tempfile
+a.AGH_DIR = tempfile.mkdtemp()
+def ytls(body):
+    open(a.AGH_DIR + "/AdGuardHome.yaml", "w").write("http:\n  address: 0.0.0.0:2646\n" + body + "filters: []\n")
+ytls("tls:\n  enabled: false\n  port_https: 443\n")
+check("加密还没开：DoH 端口按 10443 教（yaml 里那个 443 是 AdGuard 默认值，10/31 实测会教成 443）", a._doh_port() == 10443)
+ytls("tls:\n  enabled: true\n  port_https: 8443\n")
+check("加密开着：照 yaml 里的", a._doh_port() == 8443)
 r, out = run([""], ["n"])
 check("明着输 n：改用网页向导（返回 False、什么都没交）", r is False and not GOT)
 # 10/30 GCP 两次实装：用户名一回车，密码那问被凭空多出来的空回车当场顶掉
