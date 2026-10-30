@@ -197,8 +197,15 @@ def fetch_url(url):
     raise last
 
 def cnblock_load():
-    try: return json.load(open(CNBLOCK_FILE))
-    except Exception: return {}
+    try: d = json.load(open(CNBLOCK_FILE))
+    except Exception: d = {}
+    if not isinstance(d, dict):
+        d = {}
+    if "wl_mode" not in d:
+        # 放行名单默认「不放行」（仓库主人 10/30：「我还没点他他为什么就有作者名单」）。以前开着、没选过名单的
+        # 用的是当时的默认作者名单——照旧作者名单，不悄悄换掉（换了抖音 / 微信这些走节点就被拦）
+        d["wl_mode"] = "author" if d.get("enabled") else "none"
+    return d
 
 def _write_json(path, obj):
     """原子写：先写临时文件再 replace，进程中途被杀也不会留下写了一半的配置。"""
@@ -447,7 +454,7 @@ def _link_data(cfg):
 
 def _whitelist_tags(cfg):
     """取白名单 tag 列表：作者名单 / 自定义名单（链接里的 tag 部分）。"""
-    mode = cfg.get("wl_mode", "author")
+    mode = cfg.get("wl_mode", "none")
     if mode == "none":
         return []
     if mode == "custom":
@@ -570,7 +577,8 @@ def apply_cn_block(cfg=None):
     cfg["enabled"] = True; cnblock_save(cfg)
     setup_cron()                                        # 每天北京 03:00 定点刷新规则集
     extra = f"，单条放行 {len(wl_doms)} 域名 + {len(wl_ips)} IP" if (wl_doms or wl_ips) else ""
-    print(f"\n✓ 已开启屏蔽中国域名/IP：放行白名单 {len(wl_refs)} 组{extra}，其余 CN 域名+IP 一律拦截。")
+    wl_txt = f"放行白名单 {len(wl_refs)} 组" if wl_refs else "不放行白名单"
+    print(f"\n✓ 已开启屏蔽中国域名/IP：{wl_txt}{extra}，其余 CN 域名+IP 一律拦截。")
     print("  规则集每天北京时间 03:00 自动刷新（cron）；临时拉不到的会在下次刷新补齐，不影响已生效的。")
     return True
 
@@ -993,7 +1001,7 @@ def menu():
     while True:
         cfg = cnblock_load()
         on = cfg.get("enabled")
-        wl = {"author": "作者名单", "custom": "自定义名单", "none": "不放行"}.get(cfg.get("wl_mode", "author"), "作者名单")
+        wl = {"author": "作者名单", "custom": "自定义名单", "none": "不放行"}.get(cfg.get("wl_mode", "none"), "不放行")
         _d, _i = _wl_custom(cfg)
         # 3 自定义放行名单脚本链接：规则集 + 单条域名/IP，可抄样板改；5 立即更新：不用等每天 03:00 定时刷新
         ui_title("屏蔽中国域名和 IP")
@@ -1015,13 +1023,14 @@ def menu():
                 apply_cn_block(cfg)
         elif c == "2":
             print()
-            ui_items([(1, "作者名单", None), (2, "自定义名单", None), (0, "返回", None)])
+            ui_items([(1, "作者名单", None), (2, "自定义名单", None), (3, "不放行", None), (0, "返回", None)])
             s = _ask("选择: ").strip()
             if s == "1":   cfg["wl_mode"] = "author"
             elif s == "2": cfg["wl_mode"] = "custom"
+            elif s == "3": cfg["wl_mode"] = "none"
             else:          continue
             cnblock_save(cfg)
-            print("    已设为", "作者名单" if cfg["wl_mode"] == "author" else "自定义名单")
+            print("    已设为", {"author": "作者名单", "custom": "自定义名单", "none": "不放行"}[cfg["wl_mode"]])
             if cfg.get("enabled"): apply_cn_block(cfg)    # 已开启则立即用新名单重注入
         elif c == "3":
             cur = (cfg.get("wl_url") or "").strip()
