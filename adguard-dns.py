@@ -16,7 +16,7 @@
 #   - 卸载(菜单2)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
 #     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 8 里的「删除 DoT」
 #     只撤泛域名证书这一项，AdGuard 本体继续跑。
-import os, re, sys, time, json, shlex, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
+import os, re, sys, time, json, shlex, socket, shutil, getpass, secrets, struct, base64, ssl, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
@@ -255,7 +255,8 @@ def install():
         print("\n  ✓ AdGuard Home 已安装并启动。")
     else:
         print("\n  已安装，但服务暂未在运行——稍等或看 `systemctl status AdGuardHome`。")
-    _first_setup()          # 初装向导统一走默认 3000（先保证进得去），装好后再用菜单 5 改端口（带回滚，锁不死）
+    if not _auto_setup():   # 替你走完网页向导：随机后台端口 + 你设的账号密码（仓库主人 10/30）
+        _first_setup()      # 没走成：照旧网页向导，统一用默认 3000（先保证进得去），装好后菜单 5 改端口
 
 def _setup_own_domain():
     """装之前给自建 DNS 一个它自己的域名、签一张它自己的证书（域名 + *.域名，DoT 带 ClientID 要泛域名），
@@ -335,6 +336,74 @@ def _own_cert_remove(dom):
     shutil.rmtree(AGH_CERT_DIR, ignore_errors=True)
     try: os.remove(AGH_DOMAIN_FILE)
     except OSError: pass
+
+def _agh_api(path, body=None, port=None, timeout=5):
+    """本机 AdGuard 的接口（127.0.0.1，不出网）→ (状态码, 回包文字)；连不上返回 (0, 原因)。port 不给 = 向导的 WEB_PORT。"""
+    req = urllib.request.Request(f"http://127.0.0.1:{port or WEB_PORT}{path}",
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"} if body is not None else {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace").strip()
+    except Exception as e:
+        return 0, str(e)
+
+def _auto_setup():
+    """替你走完网页向导（仓库主人 10/30：「要是直接能改好随机端口最好」）：问用户名、密码，挑一个随机后台端口，
+       调向导背后的接口 /control/install/configure 一次交过去——跟在浏览器里点完向导一样（AdGuard 自己 bcrypt 存密码、
+       写配置、当场换到新端口）。以前只改配置文件做不成：没配置时它只开向导，账号密码要它自己哈希。
+       10/30 用真的 AdGuard Home v0.107.79 跑通过：200 后新端口当场起来、旧的 3000 关掉、账号能登进去；
+       密码少于 8 位它回 422「password must be at least 8 symbols long」。
+       没走成（向导没起来、接口报错、新端口打不开）返回 False，调用方照旧给网页向导的步骤。"""
+    G, Y, N = "\033[1;32m", "\033[1;33m", "\033[0m"
+    for _ in range(15):
+        if _agh_api("/control/install/get_addresses")[0] == 200:
+            break
+        time.sleep(1)
+    else:
+        return False
+    print()
+    ui_title("设置后台账号（替你走完网页向导）")
+    user = _ask("  后台用户名（回车 = admin）: ").strip() or "admin"
+    while True:
+        try:
+            pw = getpass.getpass("  后台密码（至少 8 位，输入时不显示；直接回车 = 改用网页向导）: ")
+        except (EOFError, OSError):
+            return False
+        if not pw:
+            return False
+        if len(pw) < 8:
+            print(f"  {Y}✗ 至少 8 位{N}"); continue
+        try:
+            again = getpass.getpass("  再输一次: ")
+        except (EOFError, OSError):
+            return False
+        if again != pw:
+            print(f"  {Y}✗ 两次不一样，重输{N}"); continue
+        break
+    port = _pick_web_port(WEB_PORT)
+    if not port:
+        return False
+    code, msg = _agh_api("/control/install/configure",
+                         {"web": {"ip": "0.0.0.0", "port": port}, "dns": {"ip": "0.0.0.0", "port": 53},
+                          "username": user, "password": pw})
+    if code != 200:
+        print(f"  {Y}⚠ 自动设置没成（{msg[:80] or code}），改用网页向导{N}")
+        return False
+    ok = False
+    for _ in range(15):
+        time.sleep(1)
+        if _agh_api("/", port=port)[0] in (200, 302):
+            ok = True; break
+    if not ok:
+        print(f"  {Y}⚠ 设好了，可新端口 {port} 还没起来：等一会儿再打开，或 systemctl status AdGuardHome 看原因{N}")
+    ip = _public_ip()
+    print(f"\n  {G}✔ 后台设好了：用户名 {user}，后台端口 {port}（随机，以后菜单 5 可改）{N}")
+    ui_url("后台地址（云防火墙放行这个端口 TCP）", f"http://{ip}:{port}")
+    _usage(port)
+    return True
 
 def _first_setup():
     ip = _public_ip()
@@ -531,7 +600,8 @@ def _usage(port=None, head=None):
         print(f"    应急 / 本机用明文：http://{ip}:{port}")
     else:
         print(f"    浏览器打开：{G}http://{ip}:{port}{N}")
-    print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 5 可改）")
+    if not os.path.exists(_agh_yaml()):              # 还没走过向导（自动设置没成）：浏览器里设账号，端口照 3000
+        print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 5 可改）")
 
     print(f"\n  {C}【第二步 · 设置加密】{N}")
     if dom:
