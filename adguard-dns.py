@@ -16,7 +16,7 @@
 #   - 卸载(菜单2)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
 #     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 8 里的「删除 DoT」
 #     只撤泛域名证书这一项，AdGuard 本体继续跑。
-import os, re, sys, time, json, shlex, socket, shutil, getpass, secrets, struct, base64, ssl, subprocess, urllib.request
+import os, re, sys, time, json, shlex, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
 
 BGP_DIR = "/etc/bgpeer"
 HOST_FILE = BGP_DIR + "/sub.host"                 # 主脚本存的 host（域名或 IP）
@@ -354,7 +354,7 @@ def _auto_setup():
     """替你走完网页向导（仓库主人 10/30：「要是直接能改好随机端口最好」）：问用户名、密码，挑一个随机后台端口，
        调向导背后的接口 /control/install/configure 一次交过去——跟在浏览器里点完向导一样（AdGuard 自己 bcrypt 存密码、
        写配置、当场换到新端口）。以前只改配置文件做不成：没配置时它只开向导，账号密码要它自己哈希。
-       10/30 用真的 AdGuard Home v0.107.79 跑通过：200 后新端口当场起来、旧的 3000 关掉、账号能登进去；
+       10/30 用真的 AdGuard Home v0.107.79 跑通过：200 后新端口当场起来、旧的 3000 关掉、账号能登进去（域名当用户名也行）；
        密码少于 8 位它回 422「password must be at least 8 symbols long」。
        没走成（向导没起来、接口报错、新端口打不开）返回 False，调用方照旧给网页向导的步骤。"""
     G, Y, N = "\033[1;32m", "\033[1;33m", "\033[0m"
@@ -366,23 +366,18 @@ def _auto_setup():
         return False
     print()
     ui_title("设置后台账号（替你走完网页向导）")
-    user = _ask("  后台用户名（回车 = admin）: ").strip() or "admin"
+    # 用户名默认用自建 DNS 自己的域名（仓库主人 10/30：「用户名可以直接用自己的域名吗」——真 AdGuard 认带点的用户名，
+    # 登得进去）；没域名才默认 admin。密码明着输（「建议显示，不然新手不知道有没有输入成功，DNS而已又不是什么重要网站」），
+    # 看得见就不用再输一遍
+    dft = _own_domain() or "admin"
+    user = _ask(f"  后台用户名（回车 = {dft}）: ").strip() or dft
     while True:
-        try:
-            pw = getpass.getpass("  后台密码（至少 8 位，输入时不显示；直接回车 = 改用网页向导）: ")
-        except (EOFError, OSError):
-            return False
+        pw = _ask("  后台密码（至少 8 位；直接回车 = 改用网页向导）: ").strip()
         if not pw:
             return False
-        if len(pw) < 8:
-            print(f"  {Y}✗ 至少 8 位{N}"); continue
-        try:
-            again = getpass.getpass("  再输一次: ")
-        except (EOFError, OSError):
-            return False
-        if again != pw:
-            print(f"  {Y}✗ 两次不一样，重输{N}"); continue
-        break
+        if len(pw) >= 8:
+            break
+        print(f"  {Y}✗ 至少 8 位{N}")
     port = _pick_web_port(WEB_PORT)
     if not port:
         return False

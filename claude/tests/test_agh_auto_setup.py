@@ -3,6 +3,7 @@
   以前叫你改一直改不好所以就一直默认的是3000」→「要是直接能改好随机端口最好」）。
   调向导背后的接口 /control/install/configure（跟浏览器点完向导一样）；10/30 拿真的 AdGuard Home v0.107.79 跑通过。
   这里用一个照它的行为写的假向导：200 后在新端口起服务；密码少于 8 位回 422。
+  10/30 又改：用户名默认用自建 DNS 自己的域名（真 AGH 认带点的用户名）；密码明着输、只输一遍（「新手不知道有没有输入成功」）。
 """
 import os, io, sys, json, socket, threading, contextlib, http.server, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,17 +50,20 @@ a._usage = lambda port=None, head=None: USAGE.append(port)
 FAIL_NEW_PORT = False
 NEWP = [free()]
 a._pick_web_port = lambda avoid: NEWP[0]
+PROMPTS = []
 def run(names, pws):
-    names, pws = list(names), list(pws)
-    a._ask = lambda p="": names.pop(0) if names else ""
-    a.getpass.getpass = lambda p="": pws.pop(0) if pws else ""
+    seq = list(names) + list(pws)
+    a._ask = lambda p="": (PROMPTS.append(p), seq.pop(0) if seq else "")[1]
+    PROMPTS.clear()
     GOT.clear(); USAGE.clear()
     b = io.StringIO()
     with contextlib.redirect_stdout(b):
         r = a._auto_setup()
     return r, b.getvalue()
 
-r, out = run(["myadmin"], ["short", "Passw0rd!x", "Passw0rd!x"])
+OWN = [""]
+a._own_domain = lambda: OWN[0]
+r, out = run(["myadmin"], ["short", "Passw0rd!x"])
 check("走成：返回 True", r is True)
 check("少于 8 位当场拦下、不交给它", "至少 8 位" in out and len(GOT) == 1)
 check(f"交过去的：随机后台端口、DNS 53、用户名、密码（{ {k: v for k, v in GOT[0].items() if k != 'password'} }）",
@@ -67,17 +71,22 @@ check(f"交过去的：随机后台端口、DNS 53、用户名、密码（{ {k: 
       and GOT[0]["password"] == "Passw0rd!x")
 check("屏上一行 ✔ + 后台地址顶格单独一行", "✔ 后台设好了" in out and "http" + f"://{IP}:{NEWP[0]}" in out.splitlines())
 check("随后给使用方法（按新端口）", USAGE == [NEWP[0]])
-check("密码不上屏", "Passw0rd!x" not in out)
+check("密码明着输、只问一遍（没有「再输一次」）", not [p for p in PROMPTS if "再输一次" in p]
+      and [p for p in PROMPTS if "后台密码" in p] and "不显示" not in "".join(PROMPTS))
 
 NEWP[0] = free()
-r, out = run([""], ["Passw0rd!x", "different1"] + ["Passw0rd!x", "Passw0rd!x"])
-check("用户名回车 = admin；两次不一样重输", r and GOT[0]["username"] == "admin" and "两次不一样" in out)
+r, out = run([""], ["Passw0rd!x"])
+check("没有自建 DNS 域名：用户名回车 = admin", r and GOT[0]["username"] == "admin")
+NEWP[0] = free()
+OWN[0] = "dns.example.com"
+r, out = run([""], ["Passw0rd!x"])
+check("有自建 DNS 域名：用户名回车 = 这个域名（提示里写着）", r and GOT[0]["username"] == "dns.example.com"
+      and "回车 = dns.example.com" in PROMPTS[0])
 r, out = run([""], [""])
 check("密码直接回车：改用网页向导（返回 False、什么都没交）", r is False and not GOT)
-a.getpass.getpass = lambda p="": "Passw0rd!x"
 a._agh_api = (lambda orig: (lambda path, body=None, port=None, timeout=5:
               (500, "boom") if path == "/control/install/configure" else orig(path, body, port, timeout)))(a._agh_api)
-r, out = run(["x"], ["Passw0rd!x", "Passw0rd!x"])
+r, out = run(["x"], ["Passw0rd!x"])
 check("接口报错：说一行、改用网页向导", r is False and "改用网页向导" in out)
 src = open(os.path.join(ROOT, "adguard-dns.py"), encoding="utf-8").read()
 check("装完先自动设置，没成才给网页向导步骤", "if not _auto_setup():" in src and src.index("if not _auto_setup():") < src.index("        _first_setup()"))
