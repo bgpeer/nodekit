@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""自建 DNS 菜单 12「改后台密码」（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
+"""自建 DNS 菜单 12「修改用户名和密码」（仓库主人 10/31：「可不可以用代码修改密码」→「加」→
+  「用户名可以修改吗，要不用户名和密码一起修改」：1 修改后台用户名　当前：… / 2 修改后台密码 / 0 返回）。
+  改用户名：换 users 段第一个 - name:，密码不动；10/31 真机实测新用户名 200、旧的 401。
   AdGuard 没有改密码的命令 / 接口：停服务 → 换掉 AdGuardHome.yaml 里 users 段那行 bcrypt 哈希（htpasswd -B 生成）→
   起服务 → 拿新密码登一次接口验证；登不进去就放回原配置。10/31 真 AdGuard Home v0.107.79 实测：新密码 200、旧密码 401。
 """
@@ -44,12 +46,41 @@ check("新密码登不进去：放回原配置（旧密码照旧能用）、说�
       and CMDS.count("systemctl start AdGuardHome") == 2)
 out, y = go([""])
 check("回车：取消、什么都没动", "已取消" in out and y == YAML and not CMDS)
+print("改用户名")
+def goname(answers, up=True):
+    open(Y, "w").write(YAML); CMDS.clear(); ANS[:] = answers
+    a._agh_api = lambda path, body=None, port=None, timeout=5, auth=None: (401 if up else 0, "")
+    b = io.StringIO()
+    with contextlib.redirect_stdout(b):
+        a.change_admin_name()
+    return b.getvalue(), open(Y).read()
+out, y = goname(["bad name", "a:b", "myboss"])
+check("带空格 / 冒号的不收、再问", out.count("别带空格") == 2)
+check("只换 users 段那个 name，密码那行不动", "  - name: myboss\n    password: " + OLD in y and "dns.example.com" not in y)
+check("停服务 → 写 → 起服务、✔ 一行", CMDS == ["systemctl stop AdGuardHome", "systemctl start AdGuardHome"]
+      and "✔ 后台用户名改成 myboss，密码不变" in out)
+out, y = goname(["myboss"], up=False)
+check("改完后台没起来：放回原配置、说一行", y == YAML and "已改回原来的用户名" in out)
+out, y = goname([""])
+check("回车：取消、什么都没动", "已取消" in out and y == YAML and not CMDS)
+out, y = goname(["dns.example.com"])
+check("跟现在一样：没改", "跟现在一样" in out and not CMDS)
+
+print("菜单")
+ANS2 = ["0"]
+a._ask = lambda p="": ANS2.pop(0) if ANS2 else "0"
+b = io.StringIO()
+with contextlib.redirect_stdout(b):
+    a.change_admin_account()
+check("12 里：1 修改后台用户名　当前：用户名 / 2 修改后台密码 / 0 返回",
+      "1. 修改后台用户名　当前：dns.example.com" in b.getvalue() and "2. 修改后台密码" in b.getvalue() and "0. 返回" in b.getvalue())
+
 a._agh_users = lambda: []
 out, y = go(["NewPassw0rd!"])
 check("还没设账号：提示先选 1", "先选 1" in out and not CMDS)
 src = open(os.path.join(ROOT, "adguard-dns.py"), encoding="utf-8").read()
-check("菜单里有 12「改后台密码」，原来 1~11 编号不动", '(12, "改后台密码", None)' in src and '(11, "节点使用私有DNS解析"' in src
-      and 'elif c == "12": change_admin_password()' in src)
+check("主菜单 12 叫「修改用户名和密码」，原来 1~11 编号不动", '(12, "修改用户名和密码", None)' in src
+      and '(11, "节点使用私有DNS解析"' in src and 'elif c == "12": change_admin_account()' in src)
 check("htpasswd 从标准输入喂密码（不放命令行）", '["htpasswd", "-niBC", "10", ""], input=pw' in src)
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
