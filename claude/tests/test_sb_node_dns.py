@@ -2,8 +2,8 @@
 """sing-box：用公网域名的节点不交给国内 DNS 解析（仓库主人 10/30：「就算没建私有DNS也不应该让国内的解析的，
   这就等于直接暴露了IP……」）。以前没指 domain_resolver 的出站走 route.default_domain_resolver，作者模板里那是阿里。
   先试了直连 1.1.1.1 DoH：仓库主人手机 4G 带不带 cloudflare-dns.com 都不通（sing-box 一个出站只能指一台，不通就全挂）；
-  指自建 DNS 一试就通。作者模板第二行留了 nodedns 这个口子（默认跟 local 一样是阿里），跟 final 一个路数：
-  有自建 DNS 换成自建的、没有就换成私有解析那台、都没有照模板。模板里没这一行的老模板：有自建 DNS 才加一台。
+  指自建 DNS 一试就通。作者模板不写 nodedns（写过一版默认是阿里，仓库主人：「那还不如不写」）：有自建 DNS 脚本加一台，
+  只有私有解析就指那台，都没有不动；自定义模板自己写了 nodedns 的当口子用。
 """
 import os, sys, json, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -38,13 +38,14 @@ def cfg_noslot(obs, extra=()):
     c["dns"]["servers"] = [v for v in c["dns"]["servers"] if v.get("tag") != "nodedns"]
     return c
 
-print("零、作者模板留的口子")
-slot = srvmap(cfg_with([])).get("nodedns")
-check(f"模板第二行就是 nodedns，默认跟 local 一样是阿里（{slot}）",
-      TPL["dns"]["servers"][1].get("tag") == "nodedns" and slot["server"] == ip(223, 5, 5, 5) and slot.get("detour") == "🎯直连")
+print("零、作者模板")
+check("作者模板里不写 nodedns", "nodedns" not in json.dumps(TPL))
+SLOT = {"tag": "nodedns", "type": "https", "server": ip(9, 9, 9, 9), "path": "/dns-query", "detour": "🎯直连"}
+slot = SLOT
 
-print("一、本机自建 DNS 写进了订阅")
+print("一、自定义模板写了 nodedns 口子 + 本机自建 DNS 写进了订阅")
 c = cfg_with(OB)
+c["dns"]["servers"].insert(1, dict(SLOT))
 x._sb_node_dns(c, DOH)
 s, ob = srvmap(c), obmap(c)
 check(f"nodedns 换成自建 DoH，还在原位、tag 不变（{s.get('nodedns')}）",
@@ -62,20 +63,22 @@ n = len(c["dns"]["servers"])
 x._sb_node_dns(c, DOH)
 check("再跑一次不重复加", len(c["dns"]["servers"]) == n)
 
-print("二、没写自建 DNS 进订阅")
+print("二、自定义模板写了口子、没写自建 DNS 进订阅")
 PRIV = {"tag": "privdns", "type": "https", "server": "dns.example.com", "server_port": 10443, "path": "/dns-query/xyabc123",
         "domain_resolver": "bootstrap", "detour": "🎯直连"}
 c = cfg_with(OB, [PRIV])
+c["dns"]["servers"].insert(1, dict(SLOT))
 x._sb_node_dns(c, "")
 check("有私有解析那台：nodedns 换成跟它一样，节点指 nodedns",
       {k: v for k, v in srvmap(c)["nodedns"].items() if k != "tag"} == {k: v for k, v in PRIV.items() if k != "tag"}
       and obmap(c)["b·CDN·ws"]["domain_resolver"] == {"server": "nodedns"})
 c = cfg_with(OB)
+c["dns"]["servers"].insert(1, dict(SLOT))
 x._sb_node_dns(c, "")
-check("什么都没有：nodedns 照模板（阿里），节点指它", srvmap(c)["nodedns"] == slot
+check("什么都没有：nodedns 照模板写的，节点指它", srvmap(c)["nodedns"] == slot
       and obmap(c)["a·hy2"]["domain_resolver"] == {"server": "nodedns"})
 
-print("三、自定义模板没这一行（老模板）")
+print("三、模板没这一行（作者模板就是）")
 c = cfg_noslot(OB)
 x._sb_node_dns(c, DOH)
 check("有自建 DNS：加一台 nodedns、节点指它", srvmap(c)["nodedns"]["server"] == "dns.example.com"
