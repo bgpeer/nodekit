@@ -401,9 +401,11 @@ def _auto_setup():
         pw = _ask_fresh("  后台密码（至少 8 位；输 n = 改用网页向导）: ").strip()
         if pw.lower() == "n":
             return False
-        if len(pw) >= 8:
+        # 跟用户名 / 域名一样等于没设：域名公网查得到，谁都猜得出（10/31 GCP 实装就设成了一样的）
+        if len(pw) >= 8 and pw.lower() not in (user.lower(), (_own_domain() or "").lower()):
             break
-        print(f"  {Y}✗ {'没输' if not pw else '至少 8 位'}，再输一次{N}")
+        why = "没输" if not pw else ("至少 8 位" if len(pw) < 8 else "别跟用户名 / 域名一样")
+        print(f"  {Y}✗ {why}，再输一次{N}")
     port = _pick_web_port(WEB_PORT)
     if not port:
         return False
@@ -464,10 +466,14 @@ def _selfdns_clientid():
     return t
 
 def _doh_port():
-    """当前 DoH(HTTPS) 端口：从 AdGuardHome.yaml 的 tls.port_https 读，读不到按 10443。"""
+    """当前 DoH(HTTPS) 端口：加密开着才读 AdGuardHome.yaml 的 tls.port_https；没开（或读不到）按 10443。
+       没开时 yaml 里那个是 AdGuard 的默认 443（向导一走完就写进去了）——拿它教人填，第二步就成了
+       「HTTPS 端口：443（别填 0 / 443）」自相矛盾，DoH 地址也写成 :443（10/31 GCP 自动设置后实测）。"""
     try:
-        p = int(_yaml_val(_tls_block(open(_agh_yaml()).read()), "port_https") or 0)
-        return p or 10443
+        tls = _tls_block(open(_agh_yaml()).read())
+        if str(_yaml_val(tls, "enabled")).strip().lower() != "true":
+            return 10443
+        return int(_yaml_val(tls, "port_https") or 0) or 10443
     except (OSError, ValueError):
         return 10443
 
