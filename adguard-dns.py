@@ -364,6 +364,17 @@ def _flush_typeahead():
     except Exception:
         pass
 
+def _ask_fresh(prompt):
+    """问一句、只认人敲的：问之前丢掉缓冲里的键；不到 0.3 秒就回来的空回车不是人按的（10/30 GCP 两次实装，
+       用户名一回车、密码那问就被一个凭空多出来的空回车当场顶掉——清过缓冲还有，多半是终端把回车发成 \\r\\n），
+       当没发生、再问。人真按的回车照常算。"""
+    while True:
+        _flush_typeahead()
+        t0 = time.monotonic()
+        v = _ask(prompt)
+        if v or time.monotonic() - t0 >= 0.3:
+            return v
+
 def _auto_setup():
     """替你走完网页向导（仓库主人 10/30：「要是直接能改好随机端口最好」）：问用户名、密码，挑一个随机后台端口，
        调向导背后的接口 /control/install/configure 一次交过去——跟在浏览器里点完向导一样（AdGuard 自己 bcrypt 存密码、
@@ -384,11 +395,10 @@ def _auto_setup():
     # 登得进去）；没域名才默认 admin。密码明着输（「建议显示，不然新手不知道有没有输入成功，DNS而已又不是什么重要网站」），
     # 看得见就不用再输一遍
     dft = _own_domain() or "admin"
-    _flush_typeahead()
-    user = _ask(f"  后台用户名（回车 = {dft}）: ").strip() or dft
+    user = _ask_fresh(f"  后台用户名（回车 = {dft}）: ").strip() or dft
     # 空回车不当「不要了」：装的时候误按的回车会把这问顶掉。要退回网页向导得明着输 n
     while True:
-        pw = _ask("  后台密码（至少 8 位；输 n = 改用网页向导）: ").strip()
+        pw = _ask_fresh("  后台密码（至少 8 位；输 n = 改用网页向导）: ").strip()
         if pw.lower() == "n":
             return False
         if len(pw) >= 8:

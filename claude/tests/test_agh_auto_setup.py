@@ -51,9 +51,18 @@ FAIL_NEW_PORT = False
 NEWP = [free()]
 a._pick_web_port = lambda avoid: NEWP[0]
 PROMPTS = []
+a._flush_typeahead = lambda: None
+CLOCK = [0.0]
+a.time.monotonic = lambda: CLOCK[0]
+def human(seq):
+    """人敲的：每问过 1 秒才回答（不到 0.3 秒的空回车 _ask_fresh 当成凭空多出来的、不算）。"""
+    def ask(p=""):
+        PROMPTS.append(p); CLOCK[0] += 1.0
+        return seq.pop(0) if seq else ""
+    return ask
 def run(names, pws):
     seq = list(names) + list(pws)
-    a._ask = lambda p="": (PROMPTS.append(p), seq.pop(0) if seq else "")[1]
+    a._ask = human(seq)
     PROMPTS.clear()
     GOT.clear(); USAGE.clear()
     b = io.StringIO()
@@ -87,9 +96,25 @@ r, out = run([""], ["", "Passw0rd!x"])
 check("密码空回车不算放弃（装的时候误按的回车）：再问一次", r is True and "没输，再输一次" in out and len(GOT) == 1)
 r, out = run([""], ["n"])
 check("明着输 n：改用网页向导（返回 False、什么都没交）", r is False and not GOT)
+# 10/30 GCP 两次实装：用户名一回车，密码那问被凭空多出来的空回车当场顶掉
+PH = ["", "", "Passw0rd!x"]
+def phantom_then_human(p=""):
+    PROMPTS.append(p)
+    v = PH.pop(0)
+    if len(PH) == 1:          # 第二个空回车是凭空来的：几乎不花时间
+        CLOCK[0] += 0.01
+    else:
+        CLOCK[0] += 1.0
+    return v
+a._ask = phantom_then_human
+PROMPTS.clear()
+v1 = a._ask_fresh("用户名: ")
+v2 = a._ask_fresh("密码: ")
+check(f"不到 0.3 秒回来的空回车不算、再问；人按的回车照常算（{v1!r}, {v2!r}）", v1 == "" and v2 == "Passw0rd!x"
+      and PROMPTS == ["用户名: ", "密码: ", "密码: "])
 src0 = open(os.path.join(ROOT, "adguard-dns.py"), encoding="utf-8").read()
 body = src0[src0.index("def _auto_setup("):src0.index("\ndef ", src0.index("def _auto_setup(") + 5)]
-check("问之前先丢掉装的时候误按的键", body.index("_flush_typeahead()") < body.index("后台用户名"))
+check("用户名、密码两问都用 _ask_fresh（问前清缓冲、不认凭空的空回车）", body.count("_ask_fresh(") == 2)
 ins = src0[src0.index("def install("):src0.index("\ndef ", src0.index("def install(") + 5)]
 check("装好了、向导没走完：再选 1 替你设（不用卸了重装）", "if not os.path.exists(_agh_yaml()):" in ins
       and ins.index("_auto_setup()") < ins.index("已经装过了"))
