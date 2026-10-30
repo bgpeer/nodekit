@@ -4174,6 +4174,7 @@ def build_singbox_sub(nodes, tpl_url):
     _sb_direct_ip(cfg, _direct_targets(nodes))                    # 各 VPS IP 直连（走紧凑序列化，不破坏格式）
     _sb_selfdns(cfg, _selfdns_doh())                              # 开关开启：dns.final 换成本机自建 DoH
     _sb_privdns(cfg, nodes)                                       # 被藏的节点：domain_resolver 指向它的 DNS
+    _sb_node_dns(cfg)                                             # 其余用公网域名的节点：境外 DoH 解析，不走国内 DNS
     open(SBOX_FILE, "w").write(sb_dumps(cfg))
 
 # --- Shadowrocket [Proxy] 行：从 mihomo 参数转（名称带国旗前缀让分组正则命中）---
@@ -5248,6 +5249,35 @@ def _sb_privdns(cfg, nodes):
             # 照样拿 route.default_domain_resolver（阿里）去解，私有名查不到、被藏的节点全不通；
             # 改成 {"server": "privdns"} 就通（10/30 仓库主人真机实测）。两种写法文档里等价，1.12 起都认
             o["domain_resolver"] = {"server": tag_of[used[o["server"]]]}
+
+SB_NODE_DNS = "nodedns"
+
+def _sb_node_dns(cfg):
+    """sing-box：用公网域名的节点交给境外 DoH（直连 1.1.1.1）解析（仓库主人 10/30：「就算没建私有DNS也不应该让国内的解析」）。
+       没指 domain_resolver 的出站走 route.default_domain_resolver——作者模板里是阿里（local），每连一次节点就把节点域名
+       报给国内 DNS 一次。mihomo 那份本来就是 proxy-server-nameserver 走 1.1.1.1 / 8.8.8.8 / 9.9.9.9，这里补齐。
+       · 只给还没指 domain_resolver 的、server 是域名的出站加（被藏的节点 _sb_privdns 已经指了 DMIT 那台，不碰）；
+         default_domain_resolver 不动——直连出站解析网站也用它，国内网站还得用国内 DNS 拿就近 CDN。
+       · 模板里已经有 tag 为 nodedns 的 DNS 服务器就用模板的（想换成别家 DoH，在模板里写一台叫 nodedns 的就行）；
+         没有才加一台：IP 直写，不用先解析；detour 跟 _sb_dns_dial 挑的直连一样（走代理就成了解析节点要先连节点）。
+       · 写对象 {"server": ...}：SFA 1.15 不认简写（见 _sb_privdns）。"""
+    dns = cfg.get("dns")
+    if not isinstance(dns, dict) or not isinstance(dns.get("servers"), list):
+        return
+    obs = [o for o in cfg.get("outbounds", []) if isinstance(o, dict) and isinstance(o.get("server"), str)
+           and o["server"] and not _is_ip(o["server"]) and not o.get("domain_resolver")]
+    if not obs:
+        return
+    servers = dns["servers"]
+    if SB_NODE_DNS not in {o.get("tag") for o in servers if isinstance(o, dict)}:
+        srv = {"tag": SB_NODE_DNS, "type": "https", "server": "1.1.1.1", "path": "/dns-query",
+               "tls": {"server_name": "cloudflare-dns.com"}}
+        detour, _dr = _sb_dns_dial(cfg, servers)
+        if detour:
+            srv["detour"] = detour
+        servers.append(srv)
+    for o in obs:
+        o["domain_resolver"] = {"server": SB_NODE_DNS}
 
 def _sr_direct_ip(path, targets):
     """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。

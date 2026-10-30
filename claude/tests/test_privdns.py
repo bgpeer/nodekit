@@ -293,9 +293,10 @@ check(f"sing-box：加了一台 DoH（3 的域名、端口、带 ClientID 的路
       ps == [{"tag": "privdns", "type": "https", "server": DOM, "server_port": PORT,
               "path": "/dns-query/xyabc123", "domain_resolver": "bootstrap", "detour": "🎯直连"}])
 ob = [o for o in cj["outbounds"] if isinstance(o, dict) and o.get("server") == NAME1]
-check(f"sing-box：1 的出站全指向它（{len(ob)} 个），别的出站不带",
+check(f"sing-box：1 的出站全指向它（{len(ob)} 个），别的出站不指它（用域名的指 nodedns，见 test_sb_node_dns）",
       ob and all(o.get("domain_resolver") == {"server": "privdns"} for o in ob)
-      and not [o for o in cj["outbounds"] if isinstance(o, dict) and o.get("domain_resolver") and o.get("server") != NAME1])
+      and not [o for o in cj["outbounds"] if isinstance(o, dict) and o.get("domain_resolver") == {"server": "privdns"}
+               and o.get("server") != NAME1])
 check("sing-box：1 的 reality 出站 SNI 原样", [o["tls"]["server_name"] for o in ob if o["type"] == "vless"
                                             and o["tls"].get("reality")] == ["www.cisco.com"])
 check("小火箭：1 的节点一个都不放（「小火箭的也删掉」），CDN 那条和 2、3 照放",
