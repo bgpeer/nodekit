@@ -294,7 +294,7 @@ check(f"sing-box：加了一台 DoH（3 的域名、端口、带 ClientID 的路
               "path": "/dns-query/xyabc123", "domain_resolver": "bootstrap", "detour": "🎯直连"}])
 ob = [o for o in cj["outbounds"] if isinstance(o, dict) and o.get("server") == NAME1]
 check(f"sing-box：1 的出站全指向它（{len(ob)} 个），别的出站不带",
-      ob and all(o.get("domain_resolver") == "privdns" for o in ob)
+      ob and all(o.get("domain_resolver") == {"server": "privdns"} for o in ob)
       and not [o for o in cj["outbounds"] if isinstance(o, dict) and o.get("domain_resolver") and o.get("server") != NAME1])
 check("sing-box：1 的 reality 出站 SNI 原样", [o["tls"]["server_name"] for o in ob if o["type"] == "vless"
                                             and o["tls"].get("reality")] == ["www.cisco.com"])

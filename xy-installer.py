@@ -5244,7 +5244,10 @@ def _sb_privdns(cfg, nodes):
         tag_of[url] = tag
     for o in cfg.get("outbounds", []):
         if isinstance(o, dict) and o.get("server") in used:
-            o["domain_resolver"] = tag_of[used[o["server"]]]
+            # 写完整的对象，不写简写的字符串：SFA（核心 1.15.0-alpha.13）认不得出站上的简写 "privdns"，
+            # 照样拿 route.default_domain_resolver（阿里）去解，私有名查不到、被藏的节点全不通；
+            # 改成 {"server": "privdns"} 就通（10/30 仓库主人真机实测）。两种写法文档里等价，1.12 起都认
+            o["domain_resolver"] = {"server": tag_of[used[o["server"]]]}
 
 def _sr_direct_ip(path, targets):
     """Shadowrocket：把本机/各 VPS 直连插到 [Rule] 段的 FINAL 上一层（理由同 mihomo）。
