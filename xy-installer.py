@@ -4496,11 +4496,13 @@ def build_shadowrocket_sub(nodes, tpl_url):
     sub = sr_sub_mode()
     lines, names_list, links = [], [], []
     hidden = 0
+    pdns = _sr_privdns_pick(nodes)
     for key, d in nodes:
         name = d.get("name", "") or key                  # 统一用节点池名称（含服务器端前缀）
-        if d.get("_privdns"):
-            # 被藏的节点（私有解析）：小火箭怎么指定 DNS 解析节点地址还没在手机上测出来，写进去也连不上；
-            # 照写真实 IP 又白藏了。仓库主人 10/28：「小火箭的也删掉」——这份先不放，测通了再加回来
+        if d.get("_privdns") and (sub or d["_privdns"] != pdns):
+            # 被藏的节点（私有解析）照放进配置（仓库主人 10/31：「把被藏的节点也加进小火箭吧」），私有名靠
+            # [General] proxy-dns-server 去问它的 DNS 机（_sr_node_dns）。小火箭那一行全局只能指一台：
+            # 指向别的 DNS 机的被藏节点解析不出来，不放；节点订阅（.txt 分享链接）带不了 DNS，也不放
             hidden += 1
             continue
         # 本机 xray 内核的 reality 照写：原先以为小火箭不带 X25519MLKEM768、连不上 xray 26.9.8+ 而跳过，
@@ -4517,7 +4519,7 @@ def build_shadowrocket_sub(nodes, tpl_url):
         except Exception:
             pass
     if hidden:
-        print(f"  小火箭这份不放 {hidden} 个被藏的节点（私有解析，小火箭还没测通）")
+        print(f"  小火箭这份不放 {hidden} 个被藏的节点（" + ("节点订阅带不了 DNS" if sub else "它们的 DNS 机跟 proxy-dns-server 那台不是同一台") + "）")
     if not lines and not links and not hidden:
         return                                           # 全藏了也照样往下生成：不然上一份写着真实 IP 的配置还挂在订阅上
     tpl = fetch_tpl(tpl_url)                                 # 中转改写 + 老锚点名归一
@@ -4997,15 +4999,24 @@ def _sr_selfdns(path, url):
     if new != tpl:
         open(path, "w").write(new)
 
+def _sr_privdns_pick(nodes):
+    """小火箭 proxy-dns-server 全局只能指一台：有被藏的节点时选它们的 DNS 机（多台取被藏节点最多的那台），没有返回 ''。"""
+    cnt = {}
+    for _, d in nodes:
+        if d.get("_privdns"):
+            cnt[d["_privdns"]] = cnt.get(d["_privdns"], 0) + 1
+    return max(sorted(cnt), key=lambda u: cnt[u]) if cnt else ""
+
 def _sr_node_dns(path, url, nodes):
     """Shadowrocket：节点域名用自己的 DNS 解析（仓库主人 10/31：「要不把这个字段你先写进去呗」）。
        小火箭不写 proxy-dns-server 时节点域名走 dns-server（模板里阿里 / 腾讯），每连一次就把节点域名报给国内 DNS。
        官方文档：proxy-dns-server「使用指定 DNS 解析所有节点域名」——跟 sing-box 的 _sb_node_dns 一个意思，取值顺序也一样：
-       本机自建 DoH 写进了订阅 → 用它；否则这份节点里有私有解析的 DNS 机 → 用它；都没有 → 不写，照旧。
-       【还没在 iPhone 上实测】带 ClientID 路径、非 443 端口的 DoH 认不认，文档没说（claude/tools/srtest.py pdns A 测的就是这一行）；
-       它是全局的、只有一台、没有兜底，那台 DNS 挂了所有域名节点一起连不上。被藏的节点照旧不放，测通了再加回来。
+       配置里有被藏的节点（私有解析）→ 用它们的 DNS 机（私有名只有它答得出，公网域名它也照样解析）；
+       否则本机自建 DoH 写进了订阅 → 用它；都没有 → 不写，照旧。
+       没在 iPhone 上实测过（仓库主人 10/31：群管理员说能用，不用测）；带 ClientID 路径、非 443 端口的 DoH 文档没说，
+       claude/tools/srtest.py pdns A 测的就是这一行。它是全局的、只有一台、没有兜底，那台 DNS 挂了所有域名节点一起连不上。
        模板里自己写了 proxy-dns-server 的：当口子用，换成上面那台；都没有就照模板写的。"""
-    url = url or next(iter(_privdns_used(nodes).values()), "")
+    url = _sr_privdns_pick(nodes) or url
     if not url:
         return
     try: tpl = open(path).read()
@@ -5684,7 +5695,7 @@ def _group_by_prefix(links):
 # 公网那条记录照留：订阅、面板、伪装站、Emby 照用。它自己的订阅也换（证书盖得住、DNS 答对了才换，见 _privdns_local_meta）。
 # 客户端：mihomo 要 1.19.20+（proxy-server-nameserver-policy；老内核不认这一项，名字会去问公共 DNS，公共 DNS 回
 # 「查无此名」它也当有效答案——dns/util.go 的 batchExchange 只把 SERVFAIL / REFUSED 当失败——时通时不通）；
-# sing-box 1.12+（出站的 domain_resolver）；小火箭还没在手机上测出写法，被藏的节点小火箭那份先不放（仓库主人 10/28 同意）。
+# sing-box 1.12+（出站的 domain_resolver）；小火箭写 [General] proxy-dns-server 指过去（10/31 起放被藏的节点，见 _sr_node_dns）。
 PRIVDNS_ZONE  = "internal"
 PRIVDNS_GRACE = 7 * 86400        # 外机关掉 / 删掉 / 拉不到以后，映射再留 7 天：没刷新订阅的客户端不会马上断
 _PRIVDNS_MODES = {"off": "关", "self": "本机", "remote": "外机"}
@@ -8319,7 +8330,7 @@ def _privdns_domain_enable(c, mode, dns=""):
         if not cf:
             print("  没填 Token，已取消，没改动")
             return
-    ui_warn("开了以后：节点改用公网查不到的专用域名，小火箭那份不放本机节点"
+    ui_warn("开了以后：节点改用公网查不到的专用域名"
             + ("" if covered else f"；证书要重签（多签 {wild}），节点"
                + ("和 nginx 后面的网站 / Emby" if "nginx" in _cert_consumers() else "") + "断几秒"))
     if _ask("  确认开启? [y/N]: ").strip().lower() not in ("y", "yes"):
@@ -8439,7 +8450,7 @@ def _privdns_set_remote(c):
     if dom:
         _privdns_domain_enable(c, "remote", url)
         return
-    ui_warn("开了以后：汇总本机的订阅里，小火箭那份不放本机节点，本机的直连规则去掉")
+    ui_warn("开了以后：汇总本机的订阅里，本机的直连规则去掉")
     if _ask("  确认开启? [y/N]: ").strip().lower() not in ("y", "yes"):
         print("  已取消，没改动")
         return

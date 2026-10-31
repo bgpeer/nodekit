@@ -299,14 +299,17 @@ check(f"sing-box：1 的出站全指向它（{len(ob)} 个）；地址是 IP 的
                and x._is_ip(str(o.get("server", "")))])
 check("sing-box：1 的 reality 出站 SNI 原样", [o["tls"]["server_name"] for o in ob if o["type"] == "vless"
                                             and o["tls"].get("reality")] == ["www.cisco.com"])
-check("小火箭：1 的节点一个都不放（「小火箭的也删掉」），CDN 那条和 2、3 照放",
-      not re.search(r"(?m)^🇺🇸1·(?!CDN)", sr) and re.search(r"(?m)^🇺🇸1·CDN·vless-ws = ", sr)
+check("小火箭：1 的节点照放（仓库主人 10/31「把被藏的节点也加进小火箭吧」），地址是私有名、没有 1 的 IP；CDN、2、3 照放",
+      re.search(r"(?m)^🇺🇸1·reality-vision = vless," + re.escape(NAME1) + ",", sr) and IP1 not in sr
+      and re.search(r"(?m)^🇺🇸1·CDN·vless-ws = ", sr)
       and re.search(r"(?m)^🇯🇵2·reality-vision = ", sr) and re.search(r"(?m)^🇭🇰3·reality-vision = ", sr))
+check("小火箭：[General] proxy-dns-server 指 1 的 DNS 机（私有名只有它答得出）",
+      re.search(r"(?m)^proxy-dns-server = " + re.escape(DOH) + "$", sr))
 x.sr_sub_mode = lambda: True
 with quiet():
     x.build_shadowrocket_sub(nodes, "conf")
 txt = __import__("base64").b64decode(open(x.SR_NODES_FILE).read()).decode()
-check("小火箭节点订阅（.txt）也不放", IP1 not in txt and NAME1 not in txt and IP2 in txt)
+check("小火箭节点订阅（.txt 分享链接带不了 DNS）照旧不放", IP1 not in txt and NAME1 not in txt and IP2 in txt)
 x.sr_sub_mode = lambda: False
 only = [(k, d) for k, d in nodes if d.get("_privdns")]
 open(x.SR_FILE, "w").write(f"old = vless,{IP1},443\n")
@@ -414,7 +417,7 @@ LOCAL[:] = M1
 out = run_menu("2", "http://bad.example")
 check("地址不对：不认", "不是外机的 DNS 地址" in out and x.privdns_conf()["mode"] == "off")
 out = run_menu("2", DOH, "")
-check("粘了地址、后果用红字一行说清，默认否 → 没改动", "小火箭那份不放本机节点" in out and "已取消" in out
+check("粘了地址、后果用红字一行说清，默认否 → 没改动", "直连规则去掉" in out and "已取消" in out
       and x.privdns_conf()["mode"] == "off")
 ANS.clear()
 out = run_menu("2", DOH, "y")
