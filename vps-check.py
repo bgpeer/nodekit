@@ -371,7 +371,7 @@ def check_bl(ip, name, zone, resolver):
 
 # ---------------------------------------------------------------- 可达性
 SERVICES = [("Google", "www.google.com"), ("YouTube", "www.youtube.com"),
-            ("ChatGPT", "chatgpt.com"), ("Netflix", "www.netflix.com"),
+            ("ChatGPT", "chatgpt.com"), ("Claude", "claude.ai"), ("Netflix", "www.netflix.com"),
             ("Disney+", "www.disneyplus.com"), ("GitHub", "github.com")]
 def reach(host, port=443, timeout=5):
     import time
