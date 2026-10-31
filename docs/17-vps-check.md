@@ -83,7 +83,7 @@ apt/yum/apk 装）。两个按钮：
    - 判定只认**已知骨干**：目的地自己的省级接入 AS（如 AS4835 CHINANET-IDC-SN）不算
      骨干，否则会把真正的骨干判定盖掉。
 3. **IP 黑名单** —— 10 个 DNSBL。
-4. **常用服务可达性** —— Google / YouTube / ChatGPT / Netflix / Disney+ / GitHub 的 443 握手。
+4. **常用服务可达性** —— Google / YouTube / ChatGPT / Claude / Netflix / Disney+ / GitHub 的 443 握手。
 
 > **只测回程**：这里跑的是 VPS→中国。去程（中国→VPS）本机测不到，要在国内侧测——
 > 三网的去程和回程经常走**不同**骨干，别拿回程结论去推去程。
