@@ -401,6 +401,15 @@ LOCAL[:] = []
 x.privdns_save({"mode": "off", "dns": "", "name": ""})
 out = run_menu("2")
 check("还没装节点选 2：一行提示，不改设置", "还没装节点" in out and x.privdns_conf()["mode"] == "off")
+_st = open(x.STATE_FILE).read() if os.path.exists(x.STATE_FILE) else None
+open(x.STATE_FILE, "w").write(json.dumps({"domain": "gg.example.com"}))
+out = run_menu()
+check("关着、用域名装的：一行提示不用建记录、别加 *.根域名（仓库主人 10/31）",
+      "提示：不用在 Cloudflare 建记录；别加 *.example.com 泛解析，加了开不了" in re.sub(r"\033\[[0-9;]*m", "", out))
+open(x.STATE_FILE, "w").write(json.dumps({"domain": ""}))
+check("关着、用 IP 装的：不提示（私有名是 .internal，跟 Cloudflare 无关）", "Cloudflare" not in run_menu())
+if _st is None: os.remove(x.STATE_FILE)
+else: open(x.STATE_FILE, "w").write(_st)
 LOCAL[:] = M1
 out = run_menu("2", "http://bad.example")
 check("地址不对：不认", "不是外机的 DNS 地址" in out and x.privdns_conf()["mode"] == "off")

@@ -8483,6 +8483,13 @@ def privdns_menu():
             ui_kv("节点专用域名", c["name"] + ("" if ok else _hl("1;31", "（证书没盖住，节点照用公网域名）")))
             if not ok:
                 tip = "再选一次 " + ("1" if c["mode"] == "self" else "2") + " 就补签证书"
+        if c["mode"] == "off" and not tip:
+            # 仓库主人 10/31：跟 DNS / Emby / CDN 那几处相反，这项不用建记录；根域名泛解析会让私有名公网查得到，开不了。
+            # 用 IP 装的机器私有名是 .internal，跟 Cloudflare 无关，不提示
+            try: _nd = json.load(open(STATE_FILE)).get("domain") or ""
+            except Exception: _nd = ""
+            if _nd:
+                tip = f"不用在 Cloudflare 建记录；别加 *.{_root_domain(_nd)} 泛解析，加了开不了"
         ui_line()
         ui_items([(1, "本机DNS解析", None), (2, "外机DNS解析", None), (3, "关", None), (0, "返回", None)])
         if tip:
