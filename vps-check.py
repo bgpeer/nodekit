@@ -8,7 +8,7 @@
 #   2. 查不准就明说，不给"自信但错误"的结论。GIA/GT 的细分本脚本【不下结论】，
 #      只把证据（59.43 跳、跳数、延迟）摆出来——理由见文件末尾「局限」。
 # ============================================================================
-import ipaddress, json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, concurrent.futures as cf
+import ipaddress, json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, urllib.error, concurrent.futures as cf
 
 # 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
 # vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
@@ -372,7 +372,9 @@ def check_bl(ip, name, zone, resolver):
 # ---------------------------------------------------------------- 可达性
 SERVICES = [("Google", "www.google.com"), ("YouTube", "www.youtube.com"),
             ("ChatGPT", "chatgpt.com"), ("Claude", "claude.ai"), ("Netflix", "www.netflix.com"),
-            ("Disney+", "www.disneyplus.com"), ("TikTok", "www.tiktok.com"), ("GitHub", "github.com")]
+            ("Disney+", "www.disneyplus.com"), ("TikTok", "www.tiktok.com"), ("GitHub", "github.com"),
+            ("Gemini", "gemini.google.com"), ("Spotify", "www.spotify.com"), ("Prime Video", "www.primevideo.com"),
+            ("HBO Max", "www.hbomax.com"), ("B站港澳台", "api.bilibili.com")]
 def reach(host, port=443, timeout=5):
     import time
     t0 = time.time()
@@ -610,8 +612,162 @@ def report_reach(num="四"):
     hr("·")
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         for (lab, host), ms in zip(SERVICES, ex.map(lambda s: reach(s[1]), SERVICES)):
-            if ms is None: print(f"  {C['r']}✗ {lab:<10} 连不上{C['n']}")
-            else:          print(f"  {C['g']}✓ {lab:<10} {ms} ms{C['n']}")
+            if ms is None: print(f"  {C['r']}✗ {_pad(lab, 12)}连不上{C['n']}")
+            else:          print(f"  {C['g']}✓ {_pad(lab, 12)}{ms} ms{C['n']}")
+
+def _pad(s, w):
+    """按终端显示宽度补空格（中文占两格），列才对得齐。"""
+    return s + " " * max(1, w - sum(2 if ord(ch) > 0x2E7F else 1 for ch in s))
+
+# ---------------------------------------------------------------- 解锁检测
+# 仓库主人 10/31：「再做个真解锁检测」。可达性只看 443 握不握得上手，这里真去请求页面 / 接口，看返回内容和区域判定。
+# 判断方法照公开的解锁检测脚本常用的那几处（片子页 / 接口返回 / 页面里的地区字段）；各家改版后可能对不上——
+# 对不上就报「?」，不硬下结论（本文件开头第 2 条原则）。
+# 这一节用浏览器 UA：几家对 curl UA 直接回挑战页或另一套内容，用 curl 串测出来的不是真实结果。
+# 它不自报家门（不是 nodekit / xy-installer 这类串），跟仓库「不泄漏」的规矩不冲突，同 media-stack 的 BROWSER_UA。
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+def _get(url, timeout=10, headers=None, data=None):
+    """→ (状态码, 最终网址, 正文)；连不上 (0, url, "")。4xx / 5xx 照样把正文读回来（有的家用 404 表示没解锁）。"""
+    h = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
+    h.update(headers or {})
+    try:
+        resp = urllib.request.urlopen(urllib.request.Request(url, headers=h, data=data), timeout=timeout)
+        return resp.status, resp.geturl(), resp.read(600000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        try: body = e.read(600000).decode("utf-8", "replace")
+        except Exception: body = ""
+        return e.code, e.geturl() or url, body
+    except Exception:
+        return 0, url, ""
+
+def _cf_loc(host):
+    """Cloudflare 后面的站：/cdn-cgi/trace 里的 loc= 就是它认为你在哪。"""
+    m = re.search(r"(?m)^loc=([A-Z]{2})$", _get(f"https://{host}/cdn-cgi/trace", timeout=8)[2])
+    return m.group(1) if m else ""
+
+# 结果：(级别, 说明)。级别 ok=解锁 / part=部分 / no=不支持 / ?=判断不了
+def ul_netflix():
+    # 81280792 乐高忍者（非自制）、70143836 绝命毒师（非自制）、80018499 自制剧：非自制能看 = 全解锁
+    def avail(tid):
+        code, url, body = _get(f"https://www.netflix.com/title/{tid}")
+        if code == 0: return None, ""
+        m = re.search(r'"requestCountry":\{"id":"([A-Z]{2})"', body) or re.search(r'netflix\.com/([a-z]{2})(?:-[a-z]{2})?/title', url)
+        reg = m.group(1).upper() if m else ""
+        return code == 200 and "Oh no!" not in body and "page-404" not in body, reg
+    a, reg = avail(81280792)
+    if a is None: return "?", "连不上"
+    b, reg2 = avail(70143836)
+    if a or b: return "ok", f"全解锁（{reg or reg2 or '地区未知'}）"
+    c, reg3 = avail(80018499)
+    if c: return "part", f"仅自制剧（{reg3 or '地区未知'}）"
+    return "no", "不支持"
+
+def ul_youtube():
+    code, _, body = _get("https://www.youtube.com/premium", headers={"Cookie": "CONSENT=YES+cb"})
+    if code == 0: return "?", "连不上"
+    m = re.search(r'"INNERTUBE_CONTEXT_GL":"([A-Z]{2})"', body) or re.search(r'"countryCode":"([A-Z]{2})"', body)
+    reg = m.group(1) if m else ""
+    if "www.google.cn" in body: return "no", "不支持（CN）"
+    if "Premium is not available in your country" in body: return "no", f"不支持 Premium（{reg or '地区未知'}）"
+    if "ad-free" in body.lower() or "youtube premium" in body.lower():
+        return "ok", f"Premium 可用（{reg or '地区未知'}）"
+    return "?", f"页面对不上（{reg or '地区未知'}）"
+
+def ul_chatgpt():
+    code, _, body = _get("https://api.openai.com/compliance/cookie_requirements",
+                         headers={"Authorization": "Bearer null"})
+    reg = _cf_loc("chatgpt.com")
+    if code == 0: return "?", "连不上"
+    if "unsupported_country" in body: return "no", f"不支持（{reg or '地区未知'}）"
+    _, _, ios = _get("https://ios.chat.openai.com/")
+    if "VPN" in ios: return "part", f"网页可用、App 被拦（{reg or '地区未知'}）"
+    return "ok", f"可用（{reg or '地区未知'}）"
+
+# Claude 明确不服务的地区（Anthropic 支持地区页上没有的几个常见的）；落在这里面就算不支持
+_CLAUDE_NO = {"CN", "HK", "MO", "RU", "BY", "IR", "KP", "SY", "CU"}
+def ul_claude():
+    code, url, _ = _get("https://claude.ai/")
+    reg = _cf_loc("claude.ai")
+    if "unavailable" in url: return "no", f"不支持（{reg or '地区未知'}）"
+    if reg in _CLAUDE_NO: return "no", f"不支持（{reg}）"
+    if code == 0 and not reg: return "?", "连不上"
+    return "ok", f"可用（{reg or '地区未知'}）"
+
+def ul_gemini():
+    code, _, body = _get("https://gemini.google.com/")
+    if code == 0: return "?", "连不上"
+    m = re.search(r',2,1,200,"([A-Z]{3})"', body)
+    reg = m.group(1) if m else ""
+    if "45631641,null,true" in body: return "ok", f"可用（{reg or '地区未知'}）"
+    return "no", f"不支持（{reg or '地区未知'}）"
+
+def ul_tiktok():
+    code, _, body = _get("https://www.tiktok.com/")
+    if code == 0: return "?", "连不上"
+    m = re.search(r'"region":"([A-Z]{2})"', body)
+    if m: return "ok", f"可用（{m.group(1)}）"
+    return "?", "页面里没找到地区"
+
+def ul_spotify():
+    code, url, _ = _get("https://www.spotify.com/")
+    if code == 0: return "?", "连不上"
+    if "select-your-country" in url: return "no", "不支持"
+    m = re.search(r"spotify\.com/([a-z]{2})(?:-[a-z]{2})?/", url)
+    return ("ok", f"可用（{m.group(1).upper()}）") if m else ("?", "跳转里没找到地区")
+
+def ul_prime():
+    code, _, body = _get("https://www.primevideo.com/")
+    if code == 0: return "?", "连不上"
+    m = re.search(r'"currentTerritory":"([A-Z]{2})"', body)
+    return ("ok", f"可用（{m.group(1)}）") if m else ("no", "不支持")
+
+def ul_hbomax():
+    code, url, _ = _get("https://www.hbomax.com/")
+    if code == 0: return "?", "连不上"
+    if "geo-availability" in url or "unavailable" in url: return "no", "不支持"
+    m = re.search(r"hbomax\.com/([a-z]{2})/", url)
+    return ("ok", f"可用（{m.group(1).upper()}）") if m else ("?", "跳转里没找到地区")
+
+def ul_disney():
+    code, url, body = _get("https://www.disneyplus.com/")
+    if code == 0: return "?", "连不上"
+    if "unavailable" in url or "not available in your region" in body.lower(): return "no", "不支持"
+    m = re.search(r'"region":"([A-Z]{2})"', body)
+    return ("ok", f"可能可用（{m.group(1)}，要登录才能确认）") if m else ("?", "要登录才能确认")
+
+def ul_bilibili():
+    # 港澳台限定番的一集：code 0 = 能播，-10403 = 地区不允许
+    code, _, body = _get("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777"
+                         "&qn=0&type=&otype=json&ep_id=183799&fourk=1&fnver=0&fnval=16")
+    if code == 0: return "?", "连不上"
+    try: c = json.loads(body).get("code")
+    except Exception: return "?", "返回对不上"
+    if c == 0: return "ok", "港澳台可看"
+    if c == -10403: return "no", "不支持（非港澳台 IP）"
+    return "?", f"返回 {c}"
+
+UNLOCKS = [("Netflix", ul_netflix), ("YouTube", ul_youtube), ("Disney+", ul_disney), ("Prime Video", ul_prime),
+           ("HBO Max", ul_hbomax), ("Spotify", ul_spotify), ("TikTok", ul_tiktok), ("ChatGPT", ul_chatgpt),
+           ("Claude", ul_claude), ("Gemini", ul_gemini), ("B站港澳台", ul_bilibili)]
+
+def check_unlock():
+    """解锁检测：真去请求各家的页面 / 接口，看能不能用、被判成哪个地区。"""
+    print(f"\n{C['b']}流媒体 / AI 解锁检测{C['n']}")
+    print(f"  {C['d']}按各家页面 / 接口的返回判断；页面改版对不上的报「?」，不硬下结论{C['n']}")
+    hr("·")
+    sym = {"ok": (C["g"], "✓"), "part": (C["y"], "◐"), "no": (C["r"], "✗"), "?": (C["d"], "?")}
+    def run(f):
+        try: return f()
+        except Exception: return "?", "检测出错"
+    with cf.ThreadPoolExecutor(max_workers=6) as ex:
+        for (lab, _), (lv, note) in zip(UNLOCKS, ex.map(lambda u: run(u[1]), UNLOCKS)):
+            col, s = sym.get(lv, sym["?"])
+            print(f"  {col}{s} {_pad(lab, 12)}{note}{C['n']}")
+    hr("·")
+    print(f"  {C['d']}✓ 解锁　◐ 部分（仅自制剧 / App 被拦）　✗ 不支持　? 判断不了{C['n']}")
+    return 0
 
 def _conclude_routes(v):
     """把三网判定压成一行一家，看得见差异。"""
@@ -704,7 +860,7 @@ def check_local():
           f"\n     去联通、去移动的长途段也是 59.43——这正是它卖的东西。落地进了哪家的网"
           f"\n     单独列在『→』后面（移动的落地是 CMNET/AS9808，那是移动国内网，"
           f"\n     跟线路档次无关）。两件事分开看，别混成一件。")
-    print(f"  4. 「可达」≠「解锁」。流媒体解锁要看区域判定，需专门的解锁检测脚本。")
+    print(f"  4. 「可达」≠「解锁」。真解锁回 17 菜单选「3 解锁检测」。")
     print(f"  5. 黑名单标「未知」的项是被拒答/超时，不是干净。")
     return 0
 
@@ -848,6 +1004,8 @@ def show_hops(ip):
     return 0
 
 def main():
+    if "--unlock" in sys.argv:
+        return check_unlock()
     if "--hops" in sys.argv:
         rest = sys.argv[sys.argv.index("--hops") + 1:]
         if not rest:
