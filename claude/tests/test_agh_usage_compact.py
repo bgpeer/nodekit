@@ -57,9 +57,10 @@ check(f"比原来短（{len(lines)} 行）", len(lines) < 76)
 ALLOW[0] = [CID]
 out = show()
 check("白名单已设：第三步一行 ✓、明文 53 会被挡一行提示", "✓ 已设好" in out and "明文 53 没法带 ID" in out)
-L = out.splitlines()
-check("白名单已设：ID 顶格单独一行、不带括号（仓库主人 10/31：复制时会把括号带进去）",
-      CID in L and L[L.index(CID) - 1].rstrip().endswith("已设好") and f"（{CID}）" not in out)
+import re as _re
+L = [_re.sub(r"\033\[[0-9;]*m", "", x) for x in out.splitlines()]
+check("白名单已设：ID 跟在「已设好」后面同一行、不带括号（仓库主人 10/31）",
+      any(x.strip() == "允许的客户端：✓ 已设好　" + CID for x in L) and f"（{CID}）" not in out)
 a._cert_wildcard_ok = lambda d: False
 out = show()
 check("白名单已设、没签泛域名：红字一行说安卓会被挡", "安卓专用 DNS 会被挡" in out)
