@@ -58,6 +58,9 @@ ALLOW[0] = [CID]
 out = show()
 check("白名单已设：第三步一行 ✓、明文 53 会被挡一行提示", "✓ 已设好" in out and "明文 53 没法带 ID" in out)
 import re as _re
+check("白名单已设：明文 DNS 不再列（IP 不上「使用场景」和「要填的几行」，填了也被拒）",
+      "③ 明文 DNS" not in out and "明文 DNS（电视" not in out and IP not in out.split("【DNS 使用场景】")[1].split("AdGuard Home 状态参数")[0]
+      and IP not in out.split("要填的就这几行")[1])
 L = [_re.sub(r"\033\[[0-9;]*m", "", x) for x in out.splitlines()]
 check("白名单已设：ID 跟在「已设好」后面同一行、不带括号（仓库主人 10/31）",
       any(x.strip() == "允许的客户端：✓ 已设好　" + CID for x in L) and f"（{CID}）" not in out)

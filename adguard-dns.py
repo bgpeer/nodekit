@@ -692,10 +692,12 @@ def _usage(port=None, head=None):
         print(f"    ② DoT 加密 —— 安卓「专用DNS」，全系统生效，{Y}最推荐{N}（放行 853/TCP）")
         print("       设置 → 网络 → 专用DNS → 私人DNS提供商主机名：")
         print(dot_host)
-    print(f"    ③ 明文 DNS —— 电视 / 盒子 / IoT / 路由器（放行 53/UDP+TCP；53 被占选菜单 9 自检）")
-    print(ip)
+    # 设了白名单：明文 53 带不了 ClientID、谁来都被拒，IP 列出来也是填了用不了——只留一行提示（仓库主人 10/31）
     if allow:
         ui_tip("设了允许的客户端，明文 53 没法带 ID，会被挡")
+    else:
+        print(f"    ③ 明文 DNS —— 电视 / 盒子 / IoT / 路由器（放行 53/UDP+TCP；53 被占选菜单 9 自检）")
+        print(ip)
     ui_tip("想多拦广告：后台 → 过滤器 → DNS 拦截列表 → 添加 https://anti-ad.net/easylist.txt")
 
     print("\n  " + "=" * 56)
@@ -734,7 +736,8 @@ def _usage(port=None, head=None):
         items.append(("AdGuard 后台 → DNS 设置 → 允许的客户端", cid))
     if dom:
         items.append(("DoH 地址（浏览器 / App）", doh_url))
-    items.append(("明文 DNS（电视 / 盒子 / 路由器）", ip))
+    if not allow:                                    # 设了白名单明文 53 全被拒，不列
+        items.append(("明文 DNS（电视 / 盒子 / 路由器）", ip))
     for i, (label, val) in enumerate(items):         # 条与条之间空一行（CLAUDE.md 第五节）
         ui_url(label, val)
         if i < len(items) - 1:
