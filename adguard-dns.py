@@ -2354,7 +2354,7 @@ def menu():
         ui_kv("当前状态", st)
         ui_line()
         ui_items([(1, "安装", None),
-                  (2, "使用方法（设备怎么填）", None),
+                  (2, "使用方法（安装完后观看）", None),
                   (3, "自建 DNS 写入订阅", "已写入" if os.path.exists(SELFDNS_FLAG) else "未写入"),
                   (4, "节点使用私有DNS解析", {"self": "本机", "remote": "外机"}.get(_privdns_mode(), "关")),
                   (5, "DoT 带 ClientID（签泛域名证书）", None),
