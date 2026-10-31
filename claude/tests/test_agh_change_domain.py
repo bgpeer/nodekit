@@ -123,6 +123,18 @@ print("签不下来 / 不该换的")
 reset(); ISSUE_OK[0] = False
 out = go(["", "y"])
 check("证书没签下来：什么都没改", open(Y).read() == YAML and not os.path.exists(a.AGH_DOMAIN_FILE) and "什么都没改" in out)
+reset(); ISSUE_OK[0] = False
+_real_run = a.subprocess.run
+def leave_dir(cmd, **k):                     # acme.sh 签失败也会建记录目录（10/31 DMIT 真机）
+    os.makedirs(ACME + "/dns.zone.example_ecc", exist_ok=True)
+    return _real_run(cmd, **k)
+a.subprocess.run = leave_dir
+go(["", "y"])
+a.subprocess.run = _real_run
+check("签失败留下的记录目录清掉（不然改好令牌回来再换，被「已经有一张证书在用」拦住）",
+      not os.path.isdir(ACME + "/dns.zone.example_ecc") and any("--remove -d dns.zone.example --ecc" in c for c in SH))
+reset(); out = go(["", "y"])
+check("清掉以后再试：能换", "✔ 自建 DNS 换成 dns.zone.example" in out)
 reset(own="dns.zone.example"); y0 = open(Y).read(); out = go(["node.zone.example", "y"])
 check("跟节点同一个域名：不签、不改", not RUN and open(Y).read() == y0 and "已经有一张证书在用" in out)
 reset(); os.makedirs(ACME + "/*.media.zone.example_ecc", exist_ok=True)
