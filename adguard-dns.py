@@ -13,8 +13,8 @@
 #   - 加密走 DoT(853，自建 DNS 自己的域名和证书，10/29 起跟节点分开；老装法复用节点的 acme 证书)：安卓「专用 DNS」填域名即可全系统生效；
 #     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
 #   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
-#   - 卸载(菜单2)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
-#     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 8 里的「删除 DoT」
+#   - 卸载(菜单10)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
+#     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 5 里的「删除 DoT」
 #     只撤泛域名证书这一项，AdGuard 本体继续跑。
 import os, re, sys, time, json, shlex, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
 
@@ -232,7 +232,7 @@ def install():
             if not _auto_setup():
                 _first_setup()
             return
-        print("  AdGuard Home 已经装过了。要重装请先『2 卸载』再装。")
+        print("  AdGuard Home 已经装过了。要重装请先『10 卸载』再装。")
         _usage(); return
     dom = _setup_own_domain()
     if not dom:
@@ -261,7 +261,7 @@ def install():
     else:
         print("\n  已安装，但服务暂未在运行——稍等或看 `systemctl status AdGuardHome`。")
     if not _auto_setup():   # 替你走完网页向导：随机后台端口 + 你设的账号密码（仓库主人 10/30）
-        _first_setup()      # 没走成：照旧网页向导，统一用默认 3000（先保证进得去），装好后菜单 5 改端口
+        _first_setup()      # 没走成：照旧网页向导，统一用默认 3000（先保证进得去），装好后菜单 7 改端口
 
 def _setup_own_domain():
     """装之前给自建 DNS 一个它自己的域名、签一张它自己的证书（域名 + *.域名，DoT 带 ClientID 要泛域名），
@@ -426,7 +426,7 @@ def _auto_setup():
     if not ok:
         print(f"  {Y}⚠ 设好了，可新端口 {port} 还没起来：等一会儿再打开，或 systemctl status AdGuardHome 看原因{N}")
     ip = _public_ip()
-    print(f"\n  {G}✔ 后台设好了：用户名 {user}，后台端口 {port}（随机，以后菜单 5 可改）{N}")
+    print(f"\n  {G}✔ 后台设好了：用户名 {user}，后台端口 {port}（随机，以后菜单 7 可改）{N}")
     ui_url("后台地址（云防火墙放行这个端口 TCP）", f"http://{ip}:{port}")
     _usage(port)
     return True
@@ -436,20 +436,20 @@ def _first_setup():
     print("\n  === 下一步：打开网页后台完成初始化（2 分钟）===")
     print(f"  1) 浏览器打开安装向导：\033[1;32mhttp://{ip}:{WEB_PORT}\033[0m（先在防火墙放行 {WEB_PORT}/TCP）")
     print("  2) 向导里两个端口按这样填（\033[1;33m别用默认的 80\033[0m）：")
-    print(f"     · 网页管理界面 端口 → 就填默认的 \033[1;32m{WEB_PORT}\033[0m（\033[1;33m初装先用它保证进得去\033[0m；想换防扫描端口，装好后回菜单选 5 改，改完连不上会自动回滚、锁不死）")
-    print("     · DNS 服务器 端口 → 保持 \033[1;32m53\033[0m（装前已帮你腾好；仍报红就回菜单选 4 腾53）")
+    print(f"     · 网页管理界面 端口 → 就填默认的 \033[1;32m{WEB_PORT}\033[0m（\033[1;33m初装先用它保证进得去\033[0m；想换防扫描端口，装好后回菜单选 7 改，改完连不上会自动回滚、锁不死）")
+    print("     · DNS 服务器 端口 → 保持 \033[1;32m53\033[0m（装前已帮你腾好；仍报红就回菜单选 9 自检，查到会问腾不腾）")
     print("  3) 设管理员账号密码 → 完成。广告过滤（AdGuard DNS filter）默认就是开的。")
     print(f"  4) 完成后后台地址就是 \033[1;32mhttp://{ip}:{WEB_PORT}\033[0m；想改端口防扫描，回菜单选 \033[1;32m5\033[0m 改（带回滚，安全）")
     _usage(WEB_PORT)
 
 SELFDNS_FLAG     = BGP_DIR + "/selfdns.on"        # 主脚本：自建 DNS 是否已写进订阅
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid"  # 主脚本生成的 AdGuard ClientID
-PRIVDNS_FILE     = BGP_DIR + "/privdns.json"      # 主脚本：节点使用私有DNS解析（菜单 11；关 / 本机 / 外机）
+PRIVDNS_FILE     = BGP_DIR + "/privdns.json"      # 主脚本：节点使用私有DNS解析（菜单 4；关 / 本机 / 外机）
 
 def _selfdns_clientid():
     """AdGuard ClientID（DoH 网址末段 / DoT 主机名最前一段 / 「允许的客户端」里填的那串）。没有就生成一个存下来：
        跟主脚本 selfdns_clientid 同一个文件、同一种格式（xy + 12 位十六进制），谁先用谁生成，另一边读到的是同一个。
-       以前这边只读、得先去菜单 6 打开一次才有——仓库主人签完泛域名证书，屏上还是「ClientID 还没有」，
+       以前这边只读、得先去菜单 3 打开一次才有——仓库主人签完泛域名证书，屏上还是「ClientID 还没有」，
        安卓该填的那行主机名也出不来（10/12：「写一大堆，就是不写重要信息」）。
        它等于一把口令（填进白名单后只认它），文件 root-only。写不进去返回 ''。"""
     try:
@@ -533,7 +533,7 @@ def _install_cert_guarded(acme, dom, reload_hook, what=""):
             shutil.copyfile(p, bak[p])
     sh(f"{acme} --install-cert -d {dom} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{reload_hook}")
-    root = _privdns_root()                             # 节点专用域名（菜单 11）也是节点在用的，一样得盖住
+    root = _privdns_root()                             # 节点专用域名（菜单 4）也是节点在用的，一样得盖住
     have = _cert_names(ACME_CRT)
     miss = nd if nd and not _name_covers(have, nd) else \
         (f"*.{root}" if root and not _name_covers(have, "x." + root) else "")
@@ -619,7 +619,7 @@ def _allowed_clients():
         return None
 
 def _usage(port=None, head=None):
-    """使用方法（菜单 3）：三步设置 → 三种用法 → 状态 / 当前配置 / 要填的几行。
+    """使用方法（菜单 2）：三步设置 → 三种用法 → 状态 / 当前配置 / 要填的几行。
        仓库主人 10/30 照着自己的写法重排：「啰嗦的写一堆眼都看花了」——步骤只留要点的那一行，值从这台机实时读、高亮；
        原委（白名单为什么挡安卓、DoH 为什么带端口、广告拦得到哪一步）留在注释和文档里，不上屏。
        head：状态那几行（status() 传进来），放在当前配置前面。"""
@@ -642,7 +642,7 @@ def _usage(port=None, head=None):
     else:
         print(f"    浏览器打开：{G}http://{ip}:{port}{N}")
     if not os.path.exists(_agh_yaml()):              # 还没走过向导（自动设置没成）：浏览器里设账号，端口照 3000
-        print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 5 可改）")
+        print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 7 可改）")
 
     print(f"\n  {C}【第二步 · 设置加密】{N}")
     if dom:
@@ -672,11 +672,11 @@ def _usage(port=None, head=None):
     if not cid:
         print(f"    {Y}ClientID 没生成出来（{BGP_DIR} 写不进去？），允许的客户端先不设{N}")
     elif allow and dom and not wild:
-        print(f"    {R}⚠ 允许的客户端已设、没签泛域名证书：安卓专用 DNS 会被挡{N}（菜单 8 签证书，或清空允许的客户端）")
+        print(f"    {R}⚠ 允许的客户端已设、没签泛域名证书：安卓专用 DNS 会被挡{N}（菜单 5 签证书，或清空允许的客户端）")
     elif allow:
         print(f"    允许的客户端：{G}✓ 已设好{N}（{', '.join(allow)}）")
     elif dom and not wild:
-        print(f"    允许的客户端：{Y}先做菜单 8 签泛域名证书再填{N}（不然安卓专用 DNS 会被挡）")
+        print(f"    允许的客户端：{Y}先做菜单 5 签泛域名证书再填{N}（不然安卓专用 DNS 会被挡）")
     else:
         print("    下滑到 允许的客户端，框里只填这个 ID → 保存配置：")
         print(cid)
@@ -688,7 +688,7 @@ def _usage(port=None, head=None):
         print(f"    ② DoT 加密 —— 安卓「专用DNS」，全系统生效，{Y}最推荐{N}（放行 853/TCP）")
         print("       设置 → 网络 → 专用DNS → 私人DNS提供商主机名：")
         print(dot_host)
-    print(f"    ③ 明文 DNS —— 电视 / 盒子 / IoT / 路由器（放行 53/UDP+TCP；53 被占选菜单 4）")
+    print(f"    ③ 明文 DNS —— 电视 / 盒子 / IoT / 路由器（放行 53/UDP+TCP；53 被占选菜单 9 自检）")
     print(ip)
     if allow:
         ui_tip("设了允许的客户端，明文 53 没法带 ID，会被挡")
@@ -715,7 +715,7 @@ def _usage(port=None, head=None):
     else:
         print(f"    访问白名单    : {R}未设置 —— 对全公网开放（第三步）{N}")
     # 三个订阅都写：mihomo / 小火箭放 DNS 列表最前，sing-box 换掉 dns.final（见主脚本 _*_selfdns）
-    print(f"    写入订阅      : {(G+'已写入 mihomo/sing-box/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 6 开关）'+N)}")
+    print(f"    写入订阅      : {(G+'已写入 mihomo/sing-box/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 3 开关）'+N)}")
 
     # 要填的就这几行：标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）。
     # 【列出来的几行不能互相打架】10/14：照着把 ClientID 填进「允许的客户端」，安卓专用 DNS 当场断了——
@@ -810,7 +810,7 @@ def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
 
        同样是失败安全的：acme.sh 只有签发成功才覆盖证书文件。
 
-       两个调用方：菜单 8 的「删除 DoT」用默认参数——单独撤这一项，要自己确认，Token
+       两个调用方：菜单 5 的「删除 DoT」用默认参数——单独撤这一项，要自己确认，Token
        清不清也再问一次；卸载流程用 ask=False, auto_token=True——那边总确认里已经把这件
        事列出来过了，不该在中途再拦一次，Token 也没有留着的理由，直接清。"""
     G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
@@ -827,7 +827,7 @@ def _revert_wildcard(dom, cid="", ask=True, auto_token=False):
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
         print(f"  {R}找不到 acme.sh{N}，无法重签。"); return
-    root = _privdns_root()                        # 节点专用域名（菜单 11）还要 *.根域名：只能 DNS-01，令牌留着
+    root = _privdns_root()                        # 节点专用域名（菜单 4）还要 *.根域名：只能 DNS-01，令牌留着
     http01 = not _port_busy(80) and not root
     if http01:
         issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256 --server letsencrypt --force"
@@ -917,7 +917,7 @@ def dot_clientid():
         ui_items([(1, "更换 Cloudflare API 令牌（泄露了 / 被吊销了）", None),
                   (2, "删除 DoT ClientID 支持（证书改回单域名，AdGuard 照常跑）", None),
                   (0, "返回", None)])
-        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 2")
+        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 10")
         c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
@@ -929,7 +929,7 @@ def dot_clientid():
         return
     if _own_domain():                                     # 自己那张装的时候就带 *.域名；没有说明证书出了岔子
         print(f"  {R}⚠ 自建 DNS 自己的证书里没有 *.{dom}{N}")
-        ui_tip("卸了重装自建 DNS（菜单 2 → 1），装的时候会重签"); return
+        ui_tip("卸了重装自建 DNS（菜单 10 → 1），装的时候会重签"); return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
     print(f"\n  {Y}需要你先准备两样：{N}")
@@ -957,7 +957,7 @@ def dot_clientid():
         print("  找不到 acme.sh —— 你的证书可能不是本脚本签的，不便自动接管。"); return
 
     print(f"\n  正在签发（DNS-01 验证，需要等 CF 记录传播，约 1-2 分钟）…")
-    root = _privdns_root()                                # 节点专用域名（菜单 11）要的 *.根域名，一起签上
+    root = _privdns_root()                                # 节点专用域名（菜单 4）要的 *.根域名，一起签上
     issue = (f"CF_Token='{token}' {acme} --issue --dns dns_cf "
              f"-d {dom} -d '*.{dom}'" + (f" -d '*.{root}'" if root else "") +
              " --keylength ec-256 --server letsencrypt")
@@ -995,7 +995,7 @@ def dot_clientid():
             print(f"  {G}✓ 用 {cid}.{dom} 做 SNI 实测 DoT 查询成功{N}")
         else:
             print(f"  {Y}⚠ DoT 实测没通过（{err or 'rcode=' + str(rc)}）{N}——证书是对的，"
-                  f"可能是 853 端口没开或 AdGuard 还没起好，稍后用菜单 7 自检再看。")
+                  f"可能是 853 端口没开或 AdGuard 还没起好，稍后用菜单 9 自检再看。")
 
     print(f"\n  {G}✔ 做完了{N}\n")
     ui_url("安卓「专用DNS」主机名", f"{cid}.{dom}" if cid else "")
@@ -1023,6 +1023,19 @@ def _do_free53():
         print(f"  （撤销：删 {RESOLVED_DROPIN} 后 systemctl restart systemd-resolved；卸载时会自动还原）")
     except OSError as e:
         print("  腾 53 失败:", e)
+
+def _selfcheck_more():
+    """自检之后两问（10/31 并进来的「腾出 53 端口」「手机实测」，原来是单独两项）：
+       53 被 systemd-resolved 占着才问腾不腾；再问要不要手机实测。都默认否。"""
+    if not _installed():
+        return
+    b53 = _port_busy(53)
+    if b53 and "AdGuardHome" not in b53 and "systemd" in b53:
+        print()
+        ui_tip("53 被 systemd-resolved 占着，明文 DNS 用不了")
+        free_port53()
+    if _ask("\n  接着做手机实测（开私人 DNS，看它连没连进来）? [y/N]: ").strip().lower() in ("y", "yes"):
+        phone_probe()
 
 def free_port53():
     """菜单入口：腾出 53 端口（关 systemd-resolved 桩监听，可逆）。"""
@@ -1125,7 +1138,7 @@ def status():
     _usage(port, head)
 
 def _selfdns_remove():
-    """卸载 AdGuard 时：若之前用菜单 6 把自建 DNS 写进过订阅，就交给主脚本从订阅移除并刷新
+    """卸载 AdGuard 时：若之前用菜单 3 把自建 DNS 写进过订阅，就交给主脚本从订阅移除并刷新
        （没写入则主脚本内部静默跳过）。避免订阅里留着指向已卸载 AGH 的死 DoH。"""
     xy = BGP_DIR + "/xy-installer.py"
     if os.path.exists(xy):
@@ -1184,7 +1197,7 @@ def uninstall(refresh_sub=True):
        为什么不只是删服务：这些东西是连在一起的一整套，只删 AdGuard 会留下一地孤儿——
        订阅里还指着一个没人应答的 DoH、证书上挂着没用的 *.域名、acme.sh 里躺着续期用的
        CF Token、本机解析还钉在公共 DNS 上。用户点「卸载」的意思是这套东西整个不要了。
-       （菜单 8 的「删除 DoT」是另一回事：只撤泛域名证书这一项，AdGuard 本体照常跑。）
+       （菜单 5 的「删除 DoT」是另一回事：只撤泛域名证书这一项，AdGuard 本体照常跑。）
 
        各项彼此独立、按「先撤依赖它的，再撤它本身」排序，中间某项失败不影响后面：证书
        重签失败原证书原封不动，本机解析还原不通会自动退回能用的状态。"""
@@ -1204,7 +1217,7 @@ def uninstall(refresh_sub=True):
     print("    · AdGuard Home 服务 + /opt/AdGuardHome")
     print(f"      （{Y}后台设置、允许的客户端、过滤规则、查询日志全部删除，不可恢复{N}）")
     if subw: print("    · 订阅里写入的自建 DoH —— 移除并刷新订阅")
-    if prv:  print("    · 节点私有解析（菜单 11 选了「本机DNS解析」）—— 关掉，外机节点改回真实地址")
+    if prv:  print("    · 节点私有解析（菜单 4 选了「本机DNS解析」）—— 关掉，外机节点改回真实地址")
     if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
                    f"顺带清掉 acme.sh 存的 CF Token\n"
                    f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
@@ -1445,7 +1458,7 @@ def selfcheck():
     """一键自检：服务 / 监听 / 证书 / 真实解析 / 访问控制 / 本机防火墙。只读不改任何配置。"""
     G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
     ok, warn, bad = f"{G}✓{N}", f"{Y}⚠{N}", f"{R}✗{N}"
-    print("\n" + "=" * 60 + "\n  自建DNS 自检（只读，不会改任何配置）\n" + "=" * 60)
+    print("\n" + "=" * 60 + "\n  自建DNS 自检（只查不改；要改的查完再问）\n" + "=" * 60)
     if not _installed():
         print(f"  {bad} 还没装 AdGuard Home——先回菜单选『1 安装』。"); return
     dom, ip = _domain(), _public_ip()
@@ -1478,7 +1491,7 @@ def selfcheck():
         print(f"    {ok} 53   明文DNS  由 AdGuardHome 监听")
     elif b53:
         print(f"    {bad} 53   被 {R}{b53}{N} 占着，不是 AdGuardHome —— 明文DNS用不了")
-        fix.append("腾 53：回菜单选『4 腾出 53 端口』")
+        fix.append("腾 53：自检查完会问（只认 systemd-resolved 占的）")
     else:
         print(f"    {warn} 53   没人监听 —— 明文DNS用不了（AGH 可能没配 53 或没起来）")
     if web:
@@ -1488,7 +1501,7 @@ def selfcheck():
     if not enc_on:
         print(f"    {warn} 加密(DoT/DoH) {Y}没开{N} —— 安卓「私人DNS」用不了，只能用明文 53")
         if dom:
-            fix.append("要用安卓私人DNS：后台 → 设置 → 加密设置，按菜单『3 查看状态』里的第二步填")
+            fix.append("要用安卓私人DNS：后台 → 设置 → 加密设置，按菜单『2 使用方法』里的第二步填")
     else:
         for p, label in ((p_dot, "853  DoT "), (p_doh, "10443 DoH")):
             if not p:
@@ -1548,7 +1561,7 @@ def selfcheck():
                 fix.append(f"把当前 ClientID 加进「允许的客户端」: {cid_p}")
             elif not wild_p:
                 print(f"    {bad} DoT {p_dot}  {R}被白名单拒绝{N}：没签泛域名证书，ID 传不进 SNI")
-                fix.append("要用安卓 DoT 就回菜单选『8 让 DoT 也能带 ClientID』")
+                fix.append("要用安卓 DoT 就回菜单选『5 DoT 带 ClientID』")
             else:
                 print(f"    {bad} DoT {p_dot}  {R}被白名单拒绝{N}{tail} —— 名单里的 ID 与实际不符?")
         else:
@@ -1622,7 +1635,7 @@ def selfcheck():
         print(f"    {warn} 白名单一开，{Y}明文 53 一律被拒{N}（协议本身没有 ID 机制）—— 电视/IoT 会没 DNS")
         if not wild:
             print(f"    {bad} {R}安卓 DoT 也会被拒{N}：没签泛域名证书，ID 传不进 SNI")
-            fix.append("要用安卓 DoT 就回菜单选『8 让 DoT 也能带 ClientID』签泛域名证书")
+            fix.append("要用安卓 DoT 就回菜单选『5 DoT 带 ClientID』签泛域名证书")
         elif cid:
             print(f"    {ok} 安卓 DoT 可用（已签泛域名证书）—— 手机填 {G}{cid}.{dom}{N}")
     else:
@@ -1630,7 +1643,7 @@ def selfcheck():
         print(f"       {Y}明文 53 尤其要紧：UDP 可伪造源 IP，是 DNS 放大攻击的经典跳板。{N}")
         if cid:
             fix.append(f"关掉开放解析器：「允许的客户端」填入 ClientID {cid}"
-                       + ("" if wild else "（但会挡掉安卓DoT，除非先用菜单 8 签泛域名证书）"))
+                       + ("" if wild else "（但会挡掉安卓DoT，除非先用菜单 5 签泛域名证书）"))
     if deny:
         print(f"    {warn} 拒绝列表: {', '.join(deny)}")
 
@@ -1682,7 +1695,7 @@ def selfcheck():
     # 「无法访问私人 DNS 服务器」——后台查询日志里却有手机的验证查询 xxxx-dnsotls-ds.metric.gstatic.com，
     # 说明服务器这头没毛病，是手机所在的网络时好时坏地拦 853。安卓私人 DNS 只走 853、改不了端口，
     # 服务器这边绕不过去，只能换网络或者私人 DNS 改「自动」交给代理。
-    print(f"    {Y}提醒：本机没拦 ≠ 外面能连。{N}上面 4/6 全绿、手机还连不上，就是半路被拦（选 9 手机实测能看清）：")
+    print(f"    {Y}提醒：本机没拦 ≠ 外面能连。{N}上面 4/6 全绿、手机还连不上，就是半路被拦（查完接着做手机实测能看清）：")
     print( "       ① 云商后台的安全组 / 防火墙没放行 853（DMIT/甲骨文等）")
     print( "       ② 手机所在的网络拦了 853（国内有的网络会拦；安卓私人 DNS 只走 853，换不了端口）")
     print( "          WiFi 和流量各试一次，一个行一个不行就是 ②：私人 DNS 改「自动」，开代理时 DNS 由代理接管")
@@ -1956,7 +1969,7 @@ def _probe_host_msg(sni, ask, sname, cid):
     if ask[0] == 5:
         why = "没带 ClientID" if s == sname else (f"ClientID「{pid}」不在白名单里" if pid else "跟 AdGuard 的域名对不上")
         tip = (f"AdGuard 后台 → 设置 → DNS 设置 → 允许的客户端，把 {cid} 加回去" if cid and pid == cid else
-               f"手机私人 DNS 改填：{cid}.{sname}" if cid and sname else "回菜单 8 把 ClientID 弄好，再按『3 使用方法』填手机")
+               f"手机私人 DNS 改填：{cid}.{sname}" if cid and sname else "回菜单 5 把 ClientID 弄好，再按『2 使用方法』填手机")
         return f"手机填的主机名是 {sni} —— {why}，AdGuard 拒了它的查询", tip
     if ask[0] < 0:
         return f"用手机的主机名 {sni} 在本机问 AdGuard 出错：{ask[2]}", "把这屏截图发来再查"
@@ -1969,16 +1982,16 @@ def _probe_ask(port, sni):
     return rc, ips, err
 
 def phone_probe(secs=60):
-    """菜单 9：手机实测——让手机去连私人 DNS，服务器这边盯着 853，说清卡在哪一段。"""
+    """菜单 9 自检之后：手机实测——让手机去连私人 DNS，服务器这边盯着 853，说清卡在哪一段。"""
     G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
     if not (_installed() and _running()):
-        print("  AdGuardHome 没在运行——先选 1 安装，或选 7 自检看原因。"); return
+        print("  AdGuardHome 没在运行——先选 1 安装，或选 9 自检看原因。"); return
     try: txt = open(_agh_yaml()).read()
     except OSError: txt = ""
     tb = _tls_block(txt)
     port = int(_yaml_val(tb, "port_dns_over_tls") or 0)
     if _yaml_val(tb, "enabled") != "true" or not port:
-        print("  加密（DoT）没开，安卓私人 DNS 本来就用不了——先按『3 使用方法』把加密开上。"); return
+        print("  加密（DoT）没开，安卓私人 DNS 本来就用不了——先按『2 使用方法』把加密开上。"); return
     if not shutil.which("tcpdump"):
         ui_tip("要装抓包工具 tcpdump（只在本机看包，不往外发任何东西）")
         if _ask("  装? [Y/n]: ").strip().lower() in ("n", "no"):
@@ -2086,8 +2099,8 @@ def _selfdns_toggle():
     _ask("  按回车返回菜单…")
 
 def _privdns_root():
-    """主脚本菜单 11 开着「节点专用域名」（用域名装的机器，私有名是 随机.根域名）→ 根域名；没有返回 ''。
-       共用证书上多签着 *.根域名 盖住它：这边重签证书（菜单 8、撤销）一定要带上，丢了节点就握手失败。"""
+    """菜单 4 开着「节点专用域名」（用域名装的机器，私有名是 随机.根域名）→ 根域名；没有返回 ''。
+       共用证书上多签着 *.根域名 盖住它：这边重签证书（菜单 5、撤销）一定要带上，丢了节点就握手失败。"""
     try:
         import json
         c = json.load(open(PRIVDNS_FILE))
@@ -2100,7 +2113,7 @@ def _privdns_root():
     return n.split(".", 1)[1]
 
 def _privdns_mode():
-    """菜单 11 的「当前」：主脚本存在 privdns.json 里（off / self / remote）。"""
+    """菜单 4 的「当前」：主脚本存在 privdns.json 里（off / self / remote）。"""
     try:
         import json
         m = json.load(open(PRIVDNS_FILE)).get("mode")
@@ -2109,7 +2122,7 @@ def _privdns_mode():
     return m if m in ("self", "remote") else "off"
 
 def _privdns_menu():
-    """菜单 11「节点使用私有DNS解析」：交给主脚本（订阅生成、.links 都在主脚本里），跟 6 一个路子。
+    """菜单 4「节点使用私有DNS解析」：交给主脚本（订阅生成、.links 都在主脚本里），跟 3 一个路子。
        主脚本是老版本就不叫——不认的子命令会掉进 argparse 报错退出，屏上一句话说清先更新。"""
     xy = BGP_DIR + "/xy-installer.py"
     try:
@@ -2125,7 +2138,7 @@ def _privdns_menu():
         _ask("  按回车返回菜单…")
 
 def _privdns_remove():
-    """卸载 AdGuard 时：本机在当 DNS 机（菜单 11 选了 1），交给主脚本关掉、外机节点改回真实地址。"""
+    """卸载 AdGuard 时：本机在当 DNS 机（菜单 4 选了 1），交给主脚本关掉、外机节点改回真实地址。"""
     xy = BGP_DIR + "/xy-installer.py"
     if os.path.exists(xy) and '"privdns-off"' in open(xy).read():
         subprocess.run(f"python3 {xy} privdns-off", shell=True)
@@ -2176,7 +2189,7 @@ def ios_profile():
     hp = _https_panel()
     if not hp:
         print("  ⚠ 没域名或没开加密（DoT），苹果描述文件用不了")
-        ui_tip("先按菜单 3「使用方法」第二步开加密"); return
+        ui_tip("先按菜单 2「使用方法」第二步开加密"); return
     dom, port = hp
     wild = _cert_wildcard_ok(dom); allow = _allowed_clients()
     cid = _selfdns_clientid() if wild else ""
@@ -2184,7 +2197,7 @@ def ios_profile():
     path = f"/apple/dot.mobileconfig?host={dom}" + (f"&client_id={cid}" if cid else "")
     if allow and not wild:
         print(_hl("1;31", "⚠ 白名单已设、没签泛域名证书：描述文件带不上 ClientID，苹果会被挡"))
-        ui_tip("二选一：菜单 8 签泛域名证书；或后台清空「允许的客户端」")
+        ui_tip("二选一：菜单 5 签泛域名证书；或后台清空「允许的客户端」")
     print()
     ui_url("Safari 打开这个链接，下载描述文件", f"https://{dom}:{port}{path}")
     print()
@@ -2218,7 +2231,7 @@ def _drop_sessions():
     except OSError: pass
 
 def change_admin_password():
-    """菜单 12 → 2 修改后台密码（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
+    """菜单 8 → 2 修改后台密码（仓库主人 10/31：「可不可以用代码修改密码」→「加」）。
        AdGuard 没有改密码的命令也没有接口，密码就是 AdGuardHome.yaml 里 users 那段的 bcrypt 哈希：
        停服务 → 换掉那一行 → 起服务 → 拿新密码登一次接口验证；登不进去就把原配置放回去、再起一次，绝不把人锁在外面。"""
     G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
@@ -2328,10 +2341,11 @@ def change_admin_account():
 
 def menu():
     while True:
-        # 2 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
-        # 5 改后台端口：随机 2000-5000 / 自定义，防扫描，带回滚。7 自检：只读不改。
-        # 8 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。
-        # 11 节点使用私有DNS解析：1 本机当 DNS 机 / 2 本机节点交给外机解析 / 3 关（交给主脚本，见 _privdns_menu）。
+        # 仓库主人 10/31 重排：常用的在前、卸载放最后；「腾出 53 端口」「手机实测」并进「自检」（查到 53 被占才问腾不腾，
+        # 查完再问要不要手机实测，都默认否），两项功能都还在。
+        # 4 节点使用私有DNS解析：1 本机当 DNS 机 / 2 本机节点交给外机解析 / 3 关（交给主脚本，见 _privdns_menu）。
+        # 5 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。7 改后台端口：随机 2000-5000 / 自定义，带回滚。
+        # 10 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
         ui_title("自建 DNS · AdGuard Home（兼带广告过滤）")
         if _installed():
             st = "已安装 · " + (_hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
@@ -2340,31 +2354,27 @@ def menu():
         ui_kv("当前状态", st)
         ui_line()
         ui_items([(1, "安装", None),
-                  (2, "卸载（整套撤干净，不动节点）", None),
-                  (3, "使用方法（设备怎么填）", None),
-                  (4, "腾出 53 端口（被 systemd-resolved 占用时）", None),
-                  (5, "改后台端口", None),
-                  (6, "自建 DNS 写入订阅", "已写入" if os.path.exists(SELFDNS_FLAG) else "未写入"),
-                  (7, "自检（只读）", None),
-                  (8, "DoT 带 ClientID（签泛域名证书）", None),
-                  (9, "手机实测（开私人 DNS，看它连没连进来）", None),
-                  (10, "苹果手机描述文件（iOS 一键装 DNS）", None),
-                  (11, "节点使用私有DNS解析", {"self": "本机", "remote": "外机"}.get(_privdns_mode(), "关")),
-                  (12, "修改用户名和密码", None),
+                  (2, "使用方法（设备怎么填）", None),
+                  (3, "自建 DNS 写入订阅", "已写入" if os.path.exists(SELFDNS_FLAG) else "未写入"),
+                  (4, "节点使用私有DNS解析", {"self": "本机", "remote": "外机"}.get(_privdns_mode(), "关")),
+                  (5, "DoT 带 ClientID（签泛域名证书）", None),
+                  (6, "苹果手机描述文件（iOS 一键装 DNS）", None),
+                  (7, "改后台端口", None),
+                  (8, "修改用户名和密码", None),
+                  (9, "自检（含手机实测）", None),
+                  (10, "卸载（整套撤干净，不动节点）", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
-        elif c == "2": uninstall()
-        elif c == "3": status()
-        elif c == "4": free_port53()
-        elif c == "5": change_web_port()
-        elif c == "6": _selfdns_toggle()
-        elif c == "7": selfcheck()
-        elif c == "8": dot_clientid()
-        elif c == "9": phone_probe()
-        elif c == "10": ios_profile()
-        elif c == "11": _privdns_menu()
-        elif c == "12": change_admin_account()
+        elif c == "2": status()
+        elif c == "3": _selfdns_toggle()
+        elif c == "4": _privdns_menu()
+        elif c == "5": dot_clientid()
+        elif c == "6": ios_profile()
+        elif c == "7": change_web_port()
+        elif c == "8": change_admin_account()
+        elif c == "9": selfcheck(); _selfcheck_more()
+        elif c == "10": uninstall()
         elif c in ("0", ""):
             return
 

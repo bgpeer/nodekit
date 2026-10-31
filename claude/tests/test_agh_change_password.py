@@ -82,8 +82,8 @@ a._agh_users = lambda: []
 out, y = go(["NewPassw0rd!"])
 check("还没设账号：提示先选 1", "先选 1" in out and not CMDS)
 src = open(os.path.join(ROOT, "adguard-dns.py"), encoding="utf-8").read()
-check("主菜单 12 叫「修改用户名和密码」，原来 1~11 编号不动", '(12, "修改用户名和密码", None)' in src
-      and '(11, "节点使用私有DNS解析"' in src and 'elif c == "12": change_admin_account()' in src)
+check("主菜单 8 叫「修改用户名和密码」（10/31 重排后）", '(8, "修改用户名和密码", None)' in src
+      and 'elif c == "8": change_admin_account()' in src)
 check("htpasswd 从标准输入喂密码（不放命令行）", '["htpasswd", "-niBC", "10", ""], input=pw' in src)
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
