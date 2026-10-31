@@ -10028,7 +10028,11 @@ def cdn_add():
        原理：客户端连 Cloudflare 的 IP、不是 VPS 的 IP，VPS 真 IP 被墙也能用；前提是一个能挂到
        Cloudflare 的域名（免费版就行）。装完默认写进订阅——IP 被墙时它就是主力，不该再让人去点菜单 4。"""
     ui_title("CDN 节点安装")
-    ui_tip("要一个挂在 Cloudflare 的域名；客户端连 CF，VPS 的 IP 被墙也能用")
+    # 仓库主人 10/31：装之前先说清要建哪条记录；CDN 要走 CF 代理，跟别处相反是「开黄云」
+    try: _nd = json.load(open(STATE_FILE)).get("domain") or ""
+    except Exception: _nd = ""
+    _r0 = _root_domain(_nd) if _nd else "域名"
+    ui_tip(f"请在 https://dash.cloudflare.com 做好一条 DNS 记录开黄云 cdn.{_r0}（名称不想用 cdn 改用其他也行）")
     nodes = _cdn_load()
     if nodes:                                             # 已安装 → 问怎么处理
         print(f"  检测到已安装 {len(nodes)} 条 CDN 节点。")
