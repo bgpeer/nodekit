@@ -155,6 +155,8 @@
   sing-box 用出站的 `domain_resolver`（1.12+）；不指的话走 `route.default_domain_resolver`（模板里是阿里 DoH），私有名查不到。
   小火箭：`proxy-dns-server` 是全局的（所有节点域名都去问它），`[Host]` 里 `server:` 后面能不能写 DoH 文档没说——
   **被藏的节点小火箭那份先不放**（仓库主人 10/28 同意），要加回来先拿 `srtest.py pdns A / B` 在手机上测写法。
+  10/31 起小火箭也写 `proxy-dns-server`（`_sr_node_dns`，仓库主人要求先写进去）：自建 DoH > 私有解析 DNS 机 > 不写；
+  **还没在 iPhone 上实测**，全局、单台、无兜底。测通 `pdns A` 再把被藏的节点加回来。
 - **对着源码核过**（10/28，mihomo v1.19.33 / sing-box v1.14.4 / AdGuard v0.107.79；容器里不让跑下载来的二进制，只读了源码）：
   mihomo 的 policy 按名字精确匹配，问它不走分流规则（`respect-rules` 管不到这段）；sing-box 出站指了 `domain_resolver`
   就直接问那台、不过 DNS 规则（拿不到 fakeip），A / AAAA 并发问、AAAA 空答不碍事；AdGuard 的 `$dnsrewrite` 只写了 A 时，
