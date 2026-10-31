@@ -289,8 +289,9 @@ if yaml:
 cj = json.loads(sb)
 check("sing-box：两台的出站都指向 3 的 DoH",
       {o["server"] for o in cj["outbounds"] if isinstance(o, dict) and o.get("domain_resolver") == {"server": "privdns"}} == {N3, N1R})
-check("小火箭：被藏的两台都不放（CDN 那两条照放）",
-      not re.search(r"(?m)^(🇭🇰3|🇯🇵1)·(?!CDN)", sr) and len(re.findall(r"(?m)^(🇭🇰3|🇯🇵1)·CDN·", sr)) == 2)
+check("小火箭：被藏的两台照放、地址是节点专用域名（CDN 那两条照放），proxy-dns-server 指 3 的 DoH",
+      re.search(r"(?m)^🇭🇰3·(?!CDN).*?," + re.escape(N3) + ",", sr) and re.search(r"(?m)^🇯🇵1·(?!CDN).*?," + re.escape(N1R) + ",", sr)
+      and len(re.findall(r"(?m)^(🇭🇰3|🇯🇵1)·CDN·", sr)) == 2 and re.search(r"(?m)^proxy-dns-server = " + re.escape(DOH3) + "$", sr))
 
 # ── 6. 兜底：证书丢了 *.根域名 → 照用公网域名 ───────────────────────────────────────────────
 CERT[:] = [DOM3]
@@ -339,8 +340,8 @@ out = run_menu("2", DOH3, "")
 check("没存令牌：先列出 Cloudflare 令牌怎么做、要粘令牌；没粘 → 取消，什么都没动",
       "Cloudflare 令牌怎么做" in out and "已取消" in out and not DISPATCH and x.privdns_conf()["mode"] == "off")
 out = run_menu("2", DOH3, "tok-1", "")
-check("粘了令牌、后果红字一行（证书要重签、小火箭不放），默认否 → 没动",
-      "小火箭那份不放本机节点" in out and re.search(r"多签 \*\.[a-z0-9]{6}\.zone\.example", out) and not DISPATCH)
+check("粘了令牌、后果红字一行（证书要重签），默认否 → 没动",
+      "专用域名" in out and re.search(r"多签 \*\.[a-z0-9]{6}\.zone\.example", out) and not DISPATCH)
 out = run_menu("2", DOH3, "tok-1", "y")
 c = x.privdns_conf()
 check(f"确认：转后台做，证书多签 *.随机段.根域名、原来的名字一个不丢、带着令牌（{APPLY[-1] if APPLY else ''}）",
