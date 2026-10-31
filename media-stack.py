@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.390"
+SCRIPT_VERSION = "1.5.391"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -26259,6 +26259,25 @@ def emby_set_password(key, uid, new):
     return True, ""
 
 
+def emby_logout_everywhere(key, uid):
+    """让这个账号在所有设备上退出登录：删掉 Emby「设备」里最后登录者是它的那几台（删了设备 = 那台的登录凭证作废）。
+    仓库主人 10/31：改了密码已登录的设备照样能看，要能一起踢掉，默认不勾。返回 (踢掉几台, 失败几台)。"""
+    done = fail = 0
+    try:
+        devs = (_emby("/Devices", key, timeout=15) or {}).get("Items") or []
+    except Exception:
+        return 0, -1
+    for dv in devs:
+        if str(dv.get("LastUserId") or "") != uid or not dv.get("Id"):
+            continue
+        try:
+            _emby(f"/Devices?Id={urllib.parse.quote(str(dv['Id']))}", key, method="DELETE", timeout=15)
+            done += 1
+        except Exception:
+            fail += 1
+    return done, fail
+
+
 def emby_accounts_menu(key):
     """「7 设置 → 11」：列出 Emby 账号，选一个改用户名 / 密码。"""
     if not key:
@@ -26330,6 +26349,16 @@ def _emby_account_menu(key, uid):
                 if good:
                     ok("密码已改，新密码（只显示这一次）：")
                     print(new)
+                    # 【默认不踢】改了密码，已登录的设备照样能看；要连它们一起换新密码重登才勾
+                    tip("已登录的设备不会自己掉线；踢掉的话，这个账号每台设备都要用新密码重新登录")
+                    if ask_yn(f"同时让「{name}」在所有设备上退出登录？", False):
+                        n_ok, n_bad = emby_logout_everywhere(key, uid)
+                        if n_bad < 0:
+                            warn("读不到 Emby 的设备列表，没踢")
+                        elif n_bad:
+                            warn(f"踢掉 {n_ok} 台，{n_bad} 台没踢掉（去 Emby 后台 → 设备 手动删）")
+                        else:
+                            ok(f"已让 {n_ok} 台设备退出登录")
                     break
                 if step == "reset":
                     warn("没改成：Emby 不让重置，原密码没动")
