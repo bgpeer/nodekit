@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.391"
+SCRIPT_VERSION = "1.5.392"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13960,10 +13960,13 @@ def main():
 
     # ---- 域名：节点装过就直接用它的，不再问一遍 ----
     node_domain = (state.get("domain") or "").strip()
+    # 仓库主人 10/31：装之前先说清要建哪条记录。emby / list / home 都是「底座」下的子域名，一条 *.底座 全盖住
+    _r0 = ".".join(node_domain.split(".")[-2:]) if node_domain.count(".") >= 1 else "域名"
+    tip(f"请在 https://dash.cloudflare.com 做好一条 DNS 记录关黄云 *.ys.{_r0}（名称不想用 ys 改用其他也行）")
     if node_domain:
         ok(f"检测到节点域名：{node_domain}")
         cfg["domain"] = node_domain if ask_yn("媒体服务也用这个域名？", True) \
-            else ask("你的域名（填 example.com 或 emby.example.com 都行）", "")
+            else ask("你的域名（填 example.com 或 emby.example.com 都行）", f"ys.{_r0}")
     else:
         cfg["domain"] = ask("你的域名（没有就留空，用 IP:端口 访问）", "")
 

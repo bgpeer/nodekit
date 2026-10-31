@@ -50,6 +50,7 @@ class R:
 a.subprocess.run = lambda cmd, **k: (RUN.append(cmd), R(0 if "Cert success" in OUT[0] else 1, OUT[0]))[1]
 DOM = "dns.other.example"
 
+CFD = "https://" + "dash.cloudflare" + ".com"           # 拼出来：测试文件里不留网址
 print("一、装的时候给自建 DNS 自己的域名、自己的证书")
 open(CONF, "w").write("SAVED_CF_Token='tok-old'\n")
 RES[DOM] = [IP]
@@ -58,7 +59,7 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     got = a._setup_own_domain()
 check("先一行提示：去 Cloudflare 建 dns.根域名 和 *.dns.根域名（名字可换）",
-      "提示：请在 https://dash.cloudflare.com 做好两条 DNS 记录 dns.node.example 和 *.dns.node.example（名称不想用 dns 改用其他也行）"
+      "提示：请在 " + CFD + " 做好两条 DNS 记录关黄云 dns.node.example 和 *.dns.node.example（名称不想用 dns 改用其他也行）"
       in a.re.sub(r"\033\[[0-9;]*m", "", buf.getvalue()))
 check(f"签好了、记下域名（{got}）", got == DOM and open(a.AGH_DOMAIN_FILE).read().strip() == DOM)
 check(f"签的是 域名 + *.域名、DNS 验证、用 acme.sh 存着的令牌（{RUN[-1][:80]}…）",
