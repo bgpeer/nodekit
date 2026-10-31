@@ -674,9 +674,8 @@ def _usage(port=None, head=None):
     elif allow and dom and not wild:
         print(f"    {R}⚠ 允许的客户端已设、没签泛域名证书：安卓专用 DNS 会被挡{N}（菜单 5 签证书，或清空允许的客户端）")
     elif allow:
-        print(f"    允许的客户端：{G}✓ 已设好{N}")
-        for x in allow:                              # 顶格单独一行、不带括号：长按复制干净（仓库主人 10/31）
-            print(x)
+        # 跟在后面、高亮、不带括号：复制时不会把括号带进去（仓库主人 10/31：单独一行跑到下面去了，还是高亮）
+        print(f"    允许的客户端：{G}✓ 已设好{N}　{G}{' '.join(allow)}{N}")
     elif dom and not wild:
         print(f"    允许的客户端：{Y}先做菜单 5 签泛域名证书再填{N}（不然安卓专用 DNS 会被挡）")
     else:
