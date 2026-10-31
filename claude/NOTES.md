@@ -132,7 +132,7 @@
 - 端到端测试 `test_netprofile_e2e.py` 在 `unshare --mount --net` 里跑真脚本、真内核参数（/etc 那几个目录盖 tmpfs），
   不碰本机；改保留端口相关的逻辑先跑它。
 
-## 节点私有解析（13 → 11，10/28 起）
+## 节点私有解析（13 → 4，10/28 起）
 
 - 三选一存在 `/etc/bgpeer/privdns.json`（0600）：`self`（本机当 DNS 机）/ `remote`（本机节点交给外机解析）/ `off`。
   remote 的机器在 `.links` 末尾多一行 `#privdns 私有名 外机DoH`；主机只认节点链接前缀（`aggregated_links`、`cloud_ports`），
@@ -143,7 +143,7 @@
 - **用域名装的**（仓库主人 10/28：「主要的是公网查不出节点的信息」）：节点专用域名「随机.根域名」，公网不建记录；共用证书
   多签 `*.根域名`（同一条 acme.sh 记录、主域名还是节点域名——单开一条 `*.根域名` 记录会撞上 media-stack 给 Emby 签的
   `*.域名` 那条）。重签共用证书的五个地方都带着它：`cert_want_names`、`ensure_acme`、`cert_fix_run`、`cert_install_apply`
-  （有 `*.` 就走 DNS-01）、adguard-dns 的菜单 8 和 `_revert_wildcard`（有它就不清令牌）。漏了也不会断：证书盖不住
+  （有 `*.` 就走 DNS-01）、adguard-dns 的菜单 5 和 `_revert_wildcard`（有它就不清令牌）。漏了也不会断：证书盖不住
   （`_privdns_local_meta`）就照用公网域名、`.links` 不报私有名，03:20 那轮顺手重写 `.links`。成员机报的名字必须在它
   公网域名的根域名底下，DNS 机拿它的公网域名解析出 IP。开 / 签证书走 `_node_op_dispatch`（op `privdns-domain`）。
 - **先问再换**：谁汇总就由谁去 DNS 问一遍私有名，IP 一个不差才换；问不通这一轮照写真实地址。从关 / 本机切到外机会换新名字
@@ -193,7 +193,7 @@
   10/29 实测走通：DMIT 加 AAAA 后 TCP 节点全绿。卡过的一步是**手机没 IPv6**（Termux 关代理后 `curl -6` 查本机地址的国内站没结果）——
   手机 APN 协议改 IPv4/IPv6、开关一次飞行模式就有了；FlClash 设置里也有个 IPv6 开关会盖掉订阅里的 `ipv6: true`。
   17 有 IPv6 回程了（v1.1.165）：DMIT 实测 IPv6 去联通 / 移动走 CMIN2(AS58807)、去电信走 163。我先凭前缀说成 CMI，错了——线路判定只信逐跳 ASN。
-- **节点专用域名（13 → 11）真机第一次走通**（10/29 DMIT）：一路踩了三个坑，都已修——
+- **节点专用域名（13 → 4）真机第一次走通**（10/29 DMIT）：一路踩了三个坑，都已修——
   1. 节点域名是根域名的子域时，`*.根域名` 盖住它，Let's Encrypt 拒签「redundant with a wildcard」→ 名字改成 `随机.随机段.根域名`、证书签 `*.随机段.根域名`；
   2. 传给 acme.sh 的名字按现有证书顺序（`*.dom` 在前），新证书进了 `*.dom_ecc`，`install-cert -d dom` 导出老证书 → 签发时 dom 排第一；
   3. 服务端 httpupgrade / xhttp 写了 host 就校验 Host，节点专用域名被拒「bad host」→ 服务端不写 host，老配置开的时候去掉。

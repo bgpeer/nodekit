@@ -11,7 +11,7 @@
 10/20 实测结论（都已写进 xy-installer 的 shadowrocket_line）：路径 / Host / grpc 服务名一律 obfs-uri / obfs-host，
 不是分享链接里的 path / obfsParam。下面每种里标「✔」的是实测通的，其余是实测不通的，留着小火箭更新后复测用。
 
-私有解析（种类 pdns，10/28）：本机 13 → 11 开着时，拿本机第一条 reality（vless tcp）节点出两个测试节点——
+私有解析（种类 pdns，10/28）：本机 13 → 4 开着时，拿本机第一条 reality（vless tcp）节点出两个测试节点——
 T-pdns-0 照写原来的地址（对照，它不通就是节点本身的事），T-pdns-<写法> 地址换成私有名，看小火箭能不能用指定的 DNS 解析出来。
 写法放第二个参数，一次只能测一种（A 是全局设置，跟 B 混在一份里分不清是谁起的作用）：
   A：[General] proxy-dns-server = 那个 DoH（小火箭文档：「使用指定 DNS 解析所有节点域名」）
@@ -69,7 +69,7 @@ def pdns():
     pd = json.load(open(f"{B}/privdns.json"))
     name = pd.get("name", "")
     if pd.get("mode") not in ("self", "remote") or not name:
-        sys.exit("本机 13 → 11 还没开私有解析")
+        sys.exit("本机 13 → 4 还没开私有解析")
     if pd["mode"] == "remote":
         doh = pd.get("dns", "")
     else:                                   # 本机当 DNS 机：跟主脚本 _agh_doh_url 一样拼

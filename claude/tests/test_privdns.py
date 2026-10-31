@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""节点私有解析（13 → 11「节点使用私有DNS解析」，仓库主人 10/28）——
+"""节点私有解析（13 → 4「节点使用私有DNS解析」，仓库主人 10/28）——
   「有些机场他建的节点必须要用他自己对应的私有dns解析才可以解析」「我有三台机器1，2，3，有1，2两台没有建DNS，3建了，
   1，2的节点可以指定3的DNS解析吗」。定下来的做法：
   · 1、2（用 IP 装的）选「2 外机DNS解析」、粘贴 3 的 DoH：本机起固定私有名，.links 末尾一行 `#privdns 名字 地址`
@@ -383,7 +383,7 @@ with contextlib.redirect_stdout(buf):
     r4 = x._mihomo_privdns("proxies:\n", used_nodes)
 check("两样都没有：原样、说一行", r4 == "proxies:\n" and "连不上" in buf.getvalue())
 
-# ── 13. 菜单 13 → 11 ────────────────────────────────────────────────────────────────
+# ── 13. 菜单 13 → 4 ────────────────────────────────────────────────────────────────
 ASK = []
 x._ask = lambda p="": (print(p + (ASK[0] if ASK else "")) or ASK.pop(0)) if ASK else ""
 REGEN = []
@@ -471,7 +471,7 @@ for mode, want in (("off", "关"), ("self", "本机"), ("remote", "外机")):
     b = io.StringIO()
     with contextlib.redirect_stdout(b):
         a.menu()
-    check(f"13 菜单第 11 项「节点使用私有DNS解析　当前：{want}」", f"11. 节点使用私有DNS解析　当前：{want}" in b.getvalue())
+    check(f"13 菜单第 4 项（10/31 重排）「节点使用私有DNS解析　当前：{want}」", f"4. 节点使用私有DNS解析　当前：{want}" in b.getvalue())
 open(f"{tmp}/xy-installer.py", "w").write("# 老版主脚本\n")
 b = io.StringIO()
 with contextlib.redirect_stdout(b):
