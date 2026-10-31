@@ -663,9 +663,9 @@ def ul_netflix():
     a, reg = avail(81280792)
     if a is None: return "?", "连不上"
     b, reg2 = avail(70143836)
-    if a or b: return "ok", f"全解锁（{reg or reg2 or '地区未知'}）"
+    if a or b: return "ok", f"全解锁（{reg or reg2 or '地区看上面出口'}）"
     c, reg3 = avail(80018499)
-    if c: return "part", f"仅自制剧（{reg3 or '地区未知'}）"
+    if c: return "part", f"仅自制剧（{reg3 or '地区看上面出口'}）"
     return "no", "不支持"
 
 def ul_youtube():
@@ -747,14 +747,6 @@ def ul_hbomax():
     if code == 200: return "ok", "可用（地区看上面出口）"
     return "?", f"返回 {code}"
 
-def ul_disney():
-    code, url, body = _get("https://www.disneyplus.com/")
-    if code == 0: return "?", "连不上"
-    if "unavailable" in url or "not available in your region" in body.lower(): return "no", "不支持"
-    m = re.search(r'"region":"([A-Z]{2})"', body)
-    # 10/31 真机：主页 200，能不能看由页面脚本判断（不可用时脚本才跳 /welcome/unavailable），不登录确认不了
-    return ("ok", f"可能可用（{m.group(1)}，要登录才能确认）") if m else ("?", "主页正常，要登录才能确认")
-
 def ul_bilibili():
     # 港澳台限定番的一集：code 0 = 能播，-10403 = 地区不允许
     code, _, body = _get("https://api.bilibili.com/pgc/player/web/playurl?avid=18281381&cid=29892777"
@@ -766,7 +758,8 @@ def ul_bilibili():
     if c == -10403: return "no", "不支持（非港澳台 IP）"
     return "?", f"返回 {c}"
 
-UNLOCKS = [("Netflix", ul_netflix), ("YouTube", ul_youtube), ("Disney+", ul_disney), ("Prime Video", ul_prime),
+# Disney+ 不在这里：不登录判断不了（仓库主人 10/31：「把那个要登入的删掉」）；可达性那一节照测
+UNLOCKS = [("Netflix", ul_netflix), ("YouTube", ul_youtube), ("Prime Video", ul_prime),
            ("HBO Max", ul_hbomax), ("Spotify", ul_spotify), ("TikTok", ul_tiktok), ("ChatGPT", ul_chatgpt),
            ("Claude", ul_claude), ("Gemini", ul_gemini), ("B站港澳台", ul_bilibili)]
 

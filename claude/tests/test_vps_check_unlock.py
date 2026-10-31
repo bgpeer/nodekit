@@ -30,6 +30,8 @@ R["80018499"] = (200, H + "www.netflix.com/jp/title/80018499", "")
 check("只有自制剧：部分", v.ul_netflix() == ("part", "仅自制剧（JP）"))
 R["80018499"] = (404, "", "")
 check("都不行：不支持", v.ul_netflix()[0] == "no")
+R.clear(); R["81280792"] = (200, "", "no region here")
+check("页面里没地区：写「地区看上面出口」", v.ul_netflix() == ("ok", "全解锁（地区看上面出口）"))
 R.clear()
 check("连不上：?", v.ul_netflix()[0] == "?")
 
@@ -71,8 +73,6 @@ R.clear(); R["primevideo"] = (200, "", '"currentTerritory":"US"')
 check("Prime Video 地区", v.ul_prime() == ("ok", "可用（US）"))
 R.clear(); R["hbomax"] = (200, H + "www.hbomax.com/us/en", "")
 check("HBO Max 跳到 /us/", v.ul_hbomax() == ("ok", "可用（US）"))
-R.clear(); R["disneyplus"] = (200, H + "www.disneyplus.com/unavailable", "")
-check("Disney+ 不可用", v.ul_disney()[0] == "no")
 R.clear(); R["bilibili"] = (200, "", '{"code":-10403}')
 check("B站港澳台：非港澳台 IP 不支持", v.ul_bilibili()[0] == "no")
 R["bilibili"] = (200, "", '{"code":0}')
@@ -93,8 +93,8 @@ R.clear(); R["hbomax"] = (200, H + "www.hbomax.com/", '<div data-geo-country="us
 check("HBO Max：data-geo-country", v.ul_hbomax() == ("ok", "可用（US）"))
 R["hbomax"] = (200, H + "www.hbomax.com/", "x")
 check("HBO Max：主页正常 → 可用", v.ul_hbomax()[0] == "ok")
-R.clear(); R["disneyplus"] = (200, H + "www.disneyplus.com/", "x")
-check("Disney+：主页正常 → ?（要登录确认）", v.ul_disney() == ("?", "主页正常，要登录才能确认"))
+check("Disney+ 不在解锁检测里（10/31「把那个要登入的删掉」），可达性照测",
+      "Disney+" not in [n for n, _ in v.UNLOCKS] and not hasattr(v, "ul_disney") and "Disney+" in [n for n, _ in v.SERVICES])
 
 print("读到一半断开（Netflix 真机 IncompleteRead）")
 import http.client
