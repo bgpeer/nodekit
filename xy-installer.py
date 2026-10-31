@@ -8646,11 +8646,12 @@ def vps_check_menu():
     _vpschk_last()
     ui_line()
     # 外部 IP 检测：输入任意 IP，查画像 + 本机到它的链路 + 黑名单
-    ui_items([(1, "本机 IP 检测（约 2 分钟）", None), (2, "外部 IP 检测", None), (0, "返回", None)])
+    ui_items([(1, "本机 IP 检测（约 2 分钟）", None), (2, "外部 IP 检测", None),
+              (3, "解锁检测（流媒体 / AI）", None), (0, "返回", None)])
     c = _ask("选择: ").strip()
-    if c not in ("1", "2"):
+    if c not in ("1", "2", "3"):
         return
-    arg = ""
+    arg = " --unlock" if c == "3" else ""
     if c == "2":
         ip = _ask("要检测的 IP（IPv4 / IPv6）: ").strip()
         try:

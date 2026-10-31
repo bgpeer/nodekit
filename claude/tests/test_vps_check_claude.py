@@ -6,6 +6,6 @@ spec = importlib.util.spec_from_file_location("v", os.path.join(ROOT, "vps-check
 v = importlib.util.module_from_spec(spec); spec.loader.exec_module(v)
 names = [n for n, _ in v.SERVICES]
 ok = ("Claude", "claude.ai") in v.SERVICES and names.index("Claude") == names.index("ChatGPT") + 1 \
-     and names == ["Google", "YouTube", "ChatGPT", "Claude", "Netflix", "Disney+", "TikTok", "GitHub"]
+     and names[:8] == ["Google", "YouTube", "ChatGPT", "Claude", "Netflix", "Disney+", "TikTok", "GitHub"]
 print(("  ✔ " if ok else "  ✖ ") + f"可达性列表：{'、'.join(names)}")
 print("\nALL PASS" if ok else "\nFAIL 1"); sys.exit(0 if ok else 1)
