@@ -57,6 +57,9 @@ ASK[:] = [DOM]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     got = a._setup_own_domain()
+check("先一行提示：去 Cloudflare 建 dns.根域名 和 *.dns.根域名（名字可换）",
+      "提示：请在 https://dash.cloudflare.com 做好两条 DNS 记录 dns.node.example 和 *.dns.node.example（名称不想用 dns 改用其他也行）"
+      in a.re.sub(r"\033\[[0-9;]*m", "", buf.getvalue()))
 check(f"签好了、记下域名（{got}）", got == DOM and open(a.AGH_DOMAIN_FILE).read().strip() == DOM)
 check(f"签的是 域名 + *.域名、DNS 验证、用 acme.sh 存着的令牌（{RUN[-1][:80]}…）",
       f"--dns dns_cf -d {DOM} -d '*.{DOM}'" in RUN[-1] and "CF_Token=" not in RUN[-1])

@@ -277,6 +277,9 @@ def _setup_own_domain():
     dft = f"dns.{_root_of(nd)}" if nd else ""
     if nd:
         ui_kv("节点域名", nd)
+    # 仓库主人 10/31：装之前先说清要建哪两条记录；名字不一定叫 dns
+    r0 = _root_of(nd) if nd else "域名"
+    ui_tip(f"请在 https://dash.cloudflare.com 做好两条 DNS 记录 dns.{r0} 和 *.dns.{r0}（名称不想用 dns 改用其他也行）")
     raw = _ask(f"  域名（回车 = {dft}，输 n = 不用加密）: " if dft else "  域名（回车 = 不用加密）: ")
     raw = raw.strip().lower().rstrip(".")
     if raw in ("n", "no") or not (raw or dft):
