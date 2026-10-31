@@ -32,7 +32,7 @@ def run_menu(keys):
 out = run_menu(["0"])
 want = ["1. 安装", "2. 使用方法（设备怎么填）", "3. 自建 DNS 写入订阅　当前：未写入", "4. 节点使用私有DNS解析　当前：外机",
         "5. DoT 带 ClientID（签泛域名证书）", "6. 苹果手机描述文件（iOS 一键装 DNS）", "7. 改后台端口",
-        "8. 修改用户名和密码", "9. 自检（含手机实测）", "10. 卸载（整套撤干净，不动节点）", "0. 退出"]
+        "8. 修改用户名和密码", "9. 自检（含手机实测）", "10. 卸载自建DNS", "0. 退出"]
 pos = [out.find(w) for w in want]
 check("新顺序、每项一行", all(p >= 0 for p in pos) and pos == sorted(pos))
 check("「腾出 53 端口」「手机实测」不再单独一项", "腾出 53" not in out and "11." not in out)
