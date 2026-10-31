@@ -442,6 +442,11 @@ def _change_domain_apply(dom, acme, env=""):
                        f"--keylength ec-256 --server letsencrypt", shell=True, text=True, capture_output=True)
     out = ((r.stdout or "") + (r.stderr or "")).strip()
     if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
+        # acme.sh 签失败也会留下这个域名的记录目录：不清掉的话下次再试，「已经有一张证书在用」那道检查就把自己拦住了
+        # （10/31 DMIT：令牌没管到新区域签失败，改好令牌回来再换被拦）。进到这里之前已经查过它原来不存在，放心删
+        sh(f"{acme} --remove -d {dom} --ecc")
+        for n in (dom + "_ecc", dom):
+            shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{n}"), ignore_errors=True)
         print(f"  {R}✗ 证书没签下来，什么都没改{N}")
         for ln in out.splitlines()[-4:]:
             print("     " + ln)
