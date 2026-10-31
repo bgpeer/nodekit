@@ -4997,6 +4997,31 @@ def _sr_selfdns(path, url):
     if new != tpl:
         open(path, "w").write(new)
 
+def _sr_node_dns(path, url, nodes):
+    """Shadowrocket：节点域名用自己的 DNS 解析（仓库主人 10/31：「要不把这个字段你先写进去呗」）。
+       小火箭不写 proxy-dns-server 时节点域名走 dns-server（模板里阿里 / 腾讯），每连一次就把节点域名报给国内 DNS。
+       官方文档：proxy-dns-server「使用指定 DNS 解析所有节点域名」——跟 sing-box 的 _sb_node_dns 一个意思，取值顺序也一样：
+       本机自建 DoH 写进了订阅 → 用它；否则这份节点里有私有解析的 DNS 机 → 用它；都没有 → 不写，照旧。
+       【还没在 iPhone 上实测】带 ClientID 路径、非 443 端口的 DoH 认不认，文档没说（claude/tools/srtest.py pdns A 测的就是这一行）；
+       它是全局的、只有一台、没有兜底，那台 DNS 挂了所有域名节点一起连不上。被藏的节点照旧不放，测通了再加回来。
+       模板里自己写了 proxy-dns-server 的：当口子用，换成上面那台；都没有就照模板写的。"""
+    url = url or next(iter(_privdns_used(nodes).values()), "")
+    if not url:
+        return
+    try: tpl = open(path).read()
+    except OSError: return
+    line = f"proxy-dns-server = {url}"
+    if re.search(r"(?m)^proxy-dns-server\s*=", tpl):
+        new = re.sub(r"(?m)^proxy-dns-server\s*=.*$", lambda m: line, tpl, count=1)
+    elif re.search(r"(?m)^dns-server\s*=.*$", tpl):
+        new = re.sub(r"(?m)^(dns-server\s*=.*)$", lambda m: m.group(1) + "\n" + line, tpl, count=1)
+    elif "[General]\n" in tpl:
+        new = tpl.replace("[General]\n", "[General]\n" + line + "\n", 1)
+    else:
+        return
+    if new != tpl:
+        open(path, "w").write(new)
+
 def _mihomo_direct_ip(tpl, targets):
     """mihomo：把本机/各 VPS 直连插到 rules: 段的 MATCH 上一层，避免挂本机代理管理时
        SSH 被路由进代理。
@@ -5362,6 +5387,7 @@ def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
     _sr_direct_ip(SR_FILE, _direct_targets(nodes))
     _sr_selfdns(SR_FILE, _selfdns_doh())                       # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
+    _sr_node_dns(SR_FILE, _selfdns_doh(), nodes)               # 节点域名交给自己的 DNS（proxy-dns-server），不走国内 DNS
 
 FMT = {
     "yaml": {"label": "mihomo",              "file": CFG_FILE,  "author": TEMPLATE_URL, "gen": gen_mihomo},
