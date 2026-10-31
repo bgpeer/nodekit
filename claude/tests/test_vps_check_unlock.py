@@ -78,6 +78,37 @@ check("B站港澳台：非港澳台 IP 不支持", v.ul_bilibili()[0] == "no")
 R["bilibili"] = (200, "", '{"code":0}')
 check("B站港澳台：能播", v.ul_bilibili()[0] == "ok")
 
+print("10/31 真机返回")
+R.clear(); R["youtube.com/premium"] = (200, "", 'x"INNERTUBE_CONTEXT_GL":"US",y')
+check("YouTube：只有 GL、没写不可用 → 可用", v.ul_youtube() == ("ok", "Premium 可用（US）"))
+R.clear(); R["gemini"] = (200, "", 'a,\\"45736566\\":true,\\"45631641\\":true,b'.replace("\\\\", "\\"))
+check("Gemini：转义 JSON 写法也认", v.ul_gemini()[0] == "ok")
+R.clear(); R["spotify"] = (200, H + "open.spotify.com/", "")
+check("Spotify：跳 open.spotify.com → 可用", v.ul_spotify()[0] == "ok")
+R.clear(); R["primevideo"] = (200, H + "www.primevideo.com/", "<html>prime</html>")
+check("Prime Video：主页正常、没字段 → 可用", v.ul_prime()[0] == "ok")
+R["primevideo"] = (200, "", "Prime Video is not available in your location")
+check("Prime Video：写了不可用 → 不支持", v.ul_prime()[0] == "no")
+R.clear(); R["hbomax"] = (200, H + "www.hbomax.com/", '<div data-geo-country="us">')
+check("HBO Max：data-geo-country", v.ul_hbomax() == ("ok", "可用（US）"))
+R["hbomax"] = (200, H + "www.hbomax.com/", "x")
+check("HBO Max：主页正常 → 可用", v.ul_hbomax()[0] == "ok")
+R.clear(); R["disneyplus"] = (200, H + "www.disneyplus.com/", "x")
+check("Disney+：主页正常 → ?（要登录确认）", v.ul_disney() == ("?", "主页正常，要登录才能确认"))
+
+print("读到一半断开（Netflix 真机 IncompleteRead）")
+import http.client
+class Resp:
+    status = 200
+    def geturl(self): return H + "www.netflix.com/title/81280792"
+    def read(self, n): raise http.client.IncompleteRead(b'"requestCountry":{"id":"US"}')
+real = v._get
+spec2 = importlib.util.spec_from_file_location("v2", os.path.join(ROOT, "vps-check.py"))
+v2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(v2)
+v2.urllib.request.urlopen = lambda *a, **k: Resp()
+c, u, body = v2._get(H + "www.netflix.com/title/81280792")
+check("读到的那截照样拿来判断", c == 200 and "requestCountry" in body)
+
 print("整屏")
 R.clear(); R["81280792"] = (200, "", '"requestCountry":{"id":"US"}')
 def boom(): raise RuntimeError("x")
@@ -86,7 +117,7 @@ b = io.StringIO()
 with contextlib.redirect_stdout(b):
     v.check_unlock()
 out = re.sub(r"\033\[[0-9;]*m", "", b.getvalue())
-check("每家一行、Netflix 全解锁、连不上的报 ?、出错的不炸", "✓ Netflix" in out and "全解锁（US）" in out
+check("每家一行、Netflix 全解锁、连不上的报 ?、出错的不炸；顶上一行出口地区", "出口地区" in out and "✓ Netflix" in out and "全解锁（US）" in out
       and "? Gemini" in out and "检测出错" in out and out.count("\n  ") >= 12)
 check("main 认 --unlock", "--unlock" in open(os.path.join(ROOT, "vps-check.py"), encoding="utf-8").read())
 xy = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()

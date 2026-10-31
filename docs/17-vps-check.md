@@ -23,7 +23,7 @@ apt/yum/apk 装）。两个按钮：
   > `curl -fsSL https://raw.githubusercontent.com/bgpeer/nodekit/main/vps-check.py | python3`
   > ——结论那一节会把这行命令原样打出来。
 - **`3 解锁检测（流媒体 / AI）`** —— 真去请求各家页面 / 接口，看能不能用、被判成哪个地区：Netflix（全解锁 / 仅自制剧）、YouTube Premium、Disney+、Prime Video、HBO Max、Spotify、TikTok、ChatGPT（网页 / App）、Claude、Gemini、B站港澳台。
-  ✓ 解锁　◐ 部分　✗ 不支持　? 判断不了——判断方法照公开解锁检测脚本常用的那几处，页面改版对不上就报「?」，不硬下结论；Disney+ 不登录只能说「可能可用」。用浏览器 UA（不自报家门），约 30 秒。
+  ✓ 解锁　◐ 部分　✗ 不支持　? 判断不了——判断方法照公开解锁检测脚本常用的那几处，页面改版对不上就报「?」，不硬下结论；Disney+ 不登录只能说「主页正常，要登录才能确认」；页面里不带地区的几家（Spotify / Prime Video / HBO Max / Gemini）看顶上那行「出口地区」。用浏览器 UA（不自报家门），约 30 秒。
 
   > **BGP 也查不出 CN2**，试过了。画像里的「上游/邻居」是 Cymru 的 peer 记录
   > （那个前缀的邻居 AS），本来指望里面出现 `AS4809`/`AS4134` 就能当 CN2 的证据——

@@ -8,7 +8,7 @@
 #   2. 查不准就明说，不给"自信但错误"的结论。GIA/GT 的细分本脚本【不下结论】，
 #      只把证据（59.43 跳、跳数、延迟）摆出来——理由见文件末尾「局限」。
 # ============================================================================
-import ipaddress, json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, urllib.error, concurrent.futures as cf
+import http.client, ipaddress, json, os, re, socket, struct, random, subprocess, sys, time, urllib.request, urllib.error, concurrent.futures as cf
 
 # 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
 # vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
@@ -632,13 +632,17 @@ def _get(url, timeout=10, headers=None, data=None):
     """→ (状态码, 最终网址, 正文)；连不上 (0, url, "")。4xx / 5xx 照样把正文读回来（有的家用 404 表示没解锁）。"""
     h = {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"}
     h.update(headers or {})
+    def body(f):
+        # 10/31 真机：Netflix 片子页读到一半断开（IncompleteRead）——读到的那截照样拿来判断
+        try: return f.read(600000).decode("utf-8", "replace")
+        except http.client.IncompleteRead as e: return (e.partial or b"").decode("utf-8", "replace")
     try:
         resp = urllib.request.urlopen(urllib.request.Request(url, headers=h, data=data), timeout=timeout)
-        return resp.status, resp.geturl(), resp.read(600000).decode("utf-8", "replace")
+        return resp.status, resp.geturl(), body(resp)
     except urllib.error.HTTPError as e:
-        try: body = e.read(600000).decode("utf-8", "replace")
-        except Exception: body = ""
-        return e.code, e.geturl() or url, body
+        try: b = body(e)
+        except Exception: b = ""
+        return e.code, e.geturl() or url, b
     except Exception:
         return 0, url, ""
 
@@ -667,12 +671,13 @@ def ul_netflix():
 def ul_youtube():
     code, _, body = _get("https://www.youtube.com/premium", headers={"Cookie": "CONSENT=YES+cb"})
     if code == 0: return "?", "连不上"
-    m = re.search(r'"INNERTUBE_CONTEXT_GL":"([A-Z]{2})"', body) or re.search(r'"countryCode":"([A-Z]{2})"', body)
+    m = re.search(r'"INNERTUBE_CONTEXT_GL":"([A-Z]{2})"', body) or re.search(r'"gl":"([A-Z]{2})"', body)
     reg = m.group(1) if m else ""
     if "www.google.cn" in body: return "no", "不支持（CN）"
     if "Premium is not available in your country" in body: return "no", f"不支持 Premium（{reg or '地区未知'}）"
-    if "ad-free" in body.lower() or "youtube premium" in body.lower():
-        return "ok", f"Premium 可用（{reg or '地区未知'}）"
+    # 10/31 真机：美国 IP 的 premium 页里找不到 ad-free 这类字（页面是脚本拼的），只有 "gl":"US"；没写不可用就算可用
+    if reg:
+        return "ok", f"Premium 可用（{reg}）"
     return "?", f"页面对不上（{reg or '地区未知'}）"
 
 def ul_chatgpt():
@@ -700,7 +705,9 @@ def ul_gemini():
     if code == 0: return "?", "连不上"
     m = re.search(r',2,1,200,"([A-Z]{3})"', body)
     reg = m.group(1) if m else ""
-    if "45631641,null,true" in body: return "ok", f"可用（{reg or '地区未知'}）"
+    # 老写法 45631641,null,true；10/31 真机是转义的 JSON：\"45631641\":true
+    if "45631641,null,true" in body or re.search(r'45631641\\?":true', body):
+        return "ok", f"可用（{reg or '地区看上面出口'}）"
     return "no", f"不支持（{reg or '地区未知'}）"
 
 def ul_tiktok():
@@ -713,29 +720,40 @@ def ul_tiktok():
 def ul_spotify():
     code, url, _ = _get("https://www.spotify.com/")
     if code == 0: return "?", "连不上"
-    if "select-your-country" in url: return "no", "不支持"
+    if "select-your-country" in url or "unavailable" in url: return "no", "不支持"
     m = re.search(r"spotify\.com/([a-z]{2})(?:-[a-z]{2})?/", url)
-    return ("ok", f"可用（{m.group(1).upper()}）") if m else ("?", "跳转里没找到地区")
+    if m: return "ok", f"可用（{m.group(1).upper()}）"
+    # 10/31 真机：美国 IP 直接跳 open.spotify.com，不带地区
+    if code == 200: return "ok", "可用（地区看上面出口）"
+    return "?", f"返回 {code}"
 
 def ul_prime():
     code, _, body = _get("https://www.primevideo.com/")
     if code == 0: return "?", "连不上"
     m = re.search(r'"currentTerritory":"([A-Z]{2})"', body)
-    return ("ok", f"可用（{m.group(1)}）") if m else ("no", "不支持")
+    if m: return "ok", f"可用（{m.group(1)}）"
+    # 10/31 真机：美国 IP 主页 200，老的 currentTerritory 字段没了。Prime Video 几乎全球都开，主页正常、没说不可用就算可用
+    if re.search(r"not available in your (location|region|country)", body, re.I): return "no", "不支持"
+    if code == 200: return "ok", "可用（地区看上面出口）"
+    return "?", f"返回 {code}"
 
 def ul_hbomax():
-    code, url, _ = _get("https://www.hbomax.com/")
+    code, url, body = _get("https://www.hbomax.com/")
     if code == 0: return "?", "连不上"
     if "geo-availability" in url or "unavailable" in url: return "no", "不支持"
-    m = re.search(r"hbomax\.com/([a-z]{2})/", url)
-    return ("ok", f"可用（{m.group(1).upper()}）") if m else ("?", "跳转里没找到地区")
+    m = re.search(r"hbomax\.com/([a-z]{2})/", url) or re.search(r'data-geo-country="([A-Za-z]{2})"', body)
+    if m: return "ok", f"可用（{m.group(1).upper()}）"
+    # 10/31 真机：美国 IP 不跳 /us/，地区由页面脚本去取；主页正常就算可用
+    if code == 200: return "ok", "可用（地区看上面出口）"
+    return "?", f"返回 {code}"
 
 def ul_disney():
     code, url, body = _get("https://www.disneyplus.com/")
     if code == 0: return "?", "连不上"
     if "unavailable" in url or "not available in your region" in body.lower(): return "no", "不支持"
     m = re.search(r'"region":"([A-Z]{2})"', body)
-    return ("ok", f"可能可用（{m.group(1)}，要登录才能确认）") if m else ("?", "要登录才能确认")
+    # 10/31 真机：主页 200，能不能看由页面脚本判断（不可用时脚本才跳 /welcome/unavailable），不登录确认不了
+    return ("ok", f"可能可用（{m.group(1)}，要登录才能确认）") if m else ("?", "主页正常，要登录才能确认")
 
 def ul_bilibili():
     # 港澳台限定番的一集：code 0 = 能播，-10403 = 地区不允许
@@ -756,6 +774,8 @@ def check_unlock():
     """解锁检测：真去请求各家的页面 / 接口，看能不能用、被判成哪个地区。"""
     print(f"\n{C['b']}流媒体 / AI 解锁检测{C['n']}")
     print(f"  {C['d']}按各家页面 / 接口的返回判断；页面改版对不上的报「?」，不硬下结论{C['n']}")
+    loc = _cf_loc("www.cloudflare.com")              # 出口在哪：页面里不带地区的几家，按这个看
+    print(f"  出口地区（Cloudflare 看到的）：{C['g']}{loc or '查不到'}{C['n']}")
     hr("·")
     sym = {"ok": (C["g"], "✓"), "part": (C["y"], "◐"), "no": (C["r"], "✗"), "?": (C["d"], "?")}
     def run(f):
