@@ -138,8 +138,13 @@ check("清掉以后再试：能换", "✔ 自建 DNS 换成 dns.zone.example" in
 reset(own="dns.zone.example"); y0 = open(Y).read(); out = go(["node.zone.example", "y"])
 check("跟节点同一个域名：不签、不改", not RUN and open(Y).read() == y0 and "已经有一张证书在用" in out)
 reset(); os.makedirs(ACME + "/*.media.zone.example_ecc", exist_ok=True)
+open(T + "/emby.crt", "w").write("x")
+open(ACME + "/*.media.zone.example_ecc/*.media.zone.example.conf", "w").write(f"Le_RealFullChainPath='{T}/emby.crt'\n")
 out = go(["media.zone.example", "y"])
 check("别人（Emby）的 acme 记录同名：不签、不改", not RUN and "已经有一张证书在用" in out)
+reset(); os.makedirs(ACME + "/dnsx.zone.example_ecc", exist_ok=True)       # 卸了重装 / 签失败留下的（10/31 DMIT）
+out = go(["dnsx.zone.example", "y"])
+check("自己以前留下的同名记录：照换，不报「已经有一张证书在用」", "已经有一张证书在用" not in out and "✔ 自建 DNS 换成 dnsx.zone.example" in out)
 reset(own="dns.zone.example"); out = go(["dns.zone.example"])
 check("跟现在一样：不改", not RUN and "跟现在一样" in out)
 reset(); a._resolve4 = lambda n: ["203.0.113" + ".9"]

@@ -288,7 +288,7 @@ def _setup_own_domain():
     if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
         print(f"  {R}✗ 域名格式不对{N}"); return ""
     # 跟节点同一个名字：acme.sh 按主域名存记录，会把节点那条（续期装到节点证书）顶掉——换个子域名
-    if dom == nd or os.path.isdir(os.path.expanduser(f"~/.acme.sh/{dom}_ecc")):
+    if dom == nd or _acme_has_record(dom):
         print(f"  {R}✗ {dom} 已经有一张证书在用（节点 / 别的服务的），换一个只给 DNS 用的子域名{N}"); return ""
     ip = _public_ip()
     print(_hl("1;36", f"[Cloudflare 里两条 A 记录 → {ip}，仅 DNS（灰云）]"))
@@ -371,9 +371,23 @@ def _agh_tls_retarget(txt, dom):
     return txt[:m.end()] + blk + txt[end:]
 
 def _acme_has_record(dom):
-    """acme.sh 里有没有这个名字的记录（dom 或 *.dom，带不带 _ecc）——有就是别人在用，不能拿来签。"""
+    """acme.sh 里这个名字的记录（dom 或 *.dom，带不带 _ecc）是不是【别人在用】——是就不能拿来签。
+       看记录里登记的证书装到哪（Le_RealFullChainPath）：装到别处、那个文件还在（节点 / Emby 的）才算别人的；
+       装到自建 DNS 自己那张（AGH_CRT）、或者压根没装上（签失败留下的空记录）的，是自己以前留下的，照签。
+       10/31 DMIT：换域名签失败留下一条、卸了重装又被它拦，两次都报「已经有一张证书在用」。"""
     base = os.path.expanduser("~/.acme.sh")
-    return any(os.path.isdir(os.path.join(base, n)) for n in (dom, dom + "_ecc", "*." + dom, "*." + dom + "_ecc"))
+    for n in (dom, dom + "_ecc", "*." + dom, "*." + dom + "_ecc"):
+        conf = os.path.join(base, n, n[:-4] + ".conf" if n.endswith("_ecc") else n + ".conf")
+        if not os.path.isdir(os.path.join(base, n)):
+            continue
+        try:
+            m = re.search(r"(?m)^Le_RealFullChainPath=['\"]?([^'\"\n]*)", open(conf).read())
+        except OSError:
+            m = None
+        path = m.group(1).strip() if m else ""
+        if path and path != AGH_CRT and os.path.exists(path):
+            return True
+    return False
 
 def change_domain():
     """菜单 10「更换域名证书」：问新域名、查记录、把会跟着变的说清楚，确认了才动手（_change_domain_apply）。"""
