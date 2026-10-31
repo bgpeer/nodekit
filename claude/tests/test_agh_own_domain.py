@@ -108,10 +108,17 @@ with contextlib.redirect_stdout(buf):
     got = a._setup_own_domain()
 check("填节点域名本身：不签（会把节点那条 acme 记录顶掉）", got == "" and not RUN and "换一个" in buf.getvalue())
 os.makedirs(f"{tmp}/.acme.sh/media.example_ecc")
+open(f"{tmp}/emby.crt", "w").write("x")                     # 别的服务的：记录登记装到别处、那个文件还在
+open(f"{tmp}/.acme.sh/media.example_ecc/media.example.conf", "w").write(f"Le_RealFullChainPath='{tmp}/emby.crt'\n")
 ASK[:] = ["media.example"]; RUN.clear()
 with contextlib.redirect_stdout(io.StringIO()):
     got = a._setup_own_domain()
 check("acme.sh 里已有同名记录（别的服务的）：不签", got == "" and not RUN)
+os.makedirs(f"{tmp}/.acme.sh/left.example_ecc")            # 签失败留下的空记录 / 自建 DNS 自己以前那条（10/31 DMIT 卸了重装被拦）
+open(f"{tmp}/.acme.sh/left.example_ecc/left.example.conf", "w").write("Le_Domain='left.example'\n")
+check("签失败留下的空记录、自建 DNS 自己以前的记录：不算别人的", not a._acme_has_record("left.example"))
+open(f"{tmp}/.acme.sh/left.example_ecc/left.example.conf", "w").write(f"Le_RealFullChainPath='{a.AGH_CRT}'\n")
+check("装到自建 DNS 自己那张的：不算别人的", not a._acme_has_record("left.example"))
 a._node_domain = lambda: ""
 open(a.AGH_DOMAIN_FILE, "w").write(DOM + "\n")
 
