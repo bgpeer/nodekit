@@ -22,6 +22,7 @@
 | Emby 里的空壳 | `emby_ghost_items` / `prune_emby_ghosts`（每小时，有两成刹车）/ `clear_retired_ghosts`（撤掉的盘，人点的） |
 | 开播门 | `do_heal_gate`（15 秒硬上限）；改它要单独上、等仓库主人实测退出后进度刷新 |
 | 「8 更新」 | `update_menu`：1 立即 → `do_update`；2 每月自动开关 → cron 每天 02:30 `do_imgupdate`（3 号起、本月没做成才做，`do_update(auto=True)`） |
+| Emby 域名证书（7 设置 → 12） | `emby_domain_menu` → `emby_domain_apply`：签 `*.新底座` → `.env` → `apply_nginx_site`（不过放回）→ 首页 / AutoFilm / MediaWarp 重写重启 → 撤旧那张 |
 | Emby 账号（7 设置 → 11） | `emby_accounts_menu` → `_emby_account_menu`；改名 `emby_rename_user`（读回整份资料改 Name 再 POST），改密码 `emby_set_password`（先重置再设，第二步失败 = 没密码，要醒目报） |
 | 截封面 | `fill_covers`；按钮 → 后台 `do_covers_mount`；生成后 / 凌晨新片 → `queue_new_covers` → `do_covers_new` |
 | 盘那一屏 | `_drive_menu`，公共项 `_drive_std_items` / `_drive_tail_items` |
@@ -165,6 +166,17 @@
   `domain_resolver`。作者模板（🎯直连 是选择器、有 bootstrap）碰不上，自定义模板会——`_sb_dns_dial` 挡这两条（自建 DNS、私有解析共用）。
 - 被藏机器的管理直连规则（`IP-CIDR,真实IP`）去掉（仓库主人 10/28 同意）；测试 `test_privdns.py`（IP 装的）、
   `test_privdns_domain.py`（域名装的）共用 `_fakedoh.py` 起的 TLS 假 AdGuard（按写进 yaml 的规则答），`_doh_ask` 走真握手、真 POST。
+
+## 三个换域名的入口（10/31 起互不干预）
+
+仓库主人：「不要干预emby吧，直接做成不询问，还是在emby设置里面做一个更换域名证书的口子吧，自建DNS里面也做一个……这样他们就互相不干预了」。
+- **节点** `15 → 2 更换节点域名`（xy-installer `cert_change_domain_flow` / `cert_change_domain_apply`）：不问 Emby、不动 Emby。
+  Emby 跟节点共用证书（软链）时传 `emby_keep`，新证书接着签 `*.Emby底座`；Emby 底座正好是旧节点域名又是自己一张证书时，
+  `_acme_forget(old, keep=("*.old",))` 别把它那条撤了。老装法自建 DNS（`_agh_shares_node`）照旧跟着换，屏上指到 13 → 10 先分开。
+- **自建 DNS** `13 → 10 更换域名证书`（adguard-dns `change_domain` / `_change_domain_apply`）：签新 + `*.新` → 装 `/etc/ssl/agh` →
+  `_agh_tls_retarget` 改 yaml（服务器名、证书路径、清掉贴进去的证书正文）→ 重启等 DoT → 不行整体放回。老装法从这里分出来，
+  节点证书不碰。订阅里写着它就叫主脚本 `selfdns-refresh`（老主脚本不认就不叫）。10/31 拿真 AdGuard v0.107.79 跑过改写后的 yaml：DoT 起来、SNI `ID.新域名` 给的是新证书。
+- **Emby** `16 → 7 设置 → 12 域名证书`（media-stack `emby_domain_menu`）：见上面 media-stack 地图。IP:端口 装的不在这里改（要重建容器）。
 
 ## 客户端的坑（真机踩过）
 - **sing-box 客户端连不上被藏的节点（10/30 已解决）**：SFA（核心 1.15.0-alpha.13，自定义模板）出站上的简写

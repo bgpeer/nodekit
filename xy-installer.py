@@ -8256,24 +8256,39 @@ def selfdns_off():
     except Exception as e:
         print("  订阅刷新跳过（不影响卸载）:", e)
 
+def selfdns_refresh():
+    """自建 DNS 换了它自己的域名（adguard-dns 菜单 10 调用 selfdns-refresh）：订阅里写着的 DoH 地址
+       （「自建 DNS 写入订阅」、本机当 DNS 机时被藏节点去问的那台）都是按域名拼的，三大配置重生成一遍。
+       不动节点、不换 token、不重启服务；两样都没开就什么都不做。"""
+    if not (os.path.exists(SELFDNS_FLAG) or privdns_conf()["mode"] == "self"):
+        print("  订阅里没写自建 DNS，不用刷新")
+        return
+    if not _privdns_regen():
+        print("  ✔ 订阅里的自建 DNS 地址已换成新域名（客户端刷新订阅生效）")
+
 def _privdns_regen():
     """改完私有解析重生成三大配置：跟「刷新三大配置」同一套 _regen_fmt（不动节点、不换 token、不重启服务）；
-       汇总、当 DNS 机对映射、去 DNS 问一遍都在 aggregated_links 里。手改过的格式不动，屏上一行说明。"""
+       汇总、当 DNS 机对映射、去 DNS 问一遍都在 aggregated_links 里。手改过的格式不动，屏上一行说明。
+       返回没刷成的格式有几个（手改过跳过的、生成失败的都算）。"""
     todo = [e for e in FMT if os.path.exists(FMT[e]["file"])]
     G["host"] = _host()
     links = aggregated_links()
     if not todo:
-        return
+        return 0
     ylines, nodes = parse_nodes(links)
     if not ylines:
-        return
+        return 0
+    miss = 0
     for e in todo:
         if cfg_auto_paused(e):
             print(f"  ⚠ {FMT[e]['label']} 手改过，没刷新（要刷到「刷新三大配置」里点）")
+            miss += 1
             continue
         st, _which, err = _regen_fmt(e, ylines, nodes)
         if st == "failed":
             print(f"  ⚠ {FMT[e]['label']} 生成失败，保留原配置：{str(err).splitlines()[0] if str(err) else err}")
+            miss += 1
+    return miss
 
 def _privdns_served():
     """本机替哪些外机解析 → 「2 台（🇺🇸1、🇯🇵2）」；一台没有返回「还没有」。"""
@@ -12229,8 +12244,9 @@ def _domain_resolves_here(dom):
         return True, f"解析到 {mine}，正是本机"
     return False, f"解析到 {', '.join(got)}，而本机是 {mine}"
 
-def _acme_forget(dom):
+def _acme_forget(dom, keep=()):
     """让 acme.sh 不再跟踪这个域名（只停止续期，不删磁盘上的任何文件）。
+       keep：照旧要续的记录名（比如 Emby 自己那张 *.域名 正好跟旧节点域名同名），跳过。
 
        换完域名【必须】做这一步。旧域名那条记录里存着「装到哪个文件、装完跑什么」，
        它的每日 cron 照常跑，续完就把节点正在用的证书覆盖成旧域名那张，还顺手按
@@ -12243,67 +12259,10 @@ def _acme_forget(dom):
     if not os.path.exists(acme):
         return False
     for d in (dom, f"*.{dom}"):
+        if d in keep:
+            continue
         sh(f"{acme} --remove -d '{d}' --ecc", check=False)
         sh(f"{acme} --remove -d '{d}'", check=False)
-    return True
-
-def _emby_env_files():
-    return [p for p in ("/opt/emby-stack/.env", "/opt/media-stack/.env") if os.path.exists(p)]
-
-_EMBY_NGX = "/etc/nginx/conf.d/media-stack.conf"
-
-def _emby_set_domain(old, new, shared):
-    """Emby 跟着换域名：.env 的 DOMAIN、nginx 的 server_name/证书路径、证书软链。
-       nginx -t 不过就整体还原。返回成功与否。"""
-    Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
-    bak, made = {}, []
-    def snap(p):
-        try: bak[p] = open(p, "rb").read()
-        except OSError: pass
-    def undo():
-        for p, b in bak.items():
-            try: open(p, "wb").write(b)
-            except OSError: pass
-        for p in made:
-            try: os.remove(p)
-            except OSError: pass
-    for envf in _emby_env_files():
-        snap(envf)
-        txt = open(envf, encoding="utf-8").read()
-        open(envf, "w", encoding="utf-8").write(
-            re.sub(r"(?m)^(DOMAIN=)['\"]?" + re.escape(old) + r"['\"]?\s*$", r"\g<1>" + new, txt))
-    if os.path.exists(_EMBY_NGX):
-        snap(_EMBY_NGX)
-        txt = open(_EMBY_NGX, encoding="utf-8").read()
-        # 这份 conf 是 media-stack 生成的，域名只出现在 server_name 和证书路径两处，
-        # 整体替换是安全的；不放心也没关系——下面 nginx -t 不过就原样还原。
-        open(_EMBY_NGX, "w", encoding="utf-8").write(txt.replace(old, new))
-    # 证书：本来就是跟节点共用（软链）的，就在新名字下重建软链；
-    # 各用各的则不擅自动它——那张是旧域名的证书，盖不住新域名，得重签。
-    if shared:
-        for src, dst in ((ACME_CRT, _emby_crt(new)), (ACME_KEY, _emby_key(new))):
-            try:
-                if os.path.lexists(dst):
-                    os.remove(dst)
-                os.symlink(src, dst); made.append(dst)
-            except OSError as e:
-                undo(); print(f"{R}  ✗ Emby 证书软链建不起来（{e}），Emby 那侧已还原。{N}")
-                return False
-    chk = subprocess.run("nginx -t", shell=True, text=True, capture_output=True)
-    if chk.returncode:
-        undo()
-        print(f"{R}  ✗ Emby 的 nginx 校验没过，那一侧已整体还原：{N}\n   "
-              + (chk.stderr or chk.stdout).strip().replace("\n", "\n   "))
-        return False
-    for p in (_emby_crt(old), _emby_key(old)):        # 旧名字的软链留着只会误导
-        if os.path.islink(p):
-            try: os.remove(p)
-            except OSError: pass
-    print(f"  {GRN}Emby 也换好了{N}：{old} → {new}"
-          + ("（证书继续跟节点共用一张）" if shared else ""))
-    if not shared:
-        print(f"{Y}    ⚠ Emby 的证书原来是独立一张、签的是 {old}，盖不住 {new}。"
-              f"去菜单 15『4 Emby 证书』并成一张，或自己给它重签。{N}")
     return True
 
 def _cert_usable_for(names):
@@ -12318,7 +12277,7 @@ def _cert_usable_for(names):
        直接失败）。跳过重签又不验一遍，等于把这两种情况原样带进新域名。"""
     return cert_validate(ACME_CRT, ACME_KEY, names)
 
-def _domain_switch_notice(new, emby_new=""):
+def _domain_switch_notice(new):
     """换完域名之后，哪些【对外地址】跟着变了、去哪儿看新值。
 
        证书是全机共用的地基，吃它的东西各自对外报一个地址：订阅、节点、
@@ -12350,12 +12309,14 @@ def _domain_switch_notice(new, emby_new=""):
             out.append(("GitHub 中转", gh, "面板 14　订阅里自动换好了；手工引用过的要改"))
     except Exception:
         pass
-    if emby_new:
-        out.append(("Emby", f"https://<子域>.{emby_new}", "面板 16　App / 客户端里存的地址要改"))
     return out
 
-def cert_change_domain_apply(new, cf_token="", emby_new=""):
-    """换域名（非交互，后台跑）。成功返回 True。
+def cert_change_domain_apply(new, cf_token="", emby_keep=""):
+    """换节点域名（非交互，后台跑）。成功返回 True。
+
+       只换节点这一套（仓库主人 10/31：「不要干预 emby 吧，直接做成不询问」）：Emby 在「16 自建 Emby → 7 设置 →
+       12 域名证书」、自建 DNS 在「13 → 10 更换域名证书」各自换。emby_keep：Emby 正跟节点共用这张证书（软链）时
+       它的底座域名——新证书接着把 *.它 签进去，Emby 一个字节不动照样能用。
 
        顺序是有讲究的，反了会出人命：
 
@@ -12440,12 +12401,12 @@ def cert_change_domain_apply(new, cf_token="", emby_new=""):
 
     # ── 3. 证书（到这一步才动，前面全是可回滚的本地改动）─────────────────
     names = [new, f"*.{new}"]
-    if emby_new and not _name_covers(names, "x." + emby_new):
-        names += [emby_new, f"*.{emby_new}"]
-    need = [new, f"*.{new}"] + ([f"x.{emby_new}"] if emby_new else [])
+    if emby_keep and not _name_covers(names, "x." + emby_keep):
+        names += [emby_keep, f"*.{emby_keep}"]
+    need = [new, f"*.{new}"] + ([f"x.{emby_keep}"] if emby_keep else [])
     have = cert_names()
     if _name_covers(have, new) and _name_covers(have, "x." + new) and \
-            (not emby_new or _name_covers(have, "x." + emby_new)):
+            (not emby_keep or _name_covers(have, "x." + emby_keep)):
         # 「盖得住」不等于「能用」：可能快到期了，也可能是新证书配旧私钥。
         # 跳过重签就必须在这儿补上这一验，否则等于把坏证书原样带进新域名。
         ok, why = _cert_usable_for(need)
@@ -12509,50 +12470,42 @@ def cert_change_domain_apply(new, cf_token="", emby_new=""):
         print(f"{Y}  ⚠ 订阅刷新失败（{e}）—— 节点本身已经是新域名了，"
               f"回面板点一次『更新配置』补上即可。{N}")
 
-    # ── 5. Emby ────────────────────────────────────────────────────────
-    emby_old = _emby_cert()[0]
-    if emby_new and emby_old and emby_new != emby_old:
-        _emby_set_domain(emby_old, emby_new, _emby_shared(emby_old))
-
-    # ── 6. 撤掉旧域名的 acme 记录（见 _acme_forget 的说明，这步不能省）──────
-    if _acme_forget(old):
+    # ── 5. 撤掉旧域名的 acme 记录（见 _acme_forget 的说明，这步不能省）──────
+    # Emby 自己那张（各用各的）记录名是 *.它的底座；底座正好就是旧节点域名时它还在用，别撤
+    _ed = _emby_cert()[0]
+    _keep = (f"*.{_ed}",) if _ed == old and not _emby_shared(_ed) else ()
+    if _acme_forget(old, keep=_keep):
         print(f"  已让 acme.sh 不再跟踪 {old}（不撤的话它的每日续期会覆盖掉节点证书）")
     else:
         print(f"{Y}  ⚠ 没找到 acme.sh，{old} 的续期记录没能撤掉。要是它还在，"
               f"半夜会把证书覆盖回旧域名那张 —— 回面板『5 清理旧证书』看一眼。{N}")
 
-    # ── 7. 让吃证书的服务重读，顺带把新配置加载进去 ──────────────────────
+    # ── 6. 让吃证书的服务重读，顺带把新配置加载进去 ──────────────────────
     svcs = _cert_consumers() or [s for _, _, s in cores]
     print(f"\n{G_OK}  ✓ 域名已换成 {new}{N}")
     print(f"    重启：{'、'.join(svcs)}")
     print(f"\n{Y}  ⚠ 下面这些对外地址跟着变了，都要去改：{N}")
     print("-" * 60)
-    for what, val, where in _domain_switch_notice(new, emby_new):
+    for what, val, where in _domain_switch_notice(new):
         print(f"  {Y}{what}{N}")
         print(f"      {val}")
         print(f"      {where}")
     print("-" * 60)
+    if _ed:
+        print(f"  Emby 没动，照旧是 <子域>.{_ed}" + ("（新证书接着盖住它）" if emby_keep else "")
+              + f"；{_ed} 的解析记录别删")
     restart_services(*svcs)
     return True
 
-def _emby_default_base(new):
-    """Emby 对外是 <子域>.<域名>，而节点域名是一个完整主机名。节点换到 jp2.example.net
-       时 Emby 多半该跟到 example.net（就像 jp.example.com 对应 example.com）。
-       只是个默认值，问的时候可以改。"""
-    parts = new.split(".")
-    return ".".join(parts[1:]) if len(parts) >= 3 else new
-
-def _domain_map(d, old, new, emby_old="", emby_new=""):
-    """当前在用的一个域名 → 换完之后对应的新名字（*. 照样带）。跟这次换的无关 → ''。
-       先认节点域名（更长、更具体）：jp.a.com 换 jp2.b.net 时，Emby 的 emby.a.com 才不会被它误吃。"""
+def _domain_map(d, old, new):
+    """当前在用的一个域名 → 换完之后对应的新名字（*. 照样带）。跟这次换的无关 → ''。"""
     w = d.startswith("*.")
     b = d[2:] if w else d
-    for o, n in ((old, new), (emby_old, emby_new)):
-        if o and n and (b == o or b.endswith("." + o)):
-            return ("*." if w else "") + b[:len(b) - len(o)] + n
+    if old and new and (b == old or b.endswith("." + old)):
+        return ("*." if w else "") + b[:len(b) - len(old)] + new
     return ""
 
-def _domain_record_plan(rows, old, new, emby_old="", emby_new=""):
+def _domain_record_plan(rows, old, new):
     """换之前新域名要先建好的 A 记录 → [(要建的名字, 拿来查的主机名)]。
        只要真在用的（证书里写着、却没人用的泛域名不算）；新的节点域名一定在。
        泛域名查一个具体名字：有 ClientID 就查安卓真填的 <ID>.新域名，没有就查 xycheck.新域名。"""
@@ -12562,13 +12515,30 @@ def _domain_record_plan(rows, old, new, emby_old="", emby_new=""):
     for d, _c, _lv, us in rows:
         if us == ["没找到在用的地方"]:
             continue
-        nd = _domain_map(d, old, new, emby_old, emby_new)
+        nd = _domain_map(d, old, new)
         if nd and nd not in want:
             want.append(nd)
     return [(n, f"{cid or 'xycheck'}.{n[2:]}" if n.startswith("*.") else n) for n in want]
 
+def _agh_shares_node(dom):
+    """自建 DNS 还跟节点共用这个域名吗（老装法：没有自己的域名，加密服务器名就是节点域名）。"""
+    if os.path.exists(AGH_DOMAIN_FILE):
+        return False
+    t = _agh_tls()
+    return t.get("enabled") == "true" and (t.get("server_name") or "").lower() in ("", (dom or "").lower())
+
+def _other_service_names():
+    """不归「更换节点域名」管的域名：Emby 那几个站点（和只给它们用的泛域名）、自建 DNS 自己的域名。
+       换节点域名只动节点这一套（仓库主人 10/31「这样他们就互相不干预了」），这些不列、不要求建记录。"""
+    out = {d.lower() for d in _server_names(MS_NGINX_CONF)}      # 只给 Emby 用的泛域名那行看用途（「Emby 那几个子域」）
+    if os.path.exists(AGH_DOMAIN_FILE):
+        own = _agh_domain()
+        out |= {own, "*." + own}
+    return out
+
 def cert_change_domain_flow(i):
-    """菜单 15 → 2 更换域名。交互问完 + 把要动的东西全摆出来，确认后转后台。"""
+    """菜单 15 → 2 更换节点域名。交互问完 + 把要动的东西全摆出来，确认后转后台。
+       只换节点这一套：Emby、有自己域名的自建 DNS 一律不问、不动（仓库主人 10/31），它们各有各的换域名入口。"""
     Y, R, GRN, N = "\033[1;33m", "\033[1;31m", "\033[1;32m", "\033[0m"
     old = node_domain()
     if not old:
@@ -12577,7 +12547,7 @@ def cert_change_domain_flow(i):
         _ask("  按回车返回...")
         return
     print("\n" + "=" * 60)
-    print(f"  更换域名　　当前：{GRN}{old}{N}")
+    print(f"  更换节点域名　　当前：{GRN}{old}{N}")
     print("=" * 60)
     print("  换的是【你自己的域名】——客户端连的那个、证书签的那个。")
     print(f"  {Y}不是{N} reality 借用的伪装站（那个在菜单 4，现在是 {G.get('sni') or '(未设)'}）。")
@@ -12590,7 +12560,7 @@ def cert_change_domain_flow(i):
     print(f"{Y}     ② 这个域名要在 Cloudflare 的区域里（DNS 托管在 CF）{N}")
     print(f"       泛域名证书走 DNS-01，acme 要用 CF 的 API 往区域里写一条 TXT 验证记录。")
     print(f"       域名不在 CF 名下，Token 权限再对也签不出来。")
-    if _agh_tls().get("enabled") == "true" and not os.path.exists(AGH_DOMAIN_FILE):   # 自建 DNS 有自己的域名就不跟着换
+    if _agh_shares_node(old):                     # 自建 DNS 有自己的域名就不跟着换
         print(f"{Y}     ③ 装了自建 DNS：再加一条 *.新域名 的 A 记录（灰云），安卓专用 DNS 要用{N}")
     print(f"     解析改完【等生效】再来——DNS 有缓存，改完立刻查多半还是旧值。")
     print("-" * 60)
@@ -12602,25 +12572,16 @@ def cert_change_domain_flow(i):
     if new == old:
         print("  跟现在一样，没什么可换的。"); return
 
-    # ── Emby ──────────────────────────────────────────────────────
-    emby_old, emby_new = i.get("emby_domain") or _emby_cert()[0], ""
-    if emby_old:
-        dft = _emby_default_base(new)
-        print(f"\n  本机有自建 Emby，它现在的域名是 {GRN}{emby_old}{N}"
-              f"（对外是 <子域>.{emby_old}）")
-        ans = _ask(f"  Emby 也换成（回车 = {dft}，输 n = 不动它）: ").strip().lower().rstrip(".")
-        if ans in ("n", "no"):
-            emby_new = ""
-            print(f"{Y}    Emby 留在 {emby_old}。那它就得自己一张证书、自己一条续期链，"
-                  f"而且旧域名的解析不能撤。{N}")
-        else:
-            emby_new = ans or dft
-            if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", emby_new):
-                print("  域名格式不对，已取消。"); return
+    # ── Emby、有自己域名的自建 DNS：不问、不动 ─────────────────────────────────
+    emby_dom = (i.get("emby_domain") or "").lower()
+    emby_keep = emby_dom if emby_dom and i.get("emby_shared") else ""   # 共用节点证书：新证书接着盖住它
+    others = _other_service_names()
 
     # ── 当前关联的域名 + 换之前要建好的 DNS 记录（仓库主人 10/17：全部列出来，没建好就换不成）──
-    rows = [r for r in domain_uses(i or None) if r[2] != ""]          # CDN 走自己的域名，不归换域名管
-    plan = _domain_record_plan(rows, old, new, emby_old, emby_new)
+    # CDN 走自己的域名、Emby / 自建 DNS 各换各的，都不归这里管
+    rows = [r for r in domain_uses(i or None) if r[2] != "" and r[0] not in others
+            and r[3] != ["Emby 那几个子域"]]
+    plan = _domain_record_plan(rows, old, new)
     print()
     print(_hl("1;33", f"▸ 当前 {old} 关联的域名（{len(rows)} 个）"))
     for d, _c, _lv, us in rows:
@@ -12641,7 +12602,8 @@ def cert_change_domain_flow(i):
 
     # ── 证书：够用就不重签 ──────────────────────────────────────────
     have = cert_names()
-    covered = _name_covers(have, new) and _name_covers(have, "x." + new)
+    covered = _name_covers(have, new) and _name_covers(have, "x." + new) and \
+        (not emby_keep or _name_covers(have, "x." + emby_keep))
     cf_token = ""
     if covered:
         print(f"  证书:     {GRN}现有证书已经盖得住 {new} 和 *.{new}，不用重签{N}")
@@ -12657,12 +12619,10 @@ def cert_change_domain_flow(i):
     # ── 把要动的东西全摆出来再问 ────────────────────────────────────
     targets = _domain_targets(old)
     names = [new, f"*.{new}"]
-    if emby_new and not _name_covers(names, "x." + emby_new):
-        names += [emby_new, f"*.{emby_new}"]
+    if emby_keep and not _name_covers(names, "x." + emby_keep):
+        names += [emby_keep, f"*.{emby_keep}"]          # Emby 跟节点共用这张：接着盖住它，它才不用动
     print("\n" + "-" * 60)
     print(f"  换域名:    {old}  →  {new}")
-    if emby_new:
-        print(f"  Emby:      {emby_old}  →  {emby_new}")
     if not covered:
         print(f"  要签的证书: {', '.join(names)}")
     print(f"  会动这些文件（{len(targets)} 个）:")
@@ -12671,15 +12631,22 @@ def cert_change_domain_flow(i):
     print(f"  不会动:    reality 的借用站（{G.get('sni') or '(未设)'}）、"
           f"端口 / uuid / 密码 / 路径 / short-id")
     print(f"             CDN 套用那几个节点（它们走自己的域名，见菜单 9）")
+    if emby_dom:
+        print(f"             Emby（<子域>.{emby_dom}，换它在「16 自建 Emby → 7 设置 → 12 域名证书」）")
+    if os.path.exists(AGH_DOMAIN_FILE):
+        print(f"             自建 DNS（{_agh_domain()}，换它在「13 自建 DNS → 10 更换域名证书」）")
     print(f"  安全网:    先改配置再跑两个核心自带的校验，任一不过整体回滚、"
           f"服务一个都不重启；")
     print(f"             nginx -t 不过连核心一起回滚；这些全过了才去签证书，"
           f"证书没拿到也整体回滚。")
     print("-" * 60)
     print(f"{Y}  ⚠ 证书是全机共用的地基，吃它的每一样东西对外报的地址都要跟着改：{N}")
-    for _what, _v, _where in _domain_switch_notice(new, emby_new):
+    for _what, _v, _where in _domain_switch_notice(new):
         print(f"{Y}      · {_what}　→　{_where}{N}")
     print(f"{Y}    换完会把每一条的【新值】打出来，照着去各自的配置里改一遍。{N}")
+    if _agh_shares_node(old):
+        # 老装法：自建 DNS 跟节点共用域名和证书，只能一起换；想分开先去 13 给它一个自己的域名
+        print(f"{Y}  ⚠ 自建 DNS 还跟节点共用这个域名，这次会一起换；想让它独立，先去「13 自建 DNS → 10 更换域名证书」{N}")
     print(f"{Y}  ⚠ 订阅地址的 host 会变，客户端要【重新导入】一次订阅，不是刷新。{N}")
     print(f"{Y}  ⚠ 重启核心会掐断代理链路，挂着本机代理连的 SSH 会断——"
           f"不用管，后台会跑完。{N}")
@@ -12690,9 +12657,9 @@ def cert_change_domain_flow(i):
         print("  已取消，一个字节都没改。")
         return
     plan = {"op": "cert-domain", "domain": new, "cf_token": cf_token,
-            "emby_new": emby_new, "G": dict(G)}
+            "emby_keep": emby_keep, "G": dict(G)}
     _node_op_dispatch(plan,
-                      lambda: cert_change_domain_apply(new, cf_token, emby_new))
+                      lambda: cert_change_domain_apply(new, cf_token, emby_keep))
 
 def cert_menu():
     """菜单 15：域名证书管理。"""
@@ -12700,9 +12667,9 @@ def cert_menu():
         i = cert_panel()
         _nd = node_domain()
         _can = [r for r in acme_records() if r["removable"]]
-        # 2 更换域名：连证书、节点链接、订阅一起换；3 强制重签：到期前后、或怀疑证书坏了时用
+        # 2 更换节点域名：连证书、节点链接、订阅一起换（Emby / 自建 DNS 各在自己的菜单里换）；3 强制重签：到期前后、或怀疑证书坏了时用
         items = [(1, "安装证书", _hl("1;32", "已安装") if i["exists"] else "未安装"),
-                 (2, "更换域名", _nd or _hl("2", "本机没有域名（自签 + IP）")),
+                 (2, "更换节点域名", _nd or _hl("2", "本机没有域名（自签 + IP）")),
                  (3, "强制重签（所有服务重读）", None)]
         if i["emby_domain"]:
             items.append((4, "Emby 证书", "共用一张" if i["emby_shared"] else "各用各的"))
@@ -12958,7 +12925,7 @@ def node_op_run():
                                plan.get("cf_token", ""), plan.get("names"))
         elif plan["op"] == "cert-domain":
             cert_change_domain_apply(plan["domain"], plan.get("cf_token", ""),
-                                     plan.get("emby_new", ""))
+                                     plan.get("emby_keep", ""))
         elif plan["op"] == "privdns-domain":
             privdns_domain_apply(plan)
         elif plan["op"] == "install":
@@ -14150,6 +14117,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if sys.argv[1] == "privdns":         # adguard 菜单 4 调用：节点使用私有DNS解析
         privdns_menu()
+        sys.exit(0)
+    if sys.argv[1] == "selfdns-refresh": # adguard 换了自己的域名：DoH 地址变了，写进订阅的那几处跟着重生成
+        selfdns_refresh()
         sys.exit(0)
     if sys.argv[1] == "privdns-off":     # adguard 卸载调用：本机在当 DNS 机就关掉，外机节点改回真实地址
         privdns_off()
