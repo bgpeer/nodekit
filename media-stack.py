@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.389"
+SCRIPT_VERSION = "1.5.390"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -26162,6 +26162,9 @@ def params_menu():
         print(f"  10. 自动补时长       当前："
               + (f"{CYAN}开 · 每天 {_mb_txt(heal_day_mb())}{RST}" if heal_auto_on()
                  else f"{YELLOW}关{RST}"))
+        _eu = emby_users(cur) if cur else []
+        print(f"  11. Emby 账号        当前："
+              + (f"{CYAN}{'、'.join(n for n, _a in _eu)}{RST}" if _eu else f"{DIM}读不到{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -26196,6 +26199,145 @@ def params_menu():
             set_cover_auto()
         elif c == "10":
             heal_auto_menu()
+        elif c == "11":
+            emby_accounts_menu(cur)
+            continue          # 子菜单自己管停顿
+        else:
+            print("无效选择。")
+            continue
+        ask("\n按回车返回...")
+
+
+# ---- 「7 设置 → 11」Emby 账号：改用户名 / 密码 ----
+# 仓库主人 10/31：「emby 可以用代码修改用户名和密码吗」「做吧，加进 7 设置里，这个用户名账号在后面还要显示出来」。
+# 走 Emby 自己的接口（本机 + API Key，跟脚本别处一样）：改名 = 读回整份用户资料改 Name 再 POST 回去；
+# 改密码 = 先「管理员重置」（密码变空）再用空的旧密码设新的 —— 不用知道旧密码。
+# 【两步之间失败 = 账号没密码】第二步失败就醒目说清、当场让重试，别留一个空密码的账号不吭声。
+# 新密码只在屏上显示一次，不写日志、不存文件（第一节）；脚本手里从来没有过 Emby 密码，以后也不留。
+
+def _emby_user_list(key):
+    """[(id, 名字, 是不是管理员, 有没有密码)]；问不到 → []。"""
+    try:
+        return [(str(u.get("Id") or ""), u.get("Name") or "?",
+                 bool((u.get("Policy") or {}).get("IsAdministrator")),
+                 bool(u.get("HasPassword", u.get("HasConfiguredPassword", True))))
+                for u in (_emby("/Users", key, timeout=15) or []) if u.get("Id")]
+    except Exception:
+        return []
+
+
+def emby_rename_user(key, uid, new):
+    """改用户名。返回 "" = 成功；否则原因。"""
+    new = (new or "").strip()
+    if not new:
+        return "用户名不能为空"
+    if any(n == new and i != uid for i, n, _a, _p in _emby_user_list(key)):
+        return f"已经有一个叫「{new}」的账号"
+    try:
+        u = _emby(f"/Users/{uid}", key, timeout=15) or {}
+        if not u.get("Id"):
+            return "读不到这个账号"
+        u["Name"] = new
+        _emby(f"/Users/{uid}", key, method="POST", body=u, timeout=15)
+    except Exception as e:
+        return _short_err(e)
+    return ""
+
+
+def emby_set_password(key, uid, new):
+    """管理员改密码（不用旧密码）。返回 (ok, 失败在哪一步)：步骤 "reset" 失败 = 原密码没动；"set" 失败 = 密码已被清空。"""
+    try:
+        _emby(f"/Users/{uid}/Password", key, method="POST",
+              body={"Id": uid, "ResetPassword": True}, timeout=15)
+    except Exception:
+        return False, "reset"
+    try:
+        _emby(f"/Users/{uid}/Password", key, method="POST",
+              body={"Id": uid, "CurrentPw": "", "NewPw": new}, timeout=15)
+    except Exception:
+        return False, "set"
+    return True, ""
+
+
+def emby_accounts_menu(key):
+    """「7 设置 → 11」：列出 Emby 账号，选一个改用户名 / 密码。"""
+    if not key:
+        warn("没有 Emby API Key，先填「1」。")
+        ask("\n按回车返回...")
+        return
+    while True:
+        us = _emby_user_list(key)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}Emby 账号{RST}")
+        print("-" * 60)
+        if not us:
+            warn("读不到 Emby 的账号（Emby 没起来？）")
+        for n, (_i, name, adm, _p) in enumerate(us, 1):
+            _lb = f"账号{n}" + ("（管理员）" if adm else "")
+            _w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in _lb)     # 中文占两格，对齐「当前：」
+            print(f"  {n}. {_lb}{' ' * max(1, 18 - _w)}当前：{CYAN}{name}{RST}")
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if not (c.isdigit() and 1 <= int(c) <= len(us)):
+            print("无效选择。")
+            continue
+        _emby_account_menu(key, us[int(c) - 1][0])
+
+
+def _emby_account_menu(key, uid):
+    while True:
+        u = next((x for x in _emby_user_list(key) if x[0] == uid), None)
+        if not u:
+            warn("这个账号读不到了")
+            return
+        _i, name, adm, has_pw = u
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}{name}{'（管理员）' if adm else ''}{RST}")
+        print("-" * 60)
+        print(f"  1. 用户名            当前：{CYAN}{name}{RST}")
+        print(f"  2. 密码              当前：" + (f"{GREEN}已设{RST}" if has_pw else f"{YELLOW}没设{RST}"))
+        print("  0. 返回")
+        print("-" * 60)
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            new = ask("新用户名（回车＝不改）").strip()
+            if not new or new == name:
+                print("没改。")
+            else:
+                why = emby_rename_user(key, uid, new)
+                if why:
+                    warn(f"没改成：{why}")
+                else:
+                    ok(f"用户名改成「{new}」")
+                    tip("客户端下次登录要用新用户名")
+        elif c == "2":
+            typed = ask("新密码（输 r ＝随机生成，回车＝不改）").strip()
+            if not typed:
+                print("没改。")
+                continue
+            new = rand_pw(16) if typed == "r" else typed
+            tip("改完后已登录的客户端可能要重新登录")
+            if not ask_yn(f"把「{name}」的密码改掉？", False):
+                print("没改。")
+                continue
+            while True:
+                good, step = emby_set_password(key, uid, new)
+                if good:
+                    ok("密码已改，新密码（只显示这一次）：")
+                    print(new)
+                    break
+                if step == "reset":
+                    warn("没改成：Emby 不让重置，原密码没动")
+                    break
+                print(f"  {RED}{BOLD}⚠ 密码已被清空、新密码没设上 —— 这个账号现在没有密码！{RST}")
+                if not ask_yn("再试一次？", True):
+                    tip("去 Emby 网页后台 → 用户 → 密码 立刻设一个")
+                    break
         else:
             print("无效选择。")
             continue
