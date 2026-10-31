@@ -232,7 +232,7 @@ def install():
             if not _auto_setup():
                 _first_setup()
             return
-        print("  AdGuard Home 已经装过了。要重装请先『10 卸载』再装。")
+        print("  AdGuard Home 已经装过了。要重装请先『11 卸载』再装；只换域名走『10 更换域名证书』。")
         _usage(); return
     dom = _setup_own_domain()
     if not dom:
@@ -266,7 +266,7 @@ def install():
 def _setup_own_domain():
     """装之前给自建 DNS 一个它自己的域名、签一张它自己的证书（域名 + *.域名，DoT 带 ClientID 要泛域名），
        跟节点 / Emby 完全分开（仓库主人 10/29：「各个域名分开互不干预，好操作」）。返回域名；回车 / 没弄成返回 ''。
-       换域名 = 卸了重装（仓库主人：「大不了重做」），所以不另设菜单项。
+       以后换域名走菜单 10「更换域名证书」（10/31 加的，后台设置都不动；老装法跟节点共用的也从那儿分出来）。
        两条 A 记录先查、签之前就查，省得签完才发现手机找不到这台。令牌：acme.sh 里存着就用它（续期也靠它），
        签不出来多半是那个令牌没管到这个域名的区域——让去 CF 编辑令牌把区域加上，不另贴一个顶掉（acme.sh 只存一个，
        顶掉以后节点 / Emby 那几张的续期就签不出来了）。"""
@@ -344,6 +344,179 @@ def _own_cert_remove(dom):
     shutil.rmtree(AGH_CERT_DIR, ignore_errors=True)
     try: os.remove(AGH_DOMAIN_FILE)
     except OSError: pass
+
+# ── 菜单 10 更换域名证书（仓库主人 10/31：「自建DNS里面也做一个更换域名证书的口子吧，避免以后要用，这样他们就互相不干预了」）──
+# 换的是自建 DNS 对外的那个域名和它的证书：DoT / DoH / 安卓专用 DNS 的主机名都是它。后台设置、过滤规则、允许的客户端、
+# 节点私有解析的映射都不动。老装法（跟节点共用域名、共用 /etc/ssl/sb 那张）也从这里分出来：换完它有自己的域名和证书，
+# 节点证书一个字节不碰，以后「15 → 2 更换节点域名」也就碰不到它了。
+# 顺序：先签新证书（只签不装，签不下来什么都没动）→ 备份 → 装到自己的路径、核一遍名字 → 改 AdGuardHome.yaml 的
+# 加密那段 → 重启、等 DoT 端口起来 → 起不来整体放回去。成了才撤旧域名那张的续期、刷新订阅。
+
+def _agh_tls_retarget(txt, dom):
+    """AdGuardHome.yaml 顶层 tls 段：服务器名换成 dom、证书路径指到自己那张（AGH_CRT / AGH_KEY），
+       贴在配置里的证书正文清空（AdGuard 不认「路径和正文同时有」）。别的一个字节不动；没有 tls 段原样返回。"""
+    m = re.search(r"(?m)^tls:[ \t]*\n", txt)
+    if not m:
+        return txt
+    end = m.end()
+    for line in txt[m.end():].splitlines(True):
+        if line.strip() and not line[0].isspace():
+            break
+        end += len(line)
+    want = {"server_name": dom, "certificate_path": AGH_CRT, "private_key_path": AGH_KEY,
+            "certificate_chain": '""', "private_key": '""'}
+    blk = txt[m.end():end]
+    for k, v in want.items():
+        blk = re.sub(rf"(?m)^([ \t]+{k}:)[ \t]*.*$", lambda x, v=v: f"{x.group(1)} {v}", blk)
+    return txt[:m.end()] + blk + txt[end:]
+
+def _acme_has_record(dom):
+    """acme.sh 里有没有这个名字的记录（dom 或 *.dom，带不带 _ecc）——有就是别人在用，不能拿来签。"""
+    base = os.path.expanduser("~/.acme.sh")
+    return any(os.path.isdir(os.path.join(base, n)) for n in (dom, dom + "_ecc", "*." + dom, "*." + dom + "_ecc"))
+
+def change_domain():
+    """菜单 10「更换域名证书」：问新域名、查记录、把会跟着变的说清楚，确认了才动手（_change_domain_apply）。"""
+    R, G_, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    if not _installed() or not os.path.exists(_agh_yaml()):
+        ui_tip("还没装好：先选 1"); return
+    own = _own_domain()
+    cur = _domain()
+    nd = (_node_domain() or "").lower()
+    ui_title("更换自建 DNS 的域名证书")
+    ui_kv("当前域名", (cur or "没有") + ("（自己的证书）" if own else "（跟节点共用证书）" if cur else ""))
+    r0 = _root_of(nd or cur) if (nd or cur) else "域名"
+    ui_tip(f"请在 https://dash.cloudflare.com 做好两条 DNS 记录关黄云 新名字.{r0} 和 *.新名字.{r0}")
+    dft = "" if own or not nd else f"dns.{_root_of(nd)}"      # 老装法分出来：默认 dns.根域名，回车就行
+    raw = _ask(f"  新域名（回车 = {dft}，输 n = 取消）: " if dft else "  新域名（回车 = 取消）: ").strip().lower().rstrip(".")
+    if raw in ("n", "no") or not (raw or dft):
+        print("  已取消，没改"); return
+    dom = raw or dft
+    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", dom):
+        print(f"  {R}✗ 域名格式不对{N}"); return
+    if dom == cur:
+        print("  跟现在一样，没改"); return
+    if dom == nd or _acme_has_record(dom):
+        print(f"  {R}✗ {dom} 已经有一张证书在用（节点 / Emby / 别的服务的），换一个只给 DNS 用的子域名{N}"); return
+    ip = _public_ip()
+    base = _resolve4(dom)
+    if ip not in base:
+        print(f"  {R}✗ {dom} 解析到 {', '.join(base) or '（查不到）'}，不是本机 {ip}{N}")
+        ui_tip("建好、等生效（几分钟）再来"); return
+    okw, why = _wildcard_dns_check(dom)
+    if not okw:
+        print(f"  {Y}⚠ {why}：安卓专用 DNS 带不了 ClientID，换完建好就能用{N}")
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    if not os.path.exists(acme):
+        print(f"  {R}✗ 没有 acme.sh（节点脚本装证书时会装上）{N}"); return
+    conf = os.path.expanduser("~/.acme.sh/account.conf")
+    env = ""
+    if not (os.path.exists(conf) and re.search(r"(?m)^SAVED_CF_Token=", open(conf).read())):
+        _cf_token_steps(dom)
+        tok = _ask("  粘贴 Cloudflare API Token（粘完回车）: ").strip()
+        if not tok:
+            print("  没填令牌，已取消，没改"); return
+        env = f"CF_Token={shlex.quote(tok)} "
+    # 会跟着变的说清楚（CLAUDE.md 第四节：会让东西用不了的，醒目一行 + 默认否）
+    cid = _selfdns_clientid()
+    print()
+    print(_hl("1;33", "▸ 换完要跟着改的"))
+    print(f"  安卓「专用DNS」主机名改成 {cid + '.' if cid else ''}{dom}；苹果描述文件重装（菜单 6）")
+    if os.path.exists(SELFDNS_FLAG):
+        print("  订阅里的自建 DNS 地址：自动换，客户端刷新订阅就行")
+    if _privdns_mode() == "self":
+        print(_hl("1;31", "  ⚠ 外机要到「13 → 4 → 2」重新粘贴本机新的 DNS 地址，不粘的话它们被藏的节点连不上"))
+    print("  不动：后台账号和设置、过滤规则、允许的客户端、节点证书" + ("" if own else "（从这次起 DNS 用自己的证书）"))
+    if _ask("  确认更换? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("  已取消，没改"); return
+    _change_domain_apply(dom, acme, env)
+
+def _change_domain_apply(dom, acme, env=""):
+    """真换（见上面那段说明的顺序）。成功返回 True；哪一步不成都放回原样、返回 False。"""
+    R, G_, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
+    old_own = _own_domain()
+    print(f"  签 {dom} + *.{dom}（DNS 验证，约 1-2 分钟）…")
+    r = subprocess.run(f"{env}{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' "
+                       f"--keylength ec-256 --server letsencrypt", shell=True, text=True, capture_output=True)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
+        print(f"  {R}✗ 证书没签下来，什么都没改{N}")
+        for ln in out.splitlines()[-4:]:
+            print("     " + ln)
+        if not env and "invalid domain" in out:
+            ui_tip(f"acme.sh 存的令牌管不到 {_root_of(dom)}：CF → API 令牌 → 编辑它 → 区域资源加上这个域名，别新建一个顶掉")
+        return False
+    yp = _agh_yaml()
+    y0 = open(yp).read()
+    f0 = {}
+    for p in (AGH_CRT, AGH_KEY):
+        try: f0[p] = open(p, "rb").read()
+        except OSError: f0[p] = None
+    try: d0 = open(AGH_DOMAIN_FILE).read()
+    except OSError: d0 = None
+    def undo(why):
+        open(yp, "w").write(y0)
+        for p, b in f0.items():
+            if b is None:
+                try: os.remove(p)
+                except OSError: pass
+            else:
+                open(p, "wb").write(b)
+        if d0 is None:
+            try: os.remove(AGH_DOMAIN_FILE)
+            except OSError: pass
+        else:
+            open(AGH_DOMAIN_FILE, "w").write(d0)
+        sh(f"{acme} --remove -d {dom} --ecc")                       # 新签的那张别留着续期
+        shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{dom}_ecc"), ignore_errors=True)
+        sh("systemctl restart AdGuardHome")
+        print(f"  {R}✗ {why}：已全部放回原来的域名和证书{N}")
+        return False
+    os.makedirs(AGH_CERT_DIR, exist_ok=True)
+    os.chmod(AGH_CERT_DIR, 0o700)                                  # 私钥：只给 root
+    sh(f"{acme} --install-cert -d {dom} --ecc --fullchain-file {AGH_CRT} --key-file {AGH_KEY} "
+       f"--reloadcmd 'systemctl try-restart AdGuardHome 2>/dev/null; true'")
+    have = _cert_names(AGH_CRT)
+    if not (_name_covers(have, dom) and _name_covers(have, "x." + dom)):
+        return undo(f"装上的证书盖不住 {dom} / *.{dom}（它是 {', '.join(have) or '读不出'}）")
+    open(yp, "w").write(_agh_tls_retarget(y0, dom))
+    os.makedirs(BGP_DIR, exist_ok=True)
+    open(AGH_DOMAIN_FILE, "w").write(dom + "\n")
+    sh("systemctl restart AdGuardHome")
+    tb = _tls_block(open(yp).read())
+    dot = int(_yaml_val(tb, "port_dns_over_tls") or 0) if _yaml_val(tb, "enabled") == "true" else 0
+    up = False
+    for _ in range(15):
+        time.sleep(1)
+        if _running() and (not dot or "AdGuard" in _port_busy(dot)):
+            up = True; break
+    if not up:
+        return undo("换完 AdGuard 没起来" + (f"（DoT {dot} 没在听）" if dot else ""))
+    if old_own and old_own != dom:                                  # 旧域名那张：撤掉续期，文件已经被新的顶替
+        sh(f"{acme} --remove -d {old_own} --ecc")
+        shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{old_own}_ecc"), ignore_errors=True)
+    print(f"  {G_}✔ 自建 DNS 换成 {dom}（自己的证书，自己续期，不碰节点证书）{N}")
+    xy = BGP_DIR + "/xy-installer.py"
+    if os.path.exists(SELFDNS_FLAG) or _privdns_mode() == "self":
+        try: newer = '"selfdns-refresh"' in open(xy).read()
+        except OSError: newer = False
+        if newer:
+            subprocess.run(f"python3 {xy} selfdns-refresh", shell=True)
+        else:
+            ui_tip("主脚本是老版本：订阅里的自建 DNS 地址今晚 03:20 自动刷新时换过来，急用就到主面板「2」刷新")
+    cid = _selfdns_clientid()
+    print()
+    ui_url("安卓「专用DNS」主机名", f"{cid}.{dom}" if cid else dom)
+    print()
+    ui_url("DoH 地址", f"https://{dom}:{_doh_port()}/dns-query/{cid}" if cid else f"https://{dom}:{_doh_port()}/dns-query")
+    if _privdns_mode() == "self":
+        print()
+        ui_url("外机「13 → 4 → 2」重新粘贴这一行", f"https://{dom}:{_doh_port()}/dns-query/{cid}")
+    ui_tip("苹果手机重装描述文件（菜单 6）；Cloudflare 里旧的那两条记录确认没别的用处再删" if old_own
+           else "苹果手机重装描述文件（菜单 6）；节点域名的记录还在用，别删")
+    return True
 
 def _agh_api(path, body=None, port=None, timeout=5, auth=None):
     """本机 AdGuard 的接口（127.0.0.1，不出网）→ (状态码, 回包文字)；连不上返回 (0, 原因)。port 不给 = 向导的 WEB_PORT。
@@ -924,7 +1097,7 @@ def dot_clientid():
         ui_items([(1, "更换 Cloudflare API 令牌（泄露了 / 被吊销了）", None),
                   (2, "删除 DoT ClientID 支持（证书改回单域名，AdGuard 照常跑）", None),
                   (0, "返回", None)])
-        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 10")
+        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 11")
         c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
@@ -936,7 +1109,7 @@ def dot_clientid():
         return
     if _own_domain():                                     # 自己那张装的时候就带 *.域名；没有说明证书出了岔子
         print(f"  {R}⚠ 自建 DNS 自己的证书里没有 *.{dom}{N}")
-        ui_tip("卸了重装自建 DNS（菜单 10 → 1），装的时候会重签"); return
+        ui_tip("菜单 10 换个域名，或卸了重装（11 → 1），都会重签"); return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
     print(f"\n  {Y}需要你先准备两样：{N}")
@@ -2352,7 +2525,8 @@ def menu():
         # 查完再问要不要手机实测，都默认否），两项功能都还在。
         # 4 节点使用私有DNS解析：1 本机当 DNS 机 / 2 本机节点交给外机解析 / 3 关（交给主脚本，见 _privdns_menu）。
         # 5 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。7 改后台端口：随机 2000-5000 / 自定义，带回滚。
-        # 10 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
+        # 10 更换域名证书：换自建 DNS 自己的域名和证书（10/31 加，见 change_domain），后台设置不动。
+        # 11 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
         ui_title("自建 DNS · AdGuard Home（兼带广告过滤）")
         if _installed():
             st = "已安装 · " + (_hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
@@ -2369,7 +2543,8 @@ def menu():
                   (7, "改后台端口", None),
                   (8, "修改用户名和密码", None),
                   (9, "自检（含手机实测）", None),
-                  (10, "卸载自建DNS", None),
+                  (10, "更换域名证书", _domain() if _installed() else None),
+                  (11, "卸载自建DNS", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -2381,7 +2556,8 @@ def menu():
         elif c == "7": change_web_port()
         elif c == "8": change_admin_account()
         elif c == "9": selfcheck(); _selfcheck_more()
-        elif c == "10": uninstall()
+        elif c == "10": change_domain()
+        elif c == "11": uninstall()
         elif c in ("0", ""):
             return
 

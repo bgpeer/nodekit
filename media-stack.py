@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.393"
+SCRIPT_VERSION = "1.5.394"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -26169,6 +26169,8 @@ def params_menu():
         _eu = emby_users(cur) if cur else []
         print(f"  11. Emby 账号        当前："
               + (f"{CYAN}{'、'.join(n for n, _a in _eu)}{RST}" if _eu else f"{DIM}读不到{RST}"))
+        _dm = read_env(os.path.join(d, ".env"), "DOMAIN") if is_installed(d) else ""
+        print(f"  12. 域名证书         当前：" + (f"{CYAN}{_dm}{RST}" if _dm else f"{DIM}没有（IP:端口）{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -26206,10 +26208,199 @@ def params_menu():
         elif c == "11":
             emby_accounts_menu(cur)
             continue          # 子菜单自己管停顿
+        elif c == "12":
+            emby_domain_menu()
         else:
             print("无效选择。")
             continue
         ask("\n按回车返回...")
+
+
+# ---- 「7 设置 → 12」域名证书：换 Emby 自己的底座域名 ----
+# 仓库主人 10/31：「不要干预emby吧，直接做成不询问，还是在emby设置里面做一个更换域名证书的口子吧……这样他们就互相不干预了，
+# 改动有点大做好一点哦」。节点「15 → 2」不再带着 Emby 走，Emby 在这里自己换：
+#   · emby. / list. / home. 三个站点挂在新底座下面；证书 *.新底座 自己一张（acme.sh 记录名 *.底座，续期自己 reload nginx），
+#     原来跟节点共用一张（软链）的，换完就是各用各的
+#   · 吃这个域名的还有：OpenList 对外地址（AutoFilm 的 public_url、MediaWarp 换直链问的那个地址、OpenList 的网站 URL）、
+#     首页卡片、总览表 —— 一起按新域名重写
+# 顺序：先签新证书（签不下来什么都没动）→ 改 .env → 重写 nginx 站点（nginx -t 不过 apply_nginx_site 放回原来的，这边把 .env
+# 也放回去）→ 首页 / AutoFilm / MediaWarp 配置重写、重启 → 撤旧域名那张的续期。
+# MediaWarp 重启会清空直链缓存、正在播的会断：有人在播先问一声、默认否（见 play_quiet 那段铁律）。
+
+NGX_CERT_DIR = "/etc/nginx/certs"      # Emby 那张证书放这儿（<底座>.crt / .key，跟 rebuild_cfg_from_disk 拼的一样）
+
+
+def _ms_cert_days(path):
+    """证书还有几天到期；读不出返回 None。"""
+    m = re.search(r"notAfter=(.+)", sh(f"openssl x509 -enddate -noout -in '{path}'", timeout=20).stdout or "")
+    try:
+        return int((time.mktime(time.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z")) - time.time()) / 86400)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _emby_base_norm(raw):
+    """填的是 emby.example.com 这种也认：去掉开头的 emby. / list. / home.（跟安装时一样）。"""
+    dom = (raw or "").strip().lower().rstrip(".")
+    first, _, rest = dom.partition(".")
+    return rest if rest and first in ("emby", "list", "home") else dom
+
+
+def _ipv4_of(name):
+    import socket
+    try:
+        return sorted({a[4][0] for a in socket.getaddrinfo(name, None, socket.AF_INET)})
+    except OSError:
+        return []
+
+
+def emby_domain_menu():
+    """「7 设置 → 12 域名证书」：问新底座、查记录、把会跟着变的说清楚，确认了才动手（emby_domain_apply）。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没装。")
+        return
+    if not have("nginx"):
+        warn("本机没装 nginx：媒体服务只能用 IP:端口 访问，换不了域名。")
+        return
+    cfg = rebuild_cfg_from_disk(d)
+    cur = cfg["domain"]
+    print("\n" + "-" * 60)
+    print(f"  {BOLD}域名证书{RST}")
+    print("-" * 60)
+    if not cur:
+        # IP:端口 装的：容器端口是对公网开的（gen_compose 的 bind），改成域名还得重建容器、全部重启 —— 不在这里做
+        print(f"  当前域名  {DIM}没有（IP:端口 访问）{RST}")
+        tip("这一项换的是已有的域名；IP:端口 装的要用域名，得重新装一次 Emby")
+        return
+    print(f"  当前域名  {CYAN}{cur}{RST}")
+    if os.path.exists(cfg["crt"]):
+        _days = _ms_cert_days(cfg["crt"])
+        _shared = os.path.islink(cfg["crt"]) and os.path.realpath(cfg["crt"]) == os.path.realpath(ACME_CRT)
+        print(f"  证书      *.{cur}" + (f"　还有 {_days} 天" if _days is not None else "")
+              + ("　（跟节点共用一张）" if _shared else ""))
+    nd = (node_state().get("domain") or "").strip()
+    r0 = ".".join((nd or cur).split(".")[-2:])
+    tip(f"请在 https://dash.cloudflare.com 做好一条 DNS 记录关黄云 *.新名字.{r0}（比如 *.ys.{r0}）")
+    new = _emby_base_norm(ask("新域名（emby / list / home 挂在它下面；回车取消）", ""))
+    if not new:
+        print("没有改动。")
+        return
+    if not re.match(r"^[a-z0-9.-]+\.[a-z]{2,}$", new):
+        warn("域名格式不对，没有改动。")
+        return
+    if new == cur:
+        print("跟现在一样，没有改动。")
+        return
+    # 三个站点都要解析到本机（*.新底座 一条记录全盖住）：没建好就换，换完客户端全连不上
+    ip = public_ip()
+    subs = [sb for sb, _p, _c, _l in SUBDOMAINS if sb != "home" or cfg["homepage"]]
+    miss = []
+    for sb in subs:
+        got = _ipv4_of(f"{sb}.{new}")
+        good = ip in got
+        miss += [] if good else [f"{sb}.{new}"]
+        print(f"  {GREEN + '✔' if good else RED + '✗'} {sb}.{new}{RST}　"
+              + ("解析到本机" if good else f"解析到 {', '.join(got) or '（查不到）'}，本机是 {ip}"))
+    if miss:
+        tip(f"Cloudflare 里加 *.{new} 指向 {ip}（灰云），等生效再来")
+        print("没有改动。")
+        return
+    cf_token = ""
+    if not acme_has_cf_creds():
+        print("  签证书需要一个 Cloudflare API Token（只用这一次，之后 acme.sh 自己记住）：")
+        print("    CF 后台 → 我的个人资料 → API 令牌 → 创建令牌 → 「编辑区域 DNS」模板")
+        print("    权限要有：区域→DNS→编辑、区域→区域→读取（少了第二条会失败）")
+        cf_token = ask("Cloudflare API Token（回车取消）", "")
+        if not cf_token:
+            print("没有改动。")
+            return
+    key = read_emby_api_key(d)
+    if key and someone_playing(key):
+        tip("有人在看片：换域名要重启 MediaWarp，正在播的会断")
+        if not ask_yn("还是现在就换？", False):
+            print("没有改动。")
+            return
+    print(f"\n  {YELLOW}{BOLD}换完这些地址都变：Emby App / 客户端里的服务器地址、OpenList、首页入口{RST}")
+    print(f"  {RED}{BOLD}⚠ 旧地址 https://emby.{cur} 换完就打不开了{RST}")
+    print(f"  {DIM}不动：节点、自建 DNS、媒体库和片子、账号{RST}")
+    if not ask_yn("确认更换？", False):
+        print("没有改动。")
+        return
+    emby_domain_apply(d, new, cf_token)
+
+
+def emby_domain_apply(d, new, cf_token=""):
+    """真换（顺序见上面那段说明）。成功返回 True；签不下来 / nginx 校验不过都放回原样、返回 False。"""
+    old = read_env(os.path.join(d, ".env"), "DOMAIN")
+    crt, key = f"{NGX_CERT_DIR}/{new}.crt", f"{NGX_CERT_DIR}/{new}.key"
+
+    def drop_new():                                # 新签的那张：撤掉续期、文件删掉（没换成就别留着）
+        acme = acme_bin()
+        if acme:
+            sh(f"{acme} --remove -d '*.{new}' --ecc", timeout=60)
+        for p in (crt, key):
+            try: os.remove(p)
+            except OSError: pass
+
+    info(f"签发 *.{new} 泛域名证书（DNS 验证，约 1-2 分钟）...")
+    if not issue_cert(new, crt, key, cf_token):
+        drop_new()
+        err("证书没拿到，什么都没改。")
+        return False
+    # -text 而不是 -ext：老 openssl（1.1.0 及以前）不认 -ext
+    if f"DNS:*.{new}" not in (sh(f"openssl x509 -noout -text -in '{crt}'", timeout=20).stdout or ""):
+        drop_new()
+        err(f"装上的证书盖不住 *.{new}，什么都没改。")
+        return False
+    env_file = os.path.join(d, ".env")
+    env0 = open(env_file, encoding="utf-8").read()
+    env1 = (re.sub(r"(?m)^DOMAIN=.*$", f"DOMAIN={new}", env0) if re.search(r"(?m)^DOMAIN=", env0)
+            else env0.rstrip("\n") + f"\nDOMAIN={new}\n")
+    write_atomic(env_file, env1, 0o600)
+    cfg = rebuild_cfg_from_disk(d)
+    if not apply_nginx_site(cfg):                  # nginx -t 不过：站点已放回原来的，.env 也放回去
+        write_atomic(env_file, env0, 0o600)
+        drop_new()
+        err("nginx 校验没过，已放回原来的域名，什么都没变。")
+        return False
+    ok(f"nginx 站点换成 *.{new}")
+    if cfg["homepage"]:
+        hp = os.path.join(d, "homepage", "config")
+        s1, sv, w = gen_homepage_conf(cfg)
+        for n, t in (("settings.yaml", s1), ("services.yaml", sv), ("widgets.yaml", w)):
+            write_atomic(os.path.join(hp, n), t)
+        sh("docker restart homepage", timeout=120)
+    af = os.path.join(d, "autofilm", "config", "config.yaml")
+    write_atomic(af, gen_autofilm_conf(cfg), 0o600)
+    if autofilm_busy():
+        tip("AutoFilm 正在扫，没重启它；扫完下次重启（或「8 更新」）用上新地址")
+    else:
+        sh("docker restart autofilm", timeout=120)
+    write_atomic(os.path.join(d, "mediawarp", "config", "config.yaml"), gen_mediawarp_conf(cfg), 0o600)
+    sh("docker restart mediawarp", timeout=120)
+    ensure_openlist_site_url(d, cfg, quiet=True)
+    cred = os.path.join(d, "CREDENTIALS.txt")
+    if os.path.exists(cred):
+        write_atomic(cred, build_summary(cfg, colored=False) + "\n", 0o600)
+    if old and old != new:                         # 旧域名那张：撤掉续期，文件删掉（软链就只摘掉链接）
+        acme = acme_bin()
+        if acme:
+            sh(f"{acme} --remove -d '*.{old}' --ecc", timeout=60)
+            shutil.rmtree(os.path.expanduser(f"~/.acme.sh/*.{old}_ecc"), ignore_errors=True)
+        for p in (f"{NGX_CERT_DIR}/{old}.crt", f"{NGX_CERT_DIR}/{old}.key"):
+            try: os.remove(p)
+            except OSError: pass
+    ok(f"Emby 换成 *.{new}（自己一张证书，自己续期）")
+    print()
+    for sb, _p, _c, label in SUBDOMAINS:
+        if sb == "home" and not cfg["homepage"]:
+            continue
+        print(f"{YELLOW}{BOLD}▸ {label}{RST}")
+        print(f"https://{sb}.{new}")
+        print()
+    tip("Emby App 里的服务器地址改成上面这个" + (f"；Cloudflare 里旧的 *.{old} 确认没别的用处再删" if old else ""))
+    return True
 
 
 # ---- 「7 设置 → 11」Emby 账号：改用户名 / 密码 ----
