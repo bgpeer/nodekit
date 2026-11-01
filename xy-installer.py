@@ -271,12 +271,12 @@ SELF_LOCAL     = BGP_DIR + "/xy-installer.py"    # 本地脚本副本（cron 调
 CORE_CRON_FILE = "/etc/cron.d/bgpeer-coreupdate" # 每月定点更新内核的 cron
 CORE_CRON_LOG  = "/var/log/bgpeer-coreupdate.log"
 # 三大配置（mihomo / sing-box / 小火箭）每天自动按【当前选的模板】重生成：北京时间 03:20 调 `cfg-auto`。
-# 排在 cn-block 03:00 刷新（会重启 sing-box）之后、媒体那套 04:10 起的活之前；rules 仓库 02:10 已同步完。
+# 排在 cn-block 02:55 规则更新（有变化才重启 sing-box）之后、媒体那套 04:10 起的活之前；rules 仓库 02:10 已同步完。
 CFG_AUTO_FILE = BGP_DIR + "/cfg_auto.json"      # {"off": [关掉的格式], "hand": {格式: 手改后的 sha256}}
 CFG_AUTO_CRON = "/etc/cron.d/bgpeer-cfgupdate"
 CFG_AUTO_LOG  = "/var/log/bgpeer-cfgupdate.log"
 CFG_AUTO_AT   = (3, 20)                          # 北京时间
-# 脚本本体每天自动更新：北京时间 02:50 调 `self-update`，排在凌晨所有活最前面（03:00 cn-block 刷新、03:10 每月 nginx
+# 脚本本体每天自动更新：北京时间 02:50 调 `self-update`，排在凌晨所有活最前面（02:55 cn-block 规则更新、03:10 每月 nginx
 # 升级、03:20 三大配置、03:30 Emby 元数据、04:00 每月内核……），后面的活直接用新版。跟「配置自动更新」分开管：
 # 关了配置自动更新，脚本照样更新（仓库主人 10/21）。开关在菜单 18。
 SELFUPD_CRON = "/etc/cron.d/bgpeer-selfupdate"
@@ -7502,7 +7502,7 @@ def _heal_bj_cron(path, hh, mm, title, job, day=None):
        CRON_TZ），夏令时换季 / 改时区后会偏，也没进排队器。这里就地换成 bj_job_lines 的写法，
        命令原样保留。已经进了排队器的就不动。改了返回 True。
 
-       · cn-block 每天 03:00 刷新：新版自己每次刷新也会对齐，但老副本要等它更新
+       · cn-block 每天 02:55 规则更新：新版自己每次刷新也会对齐，但老副本要等它更新
        · net-optimize 每月 1 号 03:10 升级 nginx：老写法 CRON_TZ=Asia/Shanghai，UTC 机器上实际是北京 11:10"""
     try:
         txt = open(path).read()
@@ -7532,7 +7532,7 @@ def _heal_bj_cron(path, hh, mm, title, job, day=None):
         return False
 
 def _heal_other_crons():
-    _heal_bj_cron(CNBLOCK_CRON, 3, 0, "bgpeer 屏蔽规则集每日刷新", "cnblock")
+    _heal_bj_cron(CNBLOCK_CRON, 2, 55, "bgpeer 屏蔽规则集每日刷新", "cnblock")
     _heal_bj_cron(NETOPT_NGINX_CRON, 3, 10, "Net-Optimize: monthly nginx upgrade", "nginx-upgrade", day=1)
 
 def _core_update_schedule_str():

@@ -3,10 +3,10 @@
 # 独立文件，方便单独维护；nodekit 主脚本(xy-installer.py)通过子进程调用：
 #   python3 cn-block.py            交互菜单
 #   python3 cn-block.py apply      按已存状态重新注入（未开启则直接跳过）——重装后自动调用
-#   python3 cn-block.py refresh    规则集有变化才刷新缓存并重启（cron 每天北京 03:00 调用，任何时区 / 夏令时都对）
+#   python3 cn-block.py refresh    屏蔽规则 + 放行名单有变化才刷新并重启（cron 每天北京 02:55 调用，任何时区 / 夏令时都对）
 #   python3 cn-block.py remove     卸载屏蔽规则
 #
-# 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 03:00 定点刷新：
+# 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 02:55 定点刷新（屏蔽规则 + 放行名单一起，菜单 5 可关）：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
 import os, re, ast, sys, json, time, ipaddress, subprocess, urllib.request, urllib.error
@@ -94,6 +94,12 @@ CNBLOCK_FILE = BGP_DIR + "/cnblock.json"        # 记住是否开启 + 白名单
 SELF_PATH    = BGP_DIR + "/cn-block.py"          # cron 调用的本地副本
 CRON_FILE    = "/etc/cron.d/bgpeer-cnblock"      # 每日定点刷新规则集
 CRON_LOG     = "/var/log/bgpeer-cnblock.log"
+# 每天自动更新的北京时刻。仓库主人 11/01：「屏蔽规则和放行规则一起更新……每天 2:55」。
+# 02:50 节点脚本自更新先跑（同一个排队器 bgpeer-jobq，一个跑完再跑下一个，不会撞），这里紧跟着，
+# 正好用上刚更新的作者名单；03:05 起 net-optimize / nginx / 三大配置排在后面。
+REFRESH_AT   = (2, 55)
+SELF_URL     = "https://raw.githubusercontent.com/bgpeer/nodekit/main/cn-block.py"
+SELFUPD_OFF  = BGP_DIR + "/selfupdate.off"       # 菜单 18 关了脚本自动更新：这里也不换自己
 # 规则集优先走 jsDelivr 镜像（不受 GitHub raw 的 429 限流），回退 raw。
 RULES_CDN    = "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo"
 RULES_RAW    = "https://raw.githubusercontent.com/bgpeer/rules/main/geo"
@@ -575,11 +581,11 @@ def apply_cn_block(cfg=None):
         print("注入后 sing-box 未能启动，已回滚到屏蔽前配置（节点照常可用）。可能是规则集暂时全拉不到，稍后再试。")
         return False
     cfg["enabled"] = True; cnblock_save(cfg)
-    setup_cron()                                        # 每天北京 03:00 定点刷新规则集
+    cfg["wl_sig"] = _wl_sig(cfg); cnblock_save(cfg)     # 记下这次注入的放行名单，凌晨比对用
+    setup_cron()                                        # 每天北京 02:55 定点更新（开关在菜单 5）
     extra = f"，单条放行 {len(wl_doms)} 域名 + {len(wl_ips)} IP" if (wl_doms or wl_ips) else ""
     wl_txt = f"放行白名单 {len(wl_refs)} 组" if wl_refs else "不放行白名单"
     print(f"\n✓ 已开启屏蔽中国域名/IP：{wl_txt}{extra}，其余 CN 域名+IP 一律拦截。")
-    print("  规则集每天北京时间 03:00 自动刷新（cron）；临时拉不到的会在下次刷新补齐，不影响已生效的。")
     return True
 
 def remove_cn_block(silent=False):
@@ -786,14 +792,20 @@ def jobq_cleanup_if_unused():
     return True
 
 
+def auto_on(cfg=None):
+    """每天自动更新开着没有（默认开）。"""
+    return (cfg or cnblock_load()).get("auto", True) is not False
+
 def setup_cron():
-    """装每日定点刷新的 cron：北京时间 03:00（时区 / 夏令时换算见 bj_cron_lines）。幂等。"""
+    """装 / 撤每日定点更新的 cron：北京时间 02:55（时区 / 夏令时换算见 bj_cron_lines），按菜单 5 的开关。幂等。"""
+    if not auto_on():
+        remove_cron(); return
     try:
         if os.path.abspath(__file__) != SELF_PATH:      # 确保 cron 调的本地副本存在
             os.makedirs(BGP_DIR, exist_ok=True)
             import shutil; shutil.copy(os.path.abspath(__file__), SELF_PATH)
-        lines, times = bj_job_lines(3, 0, "cnblock", f"python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1")
-        txt = (f"# bgpeer 屏蔽规则集每日刷新（北京时间 03:00 = 本机 "
+        lines, times = bj_job_lines(*REFRESH_AT, "cnblock", f"python3 {SELF_PATH} refresh >> {CRON_LOG} 2>&1")
+        txt = (f"# bgpeer 屏蔽规则集每日刷新（北京时间 {REFRESH_AT[0]:02d}:{REFRESH_AT[1]:02d} = 本机 "
                f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点，进排队器）\n"
                "SHELL=/bin/bash\n"
                "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
@@ -838,17 +850,69 @@ def _rs_hashes(sets):
         out[tag] = hashlib.sha256(data).hexdigest()
     return out
 
+def _wl_sig(cfg):
+    """放行名单（规则集组 + 单条域名 / IP）的指纹。自定义链接这会儿拉不到返回 None——
+       拉不到时 _whitelist_tags 会退回作者名单，凌晨要是照着它重注入，等于悄悄把名单换了，所以宁可这次不动。"""
+    import hashlib
+    if cfg.get("wl_mode") == "custom" and (cfg.get("wl_url") or "").strip() and _link_data(cfg) is None:
+        return None
+    tags = _whitelist_tags(cfg)
+    doms, ips = _wl_custom(cfg)
+    return hashlib.sha256(json.dumps([tags, doms, ips]).encode()).hexdigest()
+
+def _self_update_copy():
+    """凌晨更新前先把 cron 调的本地副本换成仓库最新版（作者名单写在脚本里，不换就一直是老名单）。
+       只认 raw（jsDelivr 缓存可能是旧的，没版本号防不了降级）；拉不到 / 编译不过 / 一样 → 不动。
+       菜单 18 关了脚本自动更新（selfupdate.off）就不换。换上了返回 True，调用方重新执行新版。"""
+    if os.environ.get("CNBLK_FRESH") or os.path.exists(SELFUPD_OFF):
+        return False
+    if os.path.abspath(__file__) != os.path.abspath(SELF_PATH):
+        return False
+    try:
+        req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}", headers={"User-Agent": HTTP_UA})
+        body = urllib.request.urlopen(req, timeout=20).read().decode()
+        compile(body, SELF_PATH, "exec")
+        if "def refresh" not in body or body == open(SELF_PATH).read():
+            return False
+        with open(SELF_PATH + ".new", "w") as f:
+            f.write(body)
+        os.replace(SELF_PATH + ".new", SELF_PATH)
+        return True
+    except Exception:
+        return False
+
 def refresh():
-    """定点刷新：规则集【有变化】才清 sing-box 规则集缓存并重启，强制重新拉取远程 srs；
-       起不来就回滚缓存，绝不因刷新把节点搞挂。cron 调用。
+    """每天 02:55 的自动更新（菜单 5 → 2 可关）：屏蔽规则 + 放行名单一起，【有变化】才动、才重启 sing-box；
+       起不来就回滚，绝不因更新把节点搞挂。cron 调用。
+
+       【放行名单一起更新】仓库主人 11/01：「可不可以把屏蔽规则和放行规则一起更新」。以前凌晨只比规则集，
+       作者名单（写在脚本里）、自定义链接里的名单改了，要手动点「立即更新」才生效。现在先把本地副本换成最新版
+       （作者名单随它走），再比放行名单指纹（apply 时记在 cnblock.json 的 wl_sig）：变了就照「立即更新」
+       整套重注入；自定义链接拉不到 → 名单这次不动，只比规则集。
 
        【没变化不重启】仓库主人：「03:00 那个改成规则有变化才重启吧」。以前每晚都重启一次 sing-box，
        凌晨挂着的连接都断几秒；而 geoip/cn 一个月只变十来天、域名那份更少。先按 sing-box 用的同一批地址
        拉一遍算指纹，跟上次成功刷新时记的比：一样就什么都不做；拉不下来也不重启（sing-box 自己每 24 小时
        也会更新这几个规则集，不会因为这一晚没刷就过期）。第一次（还没记过指纹）照旧刷一次。"""
-    if not cnblock_load().get("enabled"):
+    cfg = cnblock_load()
+    if not cfg.get("enabled"):
         return
+    if not auto_on(cfg):                                # 关了还被调到（老 cron 没撤干净）：撤掉、不动
+        remove_cron(); return
+    if _self_update_copy():                             # 换上了新版 → 用新版从头跑这一轮
+        env = dict(os.environ, CNBLK_FRESH="1")
+        os.execve(sys.executable, [sys.executable, SELF_PATH, "refresh"], env)
     setup_cron()                                        # 顺手对齐 cron（老装机按装的那天换算、改过时区）
+    sig = _wl_sig(cfg)
+    if sig is None:
+        print(time.strftime("%F %T"), "自定义放行名单链接拉不到，名单这次不动")
+    elif sig != cfg.get("wl_sig"):
+        print(time.strftime("%F %T"), "放行名单有变化，重新注入")
+        if update_now():
+            new = _rs_hashes(_cnblk_remote_sets())
+            if new:
+                cfg = cnblock_load(); cfg["rs_hash"] = new; cnblock_save(cfg)
+        return
     sets = _cnblk_remote_sets()
     new = _rs_hashes(sets) if sets else None
     if new is None:
@@ -884,14 +948,14 @@ def refresh():
     print(time.strftime("%F %T"), "规则集有变化，已刷新（sing-box 重启一次）")
 
 def update_now():
-    """立即更新：重新拉取最新放行名单 + 规则集并即时生效，不必等每天 03:00 的定时刷新。
+    """立即更新：重新拉取最新放行名单 + 规则集并即时生效，不必等每天 02:55 的自动更新。返回成没成。
        覆盖两种改动——① 改了放行名单(作者名单随最新 cn-block.py、自定义名单从链接实时拉)
        → 重新注入；② 改了 rules 仓库里的规则集数据(.srs) → 清 sing-box 缓存强制重拉。
        沿用 apply 的校验/回滚：失败则退回原本能用的状态，绝不把节点搞挂。"""
     cfg = cnblock_load()
     if not cfg.get("enabled"):
         print("  屏蔽还没开启——先选 1 开启，开启时本来就是按最新名单注入的。")
-        return
+        return False
     # 备份并清掉规则集缓存，逼 sing-box 重启时重新拉最新 srs（拉不到可回滚，不影响节点）
     cache = _cache_path(); baks = []
     for p in (cache, cache + "-wal", cache + "-shm"):
@@ -910,6 +974,7 @@ def update_now():
         print("  ✓ 已按最新放行名单 + 规则集刷新生效。")
     else:
         print("  更新未生效（多半规则集临时拉不到），已保持原状，稍后再试。")
+    return ok
 
 def custom_allow_menu():
     """单条放行（域名/IP）的增删查。域名按后缀匹配，含子域；IP 支持单个或 CIDR、v4/v6。"""
@@ -997,13 +1062,41 @@ def custom_allow_menu():
         elif c in ("0", ""):
             return
 
+def rule_update_menu():
+    """5 规则更新：立即更新 / 每天自动更新开关（屏蔽规则 + 放行名单一起）。"""
+    while True:
+        cfg = cnblock_load()
+        on = auto_on(cfg)
+        at = f"{REFRESH_AT[0]:02d}:{REFRESH_AT[1]:02d}"
+        ui_title("规则更新")
+        ui_items([(1, "立即更新", None),
+                  (2, "自动更新", _hl("1;32", f"开（每天 {at}）") if on else "关"),
+                  (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c == "1":
+            update_now()
+        elif c == "2":
+            if on:
+                ui_tip("关了以后屏蔽规则和放行名单不再每天自动更新")
+                if _ask("  确定关闭? [y/N]: ").lower() not in ("y", "yes"):
+                    continue
+                cfg["auto"] = False; cnblock_save(cfg); remove_cron()
+                print("  ✔ 自动更新已关")
+            else:
+                cfg["auto"] = True; cnblock_save(cfg)
+                if cfg.get("enabled"):
+                    setup_cron()
+                print(f"  ✔ 自动更新已开（每天 {at}）")
+        elif c in ("0", ""):
+            return
+
 def menu():
     while True:
         cfg = cnblock_load()
         on = cfg.get("enabled")
         wl = {"author": "作者名单", "custom": "自定义名单", "none": "不放行"}.get(cfg.get("wl_mode", "none"), "不放行")
         _d, _i = _wl_custom(cfg)
-        # 3 自定义放行名单脚本链接：规则集 + 单条域名/IP，可抄样板改；5 立即更新：不用等每天 03:00 定时刷新
+        # 3 自定义放行名单脚本链接：规则集 + 单条域名/IP，可抄样板改；5 规则更新：立即更新 + 每天 02:55 自动更新开关
         ui_title("屏蔽中国域名和 IP")
         ui_url("自定义放行名单链接", cfg.get("wl_url") or "", "94")
         ui_line()
@@ -1011,7 +1104,7 @@ def menu():
                   (2, "放行白名单", wl),
                   (3, "自定义放行名单链接", None),
                   (4, "单条放行域名 / IP", f"{len(_d)} 个域名 + {len(_i)} 个 IP" if (_d or _i) else None),
-                  (5, "立即更新（拉最新名单 / 规则集）", None),
+                  (5, "规则更新", None),
                   (6, "卸载（清掉屏蔽规则）", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
@@ -1051,7 +1144,7 @@ def menu():
         elif c == "4":
             custom_allow_menu()
         elif c == "5":
-            update_now()
+            rule_update_menu()
         elif c == "6":
             remove_cn_block()
         elif c in ("0", ""):
@@ -1062,7 +1155,7 @@ def main():
     if act == "apply":                                   # 主脚本重装后调用：仅在已开启时重注入
         if cnblock_load().get("enabled"):
             apply_cn_block()
-    elif act == "refresh":                               # cron 每日定点调用：刷新规则集
+    elif act == "refresh":                               # cron 每天 02:55 调用：屏蔽规则 + 放行名单一起更新
         refresh()
     elif act == "remove":
         remove_cn_block()
