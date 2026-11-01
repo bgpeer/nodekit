@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """自建 DNS 菜单重排（仓库主人 10/31：「把这个重新排序」，「腾出 53 端口」并进自检、「手机实测」跟自检合在一起 →「做」）。
   新顺序：1 安装 / 2 使用方法 / 3 写入订阅 / 4 节点私有解析 / 5 DoT ClientID / 6 苹果描述文件 / 7 改后台端口 /
-  8 修改用户名和密码 / 9 自检（含手机实测）/ 10 更换域名证书（10/31 加）/ 11 卸载 / 0 退出。
+  8 修改用户名和密码 / 9 自检（含手机实测）/ 10 更换域名证书（10/31 加）/ 11 DoH 走 HTTP/3（11/01 加）/ 12 卸载 / 0 退出。
   两项功能都还在：自检查完，53 被 systemd-resolved 占着才问腾不腾；再问要不要手机实测；都默认否。
 """
 import os, io, sys, re, contextlib, importlib.util
@@ -15,12 +15,13 @@ def check(l, ok):
 CALLS = []
 for f in ("install", "status", "_selfdns_toggle", "_privdns_menu", "dot_clientid", "ios_profile",
           "change_web_port", "change_admin_account", "selfcheck", "uninstall", "phone_probe", "free_port53",
-          "change_domain"):
+          "change_domain", "doh_h3_toggle"):
     setattr(a, f, (lambda n: lambda *x, **k: CALLS.append(n))(f))
 a._installed = lambda: True
 a._running = lambda: True
 a._privdns_mode = lambda: "remote"
 a._domain = lambda: "dns.example.org"
+a._h3_on = lambda: False
 a.os.path.exists = (lambda e: lambda p: False if p == a.SELFDNS_FLAG else e(p))(a.os.path.exists)
 
 def run_menu(keys):
@@ -34,13 +35,13 @@ def run_menu(keys):
 out = run_menu(["0"])
 want = ["1. 安装", "2. 使用方法（安装完后观看）", "3. 自建 DNS 写入订阅　当前：未写入", "4. 节点使用私有DNS解析　当前：外机",
         "5. DoT 带 ClientID（签泛域名证书）", "6. 苹果手机描述文件（iOS 一键装 DNS）", "7. 改后台端口",
-        "8. 修改用户名和密码", "9. 自检（含手机实测）", "10. 更换域名证书　当前：dns.example.org", "11. 卸载自建DNS", "0. 退出"]
+        "8. 修改用户名和密码", "9. 自检（含手机实测）", "10. 更换域名证书　当前：dns.example.org", "11. DoH 走 HTTP/3　当前：关", "12. 卸载自建DNS", "0. 退出"]
 pos = [out.find(w) for w in want]
 check("新顺序、每项一行", all(p >= 0 for p in pos) and pos == sorted(pos))
-check("「腾出 53 端口」「手机实测」不再单独一项", "腾出 53" not in out and "12." not in out)
+check("「腾出 53 端口」「手机实测」不再单独一项", "腾出 53" not in out and "13." not in out)
 for k, f in [("1", "install"), ("2", "status"), ("3", "_selfdns_toggle"), ("4", "_privdns_menu"), ("5", "dot_clientid"),
              ("6", "ios_profile"), ("7", "change_web_port"), ("8", "change_admin_account"), ("10", "change_domain"),
-             ("11", "uninstall")]:
+             ("11", "doh_h3_toggle"), ("12", "uninstall")]:
     run_menu([k, "0"]); check(f"{k} → {f}", CALLS == [f])
 
 print("自检之后两问")

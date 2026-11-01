@@ -232,7 +232,7 @@ def install():
             if not _auto_setup():
                 _first_setup()
             return
-        print("  AdGuard Home 已经装过了。要重装请先『11 卸载』再装；只换域名走『10 更换域名证书』。")
+        print("  AdGuard Home 已经装过了。要重装请先『12 卸载』再装；只换域名走『10 更换域名证书』。")
         _usage(); return
     dom = _setup_own_domain()
     if not dom:
@@ -1326,6 +1326,79 @@ def change_web_port():
         sh("systemctl restart AdGuardHome")
         print(f"\n  ❌ 改到 {new} 后 AGH 没在新端口正常起来，已回滚回 {cur}（后台仍可用）。稍后再试或换个端口。")
 
+# ── DoH 走 HTTP/3（仓库主人 11/01：「做个开关吧默认关」）────────────────────────────────
+# AdGuard 自带：AdGuardHome.yaml 里 dns.serve_http3 = true，DoH 端口（port_https，默认 10443）除了 TCP 再开一个 UDP
+# 收 HTTP/3（真二进制 v0.107.79 实测：开了 UDP 那个口就有人听）。默认关，理由：
+#   · DNS 是小包、连接复用，H3 省的那点握手几乎感觉不到；
+#   · 手机多半从国内直连这个 DoH，出境 UDP/QUIC 常被限速丢包，可能反而不如 TCP 稳；
+#   · 客户端要自己配成 H3 才走（订阅里写的还是普通 https://），开了也只是「多一条路」。
+# 开的时候要在防火墙 / 安全组额外放行 UDP 这个口；起不来就放回原样。
+_H3_RE = re.compile(r'(?m)^(  serve_http3:[ \t]*)(true|false)[ \t]*$')   # dns: 下面那一行（两格缩进）
+
+def _h3_on():
+    try: txt = open(_agh_yaml()).read()
+    except OSError: return False
+    m = _H3_RE.search(txt)
+    return bool(m and m.group(2) == "true")
+
+def _udp_listening(port):
+    """本机有没有人在听这个 UDP 口（读 /proc，不依赖 ss）。"""
+    for f in ("/proc/net/udp", "/proc/net/udp6"):
+        try: lines = open(f).read().splitlines()[1:]
+        except OSError: continue
+        for l in lines:
+            try:
+                if int(l.split()[1].rsplit(":", 1)[1], 16) == port:
+                    return True
+            except (IndexError, ValueError):
+                pass
+    return False
+
+def doh_h3_toggle():
+    """11 DoH 走 HTTP/3：开 / 关（默认关）。改 yaml → 重启 → 校验，不成就放回。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return
+    path = _agh_yaml()
+    try: txt = open(path).read()
+    except OSError:
+        print("  读不到 AdGuard 配置文件。"); return
+    if len(_H3_RE.findall(txt)) != 1:
+        print("  配置里没找到 serve_http3 这一行（AdGuard 版本太老？），保险起见不改。"); return
+    if _yaml_val(_tls_block(txt), "enabled") != "true":
+        ui_tip("先在后台开加密（菜单 2 使用方法第二步），DoH 有了才能走 HTTP/3")
+        return
+    port = _doh_port()
+    on = _h3_on()
+    if on:
+        new = False
+    else:
+        ui_tip(f"开了要在防火墙 / 安全组再放行 UDP {port}；国内出境 UDP 常被限速，客户端也要自己配成 H3 才走")
+        if _ask("  开启 DoH 走 HTTP/3? [y/N]: ").strip().lower() not in ("y", "yes"):
+            return
+        new = True
+    open(path, "w").write(_H3_RE.sub(lambda m: m.group(1) + ("true" if new else "false"), txt, count=1))
+    sh("systemctl restart AdGuardHome")
+    ok = False
+    for _ in range(12):
+        time.sleep(1)
+        if _running() and (_udp_listening(port) == new):
+            ok = True; break
+    if not ok:
+        open(path, "w").write(txt)
+        sh("systemctl restart AdGuardHome")
+        print(f"  ⚠ 改完 AdGuard 没按预期起来，已放回原样（HTTP/3 仍{'开' if on else '关'}）。")
+        return
+    if new:
+        print(f"  ✔ DoH 已支持 HTTP/3（UDP {port}）")
+        if "Status: active" in sh("ufw status 2>/dev/null"):
+            if _ask(f"  ufw 开着，顺手放行 {port}/udp? [Y/n]: ").strip().lower() in ("", "y", "yes"):
+                sh(f"ufw allow {port}/udp")
+                print(f"  ✔ 已放行 {port}/udp（云厂商安全组还要自己放）")
+    else:
+        print("  ✔ DoH 已关掉 HTTP/3，只走 TCP")
+
 def status():
     if not _installed():
         print("\n  未安装。选『1 安装』先装上。"); return
@@ -1884,6 +1957,7 @@ def selfcheck():
         hit = True
         print(f"    {warn} ufw 已启用，确认这些端口放行了：53(UDP+TCP)"
               + (f" / {p_dot}(TCP) / {p_doh}(TCP)" if enc_on else "")
+              + (f" / {p_doh}(UDP，HTTP/3)" if enc_on and _h3_on() else "")
               + (f" / {web}(TCP)" if web else ""))
     if sh("firewall-cmd --state 2>/dev/null") == "running":
         hit = True
@@ -2545,7 +2619,8 @@ def menu():
         # 4 节点使用私有DNS解析：1 本机当 DNS 机 / 2 本机节点交给外机解析 / 3 关（交给主脚本，见 _privdns_menu）。
         # 5 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。7 改后台端口：随机 2000-5000 / 自定义，带回滚。
         # 10 更换域名证书：换自建 DNS 自己的域名和证书（10/31 加，见 change_domain），后台设置不动。
-        # 11 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
+        # 11 DoH 走 HTTP/3：默认关（11/01 加，见 doh_h3_toggle），卸载挪到 12、照旧放最后。
+        # 12 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
         ui_title("自建 DNS · AdGuard Home（兼带广告过滤）")
         if _installed():
             st = "已安装 · " + (_hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
@@ -2563,7 +2638,8 @@ def menu():
                   (8, "修改用户名和密码", None),
                   (9, "自检（含手机实测）", None),
                   (10, "更换域名证书", _domain() if _installed() else None),
-                  (11, "卸载自建DNS", None),
+                  (11, "DoH 走 HTTP/3", ("开" if _h3_on() else "关") if _installed() else None),
+                  (12, "卸载自建DNS", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -2576,7 +2652,8 @@ def menu():
         elif c == "8": change_admin_account()
         elif c == "9": selfcheck(); _selfcheck_more()
         elif c == "10": change_domain()
-        elif c == "11": uninstall()
+        elif c == "11": doh_h3_toggle()
+        elif c == "12": uninstall()
         elif c in ("0", ""):
             return
 
