@@ -220,7 +220,7 @@ rule-providers:
   Claude-zj: {<<: *class-yaml, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geosite/anthropic.yaml"}
   PayPal: {<<: *mrs-domain, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geosite/paypal.mrs"}
   Cryptocurrency: {<<: *mrs-domain, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geosite/category-cryptocurrency.mrs"}
-  games-!cn: {<<: *class-yaml, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geosite/category-games-!cn.yaml"}
+  games-!cn: {<<: *mrs-domain, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geosite/category-games-!cn.mrs"}
   twitter: {<<: *mrs-domain, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geosite/twitter.mrs"}
   google-ip: {<<: *mrs-ipcidr, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geoip/google.mrs"}
   cloudflare-ip: {<<: *mrs-ipcidr, url: "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo/geoip/cloudflare.mrs"}
