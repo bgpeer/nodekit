@@ -367,14 +367,16 @@ def _issue_own_cert(acme, dom, env=""):
     entered = bool(env)                                  # 这次有没有填新令牌
     ok, out = _issue_attempt(acme, dom, env)
     if not ok and not env and had_tok and "invalid domain" in out:
-        print(f"  {R}✗ 存着的 Cloudflare 令牌管不到 {_root_of(dom)}{N}")
         users = _cf_token_users(dom)
         if users:
+            # 别处（节点 / Emby 证书）留下、还有证书靠它续期的令牌：这才要红字说清，默认不换
+            print(f"  {R}✗ 存着的 Cloudflare 令牌管不到 {_root_of(dom)}{N}")
             print(_hl("1;31", f"  ⚠ 本机这些证书续期也靠这个令牌：{'、'.join(users)} —— 换的新令牌也要能管它们（建令牌时选「所有区域」）"))
             yes = _ask("  换一个令牌再签一次? [y/N]: ").strip().lower() in ("y", "yes")
         else:
-            ui_tip("这个令牌本机没有别的证书在用，换掉不影响别的")
-            yes = _ask("  换一个能管这个域名的令牌再签一次? [Y/n]: ").strip().lower() not in ("n", "no")
+            # 没有证书靠它续期 = 以前没签成留下的垃圾（11/05 仓库主人：「除非人家是别的地方留下来令牌才显示这个红字」）：
+            # 不报错、不问，当没存过，照第一次那样要令牌；签不成在下面连它一起清掉
+            yes = True
         if yes:
             _cf_token_steps(dom)
             tok = _ask("  粘贴新的 Cloudflare API Token（粘完回车）: ").strip()
@@ -413,14 +415,26 @@ def _issue_own_cert(acme, dom, env=""):
     return False
 
 def _own_cert_remove(dom):
-    """卸载时撤掉自建 DNS 自己那张证书：acme.sh 不再续期它，文件和域名记录删掉。节点证书一个字节不动。"""
+    """卸载时撤掉自建 DNS 自己那张证书：acme.sh 不再续期它，文件和域名记录删掉。节点证书一个字节不动。
+       acme.sh 存的 CF 令牌：本机再没有别的证书靠它续期，也一起清掉（仓库主人 11/05：「卸载DNS也是一样要带着把自己的垃圾都清干净」）；
+       还有节点 / Emby 证书靠它的，留着。清了返回 True。"""
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if os.path.exists(acme):
         sh(f"{acme} --remove -d {dom} --ecc")
-        shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{dom}_ecc"), ignore_errors=True)
+    for n in (dom + "_ecc", dom):
+        shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{n}"), ignore_errors=True)
     shutil.rmtree(AGH_CERT_DIR, ignore_errors=True)
     try: os.remove(AGH_DOMAIN_FILE)
     except OSError: pass
+    conf = os.path.expanduser("~/.acme.sh/account.conf")
+    try:
+        txt = open(conf).read()
+    except OSError:
+        return False
+    if not re.search(r"(?m)^SAVED_CF_", txt) or _cf_token_users(dom):
+        return False
+    open(conf, "w").write(re.sub(r"(?m)^SAVED_CF_\w+=.*$\n?", "", txt)); os.chmod(conf, 0o600)
+    return True
 
 # ── 菜单 10 更换域名证书（仓库主人 10/31：「自建DNS里面也做一个更换域名证书的口子吧，避免以后要用，这样他们就互相不干预了」）──
 # 换的是自建 DNS 对外的那个域名和它的证书：DoT / DoH / 安卓专用 DNS 的主机名都是它。后台设置、过滤规则、允许的客户端、
@@ -1560,7 +1574,9 @@ def uninstall(refresh_sub=True):
     if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
                    f"顺带清掉 acme.sh 存的 CF Token\n"
                    f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
-    if own:  print(f"    · 自建 DNS 自己的证书（{own} + *.{own}）—— 删掉，acme.sh 不再续期它")
+    if own:  print(f"    · 自建 DNS 自己的证书（{own} + *.{own}）—— 删掉，acme.sh 不再续期它；"
+                   f"本机没别的证书用 CF 令牌的话，令牌也一起清")
+    h3p = _doh_port() if _h3_on() else 0             # 开过 HTTP/3：ufw 里替它放行的 UDP 口一起撤
     if res:  print("    · 腾 53 时改的本机解析 —— 交回 systemd-resolved")
     if cid:  print(f"    · ClientID 记录（{cid}）")
     print(f"\n  {G}不会动{N}：sing-box / xray / 节点 / 订阅本身"
@@ -1585,8 +1601,11 @@ def uninstall(refresh_sub=True):
     if wild:
         _revert_wildcard(dom, cid, ask=False, auto_token=True)
     if own:
-        _own_cert_remove(own)
-        print(f"  {G}✓ 已撤掉自建 DNS 自己的证书{N}（节点证书没动）")
+        tok_gone = _own_cert_remove(own)
+        print(f"  {G}✓ 已撤掉自建 DNS 自己的证书{N}" + ("、CF 令牌也清了" if tok_gone else "") + "（节点证书没动）")
+    if h3p and "Status: active" in sh("ufw status 2>/dev/null"):
+        sh(f"ufw delete allow {h3p}/udp")
+        print(f"  {G}✓ 已撤掉 ufw 里 HTTP/3 用的 {h3p}/udp{N}")
     _restore_resolved()
     if cid:
         try:
