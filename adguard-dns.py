@@ -313,16 +313,7 @@ def _setup_own_domain():
         if not tok:
             print("  没填令牌，这次只用明文 53"); return ""
         env = f"CF_Token={shlex.quote(tok)} "
-    print(f"  签 {dom} + *.{dom}（DNS 验证，约 1-2 分钟）…")
-    r = subprocess.run(f"{env}{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' "
-                       f"--keylength ec-256 --server letsencrypt", shell=True, text=True, capture_output=True)
-    out = ((r.stdout or "") + (r.stderr or "")).strip()
-    if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
-        print(f"  {R}✗ 证书没签下来{N}")
-        for ln in out.splitlines()[-4:]:
-            print("     " + ln)
-        if have_tok and "invalid domain" in out:
-            ui_tip(f"acme.sh 存的令牌管不到 {_root_of(dom)}：CF → API 令牌 → 编辑它 → 区域资源加上这个域名，别新建一个顶掉")
+    if not _issue_own_cert(acme, dom, env):
         return ""
     os.makedirs(AGH_CERT_DIR, exist_ok=True)
     os.chmod(AGH_CERT_DIR, 0o700)                        # 私钥：只给 root
@@ -334,6 +325,89 @@ def _setup_own_domain():
     open(AGH_DOMAIN_FILE, "w").write(dom + "\n")
     print(f"  {G_}✔ 自建 DNS 的证书签好了：{dom} + *.{dom}（自己续期，不碰节点证书）{N}")
     return dom
+
+def _cf_token_users(exclude=""):
+    """本机还有哪些证书【续期要靠 acme.sh 存的 CF 令牌】（DNS 验证签的、证书文件还在）。exclude 那个不算。"""
+    base = os.path.expanduser("~/.acme.sh")
+    out = []
+    try: names = os.listdir(base)
+    except OSError: return out
+    for n in names:
+        d = n[:-4] if n.endswith("_ecc") else n
+        conf = os.path.join(base, n, d + ".conf")
+        try: txt = open(conf).read()
+        except OSError: continue
+        if d in (exclude, "*." + exclude) or not re.search(r"(?m)^Le_Webroot=['\"]?dns_cf", txt):
+            continue
+        m = re.search(r"(?m)^Le_RealFullChainPath=['\"]?([^'\"\n]*)", txt)
+        if m and m.group(1).strip() and os.path.exists(m.group(1).strip()):
+            out.append(d)
+    return sorted(set(out))
+
+def _issue_attempt(acme, dom, env):
+    r = subprocess.run(f"{env}{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' "
+                       f"--keylength ec-256 --server letsencrypt", shell=True, text=True, capture_output=True)
+    out = ((r.stdout or "") + (r.stderr or "")).strip()
+    return (not r.returncode or "Cert success" in out or "Domains not changed" in out), out
+
+def _issue_own_cert(acme, dom, env=""):
+    """签自建 DNS 自己那张（dom + *.dom）。签不下来就【清干净】：这次留下的证书记录、这次存进去的令牌都撤掉，
+       跟没签过一样（仓库主人 11/05：「这个DNS没有建成功不管是证书还是令牌全部给我删干净不要残留」）。
+       · 以前签失败只报错：acme.sh 会把这次贴的令牌存进 account.conf，下回不再问令牌、一直拿这个错的去签、一直失败；
+         提示又说「别新建一个顶掉」，人就卡死在这。
+       · 存着的令牌管不到这个根域名（invalid domain）：当场问要不要换一个。本机没有别的证书靠它续期就直接换（默认是）；
+         有的话醒目说清新令牌也要能管它们（建令牌选「所有区域」），默认否。换了还签不下来，原来那个放回去。"""
+    R, G_, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
+    conf = os.path.expanduser("~/.acme.sh/account.conf")
+    try: snap = open(conf).read()
+    except OSError: snap = None
+    had_tok = bool(snap and re.search(r"(?m)^SAVED_CF_Token=", snap))
+
+    print(f"  签 {dom} + *.{dom}（DNS 验证，约 1-2 分钟）…")
+    entered = bool(env)                                  # 这次有没有填新令牌
+    ok, out = _issue_attempt(acme, dom, env)
+    if not ok and not env and had_tok and "invalid domain" in out:
+        print(f"  {R}✗ 存着的 Cloudflare 令牌管不到 {_root_of(dom)}{N}")
+        users = _cf_token_users(dom)
+        if users:
+            print(_hl("1;31", f"  ⚠ 本机这些证书续期也靠这个令牌：{'、'.join(users)} —— 换的新令牌也要能管它们（建令牌时选「所有区域」）"))
+            yes = _ask("  换一个令牌再签一次? [y/N]: ").strip().lower() in ("y", "yes")
+        else:
+            ui_tip("这个令牌本机没有别的证书在用，换掉不影响别的")
+            yes = _ask("  换一个能管这个域名的令牌再签一次? [Y/n]: ").strip().lower() not in ("n", "no")
+        if yes:
+            _cf_token_steps(dom)
+            tok = _ask("  粘贴新的 Cloudflare API Token（粘完回车）: ").strip()
+            if tok:
+                entered = True
+                ok, out = _issue_attempt(acme, dom, f"CF_Token={shlex.quote(tok)} ")
+    if ok:
+        return True
+    print(f"  {R}✗ 证书没签下来{N}")
+    for ln in out.splitlines()[-4:]:
+        print("     " + ln)
+    # 清干净：这次的证书记录（不清的话下次「已经有一张证书在用」那道检查会把自己拦住），account.conf 放回签之前
+    sh(f"{acme} --remove -d {dom} --ecc")
+    for n in (dom + "_ecc", dom):
+        shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{n}"), ignore_errors=True)
+    # 原来存的那个令牌本机没有证书靠它续期、又管不到这个域名：留着只会下次接着拿它签、接着失败 —— 一起删
+    drop_old = had_tok and "invalid domain" in out and not _cf_token_users(dom)
+    if drop_old and snap is not None:
+        snap = re.sub(r"(?m)^SAVED_CF_\w+=.*$\n?", "", snap)
+        entered = True
+    try:
+        if snap is None:                                 # 签之前没有 account.conf：这次生出来的令牌行全撤
+            if os.path.exists(conf):
+                txt = re.sub(r"(?m)^SAVED_CF_\w+=.*$\n?", "", open(conf).read())
+                open(conf, "w").write(txt); os.chmod(conf, 0o600)
+        elif open(conf).read() != snap:                  # 放回签之前那份（这次填的令牌撤掉，原来的放回）
+            open(conf, "w").write(snap); os.chmod(conf, 0o600)
+    except OSError:
+        pass
+    print(f"  {G_}✔ 已清干净：这次的证书记录{'和这次填的令牌' if entered else ''}都没留下{N}")
+    if "invalid domain" in out:
+        ui_tip(f"令牌管不到 {_root_of(dom)}：建令牌时「区域资源」选「所有区域」，或者这个域名在另一个 Cloudflare 账户")
+    return False
 
 def _own_cert_remove(dom):
     """卸载时撤掉自建 DNS 自己那张证书：acme.sh 不再续期它，文件和域名记录删掉。节点证书一个字节不动。"""
@@ -451,21 +525,8 @@ def _change_domain_apply(dom, acme, env=""):
     """真换（见上面那段说明的顺序）。成功返回 True；哪一步不成都放回原样、返回 False。"""
     R, G_, Y, N = "\033[1;31m", "\033[1;32m", "\033[1;33m", "\033[0m"
     old_own = _own_domain()
-    print(f"  签 {dom} + *.{dom}（DNS 验证，约 1-2 分钟）…")
-    r = subprocess.run(f"{env}{acme} --issue --dns dns_cf -d {dom} -d '*.{dom}' "
-                       f"--keylength ec-256 --server letsencrypt", shell=True, text=True, capture_output=True)
-    out = ((r.stdout or "") + (r.stderr or "")).strip()
-    if r.returncode and "Cert success" not in out and "Domains not changed" not in out:
-        # acme.sh 签失败也会留下这个域名的记录目录：不清掉的话下次再试，「已经有一张证书在用」那道检查就把自己拦住了
-        # （10/31 DMIT：令牌没管到新区域签失败，改好令牌回来再换被拦）。进到这里之前已经查过它原来不存在，放心删
-        sh(f"{acme} --remove -d {dom} --ecc")
-        for n in (dom + "_ecc", dom):
-            shutil.rmtree(os.path.expanduser(f"~/.acme.sh/{n}"), ignore_errors=True)
-        print(f"  {R}✗ 证书没签下来，什么都没改{N}")
-        for ln in out.splitlines()[-4:]:
-            print("     " + ln)
-        if not env and "invalid domain" in out:
-            ui_tip(f"acme.sh 存的令牌管不到 {_root_of(dom)}：CF → API 令牌 → 编辑它 → 区域资源加上这个域名，别新建一个顶掉")
+    if not _issue_own_cert(acme, dom, env):
+        print(f"  {R}✗ 换域名没成，后台和原来的证书都没动{N}")
         return False
     yp = _agh_yaml()
     y0 = open(yp).read()
