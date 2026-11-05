@@ -83,7 +83,11 @@ reset("SAVED_CF_Token='old'\n")
 os.makedirs(os.path.join(AC, "x"), exist_ok=True)
 RES[:] = [(False, '{\n  "type": "urn:ietf:params:acme:error:rateLimited",\n  "status": 429\n}')]
 r, out = run([])
-check("429：说清是限次数、等 1 小时或换名字；不问换令牌", "限次数" in out and "换个名字" in out and "[Y/n]" not in out)
+check("429：红字说清 7 天 5 次已耗光、换域名称或等 7 天；不问换令牌",
+      "该域名 7 天只能签 5 次证书，已耗光，请在 CF 换个域名称（DNS 记录）或者等 7 天后再试" in out and "[Y/n]" not in out)
+RES[:] = [(False, '"status": 429, "detail": "too many failed authorizations (5) for \\"x\\" in the last 1h0m0s"')]
+r, out = run([])
+check("429 是 1 小时内验证失败太多：说等 1 小时", "1 小时内验证失败太多次" in out and "7 天" not in out)
 check("429：令牌留着（令牌没毛病）", "SAVED_CF_Token='old'" in open(CONF).read())
 
 print("六、卸载：自己的证书记录和没人用的令牌一起清；别的证书靠它的留着")
