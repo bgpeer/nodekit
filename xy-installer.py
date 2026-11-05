@@ -4987,17 +4987,11 @@ def _mihomo_selfdns(tpl, url):
     tpl = _selfdns_prepend_list(tpl, r'(?m)^(\s*proxy-server-nameserver:\s*\[)(.*)$', q)
     return tpl
 
-def _sr_selfdns(path, url):
-    """Shadowrocket：把自建 DoH 加到 dns-server 最前（原有留兜底）。"""
-    if not url:
-        return
-    try: tpl = open(path).read()
-    except OSError: return
-    if url in tpl:
-        return
-    new = re.sub(r'(?m)^(dns-server\s*=\s*)', lambda m: m.group(1) + url + ",", tpl, count=1)
-    if new != tpl:
-        open(path, "w").write(new)
+# 【小火箭不再把自建 DoH 塞进 dns-server】仓库主人 11/05：「这个是专门解析直连的吗，那私有DNS不应该写在这里」。
+# 小火箭的 dns-server 管直连和按 IP 分流（GEOIP / IP-CIDR），走代理的域名交给节点去解析用不到它；自建 DNS 的上游是
+# Quad9 / Cloudflare / Google，国内站拿它解析会拿到海外 CDN 地址，直连反而慢、按 IP 的分流还可能判错。
+# mihomo 那边本来就只加在 global-dns（代理那组），小火箭这边以前加错了地方。自建 DNS 在小火箭里只管 proxy-dns-server
+# （节点域名，见 _sr_node_dns），dns-server / fallback-dns-server 照模板原样。
 
 def _sr_privdns_pick(nodes):
     """小火箭 proxy-dns-server 全局只能指一台：有被藏的节点时选它们的 DNS 机（多台取被藏节点最多的那台），没有返回 ''。"""
@@ -5015,15 +5009,22 @@ def _sr_node_dns(path, url, nodes):
        否则本机自建 DoH 写进了订阅 → 用它；都没有 → 不写，照旧。
        没在 iPhone 上实测过（仓库主人 10/31：群管理员说能用，不用测）；带 ClientID 路径、非 443 端口的 DoH 文档没说，
        claude/tools/srtest.py pdns A 测的就是这一行。它是全局的、只有一台、没有兜底，那台 DNS 挂了所有域名节点一起连不上。
-       模板里自己写了 proxy-dns-server 的：当口子用，换成上面那台；都没有就照模板写的。"""
-    url = _sr_privdns_pick(nodes) or url
+       模板里自己写了 proxy-dns-server 的（仓库主人 11/05：「是插入还是把别人的直接覆盖，是在旁边写一个多的这肯定不行」）：
+         · 有被藏的节点：私有名只有那台 DNS 机答得出，它插到这一行最前、逗号隔开，模板原来写的接在后面，不删、不另起一行；
+         · 没有被藏的节点：别人自己定的，一个字不动。"""
+    picked = _sr_privdns_pick(nodes)
+    url = picked or url
     if not url:
         return
     try: tpl = open(path).read()
     except OSError: return
     line = f"proxy-dns-server = {url}"
-    if re.search(r"(?m)^proxy-dns-server\s*=", tpl):
-        new = re.sub(r"(?m)^proxy-dns-server\s*=.*$", lambda m: line, tpl, count=1)
+    m = re.search(r"(?m)^proxy-dns-server\s*=[ \t]*(.*)$", tpl)
+    if m:
+        if not picked:
+            return
+        rest = [v.strip() for v in m.group(1).split(",") if v.strip() and v.strip() != picked]
+        new = tpl[:m.start()] + "proxy-dns-server = " + ",".join([picked] + rest) + tpl[m.end():]
     elif re.search(r"(?m)^dns-server\s*=.*$", tpl):
         new = re.sub(r"(?m)^(dns-server\s*=.*)$", lambda m: m.group(1) + "\n" + line, tpl, count=1)
     elif "[General]\n" in tpl:
@@ -5397,7 +5398,6 @@ def gen_singbox(ylines, nodes, tpl_url):
 def gen_shadow(ylines, nodes, tpl_url):
     build_shadowrocket_sub(nodes, tpl_url)
     _sr_direct_ip(SR_FILE, _direct_targets(nodes))
-    _sr_selfdns(SR_FILE, _selfdns_doh())                       # 开关开启：把本机自建 DoH 加进 DNS（带兜底）
     _sr_node_dns(SR_FILE, _selfdns_doh(), nodes)               # 节点域名交给自己的 DNS（proxy-dns-server），不走国内 DNS
 
 FMT = {

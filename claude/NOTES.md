@@ -158,6 +158,8 @@
   10/31 起小火箭写 `proxy-dns-server`（`_sr_node_dns`）：被藏节点的 DNS 机（多台取节点多的，`_sr_privdns_pick`）> 自建 DoH > 不写；
   被藏的节点也放回小火箭配置（仓库主人：「群管理员说能用，不用测」「把被藏的节点也加进小火箭吧」）。
   没在 iPhone 上实测，全局、单台、无兜底；用户报小火箭里域名节点全断就先撤这个。节点订阅 .txt 照旧不放被藏的。
+  11/05：模板自己写了 `proxy-dns-server` 的不再整行覆盖——有被藏节点就插最前（逗号隔开，仓库主人说其他两个字段也是逗号），没有就不动；
+  自建 DoH 不再塞进小火箭的 `dns-server`（那是管直连 / 按 IP 分流的，`_sr_selfdns` 删了）。
 - **对着源码核过**（10/28，mihomo v1.19.33 / sing-box v1.14.4 / AdGuard v0.107.79；容器里不让跑下载来的二进制，只读了源码）：
   mihomo 的 policy 按名字精确匹配，问它不走分流规则（`respect-rules` 管不到这段）；sing-box 出站指了 `domain_resolver`
   就直接问那台、不过 DNS 规则（拿不到 fakeip），A / AAAA 并发问、AAAA 空答不碍事；AdGuard 的 `$dnsrewrite` 只写了 A 时，
