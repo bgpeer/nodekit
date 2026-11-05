@@ -410,8 +410,12 @@ def _issue_own_cert(acme, dom, env=""):
     if "invalid domain" in out:
         ui_tip(f"令牌管不到 {_root_of(dom)}：建令牌时「区域资源」选「所有区域」，或者这个域名在另一个 Cloudflare 账户")
     elif re.search(r'"status":\s*429|rateLimited|too many', out, re.I):
-        # 11/05 真机：令牌好了，前面几次失败把 Let's Encrypt 的次数用掉了（同一个名字失败太多 / 一周内重复签太多）
-        ui_tip(f"Let's Encrypt 限次数了：等 1 小时再试；还不行就换个名字（比如 dns2.{_root_of(dom)}，CF 里同样建两条）")
+        # 11/05 真机：令牌好了，前面几次把 Let's Encrypt 的次数用掉了。仓库主人定的说法：直接红字、说清 7 天 5 次。
+        # 只有报的是「1 小时内验证失败太多」（failed authorizations … 1h）才说等 1 小时，那个过一会儿就好
+        if re.search(r"failed authorizations|failed validation", out, re.I) and not re.search(r"168h|exact set", out):
+            print(_hl("1;31", f"  ✗ {dom} 1 小时内验证失败太多次，请等 1 小时后再试，或者在 CF 换个域名称（DNS 记录）"))
+        else:
+            print(_hl("1;31", f"  ✗ 该域名 7 天只能签 5 次证书，已耗光，请在 CF 换个域名称（DNS 记录）或者等 7 天后再试"))
     return False
 
 def _own_cert_remove(dom):
