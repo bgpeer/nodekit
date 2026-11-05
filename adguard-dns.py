@@ -407,6 +407,9 @@ def _issue_own_cert(acme, dom, env=""):
     print(f"  {G_}✔ 已清干净：这次的证书记录{'和这次填的令牌' if entered else ''}都没留下{N}")
     if "invalid domain" in out:
         ui_tip(f"令牌管不到 {_root_of(dom)}：建令牌时「区域资源」选「所有区域」，或者这个域名在另一个 Cloudflare 账户")
+    elif re.search(r'"status":\s*429|rateLimited|too many', out, re.I):
+        # 11/05 真机：令牌好了，前面几次失败把 Let's Encrypt 的次数用掉了（同一个名字失败太多 / 一周内重复签太多）
+        ui_tip(f"Let's Encrypt 限次数了：等 1 小时再试；还不行就换个名字（比如 dns2.{_root_of(dom)}，CF 里同样建两条）")
     return False
 
 def _own_cert_remove(dom):
