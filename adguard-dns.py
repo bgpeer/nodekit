@@ -843,11 +843,14 @@ def _usage(port=None, head=None):
     if dom:
         print("    后台 → 设置 → 加密设置：")
         print("      · 勾选「启用加密」")
+        # 顺序照后台页面从上到下（仓库主人 11/05 定）；DoQ 853 是 UDP，跟 DoT 的 853/TCP 不冲突
         print(f"      · 服务器名称：{G}{dom}{N}")
+        print(f"      · 「HTTPS 自动重定向」{Y}不要勾{N}")
+        print(f"      · HTTPS 端口：{G}{dohp}{N}（别填 0 / 443）")
+        print(f"      · DNS-over-TLS 端口：{G}853{N}")
+        print(f"      · DNS-over-QUIC 端口：{G}853{N}")
         print(f"      · 证书（文件路径）：{G}{_crt()}{N}")
         print(f"      · 私钥（文件路径）：{G}{_key()}{N}")
-        print(f"      · HTTPS 端口：{G}{dohp}{N}（别填 0 / 443）　DNS-over-TLS 端口：{G}853{N}")
-        print(f"      · 「HTTPS 自动重定向」{Y}不要勾{N}")
         print(f"      · 保存（提示 no IP addresses 的黄字忽略）")
     else:
         print(f"    {Y}没设域名，加密用不了，只能用明文 DNS{N}（要加密：卸了重装，装的时候填域名）")
