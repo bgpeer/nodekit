@@ -78,7 +78,15 @@ check("回车不换：只签了一次", len(CALLS) == 1)
 check("旧令牌留着（别的证书续期要用）", "SAVED_CF_Token='old'" in open(CONF).read())
 check("这次的记录照样删", not os.path.exists(os.path.join(AC, DOM + "_ecc")))
 
-print("五、两处都走同一个签发")
+print("五、Let's Encrypt 限次数（429）")
+reset("SAVED_CF_Token='old'\n")
+os.makedirs(os.path.join(AC, "x"), exist_ok=True)
+RES[:] = [(False, '{\n  "type": "urn:ietf:params:acme:error:rateLimited",\n  "status": 429\n}')]
+r, out = run([])
+check("429：说清是限次数、等 1 小时或换名字；不问换令牌", "限次数" in out and "换个名字" in out and "[Y/n]" not in out)
+check("429：令牌留着（令牌没毛病）", "SAVED_CF_Token='old'" in open(CONF).read())
+
+print("六、两处都走同一个签发")
 src = open(os.path.join(ROOT, "adguard-dns.py"), encoding="utf-8").read()
 check("安装和换域名都用 _issue_own_cert", src.count("_issue_own_cert(acme, dom, env)") == 2)
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
