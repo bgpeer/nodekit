@@ -77,7 +77,7 @@
 > - **证书**：凡是重签共用证书的地方（装节点、15 装证书 / 修复证书、13 → 5 签泛域名和撤销）都带着 `*.根域名`，
 >   要用 Cloudflare 令牌；撤销 DoT 泛域名时令牌也留着（节点专用域名续期还要用）。
 > - **客户端**：mihomo 内核要 **1.19.20 及以后**（`proxy-server-nameserver-policy`，老内核会时通时不通）；sing-box 1.12 及以后
->   （出站的 `domain_resolver`）；小火箭写 `[General] proxy-dns-server`：有被藏的节点就指它们的 DNS 机，没有就指自建 DoH，节点域名不再走国内 DNS；
+>   （出站的 `domain_resolver`）；小火箭写 `[General] proxy-dns-server`：有被藏的节点就指它们的 DNS 机，没有就指自建 DoH，节点域名不再走国内 DNS（模板自己写了这一行的：插最前不覆盖，没被藏节点就不动）；
 >   被藏的节点 10/31 起也放进小火箭配置（全局只能指一台：DNS 机不是那台的被藏节点不放；小火箭节点订阅 .txt 带不了 DNS，也不放；
 >   没在 iPhone 上实测，`claude/tools/srtest.py` 的 `pdns A` 测的就是这一行）。单条分享链接照写原来的地址。
 > - **被藏的机器，订阅里那条管理直连规则去掉**：开着 TUN 去 SSH 1、2 会先绕一下代理。
@@ -132,10 +132,11 @@
 > **`3 自建 DNS 写入订阅`**：开关（循环）——把本机 AdGuard 的 DoH（`https://本机域名:DoH端口/dns-query`，
 > 端口从 AdGuardHome.yaml 读、默认 10443）**动态写进订阅配置的 DNS**（用本机域名、不写死在公共模板里）。
 > **三个格式都写，但机制不同**：
-> - **mihomo / 小火箭**：把自建 DoH 放 DNS 列表**最前当主用、原有留兜底**——AdGuard 没通会**自动回落**到原 DNS，
+> - **mihomo**：把自建 DoH 放 DNS 列表**最前当主用、原有留兜底**——AdGuard 没通会**自动回落**到原 DNS，
 >   不会断解析。mihomo 写两处：`nameserver`（默认解析）+ `global-dns` 锚点（`nameserver-policy` 里所有走代理的
 >   域名组 `*global-dns` 共用它，改锚点一行 17 个组全带上）；**`cn-dns` 组不动**——国内域名该走国内解析拿就近 CDN，
 >   用境外自建 DNS 反而慢。
+> - **小火箭**（11/05 改）：`dns-server` / `fallback-dns-server` **照模板原样不动**——小火箭的 `dns-server` 管直连和按 IP 分流，用境外自建 DNS 解析国内站会拿到海外 CDN、直连变慢。自建 DNS 只写进 `proxy-dns-server`（解析节点域名，见上面私有解析那段）；模板自己写了 `proxy-dns-server` 的：有被藏的节点就把 DNS 机**插到最前、逗号隔开**，原来的接在后面；没有就一个字不动。
 > - **sing-box**：把**配置自己声明的兜底 DNS** 那台换成自建 DoH（`detour` 走**直连**、
 >   `domain_resolver` 用模板里的 `bootstrap` 解析域名本身）。国内 `local`、国外 `remote`、`fakeip`
 >   **都不动**：兜底只接没被任何规则分到的查询——作者模板里 A/AAAA 先给 fakeip（直连的再用 `local`
