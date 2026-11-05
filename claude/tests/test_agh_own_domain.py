@@ -81,7 +81,8 @@ RES[DOM] = [IP]; ASK[:] = [DOM]; OUT[0] = "invalid domain\nError adding TXT reco
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     got = a._setup_own_domain()
-check("令牌管不到这个区域：说清楚去 CF 编辑令牌加区域、别新建顶掉", got == "" and "编辑它" in buf.getvalue() and "别新建" in buf.getvalue())
+# 11/05 改：以前只叫人「编辑它、别新建顶掉」，人卡死（存的令牌一直是错的）；现在当场问换不换、没换成就清干净
+check("令牌管不到这个区域：当场问换不换；没换成就清干净", got == "" and "管不到" in buf.getvalue() and "已清干净" in buf.getvalue())
 OUT[0] = "Cert success."
 open(CONF, "w").write("")
 ASK[:] = [DOM, "tok new"]; RUN.clear()

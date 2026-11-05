@@ -122,7 +122,8 @@ check("老装法起不来：自己那两个证书文件删掉、没留下域名�
 print("签不下来 / 不该换的")
 reset(); ISSUE_OK[0] = False
 out = go(["", "y"])
-check("证书没签下来：什么都没改", open(Y).read() == YAML and not os.path.exists(a.AGH_DOMAIN_FILE) and "什么都没改" in out)
+check("证书没签下来：什么都没改、清干净", open(Y).read() == YAML and not os.path.exists(a.AGH_DOMAIN_FILE)
+      and "都没动" in out and "已清干净" in out)
 reset(); ISSUE_OK[0] = False
 _real_run = a.subprocess.run
 def leave_dir(cmd, **k):                     # acme.sh 签失败也会建记录目录（10/31 DMIT 真机）
