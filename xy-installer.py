@@ -3819,7 +3819,11 @@ def mihomo_to_sb_outbound(key, d):
                                     "public_key": d["reality-opts"].get("public-key", ""),
                                     "short_id": d["reality-opts"].get("short-id", "")}
         if d.get("network") == "ws":
-            ob["transport"] = {"type": "ws", "path": d["ws-opts"].get("path", "/"),
+            # httpupgrade 在 mihomo 里也是 network: ws，靠 ws-opts 里的 v2ray-http-upgrade 区分。以前一律写成 ws：
+            # 服务端是 httpupgrade 的 vless 节点 sing-box 订阅连不上（服务端报 real websocket request received，
+            # 真内核实测）。vmess 那支本来就分了（vmess-httpupgrade）。
+            hu = str(d["ws-opts"].get("v2ray-http-upgrade")).lower() == "true"
+            ob["transport"] = {"type": "httpupgrade" if hu else "ws", "path": d["ws-opts"].get("path", "/"),
                                "headers": {"Host": d["ws-opts"].get("headers", {}).get("Host", sni)}}
             if d.get("smux"): ob["multiplex"] = dict(_SB_MUX)
         elif d.get("network") == "grpc":
