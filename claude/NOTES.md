@@ -10,6 +10,9 @@
 - 真机问题：先让仓库主人跑只读诊断（`claude/tools/`，见技能 `.claude/skills/vps-diag`），拿到原文再改，别凭猜。
 - 回复仓库主人用中文、直白，先说结论；他看的是手机终端截图。
 - 合并前可以叫审查智能体 `rule-checker` 对一遍 `CLAUDE.md`（泄漏、删功能、屏上文字、误伤播放）。
+- 订阅出站连不连得上，容器里有 sing-box 时可以本地实测（11/09 全仓检查用过）：脚本自己的 `sb_*` / `make_sb_*` 造入站和链接
+  （`ensure_acme` 换成自签、`_nginx_front` 换成 False），链接 → `link_to_proxy` → `mihomo_to_sb_outbound`，起服务端、客户端两个
+  sing-box，curl 走客户端 socks 拿本机小网页。reality 要连外网借握手，测不了；mihomo 不让现编，只能用 PyYAML 对组 / 规则引用。
 
 ## media-stack.py 地图（只记关键的）
 

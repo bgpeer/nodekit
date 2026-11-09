@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.394"
+SCRIPT_VERSION = "1.5.395"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -21625,7 +21625,9 @@ QR115_STATUS = "https://qrcodeapi.115.com/get/status/?uid={}&time={}&sign={}&_={
 
 
 def _qr115_get(url, timeout=35):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    # 出网一律中性 UA（不报 Python-urllib）；同一个域的二维码图片早就这么拉，115 认
+    req = urllib.request.Request(url, headers={"User-Agent": HTTP_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
 
 
