@@ -49,9 +49,9 @@ check("磁盘没版本号：被正在跑的新版救回 1.1.135", disk_ver() == 
 setup("1.1.135", "1.1.135"); m.install_shortcut('SCRIPT_VERSION = "1.1.140"\nprint(1)\n')
 check("带内容：强制写成 1.1.140", disk_ver() == "1.1.140")
 
-# 6. 守卫只改降级行为：bgpeer wrapper 仍是「临时下载最新 → 覆盖 → 跑」
-src = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
+# 6. bgpeer wrapper 仍是「临时下载最新 → 验过 → 覆盖 → 跑」（验的那半见 test_bgpeer_wrapper.py）
 check("wrapper 仍每次临时下载最新再跑",
-      'mv "$t" /etc/bgpeer/xy-installer.py' in src and "exec python3 /etc/bgpeer/xy-installer.py" in src)
+      'mv "$t" "$f"' in m.BGPEER_WRAPPER and 'exec python3 "$f" "$@"' in m.BGPEER_WRAPPER
+      and "f=/etc/bgpeer/xy-installer.py" in m.BGPEER_WRAPPER)
 
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)
