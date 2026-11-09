@@ -3614,9 +3614,12 @@ class H(http.server.SimpleHTTPRequestHandler):
         # sys_version 置空会留下 `Server: nginx ` 这么个带尾空格的串——真 nginx 不长这样，
         # 尾空格本身就是个破绽。直接把整串定死。
         return 'nginx'
-    error_message_format = ('<html><head><title>%(code)d</title></head>'
-                            '<body><center><h1>%(code)d %(message)s</h1></center>'
-                            '<hr><center>nginx</center></body></html>')
+    # 错误页照 nginx 自己的样子（标题「404 Not Found」、短语用标准的，不用 http.server 的 File not found）
+    error_message_format = ('<html>\r\n<head><title>%(code)d %(message)s</title></head>\r\n'
+                            '<body>\r\n<center><h1>%(code)d %(message)s</h1></center>\r\n'
+                            '<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n')
+    def send_error(self, code, message=None, explain=None):
+        super().send_error(code)
     timeout = 30                     # 读请求超时：卡住的客户端不会永久占着线程
     def __init__(self, *a, **k):
         super().__init__(*a, directory=directory, **k)
@@ -3638,8 +3641,11 @@ class H(http.server.SimpleHTTPRequestHandler):
                 ftok = f.read().strip()
         except OSError:
             pass
-        if ftok and tok != ftok:         # token 不对 → 拒（防别人蹭）
-            self.send_error(403); return
+        # token 对不上 → 当没这个地址（防别人蹭）。【没有 token 文件也一样】（11/09 查出来的）：以前是 ftok 为空就放行，
+        # 从没开过中转的机器（老装机 / 只有 IP / 一直关着）谁扫到端口都能拿它转 GitHub，也等于认出「这儿跑着中转」。
+        # 回 404 不回 403：403 本身就在说「这儿有东西、只是你没权限」。
+        if not ftok or tok != ftok:
+            self.send_error(404); return
         if not target.startswith(('http://', 'https://')):
             target = 'https://' + target.lstrip('/')
         try:
@@ -3647,7 +3653,7 @@ class H(http.server.SimpleHTTPRequestHandler):
         except Exception:
             host = ''
         if host not in ALLOW:            # 非 GitHub 主机一律拒，杜绝开放代理滥用
-            self.send_error(403); return
+            self.send_error(404); return
         try:
             # UA 跟主脚本一致（见 HTTP_UA）：这是中转服务端替别人去 GitHub 取件，
             # 报 'xy-sub' 等于替对方向沿途声明「这条链路上跑着 nodekit」。
@@ -6692,20 +6698,51 @@ def install_shortcut(content=None):
             except OSError: cur = ""
             if cur and _vt(_script_ver(cur)) > _vt(_script_ver(content)):
                 content = cur                            # 磁盘那份更新，别覆盖成旧的
-        open(SELF_LOCAL, "w").write(content)
-        # raw.githubusercontent 常被 GitHub 限流(429)，加 jsDelivr 镜像兜底；
-        # 只有真的下到非空内容才覆盖本地，拉不到就继续用本地缓存（不会退回旧版失败）。
-        wrapper = ("#!/usr/bin/env bash\n"
-                   'u="https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py"\n'
-                   'j="https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py"\n'
-                   't="$(mktemp)"\n'                     # 随机临时文件，避免固定路径被抢注
-                   'curl -fsSL "$u" -o "$t" 2>/dev/null || curl -fsSL "$j" -o "$t" 2>/dev/null || true\n'
-                   '[ -s "$t" ] && mv "$t" /etc/bgpeer/xy-installer.py; rm -f "$t"\n'
-                   'exec python3 /etc/bgpeer/xy-installer.py "$@"\n')
-        open("/usr/local/bin/bgpeer", "w").write(wrapper)
-        os.chmod("/usr/local/bin/bgpeer", 0o755)
+        _write_atomic_text(SELF_LOCAL, content)          # 写半截被打断 = 02:50 的自更新跑不起来，先写临时文件再换名
+        _write_atomic_text("/usr/local/bin/bgpeer", BGPEER_WRAPPER, 0o755)
     except Exception:
         pass
+
+# bgpeer 快捷命令：每次尽量拉最新的再跑。raw.githubusercontent 常被 GitHub 限流(429)，加 jsDelivr 镜像兜底。
+# 【拉下来的先验过再换上】（11/09 查出来的）以前是「非空就覆盖」，两个坑：
+#   · jsDelivr 的 @main 缓存能到 12 小时（?_t= 破不掉）：raw 一限流就退到镜像，拿到的可能是旧版 ——
+#     刚「18 更新」到新版，下次敲 bgpeer 又被盖回旧版，要等 02:50 自更新才回来；
+#   · 下到一半断了也是「非空」：换上一份半截的脚本，bgpeer 打不开，02:50 的 `python3 SELF_LOCAL self-update`
+#     跑的也是它，自己救不回来（不上服务器的机器就一直卡着）。
+# 所以跟 ensure_remote_script / _auto_self_update 一个规矩：先编译一遍、版本号不比本机旧才换；不然留本机那份照跑。
+# 版本号用正则里的 . 去匹配引号：这段 python 包在 bash 单引号里，里面不能再出现单引号。
+BGPEER_WRAPPER = r'''#!/usr/bin/env bash
+u="https://raw.githubusercontent.com/bgpeer/nodekit/main/xy-installer.py"
+j="https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py"
+f=/etc/bgpeer/xy-installer.py
+t="$(mktemp)"
+curl -fsSL -m 60 "$u" -o "$t" 2>/dev/null || curl -fsSL -m 60 "$j" -o "$t" 2>/dev/null || true
+if [ -s "$t" ] && python3 -c '
+import re, sys
+def ver(p):
+    try:
+        m = re.search(r"^SCRIPT_VERSION\s*=\s*.([0-9.]+).", open(p, encoding="utf-8").read(), re.M)
+    except OSError:
+        return None
+    return tuple(int(x) for x in m.group(1).split(".") if x) if m else None
+compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")
+new, old = ver(sys.argv[1]), ver(sys.argv[2])
+sys.exit(0 if new and (old is None or new >= old) else 1)
+' "$t" "$f" 2>/dev/null; then
+  mv "$t" "$f"
+fi
+rm -f "$t"
+exec python3 "$f" "$@"
+'''
+
+def _write_atomic_text(path, text, mode=None):
+    """先写同目录的临时文件再换名：中途被杀 / 断电，留下的要么是旧的、要么是新的，不会是半截。"""
+    tmp = f"{path}.new.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write(text)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
 
 def read_saved_links():
     out = []
