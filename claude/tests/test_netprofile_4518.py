@@ -291,9 +291,12 @@ mm = body(xsrc, "main_menu")
 check("进面板那次排在各项自愈后面（nginx 规则重建等可能动端口）", mm.index("_heal_other_crons()") < mm.index("netprofile_sync()") < mm.index("while True:"))
 check("画像收进 root-only 清单（harden_perms 每次入口收紧）", "NETPROFILE" in xsrc[xsrc.index("_PRIV_FILES = lambda"):xsrc.index("def harden_perms")])
 uc = body(xsrc, "_uninstall_core")
-check("卸载代理主体、/etc/bgpeer 留给 Emby 那套时，画像也删", re.search(r'for p in \("/etc/bgpeer/state\.json", CFG_AUTO_FILE, NETPROFILE\)', uc))
+owned = xsrc[xsrc.index("_NODE_OWNED = lambda"):xsrc.index("def _core_installed")]
+check("卸载代理主体、/etc/bgpeer 留给别的模块（Emby / 自建DNS / 网络优化）时，画像也删",
+      "for p in _NODE_OWNED():" in uc and "NETPROFILE" in owned)
 ua = body(xsrc, "uninstall_all")
-check("只卸代理主体、网络优化留着：叫它把节点端口放回去", re.search(r"_uninstall_core\(\)\s*if nopt:\s*_netopt_apply_profile\(\)", ua))
+check("只卸代理主体、网络优化留着：叫它把节点端口放回去",
+      re.search(r"_uninstall_core\(keep_panel=others\)\s*if nopt:\s*_netopt_apply_profile\(\)", ua))
 x3 = load("xy3", "xy-installer.py"); n5 = load("netopt5", "net-optimize.py")
 check("画像路径两边一致（/etc/bgpeer/netprofile.json）", x3.NETPROFILE == n5.NETPROFILE == "/etc/bgpeer/netprofile.json")
 check("_netopt_version 也用 NETOPT_SBIN（同一个常量）", "NETOPT_SBIN" in body(xsrc, "_netopt_version"))

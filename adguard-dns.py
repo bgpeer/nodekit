@@ -1548,7 +1548,32 @@ def _restore_resolved():
     print(f"  {Y}⚠ 交回 systemd-resolved 后解析不通，已退回写死公共 DNS 的 /etc/resolv.conf"
           f"（本机 DNS 仍然可用）。{N}")
 
-def uninstall(refresh_sub=True):
+def _uninstall_confirm(dom, own, cid, wild, subw, prv, res, allow):
+    """卸载前那一屏：列清楚要撤什么、再问一次。确认了返回 True。"""
+    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
+    print("\n  卸载会一次撤掉下面这些，不用再去别处收尾：")
+    print("    · AdGuard Home 服务 + /opt/AdGuardHome")
+    print(f"      （{Y}后台设置、允许的客户端、过滤规则、查询日志全部删除，不可恢复{N}）")
+    if subw: print("    · 订阅里写入的自建 DoH —— 移除并刷新订阅")
+    if prv:  print("    · 节点私有解析（菜单 4 选了「本机DNS解析」）—— 关掉，外机节点改回真实地址")
+    if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
+                   f"顺带清掉 acme.sh 存的 CF Token\n"
+                   f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
+    if own:  print(f"    · 自建 DNS 自己的证书（{own} + *.{own}）—— 删掉，acme.sh 不再续期它；"
+                   f"本机没别的证书用 CF 令牌的话，令牌也一起清")
+    if res:  print("    · 腾 53 时改的本机解析 —— 交回 systemd-resolved")
+    if cid:  print(f"    · ClientID 记录（{cid}）")
+    print(f"\n  {G}不会动{N}：sing-box / xray / 节点 / 订阅本身"
+          + (f"——{ACME_CRT} 仍是节点在用的那张证书，只是覆盖范围改回单域名。" if wild else "。"))
+    if allow:
+        print(f"\n  {R}先做这件事再卸载{N}：AdGuard 里设了白名单，卸载后这台 DNS 整个没了，"
+              f"而安卓「专用DNS」是严格模式、没有回落——")
+        print(f"  先把手机/路由器的 DNS 改回自动/默认，否则那些设备会立刻全部解析失败。")
+    if _ask("\n  确认卸载? [y/N]: ").lower() not in ("y", "yes"):
+        print("  已取消，没有任何改动。"); return False
+    return True
+
+def uninstall(refresh_sub=True, assume_yes=False):
     """卸载：把这套自建 DNS 留下的东西一次撤干净，回到没装过的样子。
 
        为什么不只是删服务：这些东西是连在一起的一整套，只删 AdGuard 会留下一地孤儿——
@@ -1557,8 +1582,9 @@ def uninstall(refresh_sub=True):
        （菜单 5 的「删除 DoT」是另一回事：只撤泛域名证书这一项，AdGuard 本体照常跑。）
 
        各项彼此独立、按「先撤依赖它的，再撤它本身」排序，中间某项失败不影响后面：证书
-       重签失败原证书原封不动，本机解析还原不通会自动退回能用的状态。"""
-    G = "\033[1;32m"; Y = "\033[1;33m"; R = "\033[1;31m"; N = "\033[0m"
+       重签失败原证书原封不动，本机解析还原不通会自动退回能用的状态。
+       assume_yes：主脚本 20 → 5「全部卸载」调（那边已经输过 yes），不再列清单、不再问。"""
+    G = "\033[1;32m"; N = "\033[0m"
     if not _installed():
         print("  没检测到 AdGuard Home，无需卸载。"); return
     dom  = _domain()                                 # 这些状态要趁 AGH 目录还在先读出来
@@ -1570,27 +1596,10 @@ def uninstall(refresh_sub=True):
     res  = os.path.exists(RESOLVED_DROPIN)
     allow = _allowed_clients()
 
-    print("\n  卸载会一次撤掉下面这些，不用再去别处收尾：")
-    print("    · AdGuard Home 服务 + /opt/AdGuardHome")
-    print(f"      （{Y}后台设置、允许的客户端、过滤规则、查询日志全部删除，不可恢复{N}）")
-    if subw: print("    · 订阅里写入的自建 DoH —— 移除并刷新订阅")
-    if prv:  print("    · 节点私有解析（菜单 4 选了「本机DNS解析」）—— 关掉，外机节点改回真实地址")
-    if wild: print(f"    · 为 DoT ClientID 签的泛域名证书 —— 重签回只覆盖 {G}{dom}{N}，"
-                   f"顺带清掉 acme.sh 存的 CF Token\n"
-                   f"      （{Y}重签期间 sing-box/xray 会重启几秒{N}；失败则原证书原封不动）")
-    if own:  print(f"    · 自建 DNS 自己的证书（{own} + *.{own}）—— 删掉，acme.sh 不再续期它；"
-                   f"本机没别的证书用 CF 令牌的话，令牌也一起清")
+    if not assume_yes:
+        if not _uninstall_confirm(dom, own, cid, wild, subw, prv, res, allow):
+            return
     h3p = _doh_port() if _h3_on() else 0             # 开过 HTTP/3：ufw 里替它放行的 UDP 口一起撤
-    if res:  print("    · 腾 53 时改的本机解析 —— 交回 systemd-resolved")
-    if cid:  print(f"    · ClientID 记录（{cid}）")
-    print(f"\n  {G}不会动{N}：sing-box / xray / 节点 / 订阅本身"
-          + (f"——{ACME_CRT} 仍是节点在用的那张证书，只是覆盖范围改回单域名。" if wild else "。"))
-    if allow:
-        print(f"\n  {R}先做这件事再卸载{N}：AdGuard 里设了白名单，卸载后这台 DNS 整个没了，"
-              f"而安卓「专用DNS」是严格模式、没有回落——")
-        print(f"  先把手机/路由器的 DNS 改回自动/默认，否则那些设备会立刻全部解析失败。")
-    if _ask("\n  确认卸载? [y/N]: ").lower() not in ("y", "yes"):
-        print("  已取消，没有任何改动。"); return
 
     if refresh_sub:                                  # 先撤订阅：客户端别再往这台已死的 DoH 打
         _selfdns_remove()                            # （全量卸载时订阅整个删掉，不必刷新，refresh_sub=False）
@@ -2749,8 +2758,9 @@ def menu():
 
 def main():
     act = sys.argv[1] if len(sys.argv) > 1 else ""
-    if act == "remove":                              # 主脚本整体卸载时可调用（订阅整体删，不必刷新）
-        uninstall(refresh_sub=False)
+    if act in ("remove", "uninstall"):               # 主脚本菜单 20 调：remove = 订阅整个删了 / 节点不在，不用刷新订阅；
+        # uninstall = 节点还在，订阅里的 DoH、私有解析一起撤；--yes = 全部卸载那边已经输过 yes，不再问
+        uninstall(refresh_sub=(act == "uninstall"), assume_yes="--yes" in sys.argv[2:])
     else:
         menu()
 

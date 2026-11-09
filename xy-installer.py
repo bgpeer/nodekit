@@ -7849,9 +7849,134 @@ def _media_stack_installed():
     return os.path.exists(os.path.join(d, "docker-compose.yml"))
 
 
-def _uninstall_core():
-    """卸载代理主体：sing-box/xray、订阅服务、证书、AdGuard、CDN 节点、命令、cron。
-       不含网络优化(BBR/QoS，独立模块)——由调用方决定要不要一起 --reset。"""
+# 卸代理主体、/etc/bgpeer 又得留着（Emby / 自建 DNS / 网络优化 / 面板本身还在）时，只删节点自己的这些。
+# 别的模块的东西（media-stack.json、agh.domain、selfdns.clientid、privdns-map.json、各模块脚本缓存、
+# 面板自己的 traffic.json / selfupdate.off）不在这里，一个不碰。
+_NODE_OWNED = lambda: [CFG_FILE, SBOX_FILE, SR_FILE, SR_NODES_FILE, SR_MODE_FILE, SR_ONELINK_MARK, SUB_DIR, SUB_SERVER,
+                       HOST_FILE, STATE_FILE, TOKENS_FILE, LINKS_FILE, PEERS_FILE, CUSTPL_FILE, TPLSRC_FILE, BT_STATE,
+                       SUBPORT_FILE, CNBLOCK_FILE, CN_BLOCK_LOCAL, SELFDNS_FLAG, PRIVDNS_FILE, GHRELAY_OFF,
+                       GHRELAY_TOKEN_FILE, GHDL_RELAYS, NETPROFILE, CDN_DIR, CDN_STATE, CDN_PREF_FILE, CFG_AUTO_FILE,
+                       NODE_OP_PLAN, CERT_META]
+
+
+def _core_installed():
+    return any(os.path.exists(p) for p in (SB_BIN, XRAY_BIN, STATE_FILE))
+
+
+def _agh_installed():
+    return os.path.exists(AGH_BIN_PATH)
+
+
+def _agh_uses_node_cert():
+    """自建 DNS 是老装法：加密用的就是节点那张 /etc/ssl/sb 证书（新装法有自己的 /etc/ssl/agh，跟节点无关）。"""
+    try:
+        txt = open(AGH_YAML, encoding="utf-8").read()
+    except OSError:
+        return False
+    return bool(re.search(r"(?m)^\s*(certificate_path|private_key_path):\s*['\"]?/etc/ssl/sb/", txt))
+
+
+def _netopt_installed():
+    return os.path.exists(NETOPT_CONFIG)
+
+
+def _xanmod_on_boot(boot="/boot"):
+    """/boot 里有没有 XanMod 内核（12 → 4 换的 BBRv3）。"""
+    try:
+        return any(f.startswith("vmlinuz-") and "xanmod" in f for f in os.listdir(boot))
+    except OSError:
+        return False
+
+
+def _acme_records():
+    """acme.sh 里的证书记录 → [(记录目录, 名字, conf 正文, 是否已 --remove)]。ca / dnsapi 这类目录没有 <名>.conf，不算。"""
+    base = os.path.expanduser("~/.acme.sh")
+    out = []
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for n in names:
+        d = os.path.join(base, n)
+        nm = n[:-4] if n.endswith("_ecc") else n
+        for conf, removed in ((os.path.join(d, nm + ".conf"), False), (os.path.join(d, nm + ".conf.removed"), True)):
+            try:
+                out.append((d, nm, open(conf, encoding="utf-8", errors="replace").read(), removed))
+                break
+            except OSError:
+                continue
+    return out
+
+
+def _acme_conf_val(txt, key):
+    m = re.search(rf"(?m)^{key}=['\"]?([^'\"\n]*)", txt)
+    return m.group(1).strip() if m else ""
+
+
+def _acme_ours(name, path):
+    """这条 acme.sh 记录是不是本脚本这一套签的：装到节点 /etc/ssl/sb、自建 DNS /etc/ssl/agh，
+       或者是 Emby 那张（*.底座 装成 /etc/nginx/certs/底座.crt）。别的（你自己网站的）一条都不碰。"""
+    if path.startswith(("/etc/ssl/sb/", "/etc/ssl/agh/")):
+        return True
+    return name.startswith("*.") and path == f"/etc/nginx/certs/{name[2:]}.crt"
+
+
+def _acme_cleanup(is_ours, purge_if_empty=False):
+    """acme.sh 里属于本脚本的证书记录撤掉（不再续期、记录目录删掉）；剩下的记录没有一张靠 CF 令牌续期，令牌也清掉。
+       purge_if_empty：全部卸载时用——撤完一条记录都不剩，acme.sh 本身（含每日 cron、账号）也卸掉；
+       还剩别的记录（你自己网站的）就留着它。返回 (撤了几条, 令牌清了没, acme.sh 卸了没)。"""
+    import shlex
+    acme = os.path.expanduser("~/.acme.sh/acme.sh")
+    gone = 0
+    for d, nm, txt, removed in _acme_records():
+        if not is_ours(nm, _acme_conf_val(txt, "Le_RealFullChainPath")):
+            continue
+        if not removed and os.path.exists(acme):
+            sh(f"{acme} --remove -d {shlex.quote(nm)}" + (" --ecc" if d.endswith("_ecc") else ""), check=False)
+        shutil.rmtree(d, ignore_errors=True)
+        for k in ("Le_RealFullChainPath", "Le_RealKeyPath", "Le_RealCertPath", "Le_RealCACertPath"):
+            f = _acme_conf_val(txt, k)           # 装出去的证书文件（Emby 那张在 /etc/nginx/certs）一起删
+            if f and os.path.isfile(f):
+                os.remove(f)
+        gone += 1
+    rest = _acme_records()                       # 别人的记录（--remove 过的也算，文件可能还被人直接引用）还在就不卸 acme.sh
+    left = [r for r in rest if not r[3]]         # 还在续期的：看 CF 令牌还有没有人用
+    if purge_if_empty and not rest and os.path.isdir(os.path.dirname(acme)):
+        if os.path.exists(acme):
+            sh(f"{acme} --uninstall", check=False)       # 撤掉它的每日 cron 和 shell 里的别名
+        shutil.rmtree(os.path.dirname(acme), ignore_errors=True)
+        return gone, True, True
+    conf = os.path.expanduser("~/.acme.sh/account.conf")
+    try:
+        txt = open(conf).read()
+    except OSError:
+        return gone, False, False
+    if not re.search(r"(?m)^SAVED_CF_", txt) or any(_acme_conf_val(t, "Le_Webroot") == "dns_cf" for _, _, t, _ in left):
+        return gone, False, False
+    open(conf, "w").write(re.sub(r"(?m)^SAVED_CF_\w+=.*$\n?", "", txt))
+    os.chmod(conf, 0o600)
+    return gone, True, False
+
+
+def _run_module(url, local, args, need=""):
+    """拉最新的模块脚本，跑它自己的卸载；need：新参数还没进这份脚本（镜像缓存还是旧的）就不跑，返回 None。"""
+    if not ensure_remote_script(url, local):
+        print(f"  ⚠ 拉不到 {os.path.basename(local)}，本地也没有缓存，跳过")
+        return None
+    if need and need not in open(local, encoding="utf-8", errors="replace").read():
+        print(f"  ⚠ {os.path.basename(local)} 还是旧版（镜像缓存），过几分钟再来")
+        return None
+    return _run_child(f"python3 {local} {args}")
+
+
+def _uninstall_core(keep_panel=False):
+    """卸载代理主体：sing-box/xray、订阅服务、节点证书、CDN 节点、cron；面板和别的模块按 keep_panel 留不留。
+       网络优化 / 自建 DNS（新装法）/ Emby 是独立模块，各有各的卸载（菜单 20 的 2 / 3 / 4），这里不碰；
+       只有老装法的自建 DNS 用的是节点证书、证书一删它就起不来——走它自己的卸载一次撤干净。
+       keep_panel：别的模块还在，bgpeer 命令和 /etc/bgpeer 留着（不然以后连卸它们的入口都没了），只删节点自己的文件。"""
+    if _agh_installed() and _agh_uses_node_cert():
+        print("  自建DNS 用的是节点证书，先卸它…")
+        _run_module(ADGUARD_URL, ADGUARD_LOCAL, "remove --yes")
     cdn_svcs = [n["svc"] for n in _cdn_load() if n.get("svc")]   # 全部 CDN 套用节点服务
     for svc in ["sing-box", "xray", "xy-sub", CDN_SVC] + cdn_svcs:
         sh(f"systemctl disable --now {svc}", check=False)
@@ -7870,70 +7995,134 @@ def _uninstall_core():
     sh(f"rm -f {NGINX_STREAM_CONF}", check=False)
     if have("nginx"):
         sh("nginx -t && systemctl reload nginx", check=False)
-    if os.path.exists("/opt/AdGuardHome/AdGuardHome"):   # 自建 DNS（AdGuard Home）一并撤掉——它的 DoT 靠 /etc/ssl/sb 证书，证书这里会删
-        sh("/opt/AdGuardHome/AdGuardHome -s uninstall", check=False)
-        sh("systemctl stop AdGuardHome", check=False)
-        sh("rm -rf /opt/AdGuardHome", check=False)
     # 【这两样是共用的，得先看有没有别人在用】跟 nginx 一个规矩：只拿自己的。
     _ms = _media_stack_installed()
     _keep_cert = _ms and os.path.exists(MS_NGINX_CONF)
-    paths = [SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, SUB_DIR,
-             "/root/xy-nodes.txt", "/usr/local/bin/bgpeer", WEBROOT,
+    keep_dir = _ms or keep_panel
+    paths = [SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, SUB_DIR, NODE_FILE, WEBROOT,
              # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
-             "/etc/cron.d/bgpeer-cnblock", "/var/log/bgpeer-cnblock.log",
-             CORE_CRON_FILE, CORE_CRON_LOG, CFG_AUTO_CRON, CFG_AUTO_LOG, SELFUPD_CRON, SELFUPD_LOG]
+             CNBLOCK_CRON, "/var/log/bgpeer-cnblock.log",
+             CORE_CRON_FILE, CORE_CRON_LOG, CFG_AUTO_CRON, CFG_AUTO_LOG]
+    if not keep_panel:
+        paths += ["/usr/local/bin/bgpeer", SELFUPD_CRON, SELFUPD_LOG]
     if not _keep_cert:
-        # 证书是节点签的，没人用就跟着走
-        paths.append("/etc/ssl/sb")
-    if not _ms:
-        paths.append("/etc/bgpeer")          # 没人共用，整个目录一起收
+        paths.append("/etc/ssl/sb")              # 证书是节点签的，没人用就跟着走
+    if not keep_dir:
+        paths.append(BGP_DIR)                    # 没人共用，整个目录一起收
     for p in paths:
         sh(f"rm -rf {p}", check=False)
+    if not _keep_cert:
+        _acme_cleanup(lambda n, path: path.startswith("/etc/ssl/sb/"))   # acme.sh 别再续一张没人用的证书
     jobq_cleanup_if_unused()             # 凌晨任务排队器：没有别的定时任务在用了才撤（网络优化可能还在用）
-    if _ms:
-        # 【目录留着，但节点自己的文件要清干净】留下的只有别人的东西。
-        for p in ("/etc/bgpeer/state.json", CFG_AUTO_FILE, NETPROFILE):
-            sh(f"rm -f {p}", check=False)
-        print("  ↷ /etc/bgpeer 保留：Emby 那套（media-stack）的状态也存在这里。")
-        print("    里面记着它的安装目录、分片重定向端口、每个盘的探测 UA 开关 ——")
-        print("    删掉的话它会当场显示「未安装」，而且那些开关会静默关掉。")
+    if keep_dir:
+        for p in _NODE_OWNED():          # 目录留着，节点自己的文件清干净；留下的只有别人的东西
+            sh(f"rm -rf {p}", check=False)
+        print("  ↷ bgpeer 面板和 /etc/bgpeer 保留：还有别的模块要用（以后在 20 里卸）" if keep_panel
+              else "  ↷ /etc/bgpeer 保留：Emby 的状态存在这里")
     if _keep_cert:
-        print("  ↷ /etc/ssl/sb 保留：Emby 那套的 nginx 站点正用着这里的证书。")
-        print("    删了它那个站点立刻打不开，而这不是「卸载节点」该有的结果。")
-        print("    彻底清掉：先卸 Emby 那套，再 rm -rf /etc/ssl/sb")
+        print("  ↷ /etc/ssl/sb 保留：Emby 的网站正用着这张证书（先卸 Emby 再卸它）")
+
+
+UNINSTALL_ALL_WARN = "将卸载脚本所有功能包括系统内核回到初始状态，请考虑清楚再执行"
+
+
+def _uninstall_everything():
+    """5 全部卸载：Emby → 自建DNS → 换回系统内核 → 网络优化 → 代理主体和面板 → acme.sh 里本脚本签的证书。
+       每一步交给那个模块自己的卸载（免确认，前面已经输过 yes），没装的跳过；哪一步没卸干净也接着往下走。
+       返回要不要重启（换了内核 / 还原了内核参数）。"""
+    reboot = False
+    print("\n【1/5】自建Emby")
+    if _media_stack_installed():
+        _run_module(MEDIA_URL, MEDIA_LOCAL, "uninstall --yes", need="--yes")
+    else:
+        print("  没装，跳过")
+    print("\n【2/5】自建DNS")
+    if _agh_installed():
+        _run_module(ADGUARD_URL, ADGUARD_LOCAL, "remove --yes", need="--yes")
+    else:
+        print("  没装，跳过")
+    print("\n【3/5】系统内核")
+    if _xanmod_on_boot():
+        if _run_module(NETOPT_URL, NETOPT_LOCAL, "--xanmod-remove --yes", need="--xanmod-remove") == 0:
+            reboot = True
+    else:
+        print("  没换过内核，跳过")
+    print("\n【4/5】网络优化")
+    if _netopt_installed():
+        _run_module(NETOPT_URL, NETOPT_LOCAL, "--reset")
+        reboot = True
+    else:
+        print("  没启用，跳过")
+    print("\n【5/5】代理主体 + 面板")
+    _uninstall_core(keep_panel=False)
+    gone, tok, purged = _acme_cleanup(_acme_ours, purge_if_empty=True)
+    if purged:
+        print("  ✔ acme.sh 只给本脚本签过证书，连它一起卸了（CF 令牌随之删掉）")
+    elif gone or tok:
+        print(f"  ✔ acme.sh 里本脚本签的证书撤了 {gone} 张" + ("、CF 令牌清了" if tok else "") + "（你别的证书没动）")
+    return reboot
+
 
 def uninstall_all():
-    """卸载子菜单：只卸代理主体 / 全部卸载(再带上网络优化) / 返回。
-       AdGuard 自建DNS 本就随代理主体一起卸(它的 DoT 依赖 acme 证书，证书会被删)；
-       唯一独立、需单独带上的是网络优化(BBR/QoS，写在 /etc/net-optimize)。"""
-    nopt = os.path.exists(NETOPT_CONFIG)
-    ui_title("卸载")
-    ui_kv("代理主体", "sing-box / xray、订阅服务、证书、AdGuard 自建 DNS、CDN 节点、bgpeer 命令、定时任务")
-    ui_kv("网络优化", "已启用（独立模块）" if nopt else _hl("2", "未启用"))
-    ui_line()
-    ui_items([(1, "卸载代理主体（网络优化保留）", None),
-              (2, "全部卸载（代理主体 + 网络优化，恢复系统默认）", None),
-              (0, "返回", None)])
-    c = _ask("选择: ").strip()
-    if c in ("1", "2"):
-        ui_warn("卸载后节点、订阅、证书全部删除，客户端立即连不上，不可恢复")
-    if c == "1":
-        if _ask("\n  确认卸载代理主体（AdGuard 一并卸；网络优化保留）? [y/N]: ").lower() in ("y", "yes"):
-            _uninstall_core()
+    """菜单 20 卸载（仓库主人 11/09：「1 卸载代理主体 2 卸载网络优化 3 卸载自建DNS 4 卸载自建emby 5 全部卸载 0 返回；
+       这个全部卸载一定要输入三个字母 yes，里面还要做一行红字作提示」）。
+       1~4 各卸各的，交给那个模块自己的卸载；5 一次全卸、内核换回系统内核，要打 yes。卸完一项回到这一屏看状态。"""
+    while True:
+        core, nopt, dns, emby = _core_installed(), _netopt_installed(), _agh_installed(), _media_stack_installed()
+        state = lambda on, yes="已安装", no="未安装": _hl("1;32", yes) if on else _hl("2", no)
+        ui_title("卸载")
+        ui_items([(1, "卸载代理主体", state(core)),
+                  (2, "卸载网络优化", state(nopt, "已启用", "未启用")),
+                  (3, "卸载自建DNS", state(dns)),
+                  (4, "卸载自建Emby", state(emby)),
+                  (5, "全部卸载", None),
+                  (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            if not core:
+                print("  代理主体没装，不用卸。"); continue
+            dep = dns and _agh_uses_node_cert()
+            ui_warn("节点、订阅、证书全部删除，客户端立即连不上" + ("；自建DNS 用的是节点证书，一起卸掉" if dep else ""))
+            if _ask("  确认卸载代理主体? [y/N]: ").strip().lower() not in ("y", "yes"):
+                continue
+            others = nopt or emby or (dns and not dep)
+            _uninstall_core(keep_panel=others)
             if nopt:
                 _netopt_apply_profile()              # 画像没了：保留端口退回老规矩（整段池子 + 本机服务）
-            print("\n已卸载代理主体。" + ("网络优化仍在（想卸进『网络优化→卸载』或重跑本项选 2）。" if nopt else ""))
-    elif c == "2":
-        if _ask("\n  确认全部卸载（含网络优化，恢复系统默认）? [y/N]: ").lower() in ("y", "yes"):
-            if nopt:
-                print("\n【1/2】卸载网络优化…")
-                _run_net_optimize("--reset")                 # 先卸它——它的脚本缓存在 /etc/bgpeer，等下会被主体一起删
-            else:
-                print("\n【1/2】网络优化未启用，跳过。")
-            print("\n【2/2】卸载代理主体…")
-            _uninstall_core()
-            print("\n✅ 全部卸载完毕，已恢复到装脚本前的干净状态。")
-    # 0/其它 → 返回
+            print("\n✔ 已卸载代理主体")
+            if not others:
+                raise SystemExit(0)                  # 面板也跟着没了，这个菜单回不去了
+        elif c == "2":
+            if not nopt:
+                print("  网络优化没启用，不用卸。"); continue
+            ui_warn("优化写入的内核参数、服务、防火墙标记全部清除，节点不受影响"
+                    + ("（BBRv3 内核留着，换回系统内核选 5，或 12 → 4）" if _xanmod_on_boot() else ""))
+            if _ask("  确认卸载网络优化? [y/N]: ").strip().lower() in ("y", "yes"):
+                _run_net_optimize("--reset")
+        elif c == "3":
+            if not dns:
+                print("  自建DNS 没装，不用卸。"); continue
+            # 它自己那一屏列清楚撤什么、再问一次；节点还在就连订阅里的 DoH 一起撤（uninstall），不在就不用刷订阅（remove）
+            _run_module(ADGUARD_URL, ADGUARD_LOCAL, "uninstall" if core else "remove")
+        elif c == "4":
+            if not emby:
+                print("  自建Emby 没装，不用卸。"); continue
+            _run_module(MEDIA_URL, MEDIA_LOCAL, "uninstall")      # 它自己要你打 yes，再问删不删数据
+        elif c == "5":
+            ui_warn(UNINSTALL_ALL_WARN)
+            if _ask("  确认就输入 yes（其他一律取消）: ").strip().lower() != "yes":
+                print("  已取消，什么都没动。"); continue
+            reboot = _uninstall_everything()
+            print("\n✅ 全部卸载完毕")
+            if reboot:
+                ui_tip("重启后才回到系统内核和默认参数")
+                if _ask("  现在重启? [y/N]: ").strip().lower() in ("y", "yes"):
+                    sh("reboot", check=False)
+            raise SystemExit(0)                      # 面板已经没了
+        else:
+            print("无效选择。")
 
 # ============================================================================ 屏蔽中国域名/IP（独立文件）
 def ensure_remote_script(url, local):

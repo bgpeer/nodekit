@@ -68,7 +68,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.25"
+VERSION = "4.5.26"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -3779,20 +3779,23 @@ def xanmod_update():
     _xanmod_finish(f"更新到 {new[-1]}", False)
 
 
-def xanmod_remove():
-    """卸载 XanMod、回到系统内核。没有别的内核可回就不卸（卸了开不了机）。要输 yes。"""
+def xanmod_remove(assume_yes=False):
+    """卸载 XanMod、回到系统内核。没有别的内核可回就不卸（卸了开不了机）。要输 yes。
+       assume_yes：节点面板 20 → 5「全部卸载」调（--xanmod-remove --yes，那边已经输过 yes），不再问、也不问重启
+       （那边全卸完统一问一次）。卸成了返回 True。"""
     stock = sorted((k for k in _boot_kernels() if "xanmod" not in k), key=_kver)
     if not stock:
         yellow("  ⚠ /boot 里没有系统内核可回，卸了就开不了机，没卸")
-        return
+        return False
     pk = _xanmod_installed_pkgs()
     if not pk:
         yellow("  ⚠ 没找到装着的 XanMod 包")
-        return
-    _color("1;31", f"  ⚠ 卸载后回到系统内核（{stock[-1]}），BBRv3 换回 BBRv1，要重启才生效；系统内核起不来只能后台 VNC 救")
-    if _ask_tty("  确认卸载就输入 yes（其他一律取消）: ").strip().lower() != "yes":
-        echo("  已取消，什么都没改")
-        return
+        return False
+    if not assume_yes:
+        _color("1;31", f"  ⚠ 卸载后回到系统内核（{stock[-1]}），BBRv3 换回 BBRv1，要重启才生效；系统内核起不来只能后台 VNC 救")
+        if _ask_tty("  确认卸载就输入 yes（其他一律取消）: ").strip().lower() != "yes":
+            echo("  已取消，什么都没改")
+            return False
     check_dpkg_clean()
     # 卸正在跑的内核时，Debian / Ubuntu 的内核包会用 debconf 问「真要删正在用的内核？」，没人答默认中止 → 先答好
     run(["debconf-set-selections"], timeout=30,
@@ -3803,13 +3806,15 @@ def xanmod_remove():
     if r.returncode != 0 or left:
         last = next((ln for ln in reversed((r.stderr or r.stdout).strip().splitlines()) if ln.strip()), "")
         yellow(f"  ⚠ 没卸干净{('：' + last.strip()) if last else ''}；再选一次重试")
-        return
+        return False
     if have_cmd("update-grub"):
         run(["update-grub"], timeout=300)
     if not _xanmod_other_sources():              # 我们加的源一起撤（别处手动配的不碰）
         _rm(XANMOD_LIST); _rm(XANMOD_KEYRING)
     green(f"  ✔ 已卸载，重启后回到系统内核（{stock[-1]}）")
-    _xanmod_reboot_prompt(False)
+    if not assume_yes:
+        _xanmod_reboot_prompt(False)
+    return True
 
 
 # === 状态检测（--check，原 net-optimize-check.sh v1.11 完整移植）===
@@ -4564,8 +4569,10 @@ def main():
     g.add_argument("--status", action="store_true", help="仅打印优化状态报告")
     g.add_argument("--xanmod", action="store_true",
                    help="换 BBRv3 内核（XanMod）：查条件、确认、安装、问要不要重启")
+    g.add_argument("--xanmod-remove", action="store_true",
+                   help="卸载 XanMod、回到系统内核（节点面板 20 → 5 全部卸载调；配 --yes 免确认、不问重启）")
     parser.add_argument("--yes", action="store_true",
-                        help="配合 --xanmod：免掉安装前那一问（重启从不自动）")
+                        help="配合 --xanmod：免掉安装前那一问（重启从不自动）；配合 --xanmod-remove：免确认、不问重启")
     g.add_argument("--self-update", action="store_true",
                    help="只把脚本本体更到最新，不重跑优化、不碰服务（月度 cron 调）")
     g.add_argument("--adaptive", choices=["on", "off"],
@@ -4609,6 +4616,9 @@ def main():
     elif args.xanmod:
         require_root()
         cmd_xanmod(assume_yes=args.yes)
+    elif getattr(args, "xanmod_remove"):
+        require_root()
+        sys.exit(0 if xanmod_remove(assume_yes=args.yes) else 1)
     elif getattr(args, "self_update"):
         cmd_self_update()
     elif getattr(args, "adaptive", None):
