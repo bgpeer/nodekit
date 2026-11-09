@@ -28,22 +28,38 @@ x = load("xy", "xy-installer.py")
 ANS, CALLS = [], []
 x._ask = lambda p="": (print(p, end="") or ANS.pop(0)) if ANS else "0"
 x.sh = lambda c, check=True: CALLS.append(("sh", c)) or ""
-x._run_module = lambda url, local, args, need="": CALLS.append(("mod", os.path.basename(local), args)) or 0
+FAIL = set()                                  # 这几个模块的卸载「没跑成」（脚本拉不到 / 镜像缓存还是旧版）：返回 None、状态不变
+_MOD_KEY = {("media-stack.py", "uninstall"): "emby", ("adguard-dns.py", "remove"): "dns",
+            ("adguard-dns.py", "uninstall"): "dns", ("net-optimize.py", "--xanmod-remove"): "xan",
+            ("net-optimize.py", "--reset"): "nopt"}
+def fake_module(url, local, args, need=""):
+    CALLS.append(("mod", os.path.basename(local), args))
+    key = _MOD_KEY[(os.path.basename(local), args.split()[0])]
+    if key in FAIL:
+        return None
+    if "--yes" in args or args == "--reset":   # 免确认的那几条才真卸（不带 --yes 的由模块自己再问，这里不替它答）
+        ST[key] = False
+    return 0
+x._run_module = fake_module
 x._run_net_optimize = lambda args="", env_extra=None: CALLS.append(("netopt", args))
 x._netopt_apply_profile = lambda: CALLS.append(("profile",))
 REAL_CORE = x._uninstall_core
 x._uninstall_core = lambda keep_panel=False: CALLS.append(("core", keep_panel))
 REAL_ACME = x._acme_cleanup
-x._acme_cleanup = lambda f, purge_if_empty=False: CALLS.append(("acme", purge_if_empty)) or (0, False, False)
+ACME_F = []                                   # 全部卸载传给 _acme_cleanup 的那个判据，留着后面问它
+x._acme_cleanup = lambda f, purge_if_empty=False: (ACME_F.append(f), CALLS.append(("acme", purge_if_empty))) and (0, False, False)
 ST = {"core": True, "nopt": True, "dns": True, "emby": True, "dep": False, "xan": True}
+ALL_ON = dict(ST)
 x._core_installed = lambda: ST["core"]
 x._netopt_installed = lambda: ST["nopt"]
 x._agh_installed = lambda: ST["dns"]
 x._media_stack_installed = lambda: ST["emby"]
 x._agh_uses_node_cert = lambda: ST["dep"]
 x._xanmod_on_boot = lambda boot="/boot": ST["xan"]
-def menu(*a):
-    ANS[:] = list(a); CALLS.clear()
+def menu(*a, **st):
+    """每次从「全装着」开始（st 另改）；卸掉的模块状态会变，不带到下一条用例里。"""
+    ST.update(ALL_ON); ST.update(st)
+    ANS[:] = list(a); CALLS.clear(); ACME_F.clear()
     return quiet(x.uninstall_all)
 
 print("一、菜单")
@@ -53,11 +69,9 @@ check("六项：1 代理主体 / 2 网络优化 / 3 自建DNS / 4 自建Emby / 5
                              "5. 全部卸载", "0. 返回")))
 check("每项后面显示装没装", "卸载代理主体　当前：已安装" in out and "卸载网络优化　当前：已启用" in out)
 check("选项下面不写解释行（第五节）", "sing-box / xray、订阅服务" not in out)
-ST.update(core=False, nopt=False, dns=False, emby=False)
-_, out = menu("1", "2", "3", "4", "0")
+_, out = menu("1", "2", "3", "4", "0", core=False, nopt=False, dns=False, emby=False)
 check("没装的：说不用卸，什么都不动", out.count("不用卸") == 4 and not CALLS)
 check("没装显示未安装 / 未启用", "未安装" in out and "未启用" in out)
-ST.update(core=True, nopt=True, dns=True, emby=True)
 
 print("二、5 全部卸载：要打 yes")
 for a, why in (("y", "y"), ("", "回车"), ("no", "no"), ("yess", "多打一个字")):
@@ -75,11 +89,42 @@ check("问一次重启、默认否（回车不重启）", "现在重启" in out 
 check("卸完退出（面板已经没了）", r == "EXIT" and "全部卸载完毕" in out)
 _, out = menu("5", "YES", "y")
 check("大写 YES 也认；答 y 才重启", ("sh", "reboot") in CALLS)
-ST.update(nopt=False, dns=False, emby=False, xan=False)
-_, out = menu("5", "yes")
+_, out = menu("5", "yes", nopt=False, dns=False, emby=False, xan=False)
 check("没装的模块跳过、不问重启", [c for c in CALLS if c[0] != "sh"] == [("core", False), ("acme", True)]
       and out.count("跳过") == 4 and "现在重启" not in out)
-ST.update(nopt=True, dns=True, emby=True, xan=True)
+
+print("二之二、全部卸载时有模块没卸掉：面板和它的证书留着")
+FAIL.update({"emby", "dns"})                  # 两个模块的脚本都没跑成（拉不到 / 镜像缓存是不认 --yes 的旧版）
+r, out = menu("5", "yes", "", "0")
+check("Emby、自建DNS 没卸掉：卸代理主体时留着面板（keep_panel），不连 acme.sh 一起卸",
+      ("core", True) in CALLS and ("acme", False) in CALLS and ("core", False) not in CALLS)
+check("……屏上红字点名、不报「全部卸载完毕」", "自建Emby、自建DNS 没卸掉，面板留着" in out and "全部卸载完毕" not in out)
+check("……不退出，回到卸载这一屏（看得见哪项还是已安装）", r != "EXIT" and out.count("5. 全部卸载") == 2)
+f = ACME_F[-1]
+check("……它们的证书不撤：自建DNS 那张、Emby 那张留着；节点那张照撤",
+      not f("dns.example", "/etc/ssl/agh/agh.crt") and not f("*.ys.example", "/etc/nginx/certs/ys.example.crt")
+      and f("node.example", "/etc/ssl/sb/acme.crt"))
+check("……别的模块照卸（网络优化还原了，照样问一次重启）", ("mod", "net-optimize.py", "--reset") in CALLS and "现在重启" in out)
+_isdir = x.os.path.isdir
+x.os.path.isdir = lambda p: p == "/etc/ssl/sb" or _isdir(p)     # 节点证书目录被留下了（没卸掉的 Emby 的网站还用着它）
+kept = f("node.example", "/etc/ssl/sb/acme.crt")
+x.os.path.isdir = _isdir
+check("……节点证书被留下时（没卸掉的模块还用着）：acme.sh 里那条也不撤", not kept)
+FAIL.clear(); FAIL.add("dns")
+r, out = menu("5", "yes", "", "0")
+f = ACME_F[-1]
+check("只有自建DNS 没卸掉：Emby 的证书照撤、自建DNS 的留着",
+      f("*.ys.example", "/etc/nginx/certs/ys.example.crt") and not f("dns.example", "/etc/ssl/agh/agh.crt")
+      and "⚠ 自建DNS 没卸掉，面板留着" in out)
+FAIL.clear(); FAIL.add("xan")
+r, out = menu("5", "yes", "", "0")
+check("内核没换回去（/boot 里没有系统内核可回 / 脚本没跑成）：点名、面板留着（12 → 4 还能再卸）",
+      "BBRv3 内核 没卸掉" in out and ("core", True) in CALLS and r != "EXIT")
+FAIL.clear()
+r, out = menu("5", "yes", "")
+check("都卸掉了：照旧删面板、撤全部证书、报完毕、退出",
+      ("core", False) in CALLS and ("acme", True) in CALLS and "全部卸载完毕" in out and "没卸掉" not in out and r == "EXIT"
+      and ACME_F[-1]("dns.example", "/etc/ssl/agh/agh.crt") and ACME_F[-1]("*.ys.example", "/etc/nginx/certs/ys.example.crt"))
 
 print("三、1 卸载代理主体")
 _, out = menu("1", "", "0")
@@ -87,14 +132,11 @@ check("确认默认否：回车不卸", not CALLS and "节点、订阅、证书�
 r, out = menu("1", "y", "0")
 check("别的模块还在：留着面板（keep_panel），网络优化把端口放回去，回到这一屏",
       ("core", True) in CALLS and ("profile",) in CALLS and r != "EXIT")
-ST.update(nopt=False, emby=False, dns=True, dep=True)
-r, out = menu("1", "y")
+r, out = menu("1", "y", nopt=False, emby=False, dns=True, dep=True)
 check("老装法自建DNS（共用节点证书）：确认前写明一起卸；只剩它时面板不留、卸完退出",
       "自建DNS 用的是节点证书，一起卸掉" in out and ("core", False) in CALLS and r == "EXIT")
-ST.update(dep=False)
-r, out = menu("1", "y", "0")
+r, out = menu("1", "y", "0", nopt=False, emby=False, dns=True, dep=False)
 check("新装法自建DNS（自己的证书）：不跟着卸，面板留着", ("core", True) in CALLS and r != "EXIT")
-ST.update(nopt=True, emby=True)
 
 print("四、2 / 3 / 4 交给各模块自己的卸载")
 _, out = menu("2", "y", "0")
@@ -103,10 +145,8 @@ _, out = menu("2", "", "0")
 check("2：默认否", not CALLS)
 _, out = menu("3", "0")
 check("3：节点还在 → adguard-dns.py uninstall（订阅里的 DoH 一起撤）", CALLS == [("mod", "adguard-dns.py", "uninstall")])
-ST["core"] = False
-_, out = menu("3", "0")
+_, out = menu("3", "0", core=False)
 check("3：节点不在 → remove（不用刷订阅）", CALLS == [("mod", "adguard-dns.py", "remove")])
-ST["core"] = True
 _, out = menu("4", "0")
 check("4：media-stack.py uninstall（它自己要打 yes、再问删不删数据）", CALLS == [("mod", "media-stack.py", "uninstall")])
 
@@ -139,8 +179,15 @@ rm = core(True, ms=True)
 check("Emby 的网站用着节点证书：/etc/ssl/sb 留着、acme.sh 记录不撤",
       "/etc/ssl/sb" not in rm and not any(c[0] == "acme-sb" for c in CALLS))
 os.remove(x.MS_NGINX_CONF)
-core(False, dep=True)
-check("老装法自建DNS：先走它自己的卸载（remove --yes）", CALLS[0] == ("mod", "adguard-dns.py", "remove --yes"))
+rm = core(False, dep=True)
+check("老装法自建DNS：先走它自己的卸载（remove --yes），卸掉了节点证书照删",
+      CALLS[0] == ("mod", "adguard-dns.py", "remove --yes") and "/etc/ssl/sb" in rm)
+FAIL.add("dns")
+rm = core(False, dep=True)
+out = quiet(x._uninstall_core, keep_panel=False)[1]
+check("……它没卸掉（脚本拉不到）：节点证书留着（删了它就起不来）、acme.sh 记录不撤、屏上说明",
+      "/etc/ssl/sb" not in rm and not any(c[0] == "acme-sb" for c in CALLS) and "自建DNS 没卸掉，还用着这张证书" in out)
+FAIL.clear()
 
 print("六、acme.sh 清理")
 x._acme_cleanup = REAL_ACME
@@ -192,6 +239,15 @@ acct = open(os.path.join(A, "account.conf")).read()
 check("……再没人用 CF 令牌：令牌清掉，别的设置不动、仍是 root-only",
       tok and "SAVED_CF_" not in acct and "LOG_LEVEL=1" in acct
       and oct(os.stat(os.path.join(A, "account.conf")).st_mode & 0o777) == "0o600")
+fresh(True)
+for n in ("dns.example_ecc", "*.ys.example_ecc"):
+    shutil.rmtree(os.path.join(A, n))
+d = os.path.join(A, "mysite.example_ecc"); os.makedirs(d)   # 你自己的证书：-d a --dns dns_cf -d b --dns dns_cf 签的
+open(os.path.join(d, "mysite.example.conf"), "w").write(
+    "Le_Domain='mysite.example'\nLe_Webroot='dns_cf,dns_cf'\nLe_RealFullChainPath='/etc/nginx/ssl/mysite.crt'\n")
+gone, tok, purged = quiet(x._acme_cleanup, lambda n, p: p.startswith("/etc/ssl/sb/"))[0]
+check("……你自己的证书 Le_Webroot 存成 dns_cf,dns_cf（每个域名各带一次 --dns）：也算在用，令牌留着",
+      gone == 1 and not tok and "SAVED_CF_Token" in open(os.path.join(A, "account.conf")).read())
 check("Emby 判据：*.底座 装成 /etc/nginx/certs/底座.crt 才算，你自己放那儿的不算",
       x._acme_ours("*.ys.example", "/etc/nginx/certs/ys.example.crt")
       and not x._acme_ours("shop.example", "/etc/nginx/certs/shop.example.crt"))

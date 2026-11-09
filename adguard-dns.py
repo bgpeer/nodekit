@@ -716,7 +716,7 @@ def _first_setup():
     print(f"     · 网页管理界面 端口 → 就填默认的 \033[1;32m{WEB_PORT}\033[0m（\033[1;33m初装先用它保证进得去\033[0m；想换防扫描端口，装好后回菜单选 7 改，改完连不上会自动回滚、锁不死）")
     print("     · DNS 服务器 端口 → 保持 \033[1;32m53\033[0m（装前已帮你腾好；仍报红就回菜单选 9 自检，查到会问腾不腾）")
     print("  3) 设管理员账号密码 → 完成。广告过滤（AdGuard DNS filter）默认就是开的。")
-    print(f"  4) 完成后后台地址就是 \033[1;32mhttp://{ip}:{WEB_PORT}\033[0m；想改端口防扫描，回菜单选 \033[1;32m5\033[0m 改（带回滚，安全）")
+    print(f"  4) 完成后后台地址就是 \033[1;32mhttp://{ip}:{WEB_PORT}\033[0m；想改端口防扫描，回菜单选 \033[1;32m7\033[0m 改（带回滚，安全）")
     _usage(WEB_PORT)
 
 SELFDNS_FLAG     = BGP_DIR + "/selfdns.on"        # 主脚本：自建 DNS 是否已写进订阅
@@ -1053,6 +1053,10 @@ def _replace_cf_token():
     new = _ask("  粘贴新的 Cloudflare API Token（粘完回车）: ").strip()
     if not new:
         print("  没输入，未改动。"); return
+    # account.conf 是 acme.sh 当 shell 脚本读进去的：令牌只会是字母数字和 _ - ，带了引号 / 空格 / $ 的多半是多复制了东西，
+    # 写进去轻则这一行读坏、续期失败，重则被当命令执行
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", new):
+        print(f"  {R}✗ 令牌里有不该有的字符（多复制了空格 / 引号？），未改动{N}"); return
     txt = open(conf).read()
     line = f"SAVED_CF_Token='{new}'"
     if re.search(r"(?m)^SAVED_CF_Token=.*$", txt):
@@ -1201,7 +1205,7 @@ def dot_clientid():
         ui_items([(1, "更换 Cloudflare API 令牌（泄露了 / 被吊销了）", None),
                   (2, "删除 DoT ClientID 支持（证书改回单域名，AdGuard 照常跑）", None),
                   (0, "返回", None)])
-        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 11")
+        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 12")
         c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
@@ -1213,7 +1217,7 @@ def dot_clientid():
         return
     if _own_domain():                                     # 自己那张装的时候就带 *.域名；没有说明证书出了岔子
         print(f"  {R}⚠ 自建 DNS 自己的证书里没有 *.{dom}{N}")
-        ui_tip("菜单 10 换个域名，或卸了重装（11 → 1），都会重签"); return
+        ui_tip("菜单 10 换个域名，或卸了重装（12 → 1），都会重签"); return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
     print(f"\n  {Y}需要你先准备两样：{N}")
@@ -1242,7 +1246,7 @@ def dot_clientid():
 
     print(f"\n  正在签发（DNS-01 验证，需要等 CF 记录传播，约 1-2 分钟）…")
     root = _privdns_root()                                # 节点专用域名（菜单 4）要的 *.根域名，一起签上
-    issue = (f"CF_Token='{token}' {acme} --issue --dns dns_cf "
+    issue = (f"CF_Token={shlex.quote(token)} {acme} --issue --dns dns_cf "
              f"-d {dom} -d '*.{dom}'" + (f" -d '*.{root}'" if root else "") +
              " --keylength ec-256 --server letsencrypt")
     r = subprocess.run(issue, shell=True, text=True, capture_output=True)
@@ -2696,7 +2700,7 @@ def change_admin_name():
     print(f"  {R}⚠ 改完后台没起来，已改回原来的用户名{N}")
 
 def change_admin_account():
-    """菜单 12「修改用户名和密码」（仓库主人 10/31 定的样子：1 修改后台用户名　当前：… / 2 修改后台密码 / 0 返回）。"""
+    """菜单 8「修改用户名和密码」（仓库主人 10/31 定的样子：1 修改后台用户名　当前：… / 2 修改后台密码 / 0 返回）。"""
     while True:
         users = _agh_users()
         print()

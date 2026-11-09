@@ -18,9 +18,16 @@ class FakeAGH:
         def ossl(*a):
             subprocess.run(["openssl", *a], cwd=d, check=True, capture_output=True)
         ec = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes")
-        ossl("req", "-x509", *ec, "-keyout", "ca.key", "-out", "ca.crt", "-subj", "/CN=test-ca", "-days", "2")
+        # Python 3.13 起 create_default_context 默认按严格模式验证书（VERIFY_X509_STRICT）：CA 要带 keyUsage，
+        # 下面签出来的证书要带「签发者密钥标识」，缺了就报 CA cert does not include key usage extension——
+        # 真 Let's Encrypt 证书都有，这里的自签测试证书照着补齐（3.11 / 3.12 多了这几项也照样过）。
+        ossl("req", "-x509", *ec, "-keyout", "ca.key", "-out", "ca.crt", "-subj", "/CN=test-ca", "-days", "2",
+             "-addext", "basicConstraints=critical,CA:TRUE", "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+             "-addext", "subjectKeyIdentifier=hash")
         ossl("req", *ec, "-keyout", "srv.key", "-out", "srv.csr", "-subj", "/CN=" + host)
-        open(os.path.join(d, "ext"), "w").write("subjectAltName=DNS:" + host + "\n")
+        open(os.path.join(d, "ext"), "w").write(
+            "subjectAltName=DNS:" + host + "\nbasicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\n"
+            "extendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n")
         ossl("x509", "-req", "-in", "srv.csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-CAcreateserial",
              "-out", "srv.crt", "-days", "2", "-extfile", "ext")
         self.sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

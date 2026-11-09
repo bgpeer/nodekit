@@ -588,8 +588,11 @@ def apply_cn_block(cfg=None):
     print(f"\n✓ 已开启屏蔽中国域名/IP：{wl_txt}{extra}，其余 CN 域名+IP 一律拦截。")
     return True
 
-def remove_cn_block(silent=False):
-    """移除本脚本注入的 CN 屏蔽/白名单规则，恢复不拦截。"""
+def remove_cn_block(silent=False, keep_cfg=False):
+    """移除本脚本注入的 CN 屏蔽/白名单规则，恢复不拦截。
+       keep_cfg：只是关掉（菜单 1）——放行名单选的哪种、自定义链接、单条放行的域名 / IP、自动更新开关都留着，
+       再开照旧带上。以前关一下就把整个状态文件删了：自己一条条加的放行全没了，再开变成「不放行」
+       （文档写的却是「未开启则先存着、开启时自动带上」）。卸载（菜单 6 / remove）才连状态一起清。"""
     sb_cfg = f"{SB_DIR}/config.json"
     if os.path.exists(sb_cfg):
         try:
@@ -609,6 +612,15 @@ def remove_cn_block(silent=False):
         except Exception as e:
             print("处理配置失败:", e)
     remove_cron()                                         # 一并撤掉每日刷新的定时任务
+    if keep_cfg:
+        cfg = cnblock_load()                              # 趁 enabled 还在读：没选过名单的老装机定成「作者名单」存下来
+        cfg["enabled"] = False                            # 关着：重装不自动注入、凌晨不刷新
+        for k in ("rs_hash", "wl_sig"):                   # 指纹是「上次注入」的，关了就作废
+            cfg.pop(k, None)
+        cnblock_save(cfg)
+        if not silent:
+            print("  ✔ 已关闭屏蔽（放行名单留着，再开照旧）")
+        return
     try: os.remove(CNBLOCK_FILE)                          # 卸载即清状态，之后重装不会再自动注入
     except OSError: pass
     if not silent:
@@ -1111,7 +1123,7 @@ def menu():
         if c == "1":
             if on:
                 if _ask("  已开启，关闭屏蔽? [y/N]: ").lower() in ("y", "yes"):
-                    remove_cn_block()
+                    remove_cn_block(keep_cfg=True)       # 只关：放行名单、自定义链接、单条放行都留着
             else:
                 apply_cn_block(cfg)
         elif c == "2":
@@ -1146,7 +1158,10 @@ def menu():
         elif c == "5":
             rule_update_menu()
         elif c == "6":
-            remove_cn_block()
+            # 会让数据没掉的操作：一行说清后果 + 默认否（CLAUDE.md 第四节）。以前一按就卸，连确认都没有
+            ui_tip("卸载会清掉屏蔽规则，自定义链接和单条放行也一起删；只想先关掉选 1")
+            if _ask("  确定卸载? [y/N]: ").lower() in ("y", "yes"):
+                remove_cn_block()
         elif c in ("0", ""):
             return
 

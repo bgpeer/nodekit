@@ -7337,6 +7337,18 @@ def update_script():
         # 镜像(jsDelivr)对 main 分支有最长 ~12 小时缓存；刚发布的新版可能要等缓存刷新
         print(f"\n已是最新版本 v{SCRIPT_VERSION}。（若刚发布过新版还没看到，多半是 GitHub/镜像缓存未刷新，稍后再试）")
         return
+    # 【先验过再换、只升不降】跟 02:50 自更新 / bgpeer 命令 / ensure_remote_script 一个规矩，以前只有这条手动的漏着：
+    # raw 一限流 fetch_url 就退到 jsDelivr（@main 缓存能到 12 小时）或公共反代，拿到的可能是旧版、半截、一页报错——
+    # 「内容不一样就换」会把机器降回旧版，坏文件换上去面板当场打不开，02:50 的 self-update 跑的也是它，自己救不回来。
+    try:
+        compile(latest, "xy-installer.py", "exec")
+    except SyntaxError as e:
+        print(f"\n  ⚠ 拉到的新版校验没过（第 {e.lineno} 行），没有替换，照旧用 v{SCRIPT_VERSION}；过几分钟再试")
+        return
+    new = _script_ver(latest)
+    if _vt(new) < max(_vt(SCRIPT_VERSION), _vt(_script_ver(cur))):
+        print(f"\n  ⚠ 拉到的是 v{new}，比本机的 v{SCRIPT_VERSION} 旧（镜像缓存还没刷新），没有替换；过几分钟再试")
+        return
     install_shortcut(latest)
     print(f"\n脚本已更新 v{SCRIPT_VERSION} → v{_script_ver(latest)}（节点/配置均未改动），正在重新载入新版面板…")
     import sys
@@ -7940,7 +7952,9 @@ def _acme_cleanup(is_ours, purge_if_empty=False):
                 os.remove(f)
         gone += 1
     rest = _acme_records()                       # 别人的记录（--remove 过的也算，文件可能还被人直接引用）还在就不卸 acme.sh
-    left = [r for r in rest if not r[3]]         # 还在续期的：看 CF 令牌还有没有人用
+    # 还在续期的：看 CF 令牌还有没有人用。多域名各带一次 --dns 签的，acme.sh 存成 dns_cf,dns_cf —— 按「含 dns_cf」认
+    # （跟 adguard-dns 的 _cf_token_users 一个口径），只认「等于」会把别人还要用的令牌清掉、60 天后续期才发现
+    left = [r for r in rest if not r[3]]
     if purge_if_empty and not rest and os.path.isdir(os.path.dirname(acme)):
         if os.path.exists(acme):
             sh(f"{acme} --uninstall", check=False)       # 撤掉它的每日 cron 和 shell 里的别名
@@ -7951,7 +7965,7 @@ def _acme_cleanup(is_ours, purge_if_empty=False):
         txt = open(conf).read()
     except OSError:
         return gone, False, False
-    if not re.search(r"(?m)^SAVED_CF_", txt) or any(_acme_conf_val(t, "Le_Webroot") == "dns_cf" for _, _, t, _ in left):
+    if not re.search(r"(?m)^SAVED_CF_", txt) or any("dns_cf" in _acme_conf_val(t, "Le_Webroot") for _, _, t, _ in left):
         return gone, False, False
     open(conf, "w").write(re.sub(r"(?m)^SAVED_CF_\w+=.*$\n?", "", txt))
     os.chmod(conf, 0o600)
@@ -7997,7 +8011,8 @@ def _uninstall_core(keep_panel=False):
         sh("nginx -t && systemctl reload nginx", check=False)
     # 【这两样是共用的，得先看有没有别人在用】跟 nginx 一个规矩：只拿自己的。
     _ms = _media_stack_installed()
-    _keep_cert = _ms and os.path.exists(MS_NGINX_CONF)
+    _agh_left = _agh_installed() and _agh_uses_node_cert()   # 上面那步没卸掉（拉不到脚本 / 它自己报错）：证书一删它就起不来
+    _keep_cert = (_ms and os.path.exists(MS_NGINX_CONF)) or _agh_left
     keep_dir = _ms or keep_panel
     paths = [SB_BIN, XRAY_BIN, SB_DIR, XRAY_DIR, SUB_DIR, NODE_FILE, WEBROOT,
              # cn-block 的每日刷新 cron、内核每月更新 cron 及日志：不清掉 cron 会调已删脚本报错
@@ -8020,7 +8035,8 @@ def _uninstall_core(keep_panel=False):
         print("  ↷ bgpeer 面板和 /etc/bgpeer 保留：还有别的模块要用（以后在 20 里卸）" if keep_panel
               else "  ↷ /etc/bgpeer 保留：Emby 的状态存在这里")
     if _keep_cert:
-        print("  ↷ /etc/ssl/sb 保留：Emby 的网站正用着这张证书（先卸 Emby 再卸它）")
+        print("  ↷ /etc/ssl/sb 保留：" + ("自建DNS 没卸掉，还用着这张证书（先卸自建DNS）" if _agh_left
+                                         else "Emby 的网站正用着这张证书（先卸 Emby 再卸它）"))
 
 
 UNINSTALL_ALL_WARN = "将卸载脚本所有功能包括系统内核回到初始状态，请考虑清楚再执行"
@@ -8029,7 +8045,10 @@ UNINSTALL_ALL_WARN = "将卸载脚本所有功能包括系统内核回到初始�
 def _uninstall_everything():
     """5 全部卸载：Emby → 自建DNS → 换回系统内核 → 网络优化 → 代理主体和面板 → acme.sh 里本脚本签的证书。
        每一步交给那个模块自己的卸载（免确认，前面已经输过 yes），没装的跳过；哪一步没卸干净也接着往下走。
-       返回要不要重启（换了内核 / 还原了内核参数）。"""
+       【哪个模块没卸掉，面板和它的证书就留着】模块脚本拉不到、镜像缓存还是不认 --yes 的旧版、它自己中途报错，
+       那个模块其实还在跑：以前照样删面板、撤它的证书、屏上报「全部卸载完毕」——Emby / 自建DNS 的证书没了，
+       下次 nginx 重载 / AdGuard 重启就起不来，卸它的入口（bgpeer）也没了（CLAUDE.md 第四节）。
+       返回 (要不要重启, 没卸掉的模块名)。"""
     reboot = False
     print("\n【1/5】自建Emby")
     if _media_stack_installed():
@@ -8053,14 +8072,24 @@ def _uninstall_everything():
         reboot = True
     else:
         print("  没启用，跳过")
-    print("\n【5/5】代理主体 + 面板")
-    _uninstall_core(keep_panel=False)
-    gone, tok, purged = _acme_cleanup(_acme_ours, purge_if_empty=True)
+    emby_left, dns_left = _media_stack_installed(), _agh_installed()
+    left = [n for n, on in (("自建Emby", emby_left), ("自建DNS", dns_left), ("BBRv3 内核", _xanmod_on_boot()),
+                            ("网络优化", _netopt_installed())) if on]
+    print("\n【5/5】代理主体" + ("" if left else " + 面板"))
+    _uninstall_core(keep_panel=bool(left))
+
+    def ours(name, path):                        # 没卸掉的模块，它的证书不撤
+        if (dns_left and path.startswith("/etc/ssl/agh/")) or (emby_left and path.startswith("/etc/nginx/certs/")):
+            return False
+        if path.startswith("/etc/ssl/sb/") and os.path.isdir("/etc/ssl/sb"):
+            return False                         # 节点证书被 _uninstall_core 留下了（没卸掉的 Emby / 老装法自建DNS 还用着）
+        return _acme_ours(name, path)
+    gone, tok, purged = _acme_cleanup(ours, purge_if_empty=not left)
     if purged:
         print("  ✔ acme.sh 只给本脚本签过证书，连它一起卸了（CF 令牌随之删掉）")
     elif gone or tok:
         print(f"  ✔ acme.sh 里本脚本签的证书撤了 {gone} 张" + ("、CF 令牌清了" if tok else "") + "（你别的证书没动）")
-    return reboot
+    return reboot, left
 
 
 def uninstall_all():
@@ -8114,12 +8143,18 @@ def uninstall_all():
             ui_warn(UNINSTALL_ALL_WARN)
             if _ask("  确认就输入 yes（其他一律取消）: ").strip().lower() != "yes":
                 print("  已取消，什么都没动。"); continue
-            reboot = _uninstall_everything()
-            print("\n✅ 全部卸载完毕")
+            reboot, left = _uninstall_everything()
+            if left:
+                print()
+                ui_warn(f"{'、'.join(left)} 没卸掉，面板留着：过几分钟回这里再卸一次")
+            else:
+                print("\n✅ 全部卸载完毕")
             if reboot:
                 ui_tip("重启后才回到系统内核和默认参数")
                 if _ask("  现在重启? [y/N]: ").strip().lower() in ("y", "yes"):
                     sh("reboot", check=False)
+            if left:
+                continue                             # 面板还在：回到这一屏，看得见哪项还是「已安装」
             raise SystemExit(0)                      # 面板已经没了
         else:
             print("无效选择。")
@@ -13244,7 +13279,7 @@ def main_menu():
     setup_selfupd_cron()                         # 老装机补上脚本每日自动更新（默认开，菜单 18 关）
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                 # 老装机那条是按 6 月写死的，换成冬夏两季都对的写法
-    _heal_other_crons()                          # cn-block 03:00 / 网络优化 nginx 月度：换成冬夏两季都对的写法
+    _heal_other_crons()                          # cn-block 02:55 / 网络优化 nginx 月度：换成冬夏两季都对的写法
     netprofile_sync()                            # 节点画像：网络优化的保留端口跟节点对上（老装机、错过的变动在这补）
     while True:
         print("\n" + "=" * 60)

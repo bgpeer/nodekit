@@ -188,6 +188,8 @@
 - 1 代理主体 / 2 网络优化 / 3 自建DNS / 4 自建Emby 各卸各的，都交给那个模块自己的卸载（`_run_module` 拉最新脚本跑它的
   `uninstall` / `remove` / `--reset`）；5 全部卸载要打 `yes`，模块各自的确认用 `--yes` 免掉（adguard-dns `remove --yes`、
   media-stack `uninstall --yes` 连数据目录删、net-optimize `--xanmod-remove --yes` 换回系统内核），全卸完统一问一次重启。
+- 5 全部卸载里哪个模块没卸掉（脚本拉不到、镜像缓存是不认 `--yes` 的旧版、它自己报错）：`_uninstall_everything` 返回
+  `(要不要重启, 没卸掉的)`，有没卸掉的就留面板（`keep_panel`）、不撤它的证书、不卸 acme.sh、不报「完毕」、回到这一屏（11/10）。
 - 卸代理主体时别的模块还在：`bgpeer` 和 `/etc/bgpeer` 留着，只删 `_NODE_OWNED` 里节点自己的文件（第四节：入口不能依附在会消失的东西上）。
   自建DNS 老装法（AdGuardHome.yaml 证书指着 /etc/ssl/sb）证书一删就起不来，先走它自己的卸载；新装法（/etc/ssl/agh）不碰。
 - acme.sh：卸节点时撤 /etc/ssl/sb 那条；全部卸载撤本脚本签的全部（/etc/ssl/sb、/etc/ssl/agh、Emby 的 *.底座 → /etc/nginx/certs/底座.crt），
@@ -229,6 +231,18 @@
   3. 服务端 httpupgrade / xhttp 写了 host 就校验 Host，节点专用域名被拒「bad host」→ 服务端不写 host，老配置开的时候去掉。
   名字只在证书里，Cloudflare 里**不要**给它建记录（仓库主人建过一条那种随机段的泛解析，让他删了）。客户端查 IP 走 DNS 机的 DoH（TCP）：
   DMIT IPv4 TCP 被封，只有有 IPv6 的网络查得到——DNS 机最好放 IPv4 好的机器。
+
+## 写测试 / 改更新路径时记着（11/10 全仓检查）
+
+- **脚本换自己的四条路都是「先 compile、版本不比本机旧才换」**：02:50 `_auto_self_update`、`bgpeer` 命令（`BGPEER_WRAPPER`）、
+  模块脚本 `ensure_remote_script`、菜单 18 → 1 `update_script`（最后这条 11/10 才补上）。`fetch_url` 会退到 jsDelivr（缓存最长
+  12 小时）和公共反代，拿到旧版 / 半截 / 报错页都有可能；再加更新入口照这个规矩。
+- **`claude/` 里的占位写法有测试把关**（`test_claude_folder.py`）：IP 只能是首段一位数的（`1.2.3.4`）或 127.0.0.1，
+  网址的主机名要以 `.example` 结尾（`https://wl.example/…`），RFC 5737 那几个网段、`example.com` 都会被当成泄漏拦下。
+- **容器里的 Python 是 3.13**：`ssl.create_default_context` 默认严格验证书，自签测试 CA 要带 keyUsage、签出的证书要带
+  authorityKeyIdentifier（`_fakedoh.py` 已补），不然 `test_privdns*.py` 报 CA cert does not include key usage extension。
+  脚本本身要能在 3.8 上跑：`ruff check --target-version py38 --select F` 能查出新语法（f 串里复用外层引号、match 这些）。
+- cn-block：菜单 1 关掉 = `remove_cn_block(keep_cfg=True)`，状态文件留着（enabled=false）；菜单 6 / 命令行 `remove` 才删状态。
 
 ## 仓库主人的偏好
 
