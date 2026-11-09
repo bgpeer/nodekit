@@ -183,6 +183,16 @@
   节点证书不碰。订阅里写着它就叫主脚本 `selfdns-refresh`（老主脚本不认就不叫）。10/31 拿真 AdGuard v0.107.79 跑过改写后的 yaml：DoT 起来、SNI `ID.新域名` 给的是新证书。
 - **Emby** `16 → 7 设置 → 12 域名证书`（media-stack `emby_domain_menu`）：见上面 media-stack 地图。IP:端口 装的不在这里改（要重建容器）。
 
+## 卸载（菜单 20，11/09 起）
+
+- 1 代理主体 / 2 网络优化 / 3 自建DNS / 4 自建Emby 各卸各的，都交给那个模块自己的卸载（`_run_module` 拉最新脚本跑它的
+  `uninstall` / `remove` / `--reset`）；5 全部卸载要打 `yes`，模块各自的确认用 `--yes` 免掉（adguard-dns `remove --yes`、
+  media-stack `uninstall --yes` 连数据目录删、net-optimize `--xanmod-remove --yes` 换回系统内核），全卸完统一问一次重启。
+- 卸代理主体时别的模块还在：`bgpeer` 和 `/etc/bgpeer` 留着，只删 `_NODE_OWNED` 里节点自己的文件（第四节：入口不能依附在会消失的东西上）。
+  自建DNS 老装法（AdGuardHome.yaml 证书指着 /etc/ssl/sb）证书一删就起不来，先走它自己的卸载；新装法（/etc/ssl/agh）不碰。
+- acme.sh：卸节点时撤 /etc/ssl/sb 那条；全部卸载撤本脚本签的全部（/etc/ssl/sb、/etc/ssl/agh、Emby 的 *.底座 → /etc/nginx/certs/底座.crt），
+  一条不剩就连 acme.sh 一起卸；还有别人的记录就留着它，CF 令牌没人靠它续期才清（`_acme_cleanup`）。
+
 ## 客户端的坑（真机踩过）
 - **sing-box 客户端连不上被藏的节点（10/30 已解决）**：SFA（核心 1.15.0-alpha.13，自定义模板）出站上的简写
   `"domain_resolver": "privdns"` 不认，照样拿 route.default_domain_resolver（阿里）解析，私有名查不到；

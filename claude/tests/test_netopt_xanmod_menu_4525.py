@@ -14,7 +14,7 @@ bad = 0
 def check(l, ok):
     global bad; bad += not ok; print(("  ✔ " if ok else "  ✖ ") + l)
 
-check(f"版本 4.5.25（{n.VERSION}）", n.VERSION == "4.5.25")
+check(f"版本 4.5.25 起（{n.VERSION}）", tuple(map(int, n.VERSION.split("."))) >= (4, 5, 25))
 XK, SK = "6.18.55-x64v3-xanmod1", "6.8.0-88-generic"
 BOOT = [XK, SK]
 CMDS, ANS = [], []

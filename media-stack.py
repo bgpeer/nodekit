@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.395"
+SCRIPT_VERSION = "1.5.396"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13880,20 +13880,23 @@ def do_update(from_menu=False, auto=False):
     return _imgs_ok
 
 
-def do_uninstall():
+def do_uninstall(assume_yes=False):
+    """卸载媒体栈。assume_yes：节点面板 20 → 5「全部卸载」调（那边已经输过 yes、红字写明一切回到初始状态），
+       不再问、安装目录（配置和 strm）一起删。"""
     require_root()
     install_dir = ms_install_dir()
-    if not is_installed(install_dir):
+    if not is_installed(install_dir) and not assume_yes:
         install_dir = ask("安装目录", install_dir)
     compose = os.path.join(install_dir, "docker-compose.yml")
-    print()
-    warn("将要删除：媒体栈的容器（在这里装的小雅连它一起）、nginx 站点配置、media-stack/emby 命令。")
-    warn("节点(bgpeer)的任何文件都不会被碰。")
-    print(f"  {DIM}输入 {RST}{RED}{BOLD}yes{RST}{DIM} 确认；回车 / n / 其它任何输入都是取消。{RST}")
-    # 卸载是不可逆操作，故意不接受 y —— 必须完整打出 yes，避免手滑
-    if ask("确认卸载？").strip().lower() != "yes":
-        print("已取消，什么都没动。")
-        return
+    if not assume_yes:
+        print()
+        warn("将要删除：媒体栈的容器（在这里装的小雅连它一起）、nginx 站点配置、media-stack/emby 命令。")
+        warn("节点(bgpeer)的任何文件都不会被碰。")
+        print(f"  {DIM}输入 {RST}{RED}{BOLD}yes{RST}{DIM} 确认；回车 / n / 其它任何输入都是取消。{RST}")
+        # 卸载是不可逆操作，故意不接受 y —— 必须完整打出 yes，避免手滑
+        if ask("确认卸载？").strip().lower() != "yes":
+            print("已取消，什么都没动。")
+            return
 
     if os.path.exists(compose):
         sh(f"docker compose -f {compose} down", timeout=300)
@@ -13930,7 +13933,16 @@ def do_uninstall():
     bcast_remove()                  # 账本数商家广播的那张表（只数不拦）
     ok("已移除密码文件和管理命令")
 
-    if ask_yn(f"删除 {install_dir}（配置和 strm 全部丢失，不可逆）？", False):
+    if assume_yes:
+        # 不问了就得自己把关：只删真是媒体栈装的那个目录（里面有它的 docker-compose.yml），系统目录一律不碰
+        d = os.path.abspath(install_dir)
+        if os.path.exists(os.path.join(d, "docker-compose.yml")) and d.count("/") >= 2 \
+                and d not in ("/opt", "/root", "/home", "/srv", "/mnt", "/data", "/usr/local", "/var/lib"):
+            shutil.rmtree(d, ignore_errors=True)
+            ok(f"已删除 {d}")
+        else:
+            warn(f"{d} 不像媒体栈自己的目录，没删")
+    elif ask_yn(f"删除 {install_dir}（配置和 strm 全部丢失，不可逆）？", False):
         if ask("再次确认：输入 DELETE 删除") == "DELETE":
             shutil.rmtree(install_dir, ignore_errors=True)
             ok(f"已删除 {install_dir}")
@@ -29388,7 +29400,7 @@ if __name__ == "__main__":
     try:
         arg = sys.argv[1] if len(sys.argv) > 1 else ""
         if arg in ("uninstall", "remove"):
-            do_uninstall()
+            do_uninstall(assume_yes="--yes" in sys.argv[2:])   # --yes：节点面板「全部卸载」调，那边已经输过 yes
         elif arg == "info":
             show_info()
         elif arg in ("check", "doctor", "healthcheck"):
