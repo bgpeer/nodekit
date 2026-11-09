@@ -971,6 +971,9 @@ def show_hops(ip):
        2. 在【你国内的电脑上】跑，量的就是「国内 → 那台机器」的去程走哪条骨干。
           这是不登录目标机时唯一能自己量到的东西，而且 CN2 GIA 是双向的，
           去程见到 59.43 就是很强的证据。用法见 README。"""
+    # 这个参数原样拼进 traceroute 命令：只收 IP / 普通主机名的字符，别的（; $ ` 空格、- 开头…）一律不认
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", ip or "") or ip.startswith("-"):
+        print(f"{C['r']}不是合法的 IP / 主机名：{ip}{C['n']}"); return 1
     if not ensure_traceroute():
         print(f"{C['r']}没有 traceroute/mtr 且装不上{C['n']}"); return 1
     print(f"\n{C['b']}逐跳 → {ip}{C['n']}")
