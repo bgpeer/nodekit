@@ -255,10 +255,12 @@
 - **media-stack 生成的配置可以拿真工具验**（11/10 全仓检查用过，没查出毛病）：`gen_nginx_site(cfg)` 包一层 `http {}` 跑 `nginx -t`
   （容器里 `apt-get install -y nginx` 装得上，是 1.24，不认 `http2 on;`，`http2_directive=False` 那套能过）；`gen_compose(cfg)` 跑
   `docker compose -f … config -q`（要给 DATA_ROOT / PUID / PGID / TZ 四个环境变量）。cfg 要哪些键看 `test_ms_secret_perms.py` 第四节。
-- **`save_ms_state` 是「读 → 改 → 写」没加锁**（11/10 查到，没改）：开播门、常驻补时长、每分钟那轮、菜单都写同一个 media-stack.json，
-  两个进程撞上时后写的会把先写的那一项盖回旧值（窗口就是一次 fsync，几十毫秒）。带时间戳的忙标记、计数这些会自己恢复；最坏是
-  菜单里刚改的开关被悄悄改回去（有人在播时千分之几的概率）。要修就是给这一段加文件锁——它在开播门的路上，按第六节得单独上、
-  仓库主人实测退出后进度刷新，所以先报给他、等他点头。
+- **`save_ms_state` 的读和写包在一把 flock 里**（11/10，1.5.398，仓库主人：「该怎么修改就怎么修改吧」）：开播门、常驻补时长、每分钟那轮、
+  菜单都写同一个 media-stack.json，以前没锁，后写的会把先写的那一项盖回旧值（容器里 6 个进程各写 150 项，900 项只剩 156）。
+  它在开播门的路上：等锁最多 `MS_STATE_LOCK_WAIT`（2 秒），等不到照老办法直接写，绝不卡人；锁文件在 `/run/lock`。
+  `write_atomic` 的临时文件名带了线程号（多线程同时写不会把半截文件顶上去）。**这条单独上的，等仓库主人实测「退出后进度刷新」；
+  他说不对就先退这个 PR。** 没解决的：调用方自己「读一项 → 改 → 存回去」的（`heal_gate_busy`、`heal_fail` 这类）两个进程同改
+  同一项还是会丢一边，那些本来就带时间戳、会自己恢复，没动。
 - cn-block：菜单 1 关掉 = `remove_cn_block(keep_cfg=True)`，状态文件留着（enabled=false）；菜单 6 / 命令行 `remove` 才删状态。
 
 ## 仓库主人的偏好
