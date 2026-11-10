@@ -262,6 +262,7 @@ CDN_PREF_DEFAULTS = {
     "min_mbps":   0.0,   # 候选速度低于它就不采纳；0=不设限
     "port":       0,     # 测试端口；0=沿用第一条 CDN 节点的 CF 端口
     "n_cand_out": 5,     # 最终写进订阅的候选节点数（交给客户端 URLTest 选）
+    "lat_only":   False, # 只测延时、不测下载（见 cdn_speedtest）：不耗流量，按延时最低的选
 }
 
 NODE_FILE = "/root/xy-nodes.txt"                 # 本机节点分享链接（订阅由它生成）
@@ -10702,7 +10703,8 @@ def cdn_add():
     # 以后想换就进菜单 2「优选地址」。
     cfg = _pref_load()
     ui_line()
-    ui_tip(f"筛一批更快的 CF 边缘，客户端自动挑最快的（约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量、一两分钟）")
+    ui_tip("筛一批延时低的 CF 边缘，客户端自动挑最快的（只测延时、不耗流量，一分钟左右）" if cfg.get("lat_only") else
+           f"筛一批更快的 CF 边缘，客户端自动挑最快的（约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量、一两分钟）")
     if (_ask("现在筛？（回车 = 筛 / n = 跳过）: ").strip().lower() or "y") in ("n", "no"):
         print("  已跳过，想筛随时进菜单 2「优选地址」")
         return
@@ -10972,6 +10974,24 @@ def cdn_speedtest(cfg=None, quiet=False, exclude=(), extra=None):
     if not ranked:
         say(f"  ✗ 候选 IP 没有一个连得上 {port} 端口——检查本机出网是否被限，或到「测速参数」换个端口。")
         return []
+    if cfg.get("lat_only"):
+        # 【只测延时、不测下载】（仓库主人 11/11：「那就加一个只测延时不测下载的开关吧」）下载测速一轮要走 n_top × dl_mb
+        # 的流量（默认 60 MB），流量包小的机器舍不得常测。开了就不下载：握手延时最低的那一批再各测 3 次取中间值
+        #（一次握手抖动大，拿单次排名次不稳），按延时从低到高选。结果里 mbps 是 None。
+        n_out = max(1, int(cfg.get("n_cand_out", 5)))
+        again = ranked[:max(n_out * 3, 15)]
+        say(f"  · 通了 {len(ranked)} 个；只测延时：最低的 {len(again)} 个再各测 3 次取中间值（不下载、不耗流量）...")
+        res = []
+        for ip, ms0 in again:
+            got = sorted(m for m in (_tcp_rtt(ip, port, float(cfg["timeout"])) for _ in range(3)) if m is not None)
+            if len(got) >= 2:                             # 3 次里通不了 2 次的不要
+                res.append({"ip": ip, "ms": round(got[len(got) // 2], 1), "mbps": None})
+        res.sort(key=lambda r: r["ms"])
+        if extra is not None:
+            extra["ranked"] = [ip for ip, _ms in ranked[len(again):len(again) + 10]]
+        if not res:
+            say("  ✗ 复测都不稳，本轮不动现状。")
+        return res
     top = ranked[:max(1, int(cfg["n_top"]))]
     if extra is not None:
         extra["ranked"] = [ip for ip, _ms in ranked[len(top):len(top) + 10]]
@@ -11083,9 +11103,13 @@ def cdn_pref_scan(ask=True):
     # 粗筛出最多 n_out 个 CF 边缘，各写一条节点进订阅；它们共用同一个服务端入站、不新建服务，
     # 最终由客户端 URLTest 挑最快的那条。
     ui_title(f"测速筛候选（最多 {n_out} 条 [{base.get('proto')}]）")
-    if ask:
+    lat_only = bool(cfg.get("lat_only"))
+    if ask and lat_only:
+        ui_tip("只测延时，不下载、不耗流量（优选菜单 6 可改回测下载）")
+    elif ask:
         ui_tip(f"下载测速最多耗约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量")
-    if ask and (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
+    # 确认是因为要走流量；只测延时不走流量，不用再问一遍
+    if ask and not lat_only and (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
         return
     extra = {}
     res = cdn_speedtest(cfg, extra=extra)
@@ -11102,13 +11126,13 @@ def cdn_pref_scan(ask=True):
     # 后备：测通了没选上的 + 延迟排得上没轮到下载的。「更换优选 IP」先拿它们补，不用再测一轮
     cfg["spare"] = [r["ip"] for r in res[n_out:]] + [ip for ip in extra.get("ranked", []) if ip not in picked]
     cfg["last"] = {"time": stamp, "ok": True, "n": len(picked),
-                   "best": res[0]["ip"], "mbps": res[0]["mbps"]}
+                   "best": res[0]["ip"], "mbps": res[0]["mbps"], "ms": res[0]["ms"]}
     _pref_save(cfg)
     ok = _cdn_resync(old, was)
     ui_title(f"选出 {len(picked)} 条优选节点")
     for i, r in enumerate(res[:n_out], 1):
         print(f"  {_hl('1;36', f'{_cdn_tag_prefix(base)}CDN·优选{i}')}  {r['ip']:<16}"
-              f"本机测 {r['ms']}ms / {r['mbps']} Mbps")
+              f"本机测 {r['ms']}ms" + ("" if r["mbps"] is None else f" / {r['mbps']} Mbps"))
     ui_line()
     # 本机测的是 VPS→CF 这一段，只作粗筛；哪条对你的网络最快，只有客户端的 URLTest 说了算
     if was and ok:
@@ -11155,7 +11179,8 @@ def cdn_cand_swap():
     bad = [ip for ip in (cfg.get("bad") or []) if ip]
     spare = [ip for ip in (cfg.get("spare") or []) if ip not in cands and ip not in bad]
     if len(spare) < len(idxs):
-        ui_tip(f"上次测速剩的后备不够，要再测一轮（最多约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量）")
+        ui_tip("上次测速剩的后备不够，要再测一轮（只测延时，不耗流量）" if cfg.get("lat_only") else
+               f"上次测速剩的后备不够，要再测一轮（最多约 {float(cfg['n_top']) * float(cfg['dl_mb']):.0f} MB 流量）")
         if (_ask("  继续? y 确认 / 回车返回: ") or "n").lower() not in ("y", "yes"):
             return
         extra = {}
@@ -11283,7 +11308,8 @@ def cdn_pref_menu():
         last = cfg.get("last") or {}
         if last.get("ok"):
             ui_kv("上次测速", f"{last.get('time','')}  选出 {last.get('n','?')} 个，"
-                              f"最快 {last.get('best','')} / {last.get('mbps','?')} Mbps")
+                  + (f"延时最低 {last.get('best','')} / {last.get('ms','?')} ms" if last.get("mbps") is None and "ms" in last
+                     else f"最快 {last.get('best','')} / {last.get('mbps','?')} Mbps"))
         elif last:
             ui_kv("上次测速", f"{last.get('time','')}  没选出可用地址（已保持原样）")
         ui_line()
@@ -11292,9 +11318,15 @@ def cdn_pref_menu():
                   (3, "清空候选节点", None),
                   (4, "测速参数", None),
                   (5, "更换优选 IP（换掉不通的候选）", None),
+                  (6, "只测延时（不测下载、不耗流量）", _hl("1;32", "开") if cfg.get("lat_only") else "关"),
                   (0, "返回", None)])
         c = _ask("选择: ").strip()
-        if c == "1":
+        if c == "6":
+            cfg["lat_only"] = not cfg.get("lat_only")
+            _pref_save(cfg)
+            print("  ✔ 只测延时：开（测速不再下载，按延时最低的选）" if cfg["lat_only"]
+                  else "  ✔ 只测延时：关（照旧先筛延时、再测下载速度）")
+        elif c == "1":
             cdn_pref_scan()
         elif c == "2":
             _pref_manual(nodes, cfg)
