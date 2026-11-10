@@ -245,7 +245,8 @@
 - **订阅小服务（`_SUB_SERVER_PY`）的回包是照真 nginx 逐字节对过的**（11/10，仓库主人：「那就做吧」）：不用 `http.server`，
   自己写的请求解析 + 长连接。改它之前先 `apt-get install -y nginx`（容器里装得上）再跑 `test_sub_like_nginx.py`——第八节会起一个
   真 nginx、同一批请求当场对；没装 nginx 那节跳过，只剩写死的期望值。长连接用 Go 客户端测过（mihomo / sing-box 拉订阅用的
-  net/http：连拉、并发 60、服务端断开空闲连接后再拉都正常），小火箭没法在容器里测。nginx 对「报了 ALPN 却没有 http/1.x」
+  net/http：连拉、并发 60、服务端断开空闲连接后再拉都正常），小火箭没法在容器里测。
+  11/10 仓库主人真机（v1.1.216，安卓）：进面板出「订阅服务已更新」后，sing-box 客户端和 Clash 系客户端刷新订阅都正常；小火箭（苹果）还没人测过。nginx 对「报了 ALPN 却没有 http/1.x」
   是回 no_application_protocol 警报（`openssl s_client` 打的「No ALPN negotiated」看不出来，要看原始字节）。
 - cn-block：菜单 1 关掉 = `remove_cn_block(keep_cfg=True)`，状态文件留着（enabled=false）；菜单 6 / 命令行 `remove` 才删状态。
 
