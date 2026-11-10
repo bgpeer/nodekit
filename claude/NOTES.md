@@ -248,6 +248,17 @@
   net/http：连拉、并发 60、服务端断开空闲连接后再拉都正常），小火箭没法在容器里测。
   11/10 仓库主人真机（v1.1.216，安卓）：进面板出「订阅服务已更新」后，sing-box 客户端和 Clash 系客户端刷新订阅都正常；小火箭（苹果）还没人测过。nginx 对「报了 ALPN 却没有 http/1.x」
   是回 no_application_protocol 警报（`openssl s_client` 打的「No ALPN negotiated」看不出来，要看原始字节）。
+- **media-stack 带密码 / Key 的文件一律 `write_atomic(…, 0o600)`**（11/10，1.5.397）：`write_atomic` 默认是 0644，少写一个参数
+  新文件就人人可读——「8 更新」重写 mediawarp / autofilm 的 config.yaml 就这么漏了很久（安装时是 0600）。清单在 `SECRET_FILES`，
+  老装机由 `harden_secret_files` 收（do_update、do_selfupdate 各过一遍）；`test_ms_secret_perms.py` 用 AST 把关：写这几类文件的
+  `write_atomic` 没带 0o600、或者又出现 `open(…, "w")` 直接写的都会红。再加带密码的文件记得进清单。
+- **media-stack 生成的配置可以拿真工具验**（11/10 全仓检查用过，没查出毛病）：`gen_nginx_site(cfg)` 包一层 `http {}` 跑 `nginx -t`
+  （容器里 `apt-get install -y nginx` 装得上，是 1.24，不认 `http2 on;`，`http2_directive=False` 那套能过）；`gen_compose(cfg)` 跑
+  `docker compose -f … config -q`（要给 DATA_ROOT / PUID / PGID / TZ 四个环境变量）。cfg 要哪些键看 `test_ms_secret_perms.py` 第四节。
+- **`save_ms_state` 是「读 → 改 → 写」没加锁**（11/10 查到，没改）：开播门、常驻补时长、每分钟那轮、菜单都写同一个 media-stack.json，
+  两个进程撞上时后写的会把先写的那一项盖回旧值（窗口就是一次 fsync，几十毫秒）。带时间戳的忙标记、计数这些会自己恢复；最坏是
+  菜单里刚改的开关被悄悄改回去（有人在播时千分之几的概率）。要修就是给这一段加文件锁——它在开播门的路上，按第六节得单独上、
+  仓库主人实测退出后进度刷新，所以先报给他、等他点头。
 - cn-block：菜单 1 关掉 = `remove_cn_block(keep_cfg=True)`，状态文件留着（enabled=false）；菜单 6 / 命令行 `remove` 才删状态。
 
 ## 仓库主人的偏好
