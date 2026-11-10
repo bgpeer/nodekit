@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.397"
+SCRIPT_VERSION = "1.5.398"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -355,20 +355,65 @@ def ms_state():
         return {}
 
 
+MS_STATE_LOCK_WAIT = 2.0        # 等锁最多这么久；等不到就照老办法直接写（宁可偶尔撞一次，也不能把谁卡住）
+
+
+def _ms_state_lock():
+    """抢 media-stack.json「读 → 改 → 写」的那把锁 → 拿着锁的文件句柄（关掉就放）；拿不到 / 建不了返回 None。
+
+    【为什么要锁】（11/10 全仓检查查出来的）开播门、常驻补时长、每分钟那一轮、保活、菜单是好几个进程，都往同一个
+    media-stack.json 里写，而且都是「整份读出来 → 改自己那几项 → 整份写回去」。两个进程撞上时，后写的那个手里是
+    旧的一份，会把先写的那一项盖回旧值：计数、忙标记这些过一会儿自己恢复，最坏是菜单里刚改的开关被悄悄改回去。
+    窗口就是一次写盘（write_atomic 里有 fsync，几十毫秒），有人在播时每分钟要写好多次。
+    【绝不能卡住人】这个函数在开播门的路上（note_play、忙标记）。锁只包住读文件 + 写盘那几十毫秒；等锁最多
+    MS_STATE_LOCK_WAIT 秒，等不到（拿锁的进程卡在磁盘上）就返回 None、照老办法直接写。
+    用 flock：进程无论怎么死内核都会放锁，不会留下一把没人认领的；同一个进程里几个线程各开各的句柄，一样互斥。
+    锁文件放在任务锁那个目录（CRON_LOCK_DIR），不往 /etc/bgpeer 里添东西。
+    """
+    try:
+        import fcntl
+        try:
+            os.makedirs(CRON_LOCK_DIR, exist_ok=True)
+            fh = open(os.path.join(CRON_LOCK_DIR, "media-stack-state.lock"), "w")
+        except OSError:
+            fh = open("/tmp/media-stack-state.lock", "w")
+    except (ImportError, OSError):
+        return None
+    t_end = time.monotonic() + MS_STATE_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= t_end:
+                fh.close()
+                return None
+            time.sleep(0.005)
+
+
 def save_ms_state(install_dir=None, **extra):
     """记住装在哪、以及生成的配置里读不回来的选择（比如扫描路径是不是 auto）。
 
     合并写而不是整份覆盖 —— 覆盖会把别的键悄悄抹掉。
+    读和写包在同一把锁里（见 _ms_state_lock）：不然别的进程在这中间写进去的项，会被这里手上那份旧的盖掉。
     """
-    cur = ms_state()
-    if install_dir:
-        cur["install_dir"] = install_dir
-    cur.update(extra)
+    lk = _ms_state_lock()
     try:
-        os.makedirs(BGP_DIR, exist_ok=True)
-        write_atomic(MS_STATE, json.dumps(cur, ensure_ascii=False, indent=2) + "\n")
-    except OSError:
-        pass
+        cur = ms_state()
+        if install_dir:
+            cur["install_dir"] = install_dir
+        cur.update(extra)
+        try:
+            os.makedirs(BGP_DIR, exist_ok=True)
+            write_atomic(MS_STATE, json.dumps(cur, ensure_ascii=False, indent=2) + "\n")
+        except OSError:
+            pass
+    finally:
+        if lk is not None:
+            try:
+                lk.close()              # 关掉句柄，flock 就放了
+            except OSError:
+                pass
 
 
 # 【按盘开关，默认全关】上一版把 UA 改写写在 location / 里，所有盘一起吃 —— 探测
@@ -512,7 +557,9 @@ def write_atomic(path, text, mode=0o644):
     mode 在【打开的时候】就定死：.secrets 里是密码和 API Key，不能先落地成 0644 再 chmod，
     那个时间窗里谁都读得到。
     """
-    tmp = f"{path}.tmp{os.getpid()}"
+    # 临时文件名带上线程号：开播门、换链服务是多线程的，两个线程同时写同一个文件时要是共用一个临时文件，
+    # 一个刚清空重写、另一个就把它改名顶上去了 —— 顶上去的是半截，读的那一方当成「读不出来 = 没有」。
+    tmp = f"{path}.tmp{os.getpid()}.{threading.get_ident()}"
     try:
         with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode),
                        "w", encoding="utf-8") as f:
