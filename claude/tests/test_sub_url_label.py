@@ -66,7 +66,9 @@ try:
     check("新地址带 ?参数 也能拉", get("/TokA_b-1/VPS.conf?flag=1")[0] == 200)
     check("老地址 /<token>.conf 照样能拉", get("/TokA_b-1.conf") == (200, "[General]\n"))
     check("token 错：404", get("/TokX/HK.conf")[0] == 404)
-    check("名字里塞 ../ 也跳不出去", get("/TokA_b-1/..%2f..%2fsr.conf")[0] in (200, 404) and get("/TokA_b-1/../sr.conf")[0] == 404)
+    # 11/10 起回包照 nginx：爬出根目录的回 400（nginx 也是），没爬出去的按规范后的路径找文件、找不到 404
+    r1, r2 = get("/TokA_b-1/..%2f..%2fsr.conf"), get("/TokA_b-1/../sr.conf")
+    check("名字里塞 ../ 也跳不出去", r1[0] == 400 and r2[0] == 404 and "General" not in r1[1] + r2[1])
     check("根目录不列文件", get("/")[1] == "")
 finally:
     p.terminate()

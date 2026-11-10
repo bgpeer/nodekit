@@ -242,6 +242,11 @@
 - **容器里的 Python 是 3.13**：`ssl.create_default_context` 默认严格验证书，自签测试 CA 要带 keyUsage、签出的证书要带
   authorityKeyIdentifier（`_fakedoh.py` 已补），不然 `test_privdns*.py` 报 CA cert does not include key usage extension。
   脚本本身要能在 3.8 上跑：`ruff check --target-version py38 --select F` 能查出新语法（f 串里复用外层引号、match 这些）。
+- **订阅小服务（`_SUB_SERVER_PY`）的回包是照真 nginx 逐字节对过的**（11/10，仓库主人：「那就做吧」）：不用 `http.server`，
+  自己写的请求解析 + 长连接。改它之前先 `apt-get install -y nginx`（容器里装得上）再跑 `test_sub_like_nginx.py`——第八节会起一个
+  真 nginx、同一批请求当场对；没装 nginx 那节跳过，只剩写死的期望值。长连接用 Go 客户端测过（mihomo / sing-box 拉订阅用的
+  net/http：连拉、并发 60、服务端断开空闲连接后再拉都正常），小火箭没法在容器里测。nginx 对「报了 ALPN 却没有 http/1.x」
+  是回 no_application_protocol 警报（`openssl s_client` 打的「No ALPN negotiated」看不出来，要看原始字节）。
 - cn-block：菜单 1 关掉 = `remove_cn_block(keep_cfg=True)`，状态文件留着（enabled=false）；菜单 6 / 命令行 `remove` 才删状态。
 
 ## 仓库主人的偏好

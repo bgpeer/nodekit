@@ -3592,60 +3592,269 @@ def rotate_links_token():
     """换 .links token：旧地址立即失效（防泄露）。聚合了本机的主机需重新复制新地址。"""
     t = load_tokens(); t["links"] = secrets.token_urlsafe(12); save_tokens(t); serve_sub()
 
-# 订阅托管小服务：有 cert/key 参数就起 HTTPS，否则明文 HTTP（用法：port dir [cert key]）
+# 订阅托管小服务：有 cert/key 参数就起 HTTPS，否则明文 HTTP（用法：port dir tokenfile [cert key]）
 # 订阅托管小服务：静态发订阅文件；另带一个 /gh/ GitHub 中转（规则/图标走本机、不依赖外部 CDN / 反代）。
 # 中转和订阅共用同一端口（客户端本就从这端口拉订阅，无需额外放行）。多线程，中转不卡订阅。
 # 安全：中转只白名单 GitHub 几个主机——绝不做成"谁都能拿它转发任意网址"的开放代理。
-_SUB_SERVER_PY = r'''import http.server, ssl, sys, re, socket, urllib.request, urllib.parse
+_SUB_SERVER_PY = r'''import ssl, sys, re, os, stat, time, socket, socketserver, threading, email.utils, urllib.request, urllib.parse
 port = int(sys.argv[1]); directory = sys.argv[2]
 tokenfile = sys.argv[3]
 cert = sys.argv[4] if len(sys.argv) > 4 else ''
 key  = sys.argv[5] if len(sys.argv) > 5 else ''
 ALLOW = ('raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com', 'codeload.github.com',
          'gist.github.com', 'gist.githubusercontent.com')
-class H(http.server.SimpleHTTPRequestHandler):
-    # 别报家门：Python 默认会回 `Server: SimpleHTTP/0.6 Python/3.11.2`，还有一张一眼
-    # 认得出的 http.server 错误页。扫到这个端口的人据此就知道「这是个自建的小服务」，
-    # 配上非常规端口，基本等于挂牌说明这里托管着订阅。报 nginx 混进大多数机器里。
-    server_version = 'nginx'
-    sys_version = ''
-    def version_string(self):
-        # 不能只靠 server_version + sys_version：父类是 `版本 + ' ' + 系统版本` 拼的，
-        # sys_version 置空会留下 `Server: nginx ` 这么个带尾空格的串——真 nginx 不长这样，
-        # 尾空格本身就是个破绽。直接把整串定死。
-        return 'nginx'
-    # 错误页照 nginx 自己的样子（标题「404 Not Found」、短语用标准的，不用 http.server 的 File not found）
-    error_message_format = ('<html>\r\n<head><title>%(code)d %(message)s</title></head>\r\n'
-                            '<body>\r\n<center><h1>%(code)d %(message)s</h1></center>\r\n'
-                            '<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n')
-    def send_error(self, code, message=None, explain=None):
-        super().send_error(code)
-    timeout = 30                     # 读请求超时：卡住的客户端不会永久占着线程
-    def __init__(self, *a, **k):
-        super().__init__(*a, directory=directory, **k)
-    def log_message(self, *a):
+# 【回包照 nginx 的样子】（11/10）这个小服务对外报 Server: nginx —— 别报家门：扫到这个端口的人看见 Python 的
+# `SimpleHTTP/0.6 Python/3.x` 和那张 http.server 错误页，就知道「这是个自建的小服务」，配上非常规端口基本等于挂牌
+# 说明这里托管着订阅。可以前只改了名字，回包还是 http.server 的：状态行 HTTP/1.0（真 nginx 一律 HTTP/1.1）、
+# Content-type 小写 t、没有 Connection / ETag / Accept-Ranges、别的方法回 501、乱发一行不回头部 …… 自称 nginx 却处处
+# 不像，反而更显眼。下面每一种回包都是拿真 nginx（静态站、server_tokens off）同一个请求抓下来逐字节对过的：
+# 头的名字 / 顺序 / 大小写、错误页正文、长连接、断点续传（206 / 416 / 多段）、304、405、400、414、505、
+# 往 HTTPS 口发明文、TLS 的 ALPN。改这里之前先跑 claude/tests/test_sub_like_nginx.py（装了 nginx 会当场再对一遍）。
+REASON = {200: 'OK', 206: 'Partial Content', 304: 'Not Modified', 400: 'Bad Request', 403: 'Forbidden',
+          404: 'Not Found', 405: 'Not Allowed', 413: 'Request Entity Too Large', 414: 'Request-URI Too Large',
+          416: 'Requested Range Not Satisfiable', 500: 'Internal Server Error', 502: 'Bad Gateway',
+          505: 'HTTP Version Not Supported'}
+TYPES = {'html': 'text/html', 'htm': 'text/html', 'txt': 'text/plain', 'json': 'application/json'}   # 同 nginx 的 mime.types
+CLOSES = (400, 413, 414, 500, 505)       # 这几种 nginx 回完就断，别的照请求说的保持 / 关闭
+KEEPALIVE = 65                           # 长连接空着多久断（nginx.conf 默认 keepalive_timeout 65）
+MAX_KEEP = 256                           # 连着的超过这个数就不再留长连接：每条连接占一个线程，别让扫描的把小机器拖住
+_live = [0]; _lock = threading.Lock(); _bseq = [0]
+def page(code, title='', note=''):
+    t = '%d %s' % (code, REASON[code])
+    return ('<html>\r\n<head><title>%s</title></head>\r\n<body>\r\n<center><h1>%s</h1></center>\r\n%s'
+            '<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n'
+            % (title or t, t, '<center>%s</center>\r\n' % note if note else '')).encode()
+def head(code, lines):
+    return ('HTTP/1.1 %d %s\r\nServer: nginx\r\nDate: %s\r\n%s\r\n'
+            % (code, REASON[code], email.utils.formatdate(usegmt=True), ''.join(l + '\r\n' for l in lines))).encode()
+PLAIN_ON_TLS = page(400, '400 The plain HTTP request was sent to HTTPS port', 'The plain HTTP request was sent to HTTPS port')
+class Bad(Exception):
+    pass
+def norm_path(raw):
+    """请求里的路径 → 规范路径（解 %xx、并掉重复的 /、消掉 . 和 ..）；不合法的抛 Bad（nginx 回 400）。"""
+    if re.match(r'(?i)^https?://', raw):                 # 绝对地址：只留路径
+        raw = '/' + raw.split('://', 1)[1].partition('/')[2]
+    if not raw.startswith('/'):
+        raise Bad()
+    raw = re.split(r'[?#]', raw, maxsplit=1)[0]
+    if re.search(r'%(?![0-9A-Fa-f]{2})', raw):
+        raise Bad()
+    p = urllib.parse.unquote_to_bytes(raw).decode('utf-8', 'surrogateescape')
+    if '\0' in p:
+        raise Bad()
+    out = []
+    for seg in p.split('/')[1:]:
+        if seg == '..':
+            if not out:
+                raise Bad()                              # 爬出根目录
+            out.pop()
+        elif seg not in ('', '.'):
+            out.append(seg)
+    return '/' + '/'.join(out) + ('/' if out and p.endswith(('/', '/.', '/..')) else '')
+def parse_ranges(spec, size):
+    """Range: bytes=… → [(起, 止)]；None = 不理会（照常 200）；[] = 一段都够不着（416）。口径同 nginx。"""
+    out = []
+    for part in spec.split(','):
+        m = re.match(r'^\s*(\d*)\s*-\s*(\d*)\s*$', part)
+        if not m or (m.group(1) == '' and m.group(2) == ''):
+            return []
+        a, b = m.groups()
+        if a == '':                                      # -n：最后 n 个字节
+            n = int(b); a, b = max(size - n, 0), size - 1
+            if n == 0:
+                continue
+        else:
+            a = int(a); b = min(int(b), size - 1) if b != '' else size - 1
+            if b < a and m.group(2) != '':
+                return []
+        if a < size:
+            out.append((a, b))
+    if sum(b - a + 1 for a, b in out) > size:            # 几段加起来比整个文件还大：当没写
+        return None
+    return out
+def hello_alpn(sock):
+    """偷看一眼 TLS 的 ClientHello（不取走），把客户端报的 ALPN 列出来；没带这一项 / 看不明白返回 None。"""
+    buf = b''
+    for _ in range(100):                                 # 一个包没到齐就等一等，最多 2 秒
+        buf = sock.recv(16389, socket.MSG_PEEK)
+        if len(buf) < 5 or len(buf) >= 5 + int.from_bytes(buf[3:5], 'big'):
+            break
+        time.sleep(0.02)
+    try:
+        if buf[0] != 0x16 or buf[5] != 0x01:
+            return None
+        end = min(len(buf), 9 + int.from_bytes(buf[6:9], 'big'))
+        i = 9 + 2 + 32                                   # 握手头后面：版本 2 + 随机数 32
+        i += 1 + buf[i]                                  # session id
+        i += 2 + int.from_bytes(buf[i:i + 2], 'big')     # 加密套件
+        i += 1 + buf[i]                                  # 压缩方式
+        ext_end = min(end, i + 2 + int.from_bytes(buf[i:i + 2], 'big')); i += 2
+        while i + 4 <= ext_end:
+            typ, ln = int.from_bytes(buf[i:i + 2], 'big'), int.from_bytes(buf[i + 2:i + 4], 'big')
+            if typ == 16:
+                if i + 4 + ln > ext_end:
+                    return None
+                out, j, stop = [], i + 6, i + 4 + ln
+                while j < stop:
+                    out.append(bytes(buf[j + 1:j + 1 + buf[j]])); j += 1 + buf[j]
+                return out
+            i += 4 + ln
+    except Exception:
         pass
-    def do_GET(self):
-        i = self.path.find('/gh/')       # 路径形如 /<token>/gh/<github-url>
-        if i >= 0:
-            self._relay(self.path[1:i], self.path[i + 4:]); return
+    return None
+ALPN_OK = (b'http/1.1', b'http/1.0', b'http/0.9')         # 没开 h2 的 nginx 认这三个
+class H(socketserver.StreamRequestHandler):
+    timeout = KEEPALIVE              # 读请求超时：卡住 / 空着的连接不会永久占着线程
+    disable_nagle_algorithm = True
+    def handle(self):
+        with _lock:
+            _live[0] += 1
+        try:
+            while self.one():
+                pass
+        except Exception:            # 对面断了 / 超时：安静收场
+            pass
+        finally:
+            with _lock:
+                _live[0] -= 1
+    def send(self, code, lines=(), body=b'', keep=False, v09=False, head_only=False):
+        if v09:                      # HTTP/0.9：没有头，只有正文
+            self.wfile.write(body)
+            return False
+        keep = keep and code not in CLOSES
+        lines = list(lines)
+        at = next((i for i, l in enumerate(lines) if l.startswith(('ETag:', 'Content-Range:', 'Cache-Control:'))), len(lines))
+        lines.insert(at, 'Connection: ' + ('keep-alive' if keep else 'close'))    # nginx 把它排在 Last-Modified 后、ETag 前
+        self.wfile.write(head(code, lines) + (b'' if head_only else body))
+        return keep
+    def err(self, code, keep=False, v09=False, head_only=False, extra=(), body=None):
+        body = page(code) if body is None else body
+        return self.send(code, ['Content-Type: text/html', 'Content-Length: %d' % len(body)] + list(extra),
+                         body, keep, v09, head_only)
+    def one(self):
+        """读一个请求、回一个包；返回这条连接还留不留。"""
+        line = self.rfile.readline(8194)
+        while line in (b'\r\n', b'\n'):                  # 请求前面的空行不算
+            line = self.rfile.readline(8194)
+        if not line:
+            return False
+        if not line.endswith(b'\n'):                     # 请求行超过 8k
+            return self.err(414)
+        m = re.match(rb'^([A-Z_]+) ([^ \r\n]+)(?: HTTP/(\d+)\.(\d+))?\r?\n$', line)
+        if not m:
+            return self.err(400)
+        method, target = m.group(1).decode(), m.group(2).decode('utf-8', 'surrogateescape')
+        v09 = m.group(3) is None
+        ver = (0, 9) if v09 else (int(m.group(3)), int(m.group(4)))
+        if not v09 and ver[0] != 1:
+            return self.err(505 if ver[0] > 1 else 400)
+        hdr, total = {}, 0
+        while not v09:
+            h = self.rfile.readline(8194)
+            total += len(h)
+            if not h.endswith(b'\n') or total > 32768:   # 一行超过 8k / 整个头超过四个 8k 缓冲
+                return self.err(400, body=page(400, '400 Request Header Or Cookie Too Large',
+                                               'Request Header Or Cookie Too Large'))
+            if h in (b'\r\n', b'\n'):
+                break
+            k, sep, val = h.decode('latin-1').partition(':')
+            if sep:
+                hdr[k.strip().lower()] = val.strip()
+        if v09 and method != 'GET':
+            return self.err(400)
+        if ver >= (1, 1) and 'host' not in hdr:
+            return self.err(400)
+        conn = hdr.get('connection', '').lower()
+        keep = ('close' not in conn) if ver >= (1, 1) else ('keep-alive' in conn)
+        keep = keep and not v09 and _live[0] <= MAX_KEEP
+        if 'transfer-encoding' in hdr:                   # 带分块正文的：回完就断，不去解它
+            keep = False
+        elif hdr.get('content-length', '0') != '0':      # 带正文的：读掉丢弃，不然留在连接里会被当成下一个请求
+            try:
+                n = int(hdr['content-length'])
+            except ValueError:
+                return self.err(400)
+            if n < 0:
+                return self.err(400)
+            if n > 1048576:
+                return self.err(413)
+            while n > 0:
+                got = self.rfile.read(min(n, 65536))
+                if not got:
+                    return False
+                n -= len(got)
+        head_only = method == 'HEAD'
+        try:
+            path = norm_path(target)
+        except Bad:
+            return self.err(400, v09=v09)
+        if method not in ('GET', 'HEAD', 'POST'):
+            return self.err(405, keep, v09)
+        i = target.find('/gh/')                          # 路径形如 /<token>/gh/<github-url>
+        if i >= 0 and method == 'GET' and self.relay_ok(target[1:i]):
+            return self.relay(target[i + 4:], keep, v09)
         # /<token>/<名字>.<ext> → /<token>.<ext>：名字只给客户端当订阅名显示，不参与鉴权；老地址照旧
-        m = re.match(r'^/([A-Za-z0-9_-]+)/[^/?#]+\.(yaml|json|conf|txt)(?=$|[?#])', self.path)
+        m = re.match(r'^/([A-Za-z0-9_-]+)/[^/]+\.(yaml|json|conf|txt)$', path)
         if m:
-            self.path = '/%s.%s' % (m.group(1), m.group(2))
-        super().do_GET()
-    def _relay(self, tok, target):
+            path = '/%s.%s' % (m.group(1), m.group(2))
+        if path == '/':
+            path = '/index.html'                         # 空的 index.html：不列目录（文件名就是 token）
+        name = path[1:]
+        try:
+            if '/' in name or name.startswith('.'):
+                raise OSError()
+            st = os.stat(os.path.join(directory, name))
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError()
+            with open(os.path.join(directory, name), 'rb') as f:
+                data = f.read()
+        except OSError:
+            return self.err(403 if path == '/index.html' else 404, keep, v09, head_only)
+        if method == 'POST':
+            return self.err(405, keep, v09)
+        size, mt = len(data), int(st.st_mtime)
+        lm = 'Last-Modified: ' + email.utils.formatdate(mt, usegmt=True)
+        etag = '"%x-%x"' % (mt, size)
+        ctype = TYPES.get(name.rsplit('.', 1)[-1].lower() if '.' in name else '', 'application/octet-stream')
+        ims, inm = hdr.get('if-modified-since'), hdr.get('if-none-match')
+        if ims is not None or inm is not None:           # 没改过：304（两个都带时两个都要对上）
+            try:
+                same = ims is None or int(email.utils.parsedate_to_datetime(ims).timestamp()) == mt
+            except Exception:
+                same = False
+            tags = [t.strip()[2:] if t.strip().startswith('W/') else t.strip() for t in (inm or '').split(',')]
+            if same and (inm is None or '*' in tags or etag in tags):
+                return self.send(304, [lm, 'ETag: ' + etag], b'', keep, v09)
+        rng = hdr.get('range', '')
+        rs = parse_ranges(rng[6:], size) if rng[:6].lower() == 'bytes=' else None
+        if rs == []:
+            return self.err(416, keep, v09, head_only, extra=['Content-Range: bytes */%d' % size])
+        if rs and len(rs) == 1:
+            a, b = rs[0]
+            return self.send(206, ['Content-Type: ' + ctype, 'Content-Length: %d' % (b - a + 1), lm, 'ETag: ' + etag,
+                                   'Content-Range: bytes %d-%d/%d' % (a, b, size)], data[a:b + 1], keep, v09, head_only)
+        if rs:
+            with _lock:
+                _bseq[0] += 1; bd = '%020d' % _bseq[0]
+            body = b''.join(('\r\n--%s\r\nContent-Type: %s\r\nContent-Range: bytes %d-%d/%d\r\n\r\n'
+                             % (bd, ctype, a, b, size)).encode() + data[a:b + 1] for a, b in rs)
+            body += ('\r\n--%s--\r\n' % bd).encode()
+            return self.send(206, ['Content-Type: multipart/byteranges; boundary=' + bd, 'Content-Length: %d' % len(body),
+                                   lm, 'ETag: ' + etag], body, keep, v09, head_only)
+        return self.send(200, ['Content-Type: ' + ctype, 'Content-Length: %d' % size, lm, 'ETag: ' + etag,
+                               'Accept-Ranges: bytes'], data, keep, v09, head_only)
+    def relay_ok(self, tok):
         ftok = ''
         try:                             # 每次请求读 token 文件：刷新后旧 token 立即失效，无需重启
             with open(tokenfile) as f:
                 ftok = f.read().strip()
         except OSError:
             pass
-        # token 对不上 → 当没这个地址（防别人蹭）。【没有 token 文件也一样】（11/09 查出来的）：以前是 ftok 为空就放行，
-        # 从没开过中转的机器（老装机 / 只有 IP / 一直关着）谁扫到端口都能拿它转 GitHub，也等于认出「这儿跑着中转」。
-        # 回 404 不回 403：403 本身就在说「这儿有东西、只是你没权限」。
-        if not ftok or tok != ftok:
-            self.send_error(404); return
+        # token 对不上 → 当没这个地址（防别人蹭）：跟普通地址走同一条路，回的就是不存在的文件那张 404。
+        # 【没有 token 文件也一样】（11/09 查出来的）：以前是 ftok 为空就放行，从没开过中转的机器（老装机 / 只有 IP /
+        # 一直关着）谁扫到端口都能拿它转 GitHub，也等于认出「这儿跑着中转」。不回 403：403 本身就在说「这儿有东西」。
+        return bool(ftok) and tok == ftok
+    def relay(self, target, keep, v09):
         if not target.startswith(('http://', 'https://')):
             target = 'https://' + target.lstrip('/')
         try:
@@ -3653,31 +3862,53 @@ class H(http.server.SimpleHTTPRequestHandler):
         except Exception:
             host = ''
         if host not in ALLOW:            # 非 GitHub 主机一律拒，杜绝开放代理滥用
-            self.send_error(404); return
+            return self.err(404, keep, v09)
         try:
             # UA 跟主脚本一致（见 HTTP_UA）：这是中转服务端替别人去 GitHub 取件，
             # 报 'xy-sub' 等于替对方向沿途声明「这条链路上跑着 nodekit」。
             req = urllib.request.Request(target, headers={'User-Agent': 'curl/8.5.0'})
             with urllib.request.urlopen(req, timeout=20) as r:
                 data = r.read(); ct = r.headers.get('Content-Type', 'application/octet-stream')
-            self.send_response(200)
-            self.send_header('Content-Type', ct)
-            self.send_header('Content-Length', str(len(data)))
-            self.send_header('Cache-Control', 'public, max-age=3600')
-            self.end_headers(); self.wfile.write(data)
         except Exception:
-            self.send_error(502)
-class S(http.server.ThreadingHTTPServer):
+            return self.err(502, keep, v09)
+        return self.send(200, ['Content-Type: ' + ct, 'Content-Length: %d' % len(data),
+                               'Cache-Control: public, max-age=3600'], data, keep, v09)
+class S(socketserver.ThreadingMixIn, socketserver.TCPServer):
     """TLS 握手必须在工作线程里做。若像以前那样 wrap 监听 socket，accept() 会在主循环
        内完成握手——只要有客户端连上却不握手（mihomo 并发拉几十个规则集时很常见），
        主循环就被堵死、后续订阅/中转全部连不上（表现为 active 但 EOF/超时、队列堆积）。"""
     daemon_threads = True
+    allow_reuse_address = True
     request_queue_size = 128          # 默认 5 太小，并发拉规则时瞬间排满
     ctx = None
     def process_request_thread(self, request, client_address):
         if self.ctx is not None:
             try:
                 request.settimeout(20)                    # 握手不能无限等
+                first = request.recv(1, socket.MSG_PEEK)
+                if first and first[0] != 0x16 and not first[0] & 0x80:
+                    # 往 HTTPS 口发的是明文 HTTP：nginx 回一张专门的 400，不是直接断开
+                    request.settimeout(3)
+                    try:
+                        buf = b''
+                        while b'\r\n\r\n' not in buf and b'\n\n' not in buf and len(buf) < 8192:
+                            got = request.recv(4096)
+                            if not got:
+                                break
+                            buf += got
+                    except OSError:
+                        pass
+                    request.sendall(head(400, ['Content-Type: text/html', 'Content-Length: %d' % len(PLAIN_ON_TLS),
+                                               'Connection: close']) + PLAIN_ON_TLS)
+                    self.shutdown_request(request)
+                    return
+                offer = hello_alpn(request)
+                if offer and not any(a in ALPN_OK for a in offer):
+                    # 客户端报了 ALPN、里面却没有 http/1.x（比如只报 h2）：nginx 回一个 no_application_protocol 警报就断。
+                    # Python 的 ssl 遇到这种是「不选、照常握手」，真 nginx 不会这样。看不明白的（返回 None）一律照常握手
+                    request.sendall(bytes.fromhex('15030300020278'))
+                    self.shutdown_request(request)
+                    return
                 request = self.ctx.wrap_socket(request, server_side=True)
             except Exception:
                 try: self.shutdown_request(request)
@@ -3700,13 +3931,18 @@ except OSError:
 if cert and key:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
+    try:
+        ctx.set_alpn_protocols(['http/1.1', 'http/1.0', 'http/0.9'])   # 同没开 h2 的 nginx
+    except Exception:
+        pass
     httpd.ctx = ctx
 httpd.serve_forever()
 '''
 
 def _sub_server_heal():
     """xy-sub 小服务的脚本跟本版不一样（老装机）→ 换成本版并重启 xy-sub。只在内容变了时动一次。
-       这次是为了认 /<token>/<名字>.<ext> 新地址：不换的话面板给的新地址拉不到。"""
+       10/19 是为了认 /<token>/<名字>.<ext> 新地址；11/10 是回包改成照 nginx 的样子（见 _SUB_SERVER_PY 开头）。
+       重启就一两秒，订阅地址、token、端口都不变，节点不受影响。"""
     try:
         if not os.path.exists(SUB_SERVER) or open(SUB_SERVER).read() == _SUB_SERVER_PY:
             return False
@@ -7063,7 +7299,7 @@ def cfg_auto_run():
         print(f"{time.strftime('%F %T')} 伪装站换成了本机生成的站点")
     if sr_onelink_heal():                       # 小火箭订阅改回一个链接（节点写进配置），只动一次
         print(f"{time.strftime('%F %T')} 小火箭节点改回写在配置里（一个链接）")
-    if _sub_server_heal():                      # 订阅小服务换成认 /<token>/<名字>.<ext> 的版本
+    if _sub_server_heal():                      # 订阅小服务的脚本跟本版不一样：换上、重启 xy-sub（地址不变）
         print(f"{time.strftime('%F %T')} 订阅服务已更新")
     ng = _nginx_rules_heal()                    # nginx 还是老规则（路径被摸到不回 404 页）：重建一次，平滑重载不断连接
     if ng:
@@ -13273,7 +13509,7 @@ def main_menu():
     if sr_onelink_heal():
         print("  ✔ 小火箭改回一个链接：节点写进配置了，小火箭里那条节点订阅可以删掉")
     if _sub_server_heal():
-        print("  ✔ 订阅地址末尾换成机器名（不再显示 token），老地址照样能用")
+        print("  ✔ 订阅服务已更新（地址、token 不变）")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
     setup_selfupd_cron()                         # 老装机补上脚本每日自动更新（默认开，菜单 18 关）
