@@ -88,8 +88,14 @@
 配上非常规端口，基本等于挂牌说明这里托管着订阅。现在一律回 `Server: nginx`，错误页也换成
 nginx 样式；nginx 那两个 server 块也加了 `server_tokens off`，两边口径一致、都不报版本号。
 
-根路径早就放了个空的 `index.html`——没有它 `SimpleHTTPRequestHandler` 会**列出目录**，
-把所有 `<token>.yaml` 文件名（= 你的订阅 token）一次性摆出来。
+**回包整个照 nginx 的样子**（11/10）：只改名字不够——状态行还是 `HTTP/1.0`（真 nginx 一律 `HTTP/1.1`）、
+`Content-type` 小写 t、没有 `Connection` / `ETag` / `Accept-Ranges`、别的方法回 501，自称 nginx 却处处不像。
+现在不再用 Python 的 `http.server`，每一种回包都拿真 nginx（静态站、`server_tokens off`）同样的请求抓下来逐字节对过：
+头的名字 / 顺序 / 大小写、错误页正文（404 / 405 / 400 / 414 / 416 / 505）、长连接、断点续传、304、往 HTTPS 口发明文的那张 400、
+TLS 的 ALPN。订阅地址、token、端口都不变；老装机进一次面板或等 03:20 那轮自动换上（`xy-sub` 重启一两秒）。
+做不到的：TLS 握手本身的细节（加密套件顺序、会话票据）是 Python / 系统 OpenSSL 的，没去对。
+
+根路径放了个空的 `index.html`，访问 `/` 回 200 空页、**不列目录**——文件名就是 `<token>.yaml`（= 你的订阅 token）。
 
 ### 公共反代那层的完整性
 
