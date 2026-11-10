@@ -125,7 +125,30 @@ check("读状态不用等锁（改名是原子的，读到的永远是完整的�
 check("锁文件不放在 /etc/bgpeer 里（放任务锁那个目录）", os.path.exists(os.path.join(LOCKD, "media-stack-state.lock"))
       and not [n for n in os.listdir(os.path.dirname(STATE)) if "lock" in n])
 
-print("四、版本号")
-check("media-stack 1.5.398 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 398))
+print("四、播放路上的两个常驻进程不陪着等（1.5.399，仓库主人 11/11：退出后进度「有时立刻刷新了有时没有」）")
+point(m)
+holder = open(os.path.join(LOCKD, "media-stack-state.lock"), "w")
+fcntl.flock(holder, fcntl.LOCK_EX)
+m.MS_STATE_LOCK_WAIT = 0.0                         # 开播门进程里是这个值
+t0 = time.time(); m.save_ms_state(gate_write=1); dt = time.time() - t0
+check(f"等锁上限 0：锁被占着也立刻直接写（{dt * 1000:.0f} 毫秒），跟没加锁以前一样", dt < 0.2 and json.load(open(STATE)).get("gate_write") == 1)
+fcntl.flock(holder, fcntl.LOCK_UN); holder.close()
+m.save_ms_state(gate_write=2)
+check("锁空着照样拿锁写", json.load(open(STATE)).get("gate_write") == 2)
+m.MS_STATE_LOCK_WAIT = 2.0
+tree = ast.parse(src)
+def sets(fn_name):
+    f = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+    g = [n for n in f.body if isinstance(n, ast.Global) and "MS_STATE_LOCK_WAIT" in n.names]
+    a = [n.value.value for n in f.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "MS_STATE_LOCK_WAIT"]
+    return (a[0] if g and a else None), f
+v, f = sets("do_heal_gate")
+check("开播门一进来就把等锁上限设成 0（「停止播放」先 note_play 再放行，不能被锁拖住）", v == 0.0)
+v, f = sets("do_heal_daemon")
+check("常驻补时长（退出后给进度结账的那个）最多等 50 毫秒", v == 0.05)
+check("菜单、定时任务照旧最多等 2 秒（它们不在播放路上）", "MS_STATE_LOCK_WAIT = 2.0" in src)
+
+print("五、版本号")
+check("media-stack 1.5.399 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 399))
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

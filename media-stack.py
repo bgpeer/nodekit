@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.398"
+SCRIPT_VERSION = "1.5.399"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -3981,6 +3981,9 @@ def do_heal_daemon():
     再扣一次。
     【脚本换了就退出】自动更新是原地替换文件的；退出之后 systemd 用新代码拉起来。
     """
+    # 【常驻这边等锁最多 50 毫秒】退出播放后给进度结账就在这个进程里，读详情那边只等它 1 秒：不能陪别人等 2 秒
+    global MS_STATE_LOCK_WAIT
+    MS_STATE_LOCK_WAIT = 0.05
     me = os.path.realpath(__file__)
     try:
         m0 = os.stat(me).st_mtime
@@ -4514,6 +4517,12 @@ def do_heal_gate():
     同一集同时来好几个 PlaybackInfo（有的客户端一开播问两三次）：只补一次，都等这一次。
     HEAL_GATE_IDLE_S 没人开播就退出，socket 还在 systemd 手里，下一次开播再被叫起来。
     """
+    # 【开播门不等状态文件那把锁】（1.5.399）1.5.398 给 save_ms_state 加了锁、等锁最多 2 秒。门这边「停止播放」进来
+    # 是先 note_play() 再放行的：别的进程正好拿着锁，放行就被拖住，而退出后进度刷不刷新就看「停止播放」和「读页面」
+    # 谁先到 —— 仓库主人 11/11：「退出来他有时立刻刷新了有时没有」。门里一毫秒都不等：锁空着就拿，被占着就照
+    # 1.5.397 以前那样直接写。
+    global MS_STATE_LOCK_WAIT
+    MS_STATE_LOCK_WAIT = 0.0
     import http.server
     import socket
     import socketserver
