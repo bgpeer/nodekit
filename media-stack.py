@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.396"
+SCRIPT_VERSION = "1.5.397"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -388,6 +388,32 @@ def set_ua_spoof(mp, on):
         cur.append(mp)
     save_ms_state(ua_spoof=sorted(cur))
     return sorted(cur)
+
+
+# 带密码 / API Key / 观看记录的文件（相对安装目录）：只该 root 读。安装目录本身是 0755，
+# 这台机器上任何非 root 进程（nginx 的 www-data、别的容器挂进来的目录）都进得来，文件自己得是 0600。
+#   · mediawarp / autofilm 的 config.yaml：Emby API Key、OpenList 管理员密码
+#   · .secrets / .env / CREDENTIALS.txt：全部密码
+#   · progress-map.json：看过哪些片
+# 【1.5.397 之前「8 更新」会把前两个改回 0644】（11/10 全仓检查查出来的）：安装时是 0600，
+# do_update 重写配置用的是 write_atomic 的默认 0644，换上去的新文件就人人可读；每月自动更新也走这条。
+# 写这些文件一律 write_atomic(…, 0o600)；老装机由 harden_secret_files 收回来（「8 更新」、每天 04:10 自更新各过一遍）。
+SECRET_FILES = ("mediawarp/config/config.yaml", "autofilm/config/config.yaml", ".secrets", ".env",
+                "CREDENTIALS.txt", "progress-map.json")
+
+
+def harden_secret_files(d):
+    """把 SECRET_FILES 里已经存在、权限却不是 0600 的收成 0600。幂等、极快。返回收了几个。"""
+    n = 0
+    for rel in SECRET_FILES:
+        f = os.path.join(d, rel)
+        try:
+            if os.path.isfile(f) and os.stat(f).st_mode & 0o077:
+                os.chmod(f, 0o600)
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def ms_install_dir():
@@ -1526,7 +1552,10 @@ def gen_nginx_site(cfg):
         for mp in spoof:
             # 挂载点里有中文、空格、正则元字符都可能 —— 元字符必须转义，
             # 不然一个 . 就能匹配到别的盘上去。$uri 是解码后的，中文直接比得上。
-            out.append(f'    "~^/[dp]/{re.escape(mp.strip("/"))}(/|$)" 1;')
+            # re.escape 不管英文双引号（它不是正则元字符），而这一行外面包着双引号：挂载点名字里带一个，
+            # nginx -t 就过不了，站点配置从此写不进去 —— 按 nginx 字符串的规矩转成 \"
+            _mp = re.escape(mp.strip("/")).replace('"', '\\"')
+            out.append(f'    "~^/[dp]/{_mp}(/|$)" 1;')
         out += [
             "}",
             "map $http_user_agent $ms_probe {",
@@ -5437,6 +5466,7 @@ def do_selfupdate():
     if not is_installed(d):
         return
     jobq_migrate_crons()            # 老装机：凌晨那几条接进排队器（只写 cron 文件）
+    harden_secret_files(d)          # 带 Key / 密码的配置权限收回 0600（只 chmod，不碰内容、不重启任何东西）
     me = os.path.realpath(__file__)
     # 【有人在播就推迟】换掉脚本，门、常驻服务会在手上没活时用新代码重起 —— 不碰正在播的那一场也别凑这个热闹
     play_quiet_wait(read_emby_api_key(d), "自动更新脚本", max_s=240, step=30)   # cron 只给 300 秒；没等到明天再换
@@ -10783,7 +10813,7 @@ def _progress_map(d):
 
 def _save_progress_map(d, m):
     try:
-        write_atomic(os.path.join(d, PROGRESS_MAP), json.dumps(m, ensure_ascii=False))
+        write_atomic(os.path.join(d, PROGRESS_MAP), json.dumps(m, ensure_ascii=False), 0o600)   # 看过哪些片：只给 root
     except OSError:
         pass
 
@@ -13578,6 +13608,14 @@ def self_update():
             ok(f"脚本 v{SCRIPT_VERSION} → v{SCRIPT_VERSION}"
                f"{DIM}（已是最新，{how}里也是这一版）{RST}")
         return False
+    # 【换上去之前先 compile】跟每天 04:10 那条（do_selfupdate）一个规矩：语法坏的换进去，emby / media-stack 命令、
+    # 全部定时任务一起废掉，连下一轮自动更新都跑不起来。以前只有定时那条查，手动「8 更新」这条漏着。
+    try:
+        compile(body, me, "exec")
+    except SyntaxError as e:
+        warn(f"拉到的 v{rv} 语法不对（第 {e.lineno} 行，多半没下全），没有替换")
+        print(f"  {DIM}继续用本机这份 v{SCRIPT_VERSION} 刷新配置，过几分钟再点一次。{RST}")
+        return False
     tmp = me + ".new"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(body)
@@ -13711,6 +13749,7 @@ def do_update(from_menu=False, auto=False):
     # 用户填的就三样（Emby API Key、网盘挂载路径、cron），全都能从上次生成的文件里读回来。
     # 代价却是配置层面的 bug 永远修不到已装的机器上。
     cfg = rebuild_cfg_from_disk(d)
+    harden_secret_files(d)          # 老版本「8 更新」留下的 0644 配置（带 Key / 密码）收回 0600，只改权限、不重启
     mw_cfg = os.path.join(d, "mediawarp", "config", "config.yaml")
     af_cfg = os.path.join(d, "autofilm", "config", "config.yaml")
     for path, gen, svc in ((mw_cfg, gen_mediawarp_conf, "mediawarp"),
@@ -13735,7 +13774,7 @@ def do_update(from_menu=False, auto=False):
                     continue
         except OSError:
             pass
-        write_atomic(path, text)
+        write_atomic(path, text, 0o600)      # 里面是 Emby API Key / OpenList 密码：别用默认的 0644（见 SECRET_FILES）
         subprocess.run(["docker", "restart", svc], capture_output=True)
     # 【老版本 OpenList（alist v3）还有「网站 URL」这个设置，有就顺手填上】
     # v4 已经把它去掉了，那边靠的是上面重新生成的 mediawarp 配置里那个 addr。
@@ -13826,9 +13865,7 @@ def do_update(from_menu=False, auto=False):
     # 总览表也重刷一遍，免得 emby / media-stack 命令显示的还是旧版式
     cred = os.path.join(d, "CREDENTIALS.txt")
     if os.path.exists(cred):
-        with open(cred, "w") as f:
-            f.write(build_summary(cfg, colored=False) + "\n")
-        os.chmod(cred, 0o600)
+        write_atomic(cred, build_summary(cfg, colored=False) + "\n", 0o600)
 
     # 更新会按当前版本重写 mediawarp 配置（切回 alist_strm）。磁盘上要是还留着
     # 老版本写的 URL 形式 strm，那些片子立刻就播不了了 —— 而且症状很误导：
@@ -14111,12 +14148,9 @@ DOMAIN={cfg['domain']}
 
     write_atomic(os.path.join(cfg["install_dir"], "docker-compose.yml"),
                  gen_compose(cfg))
-    with open(os.path.join(cfg["install_dir"], "autofilm/config/config.yaml"), "w") as f:
-        f.write(gen_autofilm_conf(cfg))
-    with open(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), "w") as f:
-        f.write(gen_mediawarp_conf(cfg))
-    os.chmod(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), 0o600)
-    os.chmod(os.path.join(cfg["install_dir"], "autofilm/config/config.yaml"), 0o600)
+    # 打开的时候就定成 0600（见 write_atomic）：以前是先按 0644 写下去再 chmod，中间那一下谁都读得到
+    write_atomic(os.path.join(cfg["install_dir"], "autofilm/config/config.yaml"), gen_autofilm_conf(cfg), 0o600)
+    write_atomic(os.path.join(cfg["install_dir"], "mediawarp/config/config.yaml"), gen_mediawarp_conf(cfg), 0o600)
     if cfg["homepage"]:
         hp = os.path.join(cfg["install_dir"], "homepage/config")
         s, sv, w = gen_homepage_conf(cfg)
@@ -14188,9 +14222,7 @@ DOMAIN={cfg['domain']}
 
     # ---- 总览 ----
     cred_file = os.path.join(cfg["install_dir"], "CREDENTIALS.txt")
-    with open(cred_file, "w") as f:
-        f.write(build_summary(cfg, colored=False) + "\n")
-    os.chmod(cred_file, 0o600)
+    write_atomic(cred_file, build_summary(cfg, colored=False) + "\n", 0o600)
 
     print()
     print(build_summary(cfg, colored=True))
@@ -14319,9 +14351,7 @@ def set_emby_api_key():
     if not hit:
         err(f"{path} 里没找到 auth: 这一行，没敢乱改。请手动填。")
         return
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    os.chmod(path, 0o600)
+    write_atomic(path, "\n".join(lines) + "\n", 0o600)    # 原子写：写到一半被打断不会留下一份空配置
     save_emby_api_key(d, key)      # 另存一份，配置文件出事时还能捞回来
     ok("API Key 已写入 MediaWarp 配置")
 
@@ -20064,9 +20094,8 @@ def write_secret(path, key, value):
             break
     if not hit:
         lines.append(f"{key}={value}")
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    os.chmod(path, 0o600)
+    # 原子写、打开时就是 0600：open(path, "w") 先清空再写，写到一半被打断 .secrets 就空了（全部密码、备份的 Key 一起没）
+    write_atomic(path, "\n".join(lines) + "\n", 0o600)
 
 
 def patch_credentials_file(install_dir, user, password):
@@ -20080,9 +20109,7 @@ def patch_credentials_file(install_dir, user, password):
         return
     txt = re.sub(r"(?m)^(\s*用户名\s+).*$", lambda m: m.group(1) + user, txt)
     txt = re.sub(r"(?m)^(\s*密\s+码\s+).*$", lambda m: m.group(1) + password, txt)
-    with open(p, "w") as f:
-        f.write(txt)
-    os.chmod(p, 0o600)
+    write_atomic(p, txt, 0o600)
 
 
 def set_web_credentials():
@@ -25704,7 +25731,7 @@ def _apply_autofilm_cron(d):
     try:
         cfg2 = rebuild_cfg_from_disk(d)
         write_atomic(os.path.join(d, "autofilm", "config", "config.yaml"),
-                     gen_autofilm_conf(cfg2))
+                     gen_autofilm_conf(cfg2), 0o600)
         subprocess.run(["docker", "restart", "autofilm"],
                        capture_output=True, timeout=120)
         ok("AutoFilm 配置已更新并重启")
