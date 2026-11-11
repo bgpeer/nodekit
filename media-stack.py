@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.399"
+SCRIPT_VERSION = "1.5.400"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14076,12 +14076,12 @@ def main():
     else:
         cfg["domain"] = ask("你的域名（没有就留空，用 IP:端口 访问）", "")
 
-    # 填了 emby.example.com 这种就静默归一 —— 用户填子域名本来就是合理表达
+    # 填了 emby.example.com 这种就静默归一 —— 用户填子域名本来就是合理表达；照着提示填成 *.ys.example.com 的也认
     if cfg["domain"]:
-        first, _, rest = cfg["domain"].partition(".")
-        if rest and first in ("emby", "list", "home"):
-            cfg["domain"] = rest
-            ok(f"按根域名 {rest} 处理")
+        _norm = _emby_base_norm(cfg["domain"])
+        if _norm != cfg["domain"]:
+            cfg["domain"] = _norm
+            ok(f"按根域名 {_norm} 处理")
 
     cfg["has_domain"] = bool(cfg["domain"]) and have("nginx")
     if cfg["domain"] and not have("nginx"):
@@ -26339,6 +26339,9 @@ def _ms_cert_days(path):
 def _emby_base_norm(raw):
     """填的是 emby.example.com 这种也认：去掉开头的 emby. / list. / home.（跟安装时一样）。"""
     dom = (raw or "").strip().lower().rstrip(".")
+    # 开头的 *. 也去掉：屏上那行提示写的是「做好一条 DNS 记录 *.新名字」，照着把带星号的填进来很自然，
+    # 以前直接报「域名格式不对」（仓库主人 11/11 真机就是这么填的：「把带星号的也改成自动去掉吧」）。
+    dom = dom.lstrip("*.")
     first, _, rest = dom.partition(".")
     return rest if rest and first in ("emby", "list", "home") else dom
 
