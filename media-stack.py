@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.401"
+SCRIPT_VERSION = "1.5.402"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1998,7 +1998,7 @@ case "${1:-info}" in
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
-  covers         没刮到封面的片，现在就截一帧当封面（自动截默认只截新加的，见 7 设置 → 9）
+  covers         没刮到封面的片，现在就截一帧当封面（自动截默认只截新加的，见 7 设置 → 8）
   covers --retry 截失败过的也重新试一遍
   covers-mount <挂载点>  这个盘没图的全部截一次（菜单「截封面」在后台跑的就是它）
   covers-new      生成媒体库后新加的、没刮到图的截一帧（生成完自动在后台跑）
@@ -6465,7 +6465,7 @@ def do_warm():
         cover_prefer_scrape(key)      # 先让刮削的顶掉截帧的（只问刮削器，不拉片子）
         # 【自动截封面默认关】仓库主人：「把那个自动截图的取消了吧，要么在设置里面加个
         # 开关，默认关，不然有的截不到一直在那里空转消耗流量」。要截就去「3 挂载路径 →
-        # 选盘 → 截封面」手点；想要每小时自动截，「7 设置 → 9」打开。
+        # 选盘 → 截封面」手点；想要每小时自动截，「7 设置 → 8」打开。
         if cover_auto_on():
             fill_covers(d, key)       # 再给还没封面的截一帧
     except Exception:
@@ -8758,7 +8758,7 @@ def do_heal_tick(hot_only=False):
     # 抢救表 —— 退出回到详情页那一下也就不等写回（rescue_hold 只等表里有的）。盯进度只问
     # 本机 Emby，不碰网盘，跟补不补时长无关
     if not heal_auto_on():
-        _say("自动补时长关着（7 设置 → 10）。手动补：media-stack heal <片名>")
+        _say("自动补时长关着（7 设置 → 9）。手动补：media-stack heal <片名>")
         return
     ts = last_played_ts(key)
     water = float(ms_state().get("heal_tick_seen") or 0)
@@ -11767,7 +11767,7 @@ def fix_episode_strm_names(d, rules, key, interactive=True):
         if not (interactive and has_tty()):
             print(f"  {DIM}剧集编号：有 {len(und)} 个可以补，但这是后台在跑、没法问你。"
                   f"在规则文件里给这些库写一行 episode_number: true 就不用管了，"
-                  f"或者到「7 设置 → 7」开一下{RST}")
+                  f"或者到「7 设置 → 6」开一下{RST}")
         else:
             print()
             info(f"剧集库里有 {len(und)} 个条目，Emby 认错了集号或者没认出来。")
@@ -11990,7 +11990,7 @@ def apply_libraries(d, key, plan):
 def auto_libraries_apply(d, key, quiet=False):
     """按规则把该建的媒体库建上。不问，不交互 —— 给「4 生成媒体库」用。
 
-    规则原来只在「7 设置 → 4」按 y 的时候才跑，于是用户改完网盘文件夹名、点「4」，
+    规则原来只在「7 设置 → 3」按 y 的时候才跑，于是用户改完网盘文件夹名、点「4」，
     期待的"扫完顺手把库建好"什么都没发生。
 
     不问是对的：只建【不存在的】库，不动用户已有的任何东西，重叠的直接跳过并说明。
@@ -17425,7 +17425,7 @@ HEAL_DAY_MB = 2048       # heal 每天的流量上限（MB）的【默认值】�
 # 【后来做成了可调的】仓库主人：「做一个按钮开关，默认开，里面还可以设置每日流量上限默认
 # 2G，如果有的人片多可以加大上限比如 200G，如果有的人流量不够用也可以关掉，关掉还写个提示
 # 可能保存不了进度记忆」。上面那句"不做成可调的"是早先的判断，用户要的是能调 ——
-# 见 heal_day_mb / heal_auto_on，「7 设置 → 10」。
+# 见 heal_day_mb / heal_auto_on，「7 设置 → 9」。
 HEAL_DAY_MB_LO, HEAL_DAY_MB_HI = 100, 1024 * 1024
 
 
@@ -21519,7 +21519,7 @@ def dir_cache_auto_apply(d):
     n = _apply_dir_cache(d, auto, DIR_CACHE_DEFAULT)
     save_ms_state(dir_cache_migrated=True)
     if n:
-        print(f"  {DIM}想调回长的（列目录老超时的话有用）：7 设置 → 6。"
+        print(f"  {DIM}想调回长的（列目录老超时的话有用）：7 设置 → 5。"
               f"手动设过之后脚本就再也不碰它。{RST}")
     return n
 
@@ -25657,7 +25657,7 @@ def _qtv_pick_menu():
 def _heal_mount_toggle(mp):
     """单个盘的补时长开关：只能单独关、不能单独开（总开关关着时开不了）。"""
     if not heal_auto_on():
-        tip("总开关关着，所有盘都不自动补时长 —— 先到「7 设置 → 10」打开总开关")
+        tip("总开关关着，所有盘都不自动补时长 —— 先到「7 设置 → 9」打开总开关")
         return
     off = heal_off_mounts()
     if mp in off:
@@ -26239,25 +26239,26 @@ def params_menu():
         sec = os.path.join(d, ".secrets")
         has_ba = bool(read_env(sec, "BA_PASS", fallback=os.path.join(d, ".env")))
         ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
+        # 【三个账号挨着放在最后】仓库主人 11/12：「把三个帐号移的挨着」。原来弹框账号在第 2、Emby 账号在第 11、
+        # OpenList 账号在第 13，中间隔着域名证书。现在 11 / 12 / 13 连着；别的项顺次往前补，一项没少。
         print(f"  1. Emby API Key      当前：{state}")
-        print(f"  2. 浏览器弹框账号    当前：{ba_state}")
         # 【直链方式 / 片名用哪个 / 115 扫码登录 都搬去「3 挂载路径」了】
         # 它们全是【一个盘一个样】的东西：直链方式只有夸克/UC 的驱动才有，
         # 片名该跟文件名还是跟刮削也是每个盘各不相同 —— 放在这里当全局开关，
         # 本身就是把它们摆错了地方。扫描路径同理。
         mt_state = ((f"{GREEN}已安装{RST}" if metatube_on(d) else f"{DIM}未安装{RST}")
                     if is_installed(d) else f"{DIM}未安装{RST}")
-        print(f"  3. MetaTube 刮削插件 当前：{mt_state}")
+        print(f"  2. MetaTube 刮削插件 当前：{mt_state}")
         # 【这里只报"用哪份"，一个字都不多】规则文件路径、几条、哪几个库名 ——
         # 这些进到菜单里会随库数一起长，7 条就要折两行，几十条整屏都是它。
         # 点进第 4 项那一屏本来就全列着，重复一遍只是把菜单撑丑。
         _rsrc = (f"{CYAN}自定义{RST}" if rules_source() == "custom"
                  else f"{DIM}作者的{RST}") if is_installed(d) else ""
-        print(f"  4. 自动建库规则      当前：{_rsrc}")
+        print(f"  3. 自动建库规则      当前：{_rsrc}")
         if metatube_on(d):
             mtl = [n for n, _i, on, _o in metatube_libraries(
                 read_emby_api_key(d) or "") if on]
-            print(f"  5. MetaTube 生效的库 当前："
+            print(f"  4. MetaTube 生效的库 当前："
                   + (f"{CYAN}{'、'.join(mtl)}{RST}" if mtl else f"{DIM}都不启用{RST}"))
         # 目录缓存直接决定「列目录」快不快 —— 命中缓存 0.3 秒，走真实接口十几秒
         # 还会被限流。当前值摆在菜单上，和直链方式一个道理。
@@ -26269,23 +26270,24 @@ def params_menu():
         else:
             dc_state = f"{DIM}未挂网盘{RST}"
         _dcm = "" if ms_state().get("dir_cache_manual") else f"{DIM}　脚本自动维护{RST}"
-        print(f"  6. 目录缓存时长      当前：{dc_state}{_dcm}")
+        print(f"  5. 目录缓存时长      当前：{dc_state}{_dcm}")
         _ef = ep_fix_setting()
         ef_state = (f"{DIM}没问过{RST}" if _ef is None else
                     (f"{CYAN}开{RST}" if _ef else f"{DIM}关{RST}"))
-        print(f"  7. 剧集季集编号      当前：{ef_state}")
-        print(f"  8. 几%算播放完       当前：{CYAN}{resume_max_pct()}%{RST}")
-        print(f"  9. 自动截封面        当前："
+        print(f"  6. 剧集季集编号      当前：{ef_state}")
+        print(f"  7. 几%算播放完       当前：{CYAN}{resume_max_pct()}%{RST}")
+        print(f"  8. 自动截封面        当前："
               + (f"{CYAN}每小时{RST}" if cover_auto_on() else
                  f"{CYAN}只截新加的{RST}" if cover_new_on() else f"{DIM}关{RST}"))
-        print(f"  10. 自动补时长       当前："
+        print(f"  9. 自动补时长        当前："
               + (f"{CYAN}开 · 每天 {_mb_txt(heal_day_mb())}{RST}" if heal_auto_on()
                  else f"{YELLOW}关{RST}"))
-        _eu = emby_users(cur) if cur else []
-        print(f"  11. Emby 账号        当前："
-              + (f"{CYAN}{'、'.join(n for n, _a in _eu)}{RST}" if _eu else f"{DIM}读不到{RST}"))
         _dm = read_env(os.path.join(d, ".env"), "DOMAIN") if is_installed(d) else ""
-        print(f"  12. 域名证书         当前：" + (f"{CYAN}{_dm}{RST}" if _dm else f"{DIM}没有（IP:端口）{RST}"))
+        print(f"  10. 域名证书         当前：" + (f"{CYAN}{_dm}{RST}" if _dm else f"{DIM}没有（IP:端口）{RST}"))
+        print(f"  11. 浏览器弹框账号   当前：{ba_state}")
+        _eu = emby_users(cur) if cur else []
+        print(f"  12. Emby 账号        当前："
+              + (f"{CYAN}{'、'.join(n for n, _a in _eu)}{RST}" if _eu else f"{DIM}读不到{RST}"))
         print("  13. OpenList 账号    当前：" + (f"{CYAN}{ol_user(d)}{RST}" if is_installed(d) else f"{DIM}未安装{RST}"))
         print("  0. 返回")
         print("-" * 60)
@@ -26295,12 +26297,10 @@ def params_menu():
         if c == "1":
             set_emby_api_key()
         elif c == "2":
-            set_web_credentials()
-        elif c == "3":
             toggle_metatube()
-        elif c == "4":
+        elif c == "3":
             auto_libraries()
-        elif c == "5":
+        elif c == "4":
             d0 = ms_install_dir()
             k0 = (read_yaml_scalar(os.path.join(d0, "mediawarp", "config",
                                                 "config.yaml"), "auth")
@@ -26311,21 +26311,23 @@ def params_menu():
                 warn("没有 Emby API Key，先填「1」。")
             else:
                 choose_metatube_libraries(k0)
-        elif c == "6":
+        elif c == "5":
             set_dir_cache()
-        elif c == "7":
+        elif c == "6":
             set_episode_fix()
-        elif c == "8":
+        elif c == "7":
             set_resume_max()
-        elif c == "9":
+        elif c == "8":
             set_cover_auto()
-        elif c == "10":
+        elif c == "9":
             heal_auto_menu()
+        elif c == "10":
+            emby_domain_menu()
         elif c == "11":
+            set_web_credentials()
+        elif c == "12":
             emby_accounts_menu(cur)
             continue          # 子菜单自己管停顿
-        elif c == "12":
-            emby_domain_menu()
         elif c == "13":
             ol_account_menu()
             continue          # 子菜单自己管停顿
@@ -26335,7 +26337,7 @@ def params_menu():
         ask("\n按回车返回...")
 
 
-# ---- 「7 设置 → 12」域名证书：换 Emby 自己的底座域名 ----
+# ---- 「7 设置 → 10」域名证书：换 Emby 自己的底座域名 ----
 # 仓库主人 10/31：「不要干预emby吧，直接做成不询问，还是在emby设置里面做一个更换域名证书的口子吧……这样他们就互相不干预了，
 # 改动有点大做好一点哦」。节点「15 → 2」不再带着 Emby 走，Emby 在这里自己换：
 #   · emby. / list. / home. 三个站点挂在新底座下面；证书 *.新底座 自己一张（acme.sh 记录名 *.底座，续期自己 reload nginx），
@@ -26377,7 +26379,7 @@ def _ipv4_of(name):
 
 
 def emby_domain_menu():
-    """「7 设置 → 12 域名证书」：问新底座、查记录、把会跟着变的说清楚，确认了才动手（emby_domain_apply）。"""
+    """「7 设置 → 10 域名证书」：问新底座、查记录、把会跟着变的说清楚，确认了才动手（emby_domain_apply）。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn("还没装。")
@@ -26525,7 +26527,7 @@ def emby_domain_apply(d, new, cf_token=""):
     return True
 
 
-# ---- 「7 设置 → 11」Emby 账号：改用户名 / 密码 ----
+# ---- 「7 设置 → 12」Emby 账号：改用户名 / 密码 ----
 # 仓库主人 10/31：「emby 可以用代码修改用户名和密码吗」「做吧，加进 7 设置里，这个用户名账号在后面还要显示出来」。
 # 走 Emby 自己的接口（本机 + API Key，跟脚本别处一样）：改名 = 读回整份用户资料改 Name 再 POST 回去；
 # 改密码 = 先「管理员重置」（密码变空）再用空的旧密码设新的 —— 不用知道旧密码。
@@ -26596,7 +26598,7 @@ def emby_logout_everywhere(key, uid):
 
 
 def emby_accounts_menu(key):
-    """「7 设置 → 11」：列出 Emby 账号，选一个改用户名 / 密码。"""
+    """「7 设置 → 12」：列出 Emby 账号，选一个改用户名 / 密码。"""
     if not key:
         warn("没有 Emby API Key，先填「1」。")
         ask("\n按回车返回...")
@@ -26871,7 +26873,7 @@ def _mb_txt(mb):
 
 
 def heal_auto_menu():
-    """「7 设置 → 10」：自动补时长的开关和每天流量上限。"""
+    """「7 设置 → 9」：自动补时长的开关和每天流量上限。"""
     while True:
         print()
         print(f"  1. 开关              当前："
@@ -26914,7 +26916,7 @@ def heal_auto_menu():
 
 
 def set_cover_auto():
-    """「7 设置 → 9」：自动截封面。三档：每小时（含新加的）/ 只截新加的（默认）/ 关。
+    """「7 设置 → 8」：自动截封面。三档：每小时（含新加的）/ 只截新加的（默认）/ 关。
     「只截新加的」= 生成媒体库后，新加进来、Emby 刮不到图的每部截一次（见 do_covers_new）。"""
     cur = "每小时" if cover_auto_on() else "只截新加的" if cover_new_on() else "关"
     tip("自动截会消耗 VPS 流量；关了也能在「3 挂载路径 → 选盘 → 截封面」手动截")
@@ -26928,7 +26930,7 @@ def set_cover_auto():
 
 
 def set_resume_max():
-    """「7 设置 → 8」：播到百分之几算播放完。存进状态，有 API Key 就当场对齐到各库。"""
+    """「7 设置 → 7」：播到百分之几算播放完。存进状态，有 API Key 就当场对齐到各库。"""
     cur = resume_max_pct()
     print()
     # 「所有媒体库」= 所有指向 strm 的库（tune_strm_libraries 只动这些）；用户自己另建的
@@ -28333,10 +28335,10 @@ def do_healthcheck():
             # 但代价是网盘里刚加的片子要等这么久才看得见 —— 而"点进去就能看到新片"
             # 恰恰是用户对这套东西最基本的预期。两头都是实实在在的代价，
             # 该由他自己选，体检的活是把两头说清楚，不是替他决定。
-            # 调长能少碰被限流的接口（7 设置 → 6），代价是新加的片子要等这么久才看得见
+            # 调长能少碰被限流的接口（7 设置 → 5），代价是新加的片子要等这么久才看得见
             _hc("目录缓存", "warn",
                 f"{_txt}  {YELLOW}短缓存 + 列目录常超时{RST}"
-                f"{DIM}（调长：7 设置 → 6，代价是新片晚一点看得见）{RST}")
+                f"{DIM}（调长：7 设置 → 5，代价是新片晚一点看得见）{RST}")
         else:
             _hc("目录缓存", "ok", _txt)
 
@@ -29202,7 +29204,7 @@ def do_healthcheck():
                     todo.append((f"{_inb} 个点开过的条目还没补上时长 —— 看一半退出会被当成看完",
                                  (f"在自动补（每批 {_per} 个），不用管；急的话 "
                                   f"media-stack heal <片名> 马上补那一部") if heal_auto_on()
-                                 else ("自动补时长关着：7 设置 → 10 打开，"
+                                 else ("自动补时长关着：7 设置 → 9 打开，"
                                        "或者 media-stack heal <片名> 手动补那一部")))
                 else:
                     _hc("条目时长", "ok",
@@ -29359,7 +29361,7 @@ def do_healthcheck():
     if not heal_auto_on():
         # 用户自己关的：不算故障，但要看得见 —— 进度记不住多半就是这个
         _hc("补时长（看片后）", "warn",
-            f"关着（7 设置 → 10）{DIM}　新片看一半退出可能被当成看完{RST}")
+            f"关着（7 设置 → 9）{DIM}　新片看一半退出可能被当成看完{RST}")
     elif os.path.exists(HEAL_CRON):
         # 【取最近的那一次】开播前那道门（heal-gate）补完只记 heal_last，不碰 heal_tick ——
         # 真机体检写着「28 小时前跑过一轮」，后面紧跟着同一天 17:03 开播前补的那一轮

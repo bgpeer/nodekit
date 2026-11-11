@@ -13262,7 +13262,7 @@ def cert_change_domain_flow(i):
           f"端口 / uuid / 密码 / 路径 / short-id")
     print(f"             CDN 套用那几个节点（它们走自己的域名，见菜单 9）")
     if emby_dom:
-        print(f"             Emby（<子域>.{emby_dom}，换它在「16 自建 Emby → 7 设置 → 12 域名证书」）")
+        print(f"             Emby（<子域>.{emby_dom}，换它在「16 自建 Emby → 7 设置 → 10 域名证书」）")
     if os.path.exists(AGH_DOMAIN_FILE):
         print(f"             自建 DNS（{_agh_domain()}，换它在「13 自建 DNS → 10 更换域名证书」）")
     print(f"  安全网:    先改配置再跑两个核心自带的校验，任一不过整体回滚、"

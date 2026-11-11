@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""「16 自建 Emby → 7 设置 → 12 域名证书」：换 Emby 自己的底座域名（仓库主人 10/31：「不要干预emby吧，直接做成不询问，
+"""「16 自建 Emby → 7 设置 → 10 域名证书」（1.5.402 起第 10 项，原来第 12）：换 Emby 自己的底座域名（仓库主人 10/31：「不要干预emby吧，直接做成不询问，
   还是在emby设置里面做一个更换域名证书的口子吧……这样他们就互相不干预了，改动有点大做好一点哦」）。
 钉住：
-  一、7 设置里有第 12 项「域名证书　当前：底座」
+  一、7 设置里有第 10 项「域名证书　当前：底座」
   二、三个站点（emby / list / home）都要解析到本机，没建好不签、不改；IP:端口 装的不在这里改
   三、有人在播先问一声（默认否）；最后确认默认否
   四、真换：先签 *.新底座（签不下来什么都没动）→ .env → nginx（校验不过 .env 放回、新证书撤掉）→ 首页 / AutoFilm /
@@ -88,8 +88,8 @@ env = lambda: m.read_env(f"{D}/.env", "DOMAIN")
 
 print("一、菜单")
 src = open(os.path.join(ROOT, "media-stack.py"), encoding="utf-8").read()
-check("7 设置里有第 12 项「域名证书　当前：底座」", '"  12. 域名证书         当前："' in src
-      and 'elif c == "12":\n            emby_domain_menu()' in src)
+check("7 设置里有第 10 项「域名证书　当前：底座」", '"  10. 域名证书         当前："' in src
+      and 'elif c == "10":\n            emby_domain_menu()' in src)
 
 print("二、真换")
 reset()

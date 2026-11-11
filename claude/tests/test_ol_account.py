@@ -169,7 +169,7 @@ print("五、菜单")
 i = SRC.index("def settings_menu") if "def settings_menu" in SRC else SRC.index("13. OpenList 账号")
 check("7 设置里有第 13 项「OpenList 账号　当前：用户名」，选 13 进去", '  13. OpenList 账号    当前：' in SRC
       and re.search(r'elif c == "13":\n\s+ol_account_menu\(\)', SRC) is not None)
-check("原来的 1–12 项一个没少", all(f"  {n}. " in SRC for n in range(1, 13)) and all(f'c == "{n}"' in SRC for n in range(1, 13)))
+check("前面 12 项一个没少", all(f"  {n}. " in SRC for n in range(1, 13)) and all(f'c == "{n}"' in SRC for n in range(1, 13)))
 BUSY, PLAYING, YN, ANS = [False], [False], [], []
 restarts = lambda: sorted(c for c in SH if re.search(r"docker (restart|stop|start|rm|compose)", c))
 m.autofilm_busy = lambda: BUSY[0]

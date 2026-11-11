@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""「7 设置 → 11 Emby 账号」（1.5.390）。仓库主人 10/31：「做吧，加进 7 设置里，这个用户名账号在后面还要显示出来」
+"""「7 设置 → 12 Emby 账号」（1.5.390；1.5.402 起三个账号挨着，从第 11 挪到第 12）。仓库主人 10/31：「做吧，加进 7 设置里，这个用户名账号在后面还要显示出来」
     Emby 账号 / 1. 账号1（管理员）　当前：名字 / 2. 账号2　当前：名字 / 0. 返回
 钉住：
   一、7 设置里有第 11 项，当前：列出账号名
@@ -56,7 +56,8 @@ def drive(fn, answers, yn):
 print("一、7 设置")
 src = open(SRC, encoding="utf-8").read()
 pm = src[src.index("def params_menu("):]; pm = pm[:pm.index("\ndef ", 1)]
-check("第 11 项 Emby 账号，当前列账号名", "11. Emby 账号" in pm and "emby_users(cur)" in pm and 'c == "11"' in pm)
+check("第 12 项 Emby 账号，当前列账号名", "12. Emby 账号" in pm and "emby_users(cur)" in pm
+      and re.search(r'c == "12":\n\s+emby_accounts_menu\(cur\)', pm) is not None)
 
 print("二、账号表")
 out = drive(lambda: m.emby_accounts_menu("K"), ["0"], [])
