@@ -39,6 +39,8 @@ r, out = run(x.show_links, "1", "")
 menu = "  1. 刷新三大配置\n  2. 更换节点名称前缀\n  0. 返回\n"
 check("选 1 刷新完：下面再列一遍三项接着选，不回主菜单", DID == ["refresh"] and out.count(menu) == 2
       and out.index("已刷新") < out.rindex(menu))
+line = "-" * 60 + "\n"
+check("结果和再列一遍的三项之间有一道分割线", out[out.index("已刷新"):].startswith("已刷新\n" + line + menu))
 check("链接和订阅那一大屏只印一次（不重刷）", out.count("LINKS") == 1 and out.count("SUBURLS") == 1)
 check("回车：回主菜单，返回 True（告诉主菜单别再停一下）", r is True)
 r, out = run(x.show_links, "1", "2", "1", "0")
