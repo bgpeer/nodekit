@@ -181,6 +181,11 @@
 - **自建 DNS** `13 → 10 更换域名证书`（adguard-dns `change_domain` / `_change_domain_apply`）：签新 + `*.新` → 装 `/etc/ssl/agh` →
   `_agh_tls_retarget` 改 yaml（服务器名、证书路径、清掉贴进去的证书正文）→ 重启等 DoT → 不行整体放回。老装法从这里分出来，
   节点证书不碰。订阅里写着它就叫主脚本 `selfdns-refresh`（老主脚本不认就不叫）。10/31 拿真 AdGuard v0.107.79 跑过改写后的 yaml：DoT 起来、SNI `ID.新域名` 给的是新证书。
+- **11/11 仓库主人真机走通 `15 → 2`**（日本机，同根域名换子域名，Emby 另一张证书）：签证书、改 nginx、重写链接都成；查出两处已修——
+  换完那一屏「订阅地址」印的是 xy-sub 的 unit 正文（现在印三种订阅新地址 + `.links` 地址）；节点专用域名的 `*.随机段.根域名` 没跟着签
+  （`cert_change_domain_apply` 自己拼 names，漏了 `_privdns_root`，是「五个地方都带着它」之外的第六处）。
+  **换完客户端里吃证书的协议全 Timeout、reality / CDN 正常 = 客户端（或聚合它的主机）手里还是旧链接**：订阅和 `.links` 的地址都换了 host，
+  旧地址证书对不上拉不到，要重新导入；聚合了它的机器要到「3 聚合」换成新的 `.links` 地址。
 - **Emby** `16 → 7 设置 → 12 域名证书`（media-stack `emby_domain_menu`）：见上面 media-stack 地图。IP:端口 装的不在这里改（要重建容器）。
 
 ## 卸载（菜单 20，11/09 起）

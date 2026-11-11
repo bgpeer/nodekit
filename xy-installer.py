@@ -12817,10 +12817,17 @@ def _domain_switch_notice(new):
        自建 DNS 的 DoH、GitHub 中转、Emby。换完不逐个说清楚，你只会发现
        「某个东西忽然连不上」，然后挨个去猜。"""
     out = []
+    # 【打的是新地址本身】以前这里拿的是 _sub_service_text()——那是 xy-sub 的 systemd unit 正文，屏上「订阅地址」
+    # 底下印出来的是 [Unit] / ExecStart=… 一大段，新地址反而没有（仓库主人 11/11 真机换域名的截图）。
     try:
-        t = _sub_service_text()
-        if t:
-            out.append(("订阅地址", t, "面板 2　⚠ host 变了，客户端要【重新导入】，不是刷新"))
+        items = _sub_items()
+        for e, u in items:
+            out.append((f"订阅地址 · {SUB_TITLES[e]}", u, "⚠ host 变了，客户端要【重新导入】，不是刷新"))
+        if not items:
+            out.append(("订阅地址", "(还没生成)", "面板 2"))
+        lk = links_url()
+        if lk:   # 别的机器「3 聚合」里填过本机的：那边存的还是旧域名，证书对不上就拉不到，本机节点在它的订阅里一直是旧链接
+            out.append(("本机节点链接地址（给别的机器聚合用）", lk, "⚠ 聚合了本机的机器要到它的「3 聚合节点链接」把地址换成这个"))
     except Exception:
         out.append(("订阅地址", "(读不出)", "面板 2　⚠ host 变了，客户端要重新导入"))
     out.append(("节点链接", f"@{new}:端口", "面板 2　单条分享链接发给别人过的，要重发"))
@@ -12936,6 +12943,11 @@ def cert_change_domain_apply(new, cf_token="", emby_keep=""):
     names = [new, f"*.{new}"]
     if emby_keep and not _name_covers(names, "x." + emby_keep):
         names += [emby_keep, f"*.{emby_keep}"]
+    # 节点专用域名（13 → 4）要的 *.随机段.根域名 跟着带上（同 cert_want_names）：以前这里漏了，换完域名新证书里没有它，
+    # 私有名当场失效、节点退回公网域名，要人再去 13 → 4 选一次补签（仓库主人 11/11 真机：「证书里没有 *.xxx」）。
+    _proot = _privdns_root()
+    if _proot and _root_domain(new) == _root_domain(_proot) and not _name_covers(names, "x." + _proot):
+        names.append(f"*.{_proot}")
     need = [new, f"*.{new}"] + ([f"x.{emby_keep}"] if emby_keep else [])
     have = cert_names()
     if _name_covers(have, new) and _name_covers(have, "x." + new) and \
