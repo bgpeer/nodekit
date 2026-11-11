@@ -27,6 +27,7 @@
 | 「8 更新」 | `update_menu`：1 立即 → `do_update`；2 每月自动开关 → cron 每天 02:30 `do_imgupdate`（3 号起、本月没做成才做，`do_update(auto=True)`） |
 | Emby 域名证书（7 设置 → 12） | `emby_domain_menu` → `emby_domain_apply`：签 `*.新底座` → `.env` → `apply_nginx_site`（不过放回）→ 首页 / AutoFilm / MediaWarp 重写重启 → 撤旧那张 |
 | Emby 账号（7 设置 → 11） | `emby_accounts_menu` → `_emby_account_menu`；改名 `emby_rename_user`（读回整份资料改 Name 再 POST），改密码 `emby_set_password`（先重置再设，第二步失败 = 没密码，要醒目报） |
+| OpenList 账号（7 设置 → 13，1.5.401） | `ol_account_menu`；用户名 `ol_user(d)`（`.secrets` 的 `OPENLIST_USER`，没有 = admin），改名 `ol_rename_admin`（`/api/me/update`），改密码 `ol_set_admin_password`（`docker exec openlist ./openlist admin set`），收尾 `_ol_account_apply`（两份配置重写 + 各重启一次 + CREDENTIALS）。**再加 OpenList 登录的地方用 `ol_user(d)`，别写死 admin**；`tools/` 里的排查脚本同理（读 `OPENLIST_USER`） |
 | 截封面 | `fill_covers`；按钮 → 后台 `do_covers_mount`；生成后 / 凌晨新片 → `queue_new_covers` → `do_covers_new` |
 | 盘那一屏 | `_drive_menu`，公共项 `_drive_std_items` / `_drive_tail_items` |
 | 小雅 | 1.5.385 整栏删了（仓库主人：片不多、找不到想看的）；要挂走「4 WebDAV」。卸载里只留带走旧版装的那份 |
@@ -282,6 +283,12 @@
   真正按手机这头挑的是客户端对那 5 条候选做的 URLTest，或者用户自己在本地测完走「2 手动填」。
   「9 → 2 → 6 只测延时」（11/11 加，`lat_only`）：不下载，延时最低的一批复测 3 次取中间值；结果里 `mbps` 是 None，用到它的地方要判。
 - cn-block：菜单 1 关掉 = `remove_cn_block(keep_cfg=True)`，状态文件留着（enabled=false）；菜单 6 / 命令行 `remove` 才删状态。
+
+- **OpenList 的几件事（11/12 读它的源码对的，容器里起不了真的）**：登录失败按来访 IP 计数，5 次锁 5 分钟（脚本所有登录是同一个 IP，
+  核对账号时别连着错）；`./openlist admin set` 失败也回 0（只在日志里报错），成没成要靠登录验；它的输出里有一行 `username: 真名`；
+  令牌里带着用户名和改密码的时刻，改了任一个旧令牌就 401（换链服务 / 开播门遇到 401 会现读 `.secrets` 重登）。
+  会话容器里 `dockerd` 起得来，但拉镜像起容器被环境拦了，别再试；要对接口就 `curl raw.githubusercontent.com/OpenListTeam/OpenList/main/…` 读源码。
+- **写进 YAML 的账号密码走 `_yaml_scalar`**：纯字母数字照原样（老装机配置一个字不变，不然「8 更新」会多重启一次 MediaWarp），其余加单引号。
 
 ## 仓库主人的偏好
 

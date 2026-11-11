@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.400"
+SCRIPT_VERSION = "1.5.401"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -592,6 +592,21 @@ def read_env(path, key, fallback=""):
     return ""
 
 
+def ol_user(d):
+    """OpenList 管理员的用户名。「7 设置 → 13」改过就记在 .secrets 的 OPENLIST_USER；没改过 = admin（以前一直写死的那个）。"""
+    return read_env(os.path.join(d, ".secrets"), "OPENLIST_USER") or "admin"
+
+
+def _yaml_scalar(v):
+    """写进 YAML 的账号 / 密码。纯字母数字（脚本随机生成的那种、admin）照原样不加引号 —— 老装机的配置一个字都不变、
+    「8 更新」不会因此多重启一次 MediaWarp；自己定的带符号、纯数字、true / null 这类会被 YAML 读成别的东西的，加单引号。"""
+    v = str(v)
+    if (re.fullmatch(r"[A-Za-z0-9]+", v) and re.search(r"[A-Za-z]", v)
+            and not re.fullmatch(r"(?i)0[xo][0-9a-f]+|\d+e\d+|true|false|null|yes|no|on|off|y|n|nan|inf", v)):
+        return v
+    return "'" + v.replace("'", "''") + "'"
+
+
 def keep_or_new(path, key, n=16, fallback=""):
     """脚本是幂等的、也鼓励重跑（补 API Key、改配置），但重跑时把已经在用的
        密码冲掉很坑：用户手上记的、浏览器存的全失效，而且他未必意识到密码变了。"""
@@ -965,7 +980,7 @@ def order_scan_paths(d, paths):
             pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                           fallback=os.path.join(d, ".env"))
             tok = (_ol_api("/api/auth/login",
-                           {"username": "admin", "password": pw},
+                           {"username": ol_user(d), "password": pw},
                            timeout=20).get("data") or {}).get("token", "")
         except Exception:
             tok = ""
@@ -1255,8 +1270,8 @@ alist:
     # 满足「内网调接口、公网给播放器」这个要求。
     base_url: http://openlist:5244
     public_url: {openlist_public_url(cfg)}
-    username: {cfg['ol_user']}
-    password: {cfg['ol_pass']}
+    username: {_yaml_scalar(cfg['ol_user'])}
+    password: {_yaml_scalar(cfg['ol_pass'])}
     otp_code:
     token:
     wait_time: 0.2          # 每次请求间隔，夸克风控较严，别调成 0
@@ -1434,8 +1449,8 @@ alist_strm:
     # 用容器内网名去问，拿回来的就是内网名，302 给手机电视就是解析不了。
     # 探不通时会自动退回内网地址，见 openlist_api_addr()。
     - addr: {openlist_api_addr(cfg)}
-      username: {cfg['ol_user']}
-      password: {cfg['ol_pass']}
+      username: {_yaml_scalar(cfg['ol_user'])}
+      password: {_yaml_scalar(cfg['ol_pass'])}
       prefix_list:
         # strm 在 Emby 里的路径前缀，必须和 AutoFilm 的 target_dir 一致
         - {STRM_PATH}
@@ -4946,7 +4961,7 @@ def do_keepalive():
     rec = {"ts": int(time.time()), "ok": False, "elapsed": 0.0, "error": ""}
     t0 = time.monotonic()
     try:
-        tok = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+        tok = (_ol_api("/api/auth/login", {"username": ol_user(d), "password": pw},
                        timeout=30).get("data") or {}).get("token", "")
         if not tok:
             raise RuntimeError("登录失败")
@@ -10337,7 +10352,7 @@ def _ol_token(d):
         pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                       fallback=os.path.join(d, ".env"))
         return (_ol_api("/api/auth/login",
-                        {"username": "admin", "password": pw},
+                        {"username": ol_user(d), "password": pw},
                         timeout=20).get("data") or {}).get("token", "")
     except Exception:
         return ""
@@ -13265,7 +13280,7 @@ def show_info():
 
     print(f"\n{YELLOW}{BOLD}▸ 各服务自己的账号{RST}")
     print(f"      Emby       {DIM}首次打开自己设{RST}")
-    print(f"      OpenList   {CYAN}{BOLD}admin{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
+    print(f"      OpenList   {CYAN}{BOLD}{ol_user(d)}{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
 
     # 【挂网盘要的令牌不在这套东西里，得去外面取】而"去哪取"是最容易卡住的一步：
     # OpenList 的驱动表单里【没有】这个链接，文档也在另一个域名下，
@@ -13409,7 +13424,7 @@ def rebuild_cfg_from_disk(d):
         "install_dir": d,
         "domain":   read_env(env_file, "DOMAIN"),
         "data_root": read_env(env_file, "DATA_ROOT") or os.path.join(d, "media"),
-        "ol_user":  "admin",
+        "ol_user":  ol_user(d),
         "ol_pass":  read_env(sec_file, "OPENLIST_PASS", fallback=env_file),
         "ba_user":  read_env(sec_file, "BA_USER", fallback=env_file) or "media",
         "ba_pass":  read_env(sec_file, "BA_PASS", fallback=env_file),
@@ -14122,7 +14137,9 @@ def main():
     # 密码单独放,不进 .env —— docker compose 读 .env 时会做变量插值,
     # 密码里出现 $ 会被当成变量引用,轻则告警重则报 invalid interpolation
     secret_file = os.path.join(cfg["install_dir"], ".secrets")
-    cfg["ol_user"] = "admin"
+    # 「7 设置 → 13」改过的用户名沿用；OpenList 的库不在了（数据清过重装）它会重新建一个 admin，那就回到 admin
+    cfg["ol_user"] = (read_env(secret_file, "OPENLIST_USER")
+                      if os.path.exists(os.path.join(cfg["install_dir"], "openlist", "config", "data.db")) else "") or "admin"
     cfg["ol_pass"] = keep_or_new(secret_file, "OPENLIST_PASS", fallback=env_file)
     cfg["ba_user"] = read_env(secret_file, "BA_USER", fallback=env_file) or "media"
     cfg["ba_pass"] = read_env(secret_file, "BA_PASS", fallback=env_file)
@@ -14195,6 +14212,7 @@ DOMAIN={cfg['domain']}
     # 密码写进独立的 .secrets（不给 docker compose 读），重跑时靠它沿用
     write_atomic(secret_file,
                  "# 由 media-stack.py 生成，供重跑时沿用已有密码。别手改。\n"
+                 f"OPENLIST_USER={cfg['ol_user']}\n"
                  f"OPENLIST_PASS={cfg['ol_pass']}\n"
                  f"BA_USER={cfg['ba_user']}\n"
                  f"BA_PASS={cfg['ba_pass']}\n", 0o600)
@@ -17169,7 +17187,7 @@ def prune_dead_strm(d, budget=None, only=None):
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                   fallback=os.path.join(d, ".env"))
     try:
-        token = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+        token = (_ol_api("/api/auth/login", {"username": ol_user(d), "password": pw},
                          timeout=30).get("data") or {}).get("token", "")
     except Exception:
         token = ""
@@ -18491,7 +18509,7 @@ def heal_media_info(d, key, budget=None, items=None, auto=False):
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                   fallback=os.path.join(d, ".env"))
     try:
-        token = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+        token = (_ol_api("/api/auth/login", {"username": ol_user(d), "password": pw},
                          timeout=30).get("data") or {}).get("token", "")
     except Exception:
         pass
@@ -21397,7 +21415,7 @@ def reload_storages(d, mounts):
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                   fallback=os.path.join(d, ".env"))
     try:
-        tok = (_ol_api("/api/auth/login", {"username": "admin", "password": pw},
+        tok = (_ol_api("/api/auth/login", {"username": ol_user(d), "password": pw},
                        timeout=15).get("data") or {}).get("token", "")
     except Exception:
         return 0
@@ -26268,6 +26286,7 @@ def params_menu():
               + (f"{CYAN}{'、'.join(n for n, _a in _eu)}{RST}" if _eu else f"{DIM}读不到{RST}"))
         _dm = read_env(os.path.join(d, ".env"), "DOMAIN") if is_installed(d) else ""
         print(f"  12. 域名证书         当前：" + (f"{CYAN}{_dm}{RST}" if _dm else f"{DIM}没有（IP:端口）{RST}"))
+        print("  13. OpenList 账号    当前：" + (f"{CYAN}{ol_user(d)}{RST}" if is_installed(d) else f"{DIM}未安装{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -26307,6 +26326,9 @@ def params_menu():
             continue          # 子菜单自己管停顿
         elif c == "12":
             emby_domain_menu()
+        elif c == "13":
+            ol_account_menu()
+            continue          # 子菜单自己管停顿
         else:
             print("无效选择。")
             continue
@@ -26668,6 +26690,181 @@ def _emby_account_menu(key, uid):
         ask("\n按回车返回...")
 
 
+# ---- 「7 设置 → 13」OpenList 账号：改用户名 / 密码 ----
+# 仓库主人 11/12：「三个用户名和密码可不可以自行设置」「OpenList用户名不可以修改吗？……能修改最好也可以做成修改」。
+# 以前用户名写死 admin、密码装的时候随机生成，想换只能去 OpenList 网页后台改 —— 可脚本自己存着一份
+# （.secrets），AutoFilm / MediaWarp 的配置里也各有一份，后台一改这三处全对不上：生成媒体库、换链、挂盘都登不上。
+# 所以改要在这里改，一次把四处都换掉：OpenList 自己 → .secrets → 两份配置（各重启一次）→ CREDENTIALS.txt。
+#   · 改用户名 = 登录后调 /api/me/update（OpenList 源码 server/handles/auth.go 的 UpdateCurrent：只动用户名，
+#     密码留空 = 不改，sso_id 原样带回去）。
+#   · 改密码 = docker exec openlist ./openlist admin set（装的时候就是这条；不用知道旧密码）。它的输出里带着管理员
+#     真正的用户名 —— 后台把用户名改乱了的，在这里重设一次密码就连用户名一起对上。
+#   · OpenList 按来访 IP 数登录失败：5 次就锁 5 分钟（脚本所有登录都是同一个 IP）。所以核对时最多错 3 次。
+#   · 常驻的换链服务 / 开播门手里的旧令牌会被 OpenList 拒（401），它们每次重登都现读 .secrets，自己就换过来了。
+# 没在真 OpenList 上跑过（会话容器里起不了），接口是照它的源码对的；测试里是照源码写的假 OpenList。
+OL_USER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")
+# 密码 8–64 位。符号只放这几个：引号、反斜杠、$、空格这类在 .secrets / 排查脚本 / 命令行里各有各的读法，不收；
+# 不许 - 开头（docker exec … admin set 会把它当成参数）
+OL_PASS_RE = re.compile(r"[A-Za-z0-9!@#%^*_+=.,:?~][A-Za-z0-9!@#%^*_+=.,:?~-]{7,63}")
+
+
+def _ol_login(user, pw, timeout=20):
+    """拿这对账号密码登 OpenList → token；登不上 → ""。"""
+    try:
+        return (_ol_api("/api/auth/login", {"username": user, "password": pw},
+                        timeout=timeout).get("data") or {}).get("token", "")
+    except Exception:
+        return ""
+
+
+def ol_rename_admin(d, new):
+    """改 OpenList 管理员的用户名。返回 "" = 成功（.secrets 已记下）；否则原因（什么都没改）。"""
+    tok = _ol_token(d)
+    if not tok:
+        return "OpenList 登不上（没起来，或账号在网页后台改过 —— 先用「2 密码」重设一次）"
+    try:
+        me = _ol_api("/api/me", None, tok, timeout=20, method="GET").get("data") or {}
+        r = _ol_api("/api/me/update", {"username": new, "password": "", "sso_id": me.get("sso_id") or ""},
+                    tok, timeout=30)
+    except Exception as e:
+        return _short_err(e)
+    if r.get("code") != 200:
+        return str(r.get("message") or "OpenList 没收下")[:80]
+    write_secret(os.path.join(d, ".secrets"), "OPENLIST_USER", new)
+    return ""
+
+
+def ol_set_admin_password(d, new):
+    """改 OpenList 管理员的密码。返回 "" = 成功（.secrets 已记下）；否则原因（什么都没改）。"""
+    sec = os.path.join(d, ".secrets")
+    old = read_env(sec, "OPENLIST_PASS", fallback=os.path.join(d, ".env"))
+    try:
+        r = subprocess.run(["docker", "exec", "openlist", "./openlist", "admin", "set", new],
+                           capture_output=True, text=True, timeout=120)
+    except Exception as e:
+        return _short_err(e)
+    if r.returncode != 0:
+        return "OpenList 没在跑（docker exec 失败）"
+    # 输出里那行 username: 是管理员真正的用户名（新版直接印，老版本带日志前缀）
+    m = re.search(r"(?m)username:\s*(\S+)\s*$", (r.stdout or "") + (r.stderr or ""))
+    name = m.group(1) if m else ol_user(d)
+    good = bool(_ol_login(name, new))
+    if not good:
+        time.sleep(2)
+        good = bool(_ol_login(name, new))
+    if not good and old and _ol_login(ol_user(d), old):
+        return "OpenList 没收下新密码，原密码没动"
+    write_secret(sec, "OPENLIST_PASS", new)
+    if name != ol_user(d):
+        write_secret(sec, "OPENLIST_USER", name)
+    return "" if good else "密码已交给 OpenList，但还登不上 —— 过一会儿在「9 体检」看「OpenList 登录」"
+
+
+def _ol_account_ready(d):
+    """改之前：AutoFilm 正在扫就不改（它手里的令牌会当场作废，这一轮白扫）；说清要重启什么，确认了才改。能改 → True。"""
+    if autofilm_busy():
+        tip("AutoFilm 正在生成媒体库，等它扫完再改")
+        return False
+    key = read_emby_api_key(d)
+    if key and someone_playing(key):
+        tip("有人在看片：改完要重启 MediaWarp，正在播的会断")
+        return ask_yn("还是现在就改？", False)
+    tip("改完会重启 MediaWarp 和 AutoFilm（各几秒）")
+    return ask_yn("确认修改？", False)
+
+
+def _ol_account_apply(d):
+    """改完：AutoFilm / MediaWarp 配置里的那对账号密码跟着换、各重启一次；CREDENTIALS.txt 重写。"""
+    cfg = rebuild_cfg_from_disk(d)
+    for path, gen, svc in ((os.path.join(d, "autofilm", "config", "config.yaml"), gen_autofilm_conf, "autofilm"),
+                           (os.path.join(d, "mediawarp", "config", "config.yaml"), gen_mediawarp_conf, "mediawarp")):
+        if not os.path.exists(path):
+            continue
+        try:
+            text = gen(cfg)                        # 先生成再写：生成抛了异常，原来那份不动
+        except Exception as e:
+            warn(f"{svc} 的配置没写成（{_short_err(e)}），「8 更新」会再写一次")
+            continue
+        write_atomic(path, text, 0o600)
+        if sh(f"docker restart {svc}", timeout=120).returncode != 0:
+            warn(f"{svc} 没重启成，用「8 更新」拉起来")
+    cred = os.path.join(d, "CREDENTIALS.txt")
+    if os.path.exists(cred):
+        write_atomic(cred, build_summary(cfg, colored=False) + "\n", 0o600)
+
+
+def ol_account_menu():
+    """「7 设置 → 13」：OpenList 管理员（登录 list.域名、挂网盘用的那个）的用户名 / 密码。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没装。")
+        ask("\n按回车返回...")
+        return
+    sec = os.path.join(d, ".secrets")
+    while True:
+        user = ol_user(d)
+        pw = read_env(sec, "OPENLIST_PASS", fallback=os.path.join(d, ".env"))
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}OpenList 账号{RST}")
+        print("-" * 60)
+        print(f"  1. 用户名            当前：{CYAN}{user}{RST}")
+        print("  2. 密码              当前：" + (f"{CYAN}{pw}{RST}" if pw else f"{YELLOW}读不到{RST}"))
+        print("  0. 返回")
+        print("-" * 60)
+        tip("只在这里改；去 OpenList 网页后台改，脚本会登不上")
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            new = ask("新用户名（回车＝不改）").strip()
+            if not new or new == user:
+                print("没改。")
+                continue
+            if not OL_USER_RE.fullmatch(new) or new.lower() == "guest":
+                warn("没改：用户名要字母开头，只能用字母、数字和 _ . -，最长 32 位")
+                continue
+            if not _ol_account_ready(d):
+                print("没改。")
+                continue
+            why = ol_rename_admin(d, new)
+            if why:
+                warn(f"没改成：{why}")
+            else:
+                _ol_account_apply(d)
+                ok(f"用户名改成「{new}」")
+                tip("网页里已登录的 OpenList 要用新用户名重新登录")
+        elif c == "2":
+            typed = ask("新密码（输 r ＝随机生成，回车＝不改）").strip()
+            if not typed:
+                print("没改。")
+                continue
+            new = rand_pw(16) if typed == "r" else typed
+            if not OL_PASS_RE.fullmatch(new):
+                warn("没改：密码要 8–64 位，只能用字母、数字和 !@#%^*_+=.,:?~-，不能 - 开头")
+                continue
+            if new == pw:
+                print("跟现在一样，没改。")
+                continue
+            if not _ol_account_ready(d):
+                print("没改。")
+                continue
+            why = ol_set_admin_password(d, new)
+            if why and read_env(sec, "OPENLIST_PASS", fallback=os.path.join(d, ".env")) != new:
+                warn(f"没改成：{why}")
+            else:
+                _ol_account_apply(d)
+                if why:
+                    warn(why)
+                else:
+                    ok("密码已改，新密码：")
+                    print(new)
+                    tip("网页里已登录的 OpenList 要用新密码重新登录")
+        else:
+            print("无效选择。")
+            continue
+        ask("\n按回车返回...")
+
+
 def _mb_txt(mb):
     """2048 → 2 GB，500 → 500 MB。"""
     return f"{mb / 1024:g} GB" if mb >= 1024 and mb % 1024 == 0 else f"{mb} MB"
@@ -26941,7 +27138,7 @@ def wait_openlist_ready(d, timeout=90):
             break
         try:
             tok = (_ol_api("/api/auth/login",
-                           {"username": "admin", "password": pw},
+                           {"username": ol_user(d), "password": pw},
                            timeout=10).get("data") or {}).get("token", "")
             if tok:
                 el = time.monotonic() - t0
@@ -27922,7 +28119,7 @@ def do_healthcheck():
     token = ""
     t0 = time.monotonic()
     try:
-        r = _ol_api("/api/auth/login", {"username": "admin", "password": pw}, timeout=30)
+        r = _ol_api("/api/auth/login", {"username": ol_user(d), "password": pw}, timeout=30)
         token = (r.get("data") or {}).get("token", "")
         _hc("OpenList 登录", "ok" if token else "bad",
             f"{time.monotonic() - t0:.1f} 秒" if token else f"{r.get('message', '没拿到 token')}")

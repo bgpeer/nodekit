@@ -24,6 +24,8 @@ echo "  ${0##*/}  版本 $TOOL_VER"
 DIR="${MS_DIR:-/opt/media-stack}"
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
+# 管理员用户名：「7 设置 → 13」改过就在 .secrets 里，没改过是 admin
+OLUSER="$(sed -nE 's/^OPENLIST_USER=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"; export MS_OLUSER="${OLUSER:-admin}"
 [ -n "$OLPW" ] || { echo "✖ 读不到 OpenList 管理密码（$DIR/.secrets 里的 OPENLIST_PASS）"; exit 1; }
 
 export OL_PW="$OLPW" OL_ONLY="${1:-}"
@@ -62,7 +64,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 try:
-    tok = (api("/api/auth/login", {"username": "admin", "password": pw},
+    tok = (api("/api/auth/login", {"username": os.environ.get("MS_OLUSER") or "admin", "password": pw},
                timeout=20).get("data") or {}).get("token", "")
 except Exception as e:
     print(f"{R}✖{X} 连不上 OpenList：{e}")
