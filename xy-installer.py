@@ -9030,7 +9030,9 @@ def privdns_menu():
                 tip = "外机的「聚合节点链接」里加上本机 links 链接，再点「更新配置」"
             elif why.startswith("DNS 拒绝"):
                 tip = "外机换过 ClientID：到外机 13 → 4 重新复制地址，本机选 2 再粘一次"
-            elif not why and dom_name and not _privdns_own_switched(c["name"]):
+            elif not why and dom_name and not _privdns_own_switched(c["name"]) and _name_covers(cert_names(), c["name"]):
+                # 证书盖得住私有名才换、才报 ✔：以前证书没盖住也印「✔ 本机订阅已换成节点专用域名」，紧跟着又是
+                # 「⚠ 证书里没有…照用公网域名」，两行打架（仓库主人 11/11 真机换完节点域名后的截图）。
                 _privdns_regen()                       # 外机刚对上：本机自己的订阅也换过去
                 print("  " + _hl("1;32", "✔ 本机订阅已换成节点专用域名，客户端刷新订阅后生效"))
         if dom_name:
