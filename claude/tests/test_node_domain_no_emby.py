@@ -51,7 +51,7 @@ check("没有「Emby 也换成」那一问，只问了新域名和 yes", len(ASK
 check("Emby 共用节点证书：计划里带着 emby_keep（新证书接着盖住它），没有 emby_new",
       PLAN and PLAN[0].get("emby_keep") == EMBY and "emby_new" not in PLAN[0])
 check("不要求给 Emby 的子域建记录（只查节点的）", RES and all(EMBY not in d for d in RES))
-check("屏上说清 Emby 不动、在哪换", "Emby（<子域>.media.zone2.example，换它在「16 自建 Emby → 7 设置 → 12 域名证书」）" in out)
+check("屏上说清 Emby 不动、在哪换", "Emby（<子域>.media.zone2.example，换它在「16 自建 Emby → 7 设置 → 10 域名证书」）" in out)
 check("「当前关联的域名」里不列 Emby 的", "list.media.zone2.example" not in out.split("▸ 换之前")[0])
 out = flow({"emby_domain": EMBY, "emby_shared": False}, [NEW, "yes"])
 check("Emby 各用各的：emby_keep 为空", PLAN and PLAN[0].get("emby_keep") == "")
