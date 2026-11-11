@@ -26,7 +26,7 @@ def run(f, *answers):
     return r, b.getvalue()
 
 print("一、面板 2 节点链接 / 订阅")
-x.read_saved_links = lambda: ["vless://u@node.example:443?security=tls#n1"]
+x.read_saved_links = lambda: ["link1"]            # 链接正文这里用不到（打印那步换成假的了）
 x._sub_service_synced = lambda: True
 x.sub_offer_cert_domain = lambda: None
 x.print_node_links = lambda links: print("LINKS")
