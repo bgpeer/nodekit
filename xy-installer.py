@@ -7026,13 +7026,14 @@ def show_links():
         ui_title("订阅链接（按客户端选一条）")
         print_sub_urls()
     ui_line()
-    # 1 只改显示名、不用重装，改完自动刷新三格式订阅；2 三格式各按上面标的模板重生成（见 cfg_refresh_all）
-    ui_items([(1, "更换节点名称前缀", None), (2, "刷新三大配置", None), (0, "返回", None)])
+    # 1 三格式各按上面标的模板重生成（见 cfg_refresh_all）；2 只改显示名、不用重装，改完自动刷新三格式订阅。
+    # 仓库主人 11/11：「把刷新三大配置换到第 1 位去因为选 1 选习惯了」——两项都在，只是对调了编号。
+    ui_items([(1, "刷新三大配置", None), (2, "更换节点名称前缀", None), (0, "返回", None)])
     c = _ask("选择: ").strip()
     if c == "1":
-        rename_prefix()
-    elif c == "2":
         cfg_refresh_all()
+    elif c == "2":
+        rename_prefix()
 
 def peers_menu():
     """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
@@ -12722,9 +12723,52 @@ def _xr_set_domain(data, old, new):
 
 _SRVNAME_RE = r'(?m)^(\s*server_name\s+)%s(\s*;)'
 
+def _nginx_names_rewrite(txt, fix):
+    """nginx 配置里每条 server_name 的名字列表过一遍 fix([名字…]) → 新列表；注释不动，别的指令一个字节不动。"""
+    def one(m):
+        names = list(dict.fromkeys(fix(m.group(2).split())))
+        return m.group(1) + " ".join(names) + m.group(3) if names else m.group(0)
+    out = []
+    for line in txt.splitlines(True):
+        code, sep, cmt = line.partition("#")
+        out.append(re.sub(r"((?:^|[\s{;])server_name\s+)([^;]+?)(\s*;)", one, code) + sep + cmt)
+    return "".join(out)
+
 def _nginx_sub_domain(txt, old, new):
-    """nginx 配置里的 server_name 改写（只认完全等于 old 的那条）。"""
-    return re.sub(_SRVNAME_RE % re.escape(old), lambda m: m.group(1) + new + m.group(2), txt)
+    """nginx 配置里 server_name 中的 old 换成 new。一行写几个名字的也认：443 那条后面跟着节点专用域名
+       （server_name 节点域名 私有名;），以前只认「整行就 old 一个」的，这条就漏了——换完域名 nginx 里还留着旧域名，
+       域名证书管理里多出「节点证书盖不住 ✗」（仓库主人 11/11 真机：「更换了那些垃圾都给我清干净」）。"""
+    return _nginx_names_rewrite(txt, lambda ns: [new if n == old else n for n in ns])
+
+def _nginx_names_heal():
+    """bgpeer.conf 的 server_name 里留着节点证书盖不住的名字（1.1.218 及以前换节点域名留下的旧域名 / 没补签的
+       节点专用域名）→ 去掉。只去「证书盖不住、又不是现在的节点域名」的，nginx -t 不过就放回原文件。清了返回一行话。"""
+    nd = node_domain()
+    if not nd or not os.path.exists(NGINX_CONF):
+        return ""
+    try:
+        txt = open(NGINX_CONF, encoding="utf-8").read()
+        have = cert_names()
+    except Exception:
+        return ""
+    if not have:
+        return ""
+    gone = []
+    def fix(ns):
+        keep = [n for n in ns if n in ("_", nd) or _name_covers(have, n)]
+        gone.extend(n for n in ns if n not in keep)
+        if len(keep) != len(ns) and nd not in keep:
+            keep = [nd] + keep                   # 去掉的是旧节点域名：这条换成现在的节点域名，别让它没了主名字
+        return keep or [nd]
+    new = _nginx_names_rewrite(txt, fix)
+    if not gone or new == txt:
+        return ""
+    open(NGINX_CONF, "w", encoding="utf-8").write(new)
+    if subprocess.run("nginx -t", shell=True, capture_output=True).returncode:
+        open(NGINX_CONF, "w", encoding="utf-8").write(txt)
+        return ""
+    sh("systemctl reload nginx", check=False)
+    return f"✔ nginx 里换域名留下的旧名字清掉了（{'、'.join(dict.fromkeys(gone))}）"
 
 def _agh_set_domain(txt, old, new):
     """AdGuardHome.yaml 顶层 tls 段里 server_name 等于 old 的那一行换成 new（引号写法也认），别的一个字节不动。
@@ -13548,6 +13592,9 @@ def main_menu():
     if fake_site_heal():
         print("  ✓ 伪装站换成了本机生成的站点（每台机器都不一样）")
     ng = _nginx_rules_heal()                     # nginx 还是老规则：重建一次（平滑重载，连着的不断）
+    if ng:
+        print("  " + ng)
+    ng = _nginx_names_heal()                     # 换节点域名留在 server_name 里的旧名字：清掉（平滑重载）
     if ng:
         print("  " + ng)
     if sr_onelink_heal():
