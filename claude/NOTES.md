@@ -27,6 +27,7 @@
 | 「8 更新」 | `update_menu`：1 立即 → `do_update`；2 每月自动开关 → cron 每天 02:30 `do_imgupdate`（3 号起、本月没做成才做，`do_update(auto=True)`） |
 | Emby 域名证书（7 设置 → 10） | `emby_domain_menu` → `emby_domain_apply`：签 `*.新底座` → `.env` → `apply_nginx_site`（不过放回）→ 首页 / AutoFilm / MediaWarp 重写重启 → 撤旧那张 |
 | Emby 账号（7 设置 → 12） | `emby_accounts_menu` → `_emby_account_menu`；改名 `emby_rename_user`（读回整份资料改 Name 再 POST），改密码 `emby_set_password`（先重置再设，第二步失败 = 没密码，要醒目报） |
+| 浏览器弹框账号（7 设置 → 11，也是 `media-stack passwd`） | `set_web_credentials`（1.5.403 改成 1 用户名 / 2 密码 / 0 返回，跟另外两个账号一个样子）→ `_web_cred_apply`（htpasswd → .secrets → CREDENTIALS → nginx reload） |
 | OpenList 账号（7 设置 → 13，1.5.401） | `ol_account_menu`；用户名 `ol_user(d)`（`.secrets` 的 `OPENLIST_USER`，没有 = admin），改名 `ol_rename_admin`（`/api/me/update`），改密码 `ol_set_admin_password`（`docker exec openlist ./openlist admin set`），收尾 `_ol_account_apply`（两份配置重写 + 各重启一次 + CREDENTIALS）。**再加 OpenList 登录的地方用 `ol_user(d)`，别写死 admin**；`tools/` 里的排查脚本同理（读 `OPENLIST_USER`） |
 | 「7 设置」的编号（1.5.402 重排） | 1 API Key / 2 MetaTube 插件 / 3 建库规则 / 4 MetaTube 生效的库 / 5 目录缓存 / 6 季集编号 / 7 几%算播完 / 8 自动截封面 / 9 自动补时长 / 10 域名证书 / 11 浏览器弹框账号 / 12 Emby 账号 / 13 OpenList 账号（仓库主人 11/12：「把三个帐号移的挨着」）。**挪编号要把屏上指路的「7 设置 → N」、docs、xy-installer 里那句一起改**，`test_settings_order.py` 把关 |
 | 截封面 | `fill_covers`；按钮 → 后台 `do_covers_mount`；生成后 / 凌晨新片 → `queue_new_covers` → `do_covers_new` |
