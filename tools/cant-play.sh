@@ -38,6 +38,8 @@ KEY="$(sed -nE 's/^[[:space:]]*auth:[[:space:]]*([^[:space:]#]+).*/\1/p' \
 [ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key（先跑「7 设置」）"; exit 1; }
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
+# 管理员用户名：「7 设置 → 13」改过就在 .secrets 里，没改过是 admin
+OLUSER="$(sed -nE 's/^OPENLIST_USER=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"; export MS_OLUSER="${OLUSER:-admin}"
 DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
 [ -n "$DATA_ROOT" ] || DATA_ROOT="$DIR/media"
 # 直链缓存时长是【按最短命的那家网盘算出来的】，不是固定值 —— 这台机器上是 9m，
@@ -422,7 +424,7 @@ if OLPW:
     try:
         req = urllib.request.Request(
             f"{OL}/api/auth/login",
-            data=json.dumps({"username": "admin", "password": OLPW}).encode(),
+            data=json.dumps({"username": os.environ.get("MS_OLUSER") or "admin", "password": OLPW}).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         tok = (json.load(urllib.request.urlopen(req, timeout=20)).get("data")
                or {}).get("token", "")

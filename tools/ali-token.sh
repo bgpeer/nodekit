@@ -118,7 +118,7 @@ def ol(path, body=None, token="", timeout=60):
 
 
 def ol_login():
-    pw = ""
+    pw, user = "", ""
     for f in (".secrets", ".env"):
         p = os.path.join(DIR, f)
         if not os.path.exists(p):
@@ -126,11 +126,13 @@ def ol_login():
         for line in open(p, encoding="utf-8", errors="replace"):
             if line.strip().startswith("OPENLIST_PASS="):
                 pw = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if line.strip().startswith("OPENLIST_USER="):      # 「7 设置 → 13」改过的管理员用户名；没改过是 admin
+                user = line.split("=", 1)[1].strip()
         if pw:
             break
     if not pw:
         die("读不到 OpenList 的管理密码（.secrets / .env 里的 OPENLIST_PASS）")
-    r = ol("/api/auth/login", {"username": "admin", "password": pw})
+    r = ol("/api/auth/login", {"username": user or "admin", "password": pw})
     tok = (r.get("data") or {}).get("token", "")
     if not tok:
         die(f"登录 OpenList 失败：{r.get('message') or r}")

@@ -27,6 +27,8 @@ DATA_ROOT="$(sed -nE 's/^DATA_ROOT=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1
 # OpenList 的密码在 .secrets，取不到就退回 .env（老版本装的写在那儿）
 OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"
 [ -n "$OLPW" ] || OLPW="$(sed -nE 's/^OPENLIST_PASS=(.*)$/\1/p' "$DIR/.env" 2>/dev/null | head -1)"
+# 管理员用户名：「7 设置 → 13」改过就在 .secrets 里，没改过是 admin
+OLUSER="$(sed -nE 's/^OPENLIST_USER=(.*)$/\1/p' "$DIR/.secrets" 2>/dev/null | head -1)"; export MS_OLUSER="${OLUSER:-admin}"
 [ -n "$KEY" ] || { echo "✖ 读不到 Emby API Key，先跑「7 设置」"; exit 1; }
 
 python3 - "$KEY" "$OLPW" "$DATA_ROOT" "$Q" <<'PY'
@@ -188,7 +190,7 @@ elif not OLPW:
 else:
     try:
         tok = (ol("/api/auth/login",
-                  {"username": "admin", "password": OLPW}).get("data")
+                  {"username": os.environ.get("MS_OLUSER") or "admin", "password": OLPW}).get("data")
                or {}).get("token", "")
         rr = ol("/api/fs/other",
                 {"path": cloud, "password": "", "method": "video_preview"},
