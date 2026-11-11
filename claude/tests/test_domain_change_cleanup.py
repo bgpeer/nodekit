@@ -61,8 +61,8 @@ check("进面板时过一遍", "ng = _nginx_names_heal()" in src)
 
 print("三、面板 2：刷新三大配置排第 1 位")
 i = src.index('ui_items([(1, "刷新三大配置", None), (2, "更换节点名称前缀", None), (0, "返回", None)])')
-seg = src[i:i + 400]
-check("1 = 刷新三大配置、2 = 更换节点名称前缀，两项都在", 'if c == "1":\n        cfg_refresh_all()' in seg and 'elif c == "2":\n        rename_prefix()' in seg)
+seg = " ".join(src[i:i + 400].split())           # 11/11 起这几行在循环里（见 test_menu_stay），缩进不作数
+check("1 = 刷新三大配置、2 = 更换节点名称前缀，两项都在", 'if c == "1": cfg_refresh_all()' in seg and 'elif c == "2": rename_prefix()' in seg)
 check("文档跟着改", "`1 刷新三大配置`" in open(os.path.join(ROOT, "docs/02-links.md"), encoding="utf-8").read()
       and "`2 更换节点名称前缀`" in open(os.path.join(ROOT, "docs/01-install.md"), encoding="utf-8").read())
 

@@ -7028,12 +7028,19 @@ def show_links():
     ui_line()
     # 1 三格式各按上面标的模板重生成（见 cfg_refresh_all）；2 只改显示名、不用重装，改完自动刷新三格式订阅。
     # 仓库主人 11/11：「把刷新三大配置换到第 1 位去因为选 1 选习惯了」——两项都在，只是对调了编号。
-    ui_items([(1, "刷新三大配置", None), (2, "更换节点名称前缀", None), (0, "返回", None)])
-    c = _ask("选择: ").strip()
-    if c == "1":
-        cfg_refresh_all()
-    elif c == "2":
-        rename_prefix()
+    # 【做完留在这一屏】仓库主人 11/11：「这个不要显示直接回退到主页」——刷新 / 改前缀做完，下面再列一遍这三项接着选；
+    # 回车或 0 才回主菜单，而且直接回、不再停一下问「按回车返回主菜单」（返回 True 告诉主菜单别停）。
+    while True:
+        ui_items([(1, "刷新三大配置", None), (2, "更换节点名称前缀", None), (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c == "1":
+            cfg_refresh_all()
+        elif c == "2":
+            rename_prefix()
+        elif c in ("0", ""):
+            return True
+        else:
+            print("无效选择。")
 
 def peers_menu():
     """聚合节点链接：顶部显示本机 .links 地址（给别人聚合用），下面加/删成员机链接。
@@ -9166,22 +9173,28 @@ def vps_check_menu():
     _vpschk_last()
     ui_line()
     # 外部 IP 检测：输入任意 IP，查画像 + 本机到它的链路 + 黑名单
-    ui_items([(1, "本机 IP 检测（约 2 分钟）", None), (2, "外部 IP 检测", None),
-              (3, "解锁检测（流媒体 / AI）", None), (0, "返回", None)])
-    c = _ask("选择: ").strip()
-    if c not in ("1", "2", "3"):
-        return
-    arg = " --unlock" if c == "3" else ""
-    if c == "2":
-        ip = _ask("要检测的 IP（IPv4 / IPv6）: ").strip()
-        try:
-            ip = str(ipaddress.ip_address(ip))
-        except ValueError:
-            print("  不是合法的 IP 地址。"); return
-        arg = " " + ip
-    if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
-        print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); return
-    _run_child(f"python3 {VPSCHK_LOCAL}{arg}")
+    # 【检测完留在这一屏】仓库主人 11/11：「检测完了应该也是可以选择的，要回主页回车也是可以回去的」——
+    # 跑完一项，下面再列一遍这几项接着选；回车或 0 直接回主菜单（返回 True 告诉主菜单别再停一下）。
+    while True:
+        ui_items([(1, "本机 IP 检测（约 2 分钟）", None), (2, "外部 IP 检测", None),
+                  (3, "解锁检测（流媒体 / AI）", None), (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c in ("0", ""):
+            return True
+        if c not in ("1", "2", "3"):
+            print("无效选择。"); continue
+        arg = " --unlock" if c == "3" else ""
+        if c == "2":
+            ip = _ask("要检测的 IP（IPv4 / IPv6）: ").strip()
+            try:
+                ip = str(ipaddress.ip_address(ip))
+            except ValueError:
+                print("  不是合法的 IP 地址。"); continue
+            arg = " " + ip
+        if not ensure_remote_script(VPSCHK_URL, VPSCHK_LOCAL):
+            print("  拉取 vps-check.py 失败，且本地无缓存。请检查网络。"); continue
+        _run_child(f"python3 {VPSCHK_LOCAL}{arg}")
+        ui_line()
 
 def _netopt_state():
     """读网络优化当前档位。返回 (mode, mb)：
@@ -13676,7 +13689,9 @@ def main_menu():
         if c == "0" or c == "":
             print("再见。"); return
         if c == "1":     install_flow()
-        elif c == "2":   show_links()
+        elif c == "2":
+            if show_links():                     # 自己那一屏里选完了才回来：不用再停一下
+                continue
         elif c == "3":   peers_menu()
         elif c == "4":   change_sni_menu()
         elif c == "5":   smux_menu()
@@ -13691,7 +13706,9 @@ def main_menu():
         elif c == "14":  ghrelay_menu()
         elif c == "15":  cert_menu()
         elif c == "16":  media_stack_menu()
-        elif c == "17":  vps_check_menu()
+        elif c == "17":
+            if vps_check_menu():                 # 自己那一屏里选完了才回来：不用再停一下
+                continue
         elif c == "18":  script_update_menu()
         elif c == "19":  update_cores()
         elif c == "20":  uninstall_all()
