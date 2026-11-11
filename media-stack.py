@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.402"
+SCRIPT_VERSION = "1.5.403"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -20186,59 +20186,80 @@ def patch_credentials_file(install_dir, user, password):
     write_atomic(p, txt, 0o600)
 
 
+def _web_cred_apply(d, user, pw):
+    """弹框账号落地：密码文件 → .secrets → CREDENTIALS.txt → nginx reload。密码文件没生成出来 → False（什么都没改）。"""
+    if not write_htpasswd(user, pw):
+        err("生成密码文件失败（没有 openssl？），没有改动。")
+        return False
+    sec = os.path.join(d, ".secrets")
+    write_secret(sec, "BA_USER", user)
+    write_secret(sec, "BA_PASS", pw)
+    patch_credentials_file(d, user, pw)
+    nginx_reload()
+    return True
+
+
 def set_web_credentials():
-    """改浏览器弹框那层的账号密码（首页入口用的那个）。"""
+    """「7 设置 → 11 浏览器弹框账号」：打开首页入口时弹的那道账号密码。也是 media-stack passwd。
+
+    仓库主人 11/12：「这个要不也修改成这样」—— 跟 Emby 账号、OpenList 账号一个样子：1 用户名 / 2 密码 / 0 返回，
+    各带当前值，改完留在这一屏。原来是先问「要修改吗」再连着问用户名、密码。"""
     d = ms_install_dir()
     if not is_installed(d):
         warn(f"还没安装（{d} 下没有 docker-compose.yml）。先选 1 安装。")
+        ask("\n按回车返回...")
         return
     sec = os.path.join(d, ".secrets")
     env = os.path.join(d, ".env")
-    cur_user = read_env(sec, "BA_USER", fallback=env) or "media"
-    cur_pass = read_env(sec, "BA_PASS", fallback=env)
-
-    if not cur_pass or not os.path.exists(HTPASSWD_FILE):
-        print()
-        warn("当前没有启用统一密码（Homepage / OpenList 是裸奔的）。")
-        warn("要启用：跑「1 安装」，在「给它们加一道统一密码」那步选是。")
-        return
-
-    print()
-    print(f"  当前用户名：{CYAN}{BOLD}{cur_user}{RST}")
-    print(f"  当前密码　：{CYAN}{BOLD}{cur_pass}{RST}")
-    print(f"  {DIM}这是首页入口的弹框；Emby / OpenList 用它们自己的账号，不受影响。{RST}")
-    if not ask_yn("要修改吗？", False):
-        print("保持不变。")
-        return
-
-    new_user = ask("新用户名（回车＝不改）", cur_user).strip() or cur_user
-    print(f"  {DIM}密码：回车＝不改；输 r ＝生成一个随机的；也可以直接输你要的。{RST}")
-    typed = ask("新密码（回车不改）").strip()
-    if typed == "r":
-        new_pass = rand_pw(16)
-    elif typed:
-        new_pass = typed
-    else:
-        new_pass = cur_pass
-
-    if new_user == cur_user and new_pass == cur_pass:
-        print("没有任何变化。")
-        return
-
-    if not write_htpasswd(new_user, new_pass):
-        err("生成密码文件失败（没有 openssl？），没有改动。")
-        return
-    write_secret(sec, "BA_USER", new_user)
-    write_secret(sec, "BA_PASS", new_pass)
-    patch_credentials_file(d, new_user, new_pass)
-    nginx_reload()
-
-    ok("已更新")
-    print()
-    print(f"      用户名  {CYAN}{BOLD}{new_user}{RST}")
-    print(f"      密  码  {CYAN}{BOLD}{new_pass}{RST}")
-    print(f"  {DIM}浏览器多半记着旧密码，下次弹框可能不弹 —— 用无痕窗口试，"
-          f"或清一下该站点的登录状态。{RST}")
+    while True:
+        user = read_env(sec, "BA_USER", fallback=env) or "media"
+        pw = read_env(sec, "BA_PASS", fallback=env)
+        print("\n" + "-" * 60)
+        print(f"  {BOLD}浏览器弹框账号{RST}")
+        print("-" * 60)
+        if not pw or not os.path.exists(HTPASSWD_FILE):
+            warn("首页入口没加密码。要加：重跑「1 安装」，在「给它加一道密码？」那步选是")
+            ask("\n按回车返回...")
+            return
+        print(f"  1. 用户名            当前：{CYAN}{user}{RST}")
+        print(f"  2. 密码              当前：{CYAN}{pw}{RST}")
+        print("  0. 返回")
+        print("-" * 60)
+        tip("打开首页入口时弹的那道；Emby / OpenList 用各自的账号")
+        c = ask("请选择").strip()
+        if c in ("0", ""):
+            return
+        if c == "1":
+            new = ask("新用户名（回车＝不改）").strip()
+            if not new or new == user:
+                print("没改。")
+                continue
+            if not re.fullmatch(r"[^\s:]{1,64}", new):
+                warn("没改：用户名不能有空格和冒号，最长 64 位")
+                continue
+            if _web_cred_apply(d, new, pw):
+                ok(f"用户名改成「{new}」")
+                tip("浏览器记着旧账号：用无痕窗口试，或清一下这个站点的登录状态")
+        elif c == "2":
+            typed = ask("新密码（输 r ＝随机生成，回车＝不改）").strip()
+            if not typed:
+                print("没改。")
+                continue
+            new = rand_pw(16) if typed == "r" else typed
+            if new == pw:
+                print("跟现在一样，没改。")
+                continue
+            if not ask_yn("把弹框密码改掉？", False):
+                print("没改。")
+                continue
+            if _web_cred_apply(d, user, new):
+                ok("密码已改，新密码：")
+                print(new)
+                tip("浏览器记着旧密码：用无痕窗口试，或清一下这个站点的登录状态")
+        else:
+            print("无效选择。")
+            continue
+        ask("\n按回车返回...")
 
 
 # ============================================================================ MetaTube
@@ -26238,7 +26259,9 @@ def params_menu():
         # 顺带把「有没有启用统一密码」也显示出来,省得进去才发现没开
         sec = os.path.join(d, ".secrets")
         has_ba = bool(read_env(sec, "BA_PASS", fallback=os.path.join(d, ".env")))
-        ba_state = (f"{GREEN}已启用{RST}" if has_ba else f"{DIM}未启用{RST}")
+        # 三个账号那三行都显示用户名（弹框账号原来只写「已启用」）
+        ba_state = (f"{CYAN}{read_env(sec, 'BA_USER', fallback=os.path.join(d, '.env')) or 'media'}{RST}"
+                    if has_ba else f"{DIM}未启用{RST}")
         # 【三个账号挨着放在最后】仓库主人 11/12：「把三个帐号移的挨着」。原来弹框账号在第 2、Emby 账号在第 11、
         # OpenList 账号在第 13，中间隔着域名证书。现在 11 / 12 / 13 连着；别的项顺次往前补，一项没少。
         print(f"  1. Emby API Key      当前：{state}")
@@ -26325,6 +26348,7 @@ def params_menu():
             emby_domain_menu()
         elif c == "11":
             set_web_credentials()
+            continue          # 子菜单自己管停顿
         elif c == "12":
             emby_accounts_menu(cur)
             continue          # 子菜单自己管停顿
