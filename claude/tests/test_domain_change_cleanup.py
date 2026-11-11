@@ -66,4 +66,9 @@ check("1 = 刷新三大配置、2 = 更换节点名称前缀，两项都在", 'i
 check("文档跟着改", "`1 刷新三大配置`" in open(os.path.join(ROOT, "docs/02-links.md"), encoding="utf-8").read()
       and "`2 更换节点名称前缀`" in open(os.path.join(ROOT, "docs/01-install.md"), encoding="utf-8").read())
 
+print("四、13 → 4 那一屏不说反话")
+i = src.index("_privdns_regen()                       # 外机刚对上")
+check("证书盖得住私有名才印「✔ 本机订阅已换成节点专用域名」（以前没盖住也印，跟下一行「照用公网域名」打架）",
+      '_name_covers(cert_names(), c["name"]):' in src[i - 420:i])
+
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

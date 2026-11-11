@@ -9030,7 +9030,9 @@ def privdns_menu():
                 tip = "外机的「聚合节点链接」里加上本机 links 链接，再点「更新配置」"
             elif why.startswith("DNS 拒绝"):
                 tip = "外机换过 ClientID：到外机 13 → 4 重新复制地址，本机选 2 再粘一次"
-            elif not why and dom_name and not _privdns_own_switched(c["name"]):
+            elif not why and dom_name and not _privdns_own_switched(c["name"]) and _name_covers(cert_names(), c["name"]):
+                # 证书盖得住私有名才换、才报 ✔：以前证书没盖住也印「✔ 本机订阅已换成节点专用域名」，紧跟着又是
+                # 「⚠ 证书里没有…照用公网域名」，两行打架（仓库主人 11/11 真机换完节点域名后的截图）。
                 _privdns_regen()                       # 外机刚对上：本机自己的订阅也换过去
                 print("  " + _hl("1;32", "✔ 本机订阅已换成节点专用域名，客户端刷新订阅后生效"))
         if dom_name:
@@ -12990,9 +12992,23 @@ def cert_change_domain_apply(new, cf_token="", emby_keep=""):
     # 节点专用域名（13 → 4）要的 *.随机段.根域名 跟着带上（同 cert_want_names）：以前这里漏了，换完域名新证书里没有它，
     # 私有名当场失效、节点退回公网域名，要人再去 13 → 4 选一次补签（仓库主人 11/11 真机：「证书里没有 *.xxx」）。
     _proot = _privdns_root()
-    if _proot and _root_domain(new) == _root_domain(_proot) and not _name_covers(names, "x." + _proot):
+    _pkeep = bool(_proot) and _root_domain(new) == _root_domain(_proot)
+    if _pkeep and not _name_covers(names, "x." + _proot):
         names.append(f"*.{_proot}")
-    need = [new, f"*.{new}"] + ([f"x.{emby_keep}"] if emby_keep else [])
+    # 【换到别的根域名】原来的私有名挂在旧根域名底下，带不走。私有解析开着（本机 / 外机）就在新根域名下起一个新的、
+    # 一起签进这张证书，换完直接用，不用再去 13 → 4 手动选一次（仓库主人 11/11：「检测到本机或外机DNS开启的时候
+    # 也要带着把证书给刷新了，除非没有自建DNS或者是关闭的情况下就用公网的域名……手动更换也是更麻烦事」）。
+    _pc = privdns_conf()
+    _pname_old, _pname_new = _pc["name"], ""
+    if _pc["mode"] != "off" and _privdns_is_domain_name(_pname_old) and not _pkeep:
+        _r2 = _root_domain(new)
+        if _privdns_public_free(_r2):
+            _pname_new = _privdns_new_name(_r2)
+            names.append("*." + _pname_new.split(".", 1)[1])
+        else:
+            print(f"{Y}  ⚠ Cloudflare 里有 *.{_r2} 泛解析，节点专用域名藏不住：这次节点照用公网域名{N}")
+    need = [new, f"*.{new}"] + ([f"x.{emby_keep}"] if emby_keep else []) \
+        + ([f"x.{_proot}"] if _pkeep else []) + ([_pname_new] if _pname_new else [])   # 私有名没盖住也要重签
     have = cert_names()
     if _name_covers(have, new) and _name_covers(have, "x." + new) and \
             (not emby_keep or _name_covers(have, "x." + emby_keep)):
@@ -13052,6 +13068,17 @@ def cert_change_domain_apply(new, cf_token="", emby_keep=""):
         print(f"{Y}  ⚠ 分享链接没改成（{e}）{N}")
     G["domain"] = new
     G["host"] = _host()
+    if _pname_new and _name_covers(cert_names(), _pname_new):
+        # 新私有名存下来，nginx 443 那条里旧的换成新的；.links 和订阅下面重新生成时就带着它。
+        # DNS 那头（本机 AdGuard / 外机）对上之前照用公网域名，对上了自动换过去（见 _privdns_local_meta 的「先问再换」）。
+        _pc.update(name=_pname_new)
+        privdns_save(_pc)
+        try:
+            _t = open(NGINX_CONF, encoding="utf-8").read()
+            open(NGINX_CONF, "w", encoding="utf-8").write(_nginx_sub_domain(_t, _pname_old, _pname_new))
+        except OSError:
+            pass
+        print(f"  节点专用域名换到新根域名底下：{_pname_new}（证书已带上；DNS 那头对上后节点自动用它）")
     try:
         build_subscription(read_saved_links(), new_token=False)
         print("  三格式订阅已按新域名重新渲染")
