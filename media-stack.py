@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.404"
+SCRIPT_VERSION = "1.5.405"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -12981,7 +12981,8 @@ def build_summary(cfg, colored=True):
         if container == "openlist":
             cred = f"{cfg['ol_user']} / {cfg['ol_pass']}"
         elif container == "emby":
-            cred = "首登自设"
+            # 密码不进 CREDENTIALS.txt：以后在「7 设置 → 12」改了这里不会跟着变，留一份过期的比不留更误导
+            cred = (f"{cfg['emby_user']} / 装的时候定的" if cfg.get("emby_ready") else "首登自设")
         else:
             cred = "—"
         lines.append("  " + pad(label, 14) + pad(url, 36) + cred)
@@ -13179,13 +13180,127 @@ def emby_users(key):
         return []
 
 
+EMBY_LOCAL = "http://127.0.0.1:8096"
+
+
 def emby_wizard_done():
     """Emby 的首次设置（建管理员账号）做完没有。问不到 → None。公开接口，不要 API Key。"""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:8096/System/Info/Public", timeout=5) as r:
+        with urllib.request.urlopen(f"{EMBY_LOCAL}/System/Info/Public", timeout=5) as r:
             return bool(json.loads(r.read() or b"{}").get("StartupWizardCompleted"))
     except Exception:
         return None
+
+
+# ---- 装的时候直接建 Emby 管理员账号、自动生成 API 密钥 ----
+# 仓库主人 11/12：「现在emby在第一次安装的时候跑代码就可以直接设定用户名和密码吗，不需要在网页去设置吗」
+# 「做，而且你说的这个能直接生成API密钥填上，这是一个非常有用的」。
+# 以前装完要：打开 Emby 网页走首次向导建账号 → 设置 → 高级 → API 密钥 → 新建 → 复制 → 回来填到「7 设置 → 1」。
+# 现在脚本替他把向导走完（/Startup/*，向导没完成前这几条不用登录）、用新账号登录、建一把密钥填进 MediaWarp。
+#   · 向导那几条照 Emby 最后一版开源代码（MediaBrowser.Api/StartupWizardService.cs）：Configuration → User →
+#     RemoteAccess → Complete。那一版的 /Startup/User 只认 Name、不收密码；新版收不收没法确认（闭源、会话容器里
+#     起不了 Emby）—— 所以密码两头都兜：向导里带上，完成后先拿它登录，登不上再拿空密码登录、登上了当场把密码设上。
+#   · 「允许远程访问」必须开：播放器是从外面经 nginx / MediaWarp 进来的，关着 Emby 只认本机。UPnP 不开。
+#   · 建密钥：POST /Auth/Keys?App=…（管理员令牌），再 GET /Auth/Keys 按 App 名取回。
+#   · 登录用的那台「设备」事后删掉，不在 Emby 的设备列表里留东西。
+# 没在真 Emby 上跑过，第一次要靠仓库主人在新机器上装一遍来验；哪一步不成屏上都说清，原来手动那条路还在。
+EMBY_KEY_APP = "MediaWarp"                 # Emby「API 密钥」页里这把钥匙叫什么：谁在用就叫谁
+_EMBY_SETUP_DEV = "setup-local"
+_EMBY_SETUP_AUTH = f'Emby UserId="", Client="Setup", Device="localhost", DeviceId="{_EMBY_SETUP_DEV}", Version="1.0"'
+
+
+def _emby_raw(path, method="GET", body=None, token="", timeout=30):
+    """不带 API Key 的 Emby 请求（首次向导、登录、拿着登录令牌办事）。只发给本机。"""
+    hd = {"X-Emby-Authorization": _EMBY_SETUP_AUTH}
+    if token:
+        hd["X-Emby-Token"] = token
+    if body is not None:
+        hd["Content-Type"] = "application/json"
+    req = urllib.request.Request(EMBY_LOCAL + path, method=method, headers=hd,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        out = r.read()
+    return json.loads(out) if out.strip() else {}
+
+
+def _emby_login(name, pw):
+    """用户名 + 密码登录 → (令牌, 用户 id)；登不上 → ("", "")。"""
+    try:
+        r = _emby_raw("/Users/AuthenticateByName", "POST", {"Username": name, "Pw": pw}, timeout=30)
+        return str(r.get("AccessToken") or ""), str((r.get("User") or {}).get("Id") or "")
+    except Exception:
+        return "", ""
+
+
+def _emby_logout(tok, drop_device=False):
+    """退掉这次登录；drop_device 连「设备」列表里那一条也删（先删设备再退出：退出后令牌就不能用了）。尽力而为。"""
+    for path, method in ([(f"/Devices?Id={_EMBY_SETUP_DEV}", "DELETE")] if drop_device else []) + [("/Sessions/Logout", "POST")]:
+        try:
+            _emby_raw(path, method, {} if method == "POST" else None, token=tok, timeout=10)
+        except Exception:
+            pass
+
+
+def emby_make_api_key(name, pw):
+    """用管理员账号登录，建一把 API 密钥 → (密钥, "")；不成 → ("", 原因)。登录的痕迹事后清掉。"""
+    tok, uid = _emby_login(name, pw)
+    if not tok:
+        return "", "这个用户名密码登不上 Emby"
+    key = ""
+    try:
+        _emby_raw(f"/Auth/Keys?App={urllib.parse.quote(EMBY_KEY_APP)}", "POST", {}, token=tok)
+        items = (_emby_raw("/Auth/Keys", token=tok) or {}).get("Items") or []
+        mine = [it for it in items if it.get("AppName") == EMBY_KEY_APP and it.get("AccessToken")]
+        mine.sort(key=lambda it: str(it.get("DateCreated") or ""))
+        key = str(mine[-1]["AccessToken"]) if mine else ""
+    except urllib.error.HTTPError as e:
+        return "", ("这个账号不是管理员，建不了密钥" if e.code in (401, 403) else f"Emby 回 {e.code}")
+    except Exception as e:
+        return "", _short_err(e)
+    finally:
+        _emby_logout(tok, drop_device=True)
+    return (key, "") if key else ("", "密钥建了但没读回来")
+
+
+def emby_first_setup(name, pw, wait_s=240):
+    """替用户走完 Emby 的首次向导：建管理员账号（name / pw）→ 建 API 密钥。
+
+    返回 (密钥, "")；不成 → ("", 原因)。原因里说清停在哪一步，调用方照着指路。"""
+    t0 = time.monotonic()
+    wiz = emby_wizard_done()
+    while wiz is None and time.monotonic() - t0 < wait_s:      # Emby 第一次启动要建库，慢的机器一两分钟
+        time.sleep(3)
+        wiz = emby_wizard_done()
+    if wiz is None:
+        return "", "Emby 还没起来"
+    if not wiz:
+        try:
+            _emby_raw("/Startup/Configuration")                 # 网页向导也是先读后写；有的版本靠这一读才把第一个账号建出来
+            _emby_raw("/Startup/Configuration", "POST",
+                      {"UICulture": "zh-CN", "MetadataCountryCode": "CN", "PreferredMetadataLanguage": "zh"})
+            _emby_raw("/Startup/User")
+            _emby_raw("/Startup/User", "POST", {"Name": name, "Password": pw, "ConnectUserName": ""})
+            _emby_raw("/Startup/RemoteAccess", "POST", {"EnableRemoteAccess": True, "EnableAutomaticPortMapping": False})
+            _emby_raw("/Startup/Complete", "POST", {})
+        except Exception as e:
+            return "", f"首次向导没走完（{_short_err(e)}）"
+        tok = _emby_login(name, pw)[0]
+        if tok:
+            _emby_logout(tok)
+        else:
+            tok, uid = _emby_login(name, "")                    # 向导没收密码的版本：账号建好了、密码是空的
+            if not tok:
+                return "", "账号建了但登不上"
+            try:
+                _emby_raw(f"/Users/{uid}/Password", "POST", {"Id": uid, "CurrentPw": "", "NewPw": pw}, token=tok)
+            except Exception as e:
+                return "", f"账号建了，密码没设上（{_short_err(e)}）—— 现在是空密码，马上去 Emby 网页设一个"
+            finally:
+                _emby_logout(tok)
+    key, why = emby_make_api_key(name, pw)
+    if not key and wiz:
+        why = f"Emby 早就设置过了，{why}"
+    return key, why
 
 
 def first_steps(d, key=None, stores=None, n_strm=None):
@@ -14128,9 +14243,21 @@ def main():
           f"和服务器在哪无关。{RST}")
     cfg["strm_cron"] = ask("strm 生成 cron（6 位：秒 分 时 日 月 周）", DEFAULT_STRM_CRON)
     print()
-    warn("MediaWarp 需要 Emby 的 API Key。首次部署时 Emby 还没初始化，这里可以留空；")
-    warn("装完按提示去 Emby 生成，再重跑本脚本填上即可（幂等，重跑安全）。")
-    cfg["emby_api_key"] = ask("Emby API Key（没有就直接回车）", "")
+    # Emby 账号 + API Key（见 emby_first_setup）：没有 Key 的（新装）在这里定管理员账号，起来后脚本替他建好、密钥自动填上；
+    # 已经有 Key 的（重跑）沿用，不再把它问丢。
+    cfg["emby_user"] = cfg["emby_pass"] = ""
+    cfg["emby_pass_made"] = False
+    _k_old = read_emby_api_key(cfg["install_dir"])
+    if _k_old:
+        cfg["emby_api_key"] = ask("Emby API Key（回车＝沿用现在的）", _k_old)
+    else:
+        cfg["emby_api_key"] = ""
+        tip("Emby 管理员账号现在就定：装完脚本替你建好，API 密钥也自动填上")
+        cfg["emby_user"] = ask("Emby 用户名（回车＝不建，装完自己去网页设）", "").strip()
+        if cfg["emby_user"]:
+            cfg["emby_pass"] = ask("Emby 密码（留空则随机生成）", "").strip()
+            if not cfg["emby_pass"]:
+                cfg["emby_pass"], cfg["emby_pass_made"] = rand_pw(16), True
     hr()
 
     env_file = os.path.join(cfg["install_dir"], ".env")
@@ -14234,8 +14361,8 @@ DOMAIN={cfg['domain']}
         for empty in ("bookmarks.yaml", "docker.yaml"):
             open(os.path.join(hp, empty), "w").close()
     ok("配置文件已生成")
-    if not cfg["emby_api_key"]:
-        warn("Emby API Key 为空，MediaWarp 暂时不会生效 —— 装完按提示补上再重跑。")
+    if not cfg["emby_api_key"] and not cfg["emby_user"]:
+        warn("Emby API Key 为空，MediaWarp 暂时不会生效 —— 装完到「7 设置 → 1」补上。")
 
     # ---- 起容器 ----
     hr()
@@ -14264,6 +14391,19 @@ DOMAIN={cfg['domain']}
         warn("自动设置 OpenList 密码失败（容器可能还在初始化）。")
         warn("配置里已写入这个密码，手动跑下面一行就能对上：")
         print(f"     docker exec openlist ./openlist admin set '{cfg['ol_pass']}'")
+
+    # ---- Emby 管理员账号 + API 密钥 ----
+    cfg["emby_ready"] = False
+    if cfg["emby_user"]:
+        info("建 Emby 管理员账号、生成 API 密钥（Emby 第一次启动要等一两分钟）...")
+        _key, _why = emby_first_setup(cfg["emby_user"], cfg["emby_pass"])
+        if _key:
+            cfg["emby_api_key"] = _key
+            cfg["emby_ready"] = True                       # 账号已经建好了；下面写配置 / 重启不成它自己会报
+            apply_emby_api_key(cfg["install_dir"], _key)
+        else:
+            warn(f"Emby 没自动设好：{_why}")
+            tip("装完打开 Emby 网页看一眼，再到「7 设置 → 1」输 a 自动生成密钥")
 
     # ---- nginx + 证书 ----
     if cfg["has_domain"] and write_nginx:
@@ -14302,6 +14442,15 @@ DOMAIN={cfg['domain']}
     print(build_summary(cfg, colored=True))
     hr()
     ok(f"部署完成！凭据已存到 {BOLD}{cred_file}{RST}（chmod 600）")
+    if cfg["emby_ready"]:
+        print()
+        print(f"{YELLOW}{BOLD}▸ Emby 管理员账号{RST}{DIM}（已建好，API 密钥已填上）{RST}")
+        print(f"      用户名   {CYAN}{BOLD}{cfg['emby_user']}{RST}")
+        if cfg["emby_pass_made"]:
+            print(f"      密  码   {DIM}随机生成的，只显示这一次：{RST}")
+            print(cfg["emby_pass"])
+        else:
+            print(f"      密  码   {DIM}你刚才定的那个{RST}")
     print()
     print(f"  以后敲 {BOLD}emby{RST} 甩出面板地址，敲 {BOLD}media-stack{RST} 看全部。")
     print()
@@ -14314,8 +14463,12 @@ DOMAIN={cfg['domain']}
           f"{DIM}（普通 Quark 驱动不支持 302，只能本机中转）{RST}")
     print(f"     {YELLOW}根文件夹ID 必须填 {BOLD}0{RST}{DIM}（填 / 或留空会返回空目录）{RST}")
     print(f"     保存 → 用网盘手机 App 扫码 → 扫完把该存储{BOLD}先禁用再启用{RST}，token 才生效")
-    print("  2) 打开 Emby 完成首次安装向导 → 设置 → 高级 → API 密钥 → 新建并复制")
-    print("  3) 重跑本脚本，在「Emby API Key」那步粘贴进去")
+    if cfg["emby_api_key"]:
+        print(f"  2) {GREEN}✔{RST} Emby 账号和 API 密钥已经就绪，这一步不用做")
+        print(f"  3) {GREEN}✔{RST} 同上")
+    else:
+        print("  2) 打开 Emby 完成首次安装向导（建管理员账号）")
+        print("  3) 重跑本脚本 → 7 设置 → 1 Emby API Key → 输 a 自动生成（也可以自己去 Emby 后台建了贴进来）")
     print(f"  4) 重跑本脚本 → {BOLD}4 生成媒体库{RST}（也可以敲 media-stack strm）")
     print(f"  5) Emby 添加媒体库，路径指向 {BOLD}{STRM_PATH}{RST}")
     print(f"  6) {YELLOW}重要{RST}：该媒体库高级设置里关掉「章节图像提取」和「实时监控」，")
@@ -14368,6 +14521,64 @@ def read_emby_api_key(install_dir=None):
     return read_env(os.path.join(d, ".secrets"), "EMBY_API_KEY")
 
 
+def apply_emby_api_key(d, key):
+    """把 API Key 写进 MediaWarp 配置（.secrets 另存一份）并重启 MediaWarp。成了 → True。"""
+    path = mediawarp_conf_path(d)
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        err(f"找不到 {path}，先跑一次「1 安装」。")
+        return False
+    hit = False
+    for i, ln in enumerate(lines):
+        m = re.match(r"^(\s*auth:)(.*)$", ln)
+        if not m:
+            continue
+        # 保留原有缩进和行尾注释，只换值
+        cm = re.search(r"(\s+#.*)$", m.group(2))
+        lines[i] = f"{m.group(1)} {key}{cm.group(1) if cm else ''}"
+        hit = True
+        break
+    if not hit:
+        err(f"{path} 里没找到 auth: 这一行，没敢乱改。请手动填。")
+        return False
+    write_atomic(path, "\n".join(lines) + "\n", 0o600)    # 原子写：写到一半被打断不会留下一份空配置
+    save_emby_api_key(d, key)      # 另存一份，配置文件出事时还能捞回来
+    ok("API Key 已写入 MediaWarp 配置")
+
+    info("重启 MediaWarp...")
+    if subprocess.run(["docker", "restart", "mediawarp"],
+                      capture_output=True).returncode != 0:
+        err("重启失败，MediaWarp 可能没在跑。用「8 更新」或 media-stack start 拉起来。")
+        return False
+    time.sleep(3)
+    ok("MediaWarp 已重启")
+    return True
+
+
+def _emby_key_auto(d):
+    """「7 设置 → 1」里输 a：自动生成 API 密钥。Emby 还没设置过就顺带把管理员账号建了。成了 → 密钥，否则 ""。"""
+    fresh = emby_wizard_done() is False
+    tip("Emby 还没设置过：现在定管理员账号，脚本替你建好" if fresh else "填 Emby 管理员的用户名和密码，脚本登录后建一把密钥（账号密码不保存）")
+    name = ask("Emby 用户名（回车取消）").strip()
+    if not name:
+        return ""
+    pw = ask("Emby 密码" + ("（留空则随机生成）" if fresh else "")).strip()
+    made = fresh and not pw
+    if made:
+        pw = rand_pw(16)
+    info("向 Emby 要密钥...")
+    key, why = emby_first_setup(name, pw, wait_s=30) if fresh else emby_make_api_key(name, pw)
+    if not key:
+        warn(f"没生成出来：{why}")
+        return ""
+    if fresh:
+        ok(f"Emby 账号「{name}」已建好" + ("，密码（只显示这一次）：" if made else ""))
+        if made:
+            print(pw)
+    return key
+
+
 def set_emby_api_key():
     """单独补 Emby API Key。
 
@@ -14394,14 +14605,20 @@ def set_emby_api_key():
     else:
         print(f"  {YELLOW}当前为空 —— 302 直链不会生效。{RST}")
     print(f"  {DIM}到哪拿：Emby → 设置 → 高级 → API 密钥 → 新建 → 复制那串字符{RST}")
+    tip("不想自己去拿：输 a 自动生成")
 
     # 循环到拿到一个能用的值为止，输错不用从菜单重来
     key = ""
     while True:
-        key = ask("Emby API Key（留空取消）").strip()
+        key = ask("Emby API Key（输 a ＝自动生成，留空取消）").strip()
         if not key:
             print("已取消，保持原样。")
             return
+        if key.lower() == "a":
+            key = _emby_key_auto(d)
+            if key:
+                break
+            continue
         # Emby 的 Key 是 32 位十六进制。不符也放行（版本差异），但提醒一句，
         # 免得把「新建 API 密钥」旁边的应用名之类的东西粘进来还查不出原因。
         if re.fullmatch(r"[0-9a-fA-F]{32}", key):
@@ -14411,31 +14628,8 @@ def set_emby_api_key():
             break
         print(f"  {DIM}那就重新贴一次，或直接回车取消。{RST}")
 
-    lines = open(path).read().splitlines()
-    hit = False
-    for i, ln in enumerate(lines):
-        m = re.match(r"^(\s*auth:)(.*)$", ln)
-        if not m:
-            continue
-        # 保留原有缩进和行尾注释，只换值
-        cm = re.search(r"(\s+#.*)$", m.group(2))
-        lines[i] = f"{m.group(1)} {key}{cm.group(1) if cm else ''}"
-        hit = True
-        break
-    if not hit:
-        err(f"{path} 里没找到 auth: 这一行，没敢乱改。请手动填。")
+    if not apply_emby_api_key(d, key):
         return
-    write_atomic(path, "\n".join(lines) + "\n", 0o600)    # 原子写：写到一半被打断不会留下一份空配置
-    save_emby_api_key(d, key)      # 另存一份，配置文件出事时还能捞回来
-    ok("API Key 已写入 MediaWarp 配置")
-
-    info("重启 MediaWarp...")
-    if subprocess.run(["docker", "restart", "mediawarp"],
-                      capture_output=True).returncode != 0:
-        err("重启失败，MediaWarp 可能没在跑。用「8 更新」或 media-stack start 拉起来。")
-        return
-    time.sleep(3)
-    ok("MediaWarp 已重启")
     print()
     print(f"  验证：{BOLD}media-stack 302{RST} 然后播一集，日志出现 302 就说明直链生效了。")
 
