@@ -46,6 +46,13 @@ def fake(path, key, method="GET", timeout=60, body=None):
         return {}
     raise AssertionError(path)
 m._emby = fake
+import tempfile
+D = tempfile.mkdtemp()
+m.ms_install_dir = lambda: D
+VERIFY = {"up": None, "good": True, "logins": []}      # 存的那份密码拿去登录验：Emby 问不到 → 不验
+m.emby_wizard_done = lambda: VERIFY["up"]
+m._emby_login = lambda name, pw: (VERIFY["logins"].append((name, pw)), ("tok", "u1") if VERIFY["good"] else ("", ""))[1]
+m._emby_logout = lambda tok, drop_device=False: None
 LOG = []
 m.heal_log = lambda lines: LOG.extend(lines)
 
@@ -96,7 +103,7 @@ pw = [c for c in CALLS if c[1].endswith("/Password")]
 check("先重置、再设新的", len(pw) == 2 and pw[0][2].get("ResetPassword") is True and pw[1][2].get("CurrentPw") == ""
       and len(pw[1][2].get("NewPw", "")) == 16)
 newpw = pw[1][2]["NewPw"]
-check("新密码顶格单独一行打一次", out.count(newpw) == 1 and (newpw + "\n") in out and ("\n" + newpw) in out)
+check("新密码顶格单独一行", (newpw + "\n") in out and ("\n" + newpw + "\n") in out)
 check("不进日志", not any(newpw in l for l in LOG))
 CALLS.clear(); FAIL_SET[0] = 1
 out = drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "abc123", "", "0", "0"], [True, True])
@@ -118,11 +125,40 @@ out = drive(lambda: m.emby_accounts_menu("K"), ["1", "2", "xyz2", "", "0", "0"],
 check("设备列表读不到：密码照改，屏上明说旧设备没踢掉、去哪手动删", "密码已改" in out and "没踢掉" in out and "手动删" in out)
 m._emby = _old
 
+print("五之二、脚本经手的密码存在 VPS 上（仓库主人 11/12：「这个密码在VPS设置的不能映射保存下来吗」）")
+import stat
+SEC = D + "/.secrets"
+check("刚才改的密码记在 .secrets（0600），按账号 id 记", m.emby_pw_get(D, "u1") == "xyz2" and stat.S_IMODE(os.stat(SEC).st_mode) == 0o600
+      and "EMBY_PW_u1=xyz2" in open(SEC).read())
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "0", "0"], [])
+check("账号那一屏「2 密码　当前：」直接显示它", "  2. 密码              当前：xyz2" in out)
+out = drive(lambda: m.emby_accounts_menu("K"), ["2", "0", "0"], [])
+check("没经过脚本的账号（网页上设的 / 没设）：不乱显示", "xyz2" not in out and ("没设" in out or "这里看不到" in out))
+m.emby_pw_save(D, "u2", "")                       # 前面第四节用脚本给账号 2 改过密码，这里要看的是「没经过脚本」的样子
+USERS["u2"]["HasPassword"] = True
+out = drive(lambda: m.emby_accounts_menu("K"), ["2", "0", "0"], [])
+check("网页上设了密码的：写「已设（在网页上设的，这里看不到）」", "已设（在网页上设的，这里看不到）" in out)
+USERS["u2"]["HasPassword"] = False
+VERIFY.update(up=True, good=True); VERIFY["logins"].clear()
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "0", "0"], [])
+check("Emby 问得到：进这一屏拿存的那份登录验一次，对 → 照常显示", VERIFY["logins"] == [("Evan2", "xyz2")] and "当前：xyz2" in out)
+VERIFY["good"] = False
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "0", "0"], [])
+check("验不过（在 Emby 网页上改过）：作废、不再显示，不留一份错的", "xyz2" not in out and m.emby_pw_get(D, "u1") == "" and "这里看不到" in out)
+VERIFY.update(up=None, good=True)
+m.emby_pw_save(D, "u1", "keep1"); USERS["u1"]["Name"] = "Renamed"
+check("按 id 记：改了名还在", m.emby_pw_get(D, "u1") == "keep1")
+m.emby_pw_remember(D, "K", "Renamed", "byname")
+check("只知道用户名时按名字找到账号再记", m.emby_pw_get(D, "u1") == "byname")
+m.emby_pw_remember(D, "K", "没有这个人", "x")
+check("找不到这个名字：不乱记", "=x" not in open(SEC).read())
+USERS["u1"]["Name"] = "Evan2"
+
 print("六、默认不改")
 CALLS.clear()
 drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "abc", "", "0", "0"], [False])
 check("确认答否 → 一个请求都不发", not any(c[1].endswith("/Password") for c in CALLS))
 ynd = re.search(r'ask_yn\(f"把「\{name\}」的密码改掉？", False\)', src)
 check("确认默认否", ynd is not None)
-check("版本 1.5.404 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 404))
+check("版本 1.5.406 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 406))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
