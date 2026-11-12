@@ -251,7 +251,7 @@ check("没自动建的：还是「首登自设」", "首登自设" in m.build_su
 check("装完密码在屏上顶格单独一行，并说以后在「2 使用信息」里看", 'print(cfg["emby_pass"])' in SRC and "以后在「2 使用信息」里看" in SRC
       and "只显示这一次" not in SRC)
 check("装的时候定的密码记进 .secrets（1.5.406）", 'emby_pw_remember(cfg["install_dir"], _key, cfg["emby_user"], cfg["emby_pass"])' in SRC)
-check("收尾那几步：密钥就绪就不再叫人去网页建", "Emby 账号和 API 密钥已经就绪" in SRC)
+check("收尾那几步：密钥就绪就不再叫人去网页建（没就绪才多一步指路）", 'if not cfg["emby_api_key"]:\n        print(f"      {_n}. 打开上面的 Emby 地址建管理员账号' in SRC)
 
 print("七、版本号")
 check("media-stack 1.5.408 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 408))

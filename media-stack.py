@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.414"
+SCRIPT_VERSION = "1.5.415"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14629,31 +14629,48 @@ def main():
     if cfg["domain"] and not have("nginx"):
         warn("没检测到 nginx，改用 IP:端口 模式。")
 
+    # 【第一次装只问域名和三组账号密码】仓库主人 11/12 重装时：「这个路径扫描不要出现在刚开始安装里面……这个路径谁知道是
+    # 什么路径啊刚开始都懵逼了，刚开始安装就应该是设置网页入口帐号密码和emby帐号密码挂载帐号密码，设置好了直接就安装成功了，
+    # 然后提示叫人家去挂路径」。所以：
+    #   · 第一次装（simple）：安装目录、媒体目录、时区、PUID/PGID、Homepage、扫描路径、cron、要不要自动配 nginx、要不要
+    #     加弹框密码 —— 全用默认值不问。扫描路径先空着，装完在「3 挂载路径」里扫码挂盘时按实际的盘加。
+    #   · 已经装着再点「1 安装（重跑可改配置）」：照旧整套都问 —— 这些项没删，想改的从这里改。
+    simple = not is_installed(ms_install_dir())
+
+    def q(prompt, default):
+        return default if simple else ask(prompt, default)
+
+    def q_yn(prompt, default):
+        return default if simple else ask_yn(prompt, default)
+
     # ---- 安装目录等 ----
-    cfg["install_dir"] = ask("安装目录（存放配置）", DEFAULT_DIR)
-    cfg["data_root"] = ask("媒体目录（存放 strm 和字幕）",
-                           cfg["install_dir"] + "/media")
-    cfg["tz"] = ask("时区", "Asia/Shanghai")
-    cfg["puid"] = ask("PUID", "0")
-    cfg["pgid"] = ask("PGID", "0")
-    cfg["homepage"] = ask_yn("装 Homepage 导航面板（推荐）？", True)
-    hr()
+    cfg["install_dir"] = q("安装目录（存放配置）", DEFAULT_DIR)
+    cfg["data_root"] = q("媒体目录（存放 strm 和字幕）",
+                         cfg["install_dir"] + "/media")
+    cfg["tz"] = q("时区", "Asia/Shanghai")
+    cfg["puid"] = q("PUID", "0")
+    cfg["pgid"] = q("PGID", "0")
+    cfg["homepage"] = q_yn("装 Homepage 导航面板（推荐）？", True)
+    if not simple:
+        hr()
 
     # ---- 网盘 ----
-    print(f"  {DIM}扫描路径：可以填一条（/quark）、多条用逗号隔开（/quark,/aliyun），{RST}")
-    print(f"  {DIM}或者填 {RST}{BOLD}y{RST}{DIM} 表示自动跟随 OpenList 里已挂载的全部存储"
-          f"（以后加网盘不用回来改）。{RST}")
+    if not simple:
+        print(f"  {DIM}扫描路径：可以填一条（/quark）、多条用逗号隔开（/quark,/aliyun），{RST}")
+        print(f"  {DIM}或者填 {RST}{BOLD}y{RST}{DIM} 表示自动跟随 OpenList 里已挂载的全部存储"
+              f"（以后加网盘不用回来改）。{RST}")
     while True:
-        cfg["scan_spec"] = parse_scan_spec(ask("扫描路径", "/quark"))
-        if cfg["scan_spec"]:
+        cfg["scan_spec"] = [] if simple else parse_scan_spec(ask("扫描路径", "/quark"))
+        if simple or cfg["scan_spec"]:
             break
         warn("填一条路径、多条逗号隔开、或者 y（自动）。")
     # 这一步 OpenList 还没挂任何网盘,auto 现在展开必然是空的 —— 那不是错,
     # 装完加了存储再点「4 生成媒体库」就会带上。这里只是先把意图记下来。
     cfg["scan_paths"] = resolve_scan_paths(cfg["install_dir"], cfg["scan_spec"])
-    print(f"  {DIM}下面这个时刻按【北京时间】算（调度器已钉在 {AUTOFILM_TZ}），"
-          f"和服务器在哪无关。{RST}")
-    cfg["strm_cron"] = ask("strm 生成 cron（6 位：秒 分 时 日 月 周）", DEFAULT_STRM_CRON)
+    if not simple:
+        print(f"  {DIM}下面这个时刻按【北京时间】算（调度器已钉在 {AUTOFILM_TZ}），"
+              f"和服务器在哪无关。{RST}")
+    cfg["strm_cron"] = q("strm 生成 cron（6 位：秒 分 时 日 月 周）", DEFAULT_STRM_CRON)
     print()
     # Emby 账号 + API Key（见 emby_first_setup）：没有 Key 的（新装）在这里定管理员账号，起来后脚本替他建好、密钥自动填上；
     # 已经有 Key 的（重跑）沿用，不再把它问丢。
@@ -14664,7 +14681,7 @@ def main():
         cfg["emby_api_key"] = ask("Emby API Key（回车＝沿用现在的）", _k_old)
     else:
         cfg["emby_api_key"] = ""
-        tip("Emby 管理员账号现在就定：装完脚本替你建好，API 密钥也自动填上")
+        print(f"\n{YELLOW}{BOLD}▸ Emby 账号{RST}{DIM}（播放器登录用；装完脚本替你建好，API 密钥也自动填上）{RST}")
         cfg["emby_user"] = ask("Emby 用户名（回车＝不建，装完自己去网页设）", "").strip()
         if cfg["emby_user"]:
             cfg["emby_pass"] = ask("Emby 密码（留空则随机生成）", "").strip()
@@ -14680,6 +14697,25 @@ def main():
     cfg["ol_user"] = (read_env(secret_file, "OPENLIST_USER")
                       if os.path.exists(os.path.join(cfg["install_dir"], "openlist", "config", "data.db")) else "") or "admin"
     cfg["ol_pass"] = keep_or_new(secret_file, "OPENLIST_PASS", fallback=env_file)
+    # 第一次装：OpenList（挂网盘用的那个后台）的账号也在这里定。用户名先照 OpenList 自己建的 admin 写配置，
+    # 容器起来、密码设好之后再改名（见下面「OpenList 密码」那段）
+    cfg["ol_user_want"] = cfg["ol_user"]
+    if simple:
+        print(f"\n{YELLOW}{BOLD}▸ OpenList 账号{RST}{DIM}（挂网盘的后台 list.域名 登录用）{RST}")
+        while True:
+            _u = ask("OpenList 用户名", cfg["ol_user"]).strip() or cfg["ol_user"]
+            if OL_USER_RE.fullmatch(_u) and _u.lower() != "guest":
+                cfg["ol_user_want"] = _u
+                break
+            warn("用户名要字母开头，只能用字母、数字和 _ . -，最长 32 位")
+        while True:
+            _p = ask("OpenList 密码（留空则随机生成）", "").strip()
+            if not _p:
+                break
+            if OL_PASS_RE.fullmatch(_p):
+                cfg["ol_pass"] = _p
+                break
+            warn("密码要 8–64 位，只能用字母、数字和 !@#%^*_+=.,:?~-，不能 - 开头")
     cfg["ba_user"] = read_env(secret_file, "BA_USER", fallback=env_file) or "media"
     cfg["ba_pass"] = read_env(secret_file, "BA_PASS", fallback=env_file)
     cfg["basic_auth"] = False
@@ -14699,7 +14735,7 @@ def main():
         if cfg["ngx_port"] != 443:
             ok(f"https 站点在 127.0.0.1:{cfg['ngx_port']}（节点的 SNI 分流架构），"
                f"新站点监听同一端口")
-        write_nginx = ask_yn("要自动配好 nginx 反代和证书吗（只新增 conf.d 文件）？", True)
+        write_nginx = q_yn("要自动配好 nginx 反代和证书吗（只新增 conf.d 文件）？", True)
 
         if write_nginx:
             if acme_has_cf_creds():
@@ -14713,13 +14749,17 @@ def main():
                 if not cf_token:
                     cfg["crt"] = ask("证书 fullchain 路径", cfg["crt"])
                     cfg["key"] = ask("证书私钥路径", cfg["key"])
-            print()
-            warn("Homepage 是零认证的，挂上公网后知道域名的人就能看到你全部服务地址。")
-            cfg["basic_auth"] = ask_yn("给它加一道密码？（Emby / OpenList 有自己的账号，不套）", True)
+            if simple:
+                print(f"\n{YELLOW}{BOLD}▸ 网页入口账号{RST}{DIM}（打开首页 home.域名 时弹的那道密码）{RST}")
+            else:
+                print()
+                warn("Homepage 是零认证的，挂上公网后知道域名的人就能看到你全部服务地址。")
+            cfg["basic_auth"] = q_yn("给它加一道密码？（Emby / OpenList 有自己的账号，不套）", True)
             if cfg["basic_auth"]:
-                cfg["ba_user"] = ask("登录用户名", cfg["ba_user"])
-                print(f"  {DIM}密码留空=自动生成随机的（更安全）；想自己定就直接输。{RST}")
-                typed = ask("登录密码（留空则随机生成）", "")
+                cfg["ba_user"] = ask("网页入口用户名" if simple else "登录用户名", cfg["ba_user"])
+                if not simple:
+                    print(f"  {DIM}密码留空=自动生成随机的（更安全）；想自己定就直接输。{RST}")
+                typed = ask("网页入口密码（留空则随机生成）" if simple else "登录密码（留空则随机生成）", "")
                 # 优先级：这次手填的 > 上次存下来的 > 新随机生成的
                 if typed:
                     cfg["ba_pass"] = typed
@@ -14799,6 +14839,20 @@ DOMAIN={cfg['domain']}
         time.sleep(3)
     if done:
         ok("OpenList 管理员密码已设置")
+        if cfg["ol_user_want"] != cfg["ol_user"]:
+            # 装的时候定的用户名：OpenList 起来、密码对上之后再改（它自己建的管理员叫 admin）
+            _why = ""
+            for _ in range(10):
+                _why = ol_rename_admin(cfg["install_dir"], cfg["ol_user_want"])
+                if not _why or "登不上" not in _why:
+                    break
+                time.sleep(3)                      # 刚起来还没准备好接登录：等一下再试
+            if _why:
+                warn(f"OpenList 用户名没改成（{_why}），现在还是 {cfg['ol_user']}；装完到「7 设置 → 13」改")
+            else:
+                cfg["ol_user"] = cfg["ol_user_want"]
+                _ol_account_apply(cfg["install_dir"])
+                ok(f"OpenList 用户名设成「{cfg['ol_user']}」")
     else:
         warn("自动设置 OpenList 密码失败（容器可能还在初始化）。")
         warn("配置里已写入这个密码，手动跑下面一行就能对上：")
@@ -14865,25 +14919,16 @@ DOMAIN={cfg['domain']}
     print()
     print(f"  以后敲 {BOLD}emby{RST} 甩出面板地址，敲 {BOLD}media-stack{RST} 看全部。")
     print()
-    warn("接下来这几步脚本代劳不了（顺序不能乱）：")
-    want = ("你在 OpenList 里挂的存储" if cfg["scan_spec"] == SCAN_AUTO
-            else "、".join(cfg["scan_paths"]) or "你填的那条路径")
-    print(f"  1) OpenList → 存储 → 添加，挂载路径填 {BOLD}{want}{RST}")
-    print(f"     {DIM}阿里云盘 / 115 / 天翼这些 OpenList 支持的网盘都可以，本套东西不挑驱动。{RST}")
-    print(f"     {YELLOW}夸克要选 {BOLD}QuarkTV{RST}{YELLOW}，不是 Quark{RST}"
-          f"{DIM}（普通 Quark 驱动不支持 302，只能本机中转）{RST}")
-    print(f"     {YELLOW}根文件夹ID 必须填 {BOLD}0{RST}{DIM}（填 / 或留空会返回空目录）{RST}")
-    print(f"     保存 → 用网盘手机 App 扫码 → 扫完把该存储{BOLD}先禁用再启用{RST}，token 才生效")
-    if cfg["emby_api_key"]:
-        print(f"  2) {GREEN}✔{RST} Emby 账号和 API 密钥已经就绪，这一步不用做")
-        print(f"  3) {GREEN}✔{RST} 同上")
-    else:
-        print("  2) 打开 Emby 完成首次安装向导（建管理员账号）")
-        print("  3) 重跑本脚本 → 7 设置 → 1 Emby API Key → 1 自动生成（也可以选 2，自己去 Emby 后台建了贴进来）")
-    print(f"  4) 重跑本脚本 → {BOLD}4 生成媒体库{RST}（也可以敲 media-stack strm）")
-    print(f"  5) Emby 添加媒体库，路径指向 {BOLD}{STRM_PATH}{RST}")
-    print(f"  6) {YELLOW}重要{RST}：该媒体库高级设置里关掉「章节图像提取」和「实时监控」，")
-    print("     否则 Emby 会为了截图去拉整部影片，把网盘刷到限流。")
+    # 【装完只说接下来做什么】原来这里列了 6 步，还是早先要去 OpenList 网页手动挂盘、去 Emby 网页建库关选项的做法 ——
+    # 这些现在脚本都代劳了（挂盘在「3 挂载路径」里扫码，建库和媒体库选项「4 生成媒体库」自己做）。
+    print(f"{YELLOW}{BOLD}▸ 接下来{RST}")
+    _n = 1
+    if not cfg["emby_api_key"]:
+        print(f"      {_n}. 打开上面的 Emby 地址建管理员账号，再到「7 设置 → 1 → 1 自动生成」填上 API 密钥")
+        _n += 1
+    print(f"      {_n}. 「3 挂载路径」里选网盘、扫码登录")
+    print(f"      {_n + 1}. 「4 生成媒体库」")
+    print(f"      {_n + 2}. 用 Emby 之类的播放器登录上面的 Emby 地址，开始看")
     print()
     print(f"  验证直链：{BOLD}media-stack 302{RST} 然后播一集，看到 302 就说明流量没走本机。")
     print()
