@@ -169,7 +169,7 @@ check("Emby 还没设置过：问用户名密码，密码留空随机生成、�
 m._emby_user_list = lambda key: [("u0", E["users"]["u0"]["Name"], True, True)]
 m.emby_pw_remember(D, "k", "boss", E["users"]["u0"]["pw"])
 check("建好的账号密码记在 .secrets，「2 使用信息」「7 设置 → 12」里看得到", m.emby_pw_get(D, "u0") == E["users"]["u0"]["pw"]
-      and "emby_pw_remember(d, key, name, pw)" in SRC and "emby_pw_get(d, i)" in SRC)
+      and "emby_pw_remember(d, key, name, pw)" in SRC and "emby_pw_get(d, _i)" in SRC)
 check("密钥写进 MediaWarp 配置（行尾注释还在）、.secrets 存一份、MediaWarp 重启",
       re.search(r"auth: [0-9a-f]{32}\s+# Emby API Key", open(MW).read()) is not None
       and m.read_env(f"{D}/.secrets", "EMBY_API_KEY") == E["keys"][-1]["AccessToken"] and ["docker", "restart", "mediawarp"] in RUN)
