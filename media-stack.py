@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.410"
+SCRIPT_VERSION = "1.5.411"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1997,7 +1997,7 @@ case "${1:-info}" in
   heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
   heal <片名>     只补名字对得上的那几个(不走队列、不查放弃名单)
                   没有时长 = Emby 存不住进度条，这条是"就让这一部先好"
-  route           网盘接口选路：把夸克接口的每个地址测一遍，走不通的避开(平时每小时自己查)
+  route           网盘接口选路：把夸克接口的每个地址测一遍，走不通的避开(平时每 5 分钟自己查)
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
@@ -2420,6 +2420,7 @@ CRON_LOCK_DIR  = "/run/lock"
 # 三条任务本身都是幂等 + 带预算的，砍掉的部分下一轮会接着做。
 CRON_TIMEOUT   = {
     "keepalive": KEEPALIVE_MIN * 60 - 120,   # 一小时一次 → 58 分钟
+    "route-tick": 240,                       # 网盘接口选路，5 分钟一次：正常几秒，给 4 分钟封顶
     "warm":      WARM_EVERY_H * 3600 - 300,  # 每小时一次 → 55 分钟
     "sync":      3 * 3600,                   # 每天一次，给足
     # 后台补时长。比自己的预算多留一截 —— timeout 是防吊死的最后一道，
@@ -4962,6 +4963,190 @@ OL_ROUTE_POOL_S = 86400       # DNS 这么久以内给过的地址，都算「�
 OL_ROUTE_MARK = "# pinned"    # 容器 hosts 里这一行是脚本钉的（名字不带脚本 / 仓库的字样）
 
 
+# 【每 5 分钟查一次 + IPv4 全坏时走 IPv6】仓库主人 11/12 看到 6 个地址里只有 1 个通：「他如果用着用着又坏了怎么办呢，
+# 都没得选」「两件一起做吧要做就做好」。
+#   · 每小时查一次太慢（钉着的那个坏了最长一小时才换）→ 单独一条 cron 每 5 分钟查（ROUTE_CRON）。它只连几个地址、
+#     必要时改容器里一行 hosts，不重启东西、不碰 Emby / MediaWarp，所以不用过 play_quiet（铁律管的是会打扰播放的活）。
+#   · IPv4 一个通的都没有时的后路：那台机器本机的 IPv6 到夸克是通的，只是容器里没有 IPv6。在本机起一个小中转
+#     （ROUTE6_UNIT，只在用得上的时候才起）：容器连一个专用的假地址 OL_ROUTE6_IP:443 → 一条 DNAT 转到中转 →
+#     中转用 IPv6 连到夸克。中转只搬字节（TLS 还是 OpenList 跟夸克之间的，证书照验），只连 OL_ROUTE_HOSTS 这一个域名，
+#     只听在容器网桥的网关地址上（公网连不到）。IPv4 一恢复就切回 IPv4、中转停掉、DNAT 撤掉。
+#   · 切过去之后从容器里实连一次，不通（比如本机防火墙挡了）就撤回、不钉，报出来。
+# 没在真机验过。
+ROUTE_CRON = "/etc/cron.d/media-stack-route"
+ROUTE_EVERY_MIN = 5
+ROUTE6_UNIT = "/etc/systemd/system/media-stack-route6.service"
+OL_ROUTE6_IP = "198.18.53.1"      # 容器里用来指代「IPv6 中转」的假地址（198.18/15 是测试用网段，公网上不会有）
+OL_ROUTE6_PORT = 9043             # 中转在本机听的端口（只听网桥网关地址）
+
+
+def _ol_gateway():
+    """OpenList 容器所在网桥的网关地址（本机在那张网里的地址）。问不到 → ""。"""
+    r = sh("docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}} {{end}}' openlist", timeout=30)
+    gw = ((r.stdout or "").split() or [""])[0] if r.returncode == 0 else ""
+    return gw if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", gw) else ""
+
+
+def _route6_rule_specs(gw):
+    return [("nat", "PREROUTING", f"-d {OL_ROUTE6_IP} -p tcp --dport 443 -j DNAT --to-destination {gw}:{OL_ROUTE6_PORT}"),
+            ("filter", "INPUT", f"-d {gw} -p tcp --dport {OL_ROUTE6_PORT} -j ACCEPT")]
+
+
+def _route6_rules(gw, on):
+    """那两条 iptables（假地址 → 中转；放行容器连中转）。on=False 撤掉。重复调用不会叠。"""
+    if not gw or not shutil.which("iptables"):
+        return False
+    good = True
+    for table, chain, spec in _route6_rule_specs(gw):
+        have = sh(f"iptables -w -t {table} -C {chain} {spec}", timeout=30).returncode == 0
+        if on and not have:
+            good = sh(f"iptables -w -t {table} -I {chain} {spec}", timeout=30).returncode == 0 and good
+        elif not on and have:
+            sh(f"iptables -w -t {table} -D {chain} {spec}", timeout=30)
+    return good
+
+
+def _route6_on():
+    """起 IPv6 中转 + 装规则。成了 → 网关地址；不成 → ""。"""
+    gw = _ol_gateway()
+    if not gw or not shutil.which("systemctl"):
+        return ""
+    unit = os.path.basename(ROUTE6_UNIT)
+    try:
+        if not os.path.exists(ROUTE6_UNIT):
+            with open(ROUTE6_UNIT, "w") as f:
+                f.write(f"""[Unit]
+Description=media-stack IPv6 relay
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {os.path.realpath(__file__)} route6-relay
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+""")
+            sh("systemctl daemon-reload", timeout=60)
+        sh(f"systemctl enable --now {unit}", timeout=60)
+    except Exception:
+        return ""
+    if not _route6_rules(gw, True):
+        return ""
+    save_ms_state(route6_gw=gw)
+    return gw
+
+
+def _route6_off():
+    """停掉 IPv6 中转、撤规则（没装过就什么都不做）。"""
+    gw = str(ms_state().get("route6_gw") or "")
+    if gw:
+        _route6_rules(gw, False)
+        save_ms_state(route6_gw="")
+    if os.path.exists(ROUTE6_UNIT):
+        sh(f"systemctl disable --now {os.path.basename(ROUTE6_UNIT)}", timeout=60)
+        try:
+            os.remove(ROUTE6_UNIT)
+            sh("systemctl daemon-reload", timeout=60)
+        except OSError:
+            pass
+
+
+def _route6_addrs(host):
+    """这个域名的 IPv6 地址里连得通的，按快慢排 → [(ip, 秒)]。本机没有 IPv6 / 都不通 → []。"""
+    try:
+        ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, socket.AF_INET6, socket.SOCK_STREAM)})
+    except OSError:
+        return []
+    res = _route_probe_all(host, ips[:8])
+    return sorted(((ip, v) for ip, v in res.items() if v is not None), key=lambda x: x[1])
+
+
+def _ol_can_reach(host):
+    """从 OpenList 容器里实连一次这个域名的 443。通（哪怕接口回 400）→ True。"""
+    try:
+        r = subprocess.run(["docker", "exec", "openlist", "wget", "-T", "8", "-O", "/dev/null", f"https://{host}/"],
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return False
+    return r.returncode == 0 or "server returned error" in ((r.stderr or "") + (r.stdout or ""))
+
+
+def _relay_pipe(a, b):
+    try:
+        while True:
+            buf = a.recv(65536)
+            if not buf:
+                break
+            b.sendall(buf)
+    except OSError:
+        pass
+    finally:
+        for sk in (a, b):
+            try:
+                sk.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def _relay_serve(cli, host):
+    """一条连接：用 IPv6 连到 host:443，两头对搬字节。不看内容（TLS 是两头之间的）。"""
+    up = None
+    try:
+        for ai in socket.getaddrinfo(host, 443, socket.AF_INET6, socket.SOCK_STREAM):
+            try:
+                up = socket.create_connection(ai[4][:2], timeout=8)
+                break
+            except OSError:
+                up = None
+        if up is None:
+            return
+        up.settimeout(None)
+        cli.settimeout(None)
+        t = threading.Thread(target=_relay_pipe, args=(up, cli), daemon=True)
+        t.start()
+        _relay_pipe(cli, up)
+        t.join(5)
+    except OSError:
+        pass
+    finally:
+        for sk in (cli, up):
+            try:
+                sk and sk.close()
+            except OSError:
+                pass
+
+
+def do_route6_relay():
+    """systemd 起的常驻：IPv6 中转。只听在容器网桥的网关地址上，只连 OL_ROUTE_HOSTS 的第一个域名。"""
+    gw = _ol_gateway() or str(ms_state().get("route6_gw") or "")
+    if not gw:
+        sys.exit(1)                               # docker 还没起来：让 systemd 过几秒再拉
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((gw, OL_ROUTE6_PORT))
+    srv.listen(64)
+    while True:
+        cli, _addr = srv.accept()
+        threading.Thread(target=_relay_serve, args=(cli, OL_ROUTE_HOSTS[0]), daemon=True).start()
+
+
+def install_route_cron():
+    """装选路的定时任务（每 ROUTE_EVERY_MIN 分钟）。"""
+    try:
+        txt = (f"# media-stack 网盘接口选路：每 {ROUTE_EVERY_MIN} 分钟把网盘接口的地址测一遍，走不通的避开。\n"
+               "SHELL=/bin/bash\n"
+               "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+               f"*/{ROUTE_EVERY_MIN} * * * * root {cron_cmd('route-tick')} >/dev/null 2>&1\n")
+        with open(ROUTE_CRON, "w") as f:
+            f.write(txt)
+        os.chmod(ROUTE_CRON, 0o644)
+        return True
+    except OSError:
+        return False
+
+
 def _route_resolve(host, rounds=6):
     """本机解析这个域名的 IPv4，多问几轮（它每次给的不一样）。问不到 → 空集。"""
     out = set()
@@ -5039,7 +5224,7 @@ def ol_route_check(d):
         pool = {ip: ts for ip, ts in (st.get("pool") or {}).items() if now - int(ts or 0) < OL_ROUTE_POOL_S}
         pool.update({ip: now for ip in _route_resolve(host)})
         was = cur.get(host, "")
-        res = _route_probe_all(host, sorted(set(pool) | ({was} if was else set())))
+        res = _route_probe_all(host, sorted(set(pool) | ({was} if was and was != OL_ROUTE6_IP else set())))
         note = ""
         if not any(v is not None for v in res.values()):
             # 手上的全坏了：重新多解析几轮，换一批再测
@@ -5050,7 +5235,12 @@ def ol_route_check(d):
         good = sorted(((ip, v) for ip, v in res.items() if v is not None), key=lambda x: x[1])
         bad = sorted(ip for ip, v in res.items() if v is None)
         dns_bad = [ip for ip in bad if ip in pool]             # DNS 还会给出来的坏地址
-        if not good:
+        via6 = False
+        if not good and host == OL_ROUTE_HOSTS[0] and _route6_addrs(host):
+            # IPv4 一个通的都没有，本机 IPv6 是通的：走中转（见上面 OL_ROUTE6_IP 那段）
+            pin, via6 = (OL_ROUTE6_IP, True) if _route6_on() else ("", False)
+            note = (note + "，" if note else "") + ("IPv4 全不通，走 IPv6 中转" if via6 else "IPv4 全不通，IPv6 中转没起来")
+        elif not good:
             pin, note = "", (note + "，" if note else "") + "全都不通，没钉"
         elif not dns_bad:
             pin = ""                                            # DNS 给的都通：交还给 DNS
@@ -5061,8 +5251,17 @@ def ol_route_check(d):
         want[host] = pin
         state[host] = {"pool": pool, "pin": pin, "ts": now, "bad": bad,
                        "good": [[ip, round(v, 2)] for ip, v in good], "note": note}
-        report.append({"host": host, "pin": pin, "was": was, "good": good, "bad": bad, "note": note})
+        report.append({"host": host, "pin": pin, "was": was, "good": good, "bad": bad, "note": note, "via6": via6})
     _ol_hosts_apply(want)
+    for r in report:
+        if r["via6"] and r["was"] != OL_ROUTE6_IP and not _ol_can_reach(r["host"]):
+            # 切过去了但容器里实连不通（本机防火墙挡了之类）：撤回，别钉着一条死路
+            want[r["host"]] = ""
+            r.update(pin="", via6=False, note="IPv4 全不通，IPv6 中转也没连通，没钉")
+            state[r["host"]].update(pin="", note=r["note"])
+            _ol_hosts_apply(want)
+    if not any(r["via6"] for r in report) and (os.path.exists(ROUTE6_UNIT) or ms_state().get("route6_gw")):
+        _route6_off()                                           # IPv4 恢复了（或中转没用上）：停掉、撤规则
     save_ms_state(ol_route=state)
     return report
 
@@ -5083,10 +5282,12 @@ def do_route():
             print(f"      {GREEN}✔{RST} {ip}　{v:.1f} 秒" + (f"　{CYAN}← OpenList 固定用它{RST}" if ip == r["pin"] else ""))
         for ip in r["bad"]:
             print(f"      {RED}✖{RST} {ip}　连不上")
-        if r["pin"]:
+        if r["via6"]:
+            ok("IPv4 全都不通，OpenList 改走本机的 IPv6 中转" + ("（刚切的）" if r["pin"] != r["was"] else ""))
+        elif r["pin"]:
             ok(f"有走不通的地址，OpenList 固定用 {r['pin']}" + ("（刚换的）" if r["pin"] != r["was"] else ""))
         elif r["bad"] and not r["good"]:
-            warn("全都不通（换了一批也一样），没钉；过一会儿自动再查")
+            warn(f"全都不通（换了一批也一样，IPv6 也没走通），没钉；{ROUTE_EVERY_MIN} 分钟后自动再查")
         else:
             ok("都通，不用钉" + ("（刚摘掉）" if r["was"] else ""))
 
@@ -14199,6 +14400,7 @@ def do_update(from_menu=False, auto=False):
     except Exception as e:
         warn(f"阿里 TV 本机续期服务没对上：{_short_err(e)}")
     install_keepalive(d)      # 保活定时任务也跟着换新（路径/频率可能变）
+    install_route_cron()      # 网盘接口选路：每 5 分钟查一次
     install_sync_cron(d)      # 老用户也补上每日对齐（这个版本才有）
     install_warm_cron(d)      # 定时预热同上
     install_heal_cron(d)      # 「有人看过片就补时长」的轻量轮，见 do_heal_tick
@@ -14333,9 +14535,13 @@ def do_uninstall(assume_yes=False):
             err("移除站点后 nginx -t 不通过，请检查（这不该发生）。")
     for p in (HTPASSWD_FILE, CLI_PATH, CLI_ALIAS, MS_STATE,
               KEEPALIVE_CRON, SYNC_CRON, WARM_CRON, SELFUP_CRON, IMGUP_CRON, TRAFFIC_CRON,
-              HEAL_CRON, META_CRON):
+              HEAL_CRON, META_CRON, ROUTE_CRON):
         if os.path.islink(p) or os.path.exists(p):
             os.remove(p)
+    try:
+        _route6_off()               # IPv6 中转和它那两条 iptables：用过就撤干净
+    except Exception:
+        pass
     jobq_cleanup_if_unused()        # 凌晨任务排队器：节点那边还在用就留着
     bcast_remove()                  # 账本数商家广播的那张表（只数不拦）
     ok("已移除密码文件和管理命令")
@@ -14609,6 +14815,7 @@ DOMAIN={cfg['domain']}
     # 全新安装时 OpenList 里还没有盘：把「按驱动给默认值」的账本立起来，之后挂的都算新盘
     mark_drive_defaults_empty(cfg["install_dir"])
     install_keepalive(cfg["install_dir"])
+    install_route_cron()
     install_sync_cron(cfg["install_dir"])
     install_warm_cron(cfg["install_dir"])
     install_heal_cron(cfg["install_dir"])
@@ -28630,11 +28837,14 @@ def do_healthcheck():
         _routes = []
     for _r in _routes:
         _lab = "接口选路 " + _r["host"].split(".")[-2]
-        if _r["pin"]:
+        if _r["via6"]:
+            _hc(_lab, "warn", f"IPv4 的 {len(_r['bad'])} 个地址全都走不通，OpenList 改走本机的 IPv6 中转"
+                + ("　刚切的" if _r["pin"] != _r["was"] else ""))
+        elif _r["pin"]:
             _hc(_lab, "ok", f"{len(_r['bad'])} 个地址走不通，OpenList 固定用通的那个（{_r['good'][0][1]:.1f} 秒）"
                 + ("　刚换的" if _r["pin"] != _r["was"] else ""))
         elif _r["bad"] and not _r["good"]:
-            _hc(_lab, "bad", f"{len(_r['bad'])} 个地址全都连不上（换了一批也一样）")
+            _hc(_lab, "bad", f"{len(_r['bad'])} 个地址全都连不上（换了一批也一样，IPv6 也没走通）")
             todo.append((f"{_r['host']} 从这台机器一个地址都连不上", "多半是线路，等一阵再跑体检；这个盘的片这会儿放不了"))
         else:
             _hc(_lab, "ok", f"{len(_r['good'])} 个地址都通")
@@ -30207,6 +30417,13 @@ if __name__ == "__main__":
             do_alitv_renewd()
         elif arg == "route":              # 网盘接口选路：手动查一遍
             require_root(); do_route()
+        elif arg == "route-tick":         # cron 每 5 分钟调的，安静跑
+            if take_task_lock("route"):
+                _d = ms_install_dir()
+                if is_installed(_d):
+                    ol_route_check(_d)
+        elif arg == "route6-relay":       # systemd 起的常驻：IPv4 全坏时的 IPv6 中转
+            do_route6_relay()
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
                 _timed("链路保活", do_keepalive)

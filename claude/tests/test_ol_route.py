@@ -46,6 +46,12 @@ m.sh = fake_sh
 m.subprocess = types.SimpleNamespace(run=fake_run)
 m._route_resolve = lambda host, rounds=6: (RES["rounds"].append(rounds), set(DNS["normal"]) | (DNS["fresh"] if rounds > 6 else set()))[1]
 m._route_probe = lambda host, ip, timeout=4: SPEED.get(ip)
+V6 = {"good": [], "on_ok": True, "reach": True, "on": 0, "off": 0}       # IPv6 后路：默认本机没有 IPv6
+REAL = {k: getattr(m, k) for k in ("_route6_addrs", "_route6_on", "_route6_off", "_ol_can_reach", "_route6_rules")}
+m._route6_addrs = lambda host: list(V6["good"])
+m._route6_on = lambda: (V6.__setitem__("on", V6["on"] + 1), m.save_ms_state(route6_gw="1.0.0.9") if V6["on_ok"] else None, "1.0.0.9" if V6["on_ok"] else "")[2]
+m._route6_off = lambda: (V6.__setitem__("off", V6["off"] + 1), m.save_ms_state(route6_gw=""))[0]
+m._ol_can_reach = lambda host: V6["reach"]
 pinned = lambda: [l for l in BOX["hosts"] if l.endswith(m.OL_ROUTE_MARK)]
 def run():
     BOX["cmds"].clear(); RES["rounds"].clear()
@@ -104,7 +110,7 @@ check("「5 链路体检」里有「接口选路」一行，全不通时进问�
 check("media-stack route 手动跑；帮助里有", 'arg == "route"' in SRC and "\n  route           网盘接口选路" in SRC)
 tick = SRC[SRC.index("def do_heal_gate"):]; tick = tick[:tick.index("\ndef ", 10)]
 check("没放进开播门（平时一直在跑的路径不添东西）", "ol_route" not in tick)
-fn = SRC[SRC.index("def _route_resolve"):SRC.index("def do_route")]
+fn = SRC[SRC.index("def _route_resolve"):SRC.index("def do_route():")]
 check("只用本机解析、只连网盘接口自己：不问公共 DNS、不发 HTTP 请求", "getaddrinfo" in fn and not re.search(r"dns-query|urlopen|doh|1\.1\.1\.1|8\.8\.8\.8|223\.5", fn))
 check("只测 IPv4（容器里只有 IPv4）；握手要验证书", "socket.AF_INET" in fn and "create_default_context().wrap_socket(raw, server_hostname=host)" in fn)
 check("钉的那行的记号不带脚本 / 仓库的名字", not re.search(r"(?i)media|stack|nodekit|bgpeer", m.OL_ROUTE_MARK))
@@ -124,6 +130,97 @@ helps = re.findall(r"(?m)^  ([a-z0-9-]+)\s{2,}\S", SRC[SRC.index("  url         
 miss = [h for h in helps if not re.search(r"(?m)^  (?:[a-z0-9|-]+\|)?%s(?:\|[a-z0-9|-]+)?\)" % re.escape(h), shell)]
 check(f"帮助里列的命令壳里都认（查了 {len(helps)} 条，缺：{miss or '无'}）", "route" in helps and not miss)
 
+print("八、IPv4 全坏时走 IPv6 中转（1.5.411，仓库主人：「用着用着又坏了怎么办呢，都没得选」「两件一起做吧要做就做好」）")
+SPEED.clear(); DNS["fresh"] = set(); V6.update(good=[("fd00::1", 0.3)], on_ok=True, reach=True, on=0, off=0)
+r = run()[0]
+check("IPv4 一个通的都没有、本机 IPv6 通：起中转，容器里把域名钉到假地址上", r["via6"] and r["pin"] == m.OL_ROUTE6_IP and V6["on"] == 1
+      and pinned() == [f"{m.OL_ROUTE6_IP} {HOST} {m.OL_ROUTE_MARK}"] and "IPv6 中转" in r["note"])
+r = run()[0]
+check("下一轮还是全坏：继续走中转；假地址自己不拿去测、不算进坏地址", r["via6"] and m.OL_ROUTE6_IP not in r["bad"] and V6["off"] == 0)
+SPEED[A] = 0.6
+r = run()[0]
+check("IPv4 有一个恢复了：切回 IPv4，中转停掉、规则撤掉", r["pin"] == A and not r["via6"] and V6["off"] == 1 and pinned() == [f"{A} {HOST} {m.OL_ROUTE_MARK}"])
+n_off = V6["off"]; run()
+check("中转没在用：不反复去停", V6["off"] == n_off)
+SPEED.clear(); V6["reach"] = False
+r = run()[0]
+check("切到中转后从容器里实连不通（比如防火墙挡了）：撤回、不钉着一条死路，说清", r["pin"] == "" and not r["via6"] and not pinned()
+      and "也没连通" in r["note"] and V6["off"] == n_off + 1)
+V6.update(reach=True, on_ok=False)
+r = run()[0]
+check("中转起不来（没有 systemctl / iptables）：不钉，说清", r["pin"] == "" and "没起来" in r["note"] and not pinned())
+V6.update(good=[], on_ok=True)
+r = run()[0]
+check("本机也没有 IPv6：跟以前一样报全都不通", r["pin"] == "" and "全都不通" in r["note"])
+V6["good"] = [("fd00::1", 0.3)]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.do_route()
+check("屏上说清走的是 IPv6 中转", "改走本机的 IPv6 中转" in plain(buf.getvalue()))
+SPEED.update({A: 0.4}); run()
+
+for k, v in REAL.items():
+    setattr(m, k, v)
+IPT = {"have": set(), "cmds": []}
+def sh_ipt(cmd, check=False, timeout=None):
+    IPT["cmds"].append(cmd)
+    mm = re.match(r"iptables -w -t (\w+) -([CID]) (\w+) (.+)$", cmd)
+    if mm:
+        key = (mm.group(1), mm.group(3), mm.group(4)); op = mm.group(2)
+        if op == "C":
+            return types.SimpleNamespace(returncode=0 if key in IPT["have"] else 1, stdout="", stderr="")
+        (IPT["have"].add if op == "I" else IPT["have"].discard)(key)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    if cmd.startswith("docker inspect"):
+        return types.SimpleNamespace(returncode=0, stdout="1.0.0.9 \n", stderr="")
+    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+m.sh = sh_ipt
+m.shutil = types.SimpleNamespace(which=lambda b: "/usr/sbin/" + b)
+check("网关地址从 docker inspect 读", m._ol_gateway() == "1.0.0.9")
+check("装规则：假地址:443 → DNAT 到网关上的中转端口；放行容器连中转", m._route6_rules("1.0.0.9", True) and IPT["have"] == {
+      ("nat", "PREROUTING", f"-d {m.OL_ROUTE6_IP} -p tcp --dport 443 -j DNAT --to-destination 1.0.0.9:{m.OL_ROUTE6_PORT}"),
+      ("filter", "INPUT", f"-d 1.0.0.9 -p tcp --dport {m.OL_ROUTE6_PORT} -j ACCEPT")})
+n = len([c for c in IPT["cmds"] if " -I " in c]); m._route6_rules("1.0.0.9", True)
+check("重复装不会叠（先 -C 查有没有）", len([c for c in IPT["cmds"] if " -I " in c]) == n)
+m._route6_rules("1.0.0.9", False)
+check("撤规则：两条都删干净", not IPT["have"])
+check("假地址在测试用网段（公网上不会有）；中转只听网桥网关地址", m.OL_ROUTE6_IP.startswith("198.18.") and "srv.bind((gw, OL_ROUTE6_PORT))" in SRC)
+
+import socket, threading
+# 真连接测中转搬字节。会话容器里没有 IPv6 回环，上游用本机回环顶替（中转只管「连上去、两头对搬」，跟地址族无关）
+up_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM); up_srv.bind(("127.0.0.1", 0)); up_srv.listen(4)
+def upstream():
+    c, _ = up_srv.accept(); data = c.recv(100); c.sendall(b"echo:" + data); c.close()
+threading.Thread(target=upstream, daemon=True).start()
+real_gai = socket.getaddrinfo
+ASKED = []
+m.socket.getaddrinfo = lambda host, port, fam=0, typ=0, *a: (ASKED.append((host, port, fam)), [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", up_srv.getsockname()[1]))])[1]
+a_sock, b_sock = socket.socketpair()
+threading.Thread(target=m._relay_serve, args=(b_sock, "relay.example"), daemon=True).start()
+a_sock.sendall(b"hello"); a_sock.settimeout(5)
+got = b""
+try:
+    while len(got) < 10:
+        ch = a_sock.recv(100)
+        if not ch:
+            break
+        got += ch
+except OSError:
+    pass
+m.socket.getaddrinfo = real_gai
+check("中转真搬字节：这头进来的送到那头，回来的原样送回（不看内容）", got == b"echo:hello")
+check("中转去连的是那个域名的 443、只要 IPv6 地址", ASKED[:1] == [("relay.example", 443, socket.AF_INET6)])
+check("中转只连 OL_ROUTE_HOSTS 里的域名（不是谁让连哪就连哪）", "args=(cli, OL_ROUTE_HOSTS[0])" in SRC)
+
+print("九、每 5 分钟查一次 + 卸载撤干净")
+check("单独一条 cron：每 5 分钟调 route-tick，带超时", m.ROUTE_EVERY_MIN == 5 and "*/{ROUTE_EVERY_MIN} * * * * root {cron_cmd('route-tick')}" in SRC
+      and m.CRON_TIMEOUT.get("route-tick", 999) < 300)
+check("route-tick 抢到锁才跑（上一轮没完不叠）", re.search(r'arg == "route-tick":.*\n\s+if take_task_lock\("route"\):', SRC) is not None)
+check("安装和「8 更新」都会装这条 cron", SRC.count("install_route_cron()") >= 3)
+un = SRC[SRC.index("KEEPALIVE_CRON, SYNC_CRON, WARM_CRON"):]; un = un[:un.index("jobq_cleanup_if_unused()")]
+check("卸载：cron 文件删掉、IPv6 中转和规则撤掉", "ROUTE_CRON" in un and "_route6_off()" in un)
+check("没放进每分钟那一轮和开播门（它自己一条 cron）", "ol_route" not in SRC[SRC.index("def do_heal_gate"):SRC.index("def do_heal_gate") + 6000])
+
 print("七、版本号")
-check("media-stack 1.5.410 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 410))
+check("media-stack 1.5.411 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 411))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
