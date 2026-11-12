@@ -33,11 +33,11 @@ def run(*answers):
 print("一、屏上的提示")
 r, out = run("")
 hint = [l for l in out.splitlines() if "编号 进下一层" in l]
-check("最上面一层：一行，编号 / y 就扫整个盘 / n 返回", len(hint) == 1 and "y 就扫整个盘" in hint[0] and hint[0].rstrip().endswith("n 返回"))
+check("最上面一层：一行，编号 / y 就扫整个盘 / n 返回 / 回车 放弃", len(hint) == 1 and "y 就扫整个盘" in hint[0] and hint[0].rstrip().endswith("n 返回　回车 放弃"))
 check("不再把 . * .. 贴路径 这一串摆在屏上", all(t not in out for t in ("* 这一层全部", ".. 上一层", "或者直接把路径贴进来", ". 就选")))
 r, out = run("2", "")
 hint = [l for l in out.splitlines() if "编号 进下一层" in l]
-check("下面的层：y 就扫这一层 / n 返回上一层", "y 就扫这一层" in hint[-1] and "n 返回上一层" in hint[-1])
+check("下面的层：y 就扫这一层 / n 返回上一层 / 回车 放弃（1.5.420）", "y 就扫这一层" in hint[-1] and "n 返回上一层　回车 放弃" in hint[-1])
 
 print("二、编号 / y / n")
 r, out = run("2", "y")
@@ -66,5 +66,5 @@ check("回车 = 取消", run("")[0] == [])
 
 print("四、所有盘共用")
 check("挑目录只有这一个函数，各个盘、「不扫的目录」都调它", SRC.count("def _pick_dirs(") == 1 and SRC.count("_pick_dirs(d, ") >= 2)
-check("media-stack 1.5.419 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 419))
+check("media-stack 1.5.419 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 420))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
