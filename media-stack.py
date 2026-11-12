@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.413"
+SCRIPT_VERSION = "1.5.414"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14611,10 +14611,10 @@ def main():
     _r0 = ".".join(node_domain.split(".")[-2:]) if node_domain.count(".") >= 1 else "域名"
     tip(f"请在 https://dash.cloudflare.com 做好一条 DNS 记录关黄云 *.ys.{_r0}（名称不想用 ys 改用其他也行）")
     if node_domain:
-        ok(f"检测到节点域名：{node_domain}")
-        # 默认否（仓库主人 10/31）：回车走 ys.根域名，跟节点分开
-        cfg["domain"] = node_domain if ask_yn("媒体服务也用这个域名？", False) \
-            else ask("你的域名（填 example.com 或 emby.example.com 都行）", f"ys.{_r0}")
+        # 【不再问「媒体服务也用这个域名？」】仓库主人 11/12 重装时：「后来要和节点域名分开，那就你应该是用那黄色提示的域名」。
+        # 10/31 已经定了 Emby 跟节点分开（各自一张证书、换域名互不干预），那一问只会让人多按一次、还可能按错。
+        # 直接问媒体服务的域名，回车 = 黄字提示的那个。真想跟节点共用的，在这里填节点域名照样行。
+        cfg["domain"] = ask("媒体服务的域名（回车＝用上面提示的）", f"ys.{_r0}")
     else:
         cfg["domain"] = ask("你的域名（没有就留空，用 IP:端口 访问）", "")
 
