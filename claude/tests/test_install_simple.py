@@ -55,11 +55,14 @@ check("网页入口：一行标题，问用户名、密码（留空随机）", "
 check("每组账号的标题都说了它是登录哪里用的", all(t in main for t in ("播放器登录用", "挂网盘的后台 list.域名 登录用", "打开首页 home.域名 时弹的那道密码")))
 
 print("四、OpenList 用户名装的时候定")
-i_set, i_ren, i_emby = main.index('ok("OpenList 管理员密码已设置")'), main.index('ol_rename_admin(cfg["install_dir"], cfg["ol_user_want"])'), main.index("emby_first_setup(")
-check("顺序：密码设好 → 改用户名 → 再去建 Emby 账号", i_set < i_ren < i_emby)
-check("配置先照 OpenList 自己建的 admin 写，改名成了再重写两份配置", 'cfg["ol_user_want"] = cfg["ol_user"]' in main and "_ol_account_apply(cfg[\"install_dir\"])" in main)
-check("OpenList 刚起来还登不上：等一下再试，不是一次不成就算了", 'if not _why or "登不上" not in _why:' in main and "time.sleep(3)" in main[i_ren:i_ren + 300])
-check("改不成：说清现在还是哪个名字、去哪改，安装继续", "装完到「7 设置 → 13」改" in main)
+i_init, i_ren, i_emby = main.index('ol_init_setup(cfg["ol_user_want"], cfg["ol_pass"])'), main.index('ol_rename_admin(_d, cfg["ol_user_want"])'), main.index("emby_first_setup(")
+check("顺序：先把 OpenList 管理员设好，再去建 Emby 账号", i_init < i_ren < i_emby)
+check("新版 OpenList（库里没有管理员）：脚本调初始化接口建，用户名一步到位", "if _st is False:\n        _why = ol_init_setup(" in main)
+check("老版本（它自己建了 admin）：照旧 admin set，再改名", '"admin", "set", cfg["ol_pass"]' in main and i_ren > 0)
+check("admin set 的退出码不算数（没管理员时它也回 0）：真登得上才算设好", 'capture_output=True).returncode == 0 and _ol_login(cfg["ol_user"], cfg["ol_pass"]):' in main)
+check("配置先照 admin 写，用户名定了再重写两份配置", 'cfg["ol_user_want"] = cfg["ol_user"]' in main and "_ol_account_apply(_d)" in main)
+check("没设好：屏上说原因 + 指路「7 设置 → 13」，不再假装 ✔", 'warn(f"OpenList 管理员账号没设好：{_why}")' in main and "7 设置 → 13 OpenList 账号" in main
+      and 'ok("OpenList 管理员密码已设置")' not in main)
 
 print("五、装完说接下来做什么")
 tail = main[main.index("▸ 接下来"):]
@@ -68,5 +71,5 @@ check("Emby 没自动建成的：多一步指路「7 设置 → 1 → 1 自动�
 check("不再叫人去 OpenList 网页手动挂盘、去 Emby 网页建库关选项（脚本都代劳了）", all(t not in main for t in ("OpenList → 存储 → 添加，挂载路径填", "Emby 添加媒体库，路径指向", "章节图像提取")))
 
 print("六、版本号")
-check("media-stack 1.5.415 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 415))
+check("media-stack 1.5.415 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 416))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

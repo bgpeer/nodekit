@@ -108,8 +108,8 @@ creds_in = lambda p: [l.strip() for l in open(p).read().splitlines() if re.match
 
 print("一、用户名从 .secrets 读，没有 = admin；没有写死的 admin 登录")
 check("没改过：ol_user = admin", m.ol_user(D) == "admin")
-check("脚本里 8 处登录都用 ol_user(d)，不再写死", '"username": "admin"' not in SRC
-      and SRC.count('{"username": ol_user(d), "password": pw}') == 8)
+check("脚本里 9 处登录都用 ol_user(d)，不再写死", '"username": "admin"' not in SRC
+      and SRC.count('{"username": ol_user(d), "password": pw}') == 9)        # _ol_token 里两处（1.5.416：没初始化的建好后再登一次）
 check("从磁盘重建的 cfg 用的是存下来的用户名", '"ol_user":  ol_user(d),' in SRC)
 tools = {f: open(os.path.join(ROOT, "tools", f), encoding="utf-8").read() for f in os.listdir(os.path.join(ROOT, "tools")) if f.endswith(".sh")}
 check("排查脚本（tools/）登录也不写死 admin：读 .secrets 的 OPENLIST_USER，没有才用 admin",
@@ -165,6 +165,46 @@ check("后台改过用户名：脚本登不上了", not m._ol_token(D)); OL["fai
 check("在这里重设一次密码：连用户名一起对上", m.ol_set_admin_password(D, "Fix1t-Again") == ""
       and sec("OPENLIST_USER") == "WebRenamed" and sec("OPENLIST_PASS") == "Fix1t-Again" and bool(m._ol_token(D)))
 
+print("四之二、新版 OpenList 第一次启动没有管理员（1.5.416，真机 11/12 全新重装：装完打开网页是「初始化 OpenList」向导）")
+check("老版本没有初始化接口：问不到 = None，照旧走老路", m.ol_init_status() is None)
+EM = "me" + "@" + "mail.example"          # 邮箱样子的用户名；拼出来，测试文件里不留邮箱（test_claude_folder）
+INIT = {"done": False, "calls": []}
+_real_api = m._ol_api
+def api_with_init(path, body, token=None, timeout=60, method="POST", ua=None):
+    if path == "/api/public/init_status":
+        return {"code": 200, "data": {"initialized": INIT["done"]}}
+    if path == "/api/public/init/setup":
+        INIT["calls"].append(dict(body))
+        if INIT["done"]:
+            return {"code": 400, "message": "system has already been initialized"}
+        OL["users"] = {body["username"]: {"pw": body["password"], "sso_id": "", "role": 2}, "guest": {"pw": "", "sso_id": "", "role": 1}}
+        INIT["done"] = True
+        return {"code": 200}
+    if path == "/api/auth/login" and not INIT["done"]:
+        return {"code": 401, "message": "Invalid username or password"}
+    return _real_api(path, body, token, timeout, method, ua)
+m._ol_api = api_with_init
+OL["fails"] = 0
+check("没初始化：状态是 False", m.ol_init_status() is False)
+tok = m._ol_token(D)
+check("登不上时发现它没初始化：按脚本存的账号密码替它建好管理员，再登上（挂盘不再报「登不上 OpenList」）",
+      bool(tok) and INIT["calls"] == [{"username": "WebRenamed", "password": "Fix1t-Again", "site_title": "OpenList"}])
+check("已经初始化的：不再去建", m.ol_ensure_admin(D) == "" and len(INIT["calls"]) == 1)
+INIT["done"] = False; INIT["calls"].clear()
+check("没初始化时改密码：admin set 这时什么都不做（还回 0），直接用新密码建管理员", m.ol_set_admin_password(D, "Init-Pass-1") == ""
+      and INIT["calls"][0]["password"] == "Init-Pass-1" and sec("OPENLIST_PASS") == "Init-Pass-1" and bool(m._ol_token(D)))
+INIT["done"] = False; INIT["calls"].clear()
+check("没初始化时改用户名：直接用新名字建，邮箱样子的用户名也行", m.ol_rename_admin(D, EM) == ""
+      and INIT["calls"][0]["username"] == EM and sec("OPENLIST_USER") == EM and bool(m._ol_token(D)))
+check("用户名规则放开 @、最长 64 位（仓库主人拿邮箱当用户名被拒过）", m.OL_USER_RE.fullmatch(EM) is not None
+      and m.OL_USER_RE.fullmatch("a" * 64) is not None and m.OL_USER_RE.fullmatch("a" * 65) is None and m.OL_USER_RE.fullmatch("1abc") is None)
+check("带 @ 的用户名写进 YAML 会加引号", m._yaml_scalar(EM) == "'" + EM + "'")
+up = SRC[SRC.index("def do_update"):]; up = up[:up.index("\ndef ", 10)]
+check("「8 更新」时发现没初始化：按脚本存的账号密码补建（1.5.415 及以前在新版 OpenList 上装的）", "ol_init_status() is False and not ol_ensure_admin(d)" in up)
+m.write_secret(SEC, "OPENLIST_USER", "WebRenamed"); m.write_secret(SEC, "OPENLIST_PASS", "Fix1t-Again")
+OL["users"] = {"WebRenamed": {"pw": "Fix1t-Again", "sso_id": "", "role": 2}, "guest": {"pw": "", "sso_id": "", "role": 1}}
+m._ol_api = _real_api; OL["fails"] = 0
+
 print("五、菜单")
 i = SRC.index("def settings_menu") if "def settings_menu" in SRC else SRC.index("13. OpenList 账号")
 check("7 设置里有第 13 项「OpenList 账号　当前：用户名」，选 13 进去", '  13. OpenList 账号    当前：' in SRC
@@ -187,7 +227,7 @@ def run(*answers, yes=True, busy=False, playing=False):
 out = run()
 check("屏：标题一行、两项各一行带当前值、0 返回、一行提示", "  OpenList 账号" in out and "  1. 用户名            当前：WebRenamed" in out
       and "  2. 密码              当前：Fix1t-Again" in out and "  0. 返回" in out and out.count("提示：") == 1)
-for badname in ("guest", "1abc", "有中文", "a b", "x" * 33):
+for badname in ("guest", "1abc", "有中文", "a b", "x" * 65):
     out = run("1", badname, "")
     check(f"用户名「{badname[:8]}」不收，没改", "没改：" in out and admin_name() == "WebRenamed" and not YN)
 CLI["calls"].clear()
@@ -244,6 +284,6 @@ with contextlib.redirect_stdout(buf):
 check("「2 使用信息」显示真的用户名，不再写死 admin", f"      用户名   mine\n      密  码   {new}" in plain(buf.getvalue()))
 
 print("七、版本号")
-check("media-stack 1.5.401 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 401))
+check("media-stack 1.5.416 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 416))
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
