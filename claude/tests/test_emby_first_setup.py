@@ -166,6 +166,10 @@ reset()
 out = run_key("a", "boss", "")
 check("Emby 还没设置过：问用户名密码，密码留空随机生成、顶格单独一行只显示一次",
       "Emby 账号「boss」已建好" in out and re.search(r"\n[A-Za-z0-9]{16}\n", out) is not None and E["done"])
+m._emby_user_list = lambda key: [("u0", E["users"]["u0"]["Name"], True, True)]
+m.emby_pw_remember(D, "k", "boss", E["users"]["u0"]["pw"])
+check("建好的账号密码记在 .secrets，「2 使用信息」「7 设置 → 12」里看得到", m.emby_pw_get(D, "u0") == E["users"]["u0"]["pw"]
+      and "emby_pw_remember(d, key, name, pw)" in SRC and "emby_pw_get(d, i)" in SRC)
 check("密钥写进 MediaWarp 配置（行尾注释还在）、.secrets 存一份、MediaWarp 重启",
       re.search(r"auth: [0-9a-f]{32}\s+# Emby API Key", open(MW).read()) is not None
       and m.read_env(f"{D}/.secrets", "EMBY_API_KEY") == E["keys"][-1]["AccessToken"] and ["docker", "restart", "mediawarp"] in RUN)
@@ -173,8 +177,7 @@ open(MW, "w").write("emby:\n  auth:      # x\n"); os.remove(f"{D}/.secrets")
 out = run_key("a", "boss", "wrong-pw", "")
 check("已经设置过、密码填错：说没生成出来，回到那一问，什么都没写", "没生成出来" in out and "auth:      # x" in open(MW).read() and not RUN)
 out = run_key("a", "boss", E["users"]["u0"]["pw"])
-check("已经设置过、填对管理员账号密码：建密钥填上；账号密码不落盘", re.search(r"auth: [0-9a-f]{32}", open(MW).read()) is not None
-      and E["users"]["u0"]["pw"] not in open(f"{D}/.secrets").read())
+check("已经设置过、填对管理员账号密码：建密钥填上", re.search(r"auth: [0-9a-f]{32}", open(MW).read()) is not None)
 open(MW, "w").write("emby:\n  auth:      # x\n")
 out = run_key("0123456789abcdef0123456789abcdef")
 check("手动贴密钥的老路还在", "auth: 0123456789abcdef0123456789abcdef" in open(MW).read())
@@ -201,7 +204,9 @@ except KeyError as e:
 check("总览里 Emby 那一行写用户名；密码不进 CREDENTIALS.txt（以后在 7 → 12 改了这里不会跟着变）", "boss / 装的时候定的" in summ and "TOPSECRET" not in summ)
 cfg["emby_ready"] = False
 check("没自动建的：还是「首登自设」", "首登自设" in m.build_summary(cfg, colored=False))
-check("随机生成的密码装完在屏上顶格单独一行显示一次", 'print(cfg["emby_pass"])' in SRC and "只显示这一次" in SRC)
+check("装完密码在屏上顶格单独一行，并说以后在「2 使用信息」里看", 'print(cfg["emby_pass"])' in SRC and "以后在「2 使用信息」里看" in SRC
+      and "只显示这一次" not in SRC)
+check("装的时候定的密码记进 .secrets（1.5.406）", 'emby_pw_remember(cfg["install_dir"], _key, cfg["emby_user"], cfg["emby_pass"])' in SRC)
 check("收尾那几步：密钥就绪就不再叫人去网页建", "Emby 账号和 API 密钥已经就绪" in SRC)
 
 print("七、版本号")

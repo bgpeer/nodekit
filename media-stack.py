@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.405"
+SCRIPT_VERSION = "1.5.406"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13232,6 +13232,40 @@ def _emby_login(name, pw):
         return "", ""
 
 
+# ---- 脚本经手的 Emby 密码存一份在 VPS 上 ----
+# 仓库主人 11/12：「这个密码在VPS设置的不能映射保存下来吗，网页版设置的估计就没办法保存，VPS设置的应该有办法吧」。
+# 原来只在屏上显示一次、不存盘，没抄下来就只能再改一次。现在凡是脚本经手的（装的时候定的、「7 设置 → 1」输 a 时用的、
+# 「7 设置 → 12」改的）都记在 .secrets（0600，只有 root 能读，跟 OpenList / 弹框密码放一起），按账号 id 记 —— 改名不丢。
+# 在 Emby 网页上改的脚本看不到：进「7 设置 → 12」那个账号时拿存的那份登录验一次，对不上就作废、不再显示（不留一份错的）。
+def emby_pw_get(d, uid):
+    return read_env(os.path.join(d, ".secrets"), f"EMBY_PW_{uid}") if uid else ""
+
+
+def emby_pw_save(d, uid, pw):
+    """记下（pw 给空 = 作废）。"""
+    if uid and (pw or emby_pw_get(d, uid)):
+        write_secret(os.path.join(d, ".secrets"), f"EMBY_PW_{uid}", pw)
+
+
+def emby_pw_remember(d, key, name, pw):
+    """只知道用户名时：按名字找到账号 id 再记。"""
+    uid = next((i for i, n, _a, _p in _emby_user_list(key) if n == name), "")
+    emby_pw_save(d, uid, pw)
+
+
+def emby_pw_checked(d, uid, name):
+    """存的那份还对不对：拿它登录一次。对 → 返回它；不对（网页上改过）→ 作废、返回 ""；Emby 问不到 → 原样返回。"""
+    pw = emby_pw_get(d, uid)
+    if not pw or emby_wizard_done() is None:
+        return pw
+    tok = _emby_login(name, pw)[0]
+    if not tok:
+        emby_pw_save(d, uid, "")
+        return ""
+    _emby_logout(tok, drop_device=True)
+    return pw
+
+
 def _emby_logout(tok, drop_device=False):
     """退掉这次登录；drop_device 连「设备」列表里那一条也删（先删设备再退出：退出后令牌就不能用了）。尽力而为。"""
     for path, method in ([(f"/Devices?Id={_EMBY_SETUP_DEV}", "DELETE")] if drop_device else []) + [("/Sessions/Logout", "POST")]:
@@ -13378,14 +13412,19 @@ def show_info():
         print(f"\n{YELLOW}{BOLD}▸ 外部播放器（Hills / Infuse / Emby App）服务器地址{RST}")
         print(f"{GREEN}{BOLD}{emby_url}{RST}")
         print(f"      端  口     {CYAN}{BOLD}{emby_port}{RST}")
-        us = emby_users(read_emby_api_key(d) or "")
+        us = _emby_user_list(read_emby_api_key(d) or "")
         if us:
             print("      账  号     " + "、".join(
                 f"{CYAN}{BOLD}{n}{RST}" + (f"{DIM}(管理员){RST}" if a else "")
-                for n, a in us))
+                for _i, n, a, _p in us))
         else:
             print(f"      账  号     {DIM}第一次打开 Emby 网页时自己建的{RST}")
-        print(f"      密  码     {DIM}你在 Emby 里自己设的{RST}")
+        # 脚本经手的密码（装的时候定的、「7 设置 → 12」改的）存在 .secrets 里，这里显示；网页上设的脚本看不到
+        _known = [(n, emby_pw_get(d, i)) for i, n, _a, _p in us if emby_pw_get(d, i)]
+        for n, pw_ in _known:
+            print(f"      密  码     {CYAN}{BOLD}{pw_}{RST}{DIM}（{n}）{RST}")
+        if len(_known) < max(1, len(us)):
+            print(f"      密  码     {DIM}" + ("其余账号：" if _known else "") + f"在 Emby 网页上设的，这里看不到{RST}")
         tip("客户端必须填这个地址；直连 8096 会绕开 302，视频全走 VPS")
 
     if ba_pass:
@@ -14400,6 +14439,7 @@ DOMAIN={cfg['domain']}
         if _key:
             cfg["emby_api_key"] = _key
             cfg["emby_ready"] = True                       # 账号已经建好了；下面写配置 / 重启不成它自己会报
+            emby_pw_remember(cfg["install_dir"], _key, cfg["emby_user"], cfg["emby_pass"])
             apply_emby_api_key(cfg["install_dir"], _key)
         else:
             warn(f"Emby 没自动设好：{_why}")
@@ -14446,11 +14486,8 @@ DOMAIN={cfg['domain']}
         print()
         print(f"{YELLOW}{BOLD}▸ Emby 管理员账号{RST}{DIM}（已建好，API 密钥已填上）{RST}")
         print(f"      用户名   {CYAN}{BOLD}{cfg['emby_user']}{RST}")
-        if cfg["emby_pass_made"]:
-            print(f"      密  码   {DIM}随机生成的，只显示这一次：{RST}")
-            print(cfg["emby_pass"])
-        else:
-            print(f"      密  码   {DIM}你刚才定的那个{RST}")
+        print(f"      密  码   {DIM}" + ("随机生成的" if cfg["emby_pass_made"] else "你刚才定的") + f"，以后在「2 使用信息」里看：{RST}")
+        print(cfg["emby_pass"])
     print()
     print(f"  以后敲 {BOLD}emby{RST} 甩出面板地址，敲 {BOLD}media-stack{RST} 看全部。")
     print()
@@ -14559,7 +14596,7 @@ def apply_emby_api_key(d, key):
 def _emby_key_auto(d):
     """「7 设置 → 1」里输 a：自动生成 API 密钥。Emby 还没设置过就顺带把管理员账号建了。成了 → 密钥，否则 ""。"""
     fresh = emby_wizard_done() is False
-    tip("Emby 还没设置过：现在定管理员账号，脚本替你建好" if fresh else "填 Emby 管理员的用户名和密码，脚本登录后建一把密钥（账号密码不保存）")
+    tip("Emby 还没设置过：现在定管理员账号，脚本替你建好" if fresh else "填 Emby 管理员的用户名和密码，脚本登录后建一把密钥")
     name = ask("Emby 用户名（回车取消）").strip()
     if not name:
         return ""
@@ -14572,8 +14609,9 @@ def _emby_key_auto(d):
     if not key:
         warn(f"没生成出来：{why}")
         return ""
+    emby_pw_remember(d, key, name, pw)             # 登得上 = 密码是对的，记一份
     if fresh:
-        ok(f"Emby 账号「{name}」已建好" + ("，密码（只显示这一次）：" if made else ""))
+        ok(f"Emby 账号「{name}」已建好" + ("，密码（以后在「2 使用信息」里看）：" if made else ""))
         if made:
             print(pw)
     return key
@@ -26873,11 +26911,15 @@ def _emby_account_menu(key, uid):
             warn("这个账号读不到了")
             return
         _i, name, adm, has_pw = u
+        _d = ms_install_dir()
+        _pw = emby_pw_checked(_d, uid, name) if has_pw else ""
         print("\n" + "-" * 60)
         print(f"  {BOLD}{name}{'（管理员）' if adm else ''}{RST}")
         print("-" * 60)
         print(f"  1. 用户名            当前：{CYAN}{name}{RST}")
-        print(f"  2. 密码              当前：" + (f"{GREEN}已设{RST}" if has_pw else f"{YELLOW}没设{RST}"))
+        # 脚本经手的密码显示出来；在 Emby 网页上设 / 改的脚本看不到，只写「已设」
+        print("  2. 密码              当前：" + (f"{CYAN}{_pw}{RST}" if _pw else f"{GREEN}已设{RST}{DIM}（在网页上设的，这里看不到）{RST}"
+                                                  if has_pw else f"{YELLOW}没设{RST}"))
         print("  0. 返回")
         print("-" * 60)
         c = ask("请选择").strip()
@@ -26912,7 +26954,8 @@ def _emby_account_menu(key, uid):
             while True:
                 good, step = emby_set_password(key, uid, new)
                 if good:
-                    ok("密码已改，新密码（只显示这一次）：")
+                    emby_pw_save(_d, uid, new)
+                    ok("密码已改，新密码：")
                     print(new)
                     _emby_kick(key, uid, name)
                     tip("每台设备都要用新密码重新登录")
