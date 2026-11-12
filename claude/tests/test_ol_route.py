@@ -25,6 +25,8 @@ T = tempfile.mkdtemp(); D = T + "/ms"; os.makedirs(D)
 open(f"{D}/docker-compose.yml", "w").write("services: {}\n")
 m.BGP_DIR, m.MS_STATE, m.CRON_LOCK_DIR = T + "/bgpeer", T + "/bgpeer/media-stack.json", T + "/lock"
 m.ms_install_dir = lambda: D
+MOUNTS = [("/quark", "QuarkTV", "work", "0", "")]          # 这台机器只挂了夸克
+m.openlist_storages = lambda d: list(MOUNTS)
 HOST = m.OL_ROUTE_HOSTS[0]
 A, B, C, E, F = "1.0.0.1", "1.0.0.2", "1.0.0.3", "1.0.0.4", "1.0.0.5"      # 测试用的占位地址
 BASE = ["127.0.0.1\tlocalhost", "1.0.0.9\topenlist-container"]
@@ -221,6 +223,38 @@ un = SRC[SRC.index("KEEPALIVE_CRON, SYNC_CRON, WARM_CRON"):]; un = un[:un.index(
 check("卸载：cron 文件删掉、IPv6 中转和规则撤掉", "ROUTE_CRON" in un and "_route6_off()" in un)
 check("没放进每分钟那一轮和开播门（它自己一条 cron）", "ol_route" not in SRC[SRC.index("def do_heal_gate"):SRC.index("def do_heal_gate") + 6000])
 
+print("十、阿里盘和 115 也查；只查挂着的盘（1.5.412，仓库主人：「那就把阿里盘和115也加上吧」）")
+m.sh = fake_sh; m.subprocess = types.SimpleNamespace(run=fake_run)
+m._route6_addrs = lambda host: []; m._route6_on = lambda: ""; m._route6_off = lambda: None; m._ol_can_reach = lambda host: True
+check("域名表（照 OpenList 驱动源码核对的）：夸克 / 阿里 / 115 列目录 / 115 换链", m.OL_ROUTE_HOSTS == (
+      "open-api-drive.quark.cn", "openapi.alipan.com", "webapi.115.com", "proapi.115.com"))
+check("IPv6 中转还是只给夸克（第一项）", m.OL_ROUTE_HOSTS[0] == "open-api-drive.quark.cn")
+check("只挂夸克的机器：只查夸克，不去连阿里 / 115", m._route_hosts(D) == ["open-api-drive.quark.cn"])
+MOUNTS[:] = [("/quark", "QuarkTV", "work", "0", ""), ("/aliyun", "AliyundriveOpen", "work", "root", "alipanTV"),
+             ("/115", "115 Cloud", "work", "0", ""), ("/dav", "WebDav", "work", "", "")]
+check("夸克、阿里、115 都挂着：四个域名都查；WebDAV 不查", m._route_hosts(D) == list(m.OL_ROUTE_HOSTS))
+BOX["hosts"] = list(BASE); SPEED.clear(); SPEED.update({A: 0.3, C: 0.5}); DNS["normal"] = {A, B, C}; DNS["fresh"] = set()
+PER = {"openapi.alipan.com": {A, B}, "webapi.115.com": {C}, "proapi.115.com": {A, C}, HOST: {A, C}}
+m._route_resolve = lambda host, rounds=6: set(PER.get(host, set()))
+m.save_ms_state(ol_route={})
+rep_ = {r["host"]: r for r in run()}
+check("每个域名各管各的：阿里有一个地址不通 → 只给阿里钉；别的都通 → 不钉",
+      rep_["openapi.alipan.com"]["pin"] == A and all(rep_[h]["pin"] == "" for h in (HOST, "webapi.115.com", "proapi.115.com"))
+      and pinned() == [f"{A} openapi.alipan.com {m.OL_ROUTE_MARK}"])
+check("报告里带中文名，体检和屏上用它", [rep_[h]["name"] for h in m.OL_ROUTE_HOSTS] == ["夸克", "阿里", "115 列目录", "115 换链"])
+MOUNTS[:] = [("/quark", "QuarkTV", "work", "0", "")]
+run()
+check("阿里盘撤掉以后：给阿里钉的那行跟着摘掉", not pinned())
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.do_route()
+check("手动跑的屏：标题是中文名 + 域名", "▸ 夸克  open-api-drive.quark.cn" in plain(buf.getvalue()))
+MOUNTS[:] = [("/dav", "WebDav", "work", "", "")]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.do_route()
+check("只挂了 WebDAV：说清没查，不报错", "没查" in plain(buf.getvalue()))
+
 print("七、版本号")
-check("media-stack 1.5.411 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 411))
+check("media-stack 1.5.412 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 412))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

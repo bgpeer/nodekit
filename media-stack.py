@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.411"
+SCRIPT_VERSION = "1.5.412"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4957,7 +4957,20 @@ def keepalive_state(d):
 #   · 容器重建后 hosts 会回到原样：每次检查都读一遍容器里的现状，没有就补上
 # 挂在每小时的保活、「5 链路体检」、「8 更新」上，也能手动跑 media-stack route。没放进每分钟那一轮（铁律：
 # 平时一直在跑的路径上加东西要单独上、等仓库主人实测）。
-OL_ROUTE_HOSTS = ("open-api-drive.quark.cn",)      # 夸克 TV 的接口（OpenList 的 QuarkTV 驱动连它）
+# 哪种盘查哪几个域名（仓库主人 11/12：「那就把阿里盘和115也加上吧」）。域名是照 OpenList 驱动的源码核对的，不是凭印象：
+#   · QuarkTV        drivers/quark_uc_tv   → open-api-drive.quark.cn
+#   · AliyundriveOpen drivers/aliyundrive_open → openapi.alipan.com
+#   · 115 Cloud      SheltonZhu/115driver  → webapi.115.com（列目录、文件信息）、proapi.115.com（换下载地址）
+# 【只查挂着的盘】没挂 115 的机器不去连 115（见 _route_hosts）。WebDAV 不加：地址各人不同，视频本来就过 VPS。
+# 全通时什么都不做，只有「DNS 给的地址里有连不上的」才介入。IPv6 中转只给第一项（夸克）—— 假地址只有一个。
+OL_ROUTE_TABLE = (
+    ("quark",  "open-api-drive.quark.cn", "夸克"),
+    ("aliyun", "openapi.alipan.com",      "阿里"),
+    ("115",    "webapi.115.com",          "115 列目录"),
+    ("115",    "proapi.115.com",          "115 换链"),
+)
+OL_ROUTE_HOSTS = tuple(h for _k, h, _n in OL_ROUTE_TABLE)
+OL_ROUTE_NAME = {h: n for _k, h, n in OL_ROUTE_TABLE}
 OL_ROUTE_T = 4                # 每个地址最多等几秒：好的 1 秒内，坏的是干等到超时
 OL_ROUTE_POOL_S = 86400       # DNS 这么久以内给过的地址，都算「它还会给」
 OL_ROUTE_MARK = "# pinned"    # 容器 hosts 里这一行是脚本钉的（名字不带脚本 / 仓库的字样）
@@ -5147,6 +5160,12 @@ def install_route_cron():
         return False
 
 
+def _route_hosts(d):
+    """这台机器要查的域名：OpenList 里挂着哪种盘就查哪种（驱动名里带 quark / aliyun / 115）。"""
+    drvs = [str(x[1] or "").lower() for x in openlist_storages(d)]
+    return [h for key, h, _n in OL_ROUTE_TABLE if any(key in dv for dv in drvs)]
+
+
 def _route_resolve(host, rounds=6):
     """本机解析这个域名的 IPv4，多问几轮（它每次给的不一样）。问不到 → 空集。"""
     out = set()
@@ -5219,7 +5238,7 @@ def ol_route_check(d):
     now = int(time.time())
     state = dict(ms_state().get("ol_route") or {})
     report, want = [], {}
-    for host in OL_ROUTE_HOSTS:
+    for host in _route_hosts(d):
         st = state.get(host) or {}
         pool = {ip: ts for ip, ts in (st.get("pool") or {}).items() if now - int(ts or 0) < OL_ROUTE_POOL_S}
         pool.update({ip: now for ip in _route_resolve(host)})
@@ -5251,7 +5270,8 @@ def ol_route_check(d):
         want[host] = pin
         state[host] = {"pool": pool, "pin": pin, "ts": now, "bad": bad,
                        "good": [[ip, round(v, 2)] for ip, v in good], "note": note}
-        report.append({"host": host, "pin": pin, "was": was, "good": good, "bad": bad, "note": note, "via6": via6})
+        report.append({"host": host, "name": OL_ROUTE_NAME.get(host, host), "pin": pin, "was": was, "good": good, "bad": bad,
+                       "note": note, "via6": via6})
     _ol_hosts_apply(want)
     for r in report:
         if r["via6"] and r["was"] != OL_ROUTE6_IP and not _ol_can_reach(r["host"]):
@@ -5274,10 +5294,10 @@ def do_route():
         return
     rep = ol_route_check(d)
     if not rep:
-        warn("OpenList 容器没在跑，没查。")
+        warn("没查：OpenList 容器没在跑，或者没挂夸克 / 阿里 / 115 这几种盘。")
         return
     for r in rep:
-        print(f"\n{YELLOW}{BOLD}▸ {r['host']}{RST}")
+        print(f"\n{YELLOW}{BOLD}▸ {r['name']}{RST}  {DIM}{r['host']}{RST}")
         for ip, v in r["good"]:
             print(f"      {GREEN}✔{RST} {ip}　{v:.1f} 秒" + (f"　{CYAN}← OpenList 固定用它{RST}" if ip == r["pin"] else ""))
         for ip in r["bad"]:
@@ -28836,7 +28856,7 @@ def do_healthcheck():
     except Exception:
         _routes = []
     for _r in _routes:
-        _lab = "接口选路 " + _r["host"].split(".")[-2]
+        _lab = "接口选路 " + _r["name"]
         if _r["via6"]:
             _hc(_lab, "warn", f"IPv4 的 {len(_r['bad'])} 个地址全都走不通，OpenList 改走本机的 IPv6 中转"
                 + ("　刚切的" if _r["pin"] != _r["was"] else ""))
