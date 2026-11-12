@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.409"
+SCRIPT_VERSION = "1.5.410"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -2217,6 +2217,12 @@ case "${1:-info}" in
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
     shift || true
     exec python3 "$S" play-report "$@" ;;
+  route)
+    # 【壳里必须有它】1.5.409 只在 Python 那头加了 route，这个壳的 case 里没有 —— 仓库主人敲下去就是「未知命令」（真机 11/12）。
+    # 再加命令：Python 的 arg == "x" 和这里的 case 两头都要有（test_ol_route.py 把关）
+    S=/etc/bgpeer/media-stack.py
+    [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
+    exec python3 "$S" route ;;
   play-check)
     S=/etc/bgpeer/media-stack.py
     [[ -f "$S" ]] || { echo "找不到 ${S}"; exit 1; }
@@ -14139,6 +14145,10 @@ def do_update(from_menu=False, auto=False):
     # 【老版本 OpenList（alist v3）还有「网站 URL」这个设置，有就顺手填上】
     # v4 已经把它去掉了，那边靠的是上面重新生成的 mediawarp 配置里那个 addr。
     ensure_openlist_site_url(d, cfg, quiet=True)
+    try:
+        ol_route_check(d)             # 网盘接口选路：更新完当场查一遍（OpenList 容器刚重建过的话，钉的那行在这里补上）
+    except Exception:
+        pass
     # 【OpenList 换了新容器 → 等它起好再让 MediaWarp 重新登录】真机 10/25：「8 更新」把 OpenList 换成新版，
     # MediaWarp 手里的令牌跟着作废（或者跟 OpenList 一起起来、登录时 OpenList 还没好），之后除了开播门
     # 先替它取好的那一集，别的集一点就闪退。每小时那一轮最多晚一小时才修 —— 更新这条路上当场修。
