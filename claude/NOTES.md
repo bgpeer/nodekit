@@ -308,6 +308,14 @@
   （DNAT、INPUT 放行、容器里实连这几步都只在测试里走过）。**新加 `media-stack xxx` 命令要在 bash 壳的 case 里也登记**（1.5.409 漏过，敲下去是「未知命令」）。
   表象曾被误会成「换 API Key 换坏了」—— 其实是换 Key 重启 MediaWarp 清了直链缓存，夸克每一集都得重新去要。
 
+- **新版 OpenList 新装后库里没有管理员（11/12 真机全新重装踩到）**：只有给了环境变量 `OPENLIST_ADMIN_PASSWORD` 才自己建 admin，否则等网页向导
+  `POST /api/public/init/setup`；`GET /api/public/init_status` 看状态。这时 `./openlist admin set` 报 failed get admin user 但**退出码 0**，
+  1.5.415 及以前就这样印了个假的 ✔，之后所有 OpenList 登录都失败（挂盘报「登不上 OpenList」）。1.5.416：`ol_init_status` / `ol_init_setup` /
+  `ol_ensure_admin`，安装、`_ol_token` 登不上时、「8 更新」、进「7 设置 → 13」都会补建。**外部命令的退出码不能当成功的证据，要拿结果验**。
+  同一次重装验到的：`emby_first_setup` 在真 Emby（4.10）上通了，账号和 API 密钥都自动建好。
+- **扫码挂盘不问路径（1.5.416）**：`ask_mount` 默认路径没被占就不问；挂上后 `scan_whole_mount` 把扫描路径填成整个盘 + 一行提示。
+  之前那一问是仓库主人自己要的（想挂成 `/115网盘`），11/12 他重装时在这一问里填了网盘里的文件夹，改口不要问了。
+
 ## 仓库主人的偏好
 
 - 屏上精简、整齐；危险操作醒目一行 + 默认否；功能不许悄悄删。

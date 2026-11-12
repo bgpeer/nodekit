@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.415"
+SCRIPT_VERSION = "1.5.416"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -10736,9 +10736,16 @@ def _ol_token(d):
     try:
         pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                       fallback=os.path.join(d, ".env"))
-        return (_ol_api("/api/auth/login",
-                        {"username": ol_user(d), "password": pw},
-                        timeout=20).get("data") or {}).get("token", "")
+        tok = (_ol_api("/api/auth/login",
+                       {"username": ol_user(d), "password": pw},
+                       timeout=20).get("data") or {}).get("token", "")
+        if not tok and ol_init_status() is False and not ol_ensure_admin(d):
+            # 【只在登不上时才走到这】新版 OpenList 新装后库里没有管理员（见 ol_init_status 那段）：真机 11/12 全新重装，
+            # 「3 挂载路径」里扫码挂盘报「登不上 OpenList（它在跑吗？）」。按脚本存的账号密码替它建好，再登一次
+            tok = (_ol_api("/api/auth/login",
+                           {"username": ol_user(d), "password": pw},
+                           timeout=20).get("data") or {}).get("token", "")
+        return tok
     except Exception:
         return ""
 
@@ -14370,6 +14377,11 @@ def do_update(from_menu=False, auto=False):
         ol_route_check(d)             # 网盘接口选路：更新完当场查一遍（OpenList 容器刚重建过的话，钉的那行在这里补上）
     except Exception:
         pass
+    try:
+        if ol_init_status() is False and not ol_ensure_admin(d):   # 1.5.415 及以前在新版 OpenList 上装的：管理员其实没建出来
+            ok("OpenList 还没初始化，已按脚本里存的账号密码建好管理员")
+    except Exception:
+        pass
     # 【OpenList 换了新容器 → 等它起好再让 MediaWarp 重新登录】真机 10/25：「8 更新」把 OpenList 换成新版，
     # MediaWarp 手里的令牌跟着作废（或者跟 OpenList 一起起来、登录时 OpenList 还没好），之后除了开播门
     # 先替它取好的那一集，别的集一点就闪退。每小时那一轮最多晚一小时才修 —— 更新这条路上当场修。
@@ -14707,7 +14719,7 @@ def main():
             if OL_USER_RE.fullmatch(_u) and _u.lower() != "guest":
                 cfg["ol_user_want"] = _u
                 break
-            warn("用户名要字母开头，只能用字母、数字和 _ . -，最长 32 位")
+            warn("用户名要字母开头，只能用字母、数字和 _ . - @，最长 64 位")
         while True:
             _p = ask("OpenList 密码（留空则随机生成）", "").strip()
             if not _p:
@@ -14827,36 +14839,45 @@ DOMAIN={cfg['domain']}
     else:
         ok("容器已启动")
 
-    # ---- OpenList 密码 ----
-    info("为 OpenList 设置管理员密码...")
-    done = False
-    for _ in range(20):
-        if subprocess.run(["docker", "exec", "openlist", "./openlist",
-                           "admin", "set", cfg["ol_pass"]],
-                          capture_output=True).returncode == 0:
-            done = True
+    # ---- OpenList 管理员账号 ----（见 ol_init_status 上面那段：新版要脚本替它建，老版本自己建了 admin）
+    info("设置 OpenList 管理员账号...")
+    _d, _st = cfg["install_dir"], None
+    for _ in range(30):                              # 等它起来：新版问得到初始化状态；老版本没这个接口，登录接口有回应就算起来了
+        _st = ol_init_status()
+        if _st is not None:
             break
-        time.sleep(3)
-    if done:
-        ok("OpenList 管理员密码已设置")
-        if cfg["ol_user_want"] != cfg["ol_user"]:
-            # 装的时候定的用户名：OpenList 起来、密码对上之后再改（它自己建的管理员叫 admin）
-            _why = ""
-            for _ in range(10):
-                _why = ol_rename_admin(cfg["install_dir"], cfg["ol_user_want"])
-                if not _why or "登不上" not in _why:
-                    break
-                time.sleep(3)                      # 刚起来还没准备好接登录：等一下再试
-            if _why:
-                warn(f"OpenList 用户名没改成（{_why}），现在还是 {cfg['ol_user']}；装完到「7 设置 → 13」改")
-            else:
-                cfg["ol_user"] = cfg["ol_user_want"]
-                _ol_account_apply(cfg["install_dir"])
-                ok(f"OpenList 用户名设成「{cfg['ol_user']}」")
+        try:
+            if _ol_api("/api/public/settings", None, timeout=5, method="GET").get("code") == 200:
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+    _why, _named = "", False
+    if _st is False:
+        _why = ol_init_setup(cfg["ol_user_want"], cfg["ol_pass"])
+        _named = not _why
     else:
-        warn("自动设置 OpenList 密码失败（容器可能还在初始化）。")
-        warn("配置里已写入这个密码，手动跑下面一行就能对上：")
-        print(f"     docker exec openlist ./openlist admin set '{cfg['ol_pass']}'")
+        for _ in range(20):
+            if subprocess.run(["docker", "exec", "openlist", "./openlist", "admin", "set", cfg["ol_pass"]],
+                              capture_output=True).returncode == 0 and _ol_login(cfg["ol_user"], cfg["ol_pass"]):
+                break                                # 退出码不算数（没管理员时它也回 0）：真登得上才算
+            time.sleep(3)
+        else:
+            _why = "密码没设上"
+        if not _why and cfg["ol_user_want"] != cfg["ol_user"]:
+            _w2 = ol_rename_admin(_d, cfg["ol_user_want"])
+            if _w2:
+                warn(f"OpenList 用户名没改成（{_w2}），现在还是 {cfg['ol_user']}；装完到「7 设置 → 13」改")
+            _named = not _w2
+    if _why:
+        warn(f"OpenList 管理员账号没设好：{_why}")
+        tip("装完到「7 设置 → 13 OpenList 账号」里设一次密码，就对上了")
+    else:
+        if _named and cfg["ol_user_want"] != cfg["ol_user"]:
+            cfg["ol_user"] = cfg["ol_user_want"]
+            write_secret(os.path.join(_d, ".secrets"), "OPENLIST_USER", cfg["ol_user"])
+            _ol_account_apply(_d)                    # 两份配置是照 admin 生成的：换成定的用户名
+        ok(f"OpenList 管理员账号已设置（{cfg['ol_user']}）")
 
     # ---- Emby 管理员账号 + API 密钥 ----
     cfg["emby_ready"] = False
@@ -22641,13 +22662,32 @@ def mount_taken(mount, used):
                or u.startswith(mount + "/") for u in used if u and u != "/")
 
 
+def scan_whole_mount(d, mount):
+    """刚挂上的盘：扫描路径直接填成整个盘，再用一行提示告诉人怎么缩小。
+    仓库主人 11/12：「扫完码给个提示：当前是全盘/quark所有路径，如果需要路径缩小请选2. 修改扫描路径」。
+    原来挂上之后扫描路径是空的，还要自己去「2 修改扫描路径」里加，不加的话「4 生成媒体库」什么都生成不出来。"""
+    exp = explicit_scan_paths()
+    merged = merge_scan_paths(exp + [mount])
+    if merged != exp:
+        save_ms_state(scan_spec=merged)
+        try:
+            _apply_scan_paths(d, f"扫描路径加了 {mount}，")
+        except Exception as e:
+            warn(f"扫描路径记下了，AutoFilm 配置没写成（{_short_err(e)}），「4 生成媒体库」时会再写")
+    tip(f"当前扫整个盘 {mount}（手机备份、截图也会进来）；要缩小范围选「2 修改扫描路径」")
+
+
 def ask_mount(d, default):
     """扫码 / 填表之前先问挂到哪。返回规整好的路径；不合法或撞了返回 ""（已提示过）。
 
     输错了直接回上一屏再点，不在这里打转 —— 死循环里没有退路。
     """
     used = [mp for mp, *_x in openlist_storages(d) if mp]
-    mount = norm_mount(ask(f"挂到哪个路径（回车用 {default}）"), default)
+    # 【不问了，直接用默认的】仓库主人 11/12 全新重装：「这个扫马登入直接就扫码登不要叫别人填什么路径，当你扫码成功的时候你直接
+    # 把路径什么的填好」。真机上他在这一问里填的是网盘里的文件夹（/quark/夸克挂载）—— 「挂到哪」和「扫哪个目录」是两件事，
+    # 第一次用的人分不清。之前是他自己要的这一问（想挂成 /115网盘 这种名字），现在只在默认路径已经被占时才问（第二个同类的盘）。
+    mount = default if not mount_taken(default, used) else norm_mount(
+        ask(f"{default} 已经有盘了，这一个挂到哪个路径"), default)
     if mount is None:
         warn("路径不能是 / ，也不能带空格或 ?#\\ 这些字符。")
         return ""
@@ -22747,7 +22787,7 @@ def _add115_flow(d):
         err(f"没挂上：{why}")
         ask("\n按回车返回...")
         return False
-    tip("接下来在「2 修改扫描路径」里加上要进 Emby 的目录")
+    scan_whole_mount(d, mount)
     ask("\n按回车继续...")
     return True
 
@@ -22905,7 +22945,7 @@ def _add_ali_flow(d):
         return False
     ok(f"阿里云盘已挂上：{mount}　{ALIPAN_TYPES[kind][0]}")
     sync_alitv_service(d)
-    tip("接下来在「2 修改扫描路径」里加上要进 Emby 的目录")
+    scan_whole_mount(d, mount)
     ask("\n按回车继续...")
     return True
 
@@ -23601,7 +23641,7 @@ def _add_qtv_flow(d):
             ok(f"夸克 TV 已挂上：{mount}　转码流")
             if not refresh_hls(d):
                 warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「8 更新」")
-            tip("接下来在「2 修改扫描路径」里加上要进 Emby 的目录")
+            scan_whole_mount(d, mount)
             ask("\n按回车继续...")
             return True
         warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
@@ -27470,7 +27510,7 @@ def _emby_account_menu(key, uid):
 #   · OpenList 按来访 IP 数登录失败：5 次就锁 5 分钟（脚本所有登录都是同一个 IP）。所以核对时最多错 3 次。
 #   · 常驻的换链服务 / 开播门手里的旧令牌会被 OpenList 拒（401），它们每次重登都现读 .secrets，自己就换过来了。
 # 没在真 OpenList 上跑过（会话容器里起不了），接口是照它的源码对的；测试里是照源码写的假 OpenList。
-OL_USER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")
+OL_USER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.@-]{0,63}")     # 1.5.416 放开 @、放长到 64：仓库主人拿邮箱当用户名被拒了
 # 密码 8–64 位。符号只放这几个：引号、反斜杠、$、空格这类在 .secrets / 排查脚本 / 命令行里各有各的读法，不收；
 # 不许 - 开头（docker exec … admin set 会把它当成参数）
 OL_PASS_RE = re.compile(r"[A-Za-z0-9!@#%^*_+=.,:?~][A-Za-z0-9!@#%^*_+=.,:?~-]{7,63}")
@@ -27485,8 +27525,54 @@ def _ol_login(user, pw, timeout=20):
         return ""
 
 
+# ---- 新版 OpenList 第一次启动不再自己建管理员 ----
+# 真机 11/12（仓库主人全新重装，OpenList 是当天拉的最新版）：装的时候屏上是「✔ OpenList 管理员密码已设置」，可打开
+# list.域名 是一个「初始化 OpenList」的向导，要他自己再设一遍管理员账号。查 OpenList 源码（internal/bootstrap/data/user.go、
+# server/handles/setup.go）：
+#   · 新版只有开发模式或给了环境变量 OPENLIST_ADMIN_PASSWORD 才自己建 admin，否则库里【没有管理员】，等网页向导
+#     POST /api/public/init/setup {username, password, site_title} 来建；GET /api/public/init_status 回 initialized
+#   · 这时 ./openlist admin set 会在日志里报 failed get admin user，【退出码照样是 0】—— 所以脚本当成设好了
+# 现在：没初始化的就由脚本调那个接口建管理员（用户名也在这一步直接定，不用先 admin 再改名）；老版本没有这个接口，
+# 它自己建了 admin，照旧走 admin set。设完一律拿账号密码真登一次才算数，不再只看退出码。
+def ol_init_status():
+    """OpenList 初始化了没有：True 已有管理员 / False 没有、等着建 / None 问不到（没起来，或老版本没这个接口）。"""
+    try:
+        r = _ol_api("/api/public/init_status", None, timeout=10, method="GET")
+    except Exception:
+        return None
+    if r.get("code") != 200 or "initialized" not in (r.get("data") or {}):
+        return None
+    return bool(r["data"]["initialized"])
+
+
+def ol_init_setup(user, pw):
+    """替网页向导把管理员建出来。返回 "" = 成功；否则原因。"""
+    try:
+        r = _ol_api("/api/public/init/setup", {"username": user, "password": pw, "site_title": "OpenList"}, timeout=30)
+    except Exception as e:
+        return _short_err(e)
+    return "" if r.get("code") == 200 else str(r.get("message") or "OpenList 没收下")[:80]
+
+
+def ol_ensure_admin(d):
+    """OpenList 还没初始化（库里没有管理员）→ 拿脚本存的账号密码替它建。返回 "" = 不用建或建好了；否则原因。
+    老装机 / 已经初始化的什么都不做。"""
+    if ol_init_status() is not False:
+        return ""
+    pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS", fallback=os.path.join(d, ".env"))
+    if not pw:
+        return "脚本里没存 OpenList 的密码"
+    return ol_init_setup(ol_user(d), pw)
+
+
 def ol_rename_admin(d, new):
     """改 OpenList 管理员的用户名。返回 "" = 成功（.secrets 已记下）；否则原因（什么都没改）。"""
+    if ol_init_status() is False:                  # 还没初始化：直接用新名字把管理员建出来
+        pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS", fallback=os.path.join(d, ".env"))
+        why = ol_init_setup(new, pw) if pw else "脚本里没存 OpenList 的密码"
+        if not why:
+            write_secret(os.path.join(d, ".secrets"), "OPENLIST_USER", new)
+        return why
     tok = _ol_token(d)
     if not tok:
         return "OpenList 登不上（没起来，或账号在网页后台改过 —— 先用「2 密码」重设一次）"
@@ -27506,6 +27592,11 @@ def ol_set_admin_password(d, new):
     """改 OpenList 管理员的密码。返回 "" = 成功（.secrets 已记下）；否则原因（什么都没改）。"""
     sec = os.path.join(d, ".secrets")
     old = read_env(sec, "OPENLIST_PASS", fallback=os.path.join(d, ".env"))
+    if ol_init_status() is False:                  # 还没初始化：admin set 这时什么都不做（还回 0），直接建管理员
+        why = ol_init_setup(ol_user(d), new)
+        if not why:
+            write_secret(sec, "OPENLIST_PASS", new)
+        return why
     try:
         r = subprocess.run(["docker", "exec", "openlist", "./openlist", "admin", "set", new],
                            capture_output=True, text=True, timeout=120)
@@ -27569,6 +27660,8 @@ def ol_account_menu():
         ask("\n按回车返回...")
         return
     sec = os.path.join(d, ".secrets")
+    if ol_init_status() is False and not ol_ensure_admin(d):
+        ok("OpenList 还没初始化，已按下面这对账号密码建好管理员")
     while True:
         user = ol_user(d)
         pw = read_env(sec, "OPENLIST_PASS", fallback=os.path.join(d, ".env"))
@@ -27589,7 +27682,7 @@ def ol_account_menu():
                 print("没改。")
                 continue
             if not OL_USER_RE.fullmatch(new) or new.lower() == "guest":
-                warn("没改：用户名要字母开头，只能用字母、数字和 _ . -，最长 32 位")
+                warn("没改：用户名要字母开头，只能用字母、数字和 _ . - @，最长 64 位")
                 continue
             if not _ol_account_ready(d):
                 print("没改。")
