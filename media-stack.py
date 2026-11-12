@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.416"
+SCRIPT_VERSION = "1.5.417"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -23038,17 +23038,42 @@ def _qtv_relogin_flow(d, mp):
             print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
     tip(f"夸克 App 扫一扫{qr_both_note()}，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else "")
         if lines else "二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
+    if qr_wait_login(lambda: _ol_reload_storage(d, mp, _ol_token(d) or otok)):
+        ok(f"夸克 TV 已重新登录：{mp}")
+        return True
+    _put(old)
+    warn("已放弃，恢复了原来的登录。")
+    return False
+
+
+QR_WAIT_S = 300               # 扫码后自己等多久（仓库主人记得的「5 分钟」）
+QR_POLL_S = 4                 # 多久查一次：夸克那头就是拿着扫码凭据去问一声，不重新出码（OpenList quark_uc_tv 的 Init）
+
+
+def qr_wait_login(check):
+    """扫完码不用回来按回车：自己隔几秒查一次，登上了立刻往下走。check() 返回 "" = 登上了，否则原因。
+
+    仓库主人 11/13：「以前……扫码一成功根本就不需要确认他自己就登上去了，以前是有几分钟的等待应该是5分钟吧，只要扫码成功
+    VPS这边立刻就有反应了」。夸克这几处原来是「扫完并确认后按回车」，回车一次才查一次。
+    原因变了才印一行（「设备数超限」这种要人去手机上处理的，看得见、处理完自己就接着登上）；同一个原因不刷屏。
+    等满 QR_WAIT_S 秒还没登上才问一句：回车再等，q 放弃。返回 True 登上 / False 放弃。"""
     while True:
-        c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
-        if c == "q":
-            _put(old)
-            warn("已放弃，恢复了原来的登录。")
+        t0, last = time.monotonic(), None
+        print(f"  {DIM}手机上确认后这边自己会登上（最多等 {QR_WAIT_S // 60} 分钟），不用按回车{RST}")
+        while time.monotonic() - t0 < QR_WAIT_S:
+            why = check()
+            if not why:
+                return True
+            why = _short_err(re.sub(r"<[^>]+>", "", str(why)))[:60]
+            if why != last:
+                warn(f"还没登上：{why}")
+                if "设备数超限" in why:
+                    # 真机 11/13：夸克 App「登录设备」里，带「网盘使用权限」的设备有名额，旧设备（哪怕写着未登录）占着就超限
+                    tip("夸克 App → 设置 → 登录设备：把不用的设备点「解除绑定」，这边自己会接着登上")
+                last = why
+            time.sleep(QR_POLL_S)
+        if ask(f"等了 {QR_WAIT_S // 60} 分钟还没登上；回车再等，q 放弃").strip().lower() == "q":
             return False
-        why = _ol_reload_storage(d, mp, _ol_token(d) or otok)
-        if not why:
-            ok(f"夸克 TV 已重新登录：{mp}")
-            return True
-        warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
 
 
 def _ol_reload_storage(d, mount, tok):
@@ -23630,21 +23655,16 @@ def _add_qtv_flow(d):
         tip(f"夸克 App 扫一扫{qr_both_note()}，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
     else:
         tip("二维码画不出来：到 OpenList 网页 → 存储 → 这个盘，页面上有二维码")
-    while True:
-        c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
-        if c == "q":
-            _ol_drop_storage(d, mount, tok)
-            warn("没挂上，已撤掉刚建的存储。")
-            return False
-        why = _ol_reload_storage(d, mount, _ol_token(d) or tok)
-        if not why:
-            ok(f"夸克 TV 已挂上：{mount}　转码流")
-            if not refresh_hls(d):
-                warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「8 更新」")
-            scan_whole_mount(d, mount)
-            ask("\n按回车继续...")
-            return True
-        warn(f"还没登上：{_short_err(re.sub(r'<[^>]+>', '', why))[:60]}")
+    if qr_wait_login(lambda: _ol_reload_storage(d, mount, _ol_token(d) or tok)):
+        ok(f"夸克 TV 已挂上：{mount}　转码流")
+        if not refresh_hls(d):
+            warn("分片重定向没起来，Emby 里播转码流会转圈 —— 跑一次「8 更新」")
+        scan_whole_mount(d, mount)
+        ask("\n按回车继续...")
+        return True
+    _ol_drop_storage(d, mount, tok)
+    warn("没挂上，已撤掉刚建的存储。")
+    return False
 
 
 # ============================================================================ 夸克 TV：本机自己的一份登录
@@ -23802,23 +23822,22 @@ def do_quark_login():
     if link:
         print(f"  {BOLD}链接{RST}  {CYAN}{link}{RST}")
     tip(f"夸克 App 扫一扫{qr_both_note()}，手机上点确认" + ("；扫不了就在手机上打开上面的链接" if link else ""))
-    while True:
-        c = ask("扫完并确认后按回车（q 放弃）").strip().lower()
-        if c == "q":
-            return False
+    def _try():
         try:
             rc = qtv_req("/oauth/code", {"client_id": QTV_CLIENT_ID, "scope": "netdisk",
                                         "query_token": qt}, own["device_id"])
             code = rc.get("code") or ""
             if not isinstance(code, str) or not code:
-                warn("还没确认")
-                continue
+                return "手机上还没确认"
             qtv_exchange(own, code=code)
         except Exception as e:
-            warn(f"还没登上：{_short_err(e)[:60]}")
-            continue
-        ok("夸克 TV 已登录（本机自己的一份）")
-        return True
+            return _short_err(e)
+        return ""
+
+    if not qr_wait_login(_try):
+        return False
+    ok("夸克 TV 已登录（本机自己的一份）")
+    return True
 
 
 def _qtv_mount_of(d, tp):
