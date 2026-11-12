@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.418"
+SCRIPT_VERSION = "1.5.419"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -25150,30 +25150,30 @@ def _pick_dirs(d, mp, prompt="要扫哪个"):
         for j, name in enumerate(subs, 1):
             print(f"    {j:>2}. {name}")
         if err:
-            # 【列不动是故障，不能和"底下没目录"长一样】前者要去查，后者按 . 选中就完事
+            # 【列不动是故障，不能和"底下没目录"长一样】前者要去查，后者按 y 选中就完事
             print(f"    {YELLOW}列不出来：{err}{RST}")
-            print(f"    {DIM}还是可以直接把路径贴进来（下面那行）{RST}")
+            print(f"    {DIM}还是可以直接把路径贴进来（/ 开头）{RST}")
         elif not subs:
             print(f"    {DIM}（这一层底下没有目录了）{RST}")
-        # 【不用字母键】上一版是 a 整个盘 / m 手打路径 —— 字母是脚本自己发明的暗号，
-        # 而编号、. 、* 、.. 这几个在文件路径里本来就是这个意思，不用记。
-        tips = ["编号 进这一层", "多个编号（逗号隔开）一次选好几个",
-                ". 就选整个盘" if cur == root else ". 就选这一层"]
-        if subs:
-            tips.append("* 这一层全部")
-        if cur != root:
-            tips.append(".. 上一层")
-        tips += ["或者直接把路径贴进来", "回车取消"]
-        print(f"  {DIM}{'　'.join(tips)}{RST}")
+        # 【屏上只说三个键：编号 / y / n】仓库主人 11/13：「输入编号继续往下选，输入y确认就在这一层全盘，输入n返回上一层选择，
+        # 几个盘都是改成一样」。原来屏上列了一长串（. 就选这一层、* 这一层全部、.. 上一层、贴路径、回车取消），手机上折成两行、
+        # 第一次用的人看不过来。那几个键【都还认】（没删）：. = y，.. = n，* = 这一层的子目录全选，/ 开头 = 直接贴路径，
+        # 多个编号用逗号隔开 = 一次选好几个 —— 只是不占屏了。这个函数所有盘、「不扫的目录」共用，改一处全一样。
+        print(f"  {DIM}编号 进下一层　y {'就扫整个盘' if cur == root else '就扫这一层'}　"
+              f"n {'返回' if cur == root else '返回上一层'}{RST}")
         pick = ask(prompt).strip()
         if not pick:
             return []
-        if pick == "..":
+        if pick.lower() in ("n", ".."):
+            if cur == root:
+                if pick != "..":
+                    return []                       # 最上面一层按 n：不选了，回去
+                continue
             cur = cur.rsplit("/", 1)[0]
             if len(cur) < len(root):
                 cur = root
             continue
-        if pick == ".":
+        if pick.lower() in ("y", "."):
             return [cur]
         if pick == "*":
             if not subs:
