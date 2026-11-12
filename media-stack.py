@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.412"
+SCRIPT_VERSION = "1.5.413"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14519,7 +14519,9 @@ def do_uninstall(assume_yes=False):
     compose = os.path.join(install_dir, "docker-compose.yml")
     if not assume_yes:
         print()
-        warn("将要删除：媒体栈的容器（在这里装的小雅连它一起）、nginx 站点配置、media-stack/emby 命令。")
+        # 小雅那一栏 1.5.385 就删了：只有这台机器上还留着旧版装的那份小雅，才提它（仓库主人 11/12：「这个小雅我的删掉了为什么还出现这个」）
+        _xy = "（旧版在这里装的小雅连它一起）" if ms_state().get("xiaoya_ours") else ""
+        warn(f"将要删除：媒体栈的容器{_xy}、nginx 站点配置、media-stack/emby 命令。")
         warn("节点(bgpeer)的任何文件都不会被碰。")
         print(f"  {DIM}输入 {RST}{RED}{BOLD}yes{RST}{DIM} 确认；回车 / n / 其它任何输入都是取消。{RST}")
         # 卸载是不可逆操作，故意不接受 y —— 必须完整打出 yes，避免手滑
