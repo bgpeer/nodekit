@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.406"
+SCRIPT_VERSION = "1.5.407"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13376,10 +13376,22 @@ def show_info():
     print(f"  {BOLD}媒体栈使用信息{RST}")
     print("=" * 60)
 
+    # 【这一屏的排法是仓库主人 11/12 给的】开头一句话说清装完怎么用；每个地址下面直接跟它自己的账号密码 ——
+    # 原来地址在上面、「外部播放器」「浏览器弹框」「各服务自己的账号」分三段摆在下面，看一个服务要上下对三处。
+    # 原来的「▸ 挂网盘」那段（去哪取令牌）照他给的排法拿掉了，由开头这句代替：挂盘现在在「3 挂载路径」里扫码就行。
+    print(f"\n  安装完成后：到「3 挂载路径」用网盘扫码登录 →「4 生成媒体库」→ 用 Emby 之类的播放器观看")
+
+    # 【第一次用：按顺序做的几步】全做完了整段不印 —— 装好用着的人每次进来不用再看一遍
+    _stores, _n = openlist_storages(d), strm_count(d)
+    _steps = first_steps(d, stores=_stores, n_strm=_n)
+    if not all(ok_ for ok_, _t in _steps):
+        print(f"\n{YELLOW}{BOLD}▸ 第一次用：按顺序做{RST}")
+        for i, (ok_, t) in enumerate(_steps, 1):
+            print(f"      {GREEN}✔{RST} {DIM}{i}. {t}{RST}" if ok_ else f"      {YELLOW}{BOLD}➜ {i}. {t}{RST}")
+
     # 排版（CLAUDE.md 第五节）：每个地址一行标题（名称 + 端口）+ 地址顶格单独一行，条间空一行，长按复制干净
-    print(f"\n{YELLOW}{BOLD}▸ 访问地址{RST}")
+    print(f"\n{YELLOW}{BOLD}▸ 网页浏览器访问地址{RST}")
     ip = "" if domain else public_ip()
-    emby_url = emby_port = ""
     _first = True
     for sub, port, container, label in SUBDOMAINS:
         if container == "homepage" and not os.path.isdir(os.path.join(d, "homepage")):
@@ -13391,64 +13403,29 @@ def show_info():
         if not _first:
             print()
         _first = False
-        print(f"{CYAN}{BOLD}[{label.strip()}]{RST}  {DIM}端口 {shown}{RST}")
+        # Emby 这个地址同时是外部播放器要填的服务器地址：标题里直接说，不另起一段
+        print(f"{CYAN}{BOLD}[{label.strip()}]{RST}"
+              + (f" 外部播放器（Hills / Infuse / Emby App）服务器通用地址" if container == "emby" else "")
+              + f"  {DIM}端口 {shown}{RST}")
         print(f"{GREEN}{BOLD}{url}{RST}")
-        if container == "emby":
-            emby_url, emby_port = url, shown
-
-    # 【第一次用：按顺序做的几步】全做完了整段不印 —— 装好用着的人每次进来不用再看一遍
-    _stores, _n = openlist_storages(d), strm_count(d)
-    _steps = first_steps(d, stores=_stores, n_strm=_n)
-    if not all(ok_ for ok_, _t in _steps):
-        print(f"\n{YELLOW}{BOLD}▸ 第一次用：按顺序做{RST}")
-        for i, (ok_, t) in enumerate(_steps, 1):
-            print(f"      {GREEN}✔{RST} {DIM}{i}. {t}{RST}" if ok_ else f"      {YELLOW}{BOLD}➜ {i}. {t}{RST}")
-
-    # 外部播放器（Hills / Infuse / Emby 官方 App…）单独列一段，因为有那个【必须填
-    # MediaWarp 地址】的坑：Emby 自己的 8096 只绑 127.0.0.1，外面本来就连不到，但内网里
-    # 直接连它是连得上的 —— 而那样会整个绕过 302，视频改由本机中转，又慢又烧流量，
-    # 表面上还"能播放"，属于最典型的「看起来正常、实际是废的」。
-    if emby_url:
-        print(f"\n{YELLOW}{BOLD}▸ 外部播放器（Hills / Infuse / Emby App）服务器地址{RST}")
-        print(f"{GREEN}{BOLD}{emby_url}{RST}")
-        print(f"      端  口     {CYAN}{BOLD}{emby_port}{RST}")
-        us = _emby_user_list(read_emby_api_key(d) or "")
-        if us:
-            print("      账  号     " + "、".join(
-                f"{CYAN}{BOLD}{n}{RST}" + (f"{DIM}(管理员){RST}" if a else "")
-                for _i, n, a, _p in us))
-        else:
-            print(f"      账  号     {DIM}第一次打开 Emby 网页时自己建的{RST}")
-        # 脚本经手的密码（装的时候定的、「7 设置 → 12」改的）存在 .secrets 里，这里显示；网页上设的脚本看不到
-        _known = [(n, emby_pw_get(d, i)) for i, n, _a, _p in us if emby_pw_get(d, i)]
-        for n, pw_ in _known:
-            print(f"      密  码     {CYAN}{BOLD}{pw_}{RST}{DIM}（{n}）{RST}")
-        if len(_known) < max(1, len(us)):
-            print(f"      密  码     {DIM}" + ("其余账号：" if _known else "") + f"在 Emby 网页上设的，这里看不到{RST}")
-        tip("客户端必须填这个地址；直连 8096 会绕开 302，视频全走 VPS")
-
-    if ba_pass:
-        print(f"\n{YELLOW}{BOLD}▸ 浏览器弹框{RST}{DIM}（打开首页入口时）{RST}")
-        print(f"      用户名   {CYAN}{BOLD}{ba_user}{RST}")
-        print(f"      密  码   {CYAN}{BOLD}{ba_pass}{RST}")
-
-    print(f"\n{YELLOW}{BOLD}▸ 各服务自己的账号{RST}")
-    print(f"      Emby       {DIM}首次打开自己设{RST}")
-    print(f"      OpenList   {CYAN}{BOLD}{ol_user(d)}{RST} / {CYAN}{BOLD}{ol_pass}{RST}")
-
-    # 【挂网盘要的令牌不在这套东西里，得去外面取】而"去哪取"是最容易卡住的一步：
-    # OpenList 的驱动表单里【没有】这个链接，文档也在另一个域名下，
-    # 不写在这儿的话每次挂新盘都要重新去搜一遍。
-    # 阿里的 alipan_type 要和取令牌那页的下拉框配对：default → 「阿里云盘 (OAuth2) 扫码登录」，
-    # alipanTV → 「阿里云盘 (Client) TV版扫码」；不配对 → empty token returned from official API。
-    # 授权时去掉「备份盘」（手机相册会变成一堆刮不出海报的条目）；只要刷新令牌。
-    # 【挂盘先说脚本里能扫码挂的】115、夸克 TV、阿里、WebDAV 都能在「3 挂载路径」里挂，不用去 OpenList 网页、
-    # 也不用去取令牌的网站；别的盘、或者阿里选了「贴令牌」才要那个网站
-    print(f"\n{YELLOW}{BOLD}▸ 挂网盘{RST}")
-    print(f"      「3 挂载路径」里挂：115 / 夸克 TV / 阿里扫码，WebDAV 填地址")
-    print(f"      别的盘去 OpenList 网页挂，令牌在这里取 {DIM}（打不开换 .cn）{RST}")
-    print(f"{CYAN}https://api.oplist.org/{RST}")
-    tip("阿里贴令牌时：下拉框要和接口配对；只要刷新令牌；授权时去掉「备份盘」")
+        if container == "homepage" and ba_pass:
+            print(f"      用户名   {CYAN}{BOLD}{ba_user}{RST}")
+            print(f"      密  码   {CYAN}{BOLD}{ba_pass}{RST}")
+        elif container == "emby":
+            # 脚本经手的密码（装的时候定的、「7 设置 → 12」改的）存在 .secrets 里，这里显示；网页上设的脚本看不到
+            us = _emby_user_list(read_emby_api_key(d) or "")
+            for _i, n, a, _p in us:
+                _pw = emby_pw_get(d, _i)
+                print(f"      账  号   {CYAN}{BOLD}{n}{RST}" + (f"{DIM}（管理员）{RST}" if a else ""))
+                print("      密  码   " + (f"{CYAN}{BOLD}{_pw}{RST}" if _pw else f"{DIM}在 Emby 网页上设的，这里看不到{RST}"))
+            if not us:
+                print(f"      账  号   {DIM}第一次打开 Emby 网页时自己建的{RST}")
+            # 【必须填这个地址】Emby 自己的 8096 只绑 127.0.0.1，内网里直连它连得上 —— 那样整个绕过 302，
+            # 视频改由本机中转，又慢又烧流量，表面上还"能播放"
+            tip("客户端必须填这个地址；直连 8096 会绕开 302，视频全走 VPS")
+        elif container == "openlist":
+            print(f"      用户名   {CYAN}{BOLD}{ol_user(d)}{RST}")
+            print(f"      密  码   {CYAN}{BOLD}{ol_pass}{RST}")
 
     print(f"\n{YELLOW}{BOLD}▸ 常用命令{RST}")
     print(f"      {GREEN}{BOLD}emby{RST}                甩出面板地址")

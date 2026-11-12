@@ -241,7 +241,7 @@ with contextlib.redirect_stdout(buf):
         m.show_info()
     except Exception as e:                     # 后半段要问 docker，这里只看账号那几行
         print("EXC", type(e).__name__)
-check("「2 使用信息」显示真的用户名，不再写死 admin", f"OpenList   mine / {new}" in plain(buf.getvalue()))
+check("「2 使用信息」显示真的用户名，不再写死 admin", f"      用户名   mine\n      密  码   {new}" in plain(buf.getvalue()))
 
 print("七、版本号")
 check("media-stack 1.5.401 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 401))
