@@ -114,6 +114,16 @@ with contextlib.redirect_stdout(buf):
 out = plain(buf.getvalue())
 check("手动跑的屏：每个地址一行 ✔ / ✖，标出 OpenList 固定用哪个", f"✔ {A}" in out and f"✖ {B}" in out and "← OpenList 固定用它" in out)
 
+up = SRC[SRC.index("def do_update"):]; up = up[:up.index("\ndef ", 10)]
+check("「8 更新」完当场查一遍（1.5.410：上一版注释里写了、代码里漏了）", "ol_route_check(d)" in up)
+
+print("六之二、media-stack 命令的壳里也有 route（1.5.410：真机敲下去是「未知命令」）")
+shell = SRC[:SRC.index('  *) echo "未知命令:$1。看 media-stack help"')]
+check("壳的 case 里有 route)，交给 Python 的 route", re.search(r'\n  route\)\n(?:\s*#.*\n)*\s*S=/etc/bgpeer/media-stack.py\n.*\n\s*exec python3 "\$S" route ;;', shell) is not None)
+helps = re.findall(r"(?m)^  ([a-z0-9-]+)\s{2,}\S", SRC[SRC.index("  url             只列出访问地址"):SRC.index("  heal-log [行数]")])
+miss = [h for h in helps if not re.search(r"(?m)^  (?:[a-z0-9|-]+\|)?%s(?:\|[a-z0-9|-]+)?\)" % re.escape(h), shell)]
+check(f"帮助里列的命令壳里都认（查了 {len(helps)} 条，缺：{miss or '无'}）", "route" in helps and not miss)
+
 print("七、版本号")
-check("media-stack 1.5.409 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 409))
+check("media-stack 1.5.410 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 410))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
