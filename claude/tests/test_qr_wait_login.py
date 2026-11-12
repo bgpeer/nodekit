@@ -49,14 +49,32 @@ check("人在手机上处理完，这边自己接着登上", r is True and not A
 
 print("四、等满 5 分钟才问")
 check("等 5 分钟、每 4 秒查一次", m.QR_WAIT_S == 300 and m.QR_POLL_S == 4)
-r, out = run(["need verify"], user=["q"])
-check("一直没登上：5 分钟后问一句，q = 放弃", r is False and len(ASKED) == 1 and "回车再等，q 放弃" in ASKED[0] and abs(sum(SLEPT) - 300) < 5)
+r, out = run(["need verify"], user=["n"])
+check("一直没登上：5 分钟后问一句，n = 放弃（1.5.418：不是 q）", r is False and len(ASKED) == 1 and "回车再等，n 放弃" in ASKED[0]
+      and "q" not in ASKED[0] and abs(sum(SLEPT) - 300) < 5)
 seq2 = ["need verify"] * 80 + [""]
 CLOCK[0] = 0.0; SLEPT.clear(); ASKED.clear(); ANS[:] = [""]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     r = m.qr_wait_login(lambda: seq2.pop(0) if len(seq2) > 1 else seq2[0])
 check("回车 = 再等一轮，之后登上了照样往下走", r is True and len(ASKED) == 1)
+
+print("四之二、115、阿里也是等满了问要不要再等（1.5.418，仓库主人：「都统一成夸克这种……输n放弃」）")
+ANS[:] = ["n"]; ASKED.clear()
+check("qr_wait_more：n = 放弃", m.qr_wait_more(5) is False and "等了 5 分钟还没登上；回车再等，n 放弃" in ASKED[0])
+ANS[:] = [""]
+check("回车 = 再等", m.qr_wait_more(5) is True)
+ANS[:] = ["N"]
+check("大写 N 也算放弃", m.qr_wait_more(5) is False)
+f115 = SRC[SRC.index("def _qr115_new"):]; f115 = f115[:f115.index("\ndef ", 10)]
+check("115：等满了不再直接结束，问一句；再等就续 5 分钟", "if not qr_wait_more(5):\n                break\n            deadline = time.time() + 300" in f115
+      and "while time.time() < deadline:" not in f115)
+check("115：码过期 / 手机上取消了，照旧直接结束（不问）", "if state in (2, -1, -2):\n            break" in f115)
+i = SRC.index("if not qr_wait_more(max(1, wait_s // 60)):")
+fali = SRC[i - 600:i + 3000]
+check("阿里：等满了问一句；再等就续一轮", "deadline = time.time() + wait_s" in fali)
+check("阿里：码过期照旧直接说「二维码过期了」", 'if st == "QRCodeExpired":' in fali)
+check("三种盘问法一样，都是「回车再等，n 放弃」", SRC.count("qr_wait_more(") >= 4 and "回车再等，n 放弃" in SRC and "回车再等，q 放弃" not in SRC)
 
 print("五、三处都换了")
 check("不再有「扫完并确认后按回车」（夸克三处）", SRC.count('ask("扫完并确认后按回车（q 放弃）")') == 0)
@@ -66,5 +84,5 @@ check("扫码挂上：登上 → 接着建扫描路径；放弃 → 撤掉刚建
 check("重新扫码：放弃 → 恢复原来的登录", re.search(
       r'if qr_wait_login\(lambda: _ol_reload_storage\(d, mp, _ol_token\(d\) or otok\)\):\n\s+ok\(f"夸克 TV 已重新登录.*?return True\n\s+_put\(old\)', SRC, re.S) is not None)
 check("本机自己的一份登录也自动等", "if not qr_wait_login(_try):\n        return False" in SRC)
-check("media-stack 1.5.417 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 417))
+check("media-stack 1.5.417 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 418))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.417"
+SCRIPT_VERSION = "1.5.418"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -22570,7 +22570,12 @@ def _qr115_new():
 
     state, last_err = None, ""
     deadline = time.time() + 300
-    while time.time() < deadline:
+    while True:
+        if time.time() >= deadline:                 # 等满了：问要不要再等（跟夸克、阿里一个问法）
+            print("\r\x1b[2K", end="")
+            if not qr_wait_more(5):
+                break
+            deadline = time.time() + 300
         try:
             state = (_qr115_get(QR115_STATUS.format(
                 uid, tm, sign, int(time.time() * 1000))).get("data") or {}).get("status")
@@ -23050,13 +23055,20 @@ QR_WAIT_S = 300               # 扫码后自己等多久（仓库主人记得的
 QR_POLL_S = 4                 # 多久查一次：夸克那头就是拿着扫码凭据去问一声，不重新出码（OpenList quark_uc_tv 的 Init）
 
 
+def qr_wait_more(mins):
+    """扫码等满了：问一句要不要再等。回车 = 再等一轮（True）；n = 放弃（False）。
+    仓库主人 11/13：「都统一成夸克这种，等满了问要不要再等，但是这次统一不是输q放弃而是输n放弃」——
+    115、阿里原来等满就直接结束回菜单，要重新点一次、重新出码。"""
+    return ask(f"等了 {mins} 分钟还没登上；回车再等，n 放弃").strip().lower() not in ("n", "q")
+
+
 def qr_wait_login(check):
     """扫完码不用回来按回车：自己隔几秒查一次，登上了立刻往下走。check() 返回 "" = 登上了，否则原因。
 
     仓库主人 11/13：「以前……扫码一成功根本就不需要确认他自己就登上去了，以前是有几分钟的等待应该是5分钟吧，只要扫码成功
     VPS这边立刻就有反应了」。夸克这几处原来是「扫完并确认后按回车」，回车一次才查一次。
     原因变了才印一行（「设备数超限」这种要人去手机上处理的，看得见、处理完自己就接着登上）；同一个原因不刷屏。
-    等满 QR_WAIT_S 秒还没登上才问一句：回车再等，q 放弃。返回 True 登上 / False 放弃。"""
+    等满 QR_WAIT_S 秒还没登上才问一句：回车再等，n 放弃（qr_wait_more）。返回 True 登上 / False 放弃。"""
     while True:
         t0, last = time.monotonic(), None
         print(f"  {DIM}手机上确认后这边自己会登上（最多等 {QR_WAIT_S // 60} 分钟），不用按回车{RST}")
@@ -23072,7 +23084,7 @@ def qr_wait_login(check):
                     tip("夸克 App → 设置 → 登录设备：把不用的设备点「解除绑定」，这边自己会接着登上")
                 last = why
             time.sleep(QR_POLL_S)
-        if ask(f"等了 {QR_WAIT_S // 60} 分钟还没登上；回车再等，q 放弃").strip().lower() == "q":
+        if not qr_wait_more(QR_WAIT_S // 60):
             return False
 
 
@@ -24349,7 +24361,12 @@ def alitv_scan_login(tv=None, poll=2, wait_s=300):
         if not both[0] and stretch[0] in QR_STRETCH_STEPS and stretch[0] != qr_stretch():
             save_ms_state(qr_stretch=stretch[0])
     try:
-        while time.time() < deadline:
+        while True:
+            if time.time() >= deadline:             # 等满了：问要不要再等（跟夸克、115 一个问法）
+                print("\r\x1b[2K", end="")
+                if not qr_wait_more(max(1, wait_s // 60)):
+                    break
+                deadline = time.time() + wait_s
             if grid:
                 nv = qr_stretch_key(poll, stretch[0], lambda sv: _pick(sv)[1])
                 if nv:
