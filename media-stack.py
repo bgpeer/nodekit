@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.407"
+SCRIPT_VERSION = "1.5.408"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14420,7 +14420,7 @@ DOMAIN={cfg['domain']}
             apply_emby_api_key(cfg["install_dir"], _key)
         else:
             warn(f"Emby 没自动设好：{_why}")
-            tip("装完打开 Emby 网页看一眼，再到「7 设置 → 1」输 a 自动生成密钥")
+            tip("装完打开 Emby 网页看一眼，再到「7 设置 → 1 → 1 自动生成」")
 
     # ---- nginx + 证书 ----
     if cfg["has_domain"] and write_nginx:
@@ -14482,7 +14482,7 @@ DOMAIN={cfg['domain']}
         print(f"  3) {GREEN}✔{RST} 同上")
     else:
         print("  2) 打开 Emby 完成首次安装向导（建管理员账号）")
-        print("  3) 重跑本脚本 → 7 设置 → 1 Emby API Key → 输 a 自动生成（也可以自己去 Emby 后台建了贴进来）")
+        print("  3) 重跑本脚本 → 7 设置 → 1 Emby API Key → 1 自动生成（也可以选 2，自己去 Emby 后台建了贴进来）")
     print(f"  4) 重跑本脚本 → {BOLD}4 生成媒体库{RST}（也可以敲 media-stack strm）")
     print(f"  5) Emby 添加媒体库，路径指向 {BOLD}{STRM_PATH}{RST}")
     print(f"  6) {YELLOW}重要{RST}：该媒体库高级设置里关掉「章节图像提取」和「实时监控」，")
@@ -14571,7 +14571,7 @@ def apply_emby_api_key(d, key):
 
 
 def _emby_key_auto(d):
-    """「7 设置 → 1」里输 a：自动生成 API 密钥。Emby 还没设置过就顺带把管理员账号建了。成了 → 密钥，否则 ""。"""
+    """「7 设置 → 1 → 1 自动生成」（还没有 Key，或现在这把失效了）：登录一次建 API 密钥。Emby 还没设置过就顺带把管理员账号建了。成了 → 密钥，否则 ""。"""
     fresh = emby_wizard_done() is False
     tip("Emby 还没设置过：现在定管理员账号，脚本替你建好" if fresh else "填 Emby 管理员的用户名和密码，脚本登录后建一把密钥")
     name = ask("Emby 用户名（回车取消）").strip()
@@ -14594,11 +14594,66 @@ def _emby_key_auto(d):
     return key
 
 
-def set_emby_api_key():
-    """单独补 Emby API Key。
+def emby_rotate_api_key(cur):
+    """拿现在这把 Key 向 Emby 再要一把新的 → (新 Key, "")；不成 → ("", 原因)。旧的先不动（见 emby_revoke_api_key）。
+    API Key 本身就能管密钥（Emby 对不带用户的令牌不查角色），所以换钥匙不用再问账号密码。"""
+    try:
+        _emby(f"/Auth/Keys?App={urllib.parse.quote(EMBY_KEY_APP)}", cur, method="POST", body={}, timeout=30)
+        items = (_emby("/Auth/Keys", cur, timeout=30) or {}).get("Items") or []
+    except urllib.error.HTTPError as e:
+        return "", ("现在这把 Key 已经失效" if e.code in (401, 403) else f"Emby 回 {e.code}")
+    except Exception as e:
+        return "", _short_err(e)
+    mine = [it for it in items if it.get("AppName") == EMBY_KEY_APP and it.get("AccessToken") and it.get("AccessToken") != cur]
+    mine.sort(key=lambda it: str(it.get("DateCreated") or ""))
+    return (str(mine[-1]["AccessToken"]), "") if mine else ("", "新钥匙建了但没读回来")
 
-    这是装完之后唯一必须回头再填的东西（首次部署时 Emby 还没初始化，拿不到 Key），
-    为它重跑一整轮安装问答太笨，所以单开一个入口。
+
+def emby_revoke_api_key(new, old):
+    """换好之后把旧的那把在 Emby 里作废。成了 → True。"""
+    try:
+        _emby(f"/Auth/Keys/{urllib.parse.quote(old)}", new, method="DELETE", timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def _emby_key_services_refresh():
+    """Key 换了：常驻的三个服务（补时长、换链、开播门）是启动时读的 Key，手里还是旧的 —— 旧的一作废它们全问不了 Emby。
+    补时长、换链在跑就重起（没跑的不拉起来）；开播门停掉，下一次开播 socket 用新 Key 拉起来（同 gate_fresh_restart 的办法）。"""
+    for unit in (HEAL_DAEMON_UNIT, HLS_UNIT):
+        if os.path.exists(unit):
+            sh(f"systemctl try-restart {os.path.basename(unit)}", timeout=60)
+    if os.path.exists(HEAL_GATE_UNIT):
+        sh(f"systemctl stop {os.path.basename(HEAL_GATE_UNIT)}", timeout=60)
+
+
+def _emby_key_manual(d):
+    """手动：去 Emby 后台建一把，贴进来。返回贴进来的 Key；取消 → ""。"""
+    print(f"  {DIM}到哪拿：Emby → 设置 → 高级 → API 密钥 → 新建 → 复制那串字符{RST}")
+    # 循环到拿到一个能用的值为止，输错不用从菜单重来
+    while True:
+        key = ask("Emby API Key（留空取消）").strip()
+        if not key:
+            print("已取消，保持原样。")
+            return ""
+        # Emby 的 Key 是 32 位十六进制。不符也放行（版本差异），但提醒一句，
+        # 免得把「新建 API 密钥」旁边的应用名之类的东西粘进来还查不出原因。
+        if re.fullmatch(r"[0-9a-fA-F]{32}", key):
+            return key
+        warn(f"这串是 {len(key)} 个字符，不像 Emby 的 API Key（通常 32 位十六进制）。")
+        if ask_yn("仍然使用它？", False):
+            return key
+        print(f"  {DIM}那就重新贴一次，或直接回车取消。{RST}")
+
+
+def set_emby_api_key():
+    """「7 设置 → 1 Emby API Key」：1 自动更换 / 2 手动更换 / 0 返回。也是 media-stack apikey。
+
+    仓库主人 11/12：「这个API令牌是不是可以自动更换……自动更换进去输入y他就直接跟你换好，手动更换恐怕就要在网页去制作令牌
+    到这里来复制了」。原来是先问「已经填过了，要更换吗」再让贴（或输 a 自动生成）。
+    自动更换：拿现在这把向 Emby 再要一把 → 写进 MediaWarp、重启 → 常驻服务换上新的 → 旧的那把在 Emby 里作废。
+    现在这把已经失效 / 还空着时，自动那条退到「填管理员账号密码登录一次」（_emby_key_auto）。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -14610,41 +14665,52 @@ def set_emby_api_key():
         return
 
     cur = read_emby_api_key(d)
-    print()
-    if cur:
-        # 已经填过就先拦一道 —— 直接把光标丢给用户很容易手滑覆盖掉正在用的 Key
-        print(f"  当前已填：{CYAN}{BOLD}{cur}{RST}")
-        if not ask_yn("已经填过了，要更换吗？", False):
+    print("\n" + "-" * 60)
+    print(f"  {BOLD}Emby API Key{RST}")
+    print("-" * 60)
+    print(f"  当前已填：{CYAN}{BOLD}{cur}{RST}" if cur else f"  {YELLOW}当前为空 —— 302 直链不会生效{RST}")
+    print(f"  1. 自动{'更换' if cur else '生成'}")
+    print(f"  2. 手动{'更换' if cur else '填写'}")
+    print("  0. 返回")
+    print("-" * 60)
+    c = ask("请选择").strip()
+    if c in ("0", ""):
+        return
+    if c not in ("1", "2"):
+        print("无效选择。")
+        return
+    if cur and someone_playing(cur):
+        tip("有人在看片：换完要重启 MediaWarp，正在播的会断")
+        if not ask_yn("还是现在就换？", False):
             print("保持不变。")
             return
-    else:
-        print(f"  {YELLOW}当前为空 —— 302 直链不会生效。{RST}")
-    print(f"  {DIM}到哪拿：Emby → 设置 → 高级 → API 密钥 → 新建 → 复制那串字符{RST}")
-    tip("不想自己去拿：输 a 自动生成")
-
-    # 循环到拿到一个能用的值为止，输错不用从菜单重来
     key = ""
-    while True:
-        key = ask("Emby API Key（输 a ＝自动生成，留空取消）").strip()
-        if not key:
-            print("已取消，保持原样。")
+    if c == "1" and cur:
+        tip("换完旧的那把作废；MediaWarp 重启几秒")
+        if not ask_yn("自动换一把新的？", False):
+            print("保持不变。")
             return
-        if key.lower() == "a":
-            key = _emby_key_auto(d)
-            if key:
-                break
-            continue
-        # Emby 的 Key 是 32 位十六进制。不符也放行（版本差异），但提醒一句，
-        # 免得把「新建 API 密钥」旁边的应用名之类的东西粘进来还查不出原因。
-        if re.fullmatch(r"[0-9a-fA-F]{32}", key):
-            break
-        warn(f"这串是 {len(key)} 个字符，不像 Emby 的 API Key（通常 32 位十六进制）。")
-        if ask_yn("仍然使用它？", False):
-            break
-        print(f"  {DIM}那就重新贴一次，或直接回车取消。{RST}")
-
+        key, why = emby_rotate_api_key(cur)
+        if not key:
+            warn(f"没换成：{why}")
+            if "失效" not in why:
+                return
+            key = _emby_key_auto(d)                # 现在这把已经不认了：登录一次再建
+    elif c == "1":
+        key = _emby_key_auto(d)
+    else:
+        key = _emby_key_manual(d)
+    if not key or key == cur:
+        return
     if not apply_emby_api_key(d, key):
         return
+    _emby_key_services_refresh()
+    if c == "1" and cur:
+        if emby_revoke_api_key(key, cur):
+            ok("旧的那把已作废")
+        else:
+            warn("旧的那把没作废成（去 Emby → 设置 → 高级 → API 密钥 手动删）")
+    print(f"  新的 Key：{CYAN}{BOLD}{key}{RST}")
     print()
     print(f"  验证：{BOLD}media-stack 302{RST} 然后播一集，日志出现 302 就说明直链生效了。")
 

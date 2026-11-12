@@ -145,45 +145,89 @@ check(f"不是管理员：{why}", key == "" and "不是管理员" in why and not
 key, why = m.emby_make_api_key("old", "wrong")
 check(f"密码不对：{why}", key == "" and "登不上" in why)
 
-print("五、「7 设置 → 1」输 a 自动生成")
+print("五、「7 设置 → 1」：1 自动 / 2 手动 / 0 返回（1.5.408，仓库主人 11/12：「自动更换进去输入y他就直接跟你换好」）")
 T = tempfile.mkdtemp(); D = T + "/ms"; os.makedirs(D + "/mediawarp/config")
 open(f"{D}/docker-compose.yml", "w").write("services: {}\n")
 MW = f"{D}/mediawarp/config/config.yaml"
 open(MW, "w").write("emby:\n  auth:      # Emby API Key，留空则 MediaWarp 无法工作\n")
 m.ms_install_dir = lambda: D
-RUN = []
+RUN, SH = [], []
 m.subprocess = types.SimpleNamespace(run=lambda cmd, **k: (RUN.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1])
-ANS = []
+m.sh = lambda cmd, check=False, timeout=None: (SH.append(cmd), types.SimpleNamespace(returncode=0, stdout="", stderr=""))[1]
+for u in ("HEAL_DAEMON_UNIT", "HLS_UNIT", "HEAL_GATE_UNIT"):
+    setattr(m, u, f"{T}/{os.path.basename(getattr(m, u))}"); open(getattr(m, u), "w").close()
+ANS, YN, YES, PLAYING = [], [], [True], [False]
 m.ask = lambda prompt, default="": ANS.pop(0) if ANS else ""
-m.ask_yn = lambda q, default=True: True
-def run_key(*answers):
-    ANS[:] = list(answers); RUN.clear()
+m.ask_yn = lambda q, default=True: (YN.append((q, default)), YES[0])[1]
+m.someone_playing = lambda k, cache_s=0: PLAYING[0]
+def fake_emby(path, key, method="GET", timeout=60, body=None):          # 带 API Key 的那条路：Key 得是 Emby 认的
+    valid = {k["AccessToken"] for k in E["keys"]}
+    if key not in valid:
+        raise m.urllib.error.HTTPError(path, 401, "x", {}, None)
+    if path.startswith("/Auth/Keys?App=") and method == "POST":
+        E["keys"].append({"AccessToken": "%032x" % (len(E["keys"]) + 0xabc), "AppName": "MediaWarp",
+                          "DateCreated": "2026-02-0%dT00:00:00Z" % (len(E["keys"]) + 1)})
+        return {}
+    if path == "/Auth/Keys":
+        return {"Items": list(E["keys"])}
+    mm = re.match(r"/Auth/Keys/(\w+)$", path)
+    if mm and method == "DELETE":
+        E["keys"][:] = [k for k in E["keys"] if k["AccessToken"] != mm.group(1)]; return {}
+    raise AssertionError(path)
+m._emby = fake_emby
+def run_key(*answers, yes=True, playing=False):
+    ANS[:] = list(answers); RUN.clear(); SH.clear(); YN.clear(); YES[0], PLAYING[0] = yes, playing
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         m.set_emby_api_key()
     return plain(buf.getvalue())
+cur_key = lambda: m.read_emby_api_key(D)
+
 reset()
-out = run_key("a", "boss", "")
-check("Emby 还没设置过：问用户名密码，密码留空随机生成、顶格单独一行只显示一次",
+out = run_key("0")
+check("还没有 Key：屏上说空着，1 自动生成 / 2 手动填写 / 0 返回", "当前为空" in out and "  1. 自动生成" in out and "  2. 手动填写" in out and "  0. 返回" in out)
+out = run_key("1", "boss", "")
+check("1 自动生成（Emby 还没设置过）：问用户名密码、建账号，随机密码顶格单独一行",
       "Emby 账号「boss」已建好" in out and re.search(r"\n[A-Za-z0-9]{16}\n", out) is not None and E["done"])
+k1 = cur_key()
+check("密钥写进 MediaWarp 配置（行尾注释还在）、.secrets 存一份、MediaWarp 重启",
+      re.search(r"auth: [0-9a-f]{32}\s+# Emby API Key", open(MW).read()) is not None and k1 == E["keys"][-1]["AccessToken"]
+      and m.read_env(f"{D}/.secrets", "EMBY_API_KEY") == k1 and ["docker", "restart", "mediawarp"] in RUN)
 m._emby_user_list = lambda key: [("u0", E["users"]["u0"]["Name"], True, True)]
 m.emby_pw_remember(D, "k", "boss", E["users"]["u0"]["pw"])
 check("建好的账号密码记在 .secrets，「2 使用信息」「7 设置 → 12」里看得到", m.emby_pw_get(D, "u0") == E["users"]["u0"]["pw"]
       and "emby_pw_remember(d, key, name, pw)" in SRC and "emby_pw_get(d, _i)" in SRC)
-check("密钥写进 MediaWarp 配置（行尾注释还在）、.secrets 存一份、MediaWarp 重启",
-      re.search(r"auth: [0-9a-f]{32}\s+# Emby API Key", open(MW).read()) is not None
-      and m.read_env(f"{D}/.secrets", "EMBY_API_KEY") == E["keys"][-1]["AccessToken"] and ["docker", "restart", "mediawarp"] in RUN)
-open(MW, "w").write("emby:\n  auth:      # x\n"); os.remove(f"{D}/.secrets")
-out = run_key("a", "boss", "wrong-pw", "")
-check("已经设置过、密码填错：说没生成出来，回到那一问，什么都没写", "没生成出来" in out and "auth:      # x" in open(MW).read() and not RUN)
-out = run_key("a", "boss", E["users"]["u0"]["pw"])
-check("已经设置过、填对管理员账号密码：建密钥填上", re.search(r"auth: [0-9a-f]{32}", open(MW).read()) is not None)
-open(MW, "w").write("emby:\n  auth:      # x\n")
-out = run_key("0123456789abcdef0123456789abcdef")
-check("手动贴密钥的老路还在", "auth: 0123456789abcdef0123456789abcdef" in open(MW).read())
-out = run_key("")
-check("留空 = 取消", "已取消" in out)
-check("屏上一行提示「输 a 自动生成」", 'tip("不想自己去拿：输 a 自动生成")' in SRC)
+
+out = run_key("0")
+check("已经有 Key：屏上「当前已填：…」，1 自动更换 / 2 手动更换 / 0 返回", f"当前已填：{k1}" in out and "  1. 自动更换" in out and "  2. 手动更换" in out)
+check("0 / 回车返回：什么都不动", cur_key() == k1 and not RUN and not SH)
+out = run_key("1", yes=False)
+check("1 自动更换：一行说清后果、确认默认否；答否不换", YN == [("自动换一把新的？", False)] and "旧的那把作废" in out and cur_key() == k1 and not RUN)
+n_calls = len(E["calls"])
+out = run_key("1")
+k2 = cur_key()
+check("答 y 直接换好：不用输账号密码、没去登录", k2 != k1 and re.fullmatch(r"[0-9a-f]{32}", k2) is not None and len(E["calls"]) == n_calls and not ANS)
+check("新的写进 MediaWarp 配置和 .secrets、MediaWarp 重启", m.read_env(f"{D}/.secrets", "EMBY_API_KEY") == k2 and ["docker", "restart", "mediawarp"] in RUN)
+check("旧的那把在 Emby 里作废了，新的还在", k1 not in {k["AccessToken"] for k in E["keys"]} and k2 in {k["AccessToken"] for k in E["keys"]} and "旧的那把已作废" in out)
+check("常驻服务换上新 Key：补时长 / 换链在跑才重起，开播门停掉等下次开播拉起（它们启动时读的 Key）",
+      SH == ["systemctl try-restart media-stack-heald.service", "systemctl try-restart media-stack-hls.service", "systemctl stop media-stack-healgate.service"])
+check("顺序：先写配置重启、常驻服务换好，最后才作废旧的", SRC.index("_emby_key_services_refresh()\n    if c ==") < SRC.index("if emby_revoke_api_key(key, cur):"))
+check("屏上印出新的 Key", f"新的 Key：{k2}" in out)
+out = run_key("1", yes=False, playing=True)
+check("有人在看片：说会断、先问，默认否", YN and YN[0] == ("还是现在就换？", False) and "正在播的会断" in out and cur_key() == k2)
+out = run_key("2", "0123456789abcdef0123456789abcdef")
+check("2 手动更换：贴进来的写上；Emby 里原来那把不动（没让脚本作废）", cur_key() == "0123456789abcdef0123456789abcdef"
+      and k2 in {k["AccessToken"] for k in E["keys"]} and "旧的那把已作废" not in out)
+out = run_key("2", "")
+check("手动留空 = 取消", "已取消" in out and cur_key() == "0123456789abcdef0123456789abcdef")
+out = run_key("1", "boss", "wrong-pw")
+check("现在这把 Emby 不认了（失效）：自动那条改成登录一次；密码错 → 说没生成出来，不动", "已经失效" in out and "没生成出来" in out
+      and cur_key() == "0123456789abcdef0123456789abcdef")
+out = run_key("1", "boss", E["users"]["u0"]["pw"])
+check("失效 + 填对管理员账号密码：建一把新的填上", cur_key() in {k["AccessToken"] for k in E["keys"]})
+out = run_key("9")
+check("乱按：无效选择", "无效选择" in out)
+check("media-stack apikey 这个命令还在", re.search(r'arg in \("apikey", "key"\):\n\s+require_root\(\); set_emby_api_key\(\)', SRC) is not None)
 
 print("六、安装")
 ins = SRC[SRC.index("    # Emby 账号 + API Key（见 emby_first_setup）"):]
@@ -194,7 +238,7 @@ check("重跑（已有 Key）：默认沿用，不再把它问丢", '_k_old = re
       and 'ask("Emby API Key（回车＝沿用现在的）", _k_old)' in ins)
 i_up, i_setup, i_sum = SRC.index("docker compose --env-file {env_file} up -d"), SRC.index('emby_first_setup(cfg["emby_user"], cfg["emby_pass"])'), SRC.index('cred_file = os.path.join(cfg["install_dir"], "CREDENTIALS.txt")\n    write_atomic(cred_file, build_summary')
 check("容器起来之后、写总览之前去建账号和密钥；建成了写进 MediaWarp", i_up < i_setup < i_sum and 'apply_emby_api_key(cfg["install_dir"], _key)' in SRC)
-check("没建成：屏上说原因 + 指路「7 设置 → 1 输 a」，安装继续", 'warn(f"Emby 没自动设好：{_why}")' in SRC and "输 a 自动生成密钥" in SRC)
+check("没建成：屏上说原因 + 指路「7 设置 → 1 → 1 自动生成」，安装继续", 'warn(f"Emby 没自动设好：{_why}")' in SRC and "「7 设置 → 1 → 1 自动生成」" in SRC)
 cfg = {"install_dir": D, "data_root": D + "/media", "domain": "", "has_domain": False, "homepage": False, "basic_auth": False, "host_ip": "127.0.0.1",
        "ol_user": "admin", "ol_pass": "OLPASS", "ba_user": "media", "ba_pass": "", "emby_user": "boss", "emby_pass": "TOPSECRET", "emby_ready": True}
 try:
@@ -210,6 +254,6 @@ check("装的时候定的密码记进 .secrets（1.5.406）", 'emby_pw_remember(
 check("收尾那几步：密钥就绪就不再叫人去网页建", "Emby 账号和 API 密钥已经就绪" in SRC)
 
 print("七、版本号")
-check("media-stack 1.5.405 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 405))
+check("media-stack 1.5.408 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 408))
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
