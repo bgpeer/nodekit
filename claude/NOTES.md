@@ -300,6 +300,8 @@
   查法：`getent ahostsv4` 拿地址 + `curl --resolve` 逐个连；容器里 `docker exec openlist wget` 连几次看秒数；OpenList 日志里是
   `dial tcp … i/o timeout` / `TLS handshake timeout`。换哪家 DNS 都是同一批地址。修法是 `ol_route_check`（1.5.409）：坏的避开、
   挑最快的写进容器 hosts（`# pinned` 结尾的行），挂在每小时保活 / 体检 / 「8 更新」/ `media-stack route`。真机 11/12 验过：6 个地址 5 个坏，钉上那 1 个好的后夸克能播了（hosts 写进去不用重启 OpenList 就生效）。
+  1.5.412 把阿里盘（`openapi.alipan.com`）和 115（`webapi.115.com` / `proapi.115.com`）加进 `OL_ROUTE_TABLE`，域名照 OpenList 驱动源码核对
+  （`drivers/aliyundrive_open/util.go`、`SheltonZhu/115driver` 的 `pkg/driver/api.go`）；只查挂着的盘（`_route_hosts`）；再加盘先去源码核对域名。
   1.5.411 加了两样（仓库主人：「两件一起做吧要做就做好」）：单独一条 cron 每 5 分钟查（`ROUTE_CRON` → `route-tick`）；IPv4 全坏时的后路 —— 本机 IPv6 中转
   （`ROUTE6_UNIT` → `do_route6_relay`，容器连假地址 `OL_ROUTE6_IP:443` → 一条 DNAT → 中转 → IPv6），`_route6_on` / `_route6_off` 管起停和 iptables。**中转没在真机验过**
   （DNAT、INPUT 放行、容器里实连这几步都只在测试里走过）。**新加 `media-stack xxx` 命令要在 bash 壳的 case 里也登记**（1.5.409 漏过，敲下去是「未知命令」）。
