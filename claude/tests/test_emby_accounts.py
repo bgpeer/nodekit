@@ -31,6 +31,11 @@ def fake(path, key, method="GET", timeout=60, body=None):
         return dict(USERS[mm.group(1)])
     if mm and method == "POST":
         USERS[mm.group(1)] = dict(body); return {}
+    if path == "/Sessions":
+        return [{"Id": "s1", "UserId": "u1", "NowPlayingItem": {"Id": "9"}}, {"Id": "s2", "UserId": "u1"},
+                {"Id": "s3", "UserId": "u2", "NowPlayingItem": {"Id": "8"}}]
+    if re.match(r"/Sessions/\w+/Playing/Stop$", path) and method == "POST":
+        return {}
     if path == "/Devices":
         return {"Items": [{"Id": "d1", "LastUserId": "u1"}, {"Id": "d 2", "LastUserId": "u1"}, {"Id": "d3", "LastUserId": "u2"}]}
     if path.startswith("/Devices?Id=") and method == "DELETE":
@@ -70,15 +75,23 @@ check("没 API Key → 不进", "先填「1」" in drive(lambda: m.emby_accounts
 
 print("三、改名")
 CALLS.clear()
-out = drive(lambda: m.emby_accounts_menu("K"), ["1", "1", "Evan2", "", "0", "0"], [])
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "1", "Evan2", "0", "0"], [False])
+check("先说清会踢人、确认答否 → 不改、不踢", USERS["u1"]["Name"] == "evan" and "正在看的会断" in out
+      and not any(c[0] in ("DELETE", "POST") for c in CALLS))
+check("改名的确认默认否", re.search(r'ask_yn\(f"把「\{name\}」改名成「\{new\}」？", False\)', src) is not None)
+CALLS.clear()
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "1", "Evan2", "", "0", "0"], [True])
 check("改成了，别的字段原样带回", USERS["u1"]["Name"] == "Evan2" and USERS["u1"]["Configuration"] == {"X": 1})
 check("屏上一行 ✔ + 提示用新用户名登录", "用户名改成「Evan2」" in out and "新用户名" in out)
+check("改名后这个账号的设备全踢掉（仓库主人 11/12：改完立刻要用新的重新登录）：只删它的两台",
+      [c[1] for c in CALLS if c[0] == "DELETE"] == ["/Devices?Id=d1", "/Devices?Id=d%202"] and "2 台设备已退出登录" in out)
+check("它正在播的那一个先叫停；没在播的、别人的不碰", [c[1] for c in CALLS if c[1].endswith("/Playing/Stop")] == ["/Sessions/s1/Playing/Stop"])
 check("跟别人重名 → 不改", m.emby_rename_user("K", "u1", "家人") and USERS["u1"]["Name"] == "Evan2")
 check("空名 → 不改", m.emby_rename_user("K", "u1", "  ") and USERS["u1"]["Name"] == "Evan2")
 
 print("四、改密码")
 CALLS.clear(); LOG.clear()
-out = drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "r", "", "0", "0"], [True, False])
+out = drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "r", "", "0", "0"], [True])
 pw = [c for c in CALLS if c[1].endswith("/Password")]
 check("先重置、再设新的", len(pw) == 2 and pw[0][2].get("ResetPassword") is True and pw[1][2].get("CurrentPw") == ""
       and len(pw[1][2].get("NewPw", "")) == 16)
@@ -86,17 +99,24 @@ newpw = pw[1][2]["NewPw"]
 check("新密码顶格单独一行打一次", out.count(newpw) == 1 and (newpw + "\n") in out and ("\n" + newpw) in out)
 check("不进日志", not any(newpw in l for l in LOG))
 CALLS.clear(); FAIL_SET[0] = 1
-out = drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "abc123", "", "0", "0"], [True, True, False])
+out = drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "abc123", "", "0", "0"], [True, True])
 check("第二步失败 → 醒目报没有密码、重试成功", "这个账号现在没有密码" in out and "密码已改" in out
       and sum(1 for c in CALLS if c[1].endswith("/Password")) == 4)   # 重试 = 再重置一次 + 再设
 
-print("五、改完密码顺带踢掉已登录设备（默认不勾）")
-check("上一轮答否 → 一台都没删", not any(c[0] == "DELETE" for c in CALLS))
-check("问的是默认否", re.search(r'ask_yn\(f"同时让「\{name\}」在所有设备上退出登录？", False\)', src) is not None)
+print("五、改完密码这个账号的设备全踢掉（1.5.404 起不再问，仓库主人 11/12）")
+check("不再有「同时让…退出登录？」那一问，也不再说「不会自己掉线」", "在所有设备上退出登录？" not in src and "不会自己掉线" not in src)
 CALLS.clear()
-out = drive(lambda: m.emby_accounts_menu("K"), ["1", "2", "xyz", "", "0", "0"], [True, True])
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "2", "xyz", "", "0", "0"], [True])
 dels = [c[1] for c in CALLS if c[0] == "DELETE"]
-check("勾了 → 只删这个账号的两台，别人的不动", dels == ["/Devices?Id=d1", "/Devices?Id=d%202"] and "已让 2 台设备退出登录" in out)
+check("只删这个账号的两台，别人的不动；屏上说踢了几台、要用新密码重新登录", dels == ["/Devices?Id=d1", "/Devices?Id=d%202"]
+      and "2 台设备已退出登录" in out and "新密码重新登录" in out)
+check("改之前一行说清：所有设备立刻退出、正在看的会断", "所有设备立刻退出登录，正在看的会断" in out)
+check("正在播的先叫停", [c[1] for c in CALLS if c[1].endswith("/Playing/Stop")] == ["/Sessions/s1/Playing/Stop"])
+_old = m._emby
+m._emby = lambda path, key, method="GET", timeout=60, body=None: (_ for _ in ()).throw(RuntimeError("x")) if path in ("/Devices", "/Sessions") else _old(path, key, method, timeout, body)
+out = drive(lambda: m.emby_accounts_menu("K"), ["1", "2", "xyz2", "", "0", "0"], [True])
+check("设备列表读不到：密码照改，屏上明说旧设备没踢掉、去哪手动删", "密码已改" in out and "没踢掉" in out and "手动删" in out)
+m._emby = _old
 
 print("六、默认不改")
 CALLS.clear()
@@ -104,5 +124,5 @@ drive(lambda: m.emby_accounts_menu("K"), ["2", "2", "abc", "", "0", "0"], [False
 check("确认答否 → 一个请求都不发", not any(c[1].endswith("/Password") for c in CALLS))
 ynd = re.search(r'ask_yn\(f"把「\{name\}」的密码改掉？", False\)', src)
 check("确认默认否", ynd is not None)
-check("版本 1.5.391 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 391))
+check("版本 1.5.404 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 404))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

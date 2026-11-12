@@ -100,7 +100,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.403"
+SCRIPT_VERSION = "1.5.404"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -26604,8 +26604,18 @@ def emby_set_password(key, uid, new):
 
 def emby_logout_everywhere(key, uid):
     """让这个账号在所有设备上退出登录：删掉 Emby「设备」里最后登录者是它的那几台（删了设备 = 那台的登录凭证作废）。
-    仓库主人 10/31：改了密码已登录的设备照样能看，要能一起踢掉，默认不勾。返回 (踢掉几台, 失败几台)。"""
+    仓库主人 10/31：改了密码已登录的设备照样能看，要能一起踢掉。11/12 起改用户名 / 密码后一律踢（见 _emby_kick）。
+    先让它正在播的停下（Playing/Stop，尽力而为：播放器不听也没关系，凭证作废后它下一次上报就被拒）。返回 (踢掉几台, 失败几台)。"""
     done = fail = 0
+    try:
+        for ss in (_emby("/Sessions", key, timeout=15) or []):
+            if str(ss.get("UserId") or "") == uid and ss.get("NowPlayingItem") and ss.get("Id"):
+                try:
+                    _emby(f"/Sessions/{ss['Id']}/Playing/Stop", key, method="POST", body={}, timeout=10)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     try:
         devs = (_emby("/Devices", key, timeout=15) or {}).get("Items") or []
     except Exception:
@@ -26619,6 +26629,19 @@ def emby_logout_everywhere(key, uid):
         except Exception:
             fail += 1
     return done, fail
+
+
+def _emby_kick(key, uid, name):
+    """改完用户名 / 密码：这个账号所有设备立刻退出登录，要用新的重新登录；正在看的也断。
+    仓库主人 11/12：「修改了用户名和密码之后希望能立刻清空旧的然后要用新的重新登入，就算有人在看片也会被强制退出」。
+    原来改名不踢、改密码问一句（默认不踢）—— 结果旧设备拿着旧凭证照样能看。"""
+    n_ok, n_bad = emby_logout_everywhere(key, uid)
+    if n_bad < 0:
+        warn("读不到 Emby 的设备列表，旧设备没踢掉（去 Emby 后台 → 设备 手动删）")
+    elif n_bad:
+        warn(f"踢掉 {n_ok} 台，{n_bad} 台没踢掉（去 Emby 后台 → 设备 手动删）")
+    else:
+        ok(f"「{name}」的 {n_ok} 台设备已退出登录")
 
 
 def emby_accounts_menu(key):
@@ -26670,20 +26693,25 @@ def _emby_account_menu(key, uid):
             new = ask("新用户名（回车＝不改）").strip()
             if not new or new == name:
                 print("没改。")
+                continue
+            tip(f"改完「{name}」所有设备立刻退出登录，正在看的会断")
+            if not ask_yn(f"把「{name}」改名成「{new}」？", False):
+                print("没改。")
+                continue
+            why = emby_rename_user(key, uid, new)
+            if why:
+                warn(f"没改成：{why}")
             else:
-                why = emby_rename_user(key, uid, new)
-                if why:
-                    warn(f"没改成：{why}")
-                else:
-                    ok(f"用户名改成「{new}」")
-                    tip("客户端下次登录要用新用户名")
+                ok(f"用户名改成「{new}」")
+                _emby_kick(key, uid, new)
+                tip("每台设备都要用新用户名重新登录")
         elif c == "2":
             typed = ask("新密码（输 r ＝随机生成，回车＝不改）").strip()
             if not typed:
                 print("没改。")
                 continue
             new = rand_pw(16) if typed == "r" else typed
-            tip("改完后已登录的客户端可能要重新登录")
+            tip(f"改完「{name}」所有设备立刻退出登录，正在看的会断")
             if not ask_yn(f"把「{name}」的密码改掉？", False):
                 print("没改。")
                 continue
@@ -26692,16 +26720,8 @@ def _emby_account_menu(key, uid):
                 if good:
                     ok("密码已改，新密码（只显示这一次）：")
                     print(new)
-                    # 【默认不踢】改了密码，已登录的设备照样能看；要连它们一起换新密码重登才勾
-                    tip("已登录的设备不会自己掉线；踢掉的话，这个账号每台设备都要用新密码重新登录")
-                    if ask_yn(f"同时让「{name}」在所有设备上退出登录？", False):
-                        n_ok, n_bad = emby_logout_everywhere(key, uid)
-                        if n_bad < 0:
-                            warn("读不到 Emby 的设备列表，没踢")
-                        elif n_bad:
-                            warn(f"踢掉 {n_ok} 台，{n_bad} 台没踢掉（去 Emby 后台 → 设备 手动删）")
-                        else:
-                            ok(f"已让 {n_ok} 台设备退出登录")
+                    _emby_kick(key, uid, name)
+                    tip("每台设备都要用新密码重新登录")
                     break
                 if step == "reset":
                     warn("没改成：Emby 不让重置，原密码没动")
