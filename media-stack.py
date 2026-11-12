@@ -26,7 +26,9 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
+import ssl
 import string
 import subprocess
 import sys
@@ -100,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.408"
+SCRIPT_VERSION = "1.5.409"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -1995,6 +1997,7 @@ case "${1:-info}" in
   heal            补条目的媒体信息(时长/音视频轨)，补到完为止，可随时 Ctrl-C
   heal <片名>     只补名字对得上的那几个(不走队列、不查放弃名单)
                   没有时长 = Emby 存不住进度条，这条是"就让这一部先好"
+  route           网盘接口选路：把夸克接口的每个地址测一遍，走不通的避开(平时每小时自己查)
   heal-tick       立刻跑一次"刚点开过就补"那条自动轮子(平时每分钟自己跑)
                   想验"点播放→自动补"这条链时用它，不用干等下一次触发
   heal-log [行数] 补时长的流水账：什么时候补的、走 m3u8 还是整文件、花了多久
@@ -4931,6 +4934,157 @@ def keepalive_state(d):
         return {}
 
 
+# ---- 网盘接口选路：OpenList 连网盘接口时避开走不通的地址 ----
+# 仓库主人 11/12：「可以让他自动排除坏的地址自动选择优秀的地址吗，如果全部坏了然后让他自动测试换一批」。
+# 真机 11/12（日本机器）：夸克盘时好时坏 —— 列目录 93 秒、MediaWarp 等 30 秒超时、点开转圈后退出。一路查下来：
+#   · 夸克 TV 接口的域名每次解析给的地址不一样，其中一段（IPv4）从这台机器 15 秒连不上，另一个 1 秒就通
+#   · VPS 本机有 IPv6，IPv4 不通会自己改走 IPv6，所以在本机 curl 永远是好的；OpenList 在容器里只有 IPv4，
+#     抽到坏的就干等到超时（容器里连 5 次，4 次 15 秒）
+#   · 换哪家 DNS 给的都是同一批地址 —— 不是 DNS 的事。给容器开 IPv6 动的面太大（所有容器出网都可能改走 IPv6，
+#     有的网盘直链按来访地址签发），没选
+# 做法：在本机把这个域名的每个 IPv4 各连一次（TCP + TLS 握手，验证书），DNS 会给的地址里有坏的 → 挑最快的那个
+# 写进 OpenList 容器的 /etc/hosts（Go 每次解析都会读它，不用重启容器）；现在钉着的那个还通就不换（别来回跳）；
+# DNS 给的全都通了 → 摘掉，交还给 DNS；手上的全坏了 → 重新多解析几轮换一批再测，还是全坏 → 摘掉，不乱钉。
+#   · 只动 OpenList 容器里的 hosts 文件：不重启任何容器、不碰 MediaWarp 的直链缓存、不碰 Emby（铁律）
+#   · 只用本机的解析，不去问别的公共 DNS（不多一个知道这台机器在连网盘的第三方）
+#   · 容器重建后 hosts 会回到原样：每次检查都读一遍容器里的现状，没有就补上
+# 挂在每小时的保活、「5 链路体检」、「8 更新」上，也能手动跑 media-stack route。没放进每分钟那一轮（铁律：
+# 平时一直在跑的路径上加东西要单独上、等仓库主人实测）。
+OL_ROUTE_HOSTS = ("open-api-drive.quark.cn",)      # 夸克 TV 的接口（OpenList 的 QuarkTV 驱动连它）
+OL_ROUTE_T = 4                # 每个地址最多等几秒：好的 1 秒内，坏的是干等到超时
+OL_ROUTE_POOL_S = 86400       # DNS 这么久以内给过的地址，都算「它还会给」
+OL_ROUTE_MARK = "# pinned"    # 容器 hosts 里这一行是脚本钉的（名字不带脚本 / 仓库的字样）
+
+
+def _route_resolve(host, rounds=6):
+    """本机解析这个域名的 IPv4，多问几轮（它每次给的不一样）。问不到 → 空集。"""
+    out = set()
+    for _ in range(rounds):
+        try:
+            out |= {ai[4][0] for ai in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)}
+        except OSError:
+            pass
+    return out
+
+
+def _route_probe(host, ip, timeout=OL_ROUTE_T):
+    """连这个地址一次：TCP + TLS 握手（证书要对得上这个域名）。通 → 用了几秒；不通 → None。"""
+    t0 = time.monotonic()
+    try:
+        with socket.create_connection((ip, 443), timeout=timeout) as raw:
+            with ssl.create_default_context().wrap_socket(raw, server_hostname=host):
+                return time.monotonic() - t0
+    except Exception:
+        return None
+
+
+def _route_probe_all(host, ips):
+    """几个地址同时测 → {ip: 秒 或 None}。"""
+    res = {}
+    def one(ip):
+        res[ip] = _route_probe(host, ip)
+    ts = [threading.Thread(target=one, args=(ip,), daemon=True) for ip in ips]
+    [t.start() for t in ts]
+    [t.join(OL_ROUTE_T * 2 + 2) for t in ts]
+    return {ip: res.get(ip) for ip in ips}
+
+
+def _ol_hosts_pins():
+    """OpenList 容器里现在钉着什么 → ({域名: 地址}, 整份 hosts 的行)；容器问不到 → (None, [])。"""
+    r = sh("docker exec openlist cat /etc/hosts", timeout=30)
+    if r.returncode != 0:
+        return None, []
+    lines = (r.stdout or "").splitlines()
+    pins = {}
+    for ln in lines:
+        if ln.rstrip().endswith(OL_ROUTE_MARK):
+            f = ln.split()
+            if len(f) >= 2:
+                pins[f[1]] = f[0]
+    return pins, lines
+
+
+def _ol_hosts_apply(want):
+    """把容器里脚本钉的那几行改成 want（{域名: 地址}，地址空 = 不钉）。别的行原样不动。改了 → True。"""
+    cur, lines = _ol_hosts_pins()
+    if cur is None:
+        return False
+    target = {h: ip for h, ip in want.items() if ip}
+    if cur == target:
+        return False
+    new = [ln for ln in lines if not ln.rstrip().endswith(OL_ROUTE_MARK)]
+    new += [f"{ip} {h} {OL_ROUTE_MARK}" for h, ip in sorted(target.items())]
+    # hosts 是 Docker 挂进来的单个文件：不能换文件（sed -i 会失败），只能往原文件里写
+    r = subprocess.run(["docker", "exec", "-i", "-u", "0", "openlist", "sh", "-c", "cat > /etc/hosts"],
+                       input="\n".join(new) + "\n", text=True, capture_output=True, timeout=30)
+    return r.returncode == 0
+
+
+def ol_route_check(d):
+    """查一遍、该钉的钉上。返回 [{host, pin, was, good: [(ip, 秒)], bad: [ip], note}]；OpenList 容器不在 → []。"""
+    cur, _lines = _ol_hosts_pins()
+    if cur is None:
+        return []
+    now = int(time.time())
+    state = dict(ms_state().get("ol_route") or {})
+    report, want = [], {}
+    for host in OL_ROUTE_HOSTS:
+        st = state.get(host) or {}
+        pool = {ip: ts for ip, ts in (st.get("pool") or {}).items() if now - int(ts or 0) < OL_ROUTE_POOL_S}
+        pool.update({ip: now for ip in _route_resolve(host)})
+        was = cur.get(host, "")
+        res = _route_probe_all(host, sorted(set(pool) | ({was} if was else set())))
+        note = ""
+        if not any(v is not None for v in res.values()):
+            # 手上的全坏了：重新多解析几轮，换一批再测
+            fresh = _route_resolve(host, rounds=20) - set(res)
+            pool.update({ip: now for ip in fresh})
+            res.update(_route_probe_all(host, sorted(fresh)))
+            note = "换了一批再测"
+        good = sorted(((ip, v) for ip, v in res.items() if v is not None), key=lambda x: x[1])
+        bad = sorted(ip for ip, v in res.items() if v is None)
+        dns_bad = [ip for ip in bad if ip in pool]             # DNS 还会给出来的坏地址
+        if not good:
+            pin, note = "", (note + "，" if note else "") + "全都不通，没钉"
+        elif not dns_bad:
+            pin = ""                                            # DNS 给的都通：交还给 DNS
+        elif was and res.get(was) is not None:
+            pin = was                                           # 现在钉着的还通：不换，别来回跳
+        else:
+            pin = good[0][0]
+        want[host] = pin
+        state[host] = {"pool": pool, "pin": pin, "ts": now, "bad": bad,
+                       "good": [[ip, round(v, 2)] for ip, v in good], "note": note}
+        report.append({"host": host, "pin": pin, "was": was, "good": good, "bad": bad, "note": note})
+    _ol_hosts_apply(want)
+    save_ms_state(ol_route=state)
+    return report
+
+
+def do_route():
+    """media-stack route：手动查一遍网盘接口选路，把结果印出来。"""
+    d = ms_install_dir()
+    if not is_installed(d):
+        warn("还没装。")
+        return
+    rep = ol_route_check(d)
+    if not rep:
+        warn("OpenList 容器没在跑，没查。")
+        return
+    for r in rep:
+        print(f"\n{YELLOW}{BOLD}▸ {r['host']}{RST}")
+        for ip, v in r["good"]:
+            print(f"      {GREEN}✔{RST} {ip}　{v:.1f} 秒" + (f"　{CYAN}← OpenList 固定用它{RST}" if ip == r["pin"] else ""))
+        for ip in r["bad"]:
+            print(f"      {RED}✖{RST} {ip}　连不上")
+        if r["pin"]:
+            ok(f"有走不通的地址，OpenList 固定用 {r['pin']}" + ("（刚换的）" if r["pin"] != r["was"] else ""))
+        elif r["bad"] and not r["good"]:
+            warn("全都不通（换了一批也一样），没钉；过一会儿自动再查")
+        else:
+            ok("都通，不用钉" + ("（刚摘掉）" if r["was"] else ""))
+
+
 def do_keepalive():
     """定时做一次真实的目录列举。
 
@@ -4956,6 +5110,10 @@ def do_keepalive():
     if not is_installed(d):
         return
     cfg = rebuild_cfg_from_disk(d)
+    try:
+        ol_route_check(d)             # 网盘接口选路：先把走不通的地址避开，再去列目录（只改容器里的 hosts，不重启东西）
+    except Exception:
+        pass
     pw = read_env(os.path.join(d, ".secrets"), "OPENLIST_PASS",
                   fallback=os.path.join(d, ".env"))
     rec = {"ts": int(time.time()), "ok": False, "elapsed": 0.0, "error": ""}
@@ -28455,6 +28613,22 @@ def do_healthcheck():
         todo.append(("OpenList 登不上，后面几项没法测",
                      "看 docker logs --tail 50 openlist"))
 
+    # ---- 网盘接口选路：有走不通的地址就当场避开（见 ol_route_check）----
+    try:
+        _routes = ol_route_check(d)
+    except Exception:
+        _routes = []
+    for _r in _routes:
+        _lab = "接口选路 " + _r["host"].split(".")[-2]
+        if _r["pin"]:
+            _hc(_lab, "ok", f"{len(_r['bad'])} 个地址走不通，OpenList 固定用通的那个（{_r['good'][0][1]:.1f} 秒）"
+                + ("　刚换的" if _r["pin"] != _r["was"] else ""))
+        elif _r["bad"] and not _r["good"]:
+            _hc(_lab, "bad", f"{len(_r['bad'])} 个地址全都连不上（换了一批也一样）")
+            todo.append((f"{_r['host']} 从这台机器一个地址都连不上", "多半是线路，等一阵再跑体检；这个盘的片这会儿放不了"))
+        else:
+            _hc(_lab, "ok", f"{len(_r['good'])} 个地址都通")
+
     # ---- 存储 ----
     stale_status = {}          # 挂载点 → 上次初始化时的报错（等实测结果出来再定性）
     stores = openlist_storages(d)
@@ -30021,6 +30195,8 @@ if __name__ == "__main__":
             do_hls_fix()
         elif arg == "alitv-renewd":       # systemd 起的常驻：阿里 TV 令牌本机续期
             do_alitv_renewd()
+        elif arg == "route":              # 网盘接口选路：手动查一遍
+            require_root(); do_route()
         elif arg == "keepalive":          # cron 调的，安静跑，结果写 json
             if take_task_lock("keepalive"):
                 _timed("链路保活", do_keepalive)

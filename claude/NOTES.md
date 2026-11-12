@@ -295,6 +295,13 @@
   会话容器里 `dockerd` 起得来，但拉镜像起容器被环境拦了，别再试；要对接口就 `curl raw.githubusercontent.com/OpenListTeam/OpenList/main/…` 读源码。
 - **写进 YAML 的账号密码走 `_yaml_scalar`**：纯字母数字照原样（老装机配置一个字不变，不然「8 更新」会多重启一次 MediaWarp），其余加单引号。
 
+- **夸克时好时坏先查接口地址（11/12 真机，日本机器）**：`open-api-drive.quark.cn` 每次解析给的 IPv4 不一样，其中一段从那台机器 15 秒连不上、
+  另一个 1 秒通。本机 curl 永远是好的（有 IPv6，自己绕开），容器里只有 IPv4、5 次 4 次超时 —— **别拿本机 curl 的结果当容器的**。
+  查法：`getent ahostsv4` 拿地址 + `curl --resolve` 逐个连；容器里 `docker exec openlist wget` 连几次看秒数；OpenList 日志里是
+  `dial tcp … i/o timeout` / `TLS handshake timeout`。换哪家 DNS 都是同一批地址。修法是 `ol_route_check`（1.5.409）：坏的避开、
+  挑最快的写进容器 hosts（`# pinned` 结尾的行），挂在每小时保活 / 体检 / `media-stack route`。没在真机验过，等仓库主人实测。
+  表象曾被误会成「换 API Key 换坏了」—— 其实是换 Key 重启 MediaWarp 清了直链缓存，夸克每一集都得重新去要。
+
 ## 仓库主人的偏好
 
 - 屏上精简、整齐；危险操作醒目一行 + 默认否；功能不许悄悄删。
