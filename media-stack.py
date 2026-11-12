@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.419"
+SCRIPT_VERSION = "1.5.420"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -25160,7 +25160,7 @@ def _pick_dirs(d, mp, prompt="要扫哪个"):
         # 第一次用的人看不过来。那几个键【都还认】（没删）：. = y，.. = n，* = 这一层的子目录全选，/ 开头 = 直接贴路径，
         # 多个编号用逗号隔开 = 一次选好几个 —— 只是不占屏了。这个函数所有盘、「不扫的目录」共用，改一处全一样。
         print(f"  {DIM}编号 进下一层　y {'就扫整个盘' if cur == root else '就扫这一层'}　"
-              f"n {'返回' if cur == root else '返回上一层'}{RST}")
+              f"n {'返回' if cur == root else '返回上一层'}　回车 放弃{RST}")       # 回车放弃：仓库主人 11/13「回车放弃吧」（本来就认，补到屏上）
         pick = ask(prompt).strip()
         if not pick:
             return []
