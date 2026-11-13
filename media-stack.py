@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.425"
+SCRIPT_VERSION = "1.5.426"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -5963,6 +5963,10 @@ def do_selfupdate():
     except Exception as e:
         rec["error"] = _short_err(e)
     try:
+        rec["metatube"] = metatube_auto_update(d)     # 插件有新版就换（有人在用就今晚不动），结果一起记下给体检看
+    except Exception as e:
+        rec["metatube"] = "error:" + _short_err(e)
+    try:
         with open(os.path.join(d, "selfupdate.json"), "w") as f:
             json.dump(rec, f, ensure_ascii=False)
     except OSError:
@@ -5974,8 +5978,8 @@ def install_selfupdate_cron(install_dir):
     ensure_jobq()
     m, h = cst_to_local_cron(SELFUP_HOUR_CST)
     try:
-        txt = (f"# media-stack 每天自动把脚本换成仓库最新版（只换脚本，\n"
-               f"# 不拉镜像、不重生成配置、不重启任何容器）。\n"
+        txt = (f"# media-stack 每天自动把脚本换成仓库最新版（不拉镜像、不重生成配置）；\n"
+               f"# MetaTube 插件有新版也在这一轮换（没人在播才换，换完重启 Emby 一次）。\n"
                f"# 北京时间 {SELFUP_HOUR_CST}（本机 {h:02d}:{m:02d}），"
                f"排在每日对齐之前，换完那一轮就是新版在跑。\n"
                "SHELL=/bin/bash\n"
@@ -14818,6 +14822,10 @@ DOMAIN={cfg['domain']}
     # 重跑安装的人本来就有 Key，冲掉就等于让他再去 Emby 里翻一次。
     save_emby_api_key(cfg["install_dir"], cfg.get("emby_api_key", ""))
 
+    # MetaTube：第一次装默认带上（见 metatube_preinstall）；已经装着再重跑时照旧问一句，默认跟现在一样
+    cfg["metatube"] = False
+    if q_yn("带上 MetaTube 番号刮削插件？", True if simple else metatube_on(cfg["install_dir"])):
+        metatube_preinstall(cfg)
     write_atomic(os.path.join(cfg["install_dir"], "docker-compose.yml"),
                  gen_compose(cfg))
     # 打开的时候就定成 0600（见 write_atomic）：以前是先按 0644 写下去再 chmod，中间那一下谁都读得到
@@ -14929,6 +14937,8 @@ DOMAIN={cfg['domain']}
     # 记住装在哪（菜单里的 2/3/4 就不用再问），以及扫描路径的意图 ——
     # auto 从生成出来的 yaml 里读不回来，只能存在这
     save_ms_state(cfg["install_dir"], scan_spec=cfg["scan_spec"])
+    if cfg.get("metatube"):
+        save_ms_state(metatube_files=cfg["metatube_files"], metatube_ver=cfg["metatube_ver"])
 
     # ---- 总览 ----
     cred_file = os.path.join(cfg["install_dir"], "CREDENTIALS.txt")
@@ -22456,14 +22466,17 @@ def _compose_up(d):
         shell=True, timeout=900).returncode == 0
 
 
-def _metatube_fetch_plugin(d):
-    """下载并解压 Emby 版插件，返回落地的文件名列表。"""
+_MT_TAG = [""]                # 最近一次 _metatube_fetch_plugin 装的是哪一版（调用方拿去记进状态）
+
+
+def _metatube_release(timeout=60):
+    """MetaTube 插件最新的 release → (版本号, Emby 版插件包那一项)。没有 Emby 版的包就抛异常。"""
     req = urllib.request.Request(
         METATUBE_API,
         headers={"Accept": "application/vnd.github+json",
                  # GitHub 的 API 不带 UA 会直接 403
                  "User-Agent": HTTP_UA})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         rel = json.load(r)
     asset = next((a for a in rel.get("assets") or []
                   if str(a.get("name", "")).startswith(METATUBE_ASSET_PREFIX)
@@ -22471,7 +22484,15 @@ def _metatube_fetch_plugin(d):
     if not asset:
         names = "、".join(a.get("name", "?") for a in (rel.get("assets") or [])) or "（空）"
         raise RuntimeError(f"这个 release 里没有 Emby 版插件包。现有：{names}")
-    info(f"下载 {asset['name']}（{rel.get('tag_name', '')}）...")
+    return str(rel.get("tag_name") or ""), asset
+
+
+def _metatube_fetch_plugin(d, rel=None, quiet=False):
+    """下载并解压 Emby 版插件，返回落地的文件名列表。装的版本号记在 _MT_TAG[0]。"""
+    tag, asset = rel or _metatube_release()
+    _MT_TAG[0] = tag
+    if not quiet:
+        info(f"下载 {asset['name']}（{tag}）...")
     dst = emby_plugin_dir(d)
     os.makedirs(dst, exist_ok=True)
     tmp = os.path.join(dst, ".metatube.zip.part")
@@ -24862,6 +24883,56 @@ def metatube_apply_rules(d, key):
     return names
 
 
+def metatube_auto_update(d):
+    """每天凌晨跟着脚本自动更新那一轮：MetaTube 插件有新版就换上。返回 "" 没装 / "latest" 已是最新 /
+    "busy" 有人在用、今晚不换 / "updated:<版本>" 换好了 / "error:<原因>"。
+
+    仓库主人 11/13：「把他加进每天凌晨自动更新的任务里面检查到最新版就自动更新」。
+    【换插件要重启 Emby 才生效】所以照铁律来：有人在播、刚播过、问不到 Emby（play_quiet）→ 今晚不动，明晚再看；
+    没人用才下载、换文件、重启 Emby 一次。只有真有新版的那一晚才会重启，平时就是问一下版本号。
+    以前装的没记过版本号：当成要换，装一次最新的把版本记下来。"""
+    if not metatube_on(d):
+        return ""
+    try:
+        rel = _metatube_release(timeout=30)
+    except Exception as e:
+        return "error:" + _short_err(e)
+    if rel[0] and rel[0] == str(ms_state().get("metatube_ver") or ""):
+        return "latest"
+    if not play_quiet(read_emby_api_key(d)):
+        return "busy"
+    try:
+        files = _metatube_fetch_plugin(d, rel, quiet=True)
+    except Exception as e:
+        return "error:" + _short_err(e)
+    save_ms_state(metatube_files=files, metatube_ver=rel[0])
+    metatube_write_server(d)
+    subprocess.run(["docker", "restart", "emby"], capture_output=True)
+    return "updated:" + rel[0]
+
+
+def metatube_preinstall(cfg):
+    """装 Emby 时把 MetaTube 一起带上：容器起来【之前】把插件放好、设置文件写好、compose 里加上它的服务端。
+    成了 → True（cfg["metatube"] 置上）；插件下不下来 → False，安装照常往下走。
+
+    仓库主人 11/13：「把这个插件做成首次安装emby的时候默认把它带着安装了并自动设置好」。
+    放在起容器之前：Emby 第一次启动就带着插件和它的设置，不用为它再重启一次。
+    它只在建库规则里 metatube: true 的库生效（建库时圈定，见 auto_libraries_apply），别的库不受影响。"""
+    d = cfg["install_dir"]
+    try:
+        files = _metatube_fetch_plugin(d)
+    except Exception as e:
+        warn(f"MetaTube 插件没下载下来（{_short_err(e)}），先不带它")
+        tip("装完到「7 设置 → 2 MetaTube 刮削插件」再装")
+        return False
+    os.makedirs(metatube_dir(d), exist_ok=True)
+    metatube_write_server(d)
+    cfg["metatube"] = True
+    cfg["metatube_files"], cfg["metatube_ver"] = files, _MT_TAG[0]
+    ok(f"MetaTube 插件已带上（{_MT_TAG[0]}），服务器地址已填好")
+    return True
+
+
 def metatube_conf_path(d):
     return os.path.join(emby_plugin_dir(d), "configurations", "MetaTube.json")
 
@@ -24965,7 +25036,7 @@ def toggle_metatube():
         return
     _srv = metatube_write_server(d)                 # 服务器地址：赶在 Emby 重启之前写进插件的设置文件
     subprocess.run(["docker", "restart", "emby"], capture_output=True)
-    save_ms_state(metatube_files=files)
+    save_ms_state(metatube_files=files, metatube_ver=_MT_TAG[0])
     ok("装好了")
     if _srv in ("wrote", "same"):
         ok("插件的服务器地址已填好")
