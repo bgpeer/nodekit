@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.429"
+SCRIPT_VERSION = "1.5.430"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -4972,6 +4972,10 @@ OL_ROUTE_TABLE = (
 OL_ROUTE_HOSTS = tuple(h for _k, h, _n in OL_ROUTE_TABLE)
 OL_ROUTE_NAME = {h: n for _k, h, n in OL_ROUTE_TABLE}
 OL_ROUTE_T = 4                # 每个地址最多等几秒：好的 1 秒内，坏的是干等到超时
+# 【慢的也要避开】真机 11/13：重装后夸克「扫码挂上」连着三次「网盘接口超时」，可选路屏上那批地址全是 ✔ —— 只是握手要 2～4 秒。
+# OpenList 向夸克要二维码 / 换令牌总共只给 5 秒（drivers/quark_uc_tv 的 Init 里 context.WithTimeout 5s），握手 3 秒的地址
+# 再加一来一回就超了。所以握手比这个慢的，跟连不上的一样对待：DNS 会给出它们，就钉最快的那个。
+OL_ROUTE_SLOW_S = 1.5
 OL_ROUTE_POOL_S = 86400       # DNS 这么久以内给过的地址，都算「它还会给」
 OL_ROUTE_MARK = "# pinned"    # 容器 hosts 里这一行是脚本钉的（名字不带脚本 / 仓库的字样）
 
@@ -5266,7 +5270,8 @@ def ol_route_check(d, extra=()):
             note = "换了一批再测"
         good = sorted(((ip, v) for ip, v in res.items() if v is not None), key=lambda x: x[1])
         bad = sorted(ip for ip, v in res.items() if v is None)
-        dns_bad = [ip for ip in bad if ip in pool]             # DNS 还会给出来的坏地址
+        slow = [ip for ip, v in good if v > OL_ROUTE_SLOW_S]
+        dns_bad = [ip for ip in bad + slow if ip in pool]      # DNS 还会给出来的坏地址 / 慢地址
         via6 = False
         if not good and host == OL_ROUTE_HOSTS[0] and _route6_addrs(host):
             # IPv4 一个通的都没有，本机 IPv6 是通的：走中转（见上面 OL_ROUTE6_IP 那段）
@@ -5276,15 +5281,15 @@ def ol_route_check(d, extra=()):
             pin, note = "", (note + "，" if note else "") + "全都不通，没钉"
         elif not dns_bad:
             pin = ""                                            # DNS 给的都通：交还给 DNS
-        elif was and res.get(was) is not None:
-            pin = was                                           # 现在钉着的还通：不换，别来回跳
+        elif was and res.get(was) is not None and (res[was] <= OL_ROUTE_SLOW_S or res[was] <= good[0][1] + 0.3):
+            pin = was                                           # 现在钉着的还通、也不慢：不换，别来回跳
         else:
             pin = good[0][0]
         want[host] = pin
-        state[host] = {"pool": pool, "pin": pin, "ts": now, "bad": bad,
+        state[host] = {"pool": pool, "pin": pin, "ts": now, "bad": bad, "slow": slow,
                        "good": [[ip, round(v, 2)] for ip, v in good], "note": note}
         report.append({"host": host, "name": OL_ROUTE_NAME.get(host, host), "pin": pin, "was": was, "good": good, "bad": bad,
-                       "note": note, "via6": via6})
+                       "slow": slow, "note": note, "via6": via6})
     _ol_hosts_apply(want)
     for r in report:
         if r["via6"] and r["was"] != OL_ROUTE6_IP and not _ol_can_reach(r["host"]):
@@ -5312,13 +5317,15 @@ def do_route():
     for r in rep:
         print(f"\n{YELLOW}{BOLD}▸ {r['name']}{RST}  {DIM}{r['host']}{RST}")
         for ip, v in r["good"]:
-            print(f"      {GREEN}✔{RST} {ip}　{v:.1f} 秒" + (f"　{CYAN}← OpenList 固定用它{RST}" if ip == r["pin"] else ""))
+            _slow = ip in r.get("slow", [])
+            print(f"      {YELLOW + '⚠' if _slow else GREEN + '✔'}{RST} {ip}　{v:.1f} 秒" + ("　慢" if _slow else "")
+                  + (f"　{CYAN}← OpenList 固定用它{RST}" if ip == r["pin"] else ""))
         for ip in r["bad"]:
             print(f"      {RED}✖{RST} {ip}　连不上")
         if r["via6"]:
             ok("IPv4 全都不通，OpenList 改走本机的 IPv6 中转" + ("（刚切的）" if r["pin"] != r["was"] else ""))
         elif r["pin"]:
-            ok(f"有走不通的地址，OpenList 固定用 {r['pin']}" + ("（刚换的）" if r["pin"] != r["was"] else ""))
+            ok(f"有走不通 / 太慢的地址，OpenList 固定用 {r['pin']}" + ("（刚换的）" if r["pin"] != r["was"] else ""))
         elif r["bad"] and not r["good"]:
             warn(f"全都不通（换了一批也一样，IPv6 也没走通），没钉；{ROUTE_EVERY_MIN} 分钟后自动再查")
         else:
@@ -23713,17 +23720,26 @@ def _add_qtv_flow(d):
            "refresh_token": "", "device_id": "", "query_token": "",
            "link_method": "streaming"}
     info(f"正在 OpenList 里建 {mount} ...")
-    try:
-        r = _ol_api("/api/admin/storage/create",
-                    _ol_storage_body(mount, DRIVER_QTV, add), tok, timeout=60)
-    except Exception as e:
-        err(f"没建成：{_short_err(e)}")
-        return False
+    for _try in range(2):
+        try:
+            r = _ol_api("/api/admin/storage/create",
+                        _ol_storage_body(mount, DRIVER_QTV, add), tok, timeout=60)
+        except Exception as e:
+            err(f"没建成：{_short_err(e)}")
+            return False
+        msg = str(r.get("message") or "")
+        if r.get("code") == 200 or QTV_QR_RE.search(msg) or _try:
+            break
+        # 【要二维码超时：重新选一次路，自动再试一次】OpenList 只给 5 秒，抽到慢地址就超时（见 OL_ROUTE_SLOW_S）
+        if not re.search(r"(?i)timeout|deadline|超时", msg):
+            break
+        _ol_drop_storage(d, mount, tok)
+        info("要二维码超时了，换一个快的接口地址再试一次...")
+        ol_route_before_mount(d, "quark")
     if r.get("code") == 200:
         ok(f"夸克 TV 已挂上：{mount}　转码流")
         refresh_hls(d)
         return True
-    msg = str(r.get("message") or "")
     m = QTV_QR_RE.search(msg)
     if not m:
         _ol_drop_storage(d, mount, tok)
@@ -29254,7 +29270,7 @@ def do_healthcheck():
             _hc(_lab, "warn", f"IPv4 的 {len(_r['bad'])} 个地址全都走不通，OpenList 改走本机的 IPv6 中转"
                 + ("　刚切的" if _r["pin"] != _r["was"] else ""))
         elif _r["pin"]:
-            _hc(_lab, "ok", f"{len(_r['bad'])} 个地址走不通，OpenList 固定用通的那个（{_r['good'][0][1]:.1f} 秒）"
+            _hc(_lab, "ok", f"{len(_r['bad'])} 个走不通、{len(_r.get('slow', []))} 个太慢，OpenList 固定用最快的那个（{_r['good'][0][1]:.1f} 秒）"
                 + ("　刚换的" if _r["pin"] != _r["was"] else ""))
         elif _r["bad"] and not _r["good"]:
             _hc(_lab, "bad", f"{len(_r['bad'])} 个地址全都连不上（换了一批也一样，IPv6 也没走通）")

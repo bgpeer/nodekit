@@ -274,6 +274,34 @@ for flow, key in (("_add_qtv_flow", "quark"), ("_add115_flow", "115"), ("_add_al
 fq = SRC[SRC.index("def _add_qtv_flow"):]; fq = fq[:fq.index("\ndef ", 10)]
 check("夸克：在建存储（要二维码）之前选路", fq.index('ol_route_before_mount(d, "quark")') < fq.index("/api/admin/storage/create"))
 
+print("十二、慢的地址也要避开（1.5.430，真机：选路屏上全是 ✔、握手 2～4 秒，夸克要二维码照样超时）")
+m.sh = fake_sh; m.subprocess = types.SimpleNamespace(run=fake_run)
+m._route_resolve = lambda host, rounds=6: {A, B, C} if host == HOST else set()
+MOUNTS[:] = [("/quark", "QuarkTV", "work", "0", "")]
+BOX["hosts"] = list(BASE); m.save_ms_state(ol_route={})
+SPEED.clear(); SPEED.update({A: 0.4, B: 2.6, C: 3.9})       # 全都连得通，但两个很慢
+r = run()[0]
+check("全都连得通、但有慢的：钉最快的那个（OpenList 要二维码只给 5 秒）", r["pin"] == A and sorted(r["slow"]) == [B, C] and not r["bad"])
+SPEED.update({A: 1.9, B: 0.5})                              # 钉着的那个变慢了，另一个变快了
+r = run()[0]
+check("钉着的那个变慢了：换成快的", r["pin"] == B)
+SPEED.update({B: 0.6, A: 0.5})
+r = run()[0]
+check("钉着的还不慢：别人只快一点点也不换（别来回跳）", r["pin"] == B)
+SPEED.clear(); SPEED.update({A: 0.4, B: 0.5, C: 0.9})
+r = run()[0]
+check("全都又快又通：摘掉，交还给 DNS", r["pin"] == "" and not pinned())
+SPEED.clear(); SPEED.update({A: 2.0, B: 3.0})
+r = run()[0]
+check("全都慢：照样钉最快的那个（比随机抽强）", r["pin"] == A)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m.do_route()
+check("手动跑的屏：慢的标 ⚠ 慢", "⚠ " + B in plain(buf.getvalue()) and "慢" in plain(buf.getvalue()))
+fq = SRC[SRC.index("def _add_qtv_flow"):]; fq = fq[:fq.index("\ndef ", 10)]
+check("夸克要二维码超时：撤掉、重新选路、自动再试一次（只再试一次）", "for _try in range(2):" in fq and "换一个快的接口地址再试一次" in fq
+      and fq.index("_ol_drop_storage(d, mount, tok)") < fq.index('ol_route_before_mount(d, "quark")\n    if r.get'))
+
 print("七、版本号")
-check("media-stack 1.5.427 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 427))
+check("media-stack 1.5.430 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 430))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
