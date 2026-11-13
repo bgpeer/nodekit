@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.426"
+SCRIPT_VERSION = "1.5.427"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -5230,15 +5230,28 @@ def _ol_hosts_apply(want):
     return r.returncode == 0
 
 
-def ol_route_check(d):
-    """查一遍、该钉的钉上。返回 [{host, pin, was, good: [(ip, 秒)], bad: [ip], note}]；OpenList 容器不在 → []。"""
+def ol_route_before_mount(d, key):
+    """要挂一个新盘之前：先把这种盘的接口地址测一遍、坏的避开（key = quark / aliyun / 115）。查不了就算了，不拦着挂。
+
+    真机 11/13（重装后）：夸克「扫码挂上」两次都是「没拿到登录二维码：网盘接口超时」。选路只查【已经挂着】的盘（_route_hosts），
+    重装后夸克还没挂上，就没人管它的接口地址 —— 上一回钉好的那行也因为「没挂这种盘」被摘了。而 OpenList 建存储时向夸克要
+    二维码只给 5 秒（drivers/quark_uc_tv 的 Init），抽到那批连不上的地址就超时。要二维码这一下，正是最需要先选好路的时候。"""
+    try:
+        ol_route_check(d, extra=[h for k, h, _n in OL_ROUTE_TABLE if k == key])
+    except Exception:
+        pass
+
+
+def ol_route_check(d, extra=()):
+    """查一遍、该钉的钉上。返回 [{host, pin, was, good: [(ip, 秒)], bad: [ip], note}]；OpenList 容器不在 → []。
+    extra：没挂这种盘也要查的域名（马上要挂它，见 ol_route_before_mount）。"""
     cur, _lines = _ol_hosts_pins()
     if cur is None:
         return []
     now = int(time.time())
     state = dict(ms_state().get("ol_route") or {})
     report, want = [], {}
-    for host in _route_hosts(d):
+    for host in list(dict.fromkeys(list(_route_hosts(d)) + list(extra))):
         st = state.get(host) or {}
         pool = {ip: ts for ip, ts in (st.get("pool") or {}).items() if now - int(ts or 0) < OL_ROUTE_POOL_S}
         pool.update({ip: now for ip in _route_resolve(host)})
@@ -22805,6 +22818,7 @@ def _add115_flow(d):
     mount = ask_mount(d, MOUNT_115)
     if not mount:
         return False
+    ol_route_before_mount(d, "115")            # 先避开连不上的接口地址（见 ol_route_before_mount）
     _QR115_AUTOMOUNT[0] = True
     try:
         uid, state = _qr115_new()
@@ -22936,6 +22950,8 @@ def _add_ali_flow(d):
     仓库主人：「三件都做吧，这都是功能性的问题能加则加」—— 阿里删掉之后以前只能去 OpenList
     网页加；入口要常驻（第四节），没挂也要在。"""
     mount = ask_mount(d, MOUNT_ALI)
+    if mount:
+        ol_route_before_mount(d, "aliyun")     # 先避开连不上的接口地址（见 ol_route_before_mount）
     if not mount:
         return False
     how = _ali_how()
@@ -23672,6 +23688,7 @@ def _add_qtv_flow(d):
     if not tok:
         err("登不上 OpenList（它在跑吗？）")
         return False
+    ol_route_before_mount(d, "quark")          # 要二维码只给 5 秒：先避开连不上的接口地址
     add = {"root_folder_id": "0", "order_by": "updated_at", "order_direction": "desc",
            "refresh_token": "", "device_id": "", "query_token": "",
            "link_method": "streaming"}

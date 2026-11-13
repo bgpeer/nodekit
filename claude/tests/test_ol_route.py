@@ -255,6 +255,25 @@ with contextlib.redirect_stdout(buf):
     m.do_route()
 check("只挂了 WebDAV：说清没查，不报错", "没查" in plain(buf.getvalue()))
 
+print("十一、要挂一个新盘之前先选路（1.5.427，真机：重装后夸克扫码两次「没拿到登录二维码：网盘接口超时」）")
+m.sh = fake_sh; m.subprocess = types.SimpleNamespace(run=fake_run)
+m._route_resolve = lambda host, rounds=6: {A, B} if host == HOST else set()
+SPEED.clear(); SPEED.update({A: 0.3})                   # B 连不上
+BOX["hosts"] = list(BASE); m.save_ms_state(ol_route={})
+MOUNTS[:] = [("/dav", "WebDav", "work", "", "")]        # 夸克还没挂
+r = m.ol_route_check(D)
+check("夸克没挂：平常那一轮不查它", r == [] and not pinned())
+m.ol_route_before_mount(D, "quark")
+check("要挂夸克之前：照样查它，坏的避开、钉上通的那个", pinned() == [f"{A} {HOST} {m.OL_ROUTE_MARK}"])
+m._route_resolve = lambda host, rounds=6: (_ for _ in ()).throw(RuntimeError("boom"))
+m.ol_route_before_mount(D, "quark")
+check("查的时候出错：不拦着挂（不抛出来）", True)
+for flow, key in (("_add_qtv_flow", "quark"), ("_add115_flow", "115"), ("_add_ali_flow", "aliyun")):
+    fn = SRC[SRC.index(f"def {flow}"):]; fn = fn[:fn.index("\ndef ", 10)]
+    check(f"{flow}：挂之前先 ol_route_before_mount(d, \"{key}\")", f'ol_route_before_mount(d, "{key}")' in fn)
+fq = SRC[SRC.index("def _add_qtv_flow"):]; fq = fq[:fq.index("\ndef ", 10)]
+check("夸克：在建存储（要二维码）之前选路", fq.index('ol_route_before_mount(d, "quark")') < fq.index("/api/admin/storage/create"))
+
 print("七、版本号")
-check("media-stack 1.5.412 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 412))
+check("media-stack 1.5.427 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 427))
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
