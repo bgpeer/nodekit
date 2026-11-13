@@ -301,6 +301,8 @@
   查法：`getent ahostsv4` 拿地址 + `curl --resolve` 逐个连；容器里 `docker exec openlist wget` 连几次看秒数；OpenList 日志里是
   `dial tcp … i/o timeout` / `TLS handshake timeout`。换哪家 DNS 都是同一批地址。修法是 `ol_route_check`（1.5.409）：坏的避开、
   挑最快的写进容器 hosts（`# pinned` 结尾的行），挂在每小时保活 / 体检 / 「8 更新」/ `media-stack route`。真机 11/12 验过：6 个地址 5 个坏，钉上那 1 个好的后夸克能播了（hosts 写进去不用重启 OpenList 就生效）。
+  1.5.427：选路平时只查**已挂着**的盘；重装后夸克还没挂，扫码要二维码（OpenList 只给 5 秒）抽到坏地址就「网盘接口超时」。
+  现在三种扫码挂盘在建存储之前先 `ol_route_before_mount(d, key)`。
   1.5.412 把阿里盘（`openapi.alipan.com`）和 115（`webapi.115.com` / `proapi.115.com`）加进 `OL_ROUTE_TABLE`，域名照 OpenList 驱动源码核对
   （`drivers/aliyundrive_open/util.go`、`SheltonZhu/115driver` 的 `pkg/driver/api.go`）；只查挂着的盘（`_route_hosts`）；再加盘先去源码核对域名。
   1.5.411 加了两样（仓库主人：「两件一起做吧要做就做好」）：单独一条 cron 每 5 分钟查（`ROUTE_CRON` → `route-tick`）；IPv4 全坏时的后路 —— 本机 IPv6 中转
