@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.428"
+SCRIPT_VERSION = "1.5.429"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14625,6 +14625,18 @@ def do_uninstall(assume_yes=False):
 
 
 # ============================================================================ 主流程
+def ask_domain(prompt, default):
+    """问域名：不像域名的（没有点、带空格、像 n / y / q 这种）说一句再问，不往下装。
+    真机 11/13：仓库主人在这一问里敲了 n 想退出 —— 原来会把 n 当域名接着装。"""
+    while True:
+        v = ask(prompt, default).strip()
+        if not v:
+            return v
+        if re.fullmatch(r"(\*\.)?[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+\.?", v):
+            return v
+        warn("这不像域名（要像 ys.example.com 这样）；回车用默认的，想退出按 Ctrl-C")
+
+
 def main():
     require_root()
     print()
@@ -14634,6 +14646,14 @@ def main():
     print("  └────────────────────────────────────────────────────┘")
     print(f"  {DIM}v{SCRIPT_VERSION} · 与节点共存，只读节点配置，绝不修改{RST}")
     print()
+
+    # 【已经装着：先确认一次，默认否】仓库主人 11/13：「如果不小心点进去了输入n回车他会退回去吗」—— 原来不会：进来第一问就是域名，
+    # 在那儿敲 n 回车，n 就被当成了域名往下装。装好的机器点「1」多半是手滑，先问一句，回车 / n 就回菜单，一样都不动。
+    if is_installed(ms_install_dir()):
+        tip("已经装好了；再走一遍会把每一项设置重新问一次（回车 = 保持现在的值）")
+        if not ask_yn("确定要重新走一遍安装？", False):
+            print("没有改动。")
+            return
 
     ensure_docker()
     hr()
@@ -14650,9 +14670,9 @@ def main():
         # 【不再问「媒体服务也用这个域名？」】仓库主人 11/12 重装时：「后来要和节点域名分开，那就你应该是用那黄色提示的域名」。
         # 10/31 已经定了 Emby 跟节点分开（各自一张证书、换域名互不干预），那一问只会让人多按一次、还可能按错。
         # 直接问媒体服务的域名，回车 = 黄字提示的那个。真想跟节点共用的，在这里填节点域名照样行。
-        cfg["domain"] = ask("媒体服务的域名（回车＝用上面提示的）", f"ys.{_r0}")
+        cfg["domain"] = ask_domain("媒体服务的域名（回车＝用上面提示的）", f"ys.{_r0}")
     else:
-        cfg["domain"] = ask("你的域名（没有就留空，用 IP:端口 访问）", "")
+        cfg["domain"] = ask_domain("你的域名（没有就留空，用 IP:端口 访问）", "")
 
     # 填了 emby.example.com 这种就静默归一 —— 用户填子域名本来就是合理表达；照着提示填成 *.ys.example.com 的也认
     if cfg["domain"]:

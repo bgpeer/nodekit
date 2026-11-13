@@ -10,12 +10,12 @@ def check(l, ok):
 CFD = "https://" + "dash.cloudflare" + ".com"           # 拼出来：测试文件里不留网址（test_claude_folder）
 ms = open(os.path.join(ROOT, "media-stack.py"), encoding="utf-8").read()
 i_tip = ms.find('tip(f"请在 ' + CFD + ' 做好一条 DNS 记录关黄云 *.ys.{_r0}（名称不想用 ys 改用其他也行）")')
-i_ask = ms.find('cfg["domain"] = ask("媒体服务的域名（回车＝用上面提示的）", f"ys.{_r0}")')
+i_ask = ms.find('cfg["domain"] = ask_domain("媒体服务的域名（回车＝用上面提示的）", f"ys.{_r0}")')
 check("Emby：问域名之前一行 tip，记录名 *.ys.根域名、关黄云", 0 < i_tip < i_ask)
 check("装过节点的机器：直接问媒体服务的域名，回车就是黄字提示的 ys.根域名", i_ask > 0)
 check("不再问「媒体服务也用这个域名？」、不再印「检测到节点域名」（1.5.414，仓库主人 11/12：已经定了跟节点分开）",
       "媒体服务也用这个域名" not in ms.replace("【不再问「媒体服务也用这个域名？」】", "") and 'ok(f"检测到节点域名' not in ms)
-check("没装节点的机器：照旧问域名，留空用 IP:端口", 'ask("你的域名（没有就留空，用 IP:端口 访问）", "")' in ms)
+check("没装节点的机器：照旧问域名，留空用 IP:端口", 'ask_domain("你的域名（没有就留空，用 IP:端口 访问）", "")' in ms)
 xy = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
 i = xy.find("def cdn_add():"); body = xy[i:xy.find("\ndef ", i + 5)]
 check("CDN 安装：问域名前一行 tip，cdn.根域名、开黄云（CDN 要走 CF 代理）",
