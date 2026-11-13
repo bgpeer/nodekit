@@ -331,6 +331,9 @@
   那一刻 Emby 里没有库、处理 0 个；库建好后没人再跑。1.5.423：建库那步返回 `made + added`，新建了就再 `align_library` 一遍。
   老装机库早在，看不出这个缺口 —— **改流程顺序要想一遍「全新安装第一次跑」这条路**。修完还没在真机验（等仓库主人再生成一次）。
 
+- **MetaTube 默认带上 + 每晚自动更新（1.5.426）**：首次安装 `metatube_preinstall`（起容器之前放插件、写设置文件、compose 加服务端）；
+  `do_selfupdate` 里 `metatube_auto_update`（`_metatube_release` 比 `metatube_ver`，有新版且 `play_quiet` 才换 + 重启 Emby，结果记进 selfupdate.json 的 `metatube`）。
+  **全新安装那条没在真机跑过**（插件随 Emby 第一次启动加载）。
 - **MetaTube 装完自动走完（1.5.424 / 425）**：`metatube_apply_rules`（生效范围照规则的 `mt`，真机验过）+ `metatube_write_server`
   （写 `emby/config/plugins/configurations/MetaTube.json` 的 `Server`，赶在重启 Emby 之前）。1.5.424 调的是 Emby `/Plugins/{Id}/Configuration`，真机回 HTTP 500 ——
   MetaTube 的 Emby 版是 `BasePluginSimpleUI` 新式插件，设置不走那个接口，存在那个 JSON 文件里（文件名和格式是仓库主人在网页填过一次后贴回来确认的）。
