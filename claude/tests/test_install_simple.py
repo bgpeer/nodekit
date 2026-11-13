@@ -4,7 +4,7 @@
   然后提示叫人家去挂路径」）。
 
   原来第一次装要答十几问：安装目录、媒体目录、时区、PUID、PGID、Homepage、扫描路径、cron、要不要自动配 nginx……
-  1.5.415：第一次装这些全用默认值不问；已经装着再点「1 安装（重跑可改配置）」照旧整套都问（这些项没删）。
+  1.5.415：第一次装这些全用默认值不问；已经装着再点「1 安装」照旧整套都问（这些项没删）。
 钉住：
   一、第一次装（simple）不问的那几项走默认值；扫描路径先空着（装完在「3 挂载路径」里加）
   二、重跑时这些项照旧都问（功能没少）
@@ -69,6 +69,11 @@ tail = main[main.index("▸ 接下来"):]
 check("三步：挂载路径扫码 → 生成媒体库 → 播放器登录", "「3 挂载路径」里选网盘、扫码登录" in tail and "「4 生成媒体库」" in tail and "播放器登录上面的 Emby 地址" in tail)
 check("Emby 没自动建成的：多一步指路「7 设置 → 1 → 1 自动生成」", 'if not cfg["emby_api_key"]:' in tail and "7 设置 → 1 → 1 自动生成" in tail)
 check("不再叫人去 OpenList 网页手动挂盘、去 Emby 网页建库关选项（脚本都代劳了）", all(t not in main for t in ("OpenList → 存储 → 添加，挂载路径填", "Emby 添加媒体库，路径指向", "章节图像提取")))
+
+print("五之二、菜单上不再写「（重跑可改配置）」（1.5.428，仓库主人：会让人误会）")
+SRC2 = open(os.path.join(ROOT, "media-stack.py"), encoding="utf-8").read()
+check("「1. 安装」后面不再挂那句", '"  1. 安装" + ("（重跑可改配置）"' not in SRC2 and 'print("  1. 安装")' in SRC2)
+check("屏上任何地方都不再出现这句", not [l for l in SRC2.splitlines() if "重跑可改配置" in l and not l.strip().startswith("#")])
 
 print("六、版本号")
 check("media-stack 1.5.415 起", tuple(map(int, m.SCRIPT_VERSION.split("."))) >= (1, 5, 416))
