@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.420"
+SCRIPT_VERSION = "1.5.421"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -25262,6 +25262,20 @@ def _drive_paths_menu(d, mp):
         # 【有最大的就扫最大的】加了父目录，它底下那些子路径就该消失 —— 留着既没用又骗人：
         # 屏上写着"只扫电影"，实际扫的是整个盘。反过来，整个盘已经在扫了还想加它底下的
         # 一条，那条同样是白加 —— 这时候要说清楚"没加"，不能报一句"已应用"了事。
+        # 【已经在扫大的，又挑了它底下小的 = 要缩小范围】真机 11/13：扫码挂上后扫描路径自动填成整个盘 /quark，屏上提示
+        # 「要缩小范围选 2 修改扫描路径」；仓库主人进来挑了 /quark/夸克挂载，得到一行灰字「已经包含在别的扫描路径里，没有加」，
+        # 路径还是整个盘 ——「这是添加上了还是没加上怎么还是整个盘」。以前这里只会往大里并，没有往小里收的路。
+        # 现在：挑的这几条全都落在已有的某条大路径底下 → 问一句，确认就把那条大的换成挑的这几条。
+        wider = sorted({p for p in exp for g in got if g != p and g.startswith(p.rstrip("/") + "/")})
+        if wider and all(any(g.startswith(p.rstrip("/") + "/") for p in wider) for g in got):
+            tip(f"现在扫的是 {'、'.join(wider)}；改成只扫 {'、'.join(got)}，别的目录不再进 Emby")
+            if not ask_yn("确认缩小范围？", False):
+                print("没有改动。")
+                continue
+            merged = merge_scan_paths([p for p in exp if p not in wider] + got)
+            save_ms_state(scan_spec=merged)
+            _apply_scan_paths(d, f"改成只扫 {'、'.join(got)}，")
+            continue
         merged = merge_scan_paths(exp + got)
         eaten = [p for p in exp if p not in merged]
         added = [p for p in merged if p not in exp]
