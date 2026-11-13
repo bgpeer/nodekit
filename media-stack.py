@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.421"
+SCRIPT_VERSION = "1.5.422"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -24668,19 +24668,37 @@ WantedBy=multi-user.target
 
 
 def _ask_secret(prompt):
-    """输密码不回显 —— 这一屏会被截图发出去。"""
+    """贴令牌不回显（这一屏会被截图发出去），但贴完说一声收到了多少个字符。
+    仓库主人 11/13：「不要搞隐藏的输没输进去都不知道」—— 完全没反应的话，手机上分不清是贴进去了还是没贴上。"""
     try:
         import getpass
-        return getpass.getpass(f"{prompt}: ")
+        v = getpass.getpass(f"{prompt}: ")
     except Exception:
         return ask(prompt)
+    if v.strip():
+        print(f"  {DIM}已收到 {len(v.strip())} 个字符{RST}")
+    return v
+
+
+def dav_addr_with_port(addr, port):
+    """WebDAV 地址里补上端口。port 空 / 地址里本来就带端口 → 原样。端口不是 1–65535 的数字 → None。"""
+    port = (port or "").strip()
+    m = re.match(r"^(https?://)([^/\s]+)(.*)$", addr)
+    if not port or not m:
+        return addr
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        return None
+    host = m.group(2)
+    if re.search(r":\d+$", host.rsplit("@", 1)[-1]):
+        return addr
+    return f"{m.group(1)}{host}:{port}{m.group(3)}"
 
 
 def _add_webdav_flow(d):
     """在 VPS 上挂一个 WebDAV：地址、用户名、密码、挂到哪。
 
     WebDAV 在网盘侧没有 CDN 直链，只能本机代理（见 apply_drive_defaults），所以一建就是
-    本机代理，结果那一行当场说走 VPS 流量。密码只发给本机的 OpenList，不上屏、不进日志。
+    本机代理，结果那一行当场说走 VPS 流量。密码只发给本机的 OpenList、不进日志（输入时照常显示，见下）。
     """
     addr = ask("WebDAV 地址（http:// 或 https:// 开头，回车取消）").strip()
     if not addr:
@@ -24688,8 +24706,19 @@ def _add_webdav_flow(d):
     if not re.match(r"^https?://[^\s/]+", addr):
         warn("地址要以 http:// 或 https:// 开头。")
         return False
+    # 【端口单独问一次】仓库主人 11/13：「应该还要显示一次输入端口吧」。很多 WebDAV 不在 443 / 80 上（比如 5244），
+    # 要写成 https://主机:端口/路径 —— 第一次填的人想不到要把端口塞进地址中间。地址里已经带了端口就不问。
+    if not re.search(r":\d+$", re.match(r"^https?://([^\s/]+)", addr).group(1).rsplit("@", 1)[-1]):
+        _dp = "443" if addr.startswith("https://") else "80"
+        _a2 = dav_addr_with_port(addr, ask(f"端口（回车＝默认 {_dp}）", "").strip())
+        if _a2 is None:
+            warn("端口要是 1–65535 的数字。")
+            return False
+        addr = _a2
     user = ask("用户名").strip()
-    pw = _ask_secret("密码")
+    # 【密码照常显示】仓库主人 11/13：「这里不要搞隐藏的输没输进去都不知道」。原来不回显（怕截图），手机上敲完一点反应都没有，
+    # 不知道敲没敲上、敲没敲对。他点头改成显示；密码只发给本机的 OpenList、不进日志这两条不变。
+    pw = ask("密码").strip()
     used = [mp for mp, *_x in openlist_storages(d) if mp]
     dflt = next(p for p in [MOUNT_DAV] + [f"{MOUNT_DAV}{i}" for i in range(2, 100)]
                 if not mount_taken(p, used))
