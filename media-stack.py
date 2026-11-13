@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.422"
+SCRIPT_VERSION = "1.5.423"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -12449,6 +12449,7 @@ def auto_libraries_apply(d, key, quiet=False):
     if not quiet:
         print(f"  {DIM}规则文件：{lib_rules_path(d)}"
               f"（改仓库里那份，「8 更新」会拉下来）{RST}")
+    return made + added          # 新建 / 补了几处：调用方据此决定要不要再对齐一遍（见 strm_finish）
 
 
 def auto_libraries():
@@ -20835,7 +20836,14 @@ def strm_finish(d, only, snap0):
         _ONE_DRIVE[0] = bool(only)
         try:
             align_library(d, key, heal=False, migrate=False)
-            auto_libraries_apply(d, key, quiet=bool(only))  # 按关键词规则把该建的库建上
+            # 按关键词规则把该建的库建上
+            if auto_libraries_apply(d, key, quiet=bool(only)):
+                # 【库是这一趟才建的 → 等它扫完再对齐一遍】真机 11/13（全新安装后第一次生成）：动漫点进去「共0季」、一集都没有，
+                # 电影能播。上面那次 align_library 跑的时候 Emby 里还没有库、一个条目都没有 ——「剧集编号」那步（给 Emby 认不出
+                # 集号的文件配 .nfo）处理了 0 个；库建好以后没人再跑它，要等每小时那一轮。仓库主人：「感觉电视类型行规则里面
+                # 差个什么引擎一样，怎么可能扫完了连集数都没有」。老装机库早就在，这里不会走到。
+                info("媒体库是刚建的：再对齐一遍（剧集编号、片名这些要等库里有了条目才做得了）...")
+                align_library(d, key, heal=False, migrate=False)
         finally:
             _ONE_DRIVE[0] = False
         report_not_in_emby(d, key, only)
