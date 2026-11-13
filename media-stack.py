@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.423"
+SCRIPT_VERSION = "1.5.424"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13870,7 +13870,7 @@ def show_info():
     if metatube_on(d):
         print(f"\n{YELLOW}{BOLD}▸ MetaTube 番号刮削{RST}")
         print(f"{GREEN}{BOLD}http://metatube:{METATUBE_PORT}{RST}")
-        tip("Emby → 插件 → MetaTube 填这个地址；只对番号（ABC-123）有效")
+        tip("插件里的服务器地址脚本已经替你填成它；只对番号（ABC-123）有效")
 
     # 容器只报「几个在跑」。以前这里直接贴 docker compose ps 的原始输出,在手机上
     # 每行都折成三四行,IMAGE/COMMAND/PORTS 糊成一片,而真正要看的只有"跑没跑"。
@@ -14376,6 +14376,11 @@ def do_update(from_menu=False, auto=False):
     ensure_openlist_site_url(d, cfg, quiet=True)
     try:
         ol_route_check(d)             # 网盘接口选路：更新完当场查一遍（OpenList 容器刚重建过的话，钉的那行在这里补上）
+    except Exception:
+        pass
+    try:
+        if metatube_on(d) and cfg.get("emby_api_key"):
+            metatube_set_server(cfg["emby_api_key"], tries=1)     # 以前装的：插件的服务器地址没人填过的，更新时补上
     except Exception:
         pass
     try:
@@ -24842,6 +24847,46 @@ def qr115_login(d=None, mp=None):
         ask("\n按回车继续...")
 
 
+def metatube_apply_rules(d, key):
+    """MetaTube 在哪些库生效：照建库规则里 metatube: true 的来，别的库一律摘掉。返回生效的库名列表。
+
+    仓库主人 11/13：「这个插件不是安装了默认开着就行吗，用不用取决于yaml里面开不开啊，为什么VPS要询问都把我搞迷糊了」。
+    原来装完插件弹一屏「MetaTube 要在哪些媒体库生效？」让人挑编号 —— 可规则文件里每个库早就写着 metatube: true / false，
+    建库时也是照它来的（auto_libraries_apply）。同一件事问两遍，答案还可能跟规则对不上。
+    想临时改某个库：「7 设置 → 4 MetaTube 生效的库」那个手动入口还在。"""
+    want = {r["name"] for r in lib_rules(d)[0] if r.get("mt")}
+    libs = metatube_libraries(key)
+    names = [n for n, _i, _on, _o in libs if n in want]
+    set_metatube_libraries(key, [i for n, i, _on, _o in libs if n in want])
+    return names
+
+
+def metatube_set_server(key, tries=12):
+    """把 MetaTube 插件里的「服务器地址」填成本机那个容器。返回 "" = 填好了（或本来就是）；否则原因。
+
+    原来这一步屏上写「脚本代劳不了，那是插件自己的设置页」—— 代劳得了：Emby 有 /Plugins/{Id}/Configuration，
+    读出整份配置、只改 Server 一项再写回去（字段名见插件源码 Configuration/PluginConfiguration.cs）。
+    Emby 刚重启、插件还没加载出来时 /Plugins 里没有它，所以隔几秒再试，最多等一分钟。没在真机验过。"""
+    url = f"http://metatube:{METATUBE_PORT}"
+    why = "Emby 里还没出现这个插件"
+    for i in range(tries):
+        try:
+            pid = next((p.get("Id") for p in (_emby("/Plugins", key, timeout=15) or [])
+                        if str(p.get("Name") or "").strip().lower() == "metatube"), "")
+            if pid:
+                conf = _emby(f"/Plugins/{pid}/Configuration", key, timeout=15) or {}
+                if conf.get("Server") == url:
+                    return ""
+                conf["Server"] = url
+                _emby(f"/Plugins/{pid}/Configuration", key, method="POST", body=conf, timeout=15)
+                return ""
+        except Exception as e:
+            why = _short_err(e)
+        if i < tries - 1:
+            time.sleep(5)
+    return why
+
+
 def toggle_metatube():
     """装 / 卸 MetaTube（服务端容器 + Emby 插件），一个按钮来回切。
 
@@ -24919,18 +24964,21 @@ def toggle_metatube():
                            "auth")
     if key:
         time.sleep(8)          # 等 Emby 重启完，不然媒体库列表读不到
-        choose_metatube_libraries(key)
+        # 【不问，照规则来 + 服务器地址替他填】见 metatube_apply_rules / metatube_set_server：装完就是能用的，不用再去填什么
+        names = metatube_apply_rules(d, key)
+        if names:
+            ok(f"MetaTube 只在 {'、'.join(names)} 生效（建库规则里 metatube: true 的库）")
+        else:
+            ok("MetaTube 现在哪个库都不生效：规则里开了它的库还没建，「4 生成媒体库」建库时自动生效")
+        why = metatube_set_server(key)
+        if why:
+            warn(f"插件的服务器地址没自动填上（{why}）")
+            tip(f"Emby → 设置 → 插件 → MetaTube → 服务器地址填 http://metatube:{METATUBE_PORT}")
+        else:
+            ok("插件的服务器地址已填好")
     else:
-        warn("没有 Emby API Key，没法自动圈定 MetaTube 的适用范围。")
-        print(f"  {DIM}请手动去每个不需要它的媒体库里取消勾选 MetaTube，"
-              f"否则它会去动画库、电影库里乱认。{RST}")
-
-    print()
-    print(f"  {YELLOW}还有一步要你在 Emby 里手动做{RST}{DIM}（脚本代劳不了，"
-          f"那是插件自己的设置页）：{RST}")
-    print(f"  {DIM}·{RST} Emby → 设置 → 插件 → MetaTube → 服务器地址填 "
-          f"{CYAN}{BOLD}http://metatube:{METATUBE_PORT}{RST}")
-    print(f"  {DIM}插件没出现的话，Emby 可能还没加载完，等一会儿刷新设置页。{RST}")
+        warn("没有 Emby API Key，没法自动圈定 MetaTube 的适用范围、也填不了插件的服务器地址。")
+        tip("先到「7 设置 → 1」填上 API Key，再回来装一次")
 
 
 
