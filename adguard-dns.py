@@ -783,7 +783,9 @@ def _agh_apply_settings(user, pw, port=None):
             cfg = {}
         if not isinstance(cfg, dict):
             cfg = {}
-        cfg.update({"upstream_dns": list(AGH_UPSTREAM_DNS), "upstream_mode": "load_balance",
+        # 并行请求（不是默认的负载均衡）：11/19 实装，之前这里写 load_balance，
+        # 网页上选中的是「负载均衡」——上游 3 行照样写进去了，只有模式没对上
+        cfg.update({"upstream_dns": list(AGH_UPSTREAM_DNS), "upstream_mode": "parallel",
                     "cache_enabled": True, "cache_size": AGH_DNS_CACHE_SIZE,
                     "cache_ttl_min": AGH_DNS_CACHE_TTL_MIN, "cache_ttl_max": AGH_DNS_CACHE_TTL_MAX,
                     "cache_optimistic": True})
@@ -1039,6 +1041,10 @@ def _usage(port=None, head=None):
         print(f"    应急 / 本机用明文：http://{ip}:{port}")
     else:
         print(f"    浏览器打开：{G}http://{ip}:{port}{N}")
+    users = _agh_users()          # 账号能从 yaml 读出来；密码只存了 bcrypt 哈希，读不回明文，别问
+    if users:
+        print(f"    账号：{G}{users[0]}{N}")
+        print(f"    密码：{Y}屏上不显示（只存了哈希；忘了用菜单 8 → 2 重设）{N}")
     if not os.path.exists(_agh_yaml()):              # 还没走过向导（自动设置没成）：浏览器里设账号，端口照 3000
         print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 7 可改）")
 
