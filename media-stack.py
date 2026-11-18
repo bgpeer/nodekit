@@ -140,6 +140,9 @@ OLD_STRM_CRON     = "0 0 5 * * *"           # 旧默认值，更新时静默迁�
 
 OPENLIST_PORT  = 5244
 MEDIAWARP_PORT = 9000
+# Homepage 导航页的宿主机端口：原来是 3000，跟 AdGuard Home 安装向导抢 3000（11/19 实装：
+# 向导绑不上、服务一起一停，自动设置等不到向导）。改成 3001，容器里还是 3000 不动。
+HOMEPAGE_PORT  = 3001
 STRM_SUBDIR    = "cloud"
 STRM_PATH      = "/data/strm/" + STRM_SUBDIR
 
@@ -207,7 +210,7 @@ HLS_BASE_GAP = 1.0
 HLS_SEG_EXT = ("ts", "m4s")
 
 SUBDOMAINS = [
-    ("home", 3000,           "homepage",   "首页入口"),
+    ("home", HOMEPAGE_PORT, "homepage",   "首页入口"),
     ("emby", MEDIAWARP_PORT, "emby",       "Emby"),
     ("list", OPENLIST_PORT,  "openlist",   "OpenList"),
 ]
@@ -736,7 +739,7 @@ def gen_compose(cfg):
     volumes:
       - {d}/homepage/config:/app/config
     ports:
-      - "{bind}3000:3000"
+      - "{bind}{HOMEPAGE_PORT}:3000"
     networks: [mediastack]
 """)
 
