@@ -1024,6 +1024,7 @@ def _usage(port=None, head=None):
     if not os.path.exists(_agh_yaml()):              # 还没走过向导（自动设置没成）：浏览器里设账号，端口照 3000
         print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 7 可改）")
 
+    ui_tip("第二、三步是网页端设置参数，如果没有被自动写入，可以自己登入网页端手动写入")
     print(f"\n  {C}【第二步 · 设置加密】{N}")
     if dom:
         print("    后台 → 设置 → 加密设置：")
