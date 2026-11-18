@@ -34,6 +34,19 @@ RESOLVED_DROPIN = RESOLVED_DIR + "/adguard.conf"  # 腾 53 时写的 drop-in（�
 AGH_INSTALL = "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh"
 WEB_PORT = 3000
 
+# 「2 使用方法」第二、三步 + 允许的客户端 + 拦截列表的默认值（装的时候调接口一次设好）。
+# 注意：域名 / 证书路径 / ClientID / 后台端口一律不写死，调用时从 _domain() / _crt() / _key() /
+# _selfdns_clientid() / _current_web_port() 实时取用户自己的配置；下面这几项不随用户变，
+# 才是写死的默认值（上游、缓存、拦截列表地址都是公开的、不是安装人信息）。
+AGH_UPSTREAM_DNS = ("https://dns10.quad9.net/dns-query",
+                    "https://dns.cloudflare.com/dns-query",
+                    "https://dns.google/dns-query")
+AGH_DNS_CACHE_SIZE = 67108864
+AGH_DNS_CACHE_TTL_MIN = 60
+AGH_DNS_CACHE_TTL_MAX = 86400
+AGH_FILTER_EASYLIST_URL = "https://anti-ad.net/easylist.txt"
+AGH_FILTER_EASYLIST_NAME = "EasyList"
+
 # 跟 xy-installer.py 同一套（菜单 13 是子进程跑本文件，主脚本那份管不到这里）
 # 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
 # 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
@@ -705,8 +718,98 @@ def _auto_setup():
     ip = _public_ip()
     print(f"\n  {G}✔ 后台设好了：用户名 {user}，后台端口 {port}（随机，以后菜单 7 可改）{N}")
     ui_url("后台地址（云防火墙放行这个端口 TCP）", f"http://{ip}:{port}")
+    try:
+        _agh_apply_settings(user, pw, port)
+    except Exception:
+        print(f"  {Y}⚠ 自动设置 DNS 参数没成，照「2 使用方法」在后台手动填也行{N}")
     _usage(port)
     return True
+
+
+def _agh_apply_settings(user, pw, port=None):
+    """安装时把「2 使用方法」第二步（加密）、第三步（上游 DNS / 缓存）、允许的客户端、
+       拦截列表一次调 AdGuard 接口设好，不用进浏览器手动填。
+       域名 / 证书 / ClientID 全部从本机配置实时取（_domain() / _crt() / _key() /
+       _selfdns_clientid()），绝不写死；密码只在内存里用这一次，不写文件、不打日志。
+       顺序：先签好证书才能开加密；允许的客户端只在泛域名证书就绪后才设，不然安卓
+       专用 DNS 会被挡（见 docs/13-dns.md）。某一步失败只报一行 ⚠、其余继续，
+       返回「加密 + 上游 DNS」两项都成了才算 True；失败了照旧按「2 使用方法」手动填。
+    """
+    G, Y, N = "\033[1;32m", "\033[1;33m", "\033[0m"
+    port = port or _current_web_port() or WEB_PORT
+    auth = (user, pw)
+    dom = _domain()
+    done = []
+    # —— 第二步 · 加密：POST /control/tls/configure ——
+    if dom and _cert_ready():
+        body = {"enabled": True, "server_name": dom, "force_https": False,
+                "port_https": 10443, "port_dns_over_tls": 853, "port_dns_over_quic": 853,
+                "certificate_chain": "", "private_key": "",
+                "certificate_path": _crt(), "private_key_path": _key()}
+        code, msg = _agh_api("/control/tls/configure", body, port=port, auth=auth, timeout=10)
+        if code != 200:  # 老版本没有 port_dns_over_quic：去掉再试一次
+            body.pop("port_dns_over_quic", None)
+            code, msg = _agh_api("/control/tls/configure", body, port=port, auth=auth, timeout=10)
+        if code == 200:
+            done.append("加密")
+        else:
+            print(f"  {Y}⚠ 加密没自动设好（{msg[:60] or code}），照「2 使用方法」第二步手动填{N}")
+    else:
+        print(f"  {Y}⚠ 没域名 / 证书还没好，加密这一步先跳过（照「2 使用方法」第二步手动填）{N}")
+    # —— 第三步 · DNS 设置：先 GET 完整配置再改、再 POST（整份替换，只发几项会把别的重置）——
+    code, raw = _agh_api("/control/dns_info", port=port, auth=auth)
+    if code == 200:
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else {}
+        except (TypeError, ValueError):
+            cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        cfg.update({"upstream_dns": list(AGH_UPSTREAM_DNS), "upstream_mode": "load_balance",
+                    "cache_enabled": True, "cache_size": AGH_DNS_CACHE_SIZE,
+                    "cache_ttl_min": AGH_DNS_CACHE_TTL_MIN, "cache_ttl_max": AGH_DNS_CACHE_TTL_MAX,
+                    "cache_optimistic": True})
+        code, msg = _agh_api("/control/dns_config", cfg, port=port, auth=auth, timeout=10)
+        if code == 200:
+            done.append("上游 DNS / 缓存")
+        else:
+            print(f"  {Y}⚠ 上游 DNS / 缓存没自动设好（{msg[:60] or code}），照「2 使用方法」第三步手动填{N}")
+    else:
+        print(f"  {Y}⚠ 读不到 DNS 配置（{code}），上游 DNS / 缓存先跳过{N}")
+    # —— 允许的客户端：POST /control/access/set（先读后写，别把已有的 disallowed / blocked 清掉）——
+    cid = _selfdns_clientid()
+    if cid and dom and _cert_wildcard_ok(dom):
+        code, raw = _agh_api("/control/access/list", port=port, auth=auth)
+        cur = {}
+        if code == 200:
+            try:
+                cur = json.loads(raw) if isinstance(raw, str) else {}
+            except (TypeError, ValueError):
+                cur = {}
+        allowed = list(cur.get("allowed_clients") or []) if isinstance(cur, dict) else []
+        if cid not in allowed:
+            allowed.append(cid)
+        body = {"allowed_clients": allowed,
+                "disallowed_clients": list(cur.get("disallowed_clients") or []) if isinstance(cur, dict) else [],
+                "blocked_hosts": list(cur.get("blocked_hosts") or []) if isinstance(cur, dict) else []}
+        code, msg = _agh_api("/control/access/set", body, port=port, auth=auth, timeout=10)
+        if code == 200:
+            done.append("允许的客户端")
+        else:
+            print(f"  {Y}⚠ 允许的客户端没自动设好（{msg[:60] or code}），照「2 使用方法」第三步手动填{N}")
+    elif cid:
+        print(f"  {Y}⚠ 泛域名证书还没好，允许的客户端先不设（不然安卓专用 DNS 会被挡），签完证书再手动填{N}")
+    # —— 拦截列表：POST /control/filtering/add_url ——
+    code, msg = _agh_api("/control/filtering/add_url",
+                         {"name": AGH_FILTER_EASYLIST_NAME, "url": AGH_FILTER_EASYLIST_URL,
+                          "whitelist": False}, port=port, auth=auth, timeout=30)
+    if code == 200 or (code == 400 and "already_exists" in (msg or "")):
+        done.append("拦截列表")
+    else:
+        print(f"  {Y}⚠ 拦截列表没自动加上（{msg[:60] or code}），后台 → 过滤器 → DNS 拦截列表手动加{N}")
+    if done:
+        print(f"  {G}✔ 已自动设好：{'、'.join(done)}{N}")
+    return "加密" in done and "上游 DNS / 缓存" in done
 
 def _first_setup():
     ip = _public_ip()
