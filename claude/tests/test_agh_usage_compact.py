@@ -28,6 +28,7 @@ a._port_busy = lambda p: "AdGuardHome"
 ALLOW = [None]
 a._agh_users = lambda: [DOM]
 a._allowed_clients = lambda: ALLOW[0]
+a._agh_pw_checked = lambda u, p=None: ""
 def show():
     b = io.StringIO()
     with contextlib.redirect_stdout(b):
@@ -41,7 +42,7 @@ check("顺序：一 登录 → 二 加密 → 三 DNS 设置 → 使用场景 �
 check("第一步：加密后台地址、明文应急地址、80 改 3000", H + DOM + ":10443" in out and "http" + f"://{IP}:4972" in out
       and "80 改成 3000" in out)
 check("第一步：账号写在屏上（yaml 里读出来的用户名）", "账号" in out.split("【第二步")[0] and DOM in out.split("【第二步")[0])
-check("第一步：密码不显示、写明忘了去哪重设", "屏上不显示" in out and "菜单 8 → 2 重设" in out)
+check("第一步：没存密码时写明去菜单 8 → 3 记下来", "没存下来" in out and "菜单 8 → 3" in out)
 check("第二步：服务器名称 / 证书 / 私钥 / 端口都是实时值", DOM in out and "/etc/ssl/sb/acme.crt" in out and "853" in out)
 ups = [H + h + "/dns-query" for h in ("dns10.quad9.net", "dns.cloudflare.com", "dns.google")]
 check("第三步：上游 3 行各自顶格一行（长按好复制）", all(u in lines for u in ups))
@@ -56,6 +57,10 @@ check("不再上屏的长篇：三种 DNS 怎么选、广告过滤那一大段",
 check("状态参数里有后台用户名（仓库主人 10/30：忘了能查到）", f"后台用户名    : {DOM}" in out)
 check("密码哪儿都不显示", "password" not in out.lower() and "密码" not in out.split("AdGuard Home 状态参数")[1])
 check(f"比原来短（{len(lines)} 行）", len(lines) < 78)
+a._agh_pw_checked = lambda u, p=None: "Pw12345678"
+out = show()
+check("第一步：存的密码验过就显示出来", "Pw12345678" in out.split("【第二步")[0] and "没存下来" not in out)
+a._agh_pw_checked = lambda u, p=None: ""
 ALLOW[0] = [CID]
 out = show()
 check("白名单已设：第三步一行 ✓、明文 53 会被挡一行提示", "✓ 已设好" in out and "明文 53 没法带 ID" in out)

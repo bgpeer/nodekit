@@ -726,6 +726,7 @@ def _auto_setup():
     if code != 200:
         print(f"  {Y}⚠ 自动设置没成（{msg[:80] or code}），改用网页向导{N}")
         return False
+    _agh_pw_save(pw)              # 向导上设的密码映射一份存本机（0600），菜单 2 里能看；网页上改的记不到
     ok = False
     for _ in range(15):
         time.sleep(1)
@@ -844,6 +845,7 @@ def _first_setup():
 
 SELFDNS_FLAG     = BGP_DIR + "/selfdns.on"        # 主脚本：自建 DNS 是否已写进订阅
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid"  # 主脚本生成的 AdGuard ClientID
+AGH_PW_FILE = BGP_DIR + "/agh.password"  # 脚本经手设的后台密码，映射一份存本机（0600）——Emby 的 .secrets 一个道理
 PRIVDNS_FILE     = BGP_DIR + "/privdns.json"      # 主脚本：节点使用私有DNS解析（菜单 4；关 / 本机 / 外机）
 
 def _selfdns_clientid():
@@ -1011,6 +1013,52 @@ def _agh_users():
         return []
     return [n.strip().strip("'\"") for n in re.findall(r"(?m)^[ \t]*-[ \t]*name:[ \t]*(.+?)[ \t]*$", m.group(1))]
 
+# ---- 脚本经手的后台密码存一份在 VPS 上 ----
+# 仓库主人 11/19：「VPS 设置的应该是可以映射一份的，emby 就是在 VPS 设置的密码可以映射一份作为备份显示出来」。
+# 跟 Emby 的 emby_pw_*（.secrets）一个做法：凡是脚本经手的（装向导定的、菜单 8 → 2 改的、菜单 8 → 3
+# 记住的、换 ClientID 时验过的）都记在 AGH_PW_FILE（0600，只有 root 能读）。在网页上改的脚本看不到。
+# 显示前拿它登录验一次（_agh_pw_checked）：对 → 显示；不对（网页上改过）→ 作废、不留一份错的；问不到 → 原样返回。
+def _agh_pw_get():
+    """存的那份后台密码；没有返回 ""。"""
+    try:
+        return open(AGH_PW_FILE).read().strip()
+    except OSError:
+        return ""
+
+
+def _agh_pw_save(pw):
+    """记一份（pw 给空 = 作废删掉）；写不进去返回 False。"""
+    try:
+        if not pw:
+            try:
+                os.remove(AGH_PW_FILE)
+            except OSError:
+                pass
+            return True
+        os.makedirs(BGP_DIR, exist_ok=True)
+        fd = os.open(AGH_PW_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(pw)
+        return True
+    except OSError:
+        return False
+
+
+def _agh_pw_checked(user, port=None):
+    """存的那份还对不对：拿它登录一次。对 → 返回它；不对（网页上改过）→ 作废、返回 ""；问不到 → 原样返回。"""
+    pw = _agh_pw_get()
+    if not pw:
+        return ""
+    port = port or _current_web_port() or WEB_PORT
+    code, _ = _agh_api("/control/status", port=port, auth=(user, pw))
+    if code == 200:
+        return pw
+    if code in (401, 403):
+        _agh_pw_save("")
+        return ""
+    return pw
+
+
 def _allowed_clients():
     """AdGuardHome.yaml 里的访问白名单 allowed_clients；没这个键返回 None，空列表返回 []。"""
     try:
@@ -1041,10 +1089,14 @@ def _usage(port=None, head=None):
         print(f"    应急 / 本机用明文：http://{ip}:{port}")
     else:
         print(f"    浏览器打开：{G}http://{ip}:{port}{N}")
-    users = _agh_users()          # 账号能从 yaml 读出来；密码只存了 bcrypt 哈希，读不回明文，别问
-    if users:
-        print(f"    账号：{G}{users[0]}{N}")
-        print(f"    密码：{Y}屏上不显示（只存了哈希；忘了用菜单 8 → 2 重设）{N}")
+    users = _agh_users()          # 账号能从 yaml 读出来；密码只存了 bcrypt 哈希，读不回明文——
+    if users:                     # 显示的是脚本经手设的那份（装向导 / 菜单 8 → 2 / 菜单 8 → 3 / 换 ClientID 时记的），
+        print(f"    账号：{G}{users[0]}{N}")   # 显示前拿它登录验一次，网页上改过就作废、不留一份错的
+        pw = _agh_pw_checked(users[0], port)
+        if pw:
+            print(f"    密码：{G}{pw}{N}")
+        else:
+            print(f"    密码：{Y}没存下来（网页上改的记不到；菜单 8 → 3 输一次记下来）{N}")
     if not os.path.exists(_agh_yaml()):              # 还没走过向导（自动设置没成）：浏览器里设账号，端口照 3000
         print(f"    首次打开设账号密码；向导里管理端口 {Y}80 改成 3000{N}（以后菜单 7 可改）")
 
@@ -1441,8 +1493,8 @@ def _rotate_clientid():
        顺序跟主脚本 rotate_selfdns_clientid 一个道理：先把新 ID【加】进白名单（旧的先留着），
        再写文件、刷新订阅，最后才把旧 ID 从白名单删掉——反过来做中间会有一段时间连不上。
        订阅没写（菜单 3 没开）就不刷新；白名单没设（允许的客户端为空）就不动白名单，只换文件 + 订阅。
-       后台账号密码只问这一次、只放内存里调接口，不写文件、不打日志；密码不对或白名单加新失败，
-       文件一个字节都不动。订阅刷新失败则整套退回（文件还原、白名单里的新 ID 删掉）。
+       后台账号密码只问这一次；密码对了就记一份存本机（菜单 2 里能看），密码不对或白名单加新失败，
+       ClientID 文件一个字节都不动。订阅刷新失败则整套退回（文件还原、白名单里的新 ID 删掉）。
     """
     G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
     if os.geteuid() != 0:
@@ -1473,6 +1525,7 @@ def _rotate_clientid():
         print(f"  {R}✗ 后台账号或密码不对，没改。{N}"); return False
     if code != 200:
         print(f"  {Y}⚠ 连不上 AdGuard 后台（{code}），没改。{N}"); return False
+    _agh_pw_save(pw)              # 刚验过是对的，顺手记一份（跟 Emby 一样：凡是脚本经手的都记）
     # 白名单现状：先读后写，别把已有的 disallowed / blocked 清掉
     code, raw = _agh_api("/control/access/list", port=port, auth=auth)
     cur = {}
@@ -1871,6 +1924,10 @@ def uninstall(refresh_sub=True, assume_yes=False):
             print(f"  {G}✓ 已清除 ClientID 记录{N}（重新安装会生成新的）")
         except OSError:
             pass
+    try:
+        os.remove(AGH_PW_FILE)   # 映射存的那份后台密码也清掉
+    except OSError:
+        pass
     print(f"\n  {G}卸载完成。{N}"
           f"记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
 
@@ -2890,12 +2947,40 @@ def change_admin_password():
         if _agh_api("/control/status", port=port, auth=(user, pw))[0] == 200:
             ok = True; break
     if ok:
+        _agh_pw_save(pw)          # 改完的密码记一份，菜单 2 里能看
         print(f"  {G}✔ 后台密码改好了，网页已登出，用新密码登录（用户名 {user}）{N}")
         return
     sh("systemctl stop AdGuardHome")
     open(path, "w").write(txt)                       # 放回原配置：旧密码照旧能用
     sh("systemctl start AdGuardHome")
     print(f"  {R}⚠ 新密码登不进去，已改回原来的密码{N}")
+
+def remember_admin_password():
+    """菜单 8 → 3「记住当前密码」：装好以后、网页上没改过密码的，输一次记下来（只存本机 0600 文件），
+       菜单 2 里就能看到。登得进去才记（跟 Emby 的 emby_pw_remember 一个道理）；网页上改过的密码
+       脚本看不到，只能在这里输一次、或菜单 8 → 2 重设一个。"""
+    G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    if os.geteuid() != 0:
+        print("  需要 root。"); return
+    users = _agh_users()
+    if not _installed() or not users:
+        ui_tip("后台账号还没设：先选 1"); return
+    user = users[0]
+    ui_kv("后台用户名", user)
+    pw = _ask_fresh("  后台密码（回车 = 取消）: ").strip()
+    if not pw:
+        print("  已取消，没记"); return
+    port = _current_web_port() or WEB_PORT
+    code, _ = _agh_api("/control/status", port=port, auth=(user, pw))
+    if code in (401, 403):
+        print(f"  {R}✗ 后台账号或密码不对，没记。{N}"); return
+    if code != 200:
+        print(f"  {Y}⚠ 连不上 AdGuard 后台（{code}），没记。{N}"); return
+    if _agh_pw_save(pw):
+        print(f"  {G}✔ 记下来了，菜单 2 里能看到（只存本机，0600）{N}")
+    else:
+        print(f"  {R}✗ 写不进去（{BGP_DIR} 写不了？），没记。{N}")
+
 
 def change_admin_name():
     """改后台用户名：换掉 AdGuardHome.yaml 里 users 段第一个 - name:。密码不动（哈希跟用户名无关）。
@@ -2941,18 +3026,21 @@ def change_admin_name():
     print(f"  {R}⚠ 改完后台没起来，已改回原来的用户名{N}")
 
 def change_admin_account():
-    """菜单 8「修改用户名和密码」（仓库主人 10/31 定的样子：1 修改后台用户名　当前：… / 2 修改后台密码 / 0 返回）。"""
+    """菜单 8「修改用户名和密码」（仓库主人 10/31 定的样子：1 修改后台用户名　当前：… / 2 修改后台密码 / 3 记住当前密码 / 0 返回）。"""
     while True:
         users = _agh_users()
         print()
         ui_items([(1, "修改后台用户名", users[0] if users else "还没设"),
                   (2, "修改后台密码", None),
+                  (3, "记住当前密码", "菜单 2 里显示" if _agh_pw_get() else None),
                   (0, "返回", None)])
         c = _ask("选择: ").strip()
         if c == "1":
             change_admin_name()
         elif c == "2":
             change_admin_password()
+        elif c == "3":
+            remember_admin_password()
         else:
             return
 

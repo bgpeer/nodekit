@@ -14,6 +14,9 @@ def check(l, ok):
     global bad; bad += not ok; print(("  ✔ " if ok else "  ✖ ") + l)
 
 a.AGH_DIR = tempfile.mkdtemp()
+TMP = tempfile.mkdtemp()
+a.BGP_DIR = TMP
+a.AGH_PW_FILE = TMP + "/agh.password"
 Y = a.AGH_DIR + "/AdGuardHome.yaml"
 OLD = "$2a$10$oldoldoldoldoldoldoldoldoldoldoldoldoldoldoldoldoldo"
 YAML = ("http:\n  address: 0.0.0.0:2646\nusers:\n  - name: dns.example.com\n    password: " + OLD + "\n"
@@ -42,6 +45,7 @@ check("只换 users 段那一行哈希，别处（tls 里的 password）不动",
 check("停服务 → 写 → 起服务", CMDS == ["systemctl stop AdGuardHome", "systemctl start AdGuardHome"])
 check("拿新密码登一次接口验证（当前后台端口）", LOGIN and LOGIN[0] == (2646, ("dns.example.com", "NewPassw0rd!")))
 check("✔ 一行、密码不上屏", "✔ 后台密码改好了，网页已登出" in out and "NewPassw0rd!" not in out)
+check("改完的密码记一份（菜单 2 里能看）", open(a.AGH_PW_FILE).read() == "NewPassw0rd!")
 check("改完密码：删掉 sessions.db，网页上已登录的被踢出（10/31 实测删前旧 cookie 200、删后 401）", not os.path.exists(SDB))
 out, y = go(["NewPassw0rd!"], login_ok=False)
 check("新密码登不进去：放回原配置（旧密码照旧能用）、说一行", y == YAML and "已改回原来的密码" in out
@@ -75,8 +79,9 @@ a._ask = lambda p="": ANS2.pop(0) if ANS2 else "0"
 b = io.StringIO()
 with contextlib.redirect_stdout(b):
     a.change_admin_account()
-check("12 里：1 修改后台用户名　当前：用户名 / 2 修改后台密码 / 0 返回",
-      "1. 修改后台用户名　当前：dns.example.com" in b.getvalue() and "2. 修改后台密码" in b.getvalue() and "0. 返回" in b.getvalue())
+check("12 里：1 修改后台用户名　当前：用户名 / 2 修改后台密码 / 3 记住当前密码 / 0 返回",
+      "1. 修改后台用户名　当前：dns.example.com" in b.getvalue() and "2. 修改后台密码" in b.getvalue()
+      and "3. 记住当前密码" in b.getvalue() and "0. 返回" in b.getvalue())
 
 a._agh_users = lambda: []
 out, y = go(["NewPassw0rd!"])
