@@ -247,6 +247,13 @@ def install():
             return
         print("  AdGuard Home 已经装过了。要重装请先『12 卸载』再装；只换域名走『10 更换域名证书』。")
         _usage(); return
+    # 向导要先占 3000：11/19 实装，3000 被别的网页程序占着，AdGuard 绑不上、一起一停，
+    # 装完轮询等不到向导才退回手动——先查、先问，别等装完才发现（跟前面查 53 一个路子）
+    w3000 = _port_busy(WEB_PORT)
+    if w3000:
+        print(f"\n  ⚠ {WEB_PORT} 端口被 {w3000} 占了——AdGuard 向导要先占 {WEB_PORT}，不腾出来装了也起不来。")
+        if _ask(f"  还继续安装吗（装完也得先腾 {WEB_PORT} 才能走向导）? [y/N]: ").lower() not in ("y", "yes"):
+            return
     dom = _setup_own_domain()
     if not dom:
         ui_tip("没有域名：安卓专用 DNS（加密 DoT）用不了，设备只能填本机 IP 走明文 53")
@@ -676,11 +683,22 @@ def _auto_setup():
        密码少于 8 位它回 422「password must be at least 8 symbols long」。
        没走成（向导没起来、接口报错、新端口打不开）返回 False，调用方照旧给网页向导的步骤。"""
     G, Y, N = "\033[1;32m", "\033[1;33m", "\033[0m"
+    code, msg = 0, ""
     for _ in range(15):
-        if _agh_api("/control/install/get_addresses")[0] == 200:
+        code, msg = _agh_api("/control/install/get_addresses")
+        if code == 200:
             break
         time.sleep(1)
     else:
+        # 11/19 实装：15 秒都没连上就一声不吭退回网页向导，用户根本不知道哪步掉了——
+        # 那台机器上 3000 端口被别的网页程序占了（curl 回了个 404 网页，不是 AdGuard），
+        # AdGuard 绑不上 3000、一起一停，轮询当然永远等不到 200。按回包分三种，说清楚。
+        if code and msg.lstrip().startswith("<"):
+            print(f"  {Y}⚠ 自动设置没成：{WEB_PORT} 端口被别的程序占了（打开是个网页、不是 AdGuard 向导），先腾出 {WEB_PORT} 再装；改用网页向导也进不去{N}")
+        elif not _running():
+            print(f"  {Y}⚠ 自动设置没成：AdGuard Home 服务没在运行（systemctl status AdGuardHome 看原因），改用网页向导{N}")
+        else:
+            print(f"  {Y}⚠ 自动设置没成：15 秒都没连上安装向导，改用网页向导{N}")
         return False
     print()
     ui_title("设置后台账号（替你走完网页向导）")
