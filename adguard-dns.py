@@ -1307,11 +1307,14 @@ def dot_clientid():
         ui_line()
         ui_items([(1, "更换 Cloudflare API 令牌（泄露了 / 被吊销了）", None),
                   (2, "删除 DoT ClientID 支持（证书改回单域名，AdGuard 照常跑）", None),
+                  (3, "更换 ClientID（泄露了就换，白名单 + 订阅一起换）", None),
                   (0, "返回", None)])
         ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 12")
         c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
+        elif c == "3":
+            _rotate_clientid()
         elif c == "2" and _own_domain():
             # 自己的证书本来就是泛域名、只给 DNS 用，撤了也不省什么；不想要 ClientID，后台清空「允许的客户端」就行
             ui_tip("自建 DNS 用的是自己的证书，不用撤；不想用 ClientID，后台清空「允许的客户端」即可")
@@ -1393,6 +1396,116 @@ def dot_clientid():
     print()
     ui_url("AdGuard 后台 → DNS 设置 → 允许的客户端", cid)
     ui_tip("设了白名单，明文 53（电视 / 盒子）就进不来了，要把它们的固定 IP 也加进去")
+
+
+def _write_clientid(new):
+    """把 ClientID 写进 SELFDNS_CID_FILE（root-only 0600，跟 _selfdns_clientid 生成时一样）；写不进去返回 False。"""
+    try:
+        os.makedirs(BGP_DIR, exist_ok=True)
+        fd = os.open(SELFDNS_CID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(new)
+        return True
+    except OSError:
+        return False
+
+def _rotate_clientid():
+    """菜单 5 → 3「更换 ClientID」：一键生成新 ID，白名单 + 订阅一起换。
+       主脚本菜单 13 → 3 → 2 也有换 ID，但只换文件 + 订阅，白名单要手动去后台加新删旧；
+       这里把那两步也接上（调 AdGuard 接口，不用进浏览器）。
+       顺序跟主脚本 rotate_selfdns_clientid 一个道理：先把新 ID【加】进白名单（旧的先留着），
+       再写文件、刷新订阅，最后才把旧 ID 从白名单删掉——反过来做中间会有一段时间连不上。
+       订阅没写（菜单 3 没开）就不刷新；白名单没设（允许的客户端为空）就不动白名单，只换文件 + 订阅。
+       后台账号密码只问这一次、只放内存里调接口，不写文件、不打日志；密码不对或白名单加新失败，
+       文件一个字节都不动。订阅刷新失败则整套退回（文件还原、白名单里的新 ID 删掉）。
+    """
+    G, Y, R, N = "\033[1;32m", "\033[1;33m", "\033[1;31m", "\033[0m"
+    if os.geteuid() != 0:
+        print("  需要 root 运行。"); return False
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return False
+    dom = _domain()
+    if not dom:
+        print("  没有域名，ClientID 用不上（DoH / 安卓专用 DNS 都要域名）。"); return False
+    old = _selfdns_clientid()
+    if not old:
+        print("  ClientID 写不进去（/etc/bgpeer 写不了？），没换。"); return False
+    print(f"\n  当前 ClientID: {old}")
+    print(f"  换完旧的就作废：订阅要重拉、安卓「专用DNS」要改填新主机名。")
+    if _ask("  确认更换? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("  已取消，没有任何改动。"); return False
+    # 后台账号密码：yaml 里只有 bcrypt 哈希，读不回明文，只能问一次（跟装向导一样明着输）
+    users = _agh_users()
+    dft = users[0] if users else (_own_domain() or "admin")
+    user = _ask_fresh(f"  后台用户名（回车 = {dft}）: ").strip() or dft
+    pw = _ask_fresh("  后台密码（回车 = 取消）: ").strip()
+    if not pw:
+        print("  已取消，没有任何改动。"); return False
+    port = _current_web_port() or WEB_PORT
+    auth = (user, pw)
+    code, _ = _agh_api("/control/status", port=port, auth=auth)
+    if code == 401 or code == 403:
+        print(f"  {R}✗ 后台账号或密码不对，没改。{N}"); return False
+    if code != 200:
+        print(f"  {Y}⚠ 连不上 AdGuard 后台（{code}），没改。{N}"); return False
+    # 白名单现状：先读后写，别把已有的 disallowed / blocked 清掉
+    code, raw = _agh_api("/control/access/list", port=port, auth=auth)
+    cur = {}
+    if code == 200:
+        try:
+            cur = json.loads(raw) if isinstance(raw, str) else {}
+        except (TypeError, ValueError):
+            cur = {}
+    if not isinstance(cur, dict):
+        cur = {}
+    allowed = list(cur.get("allowed_clients") or [])
+    wl_on = bool(allowed)
+    new = "xy" + secrets.token_hex(6)
+    def _set_access(lst):
+        body = {"allowed_clients": list(lst),
+                "disallowed_clients": list(cur.get("disallowed_clients") or []),
+                "blocked_hosts": list(cur.get("blocked_hosts") or [])}
+        return _agh_api("/control/access/set", body, port=port, auth=auth, timeout=10)[0] == 200
+    if wl_on and new not in allowed:
+        if not _set_access(allowed + [new]):
+            print(f"  {R}✗ 白名单加新 ID 失败，文件没动、旧 ID 照旧能用。{N}"); return False
+    if not _write_clientid(new):
+        if wl_on:
+            _set_access(allowed)  # 文件没写成：把刚加的新 ID 从白名单撤掉，别留个没人用的口子
+        print("  ClientID 写不进去，没换。"); return False
+    # 订阅刷新：跟换域名一个接线点（主脚本 selfdns-refresh；老版本主脚本没有就提示手动）
+    sub_on = os.path.exists(SELFDNS_FLAG) or _privdns_mode() == "self"
+    if sub_on:
+        xy = BGP_DIR + "/xy-installer.py"
+        try:
+            newer = '"selfdns-refresh"' in open(xy).read()
+        except OSError:
+            newer = False
+        if newer:
+            r = subprocess.run(f"python3 {xy} selfdns-refresh", shell=True,
+                               text=True, capture_output=True)
+            out = (r.stdout or "") + (r.stderr or "")
+            if r.returncode != 0 or "✔" not in out:
+                _write_clientid(old)
+                if wl_on:
+                    _set_access(allowed)
+                print(f"  {R}✗ 订阅刷新失败，已还原为原 ClientID。{N}"); return False
+        else:
+            ui_tip("主脚本是老版本：订阅不会自动刷新，客户端重拉订阅前先到主面板「2」刷新")
+    if wl_on:
+        final = [x for x in allowed if x != old]
+        if new not in final:
+            final.append(new)
+        if not _set_access(final):
+            print(f"  {Y}⚠ 新 ID 已能用，但白名单里的旧 ID 没删掉（后台 → DNS 设置 → 允许的客户端手动删）{N}")
+    print(f"\n  {G}✔ 已更换：{old}  →  {new}{N}")
+    print(f"  新的 DoH：https://{dom}:{_doh_port()}/dns-query/{new}")
+    if _cert_wildcard_ok(dom):
+        print(f"  安卓「专用DNS」改填：{G}{new}.{dom}{N}")
+    else:
+        print(f"  {Y}没签泛域名证书，安卓专用 DNS 暂时带不上新 ID（菜单 5 签证书）{N}")
+    ui_tip("客户端重拉一次订阅生效；苹果手机重装描述文件（菜单 6）")
+    return True
 
 def _do_free53():
     """真正腾 53：关掉 systemd-resolved 的桩监听 + 把 resolv.conf 指到公共 DNS（可逆）。
