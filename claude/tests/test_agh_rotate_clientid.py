@@ -17,6 +17,7 @@ TMP = tempfile.mkdtemp()
 a.BGP_DIR = TMP
 a.SELFDNS_CID_FILE = TMP + "/selfdns.clientid"
 a.SELFDNS_FLAG = TMP + "/selfdns.on"
+a.AGH_PW_FILE = TMP + "/agh.password"
 open(TMP + "/xy-installer.py", "w").write('"selfdns-refresh"\n')
 OLD, NEW = "xy0123456789ab", "xyaabbccddeeff"
 a.secrets.token_hex = lambda n: "aabbccddeeff"
@@ -75,6 +76,7 @@ check("订阅刷新调了主脚本 selfdns-refresh", len(REFRESH) == 1 and "self
 check("屏上给新 DoH 和新安卓主机名",
       (":10443/dns-query/" + NEW) in out and (NEW + "." + a._domain()) in out and "已更换" in out)
 check("密码没印到屏上", "Passw0rd" not in out)
+check("换 ClientID 时验过的密码顺手记一份（菜单 2 里能看）", open(TMP + "/agh.password").read() == "Passw0rd!x")
 
 reset()
 ACCESS["allowed_clients"] = []
