@@ -40,6 +40,8 @@ order = [out.index(k) for k in ("【第一步 · 登录网页后台】", "【第
 check("顺序：一 登录 → 二 加密 → 三 DNS 设置 → 使用场景 → 状态参数 → 要填的几行", order == sorted(order))
 check("第一步：加密后台地址、明文应急地址、80 改 3000", H + DOM + ":10443" in out and "http" + f"://{IP}:4972" in out
       and "80 改成 3000" in out)
+check("第一步：账号写在屏上（yaml 里读出来的用户名）", "账号" in out.split("【第二步")[0] and DOM in out.split("【第二步")[0])
+check("第一步：密码不显示、写明忘了去哪重设", "屏上不显示" in out and "菜单 8 → 2 重设" in out)
 check("第二步：服务器名称 / 证书 / 私钥 / 端口都是实时值", DOM in out and "/etc/ssl/sb/acme.crt" in out and "853" in out)
 ups = [H + h + "/dns-query" for h in ("dns10.quad9.net", "dns.cloudflare.com", "dns.google")]
 check("第三步：上游 3 行各自顶格一行（长按好复制）", all(u in lines for u in ups))
@@ -53,7 +55,7 @@ check("状态参数在后面：已安装 / 运行 / 53 端口 / 域名 / ClientI
 check("不再上屏的长篇：三种 DNS 怎么选、广告过滤那一大段", "三种 DNS 怎么选" not in out and "拦不掉" not in out)
 check("状态参数里有后台用户名（仓库主人 10/30：忘了能查到）", f"后台用户名    : {DOM}" in out)
 check("密码哪儿都不显示", "password" not in out.lower() and "密码" not in out.split("AdGuard Home 状态参数")[1])
-check(f"比原来短（{len(lines)} 行）", len(lines) < 76)
+check(f"比原来短（{len(lines)} 行）", len(lines) < 78)
 ALLOW[0] = [CID]
 out = show()
 check("白名单已设：第三步一行 ✓、明文 53 会被挡一行提示", "✓ 已设好" in out and "明文 53 没法带 ID" in out)

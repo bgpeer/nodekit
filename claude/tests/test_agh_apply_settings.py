@@ -59,7 +59,7 @@ check("加密：服务器名、证书路径都取自用户配置，不是写死�
 dns = GOT.get("/control/dns_config", {})
 check("DNS：上游 3 行、并行请求、缓存 67108864 / TTL 60 / 86400 / 乐观缓存",
       dns.get("upstream_dns") == list(a.AGH_UPSTREAM_DNS)
-      and dns.get("upstream_mode") == "load_balance" and dns.get("cache_enabled") is True
+      and dns.get("upstream_mode") == "parallel" and dns.get("cache_enabled") is True
       and dns.get("cache_size") == 67108864 and dns.get("cache_ttl_min") == 60
       and dns.get("cache_ttl_max") == 86400 and dns.get("cache_optimistic") is True)
 check("DNS：先读后写，别的字段没被清掉", dns.get("bootstrap_dns") == ["1.1.1.1"] and dns.get("ratelimit") == 20)
