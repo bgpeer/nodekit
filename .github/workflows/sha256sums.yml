@@ -5,11 +5,15 @@ on:
     branches: [main]
     paths:
       - 'net-optimize.py'
+      - 'cn-block.py'
   workflow_dispatch: {}
 
+# 跟 release.yml 共用同一个并发组：两个工作流都会在 net-optimize.py / cn-block.py 推上
+# main 时触发，都要往 main 推提交。串行跑就不存在抢 push；哪个先跑完，
+# 后跑的那个站到最新 main 上重新算一遍（见下面），结果都一样。
 concurrency:
-  group: sha256sums-update
-  cancel-in-progress: true
+  group: auto-release
+  cancel-in-progress: false
 
 jobs:
   update-sha256sums:
@@ -22,20 +26,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate SHA256SUMS
-        run: sha256sum net-optimize.py > SHA256SUMS
-
-      - name: Commit & Push
+      - name: Generate, commit & push (re-apply, with retry)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add SHA256SUMS
-          git diff --cached --quiet && echo "SHA256SUMS unchanged" && exit 0
-          git commit -m "chore: auto-update SHA256SUMS"
-          # SHA256SUMS 过期会导致所有 VPS 的自动更新校验失败，push 必须带重试
+          # SHA256SUMS 过期会导致所有 VPS 的自动更新校验失败，push 必须带重试。
+          # 别用 rebase：跟 release.yml 的版本号回写一个道理 —— 每一轮都站到
+          # 最新的 main 上重新生成这个文件、重新提交，而不是拿旧提交去 rebase。
+          # （SHA256SUMS 的内容只由当前 main 上的 net-optimize.py 和 cn-block.py 决定，重算一遍
+          # 就是重新打这个补丁，不会丢东西也不会冲突。）
           for i in 1 2 3 4 5; do
             git fetch origin main
-            git rebase origin/main || { git rebase --abort || true; echo "Rebase failed."; exit 1; }
+            git reset --hard origin/main
+            sha256sum net-optimize.py cn-block.py > SHA256SUMS
+            git add SHA256SUMS
+            if git diff --cached --quiet; then
+              echo "SHA256SUMS unchanged"; exit 0
+            fi
+            git commit -m "chore: auto-update SHA256SUMS"
             if git push origin HEAD:main; then
               echo "Push success."; exit 0
             fi
