@@ -13667,6 +13667,16 @@ def emby_pw_save(d, uid, pw):
         write_secret(os.path.join(d, ".secrets"), f"EMBY_PW_{uid}", pw)
 
 
+def emby_pw_kept_lines(secret_file):
+    """重写 .secrets 前读回已有的 EMBY_PW_* 行。重跑安装不问 Emby 账号密码（已经有 Key 就沿用），
+       整份重写会把备份冲掉——11/19 全仓检查查出来的，API Key 那处早补了（save_emby_api_key），密码备份漏了。"""
+    try:
+        with open(secret_file, encoding="utf-8") as f:
+            return [ln for ln in f.read().splitlines() if ln.startswith("EMBY_PW_")]
+    except OSError:
+        return []
+
+
 def emby_pw_remember(d, key, name, pw):
     """只知道用户名时：按名字找到账号 id 再记。"""
     uid = next((i for i, n, _a, _p in _emby_user_list(key) if n == name), "")
@@ -14855,12 +14865,16 @@ DOMAIN={cfg['domain']}
 """, 0o600)
 
     # 密码写进独立的 .secrets（不给 docker compose 读），重跑时靠它沿用
+    # 【先把 Emby 密码备份读回来】下面是整份重写，会把 EMBY_PW_* 一起冲掉；重跑安装不问 Emby
+    # 账号密码（已经有 Key 就沿用），冲掉就等于备份白存了。API Key 那处早补了，密码备份漏了。
+    _pw_kept = emby_pw_kept_lines(secret_file)
     write_atomic(secret_file,
                  "# 由 media-stack.py 生成，供重跑时沿用已有密码。别手改。\n"
                  f"OPENLIST_USER={cfg['ol_user']}\n"
                  f"OPENLIST_PASS={cfg['ol_pass']}\n"
                  f"BA_USER={cfg['ba_user']}\n"
-                 f"BA_PASS={cfg['ba_pass']}\n", 0o600)
+                 f"BA_PASS={cfg['ba_pass']}\n"
+                 + "".join(ln + "\n" for ln in _pw_kept), 0o600)
     # 【这一句必须在整份重写 .secrets 之后】上面是 "w"，会把备份的 Key 一起冲掉；
     # 重跑安装的人本来就有 Key，冲掉就等于让他再去 Emby 里翻一次。
     save_emby_api_key(cfg["install_dir"], cfg.get("emby_api_key", ""))
