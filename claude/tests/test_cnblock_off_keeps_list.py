@@ -16,7 +16,9 @@ cb.CNBLOCK_FILE = f"{tmp}/cnblock.json"; cb.BGP_DIR = tmp
 cb.SB_DIR = f"{tmp}/sb"; os.makedirs(cb.SB_DIR)
 cb.CRON_FILE = f"{tmp}/cron"
 SH = []
-cb.sh = lambda c, check=True: SH.append(c) or ""
+cb.sh = lambda c, check=True: SH.append(c) or ("active" if "is-active" in c else "")
+cb._sb_check = lambda cfg: True                   # 卸载先过 sing-box check：这里假装通过
+cb.time.sleep = lambda s: None                    # 重启后确认起来了：不真等
 cb.apply_cn_block = lambda cfg=None: True
 ANS = []
 cb._ask = lambda p="": (print(p) or ANS.pop(0)) if ANS else "0"
@@ -48,9 +50,10 @@ check("默认否：回车不关", json.load(open(cb.CNBLOCK_FILE))["enabled"] is
 out = run("1", "y", "0")
 d = json.load(open(cb.CNBLOCK_FILE))
 conf = json.load(open(SB))
-check("答 y：规则撤掉（别人的规则 / final 不动）、sing-box 重启一次、定时任务撤掉",
+check("答 y：规则撤掉（别人的规则 / final 不动）、sing-box 重启一次并确认起来、定时任务撤掉",
       [r["tag"] for r in conf["route"]["rule_set"]] == ["mine"] and conf["route"]["rules"] == [{"rule_set": "mine", "outbound": "direct"}]
-      and conf["route"]["final"] == "direct" and SH == ["systemctl restart sing-box"] and not os.path.exists(cb.CRON_FILE))
+      and conf["route"]["final"] == "direct" and SH == ["systemctl restart sing-box", "systemctl is-active sing-box"]
+      and not os.path.exists(cb.CRON_FILE))
 check("状态文件还在：关着", d["enabled"] is False)
 check("自定义链接、选的名单、单条放行域名 / IP、自动更新开关都留着",
       d["wl_url"] == "https://wl.example/wl.py" and d["wl_mode"] == "custom"
@@ -77,12 +80,19 @@ out = run("6", "y", "0")
 check("答 y：规则撤掉、状态文件删掉（照旧是彻底清）", not os.path.exists(cb.CNBLOCK_FILE)
       and [r["tag"] for r in json.load(open(SB))["route"]["rule_set"]] == ["mine"] and not os.path.exists(cb.CRON_FILE))
 
-print("三、命令行 remove 照旧彻底清（主脚本卸载用）")
-seed()
+print("三、命令行 remove：先问一句（默认否），--yes 才免确认")
+seed(); SH.clear()
 sys.argv = ["cn-block.py", "remove"]
 with contextlib.redirect_stdout(io.StringIO()):
     cb.main()
-check("remove：状态文件删掉", not os.path.exists(cb.CNBLOCK_FILE))
+check("直接 remove：没人答 y 就不动（状态、规则、定时任务都在）", os.path.exists(cb.CNBLOCK_FILE)
+      and len(json.load(open(SB))["route"]["rule_set"]) == 2 and os.path.exists(cb.CRON_FILE) and not SH)
+seed()
+sys.argv = ["cn-block.py", "remove", "--yes"]
+with contextlib.redirect_stdout(io.StringIO()):
+    cb.main()
+check("remove --yes：规则撤掉、状态文件删掉", not os.path.exists(cb.CNBLOCK_FILE)
+      and [r["tag"] for r in json.load(open(SB))["route"]["rule_set"]] == ["mine"])
 
 print("四、文档 / 样板跟着改")
 doc = open(os.path.join(ROOT, "docs", "10-cn-block.md"), encoding="utf-8").read()

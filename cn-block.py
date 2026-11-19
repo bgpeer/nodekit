@@ -9,7 +9,7 @@
 # 规则集用 sing-box 远程 srs（.srs binary），并挂 cron 每天北京时间 02:55 定点刷新（屏蔽规则 + 放行名单一起，菜单 5 可关）：
 #   CN 域名 geosite/geolocation-cn.srs、CN IP geoip/cn.srs → reject
 #   白名单（作者名单对齐 vps-net/whitelist-inject.sh 的 WHITELIST_TAGS）→ 命中直连放行
-import os, re, ast, sys, json, time, ipaddress, subprocess, urllib.request, urllib.error
+import os, re, ast, sys, json, time, hashlib, ipaddress, subprocess, urllib.request, urllib.error
 
 # 出网请求统一的 User-Agent。原来各脚本各报各的家门（xy-installer / media-stack /
 # vps-check / net-optimize / xy-sub），等于主动告诉沿途任何人「这台机器在跑 nodekit」——
@@ -99,6 +99,11 @@ CRON_LOG     = "/var/log/bgpeer-cnblock.log"
 # 正好用上刚更新的作者名单；03:05 起 net-optimize / nginx / 三大配置排在后面。
 REFRESH_AT   = (2, 55)
 SELF_URL     = "https://raw.githubusercontent.com/bgpeer/nodekit/main/cn-block.py"
+SELF_SHA256SUMS_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/SHA256SUMS"
+# 本脚本的版本号：自更新「只升不降」用（_self_update_copy 照抄 net-optimize.py 的 auto_update）。
+# 手动改，只动最后一位（1.0.0 → 1.0.1 → … → 1.0.99 → 1.1.0），跟 net-optimize.py 的 VERSION 一个规矩；
+# 主脚本的 ensure_remote_script 也认这个 VERSION，进菜单拉新版时同样不降级。
+VERSION = "1.0.0"
 SELFUPD_OFF  = BGP_DIR + "/selfupdate.off"       # 菜单 18 关了脚本自动更新：这里也不换自己
 # 规则集优先走 jsDelivr 镜像（不受 GitHub raw 的 429 限流），回退 raw。
 RULES_CDN    = "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo"
@@ -528,6 +533,13 @@ def apply_cn_block(cfg=None):
     if wl_doms or wl_ips:
         hr = []
         if wl_doms:
+            # 后缀匹配：含该域名及其全部子域。点边界语义是 sing-box 自身保证的，不是本脚本凑的——
+            # 对过 sing-box 1.12 / 1.14 / main 的源码：inline rule_set 的 domain_suffix
+            # 走 domain.NewMatcher(..., generateLegacy=false)，后缀按「根标签」记，命中要求
+            # 点边界：example.com 只命中自身和子域，badexample.com 不命中（拿 sing 的
+            # matcher 逻辑对过一遍，也确认 generateLegacy 那条路 sing-box 自己没调）。
+            # 所以别在前面加「.」——带点的后缀只命中子域，裸域名本身就放行不到了；
+            # 也别换成 domain（那只命中裸域名，子域丢了）。
             hr.append({"domain_suffix": wl_doms})        # 后缀匹配：含该域名及其全部子域
         if wl_ips:
             hr.append({"ip_cidr": wl_ips})
@@ -588,15 +600,39 @@ def apply_cn_block(cfg=None):
     print(f"\n✓ 已开启屏蔽中国域名/IP：{wl_txt}{extra}，其余 CN 域名+IP 一律拦截。")
     return True
 
-def remove_cn_block(silent=False, keep_cfg=False):
+def _sb_check(sb_cfg):
+    """sing-box check -c：写坏的配置别重启，直接放回。返回 True=通过。"""
+    r = subprocess.run(f"{SB_BIN} check -c {sb_cfg}", shell=True, text=True, capture_output=True)
+    if r.returncode:
+        print("  配置校验失败，未改动：\n" + (r.stderr or r.stdout).strip())
+        return False
+    return True
+
+def remove_cn_block(silent=False, keep_cfg=False, confirm=True):
     """移除本脚本注入的 CN 屏蔽/白名单规则，恢复不拦截。
        keep_cfg：只是关掉（菜单 1）——放行名单选的哪种、自定义链接、单条放行的域名 / IP、自动更新开关都留着，
        再开照旧带上。以前关一下就把整个状态文件删了：自己一条条加的放行全没了，再开变成「不放行」
-       （文档写的却是「未开启则先存着、开启时自动带上」）。卸载（菜单 6 / remove）才连状态一起清。"""
+       （文档写的却是「未开启则先存着、开启时自动带上」）。卸载（菜单 6 / remove）才连状态一起清。
+       彻底卸载前先明确确认（默认否；问不到人——没终端、读不到输入——也当作否，不动）；
+       菜单 6 自己已经问过、命令行 `remove --yes`（没人守着的卸载）传 confirm=False，别问两遍。
+       写完先过 sing-box check、重启后确认真的起来了，不过就把原配置放回、状态和定时任务都不动。
+       返回成没成。"""
+    if not keep_cfg and confirm:
+        ui_tip("卸载会清掉屏蔽规则，自定义链接和单条放行也一起删；只想先关掉选 1")
+        try:
+            ok = _ask("  确定卸载? [y/N]: ").lower() in ("y", "yes")
+        except Exception:
+            ok = False
+        if not ok:
+            if not silent:
+                print("  已取消，未改动。")
+            return False
     sb_cfg = f"{SB_DIR}/config.json"
+    backup = None
     if os.path.exists(sb_cfg):
         try:
             conf = json.load(open(sb_cfg))
+            backup = json.loads(json.dumps(conf))        # 校验 / 重启不过就放回，不把能用的配置写坏
             route = conf.get("route") or {}
             route["rule_set"] = [r for r in route.get("rule_set", []) if not str(r.get("tag", "")).startswith("cnblk-")]
             route["rules"] = [r for r in route.get("rules", []) if not _is_cnblk_rule(r)]
@@ -608,9 +644,26 @@ def remove_cn_block(silent=False, keep_cfg=False):
             else:
                 conf.pop("route", None)
             _write_json(sb_cfg, conf)
+            if not _sb_check(sb_cfg):
+                _write_json(sb_cfg, backup)
+                return False
             sh("systemctl restart sing-box", check=False)
+            active = False
+            for _ in range(10):
+                time.sleep(1)
+                if sh("systemctl is-active sing-box", check=False) == "active":
+                    active = True; break
+            if not active:
+                _write_json(sb_cfg, backup)
+                sh("systemctl restart sing-box", check=False)
+                print("  卸载后 sing-box 未能启动，已恢复原配置。")
+                return False
         except Exception as e:
+            if backup is not None:                       # 写完配置之后才出的错：先放回，再报
+                try: _write_json(sb_cfg, backup)
+                except Exception: pass
             print("处理配置失败:", e)
+            return False
     remove_cron()                                         # 一并撤掉每日刷新的定时任务
     if keep_cfg:
         cfg = cnblock_load()                              # 趁 enabled 还在读：没选过名单的老装机定成「作者名单」存下来
@@ -620,11 +673,12 @@ def remove_cn_block(silent=False, keep_cfg=False):
         cnblock_save(cfg)
         if not silent:
             print("  ✔ 已关闭屏蔽（放行名单留着，再开照旧）")
-        return
+        return True
     try: os.remove(CNBLOCK_FILE)                          # 卸载即清状态，之后重装不会再自动注入
     except OSError: pass
     if not silent:
         print("已卸载屏蔽，恢复为不拦截 CN。")
+    return True
 
 def _cache_path():
     try:
@@ -872,26 +926,72 @@ def _wl_sig(cfg):
     doms, ips = _wl_custom(cfg)
     return hashlib.sha256(json.dumps([tags, doms, ips]).encode()).hexdigest()
 
+def _vt(v):
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+def _remote_ver(text):
+    m = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else ""
+
+def _fetch_raw_bytes(url):
+    """只认 raw（jsDelivr 缓存可能是旧的），带时间戳破缓存；拿不到返回 None。"""
+    try:
+        sep = "&" if "?" in url else "?"
+        req = urllib.request.Request(f"{url}{sep}_t={int(time.time())}", headers={"User-Agent": HTTP_UA})
+        return urllib.request.urlopen(req, timeout=20).read()
+    except Exception:
+        return None
+
 def _self_update_copy():
     """凌晨更新前先把 cron 调的本地副本换成仓库最新版（作者名单写在脚本里，不换就一直是老名单）。
-       只认 raw（jsDelivr 缓存可能是旧的，没版本号防不了降级）；拉不到 / 编译不过 / 一样 → 不动。
+       照抄 net-optimize.py 的 auto_update：【只升不降 + SHA256SUMS 校验】，两项不过都不换——
+       以前只 compile() + 含 `def refresh` 就以 root 身份 os.execve，拉到被篡改 / 半截的照样执行。
+       校验用的 SHA256SUMS 只认 raw；拿不到、里面没有 cn-block.py 条目、对不上，三种都直接跳过
+       （fail-closed：宁可不更新，也不上没验过的代码）。
+       注意：SHA256SUMS 目前只有 net-optimize.py 一条，发布端要在
+       .github/workflows/sha256sums.yml 里把它改成 `sha256sum net-optimize.py cn-block.py > SHA256SUMS`
+       （触发路径也加上 cn-block.py），补上条目之前这里每次都会跳过。
        菜单 18 关了脚本自动更新（selfupdate.off）就不换。换上了返回 True，调用方重新执行新版。"""
     if os.environ.get("CNBLK_FRESH") or os.path.exists(SELFUPD_OFF):
         return False
     if os.path.abspath(__file__) != os.path.abspath(SELF_PATH):
         return False
-    try:
-        req = urllib.request.Request(f"{SELF_URL}?_t={int(time.time())}", headers={"User-Agent": HTTP_UA})
-        body = urllib.request.urlopen(req, timeout=20).read().decode()
-        compile(body, SELF_PATH, "exec")
-        if "def refresh" not in body or body == open(SELF_PATH).read():
-            return False
-        with open(SELF_PATH + ".new", "w") as f:
-            f.write(body)
-        os.replace(SELF_PATH + ".new", SELF_PATH)
-        return True
-    except Exception:
+    data = _fetch_raw_bytes(SELF_URL)
+    if not data:
         return False
+    try:
+        body = data.decode()       # 严格解码：写盘的是 body，验的是 data，两边必须是一个东西
+    except UnicodeDecodeError:
+        return False
+    # 只升不降：raw 被限流(429) / 镜像缓存旧副本时，拉到的版本号 ≤ 正在跑的就不动
+    newv = _remote_ver(body)
+    if newv and _vt(newv) <= _vt(VERSION):
+        return False
+    sums = _fetch_raw_bytes(SELF_SHA256SUMS_URL)
+    if not sums:
+        print("  自更新跳过：拿不到 SHA256SUMS，没校验就不换")
+        return False
+    expected = ""
+    for line in sums.decode(errors="replace").splitlines():
+        if re.search(r"(^|\s)cn-block\.py$", line.strip()):
+            expected = line.split()[0]
+            break
+    if not expected:
+        print("  自更新跳过：SHA256SUMS 里没有 cn-block.py 条目，没校验就不换")
+        return False
+    if hashlib.sha256(data).hexdigest() != expected:
+        print("  自更新拒绝：远程 cn-block.py SHA256 对不上（可能被篡改，或镜像缓存未同步），不换")
+        return False
+    try:
+        compile(body, SELF_PATH, "exec")
+    except SyntaxError:
+        return False
+    if "def refresh" not in body or body == open(SELF_PATH).read():
+        return False
+    with open(SELF_PATH + ".new", "w") as f:
+        f.write(body)
+    os.replace(SELF_PATH + ".new", SELF_PATH)
+    return True
 
 def refresh():
     """每天 02:55 的自动更新（菜单 5 → 2 可关）：屏蔽规则 + 放行名单一起，【有变化】才动、才重启 sing-box；
@@ -905,7 +1005,9 @@ def refresh():
        【没变化不重启】仓库主人：「03:00 那个改成规则有变化才重启吧」。以前每晚都重启一次 sing-box，
        凌晨挂着的连接都断几秒；而 geoip/cn 一个月只变十来天、域名那份更少。先按 sing-box 用的同一批地址
        拉一遍算指纹，跟上次成功刷新时记的比：一样就什么都不做；拉不下来也不重启（sing-box 自己每 24 小时
-       也会更新这几个规则集，不会因为这一晚没刷就过期）。第一次（还没记过指纹）照旧刷一次。"""
+       也会更新这几个规则集，不会因为这一晚没刷就过期）。第一次（还没记过指纹）照旧刷一次。
+       【回滚是缓存 + 配置一起】规则集变了要重启那一轮：重启前把 cache.db 和 config.json 都备下来，
+       起不来就两个一起放回、再确认 sing-box 真的起来了；以前只备缓存，配置丢了没法放回。"""
     cfg = cnblock_load()
     if not cfg.get("enabled"):
         return
@@ -939,19 +1041,41 @@ def refresh():
         except OSError: bak = None
     else:
         bak = None
+    # 配置也一起备份：以前只备缓存，配置没备——重启起不来时只回滚缓存，配置丢了没法放回。
+    # 只是放内存里，不落 .bak 文件，成功了什么都不用清。
+    sb_cfg = f"{SB_DIR}/config.json"
+    try:
+        cfg_bak = open(sb_cfg, "rb").read()
+    except OSError:
+        cfg_bak = None
     sh("systemctl restart sing-box", check=False)
     active = False
     for _ in range(15):
         time.sleep(1)
         if sh("systemctl is-active sing-box", check=False) == "active":
             active = True; break
-    if not active:                                      # 起不来 → 有旧缓存就回滚，无论如何要报出来
+    if not active:                                      # 起不来 → 缓存 + 配置一起回滚，再确认一次
+        restored = []
         if bak:
-            os.replace(bak, cache)
-            sh("systemctl restart sing-box", check=False)
-            print(time.strftime("%F %T"), "刷新后 sing-box 未启动，已回滚缓存")
+            try: os.replace(bak, cache); restored.append("缓存")
+            except OSError: pass
+        if cfg_bak is not None:
+            try:
+                with open(sb_cfg, "wb") as f:
+                    f.write(cfg_bak)
+                restored.append("配置")
+            except OSError:
+                pass
+        sh("systemctl restart sing-box", check=False)
+        back = False
+        for _ in range(15):
+            time.sleep(1)
+            if sh("systemctl is-active sing-box", check=False) == "active":
+                back = True; break
+        if back:
+            print(time.strftime("%F %T"), "刷新后 sing-box 未启动，已回滚" + (" + ".join(restored) if restored else "（无可回滚）"))
         else:
-            print(time.strftime("%F %T"), "刷新后 sing-box 未启动（无缓存可回滚），请检查 systemctl status sing-box")
+            print(time.strftime("%F %T"), "刷新后 sing-box 未启动，回滚后仍未启动，请检查 systemctl status sing-box")
         return
     if bak and os.path.exists(bak):
         try: os.remove(bak)
@@ -1161,7 +1285,7 @@ def menu():
             # 会让数据没掉的操作：一行说清后果 + 默认否（CLAUDE.md 第四节）。以前一按就卸，连确认都没有
             ui_tip("卸载会清掉屏蔽规则，自定义链接和单条放行也一起删；只想先关掉选 1")
             if _ask("  确定卸载? [y/N]: ").lower() in ("y", "yes"):
-                remove_cn_block()
+                remove_cn_block(confirm=False)           # 上面已经问过，这里别问两遍
         elif c in ("0", ""):
             return
 
@@ -1173,7 +1297,8 @@ def main():
     elif act == "refresh":                               # cron 每天 02:55 调用：屏蔽规则 + 放行名单一起更新
         refresh()
     elif act == "remove":
-        remove_cn_block()
+        # 没人守着的卸载（比如全部卸载）用 `remove --yes` 免确认；直接敲 remove 会先问一句，默认否
+        remove_cn_block(confirm="--yes" not in sys.argv[1:])
     else:
         menu()
 
