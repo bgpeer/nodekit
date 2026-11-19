@@ -7,8 +7,9 @@
 #     KNOWN 里拿掉它，门照样绿。
 #   · 并行偶发失败 —— 全量是并行跑的，负载一大个别测试会抖（test_netopt_reboot_prompt_4521、
 #     test_ms_state_lock、test_sub_dualstack、test_nginx_rules_heal，单跑都过；
-#     test_progwatch 在重负载下也抖过一次）：失败的逐个串行重跑一次，重跑过了
-#     算偶发。偶发项不写进放行清单：两次都不过可能是真回归，红了才有人看。
+#     test_progwatch 在重负载下也抖过一次）：失败的逐个串行重跑最多三次（GitHub runner
+#     是共享机器，抖一下很常见，一次重跑不够——2026-11-19 四次运行都因为这个红了），
+#     哪次过了算偶发。偶发项不写进放行清单：三次都不过可能是真回归，红了才有人看。
 #   · 其余失败 —— 红灯。
 #
 # 测试钩子（只给 claude/tests/test_ci_test_gate.py 用）：GATE_RUNNER（默认
@@ -40,12 +41,18 @@ if [ "${#failed[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# 逐个串行重跑一次：并行偶发项单跑能过，真失败过不了。
+# 逐个串行重跑最多三次：并行偶发项单跑能过，真失败过不了。
 still=()
 for f in "${failed[@]}"; do
-  if timeout 300 python3 "$TESTS_DIR/$f" </dev/null >"$log.retry" 2>&1; then
-    echo "  偶发（重跑过了）：$f"
-  else
+  passed=""
+  for attempt in 1 2 3; do
+    if timeout 300 python3 "$TESTS_DIR/$f" </dev/null >"$log.retry" 2>&1; then
+      passed=1
+      echo "  偶发（第 $attempt 次重跑过了）：$f"
+      break
+    fi
+  done
+  if [ -z "$passed" ]; then
     still+=("$f")
   fi
 done
