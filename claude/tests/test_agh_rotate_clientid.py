@@ -28,6 +28,8 @@ a._doh_port = lambda: 10443
 a._agh_users = lambda: ["admin"]
 a._privdns_mode = lambda: "off"
 a._current_web_port = lambda: 4321
+# CI 跑在普通用户下，_rotate_clientid 非 root 直接返回（跟 test_agh_doh_h3 一个做法）。
+a.os.geteuid = lambda: 0
 open(a.SELFDNS_FLAG, "w").write("1")
 
 ACCESS = {"allowed_clients": [OLD], "disallowed_clients": [], "blocked_hosts": ["bad.example"]}

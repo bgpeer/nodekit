@@ -26,6 +26,8 @@ SDB = a.AGH_DIR + "/data/sessions.db"; os.makedirs(a.AGH_DIR + "/data")
 a._own_domain = lambda: "dns.example.com"
 a._bcrypt = lambda pw: "$2y$10$NEWHASH" + str(len(pw))
 a.time.sleep = lambda s: None
+# CI 跑在普通用户下，change_admin_password 非 root 直接返回（跟 test_agh_doh_h3 一个做法）。
+a.os.geteuid = lambda: 0
 CMDS, LOGIN, ANS = [], [], []
 a.sh = lambda c, *x, **k: CMDS.append(c) or ""
 a._ask_fresh = lambda p="": ANS.pop(0) if ANS else ""
