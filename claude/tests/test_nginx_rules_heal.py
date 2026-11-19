@@ -24,7 +24,9 @@ check("只有 80 的 acme 小站（reality 占 443）：不算", not m._nginx_ru
 t0 = time.time()
 for _ in range(1000):
     m._nginx_rules_old(new + fb)
-check(f"平时只读一下：判断一次 {(time.time() - t0):.3f} 毫秒级", (time.time() - t0) < 1.0)
+# 1000 次判断：平时几毫秒；并行跑满载时本地实测到过 3.9 秒，GitHub 共享 runner 上也一样抖，
+# 阈值放 5 秒才不误报——真慢下来（比如改成每次读盘）1000 次远不止这个数。
+check(f"平时只读一下：1000 次判断共 {(time.time() - t0):.3f} 秒", (time.time() - t0) < 5.0)
 
 tmp = tempfile.mkdtemp()
 m.NGINX_CONF, m.STATE_FILE = f"{tmp}/bgpeer.conf", f"{tmp}/state.json"

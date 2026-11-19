@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """CI 测试门 .github/run-tests-gate.sh：只在「未知失败」时红灯。
-  方案（gate 脚本头注释里写了理由）：确定性已知失败放行、并行偶发失败串行重跑一次、
+  方案（gate 脚本头注释里写了理由）：确定性已知失败放行、并行偶发失败串行重跑最多三次、
   其余失败红灯。桩一个假的 runner（照 run_tests.sh 的格式印 "✖ test_xxx.py"）和
   三个假测试：一直失败的已知项、第一次失败第二次过的偶发项、一直失败的未知项。
 """
@@ -21,6 +21,14 @@ def fixture(names):
                 "s = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.flaky-ran')\n"
                 "if os.path.exists(s): sys.exit(0)\n"
                 "open(s, 'w').write('x'); sys.exit(1)\n")
+        elif n == "test_flaky2":
+            # 前两次失败、第三次过：门要给够重跑次数才绿。
+            open(os.path.join(d, n + ".py"), "w").write(
+                "import os, sys\n"
+                "s = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.flaky2-n')\n"
+                "n = int(open(s).read()) if os.path.exists(s) else 0\n"
+                "open(s, 'w').write(str(n + 1))\n"
+                "sys.exit(0 if n >= 2 else 1)\n")
         else:
             open(os.path.join(d, n + ".py"), "w").write("import sys; sys.exit(1)\n")
     run = os.path.join(d, "run.sh")
@@ -43,6 +51,9 @@ def gate(d, run, known, run_names):
 d, run = fixture(["test_known_fail", "test_flaky", "test_unknown_fail"])
 rc, out = gate(d, run, "test_known_fail", ["test_known_fail", "test_flaky"])
 check("已知失败 + 偶发失败（重跑过了）→ 门绿", rc == 0 and "门绿" in out)
+d15, run15 = fixture(["test_flaky2"])
+rc, out = gate(d15, run15, "test_known_fail", ["test_flaky2"])
+check("两次失败、第三次过 → 门绿（重跑要给够次数）", rc == 0 and "门绿" in out)
 d2, run2 = fixture(["test_known_fail", "test_flaky", "test_unknown_fail"])
 rc, out = gate(d2, run2, "test_known_fail", ["test_known_fail", "test_unknown_fail"])
 check("未知失败（重跑也不过）→ 门红，指名道姓",
