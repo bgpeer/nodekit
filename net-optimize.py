@@ -68,7 +68,7 @@ from datetime import datetime, timezone
 # 别指望它防指纹：TLS 握手特征、请求头顺序照样能认出是 Python。这一步只是不主动声明身份。
 HTTP_UA = "curl/8.5.0"
 
-VERSION = "4.5.26"
+VERSION = "4.5.27"
 
 SCRIPT_PATH = "/usr/local/sbin/net-optimize.py"
 REMOTE_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/net-optimize.py"
@@ -398,6 +398,15 @@ def ipt_add(cmd, args, iface=None, table="mangle", chain="POSTROUTING"):
 PAT_TCPMSS = r"TCPMSS"
 PAT_EF = r"0x2e|dscp-class EF|set-dscp 46"
 PAT_AF41 = r"0x22|dscp-class AF41|set-dscp 34"
+# 本脚本自己写过的 mangle 规则（TCPMSS clamp + 老版本 DSCP 打标）：清理时只按这个特征删，
+# 绝不用 -F 整表 flush、也别整段剥持久化文件——别的软件的 mangle 规则不能动。
+PAT_OWN_MANGLE = r"TCPMSS|DSCP"
+# MSS 探测用的 ping 载荷（+28 = MTU）：1500 裸线路 / 1480 PPPoE / 1452 / 1420 WG·隧道 /
+# 1380 / 1320 / 1280（IPv6 最小 MTU）。探到 1280 才停，免得更小 MTU 的路径全失败后兜底往大了报。
+MSS_PROBE_SIZES = (1472, 1452, 1424, 1392, 1352, 1292, 1252)
+# 探测全失败时的保守兜底 MSS：最小探测 MTU 1280 - 40。路径 MTU 未知时只许往小了报——
+# 报大了（旧默认值 1452 等于认定 MTU 1492）会直接黑洞，报小了最多每个包少装一点。
+MSS_FALLBACK = 1240
 PAT_DSCP = r"DSCP"
 
 
@@ -411,6 +420,12 @@ def detect_ipt_backend():
 
         test_rule = ["-p", "tcp", "--tcp-flags", "SYN,RST", "SYN",
                      "-j", "TCPMSS", "--set-mss", "9999"]
+        # 先清掉上次试写中途被杀留下的残渣：不先清，残渣会让下面的计数误以为这次试写
+        # 成功、把后端认错；而且残渣本身就是一条 MSS 9999 的活规则。
+        # （正常跑完也会清；开机恢复 / 整套运行 / --reset 清全部 TCPMSS 时同样带走它。）
+        for _c in ("iptables", "iptables-legacy"):
+            if have_cmd(_c):
+                run([_c, "-t", "mangle", "-D", "POSTROUTING"] + test_rule, timeout=5)
         run(["iptables", "-t", "mangle", "-A", "POSTROUTING"] + test_rule, timeout=5)
         cnt = ipt_count("iptables", r"set-mss 9999")
         # 清理测试规则（所有后端都清）
@@ -906,7 +921,7 @@ def clean_old_config():
         pass
 
     # 清理所有后端的 TCPMSS + DSCP 规则（IPv4 + IPv6）——4.5.17 起 DSCP 不再打，正好清掉老版本残留
-    ipt_clear(V4_CMDS + V6_CMDS, r"TCPMSS|DSCP")
+    ipt_clear(V4_CMDS + V6_CMDS, PAT_OWN_MANGLE)
     try:
         os.remove(MPTCP_SYSCTL_OLD)        # 4.5.17 起不再开 MPTCP，老版本写的持久化文件删掉
     except Exception:  # noqa
@@ -1840,13 +1855,13 @@ def _tracepath_mtu(targets=("1.1.1.1", "8.8.8.8")):
 
 
 def probe_path_mtu(ping_cmd=None):
-    # payload 1472→MTU1500(裸线路) 1452→1480(PPPoE) 1424→1452 1392→1420(WG/隧道)
+    # 载荷见 MSS_PROBE_SIZES：从 MTU 1500 一路探到 1280（IPv6 最小 MTU）
     p = ping_cmd if ping_cmd is not None else _ping_with_df()
     if not p:
         # 【别把"ping 不支持 -M"说成"ICMP 不通"】见 _ping_with_df 的注释：
         # 两者的处方完全不同，报错报歪了会把人带去查防火墙。
         return _tracepath_mtu()
-    for size in (1472, 1452, 1424, 1392):
+    for size in MSS_PROBE_SIZES:
         for target in ("1.1.1.1", "8.8.8.8"):
             r = run([p, "-c1", "-W2", "-M", "do", "-s", str(size), target],
                     timeout=10)
@@ -1862,11 +1877,24 @@ def apply_one_tcpmss(cmd, iface, mss):
 
 
 def strip_persistent_mangle():
-    """从 netfilter-persistent 保存文件里剥掉 mangle 段（保留 nat 端口跳跃）。"""
+    """从 netfilter-persistent 保存文件里只剥掉本脚本自己写过的 mangle 规则
+       （TCPMSS clamp、老版本 DSCP 打标），别的软件的 mangle 规则一律不动。
+       以前是整段删 *mangle：别的软件（比如容器 / VPN 的 MARK 规则）写进同一个文件
+       的规则，开机就被清掉。*mangle 里没有别的规则剩下时才把空段整个拿掉。"""
     for pf in ("/etc/iptables/rules.v4", "/etc/iptables/rules.v6"):
         content = read_text(pf)
-        if content and re.search(r"^\*mangle$", content, re.M):
-            new = re.sub(r"^\*mangle\n.*?^COMMIT\n", "", content, flags=re.M | re.S)
+        if not content:
+            continue
+        m = re.search(r"^\*mangle\n.*?^COMMIT\n", content, flags=re.M | re.S)
+        if not m:
+            continue
+        block = m.group(0)
+        kept = [l for l in block.splitlines(keepends=True)
+                if not (l.startswith("-A ") and re.search(PAT_OWN_MANGLE, l))]
+        body = [l for l in kept if l.startswith("-A ")]
+        new_block = "".join(kept) if body else ""
+        new = content[:m.start()] + new_block + content[m.end():]
+        if new != content:
             write_text(pf, new)
             yield pf
 
@@ -1881,30 +1909,37 @@ def setup_mss_clamping():
     # 确保 netfilter-persistent 启用（负责恢复 nat 表端口跳跃规则）
     run(["systemctl", "enable", "netfilter-persistent"], timeout=10)
 
-    # MSS 自动探测：按实际路径 MTU 推导（MTU-40），显式指定或探测失败保持原值
+    # MSS 自动探测：按实际路径 MTU 推导（MTU-40）；显式指定保持原值，探测失败用保守兜底
     mss = Cfg.MSS_VALUE
-    if Cfg.MSS_AUTO and not Cfg.MSS_USER_SET and have_cmd("ping"):
+    if Cfg.MSS_AUTO and not Cfg.MSS_USER_SET and not have_cmd("ping"):
+        # 没有 ping 可用：同样探不到，保守兜底（见 MSS_FALLBACK 的注释）
+        mss = MSS_FALLBACK
+        echo(f"ℹ️ 没有 ping 可用，路径 MTU 未知，使用保守兜底 MSS={mss}")
+    elif Cfg.MSS_AUTO and not Cfg.MSS_USER_SET:
         _p = _ping_with_df()
         mtu = probe_path_mtu(_p)
         if mtu:
             mss = mtu - 40
             echo(f"✅ 路径 MTU 探测: {mtu} → MSS={mss}")
-        elif not _p:
-            # 【这几种原因要分开说】"ping 不支持 -M"、"有 tracepath 但也没量出来"、
-            # "ICMP 被挡" 的处方完全不同，混成一句会把人带偏。
-            # 【现场踩过】机器上装着 tracepath，却照样打"也没有 tracepath 兜底" ——
-            # 照着这句去装 tracepath，装了也没用，因为它本来就在。
-            echo(f"ℹ️ 这台机的 ping 用不了 -M do（多半是 inetutils/busybox 版），"
-                 f"使用默认 MSS={mss}")
-            if have_cmd("tracepath"):
-                echo("   tracepath 在，但也没量出 pmtu。手动跑一下看它说什么：")
-                echo("     tracepath -n -m 12 1.1.1.1")
-            else:
-                echo("   也没有 tracepath 兜底。二选一：")
-                echo("     apt install -y iputils-ping        # 装完重跑本模块")
-                echo("     apt install -y iputils-tracepath   # 或者用 tracepath")
         else:
-            echo(f"ℹ️ 路径 MTU 探测失败（ICMP 不通），使用默认 MSS={mss}")
+            # 探不到就往小了报（见 MSS_FALLBACK 的注释），不再用默认 1452
+            mss = MSS_FALLBACK
+            if not _p:
+                # 【这几种原因要分开说】"ping 不支持 -M"、"有 tracepath 但也没量出来"、
+                # "ICMP 被挡" 的处方完全不同，混成一句会把人带偏。
+                # 【现场踩过】机器上装着 tracepath，却照样打"也没有 tracepath 兜底" ——
+                # 照着这句去装 tracepath，装了也没用，因为它本来就在。
+                echo(f"ℹ️ 这台机的 ping 用不了 -M do（多半是 inetutils/busybox 版），"
+                     f"使用保守兜底 MSS={mss}")
+                if have_cmd("tracepath"):
+                    echo("   tracepath 在，但也没量出 pmtu。手动跑一下看它说什么：")
+                    echo("     tracepath -n -m 12 1.1.1.1")
+                else:
+                    echo("   也没有 tracepath 兜底。二选一：")
+                    echo("     apt install -y iputils-ping        # 装完重跑本模块")
+                    echo("     apt install -y iputils-tracepath   # 或者用 tracepath")
+            else:
+                echo(f"ℹ️ 路径 MTU 探测失败（ICMP 不通），使用保守兜底 MSS={mss}")
     Cfg.MSS_VALUE = mss
 
     echo(f"📡 设置MSS Clamping (MSS={mss})...")
@@ -2972,24 +3007,23 @@ def cmd_boot_apply():
         iface = cfg.get("CLAMP_IFACE", "")
         ip6 = ip6_cmd_for(ipt)
 
-        # 第一步：flush 所有后端 mangle POSTROUTING，彻底避免重复
+        # 第一步：只清本脚本自己写过的 mangle 规则（TCPMSS + 老版本 DSCP），
+        # 别 -F 整表 flush——别的软件的 POSTROUTING 规则不能动
         for m in ("ip_tables", "iptable_mangle", "ip6_tables", "ip6table_mangle"):
             run(["modprobe", m], timeout=10)
-        logger_msg(f"BOOT: flush前 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
-        for cmd in V4_CMDS + V6_CMDS:
-            if have_cmd(cmd):
-                run([cmd, "-w", "2", "-t", "mangle", "-F", "POSTROUTING"], timeout=5)
-        logger_msg(f"BOOT: flush后 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
+        logger_msg(f"BOOT: 清理前 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
+        ipt_clear(V4_CMDS + V6_CMDS, PAT_OWN_MANGLE)
+        logger_msg(f"BOOT: 清理后 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
 
         # 第二步：写入 MSS Clamping（IPv4 + IPv6）
         if cfg.get("ENABLE_MSS_CLAMP", "0") == "1":
-            mss = int(cfg.get("MSS_VALUE", "1452"))
+            mss = int(cfg.get("MSS_VALUE", str(MSS_FALLBACK)))  # 老配置没这一项：路径 MTU 未知，保守兜底
             if have_cmd(ipt):
                 apply_one_tcpmss(ipt, iface, mss)
             if ip6 and have_cmd(ip6):
                 apply_one_tcpmss(ip6, iface, mss - 20)
 
-        # （4.5.17 起不再写 DSCP EF：上面的 flush 已把老版本的清掉）
+        # （4.5.17 起不再写 DSCP EF：上面的清理已把老版本的清掉）
         logger_msg(f"BOOT: add后 TCPMSS={ipt_count('iptables-legacy', PAT_TCPMSS)}")
 
         # initcwnd（IPv6 RA 路由可能开机后几秒才到，等待最多 10 秒）
@@ -3186,7 +3220,7 @@ def cmd_reset():
 
     # [3] iptables 规则（TCPMSS + DSCP + INVALID DROP，所有后端）
     echo("🔧 [3] 清理 iptables 规则（TCPMSS + DSCP + INVALID DROP）...")
-    ipt_clear(V4_CMDS + V6_CMDS, r"TCPMSS|DSCP")
+    ipt_clear(V4_CMDS + V6_CMDS, PAT_OWN_MANGLE)
     for cmd in V4_CMDS:
         if not have_cmd(cmd):
             continue
@@ -3932,7 +3966,7 @@ def probe_path_mtu_quick():
     p = _ping_with_df()
     if not p:
         return _tracepath_mtu(("1.1.1.1",))
-    for size in (1472, 1452, 1424, 1392):
+    for size in MSS_PROBE_SIZES:
         if run([p, "-c1", "-W1", "-M", "do", "-s", str(size), "1.1.1.1"],
                timeout=6).returncode == 0:
             return size + 28
