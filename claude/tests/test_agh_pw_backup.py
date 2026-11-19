@@ -16,6 +16,8 @@ def check(l, ok):
 TMP = tempfile.mkdtemp()
 a.BGP_DIR = TMP
 a.AGH_PW_FILE = TMP + "/agh.password"
+# CI 跑在普通用户下，remember_admin_password 非 root 直接返回（跟 test_agh_doh_h3 一个做法）。
+a.os.geteuid = lambda: 0
 PW = "Pw12345678"
 
 check("没存过：取出来是空", a._agh_pw_get() == "")

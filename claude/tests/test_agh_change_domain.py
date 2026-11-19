@@ -25,6 +25,8 @@ a.AGH_DOMAIN_FILE = a.BGP_DIR + "/agh.domain"
 a.SELFDNS_FLAG = a.BGP_DIR + "/selfdns.on"
 a.SELFDNS_CID_FILE = a.BGP_DIR + "/selfdns.clientid"; open(a.SELFDNS_CID_FILE, "w").write("xyabc123")
 a.HOST_FILE = a.BGP_DIR + "/sub.host"; open(a.HOST_FILE, "w").write("node.zone.example")
+# CI 跑在普通用户下，change_domain 非 root 直接返回（跟 test_agh_doh_h3 一个做法）。
+a.os.geteuid = lambda: 0
 ACME = T + "/.acme.sh"; os.makedirs(ACME)
 open(ACME + "/acme.sh", "w").write("#!/bin/sh\n")
 open(ACME + "/account.conf", "w").write("SAVED_CF_Token='tok'\n")

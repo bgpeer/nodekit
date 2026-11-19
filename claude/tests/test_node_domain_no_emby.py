@@ -76,6 +76,8 @@ x._agh_tls = lambda: {}
 
 print("真换的那一步")
 x.STATE_FILE, x.HOST_FILE, x.NODE_FILE = T + "/state.json", T + "/sub.host", T + "/nodes.txt"
+# cert_change_domain_apply 里 os.makedirs(BGP_DIR)：不改就往真的 /etc/bgpeer 写，CI 普通用户没权限。
+x.BGP_DIR = T + "/bgp"
 x.SB_DIR = x.XRAY_DIR = T + "/none"
 x.NGINX_CONF = x.AGH_YAML = T + "/none.conf"
 SIGNED = []
