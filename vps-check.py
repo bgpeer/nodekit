@@ -252,16 +252,22 @@ def ensure_traceroute():
 def traceroute(ip, maxhop=30, timeout=120):
     """→ [(hop, ip, ms)]；ip 为 None 表示该跳无响应。
 
+       每跳发 3 个包：单包时一个丢包就把整跳判成「无响应」，还可能把一次排队
+       毛刺当成这跳的延迟 —— 骨干在不在的判定就可能错一城。traceroute 取
+       3 个里最快的（min），mtr 取 3 个的平均（Avg 列）；不回应的跳照样多等
+       几秒，report_routes 里「约 2–3 分钟」就是这么来的。
+
        两种工具输出格式不同，必须分开解析：
-         traceroute:  ` 3  59.43.186.1  142.331 ms`      延迟带 ms 后缀
-         mtr -r -c1:  `  3.|-- 59.43.186.1  0.0%  1  142.3 142.3 ...`
+         traceroute:  ` 3  59.43.186.1  142.331 ms  139.8 ms  141.0 ms`
+                      延迟带 ms 后缀，丢了的那个包印 `*`
+         mtr -r -c 3:  `  3.|-- 59.43.186.1  0.0%  3  142.3 141.1 ...`
                       跳号后是 `.|--`，且【没有 ms 后缀】，
-                      IP 之后依次是 Loss% / Snt / Last…，Last 才是本跳延迟。"""
+                      IP 之后依次是 Loss% / Snt / Last / Avg / Best…，Avg 才是本跳延迟。"""
     fam = " -6" if is_v6(ip) else ""
     if have("traceroute"):
-        cmd, tool = f"traceroute{fam} -n -q 1 -w 1 -m {maxhop} {ip}", "traceroute"
+        cmd, tool = f"traceroute{fam} -n -q 3 -w 1 -m {maxhop} {ip}", "traceroute"
     elif have("mtr"):
-        cmd, tool = f"mtr{fam} -n -r -c 1 -m {maxhop} {ip}", "mtr"
+        cmd, tool = f"mtr{fam} -n -r -c 3 -m {maxhop} {ip}", "mtr"
     else:
         return []
     try:
@@ -284,12 +290,13 @@ def traceroute(ip, maxhop=30, timeout=120):
         ms = None
         if hip:
             if tool == "traceroute":
-                msm = re.search(r"([\d.]+)\s*ms", rest)
-                ms = float(msm.group(1)) if msm else None
-            else:                                            # mtr：IP 之后第 3 个数字是 Last
+                samples = re.findall(r"([\d.]+)\s*ms", rest)
+                ms = min(map(float, samples)) if samples else None
+            else:                                            # mtr：IP 之后第 4 个数字是 Avg
                 nums = re.findall(r"[\d.]+", rest[rest.index(hip) + len(hip):])
-                if len(nums) >= 3:
-                    try: ms = float(nums[2])
+                idx = 3 if len(nums) >= 4 else 2             # 只有 Last 时退回 Last
+                if len(nums) > idx:
+                    try: ms = float(nums[idx])
                     except ValueError: pass
         hops.append((n, hip, ms))
     return hops
@@ -531,7 +538,7 @@ def report_routes(num="二"):
     if not ensure_traceroute():
         print(f"  {C['r']}没有 traceroute/mtr 且装不上，跳过本节{C['n']}"); return None
     targets = TARGETS
-    print(f"  {C['d']}{len(targets)} 个测试点（{len(CITIES)} 城 × 三网），并发跑，约 2 分钟。{C['n']}")
+    print(f"  {C['d']}{len(targets)} 个测试点（{len(CITIES)} 城 × 三网），并发跑，约 2–3 分钟。{C['n']}")
     print(f"  {C['d']}判定看【长途段】——把流量从境外拉回中国的那一段骨干，它决定延迟和拥塞；{C['n']}")
     print(f"  {C['d']}后面的『→ xxx』是落地进了哪家的网，延迟取最后一个有响应的跳（≈到目的地 RTT）。{C['n']}")
     res = run_targets(targets)

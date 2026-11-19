@@ -1,0 +1,22 @@
+name: Tests
+
+# 回归测试门：push 到 main / PR 到 main 都跑全量 `bash claude/run_tests.sh`。
+# 干净 main 上就失败的已知项不红灯（见 .github/run-tests-gate.sh 里的 KNOWN），
+# 并行偶发失败会逐个串行重跑一次；剩下未知失败才让门变红。
+# 注意：测试里个别项要真机 / 命名空间 / 定时，跑的是容器里能跑的部分 ——
+# 全量在 GitHub runner 上的表现跟本地容器可能不一样，未知失败先在本地复现再定。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run regression tests (gated)
+        run: bash .github/run-tests-gate.sh
