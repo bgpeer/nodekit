@@ -117,7 +117,9 @@ CMDS = []
 x2.sh = lambda c, check=True: CMDS.append(c) or ""
 x2.os.path.exists = (lambda e: lambda p: True if p.endswith("acme.sh/acme.sh") else e(p))(x2.os.path.exists)
 x2._acme_forget(OLD, keep=("*." + OLD,))
-check("keep 里的那条不撤，别的照撤", any(f"'{OLD}'" in c for c in CMDS) and not any(f"'*.{OLD}'" in c for c in CMDS))
+# 断言只认「撤了哪条记录」：普通域名 shlex.quote 后是不带引号的（-d old.example），
+# 泛域名才带引号（-d '*.old.example'）——别把引号本身写进断言。
+check("keep 里的那条不撤，别的照撤", any(f"-d {OLD}" in c for c in CMDS) and not any(f"*.{OLD}" in c for c in CMDS))
 print("selfdns-refresh（自建 DNS 换了自己的域名后叫它）")
 x2.SELFDNS_FLAG = T + "/selfdns.on"
 x2.privdns_conf = lambda: {"mode": "off", "dns": "", "name": ""}

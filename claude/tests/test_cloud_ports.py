@@ -50,6 +50,7 @@ m.cloud_ports()
 check("不再去拉成员机的 .links（进「2 节点链接」不用等它们）", not fetched)
 
 # 屏上：在单节点链接和订阅之间；标题一行、端口顶格一行、台与台空一行
+# 装完那屏现在住在 _run_install 里（run() 只包一层快照 + 回滚）；顺序照旧
 m._sub_items = lambda: True
 m.print_sub_urls = lambda: print("SUBURLS")
 m._sub_service_synced = lambda: True
@@ -66,7 +67,7 @@ check("标题一行、端口顶格一行", "[本机 🇺🇸OR]" in seg and seg[
 check("屏上没有成员机", "成员" not in o[i_fw:i_sub])
 src = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
 body = lambda n: src[src.index(f"def {n}("):src.index("\ndef ", src.index(f"def {n}(") + 5)]
-check("装完、只添加新协议两屏也在链接和订阅之间", body("run").index("print_cloud_ports()") < body("run").index('ui_title("订阅链接')
+check("装完、只添加新协议两屏也在链接和订阅之间", body("_run_install").index("print_cloud_ports()") < body("_run_install").index('ui_title("订阅链接')
       and body("_add_apply").index("print_node_links(new_links)") < body("_add_apply").index("print_cloud_ports()")
       < body("_add_apply").index('ui_title("订阅链接'))
 srv.shutdown()

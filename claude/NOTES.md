@@ -354,3 +354,23 @@
 - 长时间跑的东西必须有进度（「卡在这里好长时间了，也没显示是不是在运行」）。
 - 不要扫整个库；凌晨 / 每小时的活不许误伤播放。
 - 说话要实在：没在真机上测过的就说没测过。
+
+## 安装回滚 / 端口占位（11/19 起）
+
+- **全部重装有回滚**：`run()` 先快照两核心配置 + state.json + 链接 + nginx 配置（`_snapshot_install`），
+  本体 `_run_install` 任一步失败就整体回滚（`_rollback_install`：文件放回去、服务恢复到安装前的跑/停状态，
+  新装的撤干净 `disable --now`）。写配置先写临时文件、校验通过才原子替换（`_write_core_cfg`），旧配置不先截断。
+  证书文件不进快照：装的过程中签的新证书盖同一个域名，留着无害。`takeover` 卸载别人是故意的、不可逆，不回滚。
+- **端口挑到就绑住不放**：`next_port()` / `_pick_sub_port()` 挑到端口当场 `hold_port()`（v4 + v6 都绑），
+  服务起来前才松开（`_release_ports_for` 在 `write_service` / `systemctl restart` 之前），堵住挑端口到起服务
+  之间几十秒的 TOCTOU。UDP 协议（hy2/tuic）按 UDP 占位，`port_free()` 也加了 `proto` 参数。
+  443 钉点（reality-443）腾出来后也先占住。订阅端口同样占住，`serve_sub` 起服务前松开。
+- **CLI 参数跟交互同一套校验**（`_cli_validate`）：`--domain` / `--email` / `--sni` / `--sni-xr` 格式不对直接
+  `ap.error`；`--hy2-ports` 格式 + UDP 冲突都查（全新安装不算自己的旧节点），撞上直接报错退出。
+  交互里 `ask_hy2_range` 格式不对不再静默回默认，改成红字重填。
+- **`_udp_ports_in_use` 的 ss 解析别按固定列号抠**：有的 ss 带 Netid 列、有的不带（这台容器就不带），
+  按列号抠会把对端 `0.0.0.0:*` 当成本地、冲突全漏。现在找行里第一个「:数字端口」结尾的字段当本地地址。
+- **shell 注入**：域名 / 邮箱 / 伪装域名拼进 `openssl` / `acme.sh` 的地方都加了 `shlex.quote`
+  （`ensure_acme`、`cert_install_apply`、换域名、撤证书、下载 `_dl`、sing-box 版本号那几处）。
+  没动的是：固定服务名 / 常量路径 / 内部算出来的端口（int）和 iptables 规则、vnstat 网卡名这类内部值，
+  以及 `takeover` 按固定清单删服务/目录 —— 它们到不了用户输入，动了反而容易改坏。

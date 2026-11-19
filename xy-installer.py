@@ -18,7 +18,7 @@
 #    并对照你 VPS 上实际 sing-box/xray 版本确认 schema（版本会漂）。
 # 目标系统：debian / ubuntu（apt）。用法见文件末尾 --help。
 # ============================================================================
-import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicodedata, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress, ssl, struct
+import os, json, base64, calendar, secrets, uuid, argparse, subprocess, unicodedata, urllib.request, urllib.parse, urllib.error, shutil, socket, re, time, random, ipaddress, ssl, struct, shlex
 
 # 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
 # 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
@@ -89,7 +89,7 @@ def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.231"
+SCRIPT_VERSION = "1.1.229"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -329,25 +329,95 @@ def _ensure_cron_running():
     for unit in ("cron", "crond"):                 # Debian 系叫 cron，RHEL 系叫 crond
         sh(f"systemctl enable --now {unit}", check=False)
 
-def port_free(port):
-    """standalone 验证要独占 80 端口，先探测避免 acme 无谓失败。"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("0.0.0.0", port))
+def _bind_all(port, proto="tcp"):
+    """把一个端口的 v4 和 v6 都绑住（能绑的都绑），返回绑住的 socket 列表；
+       任一绑不上就全放掉、返回 []。绑住的 socket 只是占位（不 listen、不收包），
+       别的进程再想绑同一个端口会直接 EADDRINUSE——这才是跨进程的占位，
+       _USED_PORTS 只防本进程内重复。
+
+       TCP 带 SO_REUSEADDR：只放过 TIME_WAIT 的旧 socket，不放过正绑着的；
+       探 80 这类刚停掉服务的端口时，行为跟以前的 port_free 一致。"""
+    typ = socket.SOCK_DGRAM if proto == "udp" else socket.SOCK_STREAM
+    socks = []
+    for fam, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+        try:
+            s = socket.socket(fam, typ)
+        except OSError:
+            continue                                  # 没开 IPv6 就跳过 v6
+        try:
+            if fam == socket.AF_INET6:
+                try:
+                    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                except OSError:
+                    pass
+            if typ == socket.SOCK_STREAM:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((addr, port))
+            socks.append(s)
+        except OSError:
+            s.close()
+            for x in socks:
+                try:
+                    x.close()
+                except OSError:
+                    pass
+            return []
+    return socks
+
+def port_free(port, proto="tcp"):
+    """standalone 验证要独占 80 端口，先探测避免 acme 无谓失败。
+       proto="udp"：hy2/tuic 这类 UDP 协议，TCP 探根本没意义（见 _udp_ports_in_use）。"""
+    socks = _bind_all(port, proto)
+    for s in socks:
+        try:
+            s.close()
+        except OSError:
+            pass
+    return bool(socks)
+
+_HELD_PORTS = {}           # 端口 → 占着它的 socket 列表：挑好就绑住不放，服务起来前才松开
+
+def hold_port(port, proto="tcp"):
+    """绑住端口不放（返回 True=占住了，False=已被占用）。
+       占住不放才堵得住 TOCTOU：以前 port_free 探一下立刻放开，挑端口到服务
+       起来中间隔着下内核、签证书几十秒，别的进程正好能占走。"""
+    if port in _HELD_PORTS:
         return True
-    except OSError:
+    socks = _bind_all(port, proto)
+    if not socks:
         return False
-    finally:
-        s.close()
+    _HELD_PORTS[port] = socks
+    return True
+
+def _release_port(port):
+    for s in _HELD_PORTS.pop(port, []):
+        try:
+            s.close()
+        except OSError:
+            pass
+
+def release_held_ports():
+    """松开全部占住的端口（服务已起来、或安装失败回滚时）。"""
+    for port in list(_HELD_PORTS):
+        _release_port(port)
+
+def _release_ports_for(inbounds):
+    """松开某批 inbound 占住的端口：配置已落盘、服务马上重启去绑，
+       再占着反而会把服务自己的 bind 顶掉。"""
+    for ib in inbounds or []:
+        p = _cfg_port(ib)
+        if p:
+            _release_port(p)
 
 _USED_PORTS = set()            # 本次安装已分配的端口，防止随机撞车
 
-def next_port():
+def next_port(proto="tcp"):
     """每次安装为每个协议随机挑一个可用端口（PORT_LO~PORT_HI），非连续：
        - 避开 hy2 跳跃段（整段 UDP 被 DNAT 给 hy2，别的协议落进去会被劫走）
        - 避开订阅端口、本次已分配端口、系统已被占用的端口
-       连续端口(20001,20002…)一扫一整排是明显的代理指纹，随机分散能显著削弱。"""
+       连续端口(20001,20002…)一扫一整排是明显的代理指纹，随机分散能显著削弱。
+       proto="udp"：hy2/tuic 这类 UDP 协议按 UDP 占位，TCP 探不到它们。
+       挑到的端口当场绑住（见 hold_port），直到服务起来才松开。"""
     rng = hy2_range()                           # 关了跳跃则为 ''，不占用整段
     hop = tuple(map(int, rng.split("-"))) if rng else None
     for _ in range(500):
@@ -356,7 +426,7 @@ def next_port():
             continue
         if hop and hop[0] <= p <= hop[1]:       # hy2 跳跃段，留给 hy2
             continue
-        if not port_free(p):                    # 系统层面已被别的进程占用
+        if not hold_port(p, proto):             # 系统层面已被别的进程占用（占不住就换一个）
             continue
         _USED_PORTS.add(p)
         return p
@@ -392,15 +462,17 @@ def sub_port():
     return _SUB_PORT
 
 def _pick_sub_port():
-    """从协议同一大区间随机挑订阅端口（避开 hy2 跳跃段/已分配/被占端口）。"""
+    """从协议同一大区间随机挑订阅端口（避开 hy2 跳跃段/已分配/被占端口）。
+       挑到就绑住（见 hold_port），serve_sub 起服务前才松开。"""
     rng = hy2_range()
     hop = tuple(map(int, rng.split("-"))) if rng else None
     for _ in range(500):
         p = secrets.randbelow(PORT_HI - PORT_LO + 1) + PORT_LO
         if hop and hop[0] <= p <= hop[1]:
             continue
-        if p in _USED_PORTS or not port_free(p):
+        if p in _USED_PORTS or not hold_port(p):
             continue
+        _USED_PORTS.add(p)
         return p
     raise RuntimeError(f"在 {PORT_LO}-{PORT_HI} 内找不到可用的订阅端口，请检查端口占用。")
 
@@ -474,7 +546,7 @@ def ensure_self_signed():
         return
     os.makedirs(os.path.dirname(CERT), exist_ok=True)
     sh(f"openssl ecparam -genkey -name prime256v1 -out {KEY}")
-    sh(f'openssl req -new -x509 -days 3650 -key {KEY} -out {CERT} -subj "/CN={G["sni"]}"')
+    sh(f"openssl req -new -x509 -days 3650 -key {KEY} -out {CERT} -subj {shlex.quote('/CN=' + G['sni'])}")
 
 def cert_covers(path, domain):
     """现有证书【真的顶得住】这个域名吗（换域名重装时避免复用旧域名的证书）。
@@ -507,7 +579,7 @@ _ACME_HOOK_DONE = False          # 一次运行里只补一次：ensure_acme 每
 
 def _acme_install_cert(acme):
     """把证书导出到 ACME_CRT/ACME_KEY，并把 reloadcmd 记进 acme.sh。"""
-    sh(f"{acme} --install-cert -d {G['domain']} --ecc "
+    sh(f"{acme} --install-cert -d {shlex.quote(G['domain'])} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}")
 
 def _ensure_acme_reload_hook():
@@ -522,7 +594,7 @@ def _ensure_acme_reload_hook():
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
         return
-    sh(f"{acme} --install-cert -d {G['domain']} --ecc "
+    sh(f"{acme} --install-cert -d {shlex.quote(G['domain'])} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
 
 def _wildcard_wanted():
@@ -562,10 +634,10 @@ def ensure_acme():
             ensure_deps()
         acme = os.path.expanduser("~/.acme.sh/acme.sh")
         if not os.path.exists(acme):
-            sh("curl -s https://get.acme.sh | sh -s email=" + (G["email"] or "a@a.com"))
+            sh("curl -s https://get.acme.sh | sh -s email=" + shlex.quote(G["email"] or "a@a.com"))
         if not os.path.exists(acme):
             raise RuntimeError("acme.sh 安装失败，检查网络/curl 是否可访问 get.acme.sh")
-        sh(f"{acme} --register-account -m {G['email'] or 'a@a.com'} "
+        sh(f"{acme} --register-account -m {shlex.quote(G['email'] or 'a@a.com')} "
            f"--server letsencrypt", check=False)
         sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
         Y_, R_, N_ = "\033[1;33m", "\033[1;31m", "\033[0m"
@@ -582,7 +654,7 @@ def ensure_acme():
             # 而不是降级——Emby 的共用关系靠软链指向这个文件，泛域名保住就不会断。
             names = [G["domain"]] + ([f"*.{G['domain']}"] if wild else []) + ([f"*.{root}"] if root else [])
             print(f"  这台机该用泛域名证书（{why or '节点专用域名'}），改走 DNS-01 签 " + " + ".join(names))
-            issue = (f"{acme} --issue --dns dns_cf " + " ".join(f"-d '{n}'" for n in names) +
+            issue = (f"{acme} --issue --dns dns_cf " + " ".join(f"-d {shlex.quote(n)}" for n in names) +
                      f" --keylength ec-256 --server letsencrypt")
         elif wild:
             # 只能降级了，但绝不静默：说清楚丢了什么、会坏什么、装完去哪儿补。
@@ -596,13 +668,13 @@ def ensure_acme():
             wild = False
         dns01 = bool(wild or root)
         if not dns01 and G.get("nginx"):
-            issue = f"{acme} --issue -d {G['domain']} --webroot {WEBROOT} --keylength ec-256"
+            issue = f"{acme} --issue -d {shlex.quote(G['domain'])} --webroot {WEBROOT} --keylength ec-256"
         elif not dns01:
             if not port_free(80):
                 raise RuntimeError(
                     "80 端口被占用，acme.sh --standalone 无法验证。"
                     "先停掉占用 80 的服务(nginx/caddy 等)，或改用自签(回车跳过域名)。")
-            issue = f"{acme} --issue -d {G['domain']} --standalone --keylength ec-256"
+            issue = f"{acme} --issue -d {shlex.quote(G['domain'])} --standalone --keylength ec-256"
         if not dns01:
             fw_allow({(80, "tcp")})                  # HTTP-01 要从外面连 80：开着防火墙先放行（mack-a 同做法）
         # acme.sh 在证书仍有效时会以退出码 2 “跳过续期”，这不是错误；
@@ -1793,7 +1865,7 @@ def _dl_gh(url, dest):
     errs = []
     for i, u in enumerate(_mirrors(url)):
         try:
-            sh(f"curl -fsSL --connect-timeout 10 --max-time 300 -o '{dest}' '{u}'")
+            sh(f"curl -fsSL --connect-timeout 10 --max-time 300 -o {shlex.quote(dest)} {shlex.quote(u)}")
             bad = _bad_archive(dest)
             if bad:
                 errs.append(f"{u[:72]}…\n        {bad}")
@@ -1868,7 +1940,7 @@ def install_singbox():
            f"v{ver}/sing-box-{ver}-linux-{a}.tar.gz")
     _dl_gh(url, "/tmp/sb.tgz")
     sh("tar -xzf /tmp/sb.tgz -C /tmp")
-    sh(f"install -m755 /tmp/sing-box-{ver}-linux-{a}/sing-box {SB_BIN}")
+    sh(f"install -m755 /tmp/sing-box-{shlex.quote(ver)}-linux-{a}/sing-box {SB_BIN}")
     _verify_core(SB_BIN, ver, "sing-box")
     os.makedirs(SB_DIR, exist_ok=True)
 
@@ -2527,6 +2599,28 @@ def _recap_smux():
     return ("ws 多路复用", "开启 smux" if G.get("smux") else "不开(默认)")
 
 _SNI_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+def valid_domain(v):
+    """域名格式校验（交互和 CLI 共用）：只认字母数字/连字符/点、末尾是字母 TLD。
+       格式过了还要过 check_domain_or_die 的解析比对（域名得指到本机才能签证书）。"""
+    return bool(v) and bool(_DOMAIN_RE.match(v.strip().lower().rstrip(".")))
+
+def valid_email(v):
+    """acme 注册邮箱格式校验（CLI 共用；交互里不问邮箱，默认占位）。"""
+    return bool(v) and bool(_EMAIL_RE.match(v.strip()))
+
+def _parse_hy2_range(raw):
+    """hy2 跳跃范围 → (起, 止) 或 None：格式 起-止、起<止、止≤65535。
+       跟交互里 ask_hy2_range 原来认的口径一致，别各写一套。"""
+    m = re.match(r"^(\d+)-(\d+)$", (raw or "").strip())
+    if not m:
+        return None
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if lo >= hi or hi > 65535:
+        return None
+    return lo, hi
 
 def ask_reality_sni(label, default="", avoid="", own=""):
     """问一个 reality 伪装域名 → (域名, 是不是随机挑的)。
@@ -3130,7 +3224,8 @@ def build(table, names, pinned=None, dup=None, mark=""):
     inbounds, links = [], []
     for n in names:
         # 名称 = 用户前缀 + 协议名（默认无前缀，别人部署 US/SG 时自己填 🇺🇸/🇸🇬 等）
-        port = pinned.get(n) or next_port()
+        # UDP 协议（hy2/tuic）按 UDP 占位：TCP 探根本探不到 UDP 占用。
+        port = pinned.get(n) or next_port("udp" if table[n].get("udp") else "tcp")
         tag = _tag(G.get("prefix", ""), n)
         if n in dup:                             # 两核心都有该协议 → 尾部小上标区分（sb ¹ / xray ²）
             tag += mark
@@ -3995,6 +4090,7 @@ def serve_sub(reset=False, renew_port=True):
     open("/etc/systemd/system/xy-sub.service", "w").write(svc)
     sh("systemctl daemon-reload")
     sh("systemctl enable xy-sub", check=False)
+    release_held_ports()                        # 订阅端口占位松开，让 xy-sub 自己绑
     sh("systemctl restart xy-sub")
 
 # --- 协议归类：mihomo 节点 dict → 统一协议键（三格式共用）---
@@ -6770,12 +6866,109 @@ def fw_sync(quiet=False):
     """节点 / 订阅 / 伪装站实际在用的端口全部放行（见 _fw_wanted）。"""
     return fw_allow(_fw_wanted(), quiet)
 
+def _write_core_cfg(name, binpath, path, cfg):
+    """写核心配置：先写临时文件、校验通过才原子替换，旧配置绝不先被截断。
+       以前是 json.dump 直接往正式文件写、再 core_check，校验不过时旧配置
+       已经没了（run() 里 sing-box 就是这么丢的）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".new"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    ok, msg = core_check(binpath, tmp)
+    if not ok:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError(f"{name} 配置校验失败（旧配置没动）:\n{msg}")
+    os.replace(tmp, path)
+
+def _snapshot_install():
+    """安装前快照：两核心配置 + state.json + 链接文件 + nginx 配置 + 各服务是否在跑。
+       run() 里任何一步失败就靠它回滚（见 _rollback_install）。"""
+    snap = {"files": {}, "active": {}}
+    for path in (f"{SB_DIR}/config.json", f"{XRAY_DIR}/config.json",
+                 STATE_FILE, NODE_FILE, NGINX_CONF, NGINX_STREAM_CONF):
+        try:
+            with open(path, "rb") as f:
+                snap["files"][path] = f.read()
+        except OSError:
+            snap["files"][path] = None
+    for name in ("sing-box", "xray"):
+        try:
+            snap["active"][name] = subprocess.run(
+                ["systemctl", "is-active", "--quiet", name],
+                capture_output=True).returncode == 0
+        except Exception:
+            snap["active"][name] = False
+    return snap
+
+def _rollback_install(snap):
+    """把快照里的文件放回去、服务恢复到安装前的状态。只尽力而为：哪一步实在
+       恢复不了也不再抛（安装已经失败了，别再拿回滚的异常盖掉真正的原因）。
+       证书文件不进快照：装的过程中签的新证书盖的是同一个域名，留着无害；
+       旧证书万一被换掉，cert.json / acme.sh 那边有自己的恢复路。"""
+    for path, data in snap["files"].items():
+        try:
+            if data is None:
+                if os.path.exists(path):
+                    os.remove(path)
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(data)
+        except OSError:
+            pass
+    for name, path in (("sing-box", f"{SB_DIR}/config.json"),
+                       ("xray", f"{XRAY_DIR}/config.json")):
+        try:
+            if snap["active"].get(name):
+                sh(f"systemctl restart {name}", check=False)
+            elif snap["files"].get(path) is None:
+                sh(f"systemctl disable --now {name}", check=False)   # 新装的，撤干净
+            else:
+                sh(f"systemctl stop {name}", check=False)
+        except Exception:
+            pass
+    try:
+        _hy2_hop_heal()          # 跳跃 DNAT 可能已指到新端口，按恢复后的配置重新指一次
+    except Exception:
+        pass
+    if snap["files"].get(NGINX_CONF) is not None or snap["files"].get(NGINX_STREAM_CONF) is not None:
+        try:
+            nginx_reload()
+        except Exception:
+            pass
+
 def run(sb_names, xr_names):
     ensure_deps()               # 先补齐 curl/socat/unzip/openssl 等，避免中途才炸
     if G.get("sni_split") and G["domain"]:
         G["nginx"] = "1"        # sni-split 自带 nginx(:80 webroot + stream 443)，提前置位让域名校验按 webroot 放宽
     check_domain_or_die()       # 域名不匹配就此停止——必须在 takeover 卸载别人之前
     takeover_cleanup()          # 有别人装的(mack-a 等)先踢掉再接管
+    snap = _snapshot_install()  # 接管是故意的、不可逆；从这里起的改动才要回滚
+    try:
+        _run_install(sb_names, xr_names)
+    except Exception:
+        release_held_ports()    # 先松开占住的端口，旧服务才能绑回去
+        _rollback_install(snap)
+        print("\n  ✗ 安装失败，已回滚到安装前的配置和服务状态（节点照旧跑着）。")
+        raise
+    release_held_ports()        # 都起来了，占位全部松开
+    fw_sync()                                            # 开着防火墙就把节点 / 订阅端口放行（对齐 mack-a）
+    netprofile_sync()                                    # 节点端口交给网络优化保留（装着才叫它）
+
+    install_shortcut()
+    sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
+    setup_cfg_auto_cron()                                # 三大配置每天北京 03:20 按当前模板自动更新
+    setup_selfupd_cron()                                 # 脚本本体每天北京 02:50 自动更新（菜单 18 开关）
+    if sched:
+        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 19 手动立即更新。')
+    print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
+
+def _run_install(sb_names, xr_names):
+    """安装的本体（run() 包一层快照 + 回滚）：域名 / 端口 / 配置 / 订阅 / state
+       一路写下去，任一步抛异常就由 run() 整体回滚，不留半成品节点。"""
     # 节点地址：有域名用域名，否则用公网 IP（域名需直连 A 记录指向本机）
     G["host"] = G["domain"] or public_ip()
     precheck_sni(sb_names, xr_names)     # reality 借用目标合格性预检（只警告不阻断）
@@ -6784,6 +6977,7 @@ def run(sb_names, xr_names):
     NGINX_STREAM.clear()
     _XR_ENTRY.clear(); _XR_ENTRY_FROM_DISK[0] = False    # 全新安装：reality 入口新生成密钥
     _USED_PORTS.clear()                  # 本次安装重新随机分配端口
+    release_held_ports()                 # 同进程里上一次安装残留的占位也松开
     dup_protos = set(sb_names) & set(xr_names)   # 两核心同名协议 → 各自尾部加 ¹/² 区分
 
     # --- SNI 分流（--sni-split）：nginx stream+ssl_preread 让 reality 真正上 443，
@@ -6815,6 +7009,7 @@ def run(sb_names, xr_names):
             # ws 类不再藏 443，改走自己端口的真证书。这样证书续期不会因为撤掉 nginx 而断。
             print(f"  {r443} → 443（抗封锁）；nginx 仅保留 :80 供证书续期，ws 类改走自己端口。")
         free_443_for_reality()                          # 让出 443（清掉旧 nginx 前置的 443 块）
+        hold_port(443)                                  # 腾出来了就占住，别让别的进程插进来；服务起来前松开
 
     if G.get("nginx"):
         if not G["domain"]:
@@ -6831,7 +7026,8 @@ def run(sb_names, xr_names):
         cfg = f"{SB_DIR}/config.json"
         sb_cfg = {"log": {"level": "info"}, "inbounds": ins, "outbounds": [{"type": "direct"}]}
         sb_fix_dns(sb_cfg)                              # 1.13+ 本机 DNS 不走 resolved（见 sb_fix_dns）
-        json.dump(sb_cfg, open(cfg, "w"), indent=2)
+        _write_core_cfg("sing-box", SB_BIN, cfg, sb_cfg)   # 先校验、过了才落盘，旧配置不先截断
+        _release_ports_for(ins)                         # 配置已落盘，松开占位、让服务自己绑
         write_service("sing-box", SB_BIN, cfg)
 
     if xr_names:
@@ -6840,10 +7036,11 @@ def run(sb_names, xr_names):
                          dup=dup_protos, mark="²"); all_links += lks
         ins = _xr_entry_fixup(ins)                      # grpc² / xhttp² 挂 reality 入口后面时补上回落
         cfg = f"{XRAY_DIR}/config.json"
-        json.dump({"log": {"loglevel": "warning"}, "inbounds": ins,
-                   "outbounds": [{"protocol": "freedom", "tag": "direct"},
-                                 {"protocol": "blackhole", "tag": "block"}]},
-                  open(cfg, "w"), indent=2)
+        _write_core_cfg("xray", XRAY_BIN, cfg,
+                        {"log": {"loglevel": "warning"}, "inbounds": ins,
+                         "outbounds": [{"protocol": "freedom", "tag": "direct"},
+                                       {"protocol": "blackhole", "tag": "block"}]})
+        _release_ports_for(ins)
         write_service("xray", XRAY_BIN, cfg)
 
     # 两个核心都建完再写 nginx：xray 的 ws / xhttp-tls / reality-vision 也挂在 443 后面（仓库主人 10/22），
@@ -6912,16 +7109,6 @@ def run(sb_names, xr_names):
                   open(STATE_FILE, "w"), ensure_ascii=False, indent=2)
     except OSError:
         pass
-    fw_sync()                                            # 开着防火墙就把节点 / 订阅端口放行（对齐 mack-a）
-    netprofile_sync()                                    # 节点端口交给网络优化保留（装着才叫它）
-
-    install_shortcut()
-    sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
-    setup_cfg_auto_cron()                                # 三大配置每天北京 03:20 按当前模板自动更新
-    setup_selfupd_cron()                                 # 脚本本体每天北京 02:50 自动更新（菜单 18 开关）
-    if sched:
-        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 19 手动立即更新。')
-    print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
 
 # ============================================================================ 管理面板 / 快捷命令
 def install_shortcut(content=None):
@@ -10328,7 +10515,7 @@ def _cdn_selfsigned(domain, crt, key):
     """源站自签证书即可：CF 走 Full 模式不校验源站证书，客户端看到的是 CF 的有效证书。"""
     os.makedirs(CDN_DIR, exist_ok=True)
     sh(f"openssl ecparam -genkey -name prime256v1 -out {key}")
-    sh(f'openssl req -new -x509 -days 3650 -key {key} -out {crt} -subj "/CN={domain}"')
+    sh(f"openssl req -new -x509 -days 3650 -key {key} -out {crt} -subj {shlex.quote('/CN=' + domain)}")
 
 def _cdn_pick_port(used):
     """从 CF 可代理端口里挑一个未占用的；用尽（>5 条）返回 0。"""
@@ -12234,13 +12421,13 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if not os.path.exists(acme):
         print("  正在安装 acme.sh…")
-        sh("curl -s https://get.acme.sh | sh -s email=" + (G.get("email") or "a@a.com"),
+        sh("curl -s https://get.acme.sh | sh -s email=" + shlex.quote(G.get("email") or "a@a.com"),
            check=False)
     if not os.path.exists(acme):
         print(f"{R}  ✗ acme.sh 装不上（检查能不能访问 get.acme.sh），已放弃，"
               f"现有证书没动。{N}")
         return False
-    sh(f"{acme} --register-account -m {G.get('email') or 'a@a.com'} --server letsencrypt",
+    sh(f"{acme} --register-account -m {shlex.quote(G.get('email') or 'a@a.com')} --server letsencrypt",
        check=False)
     sh(f"{acme} --set-default-ca --server letsencrypt", check=False)
 
@@ -12264,7 +12451,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
     else:
         dns01 = False
     if dns01:
-        ds = " ".join(f"-d '{n}'" for n in want)
+        ds = " ".join(f"-d {shlex.quote(n)}" for n in want)
         print(f"  要签的域名：{', '.join(want)}")
         issue = f"{acme} --issue --dns dns_cf --keylength ec-256 {ds} --server letsencrypt"
     else:
@@ -12280,7 +12467,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
             hooks = " --pre-hook 'systemctl stop nginx' --post-hook 'systemctl start nginx'"
             print("  80 端口被 nginx 占着 → 验证时自动停一下 nginx（约 10 秒）")
         fw_allow({(80, "tcp")})                      # HTTP-01 要从外面连 80：开着防火墙先放行
-        issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256{hooks}"
+        issue = f"{acme} --issue -d {shlex.quote(dom)} --standalone --keylength ec-256{hooks}"
     print("  正在签发…（走 acme.sh，可能要十几秒到一分钟）")
     r = subprocess.run(issue, shell=True, text=True, capture_output=True, env=env, timeout=600)
     out = ((r.stdout or "") + (r.stderr or "")).strip()
@@ -12297,7 +12484,7 @@ def cert_install_apply(dom, wildcard, cf_token, names=None, node_dom=None):
     # 先导到临时路径验一遍，验过了才动真的——这一步是「不可用就回退」的关键
     tmpc, tmpk = ACME_CRT + ".new", ACME_KEY + ".new"
     os.makedirs(os.path.dirname(ACME_CRT), exist_ok=True)
-    sh(f"{acme} --install-cert -d {dom} --ecc "
+    sh(f"{acme} --install-cert -d {shlex.quote(dom)} --ecc "
        f"--fullchain-file {tmpc} --key-file {tmpk}", check=False)
     ok, why = cert_validate(tmpc, tmpk, want)
     if not ok:
@@ -12341,7 +12528,7 @@ def _cert_swap_in(tmpc, tmpk, dom, wildcard, node_dom=None):
     try:
         # reloadcmd 记进 acme.sh：没有它，以后自动续期换了磁盘上的证书，
         # sing-box/xray/xy-sub 还捏着启动时读进内存的旧证书，90 天一到全挂。
-        sh(f"{os.path.expanduser('~/.acme.sh/acme.sh')} --install-cert -d {dom} --ecc "
+        sh(f"{os.path.expanduser('~/.acme.sh/acme.sh')} --install-cert -d {shlex.quote(dom)} --ecc "
            f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
         _ensure_cron_running()
         if not _acme_cron_ok():
@@ -12498,7 +12685,7 @@ def emby_share_apply(dom):
     # 覆盖成实体文件，悄无声息地退回两张。--remove 只是让它别再跟踪，不删任何文件。
     acme = os.path.expanduser("~/.acme.sh/acme.sh")
     if os.path.exists(acme):
-        sh(f"{acme} --remove -d '*.{dom}' --ecc", check=False)
+        sh(f"{acme} --remove -d {shlex.quote('*.' + dom)} --ecc", check=False)
         print(f"  已让 acme.sh 不再单独续 *.{dom}（证书文件还在，只是不跟踪了）")
     else:
         # 这一步跳过不影响「现在能不能用」，但少了它，acme.sh 的每日 cron 续期
@@ -12608,8 +12795,8 @@ def cert_clean_flow():
         print(f"{R}  ✗ 找不到 acme.sh，无法撤销。{N}")
         return
     for r in picked:
-        sh(f"{acme} --remove -d '{r['domain']}' --ecc", check=False)
-        sh(f"{acme} --remove -d '{r['domain']}'", check=False)
+        sh(f"{acme} --remove -d {shlex.quote(r['domain'])} --ecc", check=False)
+        sh(f"{acme} --remove -d {shlex.quote(r['domain'])}", check=False)
         msg = f"  ✓ {r['domain']}：已停止自动续期"
         if purge:
             try:
@@ -12854,8 +13041,8 @@ def _acme_forget(dom, keep=()):
     for d in (dom, f"*.{dom}"):
         if d in keep:
             continue
-        sh(f"{acme} --remove -d '{d}' --ecc", check=False)
-        sh(f"{acme} --remove -d '{d}'", check=False)
+        sh(f"{acme} --remove -d {shlex.quote(d)} --ecc", check=False)
+        sh(f"{acme} --remove -d {shlex.quote(d)}", check=False)
     return True
 
 def _cert_usable_for(names):
@@ -13404,8 +13591,8 @@ def cert_fix_run():
         print("    这是换域名时留下的记录，它每次自动续期都会把节点的证书覆盖掉。")
         print("    正在撤掉它们的续期跟踪（证书文件不删，只是不再自动续）…")
         for d, _c in hij:
-            sh(f"{acme} --remove -d {d} --ecc", check=False)
-            sh(f"{acme} --remove -d {d}", check=False)
+            sh(f"{acme} --remove -d {shlex.quote(d)} --ecc", check=False)
+            sh(f"{acme} --remove -d {shlex.quote(d)}", check=False)
         left = acme_hijackers(keep=dom)
         print(f"    {'✓ 已全部撤掉' if not left else R + '✗ 仍剩 ' + ', '.join(d for d, _ in left) + N}")
     # 用 --issue --force 而不是 --renew：--renew 会沿用记录里那套（可能已经失效的）
@@ -13413,12 +13600,12 @@ def cert_fix_run():
     if wild:
         print("  泛域名证书 → 走 Cloudflare DNS 验证重签（不用 80 端口），可能要一两分钟")
         names = [dom] + ([f"*.{dom}"] if _wildcard_wanted()[0] else []) + ([f"*.{root}"] if root else [])
-        issue = (f"{acme} --issue --dns dns_cf " + " ".join(f"-d '{n}'" for n in names) +
+        issue = (f"{acme} --issue --dns dns_cf " + " ".join(f"-d {shlex.quote(n)}" for n in names) +
                  f" --keylength ec-256 --server letsencrypt --force")
     else:
         fw_allow({(80, "tcp")})                      # standalone 验证要从外面连 80：开着防火墙先放行
         print("  正在续期…（走 acme.sh，可能要十几秒）")
-        issue = f"{acme} --issue -d {dom} --standalone --keylength ec-256 --force{hooks}"
+        issue = f"{acme} --issue -d {shlex.quote(dom)} --standalone --keylength ec-256 --force{hooks}"
     r = subprocess.run(issue, shell=True, text=True, capture_output=True)
     if r.returncode:
         # 续期失败要把原文打出来——十次有九次是「80 端口被占」或「域名没解析到本机」，
@@ -13427,7 +13614,7 @@ def cert_fix_run():
         print("    " + ((r.stdout or "") + (r.stderr or "")).strip().replace("\n", "\n    ")[-1200:])
         print("  常见原因：80 端口被占（standalone 验证要用）、域名没解析到本机、出网被墙。")
         return
-    sh(f"{acme} --install-cert -d {dom} --ecc "
+    sh(f"{acme} --install-cert -d {shlex.quote(dom)} --ecc "
        f"--fullchain-file {ACME_CRT} --key-file {ACME_KEY}{_ACME_RELOAD_HOOK}", check=False)
     for svc in ("nginx", "sing-box", "xray", "xy-sub"):
         sh(f"systemctl restart {svc}", check=False)
@@ -13863,7 +14050,15 @@ def _udp_ports_in_use(include_own=True):
         f = line.split()
         if len(f) < 5:
             continue
-        m = re.search(r":(\d+)$", f[4])
+        # 本地地址别按固定列号抠：ss 有的版本带 Netid 列（本地在 f[4]），有的不带
+        # （本地在 f[3]，这台容器就是后者）——按列号抠，不带的那种会把对端
+        # 「0.0.0.0:*」当成本地、端口抠不出来，冲突就全漏了。本地地址是行里
+        # 第一个「:数字端口」结尾的字段（对端是 :*，抠不上）。
+        m = None
+        for field in f:
+            m = re.search(r":(\d+)$", field)
+            if m:
+                break
         if not m:
             continue
         who = re.search(r'users:\(\("([^"]+)"', line)
@@ -13905,10 +14100,9 @@ def ask_hy2_range(cur="", include_own=True):
         raw = (_ask(f"  hy2 端口跳跃范围 起-止（{tip}，输 n 不用跳跃）: ").strip() or cur)
         if raw.lower() in ("off", "n", "no", "none"):
             return "n"
-        rng = raw if re.match(r"^\d+-\d+$", raw) else HY2_PORTS
-        lo, hi = (int(x) for x in rng.split("-"))
-        if lo >= hi or hi > 65535:
-            print(f"{RED}  ✗ {rng} 不是合法区间（要 起<止 且 ≤65535），重填。{OFF}")
+        rng = raw or HY2_PORTS
+        if _parse_hy2_range(rng) is None:
+            print(f"{RED}  ✗ {rng} 不是合法区间（要 起-止、起<止、止≤65535），重填。{OFF}")
             cur = ""
             continue
         conflicts = _hop_conflicts(rng, include_own)
@@ -14095,6 +14289,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
             add_ins.append(ib)
             add_lks.append(lk)
         if not add_ins:
+            _release_ports_for(ins)             # 重名跳过的，挑好的端口占位也松开
             continue
         cfg["inbounds"] = ibs + add_ins
         if core == "xray":
@@ -14110,9 +14305,11 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
             if backup:
                 shutil.copyfile(backup, path)
                 os.remove(backup)
+            _release_ports_for(cfg["inbounds"])
             print(f"\n  ✗ {name} 配置校验失败，已回滚，{name} 下面选的协议一个没加：\n{msg}")
             failed.append(name)
             break
+        _release_ports_for(cfg["inbounds"])     # 配置已落盘，松开占位、让服务自己绑
         try:
             sh(f"systemctl restart {name}")
         except Exception as e:
@@ -14133,6 +14330,7 @@ def _add_apply(st, pick_sb, pick_xr, have_sb, have_xr):
         else:
             have_xr = list(dict.fromkeys(have_xr + picks))
 
+    release_held_ports()                        # 各核心都已重启，占位全部松开
     if not new_links:
         print("  没有新增任何节点。")
         return
@@ -14725,6 +14923,41 @@ def install_flow():
                       lambda: run(sb_names, xr_names))
 
 # ============================================================================ CLI
+def _cli_validate(a, ap):
+    """CLI 参数校验：跟交互式问的同一套口径。过不了直接 ap.error（退出码 2），
+       绝不能带着没验过的值进 run()——那后面就是 takeover 卸载和拼进 shell 的命令。
+       --domain 还要再过 run() 里 check_domain_or_die 的解析比对（域名得指到本机）；
+       这里只拦格式（带 shell 元字符的当场就拦下来）。"""
+    if a.domain:
+        a.domain = a.domain.strip()
+        if not valid_domain(a.domain):
+            ap.error(f"--domain 格式不对（{a.domain}）：要填完整域名，如 example.com")
+    if a.email:
+        a.email = a.email.strip()
+        if not valid_email(a.email):
+            ap.error(f"--email 格式不对（{a.email}）")
+    if a.sni:
+        a.sni = a.sni.strip().lower().rstrip(".")
+        if not _SNI_RE.match(a.sni):
+            ap.error(f"--sni 格式不对（{a.sni}）：要填完整域名，如 www.example.com")
+    if a.sni_xr:
+        a.sni_xr = a.sni_xr.strip().lower().rstrip(".")
+        if not _SNI_RE.match(a.sni_xr):
+            ap.error(f"--sni-xr 格式不对（{a.sni_xr}）：要填完整域名，如 www.example.com")
+    if a.hy2_ports:
+        raw = a.hy2_ports.strip()
+        if raw.lower() in ("off", "n", "no", "none"):
+            a.hy2_ports = "n"
+        elif a.sb == "all" or "hy2" in a.sb.split(","):
+            # 只有选了 hy2 才验跳跃范围，跟交互一致；全新安装不算自己的旧节点（include_own=False）
+            if _parse_hy2_range(raw) is None:
+                ap.error(f"--hy2-ports 格式不对（{raw}）：要填 起-止，如 30000-31000，或 off 关闭跳跃")
+            conflicts = _hop_conflicts(raw, include_own=False)
+            if conflicts:
+                detail = "、".join(f"{p}（{who}）" for p, who in conflicts[:5])
+                ap.error(f"--hy2-ports {raw} 和这些 UDP 服务重叠（整段 UDP 会被 DNAT 劫给 hy2）："
+                         f"{detail}；换一段或填 off")
+
 if __name__ == "__main__":
     import sys
     harden_perms()                  # 每次进来先把 token/私钥收成 root-only（幂等）
@@ -14789,6 +15022,7 @@ if __name__ == "__main__":
     ap.add_argument("--yes", action="store_true",
                     help="检测到别人装的节点(mack-a 等)直接卸载接管，不再询问")
     a = ap.parse_args()
+    _cli_validate(a, ap)
 
     G["domain"], G["email"], G["sni"], G["prefix"], G["hy2_ports"], G["nginx"], G["force"] = \
         a.domain, a.email, (a.sni or secrets.choice(REALITY_SNI_POOL)), a.prefix, a.hy2_ports, ("1" if a.nginx else ""), a.yes

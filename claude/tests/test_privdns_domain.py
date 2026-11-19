@@ -187,13 +187,16 @@ acct(True)
 RUNS.clear()
 with quiet():
     x.cert_install_apply(DOM3, False, "", [DOM3, W3])
+def _has_d(cmd, name):
+    # shlex.quote：普通域名不带引号（-d example.com），泛域名才带（-d '*.example.com'）
+    return f"-d {name}" in cmd or f"-d '{name}'" in cmd
 check(f"有令牌：走 DNS 验证、两个名字都签（{RUNS[-1][:90] if RUNS else ''}）",
-      RUNS and "--dns dns_cf" in RUNS[-1] and f"-d '{W3}'" in RUNS[-1] and f"-d '{DOM3}'" in RUNS[-1])
+      RUNS and "--dns dns_cf" in RUNS[-1] and _has_d(RUNS[-1], W3) and _has_d(RUNS[-1], DOM3))
 RUNS.clear()
 with quiet():
     x.cert_install_apply(DOM3, True, "", ["*." + DOM3, DOM3, W3])     # 现有证书的顺序：*.dom 在前（10/29 真机）
 check(f"节点域名排第一个 -d（acme.sh 的主域名，install-cert -d 它才导得出新证书）（{RUNS[-1][:90] if RUNS else ''}）",
-      RUNS and re.search(r"--dns dns_cf --keylength ec-256 -d '([^']+)'", RUNS[-1]).group(1) == DOM3)
+      RUNS and re.search(r"--dns dns_cf --keylength ec-256 -d '?(?P<name>[^' ]+)'?", RUNS[-1]).group("name") == DOM3)
 _run0 = x.subprocess.run
 x.subprocess.run = lambda cmd, *a, **kw: (RUNS.append(cmd), types.SimpleNamespace(
     returncode=1, stdout="Adding TXT value: x for domain: _acme-challenge.q.zone.example\ninvalid domain", stderr=""))[1]
