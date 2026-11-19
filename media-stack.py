@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.430"
+SCRIPT_VERSION = "1.5.431"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -14111,6 +14111,115 @@ def _print_version_diff(before, after):
     for k in changed:
         print(f"    {k:<10} {DIM}{before[k]}{RST}  →  {GREEN}{after[k]}{RST}")
 
+def _snapshot_images(compose):
+    """更新前记下各镜像现在是哪一份（id）。镜像全是 :latest：拉完旧的那份就没了名字，
+    prune 一过就没了；记下 id 才能在换坏时指回去、换好时给旧的留个备份标签。
+    拿不到（docker 不在 / 镜像还没拉过）就返回 {}，调用方按没有备份走。"""
+    out = {}
+    for img in compose_images(compose):
+        try:
+            r = sh(f"docker image inspect --format '{{{{.Id}}}}' {img}", timeout=30)
+            _id = (r.stdout or "").strip()
+            if r.returncode == 0 and _id:
+                out[img] = _id
+        except Exception:
+            pass
+    return out
+
+
+def _backup_tag(image):
+    """镜像名换个备份标签：emby/embyserver:latest → emby/embyserver:ms-backup。"""
+    repo = image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+    return f"{repo}:ms-backup"
+
+
+def _backup_old_images(snapshot):
+    """给拉之前的旧镜像打 ms-backup 标签：prune 只删没名字的，留了标签就删不掉。
+    没变的镜像（拉完还是同一份）不用留。失败也不喊停更新 —— 这只是多留一条后路，
+    镜像本身已经换上去了。"""
+    for img, _id in (snapshot or {}).items():
+        try:
+            cur = sh(f"docker image inspect --format '{{{{.Id}}}}' {img}", timeout=30)
+            if cur.returncode == 0 and (cur.stdout or "").strip() == _id:
+                continue
+            sh(f"docker tag {_id} {_backup_tag(img)}", timeout=60)
+        except Exception:
+            pass
+
+
+def _rollback_images(snapshot):
+    """新镜像起不来：把旧镜像 id 指回原名。全部指回去才返回 True。"""
+    ok_all = bool(snapshot)
+    for img, _id in (snapshot or {}).items():
+        try:
+            if sh(f"docker tag {_id} {img}", timeout=60).returncode != 0:
+                ok_all = False
+        except Exception:
+            ok_all = False
+    return ok_all
+
+
+_UPDATE_BACKUP_RELS = ("docker-compose.yml", ".env", "CREDENTIALS.txt",
+                       "mediawarp/config/config.yaml", "autofilm/config/config.yaml",
+                       "homepage/config/settings.yaml", "homepage/config/services.yaml",
+                       "homepage/config/widgets.yaml")
+
+
+def _backup_update_configs(d):
+    """「8 更新」重渲染配置之前，把会被重写的那几份旧配置拷一份出来（安装目录下的
+    .update-backup，只留最近一次更新前的）。目录 0700：里面有带 Emby API Key 和
+    OpenList 密码的配置。拷不了就返回 ""，调用方按没有备份走。"""
+    bdir = os.path.join(d, ".update-backup")
+    try:
+        shutil.rmtree(bdir, ignore_errors=True)
+        os.makedirs(bdir, exist_ok=True)
+        os.chmod(bdir, 0o700)
+        for rel in _UPDATE_BACKUP_RELS:
+            src = os.path.join(d, rel)
+            if os.path.exists(src):
+                dst = os.path.join(bdir, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(src, dst)
+    except OSError:
+        return ""
+    return bdir
+
+
+def _restore_update_configs(d, bdir):
+    """把备份的旧配置拷回去（重渲染中途出事时用）。备份目录本身不动，下次更新会覆盖。"""
+    if not bdir or not os.path.isdir(bdir):
+        return
+    for dp, _dn, fs in os.walk(bdir):
+        for fn in fs:
+            src = os.path.join(dp, fn)
+            try:
+                shutil.copy2(src, os.path.join(d, os.path.relpath(src, bdir)))
+            except OSError:
+                pass
+
+
+def _snap_files(d, rels):
+    """记下几份旧文件的内容和权限（换域名回滚用，只活在这一次调用里）。不存在的文件不记。"""
+    out = {}
+    for rel in rels:
+        p = os.path.join(d, rel)
+        try:
+            with open(p, encoding="utf-8") as f:
+                out[rel] = (f.read(), 0o777 & os.stat(p).st_mode)
+        except OSError:
+            pass
+    return out
+
+
+def _restore_files(d, snap):
+    """把 _snap_files 记下的旧文件写回去。写不回去的跳过（调用方屏上会说）。"""
+    for rel, (text, mode) in (snap or {}).items():
+        try:
+            write_atomic(os.path.join(d, rel), text, mode)
+        except OSError:
+            pass
+
+
 def pull_images(compose, env_file):
     """拉镜像：先走正常渠道，失败了再逐个走镜像站兜底。全部成功返回 True。"""
     info("拉取最新镜像（可能要几分钟）...")
@@ -14315,7 +14424,7 @@ def do_update(from_menu=False, auto=False):
 
     from_menu 只影响自我更新之后 re-exec 的走法：菜单里进来的，跑完要回菜单。
     auto = 每月自动更新（cron 调，没人在终端前）：不换脚本（每天 04:10 那条管）、有人在播不问直接不做。
-    返回 True = 镜像拉到并换上了；False = 镜像没拉全 / 没换上（配置照样刷了）；None = 没做。
+    返回 True = 镜像拉到并换上了；False = 镜像没拉全 / 没换上（配置没动）；None = 没做。
     """
     d = ms_install_dir()
     if not is_installed(d):
@@ -14351,28 +14460,48 @@ def do_update(from_menu=False, auto=False):
             print("没有更新。")
             return
 
-    # 镜像拉不动就跳过，不再 return —— 跨境网络本来就时好时坏，
-    # 而下面重刷配置才是修 bug 的那一步，不该被一次拉取失败连坐掉。
     # 【拉之前先记一份版本】拉完再问就没有对照物了 —— 而"这次到底更了什么"
     # 正是出问题时最想知道的一件事。
     _ver_before = stack_versions(read_emby_api_key(d) or "")
     _ol_start0 = _started_at("openlist")[1]
     _imgs_ok = False
+    # 【拉之前先记下旧镜像】镜像全是 :latest，拉完旧的那份就没了名字、prune 一过就没了；
+    # 先记下 id，换上去再把旧的打个 ms-backup 的标签留一份，换坏了还能指回去。
+    _imgs_before = _snapshot_images(compose)
     if not pull_images(compose, env_file):
-        warn("镜像没拉全，跳过换镜像，继续刷新配置。")
-    else:
-        # 输出收起来，只在失败时打出来
-        r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
-                           shell=True, timeout=900, capture_output=True, text=True)
-        if r.returncode != 0:
-            for _ln in ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-15:]:
-                print(f"     {_ln}")
-            warn("用新镜像重启失败，看上面的报错；配置照常刷新。")
+        # 【拉不全就停住】以前是跳过换镜像、继续重刷配置 —— 新配置配旧镜像，
+        # 轻则多重启一次、重则新配置在旧镜像上起不来，而旧配置又没留备份。
+        # 配置的 bug 修复等下次拉得动时再来，不拿这次的半截状态去赌。
+        warn("镜像没拉全，这次不更新：配置没动、容器没重启，过一阵再试。")
+        return False
+    # 【重启前再查一次有没有人在播】拉镜像要十几分钟，开头查的那次早过期了；
+    # 期间有人开播了现在重启会断播 —— 自动更新这一轮不做，手动的问一声。
+    _k1 = read_emby_api_key(d)
+    if _k1 and someone_playing(_k1):
+        if auto:
+            return None
+        tip("拉镜像期间有人开始看片了：现在重启会断播")
+        if not ask_yn("还是现在就重启换上新镜像？", False):
+            print("镜像已拉好，容器和配置都没动；下次更新时再换上。")
+            return False
+    # 输出收起来，只在失败时打出来
+    r = subprocess.run(f"docker compose -f {compose} --env-file {env_file} up -d",
+                       shell=True, timeout=900, capture_output=True, text=True)
+    if r.returncode != 0:
+        for _ln in ((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-15:]:
+            print(f"     {_ln}")
+        # 【新镜像起不来：指回旧镜像再起一次】上面那次 up -d 可能只起了一半，
+        # 直接往下刷配置会留下"新配置 + 旧镜像 / 半截容器"的混合状态。
+        if _rollback_images(_imgs_before) and _compose_up(d):
+            warn("新镜像起不来，已指回旧镜像、容器照旧跑；配置没动，过一阵再试。")
         else:
-            ok("镜像已更新")
-            _imgs_ok = True
-            _print_version_diff(_ver_before, _versions_settle(d))
-            sh("docker image prune -f", timeout=300)
+            err("新镜像起不来，旧镜像也没指回去：先看上面的报错，修好再跑更新。")
+        return False
+    ok("镜像已更新")
+    _imgs_ok = True
+    _print_version_diff(_ver_before, _versions_settle(d))
+    _backup_old_images(_imgs_before)     # 先给旧镜像留个 ms-backup 标签，prune 才删不掉它
+    sh("docker image prune -f", timeout=300)
     sync_net_mtu(d)           # 容器网络 MTU 跟出口网卡（对得上就什么都不动）
 
     # 再把脚本生成的那几份配置按当前版本重刷一遍。
@@ -14382,32 +14511,42 @@ def do_update(from_menu=False, auto=False):
     # 代价却是配置层面的 bug 永远修不到已装的机器上。
     cfg = rebuild_cfg_from_disk(d)
     harden_secret_files(d)          # 老版本「8 更新」留下的 0644 配置（带 Key / 密码）收回 0600，只改权限、不重启
+    # 【重渲染之前先留一份旧配置】以前是直接往上盖，盖到一半出事（磁盘满、写到一半被打断）
+    # 就留下新旧混在一起的几份，还没处找旧的。备份在安装目录下的 .update-backup，只留最近一次更新前的。
+    _cfg_backup = _backup_update_configs(d)
     mw_cfg = os.path.join(d, "mediawarp", "config", "config.yaml")
     af_cfg = os.path.join(d, "autofilm", "config", "config.yaml")
-    for path, gen, svc in ((mw_cfg, gen_mediawarp_conf, "mediawarp"),
-                           (af_cfg, gen_autofilm_conf, "autofilm")):
-        if not os.path.exists(path):
-            continue
-        # 【先生成，再开文件】open(path,"w") 是【立刻清空】的：如果 gen() 在这之后
-        # 抛异常，磁盘上留下的是一份【空配置】—— 容器这次没重启所以还看不出来，
-        # 等下次重启才整个起不来，而那时候早忘了是哪一步弄的。实测栽过一次
-        # （cfg 少一个键 → KeyError），所以顺序必须是这个。
-        try:
-            text = gen(cfg)
-        except Exception as e:
-            err(f"生成 {svc} 配置失败：{e}")
-            warn(f"{path} 保持原样没动，更新继续往下走。")
-            continue
-        # 【没变就不重启】重启 MediaWarp 会清掉它手里所有直链缓存（预取好的、下一集先取好的全没了），
-        # 更新完第一次开播就得重新跨境去要地址 —— 以前每次「8 更新」都无条件重启这两个
-        try:
-            with open(path, encoding="utf-8") as f:
-                if f.read() == text:
-                    continue
-        except OSError:
-            pass
-        write_atomic(path, text, 0o600)      # 里面是 Emby API Key / OpenList 密码：别用默认的 0644（见 SECRET_FILES）
-        subprocess.run(["docker", "restart", svc], capture_output=True)
+    try:
+        for path, gen, svc in ((mw_cfg, gen_mediawarp_conf, "mediawarp"),
+                               (af_cfg, gen_autofilm_conf, "autofilm")):
+            if not os.path.exists(path):
+                continue
+            # 【先生成，再开文件】open(path,"w") 是【立刻清空】的：如果 gen() 在这之后
+            # 抛异常，磁盘上留下的是一份【空配置】—— 容器这次没重启所以还看不出来，
+            # 等下次重启才整个起不来，而那时候早忘了是哪一步弄的。实测栽过一次
+            # （cfg 少一个键 → KeyError），所以顺序必须是这个。
+            try:
+                text = gen(cfg)
+            except Exception as e:
+                err(f"生成 {svc} 配置失败：{e}")
+                warn(f"{path} 保持原样没动，更新继续往下走。")
+                continue
+            # 【没变就不重启】重启 MediaWarp 会清掉它手里所有直链缓存（预取好的、下一集先取好的全没了），
+            # 更新完第一次开播就得重新跨境去要地址 —— 以前每次「8 更新」都无条件重启这两个
+            try:
+                with open(path, encoding="utf-8") as f:
+                    if f.read() == text:
+                        continue
+            except OSError:
+                pass
+            write_atomic(path, text, 0o600)      # 里面是 Emby API Key / OpenList 密码：别用默认的 0644（见 SECRET_FILES）
+            subprocess.run(["docker", "restart", svc], capture_output=True)
+    except Exception as e:
+        # 写到一半出事（磁盘满之类）：上面已经盖过去的那份按新配置跑着、剩下的还是旧的 ——
+        # 先把文件放回更新前的样子，容器下次重启读回旧配置，不留新旧混在一起的状态。
+        _restore_update_configs(d, _cfg_backup)
+        err(f"重写配置中途出事，已放回更新前的配置：{_short_err(e)}")
+        return False
     # 【老版本 OpenList（alist v3）还有「网站 URL」这个设置，有就顺手填上】
     # v4 已经把它去掉了，那边靠的是上面重新生成的 mediawarp 配置里那个 addr。
     ensure_openlist_site_url(d, cfg, quiet=True)
@@ -14497,12 +14636,17 @@ def do_update(from_menu=False, auto=False):
         pass
 
     if cfg["homepage"]:
-        hp = os.path.join(d, "homepage", "config")
-        s, sv, w = gen_homepage_conf(cfg)
-        open(os.path.join(hp, "settings.yaml"), "w").write(s)
-        open(os.path.join(hp, "services.yaml"), "w").write(sv)
-        open(os.path.join(hp, "widgets.yaml"), "w").write(w)
-        subprocess.run(["docker", "restart", "homepage"], capture_output=True)
+        try:
+            hp = os.path.join(d, "homepage", "config")
+            s, sv, w = gen_homepage_conf(cfg)
+            open(os.path.join(hp, "settings.yaml"), "w").write(s)
+            open(os.path.join(hp, "services.yaml"), "w").write(sv)
+            open(os.path.join(hp, "widgets.yaml"), "w").write(w)
+            subprocess.run(["docker", "restart", "homepage"], capture_output=True)
+        except Exception as e:
+            _restore_update_configs(d, _cfg_backup)
+            err(f"重写首页配置中途出事，已放回更新前的配置：{_short_err(e)}")
+            return False
 
     if cfg["has_domain"] and os.path.exists(NGX_SITE):
         if not (os.path.exists(cfg["crt"]) and os.path.exists(cfg["key"])):
@@ -14907,9 +15051,13 @@ DOMAIN={cfg['domain']}
         f"cd {cfg['install_dir']} && docker compose --env-file {env_file} up -d",
         shell=True, timeout=1800)
     if r.returncode != 0:
+        # 【起不来就停住】以前只印一句错就继续往下走：建账号、写 CREDENTIALS.txt，
+        # 最后还报一句"部署完成" —— 容器根本没起来，那份凭据和"完成"全是假的。
+        # 配置文件已经写好了，修好原因（内存 / 磁盘 / 镜像拉不到）重跑安装就行。
         err("容器启动失败。看上面的报错；内存/磁盘不足是常见原因。")
-    else:
-        ok("容器已启动")
+        tip("容器没起来，这次安装没完成：凭据没写、账号没建，修好再重跑一次安装")
+        return
+    ok("容器已启动")
 
     # ---- OpenList 管理员账号 ----（见 ol_init_status 上面那段：新版要脚本替它建，老版本自己建了 admin）
     info("设置 OpenList 管理员账号...")
@@ -27522,7 +27670,7 @@ def emby_domain_menu():
 
 
 def emby_domain_apply(d, new, cf_token=""):
-    """真换（顺序见上面那段说明）。成功返回 True；签不下来 / nginx 校验不过都放回原样、返回 False。"""
+    """真换（顺序见上面那段说明）。成功返回 True；中间任何一步出事都整体放回原来的域名、返回 False。"""
     old = read_env(os.path.join(d, ".env"), "DOMAIN")
     crt, key = f"{NGX_CERT_DIR}/{new}.crt", f"{NGX_CERT_DIR}/{new}.key"
 
@@ -27546,6 +27694,39 @@ def emby_domain_apply(d, new, cf_token=""):
         return False
     env_file = os.path.join(d, ".env")
     env0 = open(env_file, encoding="utf-8").read()
+    # 【先把会被改的旧文件都记下来】nginx 成功之后，后面任何一步出事都要能整体放回；
+    # 以前只放回 nginx，首页 / AutoFilm / MediaWarp 的新配置就留下了"新域名 + 旧 nginx"的混合状态。
+    _old_files = _snap_files(d, ("homepage/config/settings.yaml", "homepage/config/services.yaml",
+                                 "homepage/config/widgets.yaml", "autofilm/config/config.yaml",
+                                 "mediawarp/config/config.yaml", "CREDENTIALS.txt"))
+    _reverted_restart = set()      # 配置已换成新的、回滚时要重启回旧配置的服务
+
+    def rollback():
+        # .env 先放回，再按放回后的 .env 重建配置、把 nginx 和 OpenList 的对外地址也换回去；
+        # 各服务的配置拷回旧的、重启过的那几个用旧配置重启回来；新签的那张撤掉。
+        write_atomic(env_file, env0, 0o600)
+        _restore_files(d, _old_files)
+        try:
+            _old_cfg = rebuild_cfg_from_disk(d)
+        except Exception:
+            _old_cfg = None
+        if _old_cfg is not None:
+            try:
+                apply_nginx_site(_old_cfg)
+            except Exception:
+                pass
+            try:
+                ensure_openlist_site_url(d, _old_cfg, quiet=True)
+            except Exception:
+                pass
+        for _svc in ("homepage", "autofilm", "mediawarp"):
+            if _svc in _reverted_restart:
+                try:
+                    sh(f"docker restart {_svc}", timeout=120)
+                except Exception:
+                    pass
+        drop_new()
+
     env1 = (re.sub(r"(?m)^DOMAIN=.*$", f"DOMAIN={new}", env0) if re.search(r"(?m)^DOMAIN=", env0)
             else env0.rstrip("\n") + f"\nDOMAIN={new}\n")
     write_atomic(env_file, env1, 0o600)
@@ -27556,29 +27737,40 @@ def emby_domain_apply(d, new, cf_token=""):
         err("nginx 校验没过，已放回原来的域名，什么都没变。")
         return False
     ok(f"nginx 站点换成 *.{new}")
-    if cfg["homepage"]:
-        hp = os.path.join(d, "homepage", "config")
-        s1, sv, w = gen_homepage_conf(cfg)
-        for n, t in (("settings.yaml", s1), ("services.yaml", sv), ("widgets.yaml", w)):
-            write_atomic(os.path.join(hp, n), t)
-        sh("docker restart homepage", timeout=120)
-    af = os.path.join(d, "autofilm", "config", "config.yaml")
-    write_atomic(af, gen_autofilm_conf(cfg), 0o600)
-    if autofilm_busy():
-        tip("AutoFilm 正在扫，没重启它；扫完下次重启（或「8 更新」）用上新地址")
-    else:
-        sh("docker restart autofilm", timeout=120)
-    write_atomic(os.path.join(d, "mediawarp", "config", "config.yaml"), gen_mediawarp_conf(cfg), 0o600)
-    sh("docker restart mediawarp", timeout=120)
-    ensure_openlist_site_url(d, cfg, quiet=True)
-    cred = os.path.join(d, "CREDENTIALS.txt")
-    if os.path.exists(cred):
-        write_atomic(cred, build_summary(cfg, colored=False) + "\n", 0o600)
+    try:
+        if cfg["homepage"]:
+            hp = os.path.join(d, "homepage", "config")
+            s1, sv, w = gen_homepage_conf(cfg)
+            for n, t in (("settings.yaml", s1), ("services.yaml", sv), ("widgets.yaml", w)):
+                write_atomic(os.path.join(hp, n), t)
+            _reverted_restart.add("homepage")
+            if sh("docker restart homepage", timeout=120).returncode != 0:
+                raise RuntimeError("homepage 重启失败")
+        af = os.path.join(d, "autofilm", "config", "config.yaml")
+        write_atomic(af, gen_autofilm_conf(cfg), 0o600)
+        if autofilm_busy():
+            # 没重启它：容器里跑的还是旧配置，回滚时不用重启回来
+            tip("AutoFilm 正在扫，没重启它；扫完下次重启（或「8 更新」）用上新地址")
+        else:
+            _reverted_restart.add("autofilm")
+            if sh("docker restart autofilm", timeout=120).returncode != 0:
+                raise RuntimeError("autofilm 重启失败")
+        write_atomic(os.path.join(d, "mediawarp", "config", "config.yaml"), gen_mediawarp_conf(cfg), 0o600)
+        _reverted_restart.add("mediawarp")
+        if sh("docker restart mediawarp", timeout=120).returncode != 0:
+            raise RuntimeError("mediawarp 重启失败")
+        ensure_openlist_site_url(d, cfg, quiet=True)
+        cred = os.path.join(d, "CREDENTIALS.txt")
+        if os.path.exists(cred):
+            write_atomic(cred, build_summary(cfg, colored=False) + "\n", 0o600)
+    except Exception as e:
+        rollback()
+        err(f"换域名中途出事（{_short_err(e)}），已放回原来的域名。")
+        return False
     if old and old != new:                         # 旧域名那张：撤掉续期，文件删掉（软链就只摘掉链接）
         acme = acme_bin()
         if acme:
             sh(f"{acme} --remove -d '*.{old}' --ecc", timeout=60)
-            shutil.rmtree(os.path.expanduser(f"~/.acme.sh/*.{old}_ecc"), ignore_errors=True)
         for p in (f"{NGX_CERT_DIR}/{old}.crt", f"{NGX_CERT_DIR}/{old}.key"):
             try: os.remove(p)
             except OSError: pass
