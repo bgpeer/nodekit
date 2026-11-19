@@ -35,7 +35,7 @@ check(f"release.yml 触发路径含 5 脚本 + 3 模板（{sorted(set(paths))}�
 raw_sha = open(sha_p, encoding="utf-8").read()
 check("sha256sums.yml 里不用 git rebase 回推（注释里提一句为什么不用不算）", "git rebase" not in raw_sha)
 check("sha256sums.yml 每轮站到最新 main 上重算（reset --hard + 重生成）",
-      "git reset --hard origin/main" in raw_sha and "sha256sum net-optimize.py > SHA256SUMS" in raw_sha)
+      "git reset --hard origin/main" in raw_sha and "sha256sum net-optimize.py cn-block.py > SHA256SUMS" in raw_sha)
 g_rel = (rel.get("concurrency") or {}).get("group")
 g_sha = (sha.get("concurrency") or {}).get("group")
 check(f"两个工作流共用同一个并发组（{g_rel}），串行跑不抢 push",
