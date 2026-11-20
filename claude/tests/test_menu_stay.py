@@ -43,6 +43,14 @@ line = "-" * 60 + "\n"
 check("结果和再列一遍的三项之间有一道分割线", out[out.index("已刷新"):].startswith("已刷新\n" + line + menu))
 check("链接和订阅那一大屏只印一次（不重刷）", out.count("LINKS") == 1 and out.count("SUBURLS") == 1)
 check("回车：回主菜单，返回 True（告诉主菜单别再停一下）", r is True)
+check("提示行：单节点链接不受私有 DNS 解析影响，三大配置订阅开私有解析后才走私有解析、公网无法解析",
+      "单节点链接不受私有 DNS 解析影响" in out and "公网无法解析" in out
+      and out.index("单节点链接不受私有 DNS 解析影响") < out.index(menu))
+x._sub_items = lambda: False
+r, out = run(x.show_links, "")
+check("没有订阅时提示行也在（单节点那句本来就跟订阅有没有无关）",
+      "单节点链接不受私有 DNS 解析影响" in out and "SUBURLS" not in out and r is True)
+x._sub_items = lambda: True
 r, out = run(x.show_links, "1", "2", "1", "0")
 check("能连着做：刷新 → 改前缀 → 再刷新，0 才回", DID == ["refresh", "rename", "refresh"] and r is True and out.count(menu) == 4)
 r, out = run(x.show_links, "9", "0")
