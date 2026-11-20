@@ -89,7 +89,7 @@ def print(*args, **kw):                   # noqa: A001 —— 故意盖住内置
 
 # 脚本自身版本号：合并进 main 后 CI 会自动把补丁位 +1 并发布 GitHub Release；
 # 想升大/中版本（如 2.0.0）就手动改这里再合并，CI 会直接用你写的这个号发布。
-SCRIPT_VERSION = "1.1.234"
+SCRIPT_VERSION = "1.1.233"
 
 # 版本：安装时优先问 GitHub（见 latest_gh_release / newest_gh_release）；下面是问不到时的兜底。
 # ⚠ sing-box 必须 ≥1.12（anytls inbound 是 1.12 才加的，1.11 会 FATAL: unknown inbound type: anytls）
@@ -7214,6 +7214,8 @@ def show_links():
         print_sub_urls()
     # 仓库主人 11/20：单节点链接不受私有 DNS 解析影响，仍走公网解析；只有三大配置订阅
     # 在开启私有 DNS 解析后才走私有解析，公网无法解析。
+    # 仓库主人 11/20：小火箭订阅和这行提示之间也要一道分割线（不然贴在一起分不清）。
+    ui_line()
     ui_tip("单节点链接不受私有 DNS 解析影响，仍走公网解析；只有三大配置订阅在开启私有 DNS 解析后才走私有解析，公网无法解析")
     ui_line()
     # 1 三格式各按上面标的模板重生成（见 cfg_refresh_all）；2 只改显示名、不用重装，改完自动刷新三格式订阅。
