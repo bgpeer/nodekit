@@ -46,6 +46,8 @@ check("回车：回主菜单，返回 True（告诉主菜单别再停一下）",
 check("提示行：单节点链接不受私有 DNS 解析影响，三大配置订阅开私有解析后才走私有解析、公网无法解析",
       "单节点链接不受私有 DNS 解析影响" in out and "公网无法解析" in out
       and out.index("单节点链接不受私有 DNS 解析影响") < out.index(menu))
+check("小火箭订阅和提示行之间有一道分割线",
+      (line + "  提示：单节点链接不受私有 DNS 解析影响") in out)
 x._sub_items = lambda: False
 r, out = run(x.show_links, "")
 check("没有订阅时提示行也在（单节点那句本来就跟订阅有没有无关）",
