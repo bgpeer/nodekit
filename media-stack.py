@@ -141,8 +141,9 @@ OLD_STRM_CRON     = "0 0 5 * * *"           # 旧默认值，更新时静默迁�
 OPENLIST_PORT  = 5244
 MEDIAWARP_PORT = 9000
 # Homepage 导航页的宿主机端口：原来是 3000，跟 AdGuard Home 安装向导抢 3000（11/19 实装：
-# 向导绑不上、服务一起一停，自动设置等不到向导）。改成 3001，容器里还是 3000 不动。
-HOMEPAGE_PORT  = 3001
+# 向导绑不上、服务一起一停，自动设置等不到向导）。改成 3001；11/20 仓库主人改成 2999。
+# 容器里还是 3000 不动。
+HOMEPAGE_PORT  = 2999
 STRM_SUBDIR    = "cloud"
 STRM_PATH      = "/data/strm/" + STRM_SUBDIR
 

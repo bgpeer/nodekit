@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Homepage 导航页宿主机端口 3000 → 3001（仓库主人 11/19：3000 跟 AdGuard Home 安装向导抢，
-  向导绑不上、服务一起一停）。只改导航页关联的端口：宿主机侧走 HOMEPAGE_PORT = 3001，
+"""Homepage 导航页宿主机端口 3000 → 3001 → 2999（仓库主人 11/19：3000 跟 AdGuard Home 安装向导抢，
+  向导绑不上、服务一起一停；11/20 再改成 2999）。只改导航页关联的端口：宿主机侧走 HOMEPAGE_PORT = 2999，
   容器里监听的还是 3000；Emby / OpenList / AdGuard 的端口一个都不动。
 """
 import importlib.util, os, re, sys
@@ -10,14 +10,14 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 bad = 0
 def check(l, ok):
     global bad; bad += not ok; print(("  ✔ " if ok else "  ✖ ") + l)
-check("HOMEPAGE_PORT = 3001", m.HOMEPAGE_PORT == 3001)
+check("HOMEPAGE_PORT = 2999", m.HOMEPAGE_PORT == 2999)
 home = [t for t in m.SUBDOMAINS if t[0] == "home"]
 check("SUBDOMAINS 里 home 那行走 HOMEPAGE_PORT（nginx 反代、显示的地址都跟这张表走）",
-      len(home) == 1 and home[0][1] == 3001 and home[0][2] == "homepage")
+      len(home) == 1 and home[0][1] == 2999 and home[0][2] == "homepage")
 cfg = {"has_domain": True, "install_dir": "/tmp/ms-test", "homepage": True,
        "metatube": False, "emby": True, "openlist": True}
 compose = m.gen_compose(cfg)
-check("新装的 compose：宿主机 3001 → 容器 3000", '"127.0.0.1:3001:3000"' in compose)
+check("新装的 compose：宿主机 2999 → 容器 3000", '"127.0.0.1:2999:3000"' in compose)
 check("新装的 compose：宿主机上不再有 3000:3000", '"127.0.0.1:3000:3000"' not in compose)
 src = open(os.path.join(ROOT, "media-stack.py"), encoding="utf-8").read()
 HP = "http" + "://" + "home" + "page:3000"   # 拼出来，claude/ 里不留网址字面量
