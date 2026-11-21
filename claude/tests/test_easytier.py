@@ -24,7 +24,7 @@ ACTIVE = {"active": True, "enabled": True}
 CURL_FAIL = {"mode": "ok"}            # ok：curl 成功建文件；fail：curl 报错；empty：curl 没报错但只留空文件
 # 真机上 easytier-cli -o json peer list 的形状（v2.6.4 实测）：本机那行 cost 是
 # "Local"，远端那行 cost 是 "p2p"、lat_ms 是数字；这里就照这个样子造。
-PEERS_JSON = {"text": '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]',
+PEERS_JSON = {"text": '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]',
               "fail": False}
 def fake_sh(cmd, check=False):
     CALLS.append(cmd)
@@ -193,6 +193,7 @@ et._fetch = _boom
 print("二之三、对端数")
 check("对端数：本机那行（Local）不算，远端那行算",
       et._peer_count() == 1)
+check("_peers()：原样返回数组", len(et._peers() or []) == 2)
 PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}]'
 check("对端数：只有本机那行就是 0 台", et._peer_count() == 0)
 check("对端 0 台：加入节点写「未连上」，首节点写「还没人连进来」",
@@ -203,7 +204,7 @@ check("对端数：CLI 回来的不是 JSON 就当没拿到，不报错", et._pe
 PEERS_JSON["fail"] = True
 check("对端数：CLI 挂了也当没拿到，不报错", et._peer_count() is None)
 PEERS_JSON["fail"] = False
-PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
 
 print("三、安装")
 et._latest_ver = lambda: "2.6.4"
@@ -270,6 +271,25 @@ check("重配：回车保持原样（密钥没变、网络名没变）",
       and cfg.get("network_name") == "test-mesh")
 r, out = run(et.configure, "1", "", "", "", "n")
 check("最后确认打 n：什么都没动", et._conf_load() == cfg and "已取消" in out)
+r, out = run(et.configure, "1", "", "", "", "")
+check("首节点：提示写着本机定（网络名密钥都是本机定一个，另一台照抄）",
+      "本机定" in out)
+try:
+    os.remove(et.ET_CONF)
+except OSError:
+    pass
+r, out = run(et.configure, "2", "test-mesh", "", "mysecret123", "5.6.7.8", "1.2.3.4", "")
+cfg = et._conf_load()
+check("加入节点：密钥空着不给过、不会随机一个（必须照首节点抄）",
+      cfg.get("network_secret") == "mysecret123")
+check("加入节点：提示写清跟首节点一样、必填、第 3 台起改 IP、外机首节点",
+      "跟首节点一样" in out and "必填" in out and "第 3 台用" in out
+      and "外机那台" in out)
+et._conf_save({"network_name": "test-mesh", "network_secret": "oldsecret123",
+               "ipv4": "5.6.7.8", "role": "join", "peer": "1.2.3.4"})
+r, out = run(et.configure, "2", "", "random", "mysecret123", "", "1.2.3.4", "")
+check("加入节点重配：打 random 也不给随机生成（必须粘首节点那个）",
+      et._conf_load().get("network_secret") == "mysecret123")
 
 print("五、状态 / 开机自启 / 卸载")
 ACTIVE["active"] = True
@@ -282,7 +302,10 @@ et._conf_save({"network_name": "test-mesh", "network_secret": "mysecret123",
                "ipv4": "5.6.7.8", "role": "join", "peer": "1.2.3.4"})
 r, out = run(et.status)
 check("状态：对端 0 台就红字写未连上", "对端 0 台" in out and "未连上" in out)
-PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "5.6.7.8/24", "lat_ms": "109.73"}]'
+r, out = run(et.status)
+check("状态：对端跟本机一个内网 IP 就红字报重复", "重复" in out)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
 ACTIVE["active"] = False
 r, out = run(et.status)
 check("服务没跑：写未运行，不印对端表", "未运行" in out and "PEER1" not in out)
@@ -323,7 +346,7 @@ check("菜单顶上：运行中就带对端数", "运行中" in out and "对端 
 PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}]'
 r, out = run(et.menu, "0")
 check("菜单顶上：对端 0 台就红字写未连上", "对端 0 台" in out and "未连上" in out)
-PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
 r, out = run(et.menu, "9", "0")
 check("菜单：打了没有的编号，接着问，0 才回", r is None)
 xy = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()

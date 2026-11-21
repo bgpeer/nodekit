@@ -146,9 +146,10 @@ def _ask(prompt=""):
     except (OSError, EOFError):
         return input(prompt).strip()
 
-def _ask_default(prompt, default):
-    """带默认值的一问：回车就用默认的。"""
-    v = _ask(f"{prompt}（回车用 {default}）: ")
+def _ask_default(prompt, default, note=""):
+    """带默认值的一问：回车就用默认的。note 是补充说明，放进同一对括号里。"""
+    tail = f"回车用 {default}" if not note else f"{note}，回车用 {default}"
+    v = _ask(f"{prompt}（{tail}）: ")
     return v or default
 
 def _fetch(url, timeout=20):
@@ -225,16 +226,22 @@ def _running():
 def _autostart_on():
     return sh("systemctl is-enabled easytier") == "enabled"
 
-def _peer_count():
-    """对端数：easytier-cli -o json peer list，扣掉 cost == "Local" 的本机那行。
-       JSON 形状是 v2.6.4 实测过的：[{cost, lat_ms, ipv4, hostname, ...}]，
-       远端那行 cost 是 "p2p" 之类、lat_ms 是数字；本机那行 cost 是 "Local"。
-       拿不到 / 没跑起来返回 None（菜单照常显示，不报错）。"""
+def _peers():
+    """对端表：easytier-cli -o json peer list 解析出来的数组；拿不到返回 None。
+       每行是 {cost, lat_ms, ipv4, hostname, ...}，本机那行 cost 是 "Local"，
+       远端那行 cost 是 "p2p" 之类；ipv4 带 /24 后缀（"10.144.0.1/24"）。"""
     try:
         peers = json.loads(sh(f"{ET_CLI} -o json peer list"))
-        return sum(1 for p in peers if isinstance(p, dict) and p.get("cost") != "Local")
+        return [p for p in peers if isinstance(p, dict)]
     except Exception:
         return None
+
+def _peer_count():
+    """对端数：_peers() 里扣掉 cost == "Local" 的本机那行。拿不到返回 None。"""
+    peers = _peers()
+    if peers is None:
+        return None
+    return sum(1 for p in peers if p.get("cost") != "Local")
 
 def _peer_text(cfg):
     """菜单 / 状态屏顶上那行对端数：有对端绿色，没对端红色（跟聚合菜单 3 一个做法）。
@@ -392,6 +399,12 @@ def status():
         pt = _peer_text(cfg)
         if pt:
             print("  " + pt)
+        peers = _peers()
+        if peers:
+            mine = (cfg.get("ipv4") or "").strip()
+            if mine and any(p.get("cost") != "Local"
+                            and p.get("ipv4", "").split("/")[0] == mine for p in peers):
+                print("  " + _hl("1;31", f"⚠ 内网 IP 跟另一台重复了（都是 {mine}）：去 2 配置组网改一个"))
     ui_tip("首节点要在云防火墙放行 TCP 11010，不然别人连不进来")
 
 def _autostart_toggle():
@@ -438,39 +451,54 @@ def configure():
         return
     role = "first" if c == "1" else "join"
     default_ip = old.get("ipv4") or (ET_DEFAULT_IP1 if role == "first" else ET_DEFAULT_IP2)
+    # 网络名、密钥是整个网共用的：首节点定一个，加入节点照首节点抄——
+    # 加入节点回车随机一个就进不去了，所以加入节点密钥必填，不能随机。
+    name_note = "本机定一个，另一台照这个抄" if role == "first" else "跟首节点一样，照首节点抄"
     while True:
-        name = _ask_default("网络名", old.get("network_name") or ET_DEFAULT_NET)
+        name = _ask_default("网络名", old.get("network_name") or ET_DEFAULT_NET, name_note)
         if _valid_name(name):
             break
         print("  网络名只能用字母、数字、-、_，开头得是字母或数字，再填一次。")
     if old.get("network_secret"):
+        keep_tip = "回车保持原样 / 打 random 重新随机生成" if role == "first" else "回车保持原样 / 粘首节点那个"
         while True:
-            sec = _ask("密钥（回车保持原样 / 打 random 重新随机生成）: ")
+            sec = _ask(f"密钥（{keep_tip}）: ")
             if not sec:
                 sec = old["network_secret"]
                 break
-            if sec == "random":
+            if role == "first" and sec == "random":
                 sec = _random_secret()
                 break
             if _valid_secret(sec):
                 break
-            print("  密钥至少 8 位、不能带空格，再填一次。")
+            print("  密钥照首节点抄，至少 8 位、不能带空格，再填一次。" if role == "join"
+                  else "  密钥至少 8 位、不能带空格，再填一次。")
+    elif role == "join":
+        while True:
+            sec = _ask("密钥（跟首节点一样，必填）: ")
+            if _valid_secret(sec):
+                break
+            print("  密钥照首节点抄，至少 8 位、不能带空格，再填一次。")
     else:
-        sec = _ask("密钥（回车随机生成）: ")
+        sec = _ask("密钥（本机定，回车随机生成）: ")
         while sec and not _valid_secret(sec):
             print("  密钥至少 8 位、不能带空格，再填一次。")
-            sec = _ask("密钥（回车随机生成）: ")
+            sec = _ask("密钥（本机定，回车随机生成）: ")
         if not sec:
             sec = _random_secret()
+    ip_note = ""
+    if role == "join":
+        base = default_ip.rsplit(".", 1)[0]
+        ip_note = f"第 3 台用 {base}.3，第 4 台用 {base}.4，别跟别的机器重复"
     while True:
-        ip = _ask_default("本机内网 IP", default_ip)
+        ip = _ask_default("本机内网 IP", default_ip, ip_note)
         if _valid_ipv4(ip):
             break
         print("  不是合法的 IPv4 地址，再填一次。")
     cfg = {"network_name": name, "network_secret": sec, "ipv4": ip, "role": role}
     if role == "join":
         while True:
-            peer = _ask("首节点公网 IP（端口固定 11010）: ")
+            peer = _ask("首节点公网 IP（外机那台，端口固定 11010）: ")
             if _valid_peer(peer):
                 break
             print("  填首节点那台的公网 IPv4 或域名，再填一次。")
