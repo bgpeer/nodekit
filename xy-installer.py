@@ -188,6 +188,8 @@ ADGUARD_LOCAL  = BGP_DIR + "/adguard-dns.py"     # 本地缓存的 adguard-dns.p
 ADGUARD_URL    = _RAW + "adguard-dns.py"         # 仓库里的 adguard-dns.py（自建 DNS·AdGuard Home）
 MEDIA_LOCAL    = BGP_DIR + "/media-stack.py"     # 本地缓存的 media-stack.py
 MEDIA_URL      = _RAW + "media-stack.py"         # 仓库里的 media-stack.py（自建 Emby·网盘直链）
+EASYTIER_LOCAL = BGP_DIR + "/easytier.py"        # 本地缓存的 easytier.py
+EASYTIER_URL   = _RAW + "easytier.py"            # 仓库里的 easytier.py（EasyTier 组网·多台 VPS 虚拟内网）
 SELFDNS_FLAG   = BGP_DIR + "/selfdns.on"         # 开关：把本机自建 DNS(AdGuard DoH) 写进订阅 DNS（存在=开）
 SELFDNS_CID_FILE = BGP_DIR + "/selfdns.clientid" # AdGuard ClientID（DoH 地址末段；填进「允许的客户端」即可只放行自己）
 PRIVDNS_FILE   = BGP_DIR + "/privdns.json"       # 节点私有解析（13 → 4）：本机选的模式 / 外机 DNS 地址 / 本机私有名
@@ -8672,6 +8674,12 @@ def adguard_menu():
         print("拉取 adguard-dns.py 失败，且本地无缓存。请检查网络。"); return
     _run_child(f"python3 {ADGUARD_LOCAL}")
 
+def easytier_menu():
+    """打开独立的 easytier.py 交互菜单（EasyTier 组网·多台 VPS 虚拟内网）。"""
+    if not ensure_remote_script(EASYTIER_URL, EASYTIER_LOCAL):
+        print("拉取 easytier.py 失败，且本地无缓存。请检查网络。"); return
+    _run_child(f"python3 {EASYTIER_LOCAL}")
+
 def media_stack_menu():
     """打开独立的 media-stack.py（自建 Emby·网盘直链媒体服务器）。
 
@@ -13875,6 +13883,7 @@ def main_menu():
         print("  18. 更新脚本（不影响节点）")
         print("  19. 更新核心（sing-box / xray）")
         print("  20. 卸载")
+        print("  21. EasyTier 组网（多台 VPS 虚拟内网）")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -13905,6 +13914,7 @@ def main_menu():
         elif c == "18":  script_update_menu()
         elif c == "19":  update_cores()
         elif c == "20":  uninstall_all()
+        elif c == "21":  easytier_menu()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
