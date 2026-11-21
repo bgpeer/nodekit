@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """脚本本体每天自动更新 —— 仓库主人 10/21：「万一有的人不上服务器也不更新脚本一直停在那里」；
-  第二天又要求：单独做进菜单 18（1 立即更新 / 2 自动更新 开关），单独一条排队任务，不跟三大配置自动更新混在一起
+  第二天又要求：单独做进菜单 19（1 立即更新 / 2 自动更新 开关），单独一条排队任务，不跟三大配置自动更新混在一起
   （关了配置自动更新，脚本照样更新）；时间往前挪、别撞别的凌晨任务 → 北京 02:50，排在 03:00 cn-block 之前。
   有新版且能编译 → 换上；拉不到 / 版本没变新 / 坏文件 → 什么都不动。
 """
@@ -42,7 +42,7 @@ open(m.SELFUPD_OFF, "w").write("1"); m.setup_selfupd_cron()
 check("关掉：定时任务撤掉", not m.selfupd_on() and not os.path.exists(m.SELFUPD_CRON))
 os.remove(m.SELFUPD_OFF)
 
-# 3. 菜单 18：1 立即更新 / 2 自动更新 当前：开（每天 02:50）/ 0 返回；2 来回切
+# 3. 菜单 19：1 立即更新 / 2 自动更新 当前：开（每天 02:50）/ 0 返回；2 来回切
 it = iter(["2", "2", "0"]); m._ask = lambda q="": next(it)
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
@@ -55,6 +55,6 @@ check("2 切关再切开，各一行 ✔", "✔ 自动更新已关" in o and "�
 src = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
 i = src.index("def cfg_auto_run():"); body = src[i:i + 1500]
 check("cfg-auto 里不再自己更新脚本（只补装定时任务）", "_auto_self_update()" not in body and "setup_selfupd_cron()" in body)
-check("主菜单 18 走新菜单", 'elif c == "18":  script_update_menu()' in src)
+check("主菜单 19 走新菜单", 'elif c == "19":  script_update_menu()' in src)
 check("卸载时一起清掉", "SELFUPD_CRON, SELFUPD_LOG]" in src)
 print("ALL PASS" if not bad else f"{bad} 项没过"); sys.exit(1 if bad else 0)

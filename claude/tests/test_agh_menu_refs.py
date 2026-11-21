@@ -59,8 +59,8 @@ txt, out = replace("AbC_123-xyz")
 check("换令牌：正常的照旧换、别的设置不动", "SAVED_CF_Token='AbC_123-xyz'" in txt and "LOG_LEVEL=1" in txt and "已更新" in out)
 
 doc = open(os.path.join(ROOT, "docs", "13-dns.md"), encoding="utf-8").read()
-check("文档：整体卸载指主菜单 20（不是早先的 17 / 19），换域名指菜单 10",
-      "主菜单 `20 卸载`" in doc and "主菜单 `20 → 5`" in doc and "主菜单 `17`" not in doc and "主菜单 `19 卸载`" not in doc
+check("文档：整体卸载指主菜单 21（不是早先的 17 / 20），换域名指菜单 10",
+      "主菜单 `21 卸载`" in doc and "主菜单 `21 → 5`" in doc and "主菜单 `17`" not in doc and "主菜单 `20 卸载`" not in doc
       and "换域名 = 卸了重装" not in doc)
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

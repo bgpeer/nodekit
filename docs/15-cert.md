@@ -25,7 +25,7 @@
 > 安装依赖清单，装完顺手 `systemctl enable --now`。
 >
 > ⚠ **重签/换证书会掐断你的 SSH**（如果你是挂着本机代理在管这台机的）：最后一步要
-> `systemctl restart sing-box / xray`，代理链路一断 SSH 跟着断。所以它跟菜单 19「更新核心」
+> `systemctl restart sing-box / xray`，代理链路一断 SSH 跟着断。所以它跟菜单 20「更新核心」
 > 一样**派到独立会话里跑**（脱离控制终端，SIGHUP 打不到它），断线也会在服务端跑完；
 > 重连后 `tail /var/log/bgpeer-certfix.log` 看结果即可。
 >

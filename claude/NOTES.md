@@ -201,7 +201,7 @@
   （新根域名有 `*.根` 泛解析就不起、屏上 ⚠）；私有解析关着 / `.internal` 的不管。换根域名这条只有模拟测试，没真机走过。
 - **Emby** `16 → 7 设置 → 10 域名证书`（media-stack `emby_domain_menu`）：见上面 media-stack 地图。IP:端口 装的不在这里改（要重建容器）。
 
-## 卸载（菜单 20，11/09 起）
+## 卸载（菜单 21，11/09 起）
 
 - 1 代理主体 / 2 网络优化 / 3 自建DNS / 4 自建Emby 各卸各的，都交给那个模块自己的卸载（`_run_module` 拉最新脚本跑它的
   `uninstall` / `remove` / `--reset`）；5 全部卸载要打 `yes`，模块各自的确认用 `--yes` 免掉（adguard-dns `remove --yes`、
@@ -253,7 +253,7 @@
 ## 写测试 / 改更新路径时记着（11/10 全仓检查）
 
 - **脚本换自己的四条路都是「先 compile、版本不比本机旧才换」**：02:50 `_auto_self_update`、`bgpeer` 命令（`BGPEER_WRAPPER`）、
-  模块脚本 `ensure_remote_script`、菜单 18 → 1 `update_script`（最后这条 11/10 才补上）。`fetch_url` 会退到 jsDelivr（缓存最长
+  模块脚本 `ensure_remote_script`、菜单 19 → 1 `update_script`（最后这条 11/10 才补上）。`fetch_url` 会退到 jsDelivr（缓存最长
   12 小时）和公共反代，拿到旧版 / 半截 / 报错页都有可能；再加更新入口照这个规矩。
 - **`claude/` 里的占位写法有测试把关**（`test_claude_folder.py`）：IP 只能是首段一位数的（`1.2.3.4`）或 127.0.0.1，
   网址的主机名要以 `.example` 结尾（`https://wl.example/…`），RFC 5737 那几个网段、`example.com` 都会被当成泄漏拦下。

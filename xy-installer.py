@@ -281,7 +281,7 @@ CFG_AUTO_LOG  = "/var/log/bgpeer-cfgupdate.log"
 CFG_AUTO_AT   = (3, 20)                          # 北京时间
 # 脚本本体每天自动更新：北京时间 02:50 调 `self-update`，排在凌晨所有活最前面（02:55 cn-block 规则更新、03:10 每月 nginx
 # 升级、03:20 三大配置、03:30 Emby 元数据、04:00 每月内核……），后面的活直接用新版。跟「配置自动更新」分开管：
-# 关了配置自动更新，脚本照样更新（仓库主人 10/21）。开关在菜单 18。
+# 关了配置自动更新，脚本照样更新（仓库主人 10/21）。开关在菜单 19。
 SELFUPD_CRON = "/etc/cron.d/bgpeer-selfupdate"
 SELFUPD_LOG  = "/var/log/bgpeer-selfupdate.log"
 SELFUPD_OFF  = BGP_DIR + "/selfupdate.off"       # 有这个文件 = 关
@@ -6963,9 +6963,9 @@ def run(sb_names, xr_names):
     install_shortcut()
     sched = setup_core_update_cron()                     # 内核每月自动更新（北京每月2号04:00）
     setup_cfg_auto_cron()                                # 三大配置每天北京 03:20 按当前模板自动更新
-    setup_selfupd_cron()                                 # 脚本本体每天北京 02:50 自动更新（菜单 18 开关）
+    setup_selfupd_cron()                                 # 脚本本体每天北京 02:50 自动更新（菜单 19 开关）
     if sched:
-        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 19 手动立即更新。')
+        print(f'内核已设为每月自动更新一次（{_core_update_schedule_str()}）；也可随时进菜单 20 手动立即更新。')
     print('\n下次直接输入 \033[1;32mbgpeer\033[0m 即可打开管理面板。')
 
 def _run_install(sb_names, xr_names):
@@ -7115,7 +7115,7 @@ def _run_install(sb_names, xr_names):
 # ============================================================================ 管理面板 / 快捷命令
 def install_shortcut(content=None):
     """安装 bgpeer 快捷命令：本地存一份脚本，wrapper 每次尽量拉最新再运行。
-       content 给了就存它（self-update / 菜单18 传刚下载的新版，强制写）。
+       content 给了就存它（self-update / 菜单19 传刚下载的新版，强制写）。
        不带 content = 装/重装时存「当前跑的这份」，但只升不降：若磁盘已有更新的一份就留磁盘那份。
        （真机踩过：有人用旧脚本跑重装，把 SELF_LOCAL 降级到连 self-update/SCRIPT_VERSION 都没有的老版本，
          每天 02:50 的自动更新 python3 SELF_LOCAL self-update 再也跑不起来、永远卡死，而 bgpeer 每次临时
@@ -7487,7 +7487,7 @@ def cfg_auto_run():
        下次拉就是新的，xy-sub 不用重启（重启那一下正好有客户端在拉就会失败一次）。
        生成或校验失败就回滚原文件，原来能用的那份不会被弄坏。手改过的格式跳过（见 cfg_auto_paused）。"""
     setup_cfg_auto_cron()
-    setup_selfupd_cron()                        # 老装机补上脚本每日自动更新（开关在菜单 18）                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
+    setup_selfupd_cron()                        # 老装机补上脚本每日自动更新（开关在菜单 19）                       # 本机改过时区 / 跨年了，顺手把 cron 对齐
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                # 内核每月那条也一起对齐（老装机是按 6 月写死的）
     _heal_other_crons()
@@ -7742,7 +7742,7 @@ def setup_selfupd_cron():
         return False
 
 def script_update_menu():
-    """菜单 18：立即更新 / 每天自动更新开关。"""
+    """菜单 19：立即更新 / 每天自动更新开关。"""
     while True:
         ui_title("更新脚本（不影响节点）")
         ui_kv("当前版本", f"v{SCRIPT_VERSION}")
@@ -8185,7 +8185,7 @@ NODE_OP_MARK   = "本次节点操作结束"  # 同上，装/加/删协议用
 
 def update_cores_auto(only=None):
     """非交互更新已安装的内核到最新并重启。起不来会记进日志。
-       两个入口共用：cron 每月自动更新，以及菜单19 转到后台时。
+       两个入口共用：cron 每月自动更新，以及菜单20 转到后台时。
        only: None 或 "both" → 两个都更；"sing-box" / "xray" → 只更那一个。"""
     ensure_deps()
     ts = time.strftime("%F %T")
@@ -8425,7 +8425,7 @@ def _run_module(url, local, args, need=""):
 
 def _uninstall_core(keep_panel=False):
     """卸载代理主体：sing-box/xray、订阅服务、节点证书、CDN 节点、cron；面板和别的模块按 keep_panel 留不留。
-       网络优化 / 自建 DNS（新装法）/ Emby 是独立模块，各有各的卸载（菜单 20 的 2 / 3 / 4），这里不碰；
+       网络优化 / 自建 DNS（新装法）/ Emby 是独立模块，各有各的卸载（菜单 21 的 2 / 3 / 4），这里不碰；
        只有老装法的自建 DNS 用的是节点证书、证书一删它就起不来——走它自己的卸载一次撤干净。
        keep_panel：别的模块还在，bgpeer 命令和 /etc/bgpeer 留着（不然以后连卸它们的入口都没了），只删节点自己的文件。"""
     if _agh_installed() and _agh_uses_node_cert():
@@ -8533,7 +8533,7 @@ def _uninstall_everything():
 
 
 def uninstall_all():
-    """菜单 20 卸载（仓库主人 11/09：「1 卸载代理主体 2 卸载网络优化 3 卸载自建DNS 4 卸载自建emby 5 全部卸载 0 返回；
+    """菜单 21 卸载（仓库主人 11/09：「1 卸载代理主体 2 卸载网络优化 3 卸载自建DNS 4 卸载自建emby 5 全部卸载 0 返回；
        这个全部卸载一定要输入三个字母 yes，里面还要做一行红字作提示」）。
        1~4 各卸各的，交给那个模块自己的卸载；5 一次全卸、内核换回系统内核，要打 yes。卸完一项回到这一屏看状态。"""
     while True:
@@ -10706,7 +10706,7 @@ def cdn_quantum():
         print("  已放弃。"); return
     if not on and vl and not _cdn_qe_xray_ok():
         if os.path.exists(XRAY_BIN):
-            print("  ⚠ xray 内核太旧（要 25.9.5+），先回主菜单 19 更新内核。"); return
+            print("  ⚠ xray 内核太旧（要 25.9.5+），先回主菜单 20 更新内核。"); return
         print("  正在下载 xray 内核（量子加密只有 xray 支持）...")
         try: install_xray()
         except Exception as e:
@@ -13784,7 +13784,7 @@ def cert_fix():
        【挂着本机代理在管这台机】的——核心一重启，代理链路当场断，SSH 跟着断，前台这个
        python 进程收到 SIGHUP 就死了。表现是「证书签下来了，但服务没重启完」「日志断在
        一半」，下次进来还得再来一遍。start_new_session=True 让它脱离控制终端，SIGHUP
-       打不到它，SSH 断了照样在服务端跑完。跟菜单 19「更新核心」是同一套处理。"""
+       打不到它，SSH 断了照样在服务端跑完。跟菜单 20「更新核心」是同一套处理。"""
     dom = ""
     try:
         dom = json.load(open(STATE_FILE)).get("domain", "")
@@ -13844,7 +13844,7 @@ def main_menu():
         print("  ✔ 订阅服务已更新（地址、token 不变）")
     if any(os.path.exists(m["file"]) for m in FMT.values()):
         setup_cfg_auto_cron()                    # 老装机补上三大配置每日自动更新（默认开）
-    setup_selfupd_cron()                         # 老装机补上脚本每日自动更新（默认开，菜单 18 关）
+    setup_selfupd_cron()                         # 老装机补上脚本每日自动更新（默认开，菜单 19 关）
     if os.path.exists(CORE_CRON_FILE):
         setup_core_update_cron()                 # 老装机那条是按 6 月写死的，换成冬夏两季都对的写法
     _heal_other_crons()                          # cn-block 02:55 / 网络优化 nginx 月度：换成冬夏两季都对的写法
@@ -13880,10 +13880,10 @@ def main_menu():
         print("  15. 域名证书管理（状态 / 安装 / 换域名 / 重签）")
         print("  16. 自建Emby（网盘直链媒体服务器·不影响节点）")
         print("  17. VPS线路检测（三网回程骨干 + IP纯净度）")
-        print("  18. 更新脚本（不影响节点）")
-        print("  19. 更新核心（sing-box / xray）")
-        print("  20. 卸载")
-        print("  21. EasyTier 组网（多台 VPS 虚拟内网）")
+        print("  18. EasyTier 组网（多台 VPS 虚拟内网）")
+        print("  19. 更新脚本（不影响节点）")
+        print("  20. 更新核心（sing-box / xray）")
+        print("  21. 卸载")
         print("  0. 退出")
         print("-" * 60)
         print("  ▸ 退出后输入 \033[1;32mbgpeer\033[0m 可再次唤醒面板管理")
@@ -13911,10 +13911,10 @@ def main_menu():
         elif c == "17":
             if vps_check_menu():                 # 自己那一屏里选完了才回来：不用再停一下
                 continue
-        elif c == "18":  script_update_menu()
-        elif c == "19":  update_cores()
-        elif c == "20":  uninstall_all()
-        elif c == "21":  easytier_menu()
+        elif c == "18":  easytier_menu()
+        elif c == "19":  script_update_menu()
+        elif c == "20":  update_cores()
+        elif c == "21":  uninstall_all()
         elif c in ("t", "T"): traffic_setup()   # 流量套餐设置（顶部流量行按机房周期显示）
         else:
             print("无效选择。"); continue
@@ -14979,10 +14979,10 @@ if __name__ == "__main__":
     if len(sys.argv) == 1:          # 不带参数 → 管理面板（bgpeer 也走这里）
         main_menu()
         sys.exit(0)
-    if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单19 转后台都调这个
+    if sys.argv[1] == "update-cores":   # 非交互：cron 每月自动更新、菜单20 转后台都调这个
         update_cores_auto(sys.argv[2] if len(sys.argv) > 2 else None)   # 可选 sing-box/xray/both
         sys.exit(0)
-    if sys.argv[1] == "self-update":     # cron 每天北京 02:50：脚本本体更新到最新（菜单 18 开关）
+    if sys.argv[1] == "self-update":     # cron 每天北京 02:50：脚本本体更新到最新（菜单 19 开关）
         _auto_self_update()
         sys.exit(0)
     if sys.argv[1] == "cfg-auto":        # cron 每天北京 03:20：三大配置按当前模板自动更新

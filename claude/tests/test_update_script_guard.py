@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""菜单 18 → 1「立即更新」：拉到的先验过再换、只升不降（11/10 全仓检查查出来的）。
+"""菜单 19 → 1「立即更新」：拉到的先验过再换、只升不降（11/10 全仓检查查出来的）。
   02:50 自更新（_auto_self_update）、bgpeer 命令（BGPEER_WRAPPER）、模块脚本（ensure_remote_script）都是
   「先编译一遍、版本不比本机旧才换」，只有这条手动的还是「内容不一样就换」：
     · raw 一限流，fetch_url 退到 jsDelivr（@main 缓存最长 12 小时）/ 公共反代，拿到旧版 → 点一次更新退一个版本，
@@ -56,7 +56,7 @@ b = io.StringIO()
 with contextlib.redirect_stdout(b):
     x.update_script()
 check("拉不到：照旧只报一行，不动", "更新脚本失败" in b.getvalue() and len(INSTALLED) == 1)
-doc = open(os.path.join(ROOT, "docs", "18-update-script.md"), encoding="utf-8").read()
+doc = open(os.path.join(ROOT, "docs", "19-update-script.md"), encoding="utf-8").read()
 check("文档写明：语法不对 / 比本机旧都不换", "比本机还旧" in doc and "都不换" in doc)
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)

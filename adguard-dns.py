@@ -3091,7 +3091,7 @@ def menu():
 
 def main():
     act = sys.argv[1] if len(sys.argv) > 1 else ""
-    if act in ("remove", "uninstall"):               # 主脚本菜单 20 调：remove = 订阅整个删了 / 节点不在，不用刷新订阅；
+    if act in ("remove", "uninstall"):               # 主脚本菜单 21 调：remove = 订阅整个删了 / 节点不在，不用刷新订阅；
         # uninstall = 节点还在，订阅里的 DoH、私有解析一起撤；--yes = 全部卸载那边已经输过 yes，不再问
         uninstall(refresh_sub=(act == "uninstall"), assume_yes="--yes" in sys.argv[2:])
     else:

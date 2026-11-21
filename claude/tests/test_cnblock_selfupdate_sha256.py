@@ -101,7 +101,7 @@ cb.urllib.request.urlopen = fake_open
 print("三、不换的开关")
 reset(); mode.update(script="ok", sums="ok")
 open(cb.SELFUPD_OFF, "w").close()
-check("菜单 18 关了脚本自动更新：不换、也不发请求", run() is False and calls == [])
+check("菜单 19 关了脚本自动更新：不换、也不发请求", run() is False and calls == [])
 os.remove(cb.SELFUPD_OFF)
 os.environ["CNBLK_FRESH"] = "1"
 check("已经是换上的新版在跑：不再换（不会循环）", run() is False and calls == [])
