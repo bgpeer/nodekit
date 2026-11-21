@@ -225,6 +225,29 @@ def _running():
 def _autostart_on():
     return sh("systemctl is-enabled easytier") == "enabled"
 
+def _peer_count():
+    """对端数：easytier-cli -o json peer list，扣掉 cost == "Local" 的本机那行。
+       JSON 形状是 v2.6.4 实测过的：[{cost, lat_ms, ipv4, hostname, ...}]，
+       远端那行 cost 是 "p2p" 之类、lat_ms 是数字；本机那行 cost 是 "Local"。
+       拿不到 / 没跑起来返回 None（菜单照常显示，不报错）。"""
+    try:
+        peers = json.loads(sh(f"{ET_CLI} -o json peer list"))
+        return sum(1 for p in peers if isinstance(p, dict) and p.get("cost") != "Local")
+    except Exception:
+        return None
+
+def _peer_text(cfg):
+    """菜单 / 状态屏顶上那行对端数：有对端绿色，没对端红色（跟聚合菜单 3 一个做法）。
+       拿不到数就返回 ""，不报错。"""
+    n = _peer_count()
+    if n is None:
+        return ""
+    if n:
+        return _hl("1;32", f"对端 {n} 台")
+    if cfg.get("role") == "first":
+        return _hl("1;31", "对端 0 台（还没人连进来）")
+    return _hl("1;31", "对端 0 台（未连上）")
+
 def install():
     """装 easytier-core + easytier-cli 到 /usr/local/bin。已是最新版就跳过。"""
     ver = _latest_ver()
@@ -343,7 +366,7 @@ def _apply_config(cfg):
     print("  ✔ EasyTier 已启动（开机自启已开）")
 
 def status():
-    """这一屏：状态 + 配好的值 + 对端表。密钥印出来是故意的：配另一台机器要照着抄。"""
+    """这一屏：状态 + 配好的值 + 对端表 + 对端数。密钥印出来是故意的：配另一台机器要照着抄。"""
     ui_title("EasyTier 组网 · 状态")
     if not _installed():
         print("  " + _hl("2", "未安装，先跑 1 安装"))
@@ -366,6 +389,9 @@ def status():
         out = sh(f"{ET_CLI} peer", check=False)
         ui_line()
         print(out if out else "  （对端表是空的：另一台还没连进来）")
+        pt = _peer_text(cfg)
+        if pt:
+            print("  " + pt)
     ui_tip("首节点要在云防火墙放行 TCP 11010，不然别人连不进来")
 
 def _autostart_toggle():
@@ -469,14 +495,18 @@ def configure():
 def menu():
     while True:
         ui_title("EasyTier 组网（多台 VPS 虚拟内网）")
+        cfg = _conf_load()
         if _installed():
             cur = sh(f"{ET_BIN} --version", check=False)
-            st = "已安装 " + (cur.split()[-1] if cur else "") + " · " + (
-                _hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
+            ver = cur.split()[-1] if cur else ""
+            if _running():
+                pt = _peer_text(cfg)
+                st = f"已安装 {ver} · " + _hl("1;32", "运行中") + (f" · {pt}" if pt else "")
+            else:
+                st = f"已安装 {ver} · " + _hl("1;31", "未运行")
         else:
             st = _hl("2", "未安装")
         ui_kv("当前状态", st)
-        cfg = _conf_load()
         ui_tip("首节点要在云防火墙放行 TCP 11010，不然别人连不进来")
         ui_line()
         ui_items([(1, "安装 EasyTier", None),

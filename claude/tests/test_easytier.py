@@ -22,6 +22,10 @@ et.ET_UNIT = f"{tmp}/easytier.service"
 CALLS = []
 ACTIVE = {"active": True, "enabled": True}
 CURL_FAIL = {"mode": "ok"}            # ok：curl 成功建文件；fail：curl 报错；empty：curl 没报错但只留空文件
+# 真机上 easytier-cli -o json peer list 的形状（v2.6.4 实测）：本机那行 cost 是
+# "Local"，远端那行 cost 是 "p2p"、lat_ms 是数字；这里就照这个样子造。
+PEERS_JSON = {"text": '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]',
+              "fail": False}
 def fake_sh(cmd, check=False):
     CALLS.append(cmd)
     if cmd.startswith("systemctl is-active easytier"):
@@ -30,6 +34,10 @@ def fake_sh(cmd, check=False):
         return "enabled" if ACTIVE["enabled"] else "disabled"
     if " --version" in cmd:
         return "easytier-core 2.6.4-8428a89d"
+    if " -o json peer list" in cmd:
+        if PEERS_JSON["fail"]:
+            raise RuntimeError("rpc fail")
+        return PEERS_JSON["text"]
     if "easytier-cli peer" in cmd:
         return "PEER1 5.6.7.8"
     if cmd.startswith("curl "):
@@ -182,6 +190,21 @@ check("两个都失败：报错，不静默返回", dl_ok and not os.path.exists
 CURL_FAIL["mode"] = "ok"
 et._fetch = _boom
 
+print("二之三、对端数")
+check("对端数：本机那行（Local）不算，远端那行算",
+      et._peer_count() == 1)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}]'
+check("对端数：只有本机那行就是 0 台", et._peer_count() == 0)
+check("对端 0 台：加入节点写「未连上」，首节点写「还没人连进来」",
+      "未连上" in et._peer_text({"role": "join"})
+      and "还没人连进来" in et._peer_text({"role": "first"}))
+PEERS_JSON["text"] = "not json"
+check("对端数：CLI 回来的不是 JSON 就当没拿到，不报错", et._peer_count() is None)
+PEERS_JSON["fail"] = True
+check("对端数：CLI 挂了也当没拿到，不报错", et._peer_count() is None)
+PEERS_JSON["fail"] = False
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
+
 print("三、安装")
 et._latest_ver = lambda: "2.6.4"
 for p in (et.ET_BIN, et.ET_CLI):
@@ -253,7 +276,13 @@ ACTIVE["active"] = True
 r, out = run(et.status)
 check("状态：印出网络名、本机 IP、密钥和对端表",
       "test-mesh" in out and "5.6.7.8" in out and "mysecret123" in out
-      and "PEER1" in out and "运行中" in out)
+      and "PEER1" in out and "运行中" in out and "对端 1 台" in out)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}]'
+et._conf_save({"network_name": "test-mesh", "network_secret": "mysecret123",
+               "ipv4": "5.6.7.8", "role": "join", "peer": "1.2.3.4"})
+r, out = run(et.status)
+check("状态：对端 0 台就红字写未连上", "对端 0 台" in out and "未连上" in out)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
 ACTIVE["active"] = False
 r, out = run(et.status)
 check("服务没跑：写未运行，不印对端表", "未运行" in out and "PEER1" not in out)
@@ -289,6 +318,12 @@ open(et.ET_BIN, "w").close()
 open(et.ET_CLI, "w").close()
 r, out = run(et.menu, "3", "0")
 check("菜单：3 看状态，0 返回，不报错", "状态" in out and r is None)
+r, out = run(et.menu, "0")
+check("菜单顶上：运行中就带对端数", "运行中" in out and "对端 1 台" in out)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}]'
+r, out = run(et.menu, "0")
+check("菜单顶上：对端 0 台就红字写未连上", "对端 0 台" in out and "未连上" in out)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "Evan", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
 r, out = run(et.menu, "9", "0")
 check("菜单：打了没有的编号，接着问，0 才回", r is None)
 xy = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
