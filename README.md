@@ -54,10 +54,10 @@ curl -fsSL https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py -o /t
 - [15. 域名证书管理（状态 / 安装 / 换域名 / 重签）](docs/15-cert.md)
 - [16. 自建Emby（网盘直链媒体服务器·不影响节点）](docs/16-emby.md)
 - [17. VPS线路检测（三网回程骨干 + IP纯净度）](docs/17-vps-check.md)
-- [18. 更新脚本（不影响节点）](docs/18-update-script.md)
-- [19. 更新核心（sing-box / xray）](docs/19-update-core.md)
-- [20. 卸载](docs/20-uninstall.md)
-- [21. EasyTier 组网](docs/21-easytier.md)
+- [18. EasyTier 组网](docs/18-easytier.md)
+- [19. 更新脚本（不影响节点）](docs/19-update-script.md)
+- [20. 更新核心（sing-box / xray）](docs/20-update-core.md)
+- [21. 卸载](docs/21-uninstall.md)
 - [附：Nginx 是共用件](docs/nginx.md)
 
 ---

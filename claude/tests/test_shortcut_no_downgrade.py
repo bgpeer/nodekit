@@ -5,7 +5,7 @@
   旧到连 self-update / SCRIPT_VERSION 都没有时，每天 02:50 的 `python3 SELF_LOCAL self-update`
   根本跑不起来，永远卡在旧版救不回来，而 bgpeer（每次临时下载最新再跑）一直显示新版把问题盖住。
   修法：不带内容时比较「正在跑的」和「磁盘已有的」版本，只留更新的那份，绝不降级；
-  带内容（self-update / 菜单18 传下载好的新版）照常强制写。
+  带内容（self-update / 菜单19 传下载好的新版）照常强制写。
 """
 import os, sys, tempfile, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,7 +45,7 @@ check("正在跑的更新：磁盘升到 1.1.135", disk_ver() == "1.1.135")
 setup(None, "1.1.135"); m.install_shortcut()
 check("磁盘没版本号：被正在跑的新版救回 1.1.135", disk_ver() == "1.1.135")
 
-# 5. 带内容（self-update / 菜单18）：强制写，不受降级守卫影响
+# 5. 带内容（self-update / 菜单19）：强制写，不受降级守卫影响
 setup("1.1.135", "1.1.135"); m.install_shortcut('SCRIPT_VERSION = "1.1.140"\nprint(1)\n')
 check("带内容：强制写成 1.1.140", disk_ver() == "1.1.140")
 

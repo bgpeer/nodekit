@@ -104,7 +104,7 @@ SELF_SHA256SUMS_URL = "https://raw.githubusercontent.com/bgpeer/nodekit/main/SHA
 # 手动改，只动最后一位（1.0.0 → 1.0.1 → … → 1.0.99 → 1.1.0），跟 net-optimize.py 的 VERSION 一个规矩；
 # 主脚本的 ensure_remote_script 也认这个 VERSION，进菜单拉新版时同样不降级。
 VERSION = "1.0.0"
-SELFUPD_OFF  = BGP_DIR + "/selfupdate.off"       # 菜单 18 关了脚本自动更新：这里也不换自己
+SELFUPD_OFF  = BGP_DIR + "/selfupdate.off"       # 菜单 19 关了脚本自动更新：这里也不换自己
 # 规则集优先走 jsDelivr 镜像（不受 GitHub raw 的 429 限流），回退 raw。
 RULES_CDN    = "https://cdn.jsdelivr.net/gh/bgpeer/rules@main/geo"
 RULES_RAW    = "https://raw.githubusercontent.com/bgpeer/rules/main/geo"
@@ -951,7 +951,7 @@ def _self_update_copy():
        注意：SHA256SUMS 目前只有 net-optimize.py 一条，发布端要在
        .github/workflows/sha256sums.yml 里把它改成 `sha256sum net-optimize.py cn-block.py > SHA256SUMS`
        （触发路径也加上 cn-block.py），补上条目之前这里每次都会跳过。
-       菜单 18 关了脚本自动更新（selfupdate.off）就不换。换上了返回 True，调用方重新执行新版。"""
+       菜单 19 关了脚本自动更新（selfupdate.off）就不换。换上了返回 True，调用方重新执行新版。"""
     if os.environ.get("CNBLK_FRESH") or os.path.exists(SELFUPD_OFF):
         return False
     if os.path.abspath(__file__) != os.path.abspath(SELF_PATH):

@@ -102,7 +102,7 @@ cb2.urllib.request.urlopen = lambda *a, **k: fetched.append(a) or (_ for _ in ()
 cb2.SELF_PATH = os.path.abspath(cb2.__file__)
 cb2.SELFUPD_OFF = f"{tmp}/selfupdate.off"
 open(cb2.SELFUPD_OFF, "w").close()
-check("菜单 18 关了脚本自动更新：不换、也不发请求", cb2._self_update_copy() is False and fetched == [])
+check("菜单 19 关了脚本自动更新：不换、也不发请求", cb2._self_update_copy() is False and fetched == [])
 os.remove(cb2.SELFUPD_OFF)
 os.environ["CNBLK_FRESH"] = "1"
 check("已经是换上的新版在跑：不再换（不会循环）", cb2._self_update_copy() is False and fetched == [])

@@ -2,7 +2,7 @@
 # easytier.py —— 一键组 EasyTier 虚拟内网（多台 VPS 在一个内网里互访）
 # 独立文件，nodekit 主脚本(xy-installer.py)通过子进程调用：
 #   python3 easytier.py            交互菜单（安装 / 配置组网 / 状态 / 开机自启 / 卸载）
-#   python3 easytier.py remove --yes     菜单 20 那边调：整套撤干净
+#   python3 easytier.py remove --yes     菜单 21 那边调：整套撤干净
 #
 # 定位：把几台 VPS 连成一个虚拟局域网（默认 10.144.0.0/24），互相用内网 IP 访问。
 #   - EasyTier 是去中心化 mesh VPN：没有中心服务器，节点之间自己打洞直连，打不通才走中继；
@@ -16,7 +16,7 @@
 #     （都是 0600，只有 root 能读），跟 AdGuard 的 agh.password 一个做法；进菜单 3 状态
 #     能再看到，配另一台机器时照着抄过去。服务只拿 -c 指配置文件，密钥不进服务文件、
 #     也不进进程命令行（ps 就能看到）。
-import os, re, sys, json, shlex, socket, shutil, secrets, subprocess, urllib.request, ipaddress
+import os, re, sys, json, shlex, socket, shutil, secrets, subprocess, urllib.request, ipaddress, random, time
 
 BGP_DIR = "/etc/bgpeer"
 ET_CONF = BGP_DIR + "/easytier.conf"      # 网络名 / 密钥 / 内网 IP / 角色 / 对端（0600）
@@ -31,7 +31,7 @@ ET_DEFAULT_IP1 = "10.144.0.1"             # 首节点默认内网 IP
 ET_DEFAULT_IP2 = "10.144.0.2"             # 加入节点默认内网 IP
 HTTP_UA = "curl/8.5.0"                    # 出网一律用中性 UA，不报家门
 
-# 跟 xy-installer.py / adguard-dns.py 同一套（菜单 21 是子进程跑本文件，主脚本那份管不到这里）
+# 跟 xy-installer.py / adguard-dns.py 同一套（菜单 18 是子进程跑本文件，主脚本那份管不到这里）
 # 【菜单编号统一高亮】（独占一行的「  3. xx」和并排的「1. a   2. b」都算）仓库主人：「像这种被选项数字 0-20 可以做成高亮的吗，包括里面的选项数字，所有的只要是被选项
 # 数字都变成高亮……跟下面的 bgpeer 一样的颜色」。不去改几十处菜单代码：屏幕上每一行「行首空格 + 1~2 位数字 + 点 +
 # 空格」的，数字那段换成 bgpeer 同色（粗体绿 1;32）。只在直接印到终端时上色 —— 进日志 / 管道 / 测试的照旧是纯文本。
@@ -243,6 +243,53 @@ def _peer_count():
         return None
     return sum(1 for p in peers if p.get("cost") != "Local")
 
+def _random_ip(exclude=()):
+    """加入节点默认内网 IP：10.144.0.2～10.144.0.254 里随机挑一个（不含 exclude）。
+       以前固定 .2，第 3 台回车也拿 .2 就撞了；池子是整个 /24（253 个地址），
+       随机挑撞上的概率很小，撞上了还有连上之后的重复检测兜底。"""
+    base = ET_DEFAULT_IP2.rsplit(".", 1)[0]
+    cands = [f"{base}.{n}" for n in range(2, 255) if f"{base}.{n}" not in exclude]
+    return random.choice(cands) if cands else ET_DEFAULT_IP2
+
+def _dup_ip(cfg, timeout=15):
+    """连上那一刻查对端表：有没有别的机器跟本机一个内网 IP。
+       等 timeout 秒（每 2 秒看一次），对端一出现就看，撞了返回 True；
+       超时还没对端出现返回 False（查不到，不拦着）。
+       timeout=0 只查一次：首节点不主动发现别人，刚配的首节点等了也没对端，
+       但重配时万一已有加入节点连着，查一次就能撞上。"""
+    mine = (cfg.get("ipv4") or "").strip()
+    if not mine:
+        return False
+    waited = False
+    for _ in range(max(1, timeout // 2)):
+        peers = _peers()
+        if peers:
+            remote = [p for p in peers if p.get("cost") != "Local"]
+            if remote:
+                return any(p.get("ipv4", "").split("/")[0] == mine for p in remote)
+        if timeout <= 0:
+            return False
+        if not waited:
+            print("  正在等对端出现，确认内网 IP 没跟别的机器撞上（最多 15 秒）…")
+            waited = True
+        time.sleep(2)
+    print("  （等了 15 秒还没看到对端：先这样，去 3 状态看一眼）")
+    return False
+
+def _rollback(old):
+    """配重了（内网 IP 跟别的机器撞了）回滚：有旧配置就恢复旧配置重启；
+       没旧配置（第一次配）就把服务停掉、关开机自启、新配置删掉，回到没配的状态
+       （只停不停自启的话，下次开机服务起来找不到 TOML 会一直重启）。"""
+    if old:
+        _apply_config(old)
+    else:
+        sh("systemctl disable --now easytier", check=False)
+        for p in (ET_CONF, ET_TOML):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
 def _peer_text(cfg):
     """菜单 / 状态屏顶上那行对端数：有对端绿色，没对端红色（跟聚合菜单 3 一个做法）。
        拿不到数就返回 ""，不报错。"""
@@ -419,8 +466,8 @@ def _autostart_toggle():
         print("  ✔ 开机自启已开")
 
 def uninstall(assume_yes=False):
-    """整套撤干净：服务 + 二进制 + 配置和密钥。菜单 20 的 5 全部卸载暂不调它（那边的
-       1/5～5/5 排好了，动编号要连测试一起改），先在菜单 21 里自己卸；以后要接再接。"""
+    """整套撤干净：服务 + 二进制 + 配置和密钥。菜单 21 的 5 全部卸载暂不调它（那边的
+       1/5～5/5 排好了，动编号要连测试一起改），先在菜单 18 里自己卸；以后要接再接。"""
     if not _installed() and not os.path.exists(ET_CONF) and not os.path.exists(ET_UNIT) \
             and not os.path.exists(ET_TOML):
         print("  EasyTier 没装，不用卸。")
@@ -436,7 +483,7 @@ def uninstall(assume_yes=False):
 
 # ── 配置组网 ──────────────────────────────────────────────────────────────────
 def configure():
-    """问一圈配好：角色 → 网络名 → 密钥 → 内网 IP →（加入节点）首节点地址 → 确认 → 起服务。
+    """问一圈配好：角色 → 网络名 → 密钥 →（加入节点）首节点地址 → 内网 IP → 确认 → 起服务 → 查 IP 重复。
        上次配过的当默认值，回车就沿用；密钥回车是「保持原样」（没配过才是随机生成）。"""
     if not _installed():
         print("  先跑 1 安装 EasyTier。")
@@ -450,7 +497,6 @@ def configure():
     if c not in ("1", "2"):
         return
     role = "first" if c == "1" else "join"
-    default_ip = old.get("ipv4") or (ET_DEFAULT_IP1 if role == "first" else ET_DEFAULT_IP2)
     # 网络名、密钥是整个网共用的：首节点定一个，加入节点照首节点抄——
     # 加入节点回车随机一个就进不去了，所以加入节点密钥必填，不能随机。
     name_note = "本机定一个，另一台照这个抄" if role == "first" else "跟首节点一样，照首节点抄"
@@ -486,34 +532,51 @@ def configure():
             sec = _ask("密钥（本机定，回车随机生成）: ")
         if not sec:
             sec = _random_secret()
-    ip_note = ""
-    if role == "join":
-        base = default_ip.rsplit(".", 1)[0]
-        ip_note = f"第 3 台用 {base}.3，第 4 台用 {base}.4，别跟别的机器重复"
-    while True:
-        ip = _ask_default("本机内网 IP", default_ip, ip_note)
-        if _valid_ipv4(ip):
-            break
-        print("  不是合法的 IPv4 地址，再填一次。")
-    cfg = {"network_name": name, "network_secret": sec, "ipv4": ip, "role": role}
     if role == "join":
         while True:
             peer = _ask("首节点公网 IP（外机那台，端口固定 11010）: ")
             if _valid_peer(peer):
                 break
             print("  填首节点那台的公网 IPv4 或域名，再填一次。")
-        cfg["peer"] = peer
-    ui_line()
-    ui_kv("网络名", name)
-    ui_kv("角色", "首节点（监听）" if role == "first" else "加入节点")
-    ui_kv("本机内网 IP", ip)
-    if role == "join":
-        ui_kv("首节点", f"{peer}:{ET_PORT}")
-    ui_kv("密钥", sec)
-    if _ask("确认这样配？[Y/n]: ").strip().lower() in ("n", "no"):
-        print("  已取消，什么都没动。")
-        return
-    _apply_config(cfg)
+    # 内网 IP：加入节点默认不再固定 .2——池子是整个 10.144.0.2～.254，回车就从
+    # 池子里随机挑一个（也可手动改）；连上那一刻查对端表，撞了就回滚重填。
+    failed_ips = set()
+    while True:
+        if old.get("ipv4") and not failed_ips:
+            default_ip = old["ipv4"]
+        elif role == "first" and not failed_ips:
+            default_ip = ET_DEFAULT_IP1
+        else:
+            default_ip = _random_ip(exclude=failed_ips)
+        ip_note = ""
+        if role == "join":
+            base = default_ip.rsplit(".", 1)[0]
+            ip_note = f"第 3 台用 {base}.3，第 4 台用 {base}.4，别跟别的机器重复"
+        while True:
+            ip = _ask_default("本机内网 IP", default_ip, ip_note)
+            if _valid_ipv4(ip):
+                break
+            print("  不是合法的 IPv4 地址，再填一次。")
+        cfg = {"network_name": name, "network_secret": sec, "ipv4": ip, "role": role}
+        if role == "join":
+            cfg["peer"] = peer
+        ui_line()
+        ui_kv("网络名", name)
+        ui_kv("角色", "首节点（监听）" if role == "first" else "加入节点")
+        ui_kv("本机内网 IP", ip)
+        if role == "join":
+            ui_kv("首节点", f"{peer}:{ET_PORT}")
+        ui_kv("密钥", sec)
+        if _ask("确认这样配？[Y/n]: ").strip().lower() in ("n", "no"):
+            print("  已取消，什么都没动。")
+            return
+        _apply_config(cfg)
+        if _dup_ip(cfg, 15 if role == "join" else 0):
+            print("  " + _hl("1;31", f"⚠ 内网 IP 跟另一台重复了（都是 {ip}）：正在回滚，重新填本机内网 IP。"))
+            failed_ips.add(ip)
+            _rollback(old)
+            continue
+        break
     if role == "first":
         ui_tip("去云防火墙放行 TCP 11010，不然别人连不进来")
         ui_tip("另一台机器跑 2 选「加入节点」，网络名和密钥照上面抄")
@@ -555,7 +618,7 @@ def menu():
 
 def main():
     act = sys.argv[1] if len(sys.argv) > 1 else ""
-    if act in ("remove", "uninstall"):               # 菜单 20 那边以后要接就调这个；
+    if act in ("remove", "uninstall"):               # 菜单 21 那边以后要接就调这个；
         # --yes = 已经输过 yes，不再问
         uninstall(assume_yes="--yes" in sys.argv[2:])
     else:

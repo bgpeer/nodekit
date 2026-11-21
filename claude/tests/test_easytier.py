@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""菜单 21 EasyTier 组网：装 / 配 / 状态 / 开机自启 / 卸载，全程不碰真服务、不联网。
+"""菜单 18 EasyTier 组网：装 / 配 / 状态 / 开机自启 / 卸载，全程不碰真服务、不联网。
   用到的 IP 全是首段一位数的占位（1.2.3.4 / 5.6.7.8），网址只有 github.com，
   免得 test_claude_folder.py 当成安装人信息拦下来。
 """
@@ -194,8 +194,17 @@ print("二之三、对端数")
 check("对端数：本机那行（Local）不算，远端那行算",
       et._peer_count() == 1)
 check("_peers()：原样返回数组", len(et._peers() or []) == 2)
+check("_random_ip()：在池子里，排除的不要",
+      (lambda _b: re.match(r"^" + re.escape(_b) + r"\.(\d+)$", et._random_ip()) is not None
+       and 2 <= int(et._random_ip().rsplit(".", 1)[-1]) <= 254
+       and et._random_ip(exclude={f"{_b}.{n}" for n in range(2, 255)}) == et.ET_DEFAULT_IP2)
+      (et.ET_DEFAULT_IP2.rsplit(".", 1)[0]))
 PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}]'
 check("对端数：只有本机那行就是 0 台", et._peer_count() == 0)
+CALLS.clear()
+check("首节点：没对端就不等（只查一次就回）",
+      et._dup_ip({"ipv4": "5.6.7.8"}, timeout=0) is False
+      and len([c for c in CALLS if " -o json peer list" in c]) == 1)
 check("对端 0 台：加入节点写「未连上」，首节点写「还没人连进来」",
       "未连上" in et._peer_text({"role": "join"})
       and "还没人连进来" in et._peer_text({"role": "first"}))
@@ -254,7 +263,7 @@ check("首节点：TOML 写好了（监听 + 网络名密钥）、是 0600；服
       and any(c == "systemctl enable easytier" for c in CALLS)
       and any(c == "systemctl restart easytier" for c in CALLS))
 r, out = run(et.configure, "2", "bad name!", "test-mesh", "short", "mysecret123",
-             "5.6.7.8", "bad-peer", "1.2.3.4", "")
+             "bad-peer", "1.2.3.4", "5.6.7.8", "")
 cfg = et._conf_load()
 check("加入节点：写错的重填（网络名、密钥、对端都各错一次才过）",
       cfg.get("role") == "join" and cfg.get("network_name") == "test-mesh"
@@ -278,16 +287,42 @@ try:
     os.remove(et.ET_CONF)
 except OSError:
     pass
-r, out = run(et.configure, "2", "test-mesh", "", "mysecret123", "5.6.7.8", "1.2.3.4", "")
+r, out = run(et.configure, "2", "test-mesh", "", "mysecret123", "1.2.3.4", "5.6.7.8", "")
 cfg = et._conf_load()
 check("加入节点：密钥空着不给过、不会随机一个（必须照首节点抄）",
       cfg.get("network_secret") == "mysecret123")
 check("加入节点：提示写清跟首节点一样、必填、第 3 台起改 IP、外机首节点",
       "跟首节点一样" in out and "必填" in out and "第 3 台用" in out
       and "外机那台" in out)
+try:
+    os.remove(et.ET_CONF)
+except OSError:
+    pass
+r, out = run(et.configure, "2", "test-mesh", "mysecret123", "1.2.3.4", "", "")
+cfg = et._conf_load()
+_last = int(cfg.get("ipv4", "0.0.0.0").rsplit(".", 1)[-1])
+check("加入节点：内网 IP 回车就从池子里随机挑（不再固定 .2）",
+      cfg.get("ipv4", "").startswith("10.144.0.") and 2 <= _last <= 254)
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "5.6.7.8/24", "lat_ms": "109.73"}]'
+try:
+    os.remove(et.ET_CONF)
+except OSError:
+    pass
+r, out = run(et.configure, "2", "test-mesh", "mysecret123", "1.2.3.4", "5.6.7.8", "", "5.6.7.9", "")
+cfg = et._conf_load()
+check("连上撞 IP：红字报重复、回滚、重填一个就过了",
+      cfg.get("ipv4") == "5.6.7.9" and "重复" in out and "回滚" in out
+      and any("systemctl disable --now easytier" in c for c in CALLS))
 et._conf_save({"network_name": "test-mesh", "network_secret": "oldsecret123",
                "ipv4": "5.6.7.8", "role": "join", "peer": "1.2.3.4"})
-r, out = run(et.configure, "2", "", "random", "mysecret123", "", "1.2.3.4", "")
+r, out = run(et.configure, "2", "", "", "1.2.3.4", "5.6.7.8", "", "5.6.7.9", "n")
+check("撞 IP 回滚：旧配置还在（第二次确认打 n 就停在旧配置上）",
+      et._conf_load().get("ipv4") == "5.6.7.8"
+      and et._conf_load().get("network_secret") == "oldsecret123")
+PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24", "lat_ms": "-"}, {"cost": "p2p", "hostname": "peer1", "ipv4": "1.2.3.4/24", "lat_ms": "109.73"}]'
+et._conf_save({"network_name": "test-mesh", "network_secret": "oldsecret123",
+               "ipv4": "5.6.7.8", "role": "join", "peer": "1.2.3.4"})
+r, out = run(et.configure, "2", "", "random", "mysecret123", "1.2.3.4", "", "")
 check("加入节点重配：打 random 也不给随机生成（必须粘首节点那个）",
       et._conf_load().get("network_secret") == "mysecret123")
 
@@ -350,13 +385,19 @@ PEERS_JSON["text"] = '[{"cost": "Local", "hostname": "self", "ipv4": "5.6.7.8/24
 r, out = run(et.menu, "9", "0")
 check("菜单：打了没有的编号，接着问，0 才回", r is None)
 xy = open(os.path.join(ROOT, "xy-installer.py"), encoding="utf-8").read()
-check("主菜单接上了 21 号入口",
-      "21. EasyTier 组网" in xy and 'c == "21"' in xy
+check("主菜单接上了 18 号入口",
+      "18. EasyTier 组网" in xy and 'c == "18"' in xy
       and "EASYTIER_URL" in xy and "def easytier_menu" in xy)
+check("主菜单 18/19/20/21：印的字和分发对得上，写反了就红",
+      'elif c == "18":  easytier_menu()' in xy
+      and 'elif c == "19":  script_update_menu()' in xy
+      and 'elif c == "20":  update_cores()' in xy
+      and 'elif c == "21":  uninstall_all()' in xy
+      and "19. 更新脚本" in xy and "20. 更新核心" in xy and "21. 卸载" in xy)
 readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
-doc = os.path.join(ROOT, "docs", "21-easytier.md")
+doc = os.path.join(ROOT, "docs", "18-easytier.md")
 check("README 和文档都挂上了",
-      "docs/21-easytier.md" in readme and os.path.exists(doc)
+      "docs/18-easytier.md" in readme and os.path.exists(doc)
       and "11010" in open(doc, encoding="utf-8").read())
 
 print("\nALL PASS" if not bad else f"\nFAIL {bad}"); sys.exit(1 if bad else 0)
