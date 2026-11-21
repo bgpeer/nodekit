@@ -11,7 +11,7 @@ on:
   push:
     branches: [main]
     paths:
-      # 脚本 + 模板有改动合并进 main 就算发布（docs/18-update-script.md）：
+      # 脚本 + 模板有改动合并进 main 就算发布（docs/19-update-script.md）：
       # 五个脚本 + 三个订阅模板。模板是运行期从 raw 直接拉的，改了也要发版、
       # 不然 VPS 上的自更新看不到新版本。library-rules.yaml 是规则文件不是模板、
       # whitelist-template.py 只是给人抄走的样板，都不触发。
