@@ -57,6 +57,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/bgpeer/nodekit@main/xy-installer.py -o /t
 - [18. 更新脚本（不影响节点）](docs/18-update-script.md)
 - [19. 更新核心（sing-box / xray）](docs/19-update-core.md)
 - [20. 卸载](docs/20-uninstall.md)
+- [21. EasyTier 组网](docs/21-easytier.md)
 - [附：Nginx 是共用件](docs/nginx.md)
 
 ---
