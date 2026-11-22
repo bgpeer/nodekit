@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """自建 DNS 屏上指路的菜单编号跟现在的菜单对得上（11/10 全仓检查查出来的）。
-  11/01 加了「11 DoH 走 HTTP/3」，卸载挪到 12；10/31 重排后改端口是 7。屏上还有三处指着老编号：
+  11/01 加了「11 DoH 走 HTTP/3」，卸载挪到 12；11/22 加了「12 更新 AdGuard」，卸载挪到 13；10/31 重排后改端口是 7。屏上还有三处指着老编号：
     · 菜单 5 里「想把整套自建 DNS 卸掉：回上级菜单选 11」→ 照着点进去的是 HTTP/3 开关；
     · 「卸了重装（11 → 1）」同上；
     · 网页向导那一屏第 4 步「回菜单选 5 改」端口 → 5 是 DoT 带 ClientID。
@@ -24,8 +24,8 @@ with contextlib.redirect_stdout(b):
     a.menu()
 menu = b.getvalue()
 num = {name: int(n) for n, name in re.findall(r"(?m)^\s+(\d+)\. (\S+)", menu)}
-check("现在的菜单：改后台端口 7、DoH 走 HTTP/3 是 11、卸载是 12",
-      num.get("改后台端口") == 7 and num.get("DoH") == 11 and num.get("卸载自建DNS") == 12)
+check("现在的菜单：改后台端口 7、DoH 走 HTTP/3 是 11、更新 AdGuard 是 12、卸载是 13",
+      num.get("改后台端口") == 7 and num.get("DoH") == 11 and num.get("更新") == 12 and num.get("卸载自建DNS") == 13)
 
 a._public_ip = lambda: "1.2.3.4"
 a._usage = lambda *x, **k: None
@@ -34,9 +34,9 @@ with contextlib.redirect_stdout(b):
     a._first_setup()
 out = re.sub(r"\033\[[0-9;]*m", "", b.getvalue())
 check("网页向导那一屏：两处都指「菜单 7」改端口，没有「选 5 改」", out.count("回菜单选 7 改") == 2 and "选 5 改" not in out)
-check("菜单 5 里指卸载：回上级菜单选 12", "回上级菜单选 12" in src and "回上级菜单选 11" not in src)
-check("证书出岔子那行：卸了重装是 12 → 1", "卸了重装（12 → 1）" in src and "11 → 1" not in src)
-check("install() 里「已经装过了」那行照旧指 12 卸载、10 换域名", "先『12 卸载』再装" in src and "『10 更换域名证书』" in src)
+check("菜单 5 里指卸载：回上级菜单选 13", "回上级菜单选 13" in src and "回上级菜单选 12" not in src)
+check("证书出岔子那行：卸了重装是 13 → 1", "卸了重装（13 → 1）" in src and "12 → 1" not in src)
+check("install() 里「已经装过了」那行照旧指 13 卸载、10 换域名", "先『13 卸载』再装" in src and "『10 更换域名证书』" in src)
 check("粘的 CF 令牌进命令行一律 shlex.quote，不手写单引号",
       not re.search(r"(?<!SAVED_)CF_Token='\{", src) and src.count("CF_Token={shlex.quote(") >= 4)
 
