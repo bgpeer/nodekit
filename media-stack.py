@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.432"
+SCRIPT_VERSION = "1.5.433"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -13382,7 +13382,7 @@ def do_sync():
     if not is_installed(d):
         return
     rec = {"ts": int(time.time()), "ok": False, "pruned": 0, "bluray": 0,
-           "bluray_stuck": 0, "skipped": 0, "nodur_before": 0,
+           "bluray_stuck": 0, "skipped": 0, "filled": 0, "nodur_before": 0,
            "nodur_after": 0, "missing": 0, "error": ""}
     try:
         key = read_yaml_scalar(os.path.join(d, "mediawarp", "config", "config.yaml"),
@@ -13392,6 +13392,10 @@ def do_sync():
             rec["error"] = "一直有人在播，这一轮推迟到明天"
             raise RuntimeError(rec["error"])
         normalize_strm_files(d)
+        # 【补 AutoFilm 漏掉的格式】.mov 这类它只数不生成，不补就永远进不了库。
+        # 放清失效、压原盘之前：新补的 strm 走同一套清理（不扫的目录、原盘），
+        # 之后核对 strm 也能把它算进去。凌晨这条和手动「4」共用这一个补扫。
+        rec["filled"] = fill_missing_strm(d)["created"]
         # 【规则拦不住 AutoFilm】它每一轮都会把排除掉的目录重新生成出来，所以这里也要清
         # 一遍 —— 不然用户在菜单里清干净了，第二天早上那批条目又回到库里。
         rec["skipped"] = apply_skip_dirs(d, quiet=True)
@@ -18208,6 +18212,82 @@ def _prune_order(by_dir, dir_local, d, budget):
     return hot + rest[cur:] + rest[:cur], len(hot)
 
 
+# AutoFilm 写死的视频后缀（它源码 src/extensions.rs 的 VIDEO_EXTS）：.mp4/.mkv/
+# .flv/.avi/.wmv/.ts/.rmvb/.webm/.mpg/.m2ts。Emby 能播、它不认的这些落在下面这张
+# 表里，补扫时才生成 strm。别跟 DISC_VIDEO_EXT（原盘挑正片那张，上面那处）混了：
+# 那张只管 BDMV/STREAM 里挑正片，这张是「AutoFilm 漏掉的 Emby 可播容器」。
+FILL_VIDEO_EXTS = (
+    ".mov", ".m4v", ".mts", ".m2t", ".3gp", ".3g2", ".f4v", ".asf",
+    ".vob", ".ogv", ".ogm", ".wtv", ".dvr-ms", ".divx", ".mpeg", ".mpe",
+    ".mpv", ".xvid",
+)
+
+
+def fill_missing_strm(d, only=None):
+    """AutoFilm 漏掉的视频格式，补生成 strm。返回 {"created", "skipped",
+    "failed", "unlisted"}。
+
+    AutoFilm 的 VIDEO_EXTS 写死了十种，.mov 这类它直接跳过 —— 扫描统计里「发现文件」
+    照样数它，就是不生成 strm，Emby 里那一集永远缺着。补扫在这里：按扫描路径把网盘
+    目录列一遍，扩展名在 FILL_VIDEO_EXTS 里、本地还没有对应 strm 的，按 AutoFilm 的
+    AlistPath 形态写一个（内容就是网盘路径，落在同样的镜像目标目录）。
+
+    只加不减：列不出来的目录整个跳过（当成没看见，不当成没有）；已经有 strm 的不重写
+    （跟 AutoFilm 的 overwrite: false 一个意思）；写失败的只计数，不拦后面的。
+    """
+    paths = effective_scan_paths(d)
+    if only:
+        _ms = set(only_mounts(only))
+        paths = [p for p in paths if "/" + strm_mount_dir(p) in _ms]
+    if not paths:
+        return {"created": 0, "skipped": 0, "failed": 0, "unlisted": 0}
+    tok = _ol_token(d)
+    if not tok:
+        warn("OpenList 登不上，跳过补扫 AutoFilm 漏掉的格式（不影响已生成的片子）。")
+        return {"created": 0, "skipped": 0, "failed": 0, "unlisted": 0}
+    have = {tgt for _hp, tgt in strm_inventory(d, only)}
+    created, skipped, failed, unlisted = 0, 0, 0, 0
+    stack = list(paths)
+    while stack:
+        cur = stack.pop()
+        items = _ol_ls(cur, tok)
+        if items is None:
+            unlisted += 1
+            continue
+        for x in items:
+            name = x.get("name") or ""
+            if not name:
+                continue
+            child = cur.rstrip("/") + "/" + name
+            if x.get("is_dir"):
+                stack.append(child)
+                continue
+            if os.path.splitext(name)[1].lower() not in FILL_VIDEO_EXTS:
+                continue
+            if child in have:
+                skipped += 1
+                continue
+            want = planned_strm_path(d, child, paths)
+            if not want:
+                failed += 1
+                continue
+            if os.path.exists(want):
+                skipped += 1
+                continue
+            try:
+                os.makedirs(os.path.dirname(want), exist_ok=True)
+                write_atomic(want, child)
+            except OSError:
+                failed += 1
+                continue
+            have.add(child)
+            created += 1
+    if unlisted:
+        warn(f"有 {unlisted} 个目录网盘超时没列出来，补扫没覆盖到 —— 下次扫描会再补。")
+    return {"created": created, "skipped": skipped, "failed": failed,
+            "unlisted": unlisted}
+
+
 def prune_dead_strm(d, budget=None, only=None):
     """删掉网盘上【确认已经不存在】的 strm。返回删了几个。
 
@@ -21013,6 +21093,10 @@ def do_strm(only=None):
         except OSError:
             pass
 
+    # 【补 AutoFilm 漏掉的格式】它的 VIDEO_EXTS 写死了十种，.mov 这类只数不生成 ——
+    # 不在这里补，Emby 里那一集永远缺着。放在计数之前：下面的「新增/跳过/失败」和
+    # 「本地 strm」都要把补扫的算进去，不然数字对不上。
+    fill = fill_missing_strm(d, only)
     after = strm_count(d, only)
     print()
     if done:
@@ -21022,6 +21106,13 @@ def do_strm(only=None):
         for _k, _v in re.findall(r"([a-z_]+_count)=(\d+)", done):
             nums[_k] = nums.get(_k, 0) + int(_v)
         if nums:
+            # 【补扫的算进去】AutoFilm 的数只含它自己那十种格式
+            nums["strm_created_count"] = (nums.get("strm_created_count", 0)
+                                          + fill["created"])
+            nums["strm_skipped_count"] = (nums.get("strm_skipped_count", 0)
+                                          + fill["skipped"])
+            nums["failed_path_count"] = (nums.get("failed_path_count", 0)
+                                         + fill["failed"])
             _tag = ("生成完成" if not (give_up or early)
                     else f"已完成 {len(done_lines)}/{want_tasks} 个网盘")
             ok(f"{_tag}：新增 {nums.get('strm_created_count', '?')}，"
@@ -21032,6 +21123,9 @@ def do_strm(only=None):
             print(f"  {DIM}扫描目录 {nums.get('scanned_dir_count', '?')} 个，"
                   f"发现文件 {nums.get('discovered_file_count', '?')} 个，"
                   f"用时 {_mmss(int(time.monotonic() - t_start))}{RST}")
+            if fill["created"]:
+                print(f"  {DIM}其中 {fill['created']} 个是 AutoFilm 不支持的格式"
+                      f"（.mov 等），已补生成{RST}")
             # 【把这几分钟花在哪儿说清楚】用户看到"7 个片跑了 7 分钟"会以为脚本慢，
             # 而实测那次的构成是：2 分钟在等 AutoFilm 的定时触发（固定开销），
             # 5 分钟里 3 个目录一直在等夸克接口、等到超时被跳过。
@@ -21045,6 +21139,13 @@ def do_strm(only=None):
             # 解析不出来就把原始那行摆出来，别拿一排问号糊弄人
             ok("生成完成，AutoFilm 的统计行：")
             print(f"  {DIM}{done.strip()[-400:]}{RST}")
+            if fill["created"] or fill["failed"]:
+                print(f"  {DIM}补扫 AutoFilm 漏掉的格式：新增 {fill['created']}，"
+                      f"失败 {fill['failed']}{RST}")
+    elif fill["created"] or fill["failed"]:
+        # AutoFilm 这轮没报「任务完成」：补扫照常跑了，数字不能悄悄吞掉
+        ok(f"补扫 AutoFilm 漏掉的格式：新增 {fill['created']}，"
+           f"已有跳过 {fill['skipped']}，失败 {fill['failed']}")
     print(f"  本地 strm：{before} → {BOLD}{after}{RST}")
 
     if after == 0:
