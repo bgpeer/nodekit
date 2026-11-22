@@ -2343,13 +2343,13 @@ def bj_cron_lines(hh, mm, cmd, day=None):
 # ── 凌晨任务排队（bgpeer-jobq）────────────────────────────────────────────────
 # 仓库主人：「如果有影响就在后面排队，如果要等服务器重启了排队的就自动跟上进行继续做」。
 # 凌晨这几条（cn-block 刷新会重启 sing-box、nginx 升级会重启 nginx、内核更新会重启 sing-box/xray、
-# 三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
-# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize /
-# media-stack 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对四份一致）。
+# AdGuard 更新会重启 AdGuard、三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
+# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize / media-stack /
+# adguard-dns 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对五份一致）。
 JOBQ_BIN  = "/usr/local/sbin/bgpeer-jobq"
 JOBQ_UNIT = "/etc/systemd/system/bgpeer-jobq.service"
 JOBQ_SH = r"""#!/bin/bash
-# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，四个脚本各带一份同样的，勿手改）
+# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，五个脚本各带一份同样的，勿手改）
 #   bgpeer-jobq run <任务名> '<命令>'   登记 → 排队 → 前面的跑完再跑（同名任务已在排/在跑就不重复登记）
 #   bgpeer-jobq resume                  开机时调：上次重启打断的、还没轮到的，按原先顺序接着跑
 #   bgpeer-jobq list                    看队列

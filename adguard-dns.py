@@ -13,7 +13,7 @@
 #   - 加密走 DoT(853，自建 DNS 自己的域名和证书，10/29 起跟节点分开；老装法复用节点的 acme 证书)：安卓「专用 DNS」填域名即可全系统生效；
 #     DoH 需要 443（被 reality/nginx 占了）故不用。明文 53 给装不了 DoT 的设备（电视/IoT）。
 #   - 不动 sing-box/xray/节点：独立服务，卸载彻底、互不影响。
-#   - 卸载(菜单10)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
+#   - 卸载(菜单13)是整套撤干净：服务+数据、订阅里写入的自建 DoH、为 DoT 签的泛域名证书、
 #     腾 53 时改的本机解析、ClientID 记录，一次回到没装过的样子。菜单 5 里的「删除 DoT」
 #     只撤泛域名证书这一项，AdGuard 本体继续跑。
 import os, re, sys, time, json, shlex, socket, shutil, secrets, struct, base64, ssl, subprocess, urllib.request
@@ -29,6 +29,10 @@ AGH_CERT_DIR = "/etc/ssl/agh"
 AGH_CRT, AGH_KEY = AGH_CERT_DIR + "/agh.crt", AGH_CERT_DIR + "/agh.key"
 AGH_DIR = "/opt/AdGuardHome"
 AGH_BIN = AGH_DIR + "/AdGuardHome"
+AGH_AUTOUPD_OFF  = BGP_DIR + "/agh-autoupdate.off"   # 有这个文件 = 每天自动更新关；默认开
+AGH_AUTOUPD_CRON = "/etc/cron.d/bgpeer-aghupdate"   # 每天 01:00 自动更新的 cron
+AGH_AUTOUPD_LOG  = "/var/log/bgpeer-aghupdate.log"
+AGH_AUTOUPD_AT   = (1, 0)                           # 北京时间每天 01:00（见 claude/NOTES.md 总表，01:00 是空的）
 RESOLVED_DIR    = "/etc/systemd/resolved.conf.d"
 RESOLVED_DROPIN = RESOLVED_DIR + "/adguard.conf"  # 腾 53 时写的 drop-in（卸载时据此还原本机解析）
 AGH_INSTALL = "https://raw.githubusercontent.com/AdguardTeam/AdGuardHome/master/scripts/install.sh"
@@ -245,7 +249,7 @@ def install():
             if not _auto_setup():
                 _first_setup()
             return
-        print("  AdGuard Home 已经装过了。要重装请先『12 卸载』再装；只换域名走『10 更换域名证书』。")
+        print("  AdGuard Home 已经装过了。要重装请先『13 卸载』再装；只换域名走『10 更换域名证书』。")
         _usage(); return
     # 向导要先占 3000：11/19 实装，3000 被别的网页程序占着，AdGuard 绑不上、一起一停，
     # 装完轮询等不到向导才退回手动——先查、先问，别等装完才发现（跟前面查 53 一个路子）
@@ -282,6 +286,8 @@ def install():
         print("\n  已安装，但服务暂未在运行——稍等或看 `systemctl status AdGuardHome`。")
     if not _auto_setup():   # 替你走完网页向导：随机后台端口 + 你设的账号密码（仓库主人 10/30）
         _first_setup()      # 没走成：照旧网页向导，统一用默认 3000（先保证进得去），装好后菜单 7 改端口
+    if _installed():
+        _ensure_autoupd_cron()                   # 默认开每天 01:00 自动更新（没关就补写 cron）
 
 def _setup_own_domain():
     """装之前给自建 DNS 一个它自己的域名、签一张它自己的证书（域名 + *.域名，DoT 带 ClientID 要泛域名），
@@ -1386,7 +1392,7 @@ def dot_clientid():
                   (2, "删除 DoT ClientID 支持（证书改回单域名，AdGuard 照常跑）", None),
                   (3, "更换 ClientID（泄露了就换，白名单 + 订阅一起换）", None),
                   (0, "返回", None)])
-        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 12")
+        ui_tip("想把整套自建 DNS 卸掉：回上级菜单选 13")
         c = _ask("选择: ").strip()
         if c == "1":
             _replace_cf_token()
@@ -1400,7 +1406,7 @@ def dot_clientid():
         return
     if _own_domain():                                     # 自己那张装的时候就带 *.域名；没有说明证书出了岔子
         print(f"  {R}⚠ 自建 DNS 自己的证书里没有 *.{dom}{N}")
-        ui_tip("菜单 10 换个域名，或卸了重装（12 → 1），都会重签"); return
+        ui_tip("菜单 10 换个域名，或卸了重装（13 → 1），都会重签"); return
     print(f"  会把 acme 证书重签成同时覆盖 {G}{dom}{N} 和 {G}*.{dom}{N}。")
     print(f"  AdGuard 的证书路径不用改（还是 {ACME_CRT}），新证书是旧的超集，节点不受影响。")
     print(f"\n  {Y}需要你先准备两样：{N}")
@@ -1709,6 +1715,313 @@ def change_web_port():
         sh("systemctl restart AdGuardHome")
         print(f"\n  ❌ 改到 {new} 后 AGH 没在新端口正常起来，已回滚回 {cur}（后台仍可用）。稍后再试或换个端口。")
 
+# ── 更新 AdGuard（菜单 12，11/22 加）──────────────────────────────────────────────
+# 更新本身跑 AdGuard 自己的 --update（先 --check-config 校验、旧版进 backup 目录），不要自己下包。
+# 每天 01:00 的自动更新走下面这套排队基础设施（跟 xy-installer / cn-block / net-optimize / media-stack 里的一模一样，勿手改）：
+# 北京时间换算 + 到点核对 + 交给 bgpeer-jobq，一个跑完再跑下一个，重启后接着跑。
+# 时刻对照 claude/NOTES.md「凌晨定时任务总表」：01:00 是空的，最早的是 02:30 镜像更新。
+
+
+def bj_cron_lines(hh, mm, cmd, day=None):
+    """北京时间 hh:mm（day 给了 = 每月那一号）→ /etc/cron.d 里的行。
+
+    为什么不能只换算一次：Debian/Ubuntu 的 cron 不认 CRON_TZ，只能按本机时区写；而美国、欧洲、
+    澳洲这些地方有夏令时，同一个北京时刻在本机冬天和夏天差一小时（洛杉矶冬 11:00 / 夏 12:00），
+    只按装的那天算，换季后就整整偏一小时，还可能撞上别的凌晨任务。
+    所以按今年 1 月和 7 月各算一次，两个本机时刻都写；每行前面用北京时间再核对一次
+    （TZ=CST-8 是 POSIX 写法，不依赖 tzdata），只有对的那行真跑。没有夏令时的时区只有一行。
+    每月任务：本机日期可能跟北京差一天，所以日期字段写 *、改由核对里的「几号」把关。"""
+    import datetime
+    bj = datetime.timezone(datetime.timedelta(hours=8))
+    y = datetime.date.today().year
+    times = []
+    for mon in (1, 7):
+        t = datetime.datetime(y, mon, 15, hh, mm, tzinfo=bj).astimezone()
+        if (t.hour, t.minute) not in times:
+            times.append((t.hour, t.minute))
+    fmt, want = ("\\%d\\%H", f"{day:02d}{hh:02d}") if day else ("\\%H", f"{hh:02d}")
+    guard = f'[ "$(TZ=CST-8 date +{fmt})" = "{want}" ] && '
+    return [f"{m} {h} * * * root {guard}{cmd}" for h, m in times], times
+
+
+# ── 凌晨任务排队（bgpeer-jobq）────────────────────────────────────────────────
+# 仓库主人：「如果有影响就在后面排队，如果要等服务器重启了排队的就自动跟上进行继续做」。
+# 凌晨这几条（cn-block 刷新会重启 sing-box、nginx 升级会重启 nginx、内核更新会重启 sing-box/xray、
+# AdGuard 更新会重启 AdGuard、三大配置自动更新）一律先交给 bgpeer-jobq：一个跑完再跑下一个，按登记顺序；记录落硬盘，
+# 重启打断的、没轮到的，开机由 bgpeer-jobq.service 接着跑。xy-installer / cn-block / net-optimize / media-stack /
+# adguard-dns 各带一份【一模一样】的（谁先装谁写，内容相同就不重写；测试会核对五份一致）。
+JOBQ_BIN  = "/usr/local/sbin/bgpeer-jobq"
+JOBQ_UNIT = "/etc/systemd/system/bgpeer-jobq.service"
+JOBQ_SH = r"""#!/bin/bash
+# bgpeer-jobq —— 凌晨定时任务排队器（nodekit 生成，五个脚本各带一份同样的，勿手改）
+#   bgpeer-jobq run <任务名> '<命令>'   登记 → 排队 → 前面的跑完再跑（同名任务已在排/在跑就不重复登记）
+#   bgpeer-jobq resume                  开机时调：上次重启打断的、还没轮到的，按原先顺序接着跑
+#   bgpeer-jobq list                    看队列
+# 记录落在硬盘（不是 /run），断电重启也丢不了；登记超过 12 小时还没跑上的丢掉，免得白天冒出凌晨的活。
+Q=${BGPEER_JOBQ_DIR:-/var/lib/bgpeer-jobq}
+LOCK=${BGPEER_JOBQ_LOCK:-/run/bgpeer-jobq.lock}
+LOG=${BGPEER_JOBQ_LOG:-/var/log/bgpeer-jobq.log}
+MAX_AGE=${BGPEER_JOBQ_MAX_AGE:-43200}
+JOB_TIMEOUT=${BGPEER_JOBQ_TIMEOUT:-14400}   # 4 小时：Emby 每日对齐自己就给了 3 小时
+BOOT_WAIT=${BGPEER_JOBQ_BOOT_WAIT:-60}
+mkdir -p "$Q" && chmod 700 "$Q"
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+queued() {   # 同名任务是否已在排 / 在跑
+  local f
+  for f in "$Q"/*.job "$Q"/*.run; do
+    [ -e "$f" ] && [ "$(head -n1 "$f")" = "$1" ] && return 0
+  done
+  return 1
+}
+
+drain() {    # 拿到锁的那个把整条队按登记顺序跑完；没拿到的等着（= 排队）
+  exec 9>"$LOCK"
+  flock 9
+  local f id cmd t0 rc
+  while :; do
+    f=$(ls -1 "$Q"/*.job 2>/dev/null | sort | head -n1)
+    [ -n "$f" ] || break
+    id=$(sed -n 1p "$f"); cmd=$(sed -n 2p "$f")
+    if [ $(( $(date +%s) - $(stat -c %Y "$f") )) -gt "$MAX_AGE" ]; then
+      log "$id 登记超过 $((MAX_AGE / 3600)) 小时没跑上，丢弃"; rm -f "$f"; continue
+    fi
+    mv "$f" "${f%.job}.run"                 # 正在跑：这时重启，开机会接着跑它
+    t0=$(date +%s); log "$id 开始"
+    timeout "$JOB_TIMEOUT" bash -c "$cmd" 9>&-   # 9>&-：锁别漏给任务起的进程，不然锁永远放不掉
+    rc=$?
+    rm -f "${f%.job}.run"; log "$id 结束 rc=$rc 用时 $(( $(date +%s) - t0 ))s"
+  done
+  exec 9>&-
+}
+
+case "$1" in
+  run)
+    [ -n "$2" ] && [ -n "$3" ] || { echo "用法: $0 run <任务名> '<命令>'" >&2; exit 2; }
+    if queued "$2"; then log "$2 已在队列里，不重复登记"; exit 0; fi
+    tmp=$(mktemp "$Q/.new.XXXXXX")
+    printf '%s\n%s\n' "$2" "$3" > "$tmp"
+    mv "$tmp" "$Q/$(date +%s%N)-$2.job"
+    if ! flock -n "$LOCK" true 2>/dev/null; then log "$2 排队：前面还有任务在跑"; fi
+    drain
+    ;;
+  resume)
+    n=0
+    for f in "$Q"/*.run; do [ -e "$f" ] && mv "$f" "${f%.run}.job" && n=$((n + 1)); done
+    m=$(ls -1 "$Q"/*.job 2>/dev/null | wc -l)
+    [ "$m" -gt 0 ] || exit 0
+    log "开机续跑：被重启打断 $n 个，共 $m 个待跑；等 ${BOOT_WAIT}s 让网络和服务先起来"
+    sleep "$BOOT_WAIT"
+    drain
+    ;;
+  list)
+    for f in "$Q"/*.job "$Q"/*.run; do
+      [ -e "$f" ] && echo "$(basename "$f")  $(sed -n 2p "$f")"
+    done
+    ;;
+  *) echo "用法: $0 run <任务名> '<命令>' | resume | list" >&2; exit 2 ;;
+esac
+"""
+JOBQ_UNIT_TXT = ("[Unit]\nDescription=bgpeer 凌晨任务排队：开机接着跑被重启打断 / 还没轮到的\n"
+                 "Wants=network-online.target\nAfter=network-online.target sing-box.service xray.service nginx.service\n"
+                 "[Service]\nType=simple\nExecStart=" + JOBQ_BIN + " resume\n"
+                 "[Install]\nWantedBy=multi-user.target\n")
+
+
+def ensure_jobq():
+    """装 / 更新排队器和开机续跑服务。内容没变什么都不做。装不上返回 False（调用方退回直接跑）。"""
+    try:
+        changed = False
+        for path, txt, mode in ((JOBQ_BIN, JOBQ_SH, 0o755), (JOBQ_UNIT, JOBQ_UNIT_TXT, 0o644)):
+            try:
+                same = open(path).read() == txt
+            except OSError:
+                same = False
+            if not same:
+                # 写临时文件再换名：排队器可能正在跑（bash 是边跑边读脚本的），原地改写会把它读花
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".new", "w") as f:
+                    f.write(txt)
+                os.chmod(path + ".new", mode)
+                os.replace(path + ".new", path)
+                changed = True
+            os.chmod(path, mode)
+        if changed:
+            subprocess.run("systemctl daemon-reload; systemctl enable bgpeer-jobq.service",
+                           shell=True, capture_output=True)
+        return True
+    except OSError:
+        return False
+
+
+def jobq_wrap(job, cmd):
+    """把一条命令包成「交给排队器」：排队器不在（被别的卸载删了）就直接跑，至少不丢任务。"""
+    import shlex
+    return f"if [ -x {JOBQ_BIN} ]; then {JOBQ_BIN} run {job} {shlex.quote(cmd)}; else {cmd}; fi"
+
+
+def bj_job_lines(hh, mm, job, cmd, day=None):
+    """北京时间定时任务的 cron 行：时间换算 + 到点核对（见 bj_cron_lines）+ 交给排队器。"""
+    ensure_jobq()
+    return bj_cron_lines(hh, mm, jobq_wrap(job, cmd), day=day)
+
+
+
+
+_AGH_VER_RE = re.compile(r"v(\d+\.\d+\.\d+)")
+
+def _agh_version():
+    """已装 AdGuard 的版本（v0.107.79 这类）；没装 / 读不到返回 ''。
+       真二进制实测：`AdGuardHome --version` 只印一行 `AdGuard Home, version v0.107.79`。"""
+    if not _installed():
+        return ""
+    m = _AGH_VER_RE.search(sh(f"{AGH_BIN} --version"))
+    return "v" + m.group(1) if m else ""
+
+def _agh_backup_dir():
+    """官方更新器留下的旧版备份目录（/opt/AdGuardHome/backup-v*，里面有旧二进制 + 配置）；
+       没有返回 ''。更新后服务起不来时告诉用户这个位置，可手动换回去。"""
+    try:
+        ds = [d for d in os.listdir(AGH_DIR) if d.startswith("backup-v")]
+    except OSError:
+        return ""
+    if not ds:
+        return ""
+    return AGH_DIR + "/" + sorted(ds)[-1]
+
+def update_now(auto=False):
+    """立即更新：跑 AdGuard 自己的 --update（它先 --check-config 校验配置、旧版进 backup 目录，
+       再换二进制、重启服务），不要自己下包。auto=True 是 cron 调：不问问题，结果直接印出来（cron 重定向进日志）。
+       判断只认两样：更新后版本号变没变、服务回没回来；--update 的退出码只当失败信号（真二进制实测：
+       查不到新版时 rc=1、原二进制一个字节不动）。"""
+    if os.geteuid() != 0:
+        print("  需要 root。"); return False
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return False
+    old = _agh_version()
+    if not auto:
+        print("  " + _hl("1;31", "⚠ 更新会重启 AdGuard，DNS 断一两秒"))
+        if _ask("  现在更新 AdGuard？[y/N]: ").strip().lower() not in ("y", "yes"):
+            return False
+    print(f"  正在更新 AdGuard（现在 {old or '未知版本'}，官方更新器自己校验、自己换，旧版留备份）…")
+    try:
+        r = subprocess.run(f"{AGH_BIN} --update", shell=True, capture_output=True, text=True, timeout=600)
+        out = (r.stdout or "") + (r.stderr or "")
+        rc = r.returncode
+    except subprocess.TimeoutExpired:
+        print("  " + _hl("1;31", "⚠ 更新 10 分钟还没完（多半是下载卡住了），已停掉这次尝试；AdGuard 还是原来那个版本"))
+        return False
+    if rc != 0:
+        lines = [l for l in out.splitlines() if l.strip()]
+        tail = lines[-1].strip() if lines else ""
+        if len(tail) > 160:                                       # 日志行带时间戳和整串 URL，只留后半截原因
+            tail = "…" + tail[-160:]
+        print("  " + _hl("1;31", f"⚠ 更新没成（退出码 {rc}），AdGuard 还是 {old or '原来那个版本'}，服务没动"))
+        if tail:
+            print(f"    原因：{tail}")
+        return False
+    for _ in range(60):                                           # 更新器自己重启服务，等它回来
+        time.sleep(1)
+        if _running():
+            break
+    new = _agh_version()
+    if not _running() or not new:
+        print("  " + _hl("1;31", "⚠ 更新完了但 AdGuard 没起来（或版本号读不到），先别动它"))
+        bk = _agh_backup_dir()
+        if bk:
+            print(f"    旧版备份在 {bk}，可手动换回去；再看 `systemctl status AdGuardHome`")
+        else:
+            print("    再看 `systemctl status AdGuardHome` 找原因")
+        return False
+    if old and new != old:
+        print(f"  ✔ 已更新 {old} → {new}（服务已回来）")
+    else:
+        print(f"  ✔ 已经是最新版 {new}，不用更新")
+    return True
+
+def _autoupd_on():
+    """每天自动更新开着没：默认开；AGH_AUTOUPD_OFF 在 = 关（跟主脚本 SELFUPD_OFF 一个路子）。"""
+    return not os.path.exists(AGH_AUTOUPD_OFF)
+
+def _autoupd_cron_text():
+    """每天 01:00 的 cron 文件内容（北京时间核对 + 进排队器，见 setup_selfupd_cron 那套写法）。"""
+    hh, mm = AGH_AUTOUPD_AT
+    cmd = f"python3 {BGP_DIR}/adguard-dns.py update >>{AGH_AUTOUPD_LOG} 2>&1"
+    lines, times = bj_job_lines(hh, mm, "agh-update", cmd)
+    return (f"# AdGuard Home 每天自动更新（北京时间 {hh:02d}:{mm:02d} = 本机 "
+            f"{' / '.join(f'{h:02d}:{m:02d}' for h, m in times)}，到点核对北京钟点，进排队器）\n"
+            "SHELL=/bin/bash\n"
+            "PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin\n"
+            + "".join(l + "\n" for l in lines))
+
+def _autoupd_write_cron():
+    """写 / 刷新 cron 文件；写不上返回 False。"""
+    try:
+        open(AGH_AUTOUPD_CRON, "w").write(_autoupd_cron_text())
+        os.chmod(AGH_AUTOUPD_CRON, 0o644)
+        return True
+    except OSError:
+        return False
+
+def _autoupd_remove_cron():
+    try: os.remove(AGH_AUTOUPD_CRON)
+    except OSError: pass
+
+def _autoupd_set(on):
+    """开关切换：开 = 删 off 文件 + 写 cron；关 = 写 off 文件 + 删 cron。"""
+    try:
+        if on:
+            try: os.remove(AGH_AUTOUPD_OFF)
+            except OSError: pass
+            return _autoupd_write_cron()
+        open(AGH_AUTOUPD_OFF, "w").write("1")
+        _autoupd_remove_cron()
+        return True
+    except OSError:
+        return False
+
+def _ensure_autoupd_cron():
+    """进菜单 / 装完时调：没关且 cron 缺失或内容不对就补写；关了就确保 cron 不在。
+       这样老装机不用手动开，下次进菜单自动有了 01:00 任务。"""
+    if not _installed():
+        return
+    if not _autoupd_on():
+        _autoupd_remove_cron()
+        return
+    try: cur = open(AGH_AUTOUPD_CRON).read()
+    except OSError: cur = ""
+    if cur != _autoupd_cron_text():
+        _autoupd_write_cron()
+
+def update_menu():
+    """菜单 12「更新 AdGuard」（11/22 加）：1 立即更新 / 2 自动更新（默认开，每天 01:00）/ 0 返回。
+       子菜单做完一项留在这里接着选（跟菜单 8 一个样子）。"""
+    if not _installed():
+        print("  还没装 AdGuard Home，先选 1 安装。"); return
+    while True:
+        print()
+        ui_items([(1, "立即更新", _agh_version() or None),
+                  (2, "自动更新", f"开（每天 {AGH_AUTOUPD_AT[0]:02d}:{AGH_AUTOUPD_AT[1]:02d}）" if _autoupd_on() else "关"),
+                  (0, "返回", None)])
+        c = _ask("选择: ").strip()
+        if c == "1":
+            update_now()
+        elif c == "2":
+            if _autoupd_on():
+                if _ask("  关闭每天自动更新？[y/N]: ").strip().lower() in ("y", "yes"):
+                    if _autoupd_set(False):
+                        print("  ✔ 每天自动更新已关（01:00 的任务已撤）")
+                    else:
+                        print("  ⚠ 没关掉（/etc/bgpeer 写不了？）")
+            else:
+                if _ask("  开启每天自动更新（每天 01:00）？[Y/n]: ").strip().lower() in ("", "y", "yes"):
+                    if _autoupd_set(True):
+                        print("  ✔ 每天自动更新已开（每天 01:00，进排队器）")
+                    else:
+                        print("  ⚠ 定时任务没写进去（/etc/cron.d 写不了？）")
+        else:
+            return
+
 # ── DoH 走 HTTP/3（仓库主人 11/01：「做个开关吧默认关」）────────────────────────────────
 # AdGuard 自带：AdGuardHome.yaml 里 dns.serve_http3 = true，DoH 端口（port_https，默认 10443）除了 TCP 再开一个 UDP
 # 收 HTTP/3（真二进制 v0.107.79 实测：开了 UDP 那个口就有人听）。默认关，理由：
@@ -1881,7 +2194,7 @@ def uninstall(refresh_sub=True, assume_yes=False):
 
        各项彼此独立、按「先撤依赖它的，再撤它本身」排序，中间某项失败不影响后面：证书
        重签失败原证书原封不动，本机解析还原不通会自动退回能用的状态。
-       assume_yes：主脚本 20 → 5「全部卸载」调（那边已经输过 yes），不再列清单、不再问。"""
+       assume_yes：主脚本 21 → 5「全部卸载」调（那边已经输过 yes），不再列清单、不再问。"""
     G = "\033[1;32m"; N = "\033[0m"
     if not _installed():
         print("  没检测到 AdGuard Home，无需卸载。"); return
@@ -1928,6 +2241,9 @@ def uninstall(refresh_sub=True, assume_yes=False):
         os.remove(AGH_PW_FILE)   # 映射存的那份后台密码也清掉
     except OSError:
         pass
+    _autoupd_remove_cron()                       # 每天 01:00 的自动更新任务一起撤（日志文件留着）
+    try: os.remove(AGH_AUTOUPD_OFF)
+    except OSError: pass
     print(f"\n  {G}卸载完成。{N}"
           f"记得把之前改过 DNS / 专用DNS 的设备改回自动/默认，否则它们会没 DNS 可用。")
 
@@ -3045,14 +3361,16 @@ def change_admin_account():
             return
 
 def menu():
+    _ensure_autoupd_cron()                       # 老装机下次进菜单，自动补上每天 01:00 的更新任务
     while True:
         # 仓库主人 10/31 重排：常用的在前、卸载放最后；「腾出 53 端口」「手机实测」并进「自检」（查到 53 被占才问腾不腾，
         # 查完再问要不要手机实测，都默认否），两项功能都还在。
         # 4 节点使用私有DNS解析：1 本机当 DNS 机 / 2 本机节点交给外机解析 / 3 关（交给主脚本，见 _privdns_menu）。
         # 5 DoT 带 ClientID：签泛域名证书，设了白名单后安卓「专用 DNS」仍可用。7 改后台端口：随机 2000-5000 / 自定义，带回滚。
         # 10 更换域名证书：换自建 DNS 自己的域名和证书（10/31 加，见 change_domain），后台设置不动。
-        # 11 DoH 走 HTTP/3：默认关（11/01 加，见 doh_h3_toggle），卸载挪到 12、照旧放最后。
-        # 12 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
+        # 11 DoH 走 HTTP/3：默认关（11/01 加，见 doh_h3_toggle）。
+        # 12 更新 AdGuard：1 立即更新（跑官方 --update）/ 2 自动更新（默认开，每天 01:00，可关，见 update_menu）。
+        # 13 卸载：整套撤干净（服务 + 数据、订阅里的自建 DNS、泛域名证书、腾 53 的改动），不动节点。
         ui_title("自建 DNS · AdGuard Home（兼带广告过滤）")
         if _installed():
             st = "已安装 · " + (_hl("1;32", "运行中") if _running() else _hl("1;31", "未运行"))
@@ -3071,7 +3389,8 @@ def menu():
                   (9, "自检（含手机实测）", None),
                   (10, "更换域名证书", _domain() if _installed() else None),
                   (11, "DoH 走 HTTP/3", ("开" if _h3_on() else "关") if _installed() else None),
-                  (12, "卸载自建DNS", None),
+                  (12, "更新 AdGuard", _agh_version() if _installed() else None),
+                  (13, "卸载自建DNS", None),
                   (0, "退出", None)])
         c = _ask("选择: ").strip()
         if c == "1":   install()
@@ -3085,7 +3404,8 @@ def menu():
         elif c == "9": selfcheck(); _selfcheck_more()
         elif c == "10": change_domain()
         elif c == "11": doh_h3_toggle()
-        elif c == "12": uninstall()
+        elif c == "12": update_menu()
+        elif c == "13": uninstall()
         elif c in ("0", ""):
             return
 
@@ -3094,6 +3414,8 @@ def main():
     if act in ("remove", "uninstall"):               # 主脚本菜单 21 调：remove = 订阅整个删了 / 节点不在，不用刷新订阅；
         # uninstall = 节点还在，订阅里的 DoH、私有解析一起撤；--yes = 全部卸载那边已经输过 yes，不再问
         uninstall(refresh_sub=(act == "uninstall"), assume_yes="--yes" in sys.argv[2:])
+    elif act == "update":                            # cron 每天 01:00 调：不问问题，结果进日志
+        update_now(auto=True)
     else:
         menu()
 
