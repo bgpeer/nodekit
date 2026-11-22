@@ -102,7 +102,7 @@ def bj_fmt(fmt, ts=None):
 
 # 版本号：改了代码就 +1，让「8 更新」能显示 vX → vY。
 # 仓库主人定的规矩：只动最后一位，1.5.0 一路加到 1.5.999，前两位不要自己动。
-SCRIPT_VERSION = "1.5.431"
+SCRIPT_VERSION = "1.5.432"
 _T_LOAD = time.monotonic()      # 开播计时用：脚本从这儿开始加载（见 do_heal_gate）
 
 # 本脚本在仓库里的地址，「更新」时用它把自己换成最新版
@@ -140,10 +140,12 @@ OLD_STRM_CRON     = "0 0 5 * * *"           # 旧默认值，更新时静默迁�
 
 OPENLIST_PORT  = 5244
 MEDIAWARP_PORT = 9000
-# Homepage 导航页的宿主机端口：原来是 3000，跟 AdGuard Home 安装向导抢 3000（11/19 实装：
-# 向导绑不上、服务一起一停，自动设置等不到向导）。改成 3001；11/20 仓库主人改成 2999。
-# 容器里还是 3000 不动。
-HOMEPAGE_PORT  = 2999
+# Homepage 导航页的端口只在这里定义，别处不许再写字面量（test_ms_homepage_port.py 把关）：
+# 宿主机侧走 HOMEPAGE_PORT，nginx 反代和 compose 映射都读它；容器里监听的还是容器端口。
+# 原来跟 AdGuard Home 安装向导抢同一个端口，向导绑不上、服务一起一停，11/19 迁过一次，
+# 11/20 仓库主人改成现在这个值。
+HOMEPAGE_PORT = 2999
+HOMEPAGE_CONTAINER_PORT = 3000  # 容器里 Homepage 自己监听的端口（镜像定的，别动）
 STRM_SUBDIR    = "cloud"
 STRM_PATH      = "/data/strm/" + STRM_SUBDIR
 
@@ -497,6 +499,76 @@ def detect_nginx_https_port():
     return 443
 
 
+def homepage_published_port():
+    """Homepage 容器现在对外发布的宿主机端口（docker port 问出来的）；
+    容器不在 / 没发布端口 / 问不到 → None。"""
+    try:
+        out = (sh(f"docker port homepage {HOMEPAGE_CONTAINER_PORT}", timeout=15).stdout or "").strip()
+        m = re.search(r":(\d+)\s*$", out)
+        if m:
+            p = int(m.group(1))
+            if 1 <= p <= 65535:
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def _compose_homepage_port(d):
+    """docker-compose.yml 里 Homepage 那行映射的宿主机端口；没有 / 读不到 → None。"""
+    try:
+        with open(os.path.join(d, "docker-compose.yml"), encoding="utf-8") as f:
+            for ln in f:
+                m = re.search(rf"-\s*[\"']?(?:127\.0\.0\.1:)?(\d+):{HOMEPAGE_CONTAINER_PORT}[\"']?", ln)
+                if m:
+                    p = int(m.group(1))
+                    if 1 <= p <= 65535:
+                        return p
+    except Exception:
+        pass
+    return None
+
+
+def migrate_homepage_port(d):
+    """已装 Homepage 容器的发布端口不是 HOMEPAGE_PORT 时，把它迁过去。
+
+    11/20 起新装用 HOMEPAGE_PORT，但 11/19 迁到旧端口的老机器容器还跑在旧端口；
+    nginx 重生成只管自己那份（写 HOMEPAGE_PORT），容器不动 —— 首页 502（11/22 真机：
+    容器 Up 3 天、旧端口在听，nginx 却往 HOMEPAGE_PORT 连）。所以 nginx 动笔之前先把容器
+    迁到脚本的端口：compose 按当前脚本重写（映射写 HOMEPAGE_PORT）、只重建 homepage
+    这一个容器。已经是 HOMEPAGE_PORT / 没装 / 问不到，都什么都不做。
+    容器已经是 HOMEPAGE_PORT、只有 compose 文件还写着旧端口时，也顺手把文件改过来 ——
+    不然下次 docker compose up 又把它搬回旧端口。
+    返回 True = 已迁过去或本来就是；False = 想迁没迁成（调用方照旧写 nginx，
+    屏上那句 warn 会说清，修好 docker 再跑一次更新）。
+    """
+    try:
+        cur = homepage_published_port()
+    except Exception:
+        return True
+    try:
+        compose = os.path.join(d, "docker-compose.yml")
+        env_file = os.path.join(d, ".env")
+        if cur is not None and cur != HOMEPAGE_PORT:
+            write_atomic(compose, gen_compose(rebuild_cfg_from_disk(d)))
+            r = subprocess.run(
+                f"docker compose -f {compose} --env-file {env_file} up -d homepage",
+                shell=True, timeout=600, capture_output=True, text=True)
+            if r.returncode != 0:
+                warn(f"Homepage 端口没迁成（{cur} → {HOMEPAGE_PORT}）："
+                     "容器还在旧端口，nginx 写完首页会 502，修好 docker 再跑一次更新")
+                return False
+            ok(f"Homepage 端口已迁到 {HOMEPAGE_PORT}（原来 {cur}）")
+            return True
+        if cur is not None and _compose_homepage_port(d) not in (None, HOMEPAGE_PORT):
+            write_atomic(compose, gen_compose(rebuild_cfg_from_disk(d)))
+            ok(f"Homepage 端口已迁到 {HOMEPAGE_PORT}（compose 文件还写着旧端口）")
+        return True
+    except Exception as e:
+        warn(f"Homepage 端口没迁成：{_short_err(e)}")
+        return False
+
+
 def nginx_worker_user():
     """nginx worker 跑在哪个用户下。
 
@@ -740,7 +812,7 @@ def gen_compose(cfg):
     volumes:
       - {d}/homepage/config:/app/config
     ports:
-      - "{bind}{HOMEPAGE_PORT}:3000"
+      - "{bind}{HOMEPAGE_PORT}:{HOMEPAGE_CONTAINER_PORT}"
     networks: [mediastack]
 """)
 
@@ -1495,7 +1567,7 @@ layout:
         "emby":     f"http://mediawarp:{MEDIAWARP_PORT}/System/Info/Public",
         # OpenList 打根路径就正常返回 200，别改成 /ping —— 现在是好的，不动它
         "openlist": f"http://openlist:{OPENLIST_PORT}",
-        "homepage": "http://homepage:3000",
+        "homepage": f"http://homepage:{HOMEPAGE_CONTAINER_PORT}",
     }
     services = ["- 媒体:"]
     for sub, port, container, label in SUBDOMAINS:
@@ -1642,6 +1714,10 @@ def gen_nginx_site(cfg):
     for sub, port, container, _label in SUBDOMAINS:
         if sub == "home" and not cfg["homepage"]:
             continue
+        if sub == "home":
+            # 首页端口只认 HOMEPAGE_PORT 一个常量（SUBDOMAINS 那行是 import 时从它抄的；
+            # 生成时直接读常量，改常量就连生成结果一起变，不用再改第二处）。
+            port = HOMEPAGE_PORT
         # 自带账号体系的服务不加 Basic Auth：
         #   emby —— 有自己的用户系统，而且 App 客户端处理不了 Basic Auth，套上去连不上
         #   list —— OpenList 有 admin 账号，再套一层就变成连输两次不同的密码，
@@ -1880,6 +1956,13 @@ def apply_nginx_site(cfg, quiet=True):
 
        quiet：成功时不说话（更新、切开关时每次都要重写一遍，屏上刷一行
        「nginx 配置已生效」+ 一句"无需改节点配置"只是噪音）。出错永远说。"""
+    # 【先把 Homepage 容器迁到脚本的端口】只写 nginx 不迁容器，首页 502
+    # （11/22 真机）。迁不成也不拦着写 nginx，上面那句 warn 会说清。
+    if cfg.get("homepage"):
+        try:
+            migrate_homepage_port(cfg.get("install_dir") or ms_install_dir())
+        except Exception:
+            pass
     os.makedirs("/etc/nginx/conf.d", exist_ok=True)
     backup = ""
     if os.path.exists(NGX_SITE):
@@ -25226,6 +25309,10 @@ def toggle_metatube():
         write_atomic(os.path.join(d, "docker-compose.yml"), gen_compose(cfg))
         subprocess.run(["docker", "rm", "-f", "metatube"], capture_output=True)
         _compose_up(d)
+        # compose 重写可能把 Homepage 端口从旧端口迁到 HOMEPAGE_PORT，nginx 也要跟着刷，
+        # 不然首页指着旧端口 502（见 migrate_homepage_port）。
+        if cfg.get("has_domain") and os.path.exists(cfg.get("crt") or ""):
+            apply_nginx_site(cfg)
         subprocess.run(["docker", "restart", "emby"], capture_output=True)
         save_ms_state(metatube_files=[])
         ok("已卸载（元数据缓存保留）")
@@ -25253,6 +25340,10 @@ def toggle_metatube():
     if not _compose_up(d):
         err("容器启动失败，看上面的报错。")
         return
+    # compose 重写可能把 Homepage 端口从旧端口迁到 HOMEPAGE_PORT，nginx 也要跟着刷，
+    # 不然首页指着旧端口 502（见 migrate_homepage_port）。
+    if cfg.get("has_domain") and os.path.exists(cfg.get("crt") or ""):
+        apply_nginx_site(cfg)
     _srv = metatube_write_server(d)                 # 服务器地址：赶在 Emby 重启之前写进插件的设置文件
     subprocess.run(["docker", "restart", "emby"], capture_output=True)
     save_ms_state(metatube_files=files, metatube_ver=_MT_TAG[0])
