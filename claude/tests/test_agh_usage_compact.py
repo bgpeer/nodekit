@@ -74,6 +74,8 @@ check("白名单已设：ID 在前、✓ 已设好跟在后面同一行、不带
 check("要填的几行：DOT 地址新标签、DoH 地址新标签、白名单那行不列了（仓库主人 11/23）",
       "DOT地址「安卓专用私密DNS主机名」" in out and "DoH 地址（浏览器 / App/三大配置）" in out
       and "AdGuard 后台 → DNS 设置 → 允许的客户端" not in out)
+check("状态参数里有 DoQ 端口 853（UDP，与 DoT 同端口、同一主机名、无需另填）（仓库主人 11/24）",
+      "DoQ 端口" in out and "无需另填" in out)
 a._cert_wildcard_ok = lambda d: False
 out = show()
 check("白名单已设、没签泛域名：红字一行说安卓会被挡", "安卓专用 DNS 会被挡" in out)
