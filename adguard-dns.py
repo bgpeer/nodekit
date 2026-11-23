@@ -1175,6 +1175,7 @@ def _usage(port=None, head=None):
     print(f"    后台用户名    : {(G + '、'.join(users) + N) if users else (Y + '还没设（第一步）' + N)}")
     print(f"    加密(DoT/DoH) : {(G+'已开启'+N) if enc else (Y+'未开启（第二步）'+N)}")
     print(f"    DoH 端口      : {G}{dohp}{N}        DoT 端口: {G}853{N}       明文: {G}53{N}")
+    print(f"    DoQ 端口      : {G}853{N} (UDP，与 DoT 同端口、同一主机名，无需另填)")
     if cid:
         print(f"    {C}ClientID{N}      : {G}{cid}{N}")
     else:
