@@ -69,8 +69,11 @@ check("白名单已设：明文 DNS 不再列（IP 不上「使用场景」和�
       "③ 明文 DNS" not in out and "明文 DNS（电视" not in out and IP not in out.split("【DNS 使用场景】")[1].split("AdGuard Home 状态参数")[0]
       and IP not in out.split("要填的就这几行")[1])
 L = [_re.sub(r"\033\[[0-9;]*m", "", x) for x in out.splitlines()]
-check("白名单已设：ID 跟在「已设好」后面同一行、不带括号（仓库主人 10/31）",
-      any(x.strip() == "允许的客户端：✓ 已设好　" + CID for x in L) and f"（{CID}）" not in out)
+check("白名单已设：ID 在前、✓ 已设好跟在后面同一行、不带括号（仓库主人 11/23）",
+      any(x.strip() == "允许的客户端：" + CID + "     ✓ 已设好" for x in L) and f"（{CID}）" not in out)
+check("要填的几行：DOT 地址新标签、DoH 地址新标签、白名单那行不列了（仓库主人 11/23）",
+      "DOT地址「安卓专用私密DNS主机名」" in out and "DoH 地址（浏览器 / App/三大配置）" in out
+      and "AdGuard 后台 → DNS 设置 → 允许的客户端" not in out)
 a._cert_wildcard_ok = lambda d: False
 out = show()
 check("白名单已设、没签泛域名：红字一行说安卓会被挡", "安卓专用 DNS 会被挡" in out)
