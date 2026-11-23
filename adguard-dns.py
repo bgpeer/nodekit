@@ -1140,8 +1140,8 @@ def _usage(port=None, head=None):
     elif allow and dom and not wild:
         print(f"    {R}⚠ 允许的客户端已设、没签泛域名证书：安卓专用 DNS 会被挡{N}（菜单 5 签证书，或清空允许的客户端）")
     elif allow:
-        # 跟在后面、高亮、不带括号：复制时不会把括号带进去（仓库主人 10/31：单独一行跑到下面去了，还是高亮）
-        print(f"    允许的客户端：{G}✓ 已设好{N}　{G}{' '.join(allow)}{N}")
+        # ID 在前高亮、✓ 已设好跟在后面不高亮：复制 ID 时不会把括号带进去（仓库主人 11/23）
+        print(f"    允许的客户端：{G}{' '.join(allow)}{N}     ✓ 已设好")
     elif dom and not wild:
         print(f"    允许的客户端：{Y}先做菜单 5 签泛域名证书再填{N}（不然安卓专用 DNS 会被挡）")
     else:
@@ -1187,18 +1187,15 @@ def _usage(port=None, head=None):
     print(f"    写入订阅      : {(G+'已写入 mihomo/sing-box/小火箭'+N) if os.path.exists(SELFDNS_FLAG) else (Y+'未写入（菜单 3 开关）'+N)}")
 
     # 要填的就这几行：标题高亮、值顶格单独一行好复制（仓库主人 10/12：「写一大堆，就是不写重要信息」）。
-    # 【列出来的几行不能互相打架】10/14：照着把 ClientID 填进「允许的客户端」，安卓专用 DNS 当场断了——
-    # 没签泛域名证书时安卓主机名带不上 ClientID。所以白名单那行只在签了泛域名之后才列。
+    # 【列出来的几行不能互相打架】白名单那行不列了：上面第三步已经有「允许的客户端」一行，重复了（仓库主人 11/23）。
     print("\n  " + "=" * 56)
     print(f"  {C}要填的就这几行{N}")
     print("  " + "=" * 56)
     items = []
     if dom:
-        items.append(("安卓「专用DNS」主机名", dot_host))
-    if dom and wild and cid:
-        items.append(("AdGuard 后台 → DNS 设置 → 允许的客户端", cid))
+        items.append(("DOT地址「安卓专用私密DNS主机名」", dot_host))
     if dom:
-        items.append(("DoH 地址（浏览器 / App）", doh_url))
+        items.append(("DoH 地址（浏览器 / App/三大配置）", doh_url))
     if not allow:                                    # 设了白名单明文 53 全被拒，不列
         items.append(("明文 DNS（电视 / 盒子 / 路由器）", ip))
     for i, (label, val) in enumerate(items):         # 条与条之间空一行（CLAUDE.md 第五节）
